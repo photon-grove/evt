@@ -1,0 +1,8 @@
+go:
+  version: 1.25.9
+javascript:
+  packageManager: pnpm
+node:
+  version: '~24.5'
+pnpm:
+  version: '10'

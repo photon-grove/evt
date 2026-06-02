@@ -1,0 +1,30 @@
+{
+  "name": "@photon-grove/evt-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": "24.x",
+    "pnpm": "10.x"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "moon run :build",
+    "format": "prettier --write .",
+    "moon": "moon",
+    "test": "moon run :test"
+  },
+  "devDependencies": {
+    "@moonrepo/cli": "2.2.4",
+    "prettier": "^3.8.1"
+  }
+}

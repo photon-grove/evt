@@ -1,0 +1,8 @@
+language: go
+stack: backend
+layer: library
+toolchains:
+  default: go
+project:
+  name: evt
+  description: Event sourcing framework for Go with DynamoDB, projections, streams, and rebuild tooling.

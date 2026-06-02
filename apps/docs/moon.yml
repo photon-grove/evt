@@ -1,0 +1,43 @@
+toolchains:
+  default: node
+language: typescript
+stack: frontend
+layer: application
+project:
+  name: docs
+  description: Documentation site for evt.
+tasks:
+  build:
+    command: pnpm
+    args:
+      - run
+      - build
+    inputs:
+      - '@group(sources)'
+  dev:
+    command: pnpm
+    args:
+      - run
+      - dev
+    preset: server
+  test:
+    command: pnpm
+    args:
+      - run
+      - test
+    inputs:
+      - '@group(sources)'
+  typecheck:
+    command: pnpm
+    args:
+      - run
+      - typecheck
+    inputs:
+      - '@group(sources)'
+fileGroups:
+  sources:
+    - src/**/*
+    - index.html
+    - package.json
+    - tsconfig.json
+    - vite.config.ts

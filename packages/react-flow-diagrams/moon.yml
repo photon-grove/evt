@@ -1,0 +1,25 @@
+toolchains:
+  default: node
+language: typescript
+tasks:
+  typecheck:
+    command: pnpm run typecheck
+    inputs:
+    - '@group(sources)'
+  test:
+    command: pnpm run test
+    inputs:
+    - '@group(sources)'
+    options:
+      cache: true
+project:
+  description: Reusable React Flow + ELK system-diagram toolkit for photon-grove apps
+  title: react-flow-diagrams
+fileGroups:
+  sources:
+  - src/**/*
+  - package.json
+  - tsconfig.json
+  - vitest.config.ts
+  - vitest.setup.ts
+layer: library

@@ -1,0 +1,16 @@
+actionlint = "~1.7"
+go = "1.25.9"
+golangci-lint = "~2.7"
+moon = "2.2.4"
+node = "~24.5"
+npm = "~11.7"
+pnpm = "~10"
+terraform = "~1.14"
+
+[settings]
+auto-install = true
+
+[plugins.tools]
+"actionlint" = "https://raw.githubusercontent.com/Phault/proto-toml-plugins/main/actionlint/plugin.toml"
+"golangci-lint" = "https://raw.githubusercontent.com/b4nst/proto-plugins/refs/heads/main/toml/golangci-lint.toml"
+"terraform" = "source:./.github/proto-plugins/terraform.toml"

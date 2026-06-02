@@ -1,0 +1,86 @@
+fileGroups:
+  sources:
+    - '**/*.go'
+    - go.mod
+    - go.sum
+  tests:
+    - '**/*_test.go'
+tasks:
+  build:
+    command: go
+    args:
+      - build
+      - ./...
+    inputs:
+      - '@globs(sources)'
+  check:
+    command: go
+    args:
+      - vet
+      - ./...
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+  format:
+    command: gofmt
+    args:
+      - -w
+      - -s
+      - ./
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+  lint:
+    command: golangci-lint
+    args:
+      - run
+      - --allow-parallel-runners
+      - --tests
+      - --build-tags=integration
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+      - /.golangci.yml
+    options:
+      cache: false
+  test:
+    command: go
+    args:
+      - test
+      - ./...
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+  tidy:
+    command: go
+    args:
+      - mod
+      - tidy
+    inputs:
+      - go.mod
+      - go.sum
+  check-integration-readiness:
+    command: bash
+    args:
+      - scripts/check-integration-readiness.sh
+      - --endpoint
+      - '${AWS_ENDPOINT_URL:-http://localhost:4566}'
+  integration:
+    command: go
+    args:
+      - test
+      - -race
+      - -tags=integration
+      - ./dynamo/integration
+    deps:
+      - check-integration-readiness
+    env:
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_REGION: us-west-2
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+inheritedBy:
+  toolchain: go

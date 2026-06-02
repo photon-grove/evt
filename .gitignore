@@ -1,0 +1,11 @@
+.DS_Store
+.moon/cache/
+.moon/docker/
+.terraform/
+*.tfstate
+*.tfstate.*
+node_modules/
+dist/
+coverage/
+apps/docs/dist/
+tmp/

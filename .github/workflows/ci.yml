@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.5
+          cache: pnpm
+
+      - name: Cache Go
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Go checks
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          go vet ./...
+          go test ./...
+
+      - name: Moon checks
+        run: |
+          pnpm exec moon run evt:check evt:test docs:typecheck docs:build react-flow-diagrams:test
+
+  integration:
+    name: DynamoDB integration
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.5
+          cache: pnpm
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
+
+      - name: Cache Go
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Cache Terraform providers
+        uses: actions/cache@v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles('infra/local/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Start Moto
+        run: |
+          docker run -d --name moto -p 4566:5000 motoserver/moto:5.1.22
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:4566/ >/dev/null 2>&1; then
+              echo "Moto is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs moto
+          exit 1
+
+      - name: Apply local Terraform
+        env:
+          AWS_REGION: us-west-2
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: |
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform -chdir=infra/local init
+          terraform -chdir=infra/local apply -auto-approve
+
+      - name: Run integration tests
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_REGION: us-west-2
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: pnpm exec moon run evt:integration
+
+  summary:
+    name: Summary
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    needs: [quality, integration]
+    if: always()
+    steps:
+      - name: Check required jobs
+        env:
+          QUALITY: ${{ needs.quality.result }}
+          INTEGRATION: ${{ needs.integration.result }}
+        run: |
+          if [ "$QUALITY" != "success" ] || [ "$INTEGRATION" != "success" ]; then
+            echo "::error::CI failed: quality=$QUALITY integration=$INTEGRATION"
+            exit 1
+          fi
+          echo "All required jobs passed."
