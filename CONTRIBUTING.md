@@ -23,3 +23,10 @@ Keep framework behavior compatible unless the change is explicitly released as a
 breaking change. Add tests for storage, serialization, or retry behavior changes.
 
 Use neutral example names and local emulator values in docs and tests.
+
+## Releases
+
+Published GitHub releases trigger GoReleaser to build `evt-doctor` artifacts.
+Release Please is available as a manual workflow because some organizations
+disable `GITHUB_TOKEN` pull-request creation; wire it to a bot or PAT secret
+before enabling it on every push.
