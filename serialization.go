@@ -5,8 +5,8 @@ import (
 	"fmt"
 )
 
-// A SerializedEvent is a common event format that is ready to be committed to an Event Store and
-// streamed to downstream event listeners
+// SerializedEvent is a common event format that is ready to be committed to an Event Store and
+// streamed to downstream event listeners.
 type SerializedEvent struct {
 	ID         EventID       `json:"id"` // Composed of the EntityID and EventSequence
 	Sequence   EventSequence `json:"sequence"`
@@ -24,7 +24,44 @@ type SerializedResult struct {
 	Transaction Transaction       `json:"transactions"`
 }
 
-// SerializeEvents prepares an Event for serialization and storage
+// SerializedSnapshot represents a snapshot of current Entity state that is ready
+// to be committed to a Repository.
+type SerializedSnapshot struct {
+	EntityType    EntityType    `json:"entityType"`
+	EntityID      EntityID      `json:"entityID"`
+	Sequence      EventSequence `json:"sequence"`
+	EventSequence EventSequence `json:"eventSequence"`
+	Payload       []byte        `json:"payload"`
+}
+
+// EventUpcaster migrates a serialized event from an older version to a newer
+// version before aggregate replay.
+type EventUpcaster interface {
+	CanUpcast(EventType, EventVersion) bool
+	Upcast(SerializedEvent) (SerializedEvent, error)
+}
+
+// UpcastError wraps a failure that occurred while upcasting a serialized event.
+type UpcastError struct {
+	Err             error           `json:"err"`
+	SerializedEvent SerializedEvent `json:"serializedEvent"`
+}
+
+// NewUpcastError creates a new UpcastError instance.
+func NewUpcastError(err error, serializedEvent SerializedEvent) *UpcastError {
+	return &UpcastError{err, serializedEvent}
+}
+
+// Error returns the wrapped error message.
+func (e *UpcastError) Error() string {
+	if e == nil || e.Err == nil {
+		return "upcast error"
+	}
+
+	return e.Err.Error()
+}
+
+// SerializeEvents prepares an Event for serialization and storage.
 func SerializeEvents(
 	events []Event,
 	sequence EventSequence,
@@ -58,7 +95,7 @@ func SerializeEvents(
 	return serializedEvents, nil
 }
 
-// SerializeEventsWithContext serializes Events with the Entity within the given Context
+// SerializeEventsWithContext serializes Events with the Entity within the given Context.
 func SerializeEventsWithContext(events []Event, eventContext *Context, metadata Metadata) ([]SerializedEvent, error) {
 	if eventContext == nil {
 		return nil, fmt.Errorf("context not found")
@@ -108,7 +145,7 @@ func SerializeResult(
 	}, nil
 }
 
-// DeserializeEvent decodes Events with the Entity within the given Context, applying upcasters
+// DeserializeEvent decodes Events with the Entity within the given Context, applying upcasters.
 func DeserializeEvent(serializedEvent SerializedEvent, entity Entity) (Event, error) {
 	event := serializedEvent
 
@@ -144,7 +181,7 @@ func DeserializeEvent(serializedEvent SerializedEvent, entity Entity) (Event, er
 }
 
 // CalculateAdditionalEvents calculates the number of additional events that can be applied
-// after the next snapshot is taken
+// after the next snapshot is taken.
 func CalculateAdditionalEvents(currentSequence EventSequence, numEvents int, maxSize int) int {
 	nextSnapshotAt := maxSize - (int(currentSequence) % maxSize)
 	if numEvents < nextSnapshotAt {
@@ -155,4 +192,31 @@ func CalculateAdditionalEvents(currentSequence EventSequence, numEvents int, max
 	eventsAfterNextSnapshotToApply := eventsAfterNextSnapshot - (eventsAfterNextSnapshot & maxSize)
 
 	return nextSnapshotAt + eventsAfterNextSnapshotToApply
+}
+
+// ByCommandID allows you to sort SerializedEvents by the CommandID in the Metadata, falling back to
+// sorting by EntityID if the CommandID is empty.
+type ByCommandID []SerializedEvent
+
+// Len returns the length of the slice.
+func (events ByCommandID) Len() int {
+	return len(events)
+}
+
+// Swap swaps the elements with indexes i and j.
+func (events ByCommandID) Swap(i, j int) {
+	events[i], events[j] = events[j], events[i]
+}
+
+// Less reports whether the element with index i should sort before the element with index j.
+func (events ByCommandID) Less(i, j int) bool {
+	// Try to see if both have CommandIDs
+	if cmd := events[i].Metadata.CommandID; cmd != nil {
+		if otherCmd := events[j].Metadata.CommandID; otherCmd != nil {
+			return *cmd < *otherCmd
+		}
+	}
+
+	// Fall back to the EntityIDs
+	return events[i].ID < events[j].ID
 }
