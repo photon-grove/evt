@@ -31,5 +31,5 @@ Release Please runs on every push to `main`, maintaining a release pull request
 with the next version and changelog. It can also be triggered manually via
 `workflow_dispatch`. Creating that pull request relies on the organization
 setting that allows GitHub Actions to create pull requests; if that is ever
-disabled again, point the workflow at a bot or PAT secret with
-`pull-requests: write` instead.
+disabled again, supply a bot or PAT token via a secret (with permission to open
+pull requests) and pass it to the action instead.
