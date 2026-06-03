@@ -63,7 +63,7 @@ func TestHandleDynamoDBEvent_Success(t *testing.T) {
 	pub := &stubPublisher{result: &stream.PublishResult{}}
 	budget := &stubBudget{}
 
-	resp, err := publishers.HandleDynamoDBEvent(context.Background(), newInsertEvent("evt-1"), pub, budget, nil)
+	resp, err := publishers.HandleDynamoDBEvent(context.Background(), newInsertEvent("evt-1"), pub, budget)
 	require.NoError(t, err)
 	require.Len(t, resp.BatchItemFailures, 0)
 	require.Equal(t, 1, pub.calls)

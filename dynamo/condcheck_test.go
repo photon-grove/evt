@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,6 +51,28 @@ func Test_handleConditionalCheckFailure_RaceCondition(t *testing.T) {
 	// but we have no transaction groups, so it's a race condition
 	result := repo.handleConditionalCheckFailure(ctx, nil, nil, conditionalErr)
 	require.ErrorIs(t, result, ErrSnapshotRaceCondition)
+
+	var classified *policy.ClassifiedError
+	require.ErrorAs(t, result, &classified)
+	require.Equal(t, policy.ClassTransient, classified.Class)
+}
+
+func Test_handleConditionalCheckFailure_ClassifiesTransientTransactionConflict(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	transactionErr := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("TransactionConflict")},
+		},
+	}
+
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, transactionErr)
+	require.ErrorIs(t, result, transactionErr)
+
+	var classified *policy.ClassifiedError
+	require.ErrorAs(t, result, &classified)
+	require.Equal(t, policy.ClassTransient, classified.Class)
 }
 
 func Test_handleConditionalCheckFailure_TransactionGroupHandlesError(t *testing.T) {
@@ -134,8 +157,11 @@ func Test_handleConditionalCheckFailure_FailureBeyondTransactionGroups(t *testin
 	}
 
 	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
-	// The failure is past the transaction groups so original error is returned
-	require.Equal(t, conditionalErr, result)
+	require.ErrorIs(t, result, conditionalErr)
+
+	var classified *policy.ClassifiedError
+	require.ErrorAs(t, result, &classified)
+	require.Equal(t, policy.ClassTransient, classified.Class)
 }
 
 func Test_handleConditionalCheckFailure_IndexCalculation(t *testing.T) {

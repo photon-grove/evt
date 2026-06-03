@@ -22,8 +22,12 @@ func HandleDynamoDBEvent(
 	event events.DynamoDBEvent,
 	publisher StreamPublisher,
 	budget BudgetController,
-	logger *slog.Logger,
+	loggers ...*slog.Logger,
 ) (events.DynamoDBEventResponse, error) {
+	var logger *slog.Logger
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}

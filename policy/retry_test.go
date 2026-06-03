@@ -43,6 +43,33 @@ func TestExecute_RetriesTransientThenSucceeds(t *testing.T) {
 	}
 }
 
+func TestExecute_DefaultConfigRetriesClassifiedTransient(t *testing.T) {
+	calls := 0
+	transient := errors.New("transient")
+	cfg := DefaultConfig()
+	cfg.Sleep = func(context.Context, time.Duration) error { return nil }
+
+	err := Execute(
+		context.Background(),
+		cfg,
+		func() error {
+			calls++
+			if calls < 2 {
+				return &ClassifiedError{Class: ClassTransient, Err: transient}
+			}
+
+			return nil
+		},
+		Hooks{},
+	)
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+}
+
 func TestExecute_GiveUpOnPermanent(t *testing.T) {
 	calls := 0
 	giveUps := 0

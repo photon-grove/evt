@@ -13,7 +13,11 @@ type DynamoDBHandler struct {
 }
 
 // NewDynamoDBHandler creates a new DynamoDB handler.
-func NewDynamoDBHandler(logger *slog.Logger) *DynamoDBHandler {
+func NewDynamoDBHandler(loggers ...*slog.Logger) *DynamoDBHandler {
+	var logger *slog.Logger
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
