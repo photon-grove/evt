@@ -103,3 +103,8 @@ serialization and DynamoDB schema guarantees.
 ## License
 
 Apache-2.0. See [`LICENSE`](LICENSE).
+
+---
+
+Built with care by [Photon Grove](https://photon-grove.com) — a Colorado
+software studio.

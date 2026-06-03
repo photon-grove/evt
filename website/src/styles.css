@@ -266,6 +266,25 @@ h3 {
   grid-template-columns: minmax(0, 0.9fr) minmax(320px, 0.65fr);
 }
 
+.site-footer {
+  background: var(--paper);
+  border-top: 1px solid var(--line);
+  padding: clamp(28px, 4vw, 44px) clamp(20px, 5vw, 72px);
+  text-align: center;
+}
+
+.attribution {
+  color: var(--muted);
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.attribution a {
+  border-bottom: 1px solid currentColor;
+  color: var(--teal);
+  font-weight: 640;
+}
+
 .steps {
   counter-reset: step;
   display: grid;
