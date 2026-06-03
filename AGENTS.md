@@ -126,6 +126,35 @@
 - Use `gh` for GitHub operations when needed.
 - PR descriptions should be concise Markdown, start with `## Summary`, and include verification
   notes when manual evidence or non-obvious test selection matters.
+- An automatic PR review agent reviews every PR and posts findings as inline review threads; treat
+  them like any reviewer's — reply, then resolve before merge. The reviewer is configured outside the
+  repo (provider settings), so keep guidance here agent-agnostic. What it flags is tuned by the
+  `## Review guidelines` section below.
+
+## Review guidelines
+
+These instructions steer the automatic PR review agent (and apply to the closest `AGENTS.md` to each
+changed file). Severities: **P0** = must fix before merge; **P1** = should fix; otherwise a nit.
+
+- Focus on correctness over style; reserve **P0** for changes that break behavior or corrupt stored
+  data. Style, naming, and refactor suggestions are nits at most.
+- **P0** — flag mutable state (decisions, external signals, publish flags, accept/reject verdicts,
+  review state) persisted directly to a view/projection table with no backing event; projections
+  must stay safe to wipe and rebuild by replay.
+- **P0** — flag changes to the DynamoDB event-log `pk`/`sk`, inline snapshot, metadata, or
+  serialized-event formats that aren't intentional and documented, and table scans outside an
+  explicit migration/rebuild/diagnostic flow.
+- **P0** — flag event-JSON changes that lack a matching upcaster + fixture coverage keeping older
+  stored events readable.
+- **P1** — flag new behavior without test coverage, and documentation a change makes stale
+  (especially `README.md`, `BEHAVIORAL_INVARIANTS.md`, and `docs/`).
+- **P1** — flag accidental breaks to existing exported package contracts.
+- Do not report issues in generated code or lockfiles, and do not re-flag anything CI already
+  enforces (`go vet`, formatting/lint, `go mod tidy`). This is a public repo: also flag any private
+  repo names, hostnames, account IDs, credentials, or non-public details that slip into docs,
+  examples, or fixtures (see the Public-Safety Checklist).
+- Keep reviews actionable: cap nits at roughly five and summarize the rest as a count. On re-review,
+  prefer P0/P1 and suppress new nits.
 
 ## Public-Safety Checklist
 
