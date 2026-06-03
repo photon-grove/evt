@@ -82,6 +82,8 @@ func HandleDynamoDBEvent(
 					"itemIdentifier", identifier,
 					"error", err,
 				)
+
+				continue
 			}
 
 			response.BatchItemFailures = append(response.BatchItemFailures, events.DynamoDBBatchItemFailure{

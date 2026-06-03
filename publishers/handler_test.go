@@ -91,6 +91,16 @@ func TestHandleDynamoDBEvent_FailureReturnsBatchItemFailure(t *testing.T) {
 	require.Equal(t, 1, pub.calls)
 }
 
+func TestHandleDynamoDBEvent_RetryBudgetDropSuppressesRetry(t *testing.T) {
+	pub := &stubPublisher{err: errors.New("publish failed")}
+	budget := &stubBudget{retryDecision: publishers.DecisionDrop}
+
+	resp, err := publishers.HandleDynamoDBEvent(context.Background(), newInsertEvent("evt-1"), pub, budget)
+	require.NoError(t, err)
+	require.Empty(t, resp.BatchItemFailures)
+	require.Equal(t, 1, pub.calls)
+}
+
 func TestHandleDynamoDBEvent_FailedIndicesReturnBatchItemFailure(t *testing.T) {
 	pub := &stubPublisher{
 		result: &stream.PublishResult{
