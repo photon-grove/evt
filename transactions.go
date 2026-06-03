@@ -31,14 +31,7 @@ func Merge(group, with TransactionGroup) (TransactionGroup, error) {
 // MergeTransactionGroups takes two TransactionGroups to merge together, and returns a new TransactionGroup that
 // contains the operations from both TransactionGroups (or either, if one is nil)
 func MergeTransactionGroups(group, with TransactionGroup) (TransactionGroup, error) {
-	if group == nil {
-		return with, nil
-	}
-	if with == nil {
-		return group, nil
-	}
-
-	return group.Merge(with)
+	return Merge(group, with)
 }
 
 // MergeTransactions takes two Transactions to merge together, and returns a new Transaction that

@@ -49,7 +49,10 @@ type UpcastError struct {
 
 // NewUpcastError creates a new UpcastError instance.
 func NewUpcastError(err error, serializedEvent SerializedEvent) *UpcastError {
-	return &UpcastError{err, serializedEvent}
+	return &UpcastError{
+		Err:             err,
+		SerializedEvent: serializedEvent,
+	}
 }
 
 // Error returns the wrapped error message.
@@ -195,7 +198,7 @@ func CalculateAdditionalEvents(currentSequence EventSequence, numEvents int, max
 }
 
 // ByCommandID allows you to sort SerializedEvents by the CommandID in the Metadata, falling back to
-// sorting by EntityID if the CommandID is empty.
+// sorting by event ID if the CommandID is empty.
 type ByCommandID []SerializedEvent
 
 // Len returns the length of the slice.
@@ -217,6 +220,6 @@ func (events ByCommandID) Less(i, j int) bool {
 		}
 	}
 
-	// Fall back to the EntityIDs
+	// Fall back to the event IDs.
 	return events[i].ID < events[j].ID
 }
