@@ -3,6 +3,7 @@ import {DiagramViewer} from '@photon-grove/react-flow-diagrams'
 import {EventGarden, ToolkitShelf} from './ClipArt'
 import {capabilities, cookbook, examples, gettingStarted} from './content'
 import {diagrams} from './diagrams'
+import {photonGroveUrl} from './siteConfig'
 
 export function App() {
   return (
@@ -107,6 +108,13 @@ export function App() {
           ))}
         </div>
       </section>
+
+      <footer className="site-footer">
+        <p className="attribution">
+          Built with care by{' '}
+          <a href={photonGroveUrl}>Photon Grove</a> — a Colorado software studio.
+        </p>
+      </footer>
     </main>
   )
 }
