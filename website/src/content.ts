@@ -73,7 +73,7 @@ export const examples = [
   },
   {
     title: 'Docs build',
-    command: 'moon run docs:build',
+    command: 'moon run website:build',
     body: 'Builds this site and validates the interactive architecture diagrams compile.',
   },
 ]

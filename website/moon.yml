@@ -4,8 +4,8 @@ language: typescript
 stack: frontend
 layer: application
 project:
-  name: docs
-  description: Documentation site for evt.
+  name: website
+  description: Documentation and diagrams website for evt.
 tasks:
   build:
     command: pnpm

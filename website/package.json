@@ -1,5 +1,5 @@
 {
-  "name": "@photon-grove/evt-docs",
+  "name": "@photon-grove/evt-website",
   "private": true,
   "type": "module",
   "scripts": {

@@ -1,5 +1,7 @@
 # evt
 
+[Documentation site](https://photon-grove.github.io/evt/)
+
 `evt` is a Go event-sourcing framework for systems that want immutable domain
 events, DynamoDB-backed persistence, deterministic read models, and practical
 operational tooling without a large application framework.
@@ -81,12 +83,12 @@ The docs site includes architecture diagrams, examples, and an integration
 cookbook:
 
 ```sh
-moon run docs:dev
-moon run docs:build
+moon run website:dev
+moon run website:build
 ```
 
 Static docs live in [`docs/`](docs/), and the interactive site lives in
-[`apps/docs/`](apps/docs/).
+[`website/`](website/).
 
 ## Operational Invariants
 

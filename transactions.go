@@ -16,9 +16,8 @@ type TransactionGroup interface {
 	HandleError(error, int) error
 }
 
-// MergeTransactionGroups takes two TransactionGroups to merge together, and returns a new TransactionGroup that
-// contains the operations from both TransactionGroups (or either, if one is nil)
-func MergeTransactionGroups(group, with TransactionGroup) (TransactionGroup, error) {
+// Merge combines two TransactionGroups into one, gracefully handling nil values.
+func Merge(group, with TransactionGroup) (TransactionGroup, error) {
 	if group == nil {
 		return with, nil
 	}
@@ -27,6 +26,12 @@ func MergeTransactionGroups(group, with TransactionGroup) (TransactionGroup, err
 	}
 
 	return group.Merge(with)
+}
+
+// MergeTransactionGroups takes two TransactionGroups to merge together, and returns a new TransactionGroup that
+// contains the operations from both TransactionGroups (or either, if one is nil)
+func MergeTransactionGroups(group, with TransactionGroup) (TransactionGroup, error) {
+	return Merge(group, with)
 }
 
 // MergeTransactions takes two Transactions to merge together, and returns a new Transaction that
