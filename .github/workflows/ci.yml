@@ -56,7 +56,7 @@ jobs:
 
       - name: Moon checks
         run: |
-          pnpm exec moon run evt:check evt:test docs:typecheck docs:build react-flow-diagrams:test
+          pnpm exec moon run evt:check evt:test website:typecheck website:build react-flow-diagrams:test
 
   integration:
     name: DynamoDB integration

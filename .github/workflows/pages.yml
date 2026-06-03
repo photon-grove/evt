@@ -31,11 +31,11 @@ jobs:
           node-version: 24.5
 
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec moon run docs:build
+      - run: pnpm exec moon run website:build
 
       - uses: actions/upload-pages-artifact@v4
         with:
-          path: apps/docs/dist
+          path: website/dist
 
   deploy:
     environment:

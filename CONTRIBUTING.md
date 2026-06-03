@@ -5,7 +5,7 @@
 ```sh
 pnpm install
 go test ./...
-moon run docs:build
+moon run website:build
 ```
 
 For DynamoDB integration:
