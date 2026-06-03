@@ -18,14 +18,13 @@ private application environment details.
 | `github.com/photon-grove/evt/mem` | In-memory repository and store for unit tests |
 | `github.com/photon-grove/evt/dynamo` | DynamoDB event log, snapshots, views, stream helpers, and transaction groups |
 | `github.com/photon-grove/evt/snapshots` | Store implementation with snapshot loading and snapshot write thresholds |
+| `github.com/photon-grove/evt/stream` | Stream handler and publisher helpers for event fanout |
 | `github.com/photon-grove/evt/projectors` | DynamoDB Streams Lambda projector runtime with idempotency and retry classification |
 | `github.com/photon-grove/evt/publishers` | DynamoDB Streams publisher handler with ingress and retry budgets |
+| `github.com/photon-grove/evt/policy` | Backend-neutral retry helpers for commit paths |
+| `github.com/photon-grove/evt/policy/dynamodb` | DynamoDB-specific retry classification |
 | `github.com/photon-grove/evt/viewstore` | Typed JSON helper around `evt.ViewRepository` |
 | `github.com/photon-grove/evt/test` | Test aggregate, commands, events, and helpers for adopters and framework tests |
-
-Support packages such as `result`, `logging`, `awsclients`, `stream`, `address`,
-and `ingressbudget` are included because they appear in exported framework
-interfaces or adjacent stream tooling.
 
 ## Install
 

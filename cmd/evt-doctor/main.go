@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/photon-grove/evt/awsclients"
 )
 
 type tableSpec struct {
@@ -24,7 +26,7 @@ type tableSpec struct {
 func main() {
 	var (
 		region      = flag.String("region", envOr("AWS_REGION", "us-west-2"), "AWS region")
-		endpoint    = flag.String("endpoint", awsclients.ResolveLocalEndpoint(), "AWS emulator endpoint")
+		endpoint    = flag.String("endpoint", resolveLocalEndpoint(), "AWS emulator endpoint")
 		eventsTable = flag.String("events-table", "evt-local-event-log", "event-log table name")
 		viewsTable  = flag.String("views-table", "evt-local-entity-views", "entity-views table name")
 		printSchema = flag.Bool("schema", false, "print required DynamoDB table schema and exit")
@@ -40,7 +42,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	cfg, err := awsclients.NewConfig(ctx, *region, *endpoint)
+	cfg, err := newAWSConfig(ctx, *region, *endpoint)
 	if err != nil {
 		exitf("load AWS config: %v", err)
 	}
@@ -65,6 +67,44 @@ func envOr(name, fallback string) string {
 	}
 
 	return fallback
+}
+
+func resolveLocalEndpoint() string {
+	if endpoint := os.Getenv("AWS_ENDPOINT_URL"); endpoint != "" {
+		return endpoint
+	}
+
+	return os.Getenv("LOCALSTACK_ENDPOINT")
+}
+
+func newAWSConfig(ctx context.Context, region, localEndpoint string) (*aws.Config, error) {
+	if localEndpoint == "" {
+		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+		if err != nil {
+			return nil, err
+		}
+
+		return &cfg, nil
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithRetryMaxAttempts(1),
+		config.WithCredentialsProvider(credentials.StaticCredentialsProvider{
+			Value: aws.Credentials{
+				AccessKeyID:     "test",
+				SecretAccessKey: "test",
+				SessionToken:    "test",
+				Source:          "local emulator credentials",
+			},
+		}),
+		config.WithBaseEndpoint(localEndpoint),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
 }
 
 func requiredSchema(eventsTable, viewsTable string) []tableSpec {

@@ -1,14 +1,13 @@
-package awsclients
+package dynamo
 
 import (
 	"context"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 )
 
-// Dynamo is an interface wrapping the DynamoDB client so that it can be easily mocked for testing
-type Dynamo interface {
+// Client is the subset of DynamoDB operations used by evt's DynamoDB backend.
+type Client interface {
 	TransactWriteItems(
 		ctx context.Context,
 		params *dynamodb.TransactWriteItemsInput,
@@ -68,11 +67,4 @@ type Dynamo interface {
 		params *dynamodb.ExportTableToPointInTimeInput,
 		options ...func(*dynamodb.Options),
 	) (*dynamodb.ExportTableToPointInTimeOutput, error)
-}
-
-// NewDynamoDBClient creates a new DynamoDB client
-func NewDynamoDBClient(cfg *aws.Config, optsCallback ...func(*dynamodb.Options)) (Dynamo, error) {
-	client := dynamodb.NewFromConfig(*cfg, optsCallback...)
-
-	return client, nil
 }

@@ -5,13 +5,12 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/photon-grove/evt/dynamo"
 )
 
 func TestExecute_RetriesTransientThenSucceeds(t *testing.T) {
 	calls := 0
 	retries := 0
+	transient := errors.New("transient")
 
 	err := Execute(
 		context.Background(),
@@ -25,7 +24,7 @@ func TestExecute_RetriesTransientThenSucceeds(t *testing.T) {
 		func() error {
 			calls++
 			if calls < 3 {
-				return dynamo.ErrSnapshotRaceCondition
+				return &ClassifiedError{Class: ClassTransient, Err: transient}
 			}
 			return nil
 		},
@@ -75,6 +74,8 @@ func TestExecute_GiveUpOnPermanent(t *testing.T) {
 }
 
 func TestExecute_ReturnsClassifiedErrorOnGiveUp(t *testing.T) {
+	transient := errors.New("transient")
+
 	err := Execute(
 		context.Background(),
 		Config{
@@ -83,7 +84,7 @@ func TestExecute_ReturnsClassifiedErrorOnGiveUp(t *testing.T) {
 			Sleep:       func(context.Context, time.Duration) error { return nil },
 		},
 		func() error {
-			return dynamo.ErrSnapshotRaceCondition
+			return &ClassifiedError{Class: ClassTransient, Err: transient}
 		},
 		Hooks{},
 	)
@@ -98,8 +99,8 @@ func TestExecute_ReturnsClassifiedErrorOnGiveUp(t *testing.T) {
 	if ce.Class != ClassTransient {
 		t.Fatalf("expected transient class, got %s", ce.Class)
 	}
-	if !errors.Is(ce.Err, dynamo.ErrSnapshotRaceCondition) {
-		t.Fatalf("expected snapshot race condition, got %v", ce.Err)
+	if !errors.Is(ce.Err, transient) {
+		t.Fatalf("expected transient error, got %v", ce.Err)
 	}
 }
 

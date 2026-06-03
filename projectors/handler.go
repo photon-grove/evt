@@ -6,7 +6,6 @@ import (
 	"strconv"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/photon-grove/evt/logging"
 )
 
 // DynamoDBStreamResponse is the Lambda response for DynamoDB Streams event
@@ -19,7 +18,7 @@ type DynamoDBStreamResponse struct {
 // processes DynamoDB Streams events through the provided Runtime.
 func NewLambdaHandler(runtime *Runtime) func(ctx context.Context, event events.DynamoDBEvent) (DynamoDBStreamResponse, error) {
 	return func(ctx context.Context, event events.DynamoDBEvent) (DynamoDBStreamResponse, error) {
-		logger := logging.GetLogger(ctx)
+		logger := runtime.Logger()
 		logger.Info("Received DynamoDB stream event", "recordCount", len(event.Records))
 
 		records := make([]StreamRecord, 0, len(event.Records))

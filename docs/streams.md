@@ -10,7 +10,7 @@ The projector runtime adds:
 - idempotency checks by projector name and event ID
 - retry classification
 - partial-batch failure responses
-- structured logging context
+- structured logging with caller-provided `*slog.Logger` values
 
 ## Publishers
 

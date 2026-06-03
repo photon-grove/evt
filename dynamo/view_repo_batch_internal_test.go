@@ -9,7 +9,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/awsclients"
 	dynamock "github.com/photon-grove/evt/dynamo/mock"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -17,7 +16,7 @@ import (
 
 const testViewsTable = "views"
 
-func newBatchTestRepo(client awsclients.Dynamo) *ViewRepository {
+func newBatchTestRepo(client Client) *ViewRepository {
 	return &ViewRepository{
 		ViewsTable: testViewsTable,
 		client:     client,

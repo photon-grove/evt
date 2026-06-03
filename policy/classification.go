@@ -3,9 +3,6 @@ package policy
 
 import (
 	stderrors "errors"
-
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/photon-grove/evt/dynamo"
 )
 
 // Class identifies whether an error should be retried.
@@ -20,50 +17,22 @@ const (
 	ClassPermanent Class = "permanent"
 )
 
-// Classify maps known errors into transient/permanent classes.
+// Classifier maps an error into a retry/failure class.
+type Classifier func(error) Class
+
+// Classify maps errors already wrapped with ClassifiedError into their stored
+// class. Backend-specific packages can provide richer classifiers.
 func Classify(err error) Class {
 	if err == nil {
 		return ClassUnknown
 	}
 
-	if stderrors.Is(err, dynamo.ErrSnapshotRaceCondition) {
-		return ClassTransient
-	}
-
-	var canceled *types.TransactionCanceledException
-	if stderrors.As(err, &canceled) {
-		if isAnyCancellationCode(canceled, map[string]struct{}{
-			"ConditionalCheckFailed":        {},
-			"TransactionConflict":           {},
-			"ProvisionedThroughputExceeded": {},
-			"ThrottlingError":               {},
-		}) {
-			return ClassTransient
-		}
-		if isAnyCancellationCode(canceled, map[string]struct{}{
-			"ValidationError": {},
-			"AccessDenied":    {},
-		}) {
-			return ClassPermanent
-		}
+	var classified *ClassifiedError
+	if stderrors.As(err, &classified) {
+		return classified.Class
 	}
 
 	return ClassUnknown
-}
-
-func isAnyCancellationCode(err *types.TransactionCanceledException, set map[string]struct{}) bool {
-	if err == nil {
-		return false
-	}
-	for _, reason := range err.CancellationReasons {
-		if reason.Code == nil {
-			continue
-		}
-		if _, ok := set[*reason.Code]; ok {
-			return true
-		}
-	}
-	return false
 }
 
 // IsTransient reports whether an error should be retried.

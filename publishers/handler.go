@@ -2,23 +2,16 @@ package publishers
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/photon-grove/evt/ingressbudget"
-	"github.com/photon-grove/evt/logging"
 	"github.com/photon-grove/evt/stream"
 )
 
 // StreamPublisher publishes DynamoDB stream records to a downstream stream.
 type StreamPublisher interface {
 	Publish(ctx context.Context, records []events.DynamoDBEventRecord) (*stream.PublishResult, error)
-}
-
-// BudgetController exposes ingress and retry budget checks.
-type BudgetController interface {
-	AllowEvent(now time.Time) ingressbudget.Decision
-	AllowRetry(now time.Time) ingressbudget.Decision
 }
 
 // HandleDynamoDBEvent publishes INSERT records from DynamoDB Streams to a
@@ -29,8 +22,15 @@ func HandleDynamoDBEvent(
 	event events.DynamoDBEvent,
 	publisher StreamPublisher,
 	budget BudgetController,
+	logger *slog.Logger,
 ) (events.DynamoDBEventResponse, error) {
-	logger := logging.GetLogger(ctx)
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if budget == nil {
+		budget = NewBudgetController(0, 0, time.Now().UTC())
+	}
+
 	response := events.DynamoDBEventResponse{
 		BatchItemFailures: []events.DynamoDBBatchItemFailure{},
 	}
@@ -57,7 +57,7 @@ func HandleDynamoDBEvent(
 			continue
 		}
 
-		if budget.AllowEvent(time.Now().UTC()) == ingressbudget.DecisionDrop {
+		if budget.AllowEvent(time.Now().UTC()) == DecisionDrop {
 			throttledEventCount++
 			response.BatchItemFailures = append(response.BatchItemFailures, events.DynamoDBBatchItemFailure{
 				ItemIdentifier: identifier,
@@ -71,7 +71,7 @@ func HandleDynamoDBEvent(
 
 		result, err := publisher.Publish(ctx, []events.DynamoDBEventRecord{record})
 		if err != nil || (result != nil && len(result.FailedIndices) > 0) {
-			if budget.AllowRetry(time.Now().UTC()) == ingressbudget.DecisionDrop {
+			if budget.AllowRetry(time.Now().UTC()) == DecisionDrop {
 				throttledRetryCount++
 				logger.Warn("Retry budget dropped failed publish record",
 					"index", i,

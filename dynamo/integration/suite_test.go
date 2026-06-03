@@ -8,9 +8,11 @@ import (
 	"os"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/awsclients"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/snapshots"
 	"github.com/photon-grove/evt/test"
@@ -45,12 +47,12 @@ func (s *DynamoEventsIntegrationSuite) SetupSuite() {
 	}
 	s.awsRegion = awsRegion
 
-	endpoint := awsclients.ResolveLocalEndpoint()
+	endpoint := resolveLocalEndpoint()
 	if endpoint == "" {
 		endpoint = "http://localhost:4566"
 	}
 
-	awsCfg, err := awsclients.NewConfig(ctx, awsRegion, endpoint)
+	awsCfg, err := newAWSConfig(ctx, awsRegion, endpoint)
 	require.NoError(s.T(), err)
 	client := dynamodb.NewFromConfig(*awsCfg)
 
@@ -81,4 +83,42 @@ func (s *DynamoEventsIntegrationSuite) getMetadata(ctx context.Context) evt.Meta
 		&s.awsRegion,
 		evt.WithOrigin(evt.Origin{Source: "testing", Endpoint: "Testing"}),
 	)
+}
+
+func resolveLocalEndpoint() string {
+	if endpoint := os.Getenv("AWS_ENDPOINT_URL"); endpoint != "" {
+		return endpoint
+	}
+
+	return os.Getenv("LOCALSTACK_ENDPOINT")
+}
+
+func newAWSConfig(ctx context.Context, region, localEndpoint string) (*aws.Config, error) {
+	if localEndpoint == "" {
+		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+		if err != nil {
+			return nil, err
+		}
+
+		return &cfg, nil
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithRetryMaxAttempts(1),
+		config.WithCredentialsProvider(credentials.StaticCredentialsProvider{
+			Value: aws.Credentials{
+				AccessKeyID:     "test",
+				SecretAccessKey: "test",
+				SessionToken:    "test",
+				Source:          "local emulator credentials",
+			},
+		}),
+		config.WithBaseEndpoint(localEndpoint),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
 }
