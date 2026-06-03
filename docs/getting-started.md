@@ -17,6 +17,8 @@ the same `evt.Store` interface as production without requiring DynamoDB.
 
 `evt.Metadata` carries optional command ID, trace context, origin, address,
 region, and timestamp. A stable command ID is the practical path to safe retries.
+Use `evt.WithAddress(address)` when caller-owned request parsing should record a
+client address.
 
 ## 4. Move to DynamoDB
 

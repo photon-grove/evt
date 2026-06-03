@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"time"
-
-	"github.com/photon-grove/evt/logging"
 )
 
 // Projector processes events from a DynamoDB Stream and maintains read models.
@@ -51,6 +49,10 @@ type Runtime struct {
 // NewRuntime creates a Runtime that decorates the given projector with the
 // provided idempotency guard and logger.
 func NewRuntime(projector Projector, idempotency IdempotencyGuard, logger *slog.Logger) *Runtime {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &Runtime{
 		projector:   projector,
 		idempotency: idempotency,
@@ -58,12 +60,19 @@ func NewRuntime(projector Projector, idempotency IdempotencyGuard, logger *slog.
 	}
 }
 
+func (r *Runtime) Logger() *slog.Logger {
+	if r == nil || r.logger == nil {
+		return slog.Default()
+	}
+
+	return r.logger
+}
+
 // Process runs the projector over the given records, skipping already-processed
 // events (idempotency) and classifying errors for retry vs DLQ routing.
 // It returns partial batch failures for records that should be retried.
 func (r *Runtime) Process(ctx context.Context, records []StreamRecord) ([]BatchItemFailure, error) {
-	ctx = logging.WithLogger(ctx, r.logger.With("projector", r.projector.Name()))
-	logger := logging.GetLogger(ctx)
+	logger := r.Logger().With("projector", r.projector.Name())
 
 	logger.Info("Processing batch", "recordCount", len(records))
 

@@ -8,7 +8,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/logging"
 	"github.com/photon-grove/evt/result"
 )
 
@@ -39,7 +38,7 @@ func (repo *Repository) StreamEntities(
 	expr *expression.Expression,
 	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
 ) <-chan result.Result[evt.Entity] {
-	logger := logging.GetLogger(ctx)
+	logger := repo.loggerOrDefault()
 
 	results := make(chan result.Result[evt.Entity])
 
@@ -90,7 +89,7 @@ func (repo *Repository) StreamEntities(
 					With("entity_type", event.EntityType).
 					With("event_type", event.Type)
 
-				entity, err = applyEvent(logging.WithLogger(ctx, evtLogger), event, entity)
+				entity, err = applyEvent(ctx, event, entity)
 				if err != nil {
 					evtLogger.Error("Error during applyEvent", "error", err.Error())
 

@@ -29,9 +29,10 @@ func (repo *Repository) handleConditionalCheckFailure(
 				}
 				offset += group.Len()
 			}
-			return err
+			return wrapClassifiedError(err)
 		}
-		return ErrSnapshotRaceCondition
+		return wrapClassifiedError(ErrSnapshotRaceCondition)
 	}
-	return err
+
+	return wrapClassifiedError(err)
 }

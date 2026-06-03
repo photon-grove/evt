@@ -156,22 +156,25 @@ func Test_Metadata_WithTrace(t *testing.T) {
 }
 
 func Test_Metadata_WithAddress(t *testing.T) {
-	// Test with context that has address (using context.WithValue to simulate)
-	type addrKey struct{}
-	ctxWithAddr := context.WithValue(context.Background(), addrKey{}, "192.168.1.1")
+	ctx := context.Background()
 	region := "us-east-1"
 
-	metadata := NewMetadata(ctxWithAddr, &region)
+	metadata := NewMetadata(ctx, &region, WithAddress("203.0.113.1"))
 
-	// The metadata should not have address since address.Get won't find our fake context key
-	// This is expected behavior - we're testing the absence of address in normal context
+	require.NotNil(t, metadata.Address)
+	require.Equal(t, "203.0.113.1", *metadata.Address)
+}
+
+func Test_Metadata_WithAddressEmptyClearsAddress(t *testing.T) {
+	ctx := context.Background()
+	region := "us-east-1"
+
+	metadata := NewMetadata(ctx, &region,
+		WithAddress("203.0.113.1"),
+		WithAddress(""),
+	)
+
 	require.Nil(t, metadata.Address)
-
-	// Test with context without any special values
-	ctxWithoutAddr := context.Background()
-
-	metadata2 := NewMetadata(ctxWithoutAddr, &region)
-	require.Nil(t, metadata2.Address)
 }
 
 func Test_Metadata_MultipleOptions(t *testing.T) {
@@ -184,6 +187,7 @@ func Test_Metadata_MultipleOptions(t *testing.T) {
 		WithCommandID(cmdID),
 		WithOrigin(origin),
 		WithTrace(ctx),
+		WithAddress("203.0.113.2"),
 	)
 
 	// Verify all fields are set
@@ -193,8 +197,8 @@ func Test_Metadata_MultipleOptions(t *testing.T) {
 	require.NotNil(t, metadata.Origin)
 	require.Equal(t, origin, *metadata.Origin)
 	require.NotNil(t, metadata.Trace)
-	// Address will be nil without proper HTTP context
-	require.Nil(t, metadata.Address)
+	require.NotNil(t, metadata.Address)
+	require.Equal(t, "203.0.113.2", *metadata.Address)
 	require.NotEmpty(t, metadata.Timestamp)
 }
 
@@ -311,7 +315,6 @@ func Test_Metadata_NestedContextValues(t *testing.T) {
 	metadata := NewMetadata(ctxWithValues, &region)
 
 	require.Equal(t, region, metadata.Region)
-	// Address will be nil since we're not using the address package's context properly
 	require.Nil(t, metadata.Address)
 }
 

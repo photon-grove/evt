@@ -13,14 +13,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/awsclients"
 )
 
 // ViewRepository provides Dynamo-backed views.
 type ViewRepository struct {
 	ViewsTable string
 
-	client  awsclients.Dynamo
+	client  Client
 	encoder *attributevalue.Encoder
 	decoder *attributevalue.Decoder
 }
@@ -36,7 +35,7 @@ const maxBatchGetItems = 100
 const maxBatchGetRetries = 3
 
 // NewViewRepository constructs a view repository for the given table.
-func NewViewRepository(client awsclients.Dynamo, viewsTable string) evt.ViewRepository {
+func NewViewRepository(client Client, viewsTable string) evt.ViewRepository {
 	encoder := attributevalue.NewEncoder(func(opts *attributevalue.EncoderOptions) {
 		opts.TagKey = tagKey
 	})
@@ -195,7 +194,7 @@ func (repo *ViewRepository) PutView(ctx context.Context, view *evt.SerializedVie
 		return err
 	}
 
-	// Use BatchWriteItem (PutItem is not in the awsclients Dynamo interface) to persist the view.
+	// Use BatchWriteItem to persist the view through the shared DynamoDB client interface.
 	return repo.writeBatch(ctx, []types.WriteRequest{{PutRequest: &types.PutRequest{Item: item}}})
 }
 

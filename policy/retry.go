@@ -13,7 +13,7 @@ type Attempt struct {
 	Err     error
 }
 
-// Hooks emits retry lifecycle callbacks for telemetry/logging.
+// Hooks emits retry lifecycle callbacks for telemetry.
 type Hooks struct {
 	OnRetry  func(Attempt)
 	OnGiveUp func(Attempt)
@@ -27,6 +27,7 @@ type Config struct {
 	Jitter      func(time.Duration) time.Duration
 	Sleep       func(context.Context, time.Duration) error
 	IsRetryable func(error) bool
+	Classify    Classifier
 }
 
 // Execute runs op with bounded retries using the configured policy.
@@ -37,8 +38,14 @@ func Execute(ctx context.Context, cfg Config, op func() error, hooks Hooks) erro
 	}
 
 	isRetryable := cfg.IsRetryable
+	classify := cfg.Classify
+	if classify == nil {
+		classify = Classify
+	}
 	if isRetryable == nil {
-		isRetryable = IsTransient
+		isRetryable = func(err error) bool {
+			return classify(err) == ClassTransient
+		}
 	}
 
 	sleep := cfg.Sleep
@@ -52,7 +59,7 @@ func Execute(ctx context.Context, cfg Config, op func() error, hooks Hooks) erro
 			return nil
 		}
 
-		class := Classify(err)
+		class := classify(err)
 		if attempt >= maxAttempts || !isRetryable(err) {
 			if hooks.OnGiveUp != nil {
 				hooks.OnGiveUp(Attempt{Attempt: attempt, Class: class, Err: err})

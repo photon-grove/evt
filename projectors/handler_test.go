@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/photon-grove/evt/logging"
 	"github.com/photon-grove/evt/projectors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,7 +20,7 @@ func TestLambdaHandler_ProcessesINSERTRecords(t *testing.T) {
 	rt := newTestRuntime(proj)
 	handler := projectors.NewLambdaHandler(rt)
 
-	ctx := logging.WithLogger(context.Background(), testLogger())
+	ctx := context.Background()
 	event := events.DynamoDBEvent{
 		Records: []events.DynamoDBEventRecord{
 			{
@@ -60,7 +59,7 @@ func TestLambdaHandler_SkipsNonINSERTRecords(t *testing.T) {
 	rt := newTestRuntime(proj)
 	handler := projectors.NewLambdaHandler(rt)
 
-	ctx := logging.WithLogger(context.Background(), testLogger())
+	ctx := context.Background()
 	event := events.DynamoDBEvent{
 		Records: []events.DynamoDBEventRecord{
 			{
@@ -96,7 +95,7 @@ func TestLambdaHandler_ReturnsPartialBatchFailures(t *testing.T) {
 	rt := newTestRuntime(proj)
 	handler := projectors.NewLambdaHandler(rt)
 
-	ctx := logging.WithLogger(context.Background(), testLogger())
+	ctx := context.Background()
 	event := events.DynamoDBEvent{
 		Records: []events.DynamoDBEventRecord{
 			{
@@ -137,7 +136,7 @@ func TestLambdaHandler_SkipsRecordsMissingRequiredFields(t *testing.T) {
 	rt := newTestRuntime(proj)
 	handler := projectors.NewLambdaHandler(rt)
 
-	ctx := logging.WithLogger(context.Background(), testLogger())
+	ctx := context.Background()
 	event := events.DynamoDBEvent{
 		Records: []events.DynamoDBEventRecord{
 			{

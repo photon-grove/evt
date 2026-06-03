@@ -14,7 +14,6 @@ import (
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
-	"github.com/photon-grove/evt/logging"
 )
 
 // GroupIDExtractor maps a serialized domain event to an SNS FIFO
@@ -44,6 +43,7 @@ type SNSPublisher struct {
 	topicARN string
 	source   string
 	fifo     *fifoTarget
+	logger   *slog.Logger
 }
 
 type snsPublishClient interface {
@@ -74,6 +74,15 @@ func WithFIFOTarget(topicARN string, extractor GroupIDExtractor) Option {
 	}
 }
 
+// WithLogger configures the logger used by the publisher. If unset, slog.Default() is used.
+func WithLogger(logger *slog.Logger) Option {
+	return func(p *SNSPublisher) error {
+		p.logger = logger
+
+		return nil
+	}
+}
+
 // NewSNSPublisher creates a new SNS publisher.
 // source is the logical event source (e.g. "example.events").
 func NewSNSPublisher(client snsPublishClient, topicARN string, source string, opts ...Option) (*SNSPublisher, error) {
@@ -98,6 +107,14 @@ func NewSNSPublisher(client snsPublishClient, topicARN string, source string, op
 		}
 	}
 	return pub, nil
+}
+
+func (p *SNSPublisher) loggerOrDefault() *slog.Logger {
+	if p == nil || p.logger == nil {
+		return slog.Default()
+	}
+
+	return p.logger
 }
 
 // PublishResult contains the outcome of publishing a batch of records.
@@ -142,7 +159,7 @@ func (p *SNSPublisher) Publish(ctx context.Context, records []events.DynamoDBEve
 		return result, nil
 	}
 
-	logger := logging.GetLogger(ctx)
+	logger := p.loggerOrDefault()
 	logger.Info("Publishing records to SNS", "count", len(records), "topic", p.topicARN)
 
 	batch := make([]batchEntry, 0, min(len(records), maxBatchSize))

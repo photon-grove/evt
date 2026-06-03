@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/photon-grove/evt/address"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 )
@@ -64,6 +63,21 @@ func WithOrigin(origin Origin) MetadataOption {
 	}
 }
 
+// WithAddress adds the caller-provided address to metadata.
+func WithAddress(address string) MetadataOption {
+	return func(m Metadata) Metadata {
+		if address == "" {
+			m.Address = nil
+
+			return m
+		}
+
+		m.Address = &address
+
+		return m
+	}
+}
+
 // NewMetadata initializes a Metadata k-v store
 func NewMetadata(ctx context.Context, region *string, opts ...MetadataOption) Metadata {
 	m := Metadata{}
@@ -72,9 +86,6 @@ func NewMetadata(ctx context.Context, region *string, opts ...MetadataOption) Me
 	if region != nil {
 		m.Region = *region
 	}
-
-	// Add the end-user's IP address, which should always be in the Metadata if available
-	m.Address = address.Get(ctx)
 
 	// Add a Timestamp in UTC using the RFC3339 format
 	m.Timestamp = time.Now().In(time.UTC).Format(time.RFC3339)

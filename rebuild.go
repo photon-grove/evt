@@ -6,8 +6,6 @@ import (
 	"log/slog"
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
-
-	"github.com/photon-grove/evt/logging"
 )
 
 // RebuildConfig configures a projection rebuild run.
@@ -36,6 +34,9 @@ type RebuildConfig struct {
 	// The processed argument is the count of successfully processed entities so far,
 	// and errors is the cumulative number of errors encountered.
 	OnProgress func(processed, errors int)
+
+	// Logger receives rebuild telemetry. If nil, slog.Default() is used.
+	Logger *slog.Logger
 }
 
 // RebuildResult summarizes a projection rebuild run.
@@ -77,7 +78,10 @@ func RebuildProjections(
 		return nil, fmt.Errorf("CommitGroup is required when DryRun is false")
 	}
 
-	logger := logging.GetLogger(ctx)
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	// Build an optional filter expression for the entity type.
 	var expr *expression.Expression
