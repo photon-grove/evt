@@ -27,6 +27,9 @@ Use neutral example names and local emulator values in docs and tests.
 ## Releases
 
 Published GitHub releases trigger GoReleaser to build `evt-doctor` artifacts.
-Release Please is available as a manual workflow because some organizations
-disable `GITHUB_TOKEN` pull-request creation; wire it to a bot or PAT secret
-before enabling it on every push.
+Release Please runs on every push to `main`, maintaining a release pull request
+with the next version and changelog. It can also be triggered manually via
+`workflow_dispatch`. Creating that pull request relies on the organization
+setting that allows GitHub Actions to create pull requests; if that is ever
+disabled again, point the workflow at a bot or PAT secret with
+`pull-requests: write` instead.
