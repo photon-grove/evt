@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   release-please:
-    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: googleapis/release-please-action@v4
         with:
