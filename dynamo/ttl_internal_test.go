@@ -1,13 +1,17 @@
 package dynamo
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	dynamock "github.com/photon-grove/evt/dynamo/mock"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -105,4 +109,51 @@ func Test_buildSnapshotPutTransactions_StampsTTLForPolicyType(t *testing.T) {
 	got, present := ttlValue(t, snapshot)
 	require.True(t, present, "snapshot of a policy'd type must carry a ttl")
 	require.Equal(t, fixed.Add(7*24*time.Hour).Unix(), got)
+}
+
+func Test_PutSnapshot_StampsTTLForPolicyType(t *testing.T) {
+	fixed := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	client := dynamock.NewClient()
+
+	var captured *dynamodb.PutItemInput
+	client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.PutItemOutput{}, nil).
+		Run(func(args mock.Arguments) {
+			input, ok := args.Get(1).(*dynamodb.PutItemInput)
+			require.True(t, ok)
+			captured = input
+		})
+
+	repo := NewRepository(client, "events").
+		WithRetention(Retention{"transient": 30 * 24 * time.Hour}).
+		WithClock(func() time.Time { return fixed })
+
+	require.NoError(t, repo.PutSnapshot(context.Background(), "transient", "a", []byte(`{}`), 1, 3))
+	require.NotNil(t, captured)
+
+	attr, ok := captured.Item["ttl"].(*types.AttributeValueMemberN)
+	require.True(t, ok, "background snapshot of a policy'd type must carry a ttl")
+	require.Equal(t, strconv.FormatInt(fixed.Add(30*24*time.Hour).Unix(), 10), attr.Value)
+}
+
+func Test_PutSnapshot_NoTTLForUnpolicedType(t *testing.T) {
+	client := dynamock.NewClient()
+
+	var captured *dynamodb.PutItemInput
+	client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.PutItemOutput{}, nil).
+		Run(func(args mock.Arguments) {
+			input, ok := args.Get(1).(*dynamodb.PutItemInput)
+			require.True(t, ok)
+			captured = input
+		})
+
+	repo := NewRepository(client, "events").
+		WithRetention(Retention{"transient": 30 * 24 * time.Hour})
+
+	require.NoError(t, repo.PutSnapshot(context.Background(), "durable", "a", []byte(`{}`), 1, 3))
+	require.NotNil(t, captured)
+
+	_, present := captured.Item["ttl"]
+	require.False(t, present, "un-policed type must not carry a ttl on background snapshot writes")
 }

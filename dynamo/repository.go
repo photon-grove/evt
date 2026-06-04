@@ -25,11 +25,21 @@ type Repository struct {
 
 // Retention maps entity types to how long their committed events (and inline snapshots) are kept
 // before DynamoDB TTL expires them. Only entity types present in this map are ever stamped with a
-// `ttl` attribute; every other row is written without one and is never auto-expired.
+// `ttl` attribute; every other row is written without one and is never auto-expired. The events
+// table must have DynamoDB TTL enabled on the `ttl` attribute for this to take effect.
 //
-// Use this ONLY for transient/process entity types whose events no projection rebuild depends on.
-// Never policy a type whose events a view is reconstructed from by replay — DynamoDB would silently
-// delete history the rebuild needs. The events table must have TTL enabled on the `ttl` attribute.
+// Constraints — policy a type ONLY when BOTH hold:
+//
+//   - No projection rebuild replays its events. Never policy a type whose events a view is
+//     reconstructed from by replay; DynamoDB would silently delete history the rebuild needs.
+//   - Its streams are terminal and short-lived. Each event is stamped with `committedAt + duration`,
+//     and DynamoDB TTL expires items individually — it cannot atomically expire a whole stream. So a
+//     stream that keeps receiving events across a span comparable to the retention duration can have
+//     its older prefix deleted while newer events survive; the read path (GetEvents/GetLatestEvents
+//     query `sk > N`) cannot detect that gap and would replay a partial suffix. Retention is therefore
+//     safe only for streams whose entire lifetime is much shorter than the duration and that are not
+//     appended to after going terminal (e.g. a one-shot job run). For streams that accumulate events
+//     over time, keep a durable snapshot and use compaction (Compactor.CompactBelow) instead.
 type Retention map[evt.EntityType]time.Duration
 
 const tagKey string = "json"

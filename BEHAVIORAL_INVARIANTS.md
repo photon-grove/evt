@@ -50,6 +50,11 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
   never auto-expired. It is a no-op unless the table has DynamoDB TTL enabled on the `ttl` attribute.
   Policy a type **only** when its events are transient and no projection rebuild replays them —
   otherwise DynamoDB would silently delete history a wipe-and-replay depends on.
+- Each event is stamped `committedAt + duration`, and DynamoDB TTL expires items individually, so
+  retention cannot atomically drop a multi-event stream. It is safe only for terminal, short-lived
+  streams (lifetime ≪ duration, no appends after terminal); a stream appended across a span near the
+  duration can lose its older prefix while newer events survive, and `sk > N` reads will not detect
+  the gap. Use compaction (snapshot + `CompactBelow`) for streams that accumulate events over time.
 
 ### Inline Snapshots (sk=0)
 

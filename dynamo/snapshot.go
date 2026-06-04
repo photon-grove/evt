@@ -61,6 +61,9 @@ func (repo *Repository) PutSnapshot(
 		EventSequence: eventSequence,
 		EntityType:    entityType,
 		Payload:       string(payload),
+		// Mirror the events' retention so a background/catch-up snapshot of a policy'd type expires
+		// with its stream instead of lingering as an orphan sk=0 row; omitempty drops it otherwise.
+		TTL: repo.ttlFor(entityType),
 	}
 
 	item, err := repo.marshalMap(snapshot)
