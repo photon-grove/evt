@@ -11,4 +11,8 @@ type Event struct {
 	EntityType evt.EntityType    `json:"entityType"`
 	Payload    string            `json:"payload"`
 	Metadata   string            `json:"metadata"`
+	// TTL is the optional DynamoDB time-to-live expiry (Unix epoch seconds). It is written only for
+	// entity types covered by a Repository retention policy; the omitempty tag drops it otherwise, so
+	// un-policed events carry no ttl attribute and are never auto-expired. See Repository.WithRetention.
+	TTL int64 `json:"ttl,omitempty"`
 }

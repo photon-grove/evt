@@ -38,12 +38,18 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
 | entityType | S             | `entityType` | EntityType                    |
 | payload    | S             | `payload`    | JSON-encoded event data       |
 | metadata   | S             | `metadata`   | JSON-encoded Metadata struct  |
+| ttl        | N             | `ttl`        | Optional TTL expiry (Unix s)  |
 
 **Key Invariants:**
 
 - `pk` + `sk` combination must be unique (enforced by conditional write)
 - `sk` (sequence) starts at 1 and increments monotonically per entity
 - `sk` = 0 is reserved for inline snapshots (filtered out by event queries)
+- `ttl` is written **only** for entity types covered by a `Repository` retention policy
+  (`WithRetention`); every other row omits the attribute entirely (`json:"ttl,omitempty"`) and is
+  never auto-expired. It is a no-op unless the table has DynamoDB TTL enabled on the `ttl` attribute.
+  Policy a type **only** when its events are transient and no projection rebuild replays them —
+  otherwise DynamoDB would silently delete history a wipe-and-replay depends on.
 
 ### Inline Snapshots (sk=0)
 
@@ -57,10 +63,13 @@ Snapshots are stored inline in the events table at `sk=0` for each entity:
 | eventSeq   | N             | `eventSeq`   | Last event sequence included in snapshot |
 | entityType | S             | `entityType` | EntityType                               |
 | payload    | S             | `payload`    | JSON-encoded entity state                |
+| ttl        | N             | `ttl`        | Optional TTL expiry (Unix s), mirrors policy |
 
 **Key Invariants:**
 
 - One snapshot per entity (overwritten in place at `sk=0`)
+- `ttl` mirrors the entity type's retention policy (see Events Table) so a snapshot never outlives the
+  events it summarizes; omitted for un-policed types
 - `seq` represents how many snapshots have been taken (1, 2, 3...)
 - `eventSeq` is the last event sequence included in the snapshot
 - `eventSeq >= seq` always (usually `eventSeq >> seq`)

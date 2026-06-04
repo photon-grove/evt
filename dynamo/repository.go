@@ -2,8 +2,11 @@ package dynamo
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+
+	"github.com/photon-grove/evt"
 )
 
 // Repository wires DynamoDB access for the event store.
@@ -15,8 +18,19 @@ type Repository struct {
 	decoder        *attributevalue.Decoder
 	consistentRead bool // default true for backward compatibility
 	scanSegments   int  // parallel Scan segments for table-wide reads; <=1 means a single sequential scan
+	retention      Retention
+	now            func() time.Time // clock for TTL expiry; nil means time.Now
 	logger         *slog.Logger
 }
+
+// Retention maps entity types to how long their committed events (and inline snapshots) are kept
+// before DynamoDB TTL expires them. Only entity types present in this map are ever stamped with a
+// `ttl` attribute; every other row is written without one and is never auto-expired.
+//
+// Use this ONLY for transient/process entity types whose events no projection rebuild depends on.
+// Never policy a type whose events a view is reconstructed from by replay — DynamoDB would silently
+// delete history the rebuild needs. The events table must have TTL enabled on the `ttl` attribute.
+type Retention map[evt.EntityType]time.Duration
 
 const tagKey string = "json"
 
@@ -78,6 +92,48 @@ func (repo *Repository) scanSegmentCount() int {
 	}
 
 	return repo.scanSegments
+}
+
+// WithRetention returns a shallow copy of the repository that stamps a DynamoDB `ttl` attribute on
+// committed events and inline snapshots whose entity type appears in the policy. Entity types absent
+// from the policy are written without a `ttl` and are never auto-expired. The original repository is
+// unchanged. See Retention for the safety constraint.
+func (repo *Repository) WithRetention(retention Retention) *Repository {
+	r := *repo
+	r.retention = retention
+	return &r
+}
+
+// WithClock returns a shallow copy of the repository using the given clock to compute TTL expiry
+// timestamps. Intended for tests; production callers leave it unset to use time.Now.
+func (repo *Repository) WithClock(now func() time.Time) *Repository {
+	r := *repo
+	r.now = now
+	return &r
+}
+
+// ttlFor returns the Unix-epoch expiry for an event or snapshot of the given entity type, or 0 when
+// the type has no retention policy. A 0 result is dropped by the `ttl,omitempty` tag, so un-policed
+// rows carry no ttl attribute and DynamoDB never expires them.
+func (repo *Repository) ttlFor(entityType evt.EntityType) int64 {
+	if repo == nil || len(repo.retention) == 0 {
+		return 0
+	}
+
+	duration, ok := repo.retention[entityType]
+	if !ok || duration <= 0 {
+		return 0
+	}
+
+	return repo.nowOrDefault().Add(duration).Unix()
+}
+
+func (repo *Repository) nowOrDefault() time.Time {
+	if repo != nil && repo.now != nil {
+		return repo.now()
+	}
+
+	return time.Now()
 }
 
 func (repo *Repository) loggerOrDefault() *slog.Logger {
