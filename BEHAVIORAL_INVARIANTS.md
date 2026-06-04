@@ -212,6 +212,38 @@ type TransactionGroup interface {
 3. If not found: load all events from sequence 1
 4. Apply all loaded events to rebuild state
 
+## Compaction
+
+Compaction is the opt-in mechanism for bounding event-log growth. See
+[ADR 0001](docs/adr/0001-event-compaction-and-snapshot-truncation.md) for the full rationale and
+its coordination with consumer wipe-and-replay guarantees.
+
+### Compactor capability
+
+`CompactBelow(ctx, entityID, throughSequence) (deleted int, err error)` is an optional capability
+(interface `evt.Compactor`, detected via type assertion; implemented by `dynamo` and `mem`).
+
+- Deletes events with sequence in `[1, throughSequence]` for the entity.
+- **Refuses unless covered:** reads the inline snapshot and requires
+  `snapshot.EventSequence >= throughSequence`. With no snapshot, or an uncovered range, it deletes
+  nothing and returns `evt.ErrCompactionUncovered` (wrapped; matchable with `errors.Is`).
+- Never deletes the `sk = 0` snapshot row. `throughSequence < 1` is a no-op. Idempotent.
+
+### Compaction invariants
+
+- A stream's events below its latest durable snapshot's `eventSeq` are **not required for rebuild**;
+  the authoritative start of a compacted stream is its snapshot, not event 1.
+- After compaction, correct rebuild **requires** the snapshot-aware path; legacy full-replay-from-1
+  over a compacted stream reconstructs incorrect state.
+
+### Snapshot-aware rebuild
+
+`SnapshotStreamer.StreamEntitiesFromSnapshots(ctx, expr, seedEntity, applyEvent)` (optional
+capability) seeds each entity from its `sk = 0` snapshot, then applies only events with
+`sequence > snapshot.EventSequence`. Streams without a snapshot fall back to full replay from
+sequence 1. `RebuildProjections` uses this path when `RebuildConfig.SeedEntity` is set, and errors
+if `SeedEntity` is set on a repository that is not a `SnapshotStreamer`.
+
 ## Projector System
 
 ### EventProjector Interface
@@ -320,3 +352,25 @@ evt.Metadata{
 - Yields complete entities after all their events are processed
 - Skips `sequence = 0` events (snapshot markers)
 - Errors during `applyEvent` are yielded to channel, then continues
+
+### StreamEntitiesFromSnapshots (optional: `evt.SnapshotStreamer`)
+
+- Like `StreamEntities`, but seeds each entity from its `sk = 0` snapshot via `seedEntity`
+- Skips events with `sequence <= snapshot.EventSequence` (already captured by the seed)
+- Entities without a snapshot fall back to full replay from sequence 1 via `applyEvent`
+- A `seedEntity` error is yielded to the channel and that entity's remaining events are skipped
+
+### CompactBelow (optional: `evt.Compactor`)
+
+- Deletes events with `sequence` in `[1, throughSequence]`
+- Refuses with `evt.ErrCompactionUncovered` unless a snapshot covers the range
+  (`snapshot.EventSequence >= throughSequence`)
+- Never deletes the `sk = 0` snapshot; `throughSequence < 1` is a no-op; idempotent
+- DynamoDB: key-only range query + `BatchWriteItem` deletes (25/batch) with bounded
+  `UnprocessedItems` retries
+
+### Delete (build-tagged `//go:build !prod`)
+
+- Raw, snapshot-unsafe point-delete by `(pk, sk)`; for local/staging fixtures only
+- Excluded from production builds (`-tags prod`); released binaries set this tag
+- Use `CompactBelow` for principled, snapshot-verified truncation instead

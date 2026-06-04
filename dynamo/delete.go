@@ -1,3 +1,5 @@
+//go:build !prod
+
 package dynamo
 
 import (
@@ -8,7 +10,14 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// Delete removes serialized events from the events table.
+// Delete removes serialized events from the events table by point-deleting each (pk, sk). It
+// performs NO snapshot-safety checks and can leave a stream unreplayable, so it is intended only
+// for local and staging fixtures (e.g. resetting test data).
+//
+// This method is compiled out of production builds: it is guarded by `//go:build !prod`, so a
+// binary built with `-tags prod` does not contain it and cannot call it. For principled,
+// snapshot-verified log truncation in any environment, use CompactBelow (evt.Compactor) instead.
+//
 // WARNING: Use only in local and staging environments.
 func (repo *Repository) Delete(
 	ctx context.Context,

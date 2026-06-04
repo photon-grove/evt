@@ -23,6 +23,15 @@
 - Never commit secrets.
 - Immutable domain events are the source of truth. Views/projections are derived state and must be
   safe to wipe and rebuild by replaying events.
+- Event logs are append-only and retained in full by default. Compaction
+  (`evt.Compactor.CompactBelow`) may delete events only where a durable snapshot already covers them
+  (`snapshot.EventSequence >= throughSequence`); it must never delete the `sk=0` snapshot. After a
+  stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedEntity` /
+  `evt.SnapshotStreamer`), never full-replay-from-1. See
+  `docs/adr/0001-event-compaction-and-snapshot-truncation.md`.
+- The raw `dynamo.Delete` is snapshot-unsafe and for local/staging fixtures only. It is guarded by
+  `//go:build !prod`; production builds must use `-tags prod` (released binaries already do). Prefer
+  `CompactBelow` for any principled truncation.
 - Do not persist mutable decisions, external signals, publish flags, accept/reject verdicts, or
   review state directly to a view table with no backing event.
 - DynamoDB event-log key patterns must stay stable. Preserve the documented `pk`/`sk`, inline

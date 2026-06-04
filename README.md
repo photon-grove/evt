@@ -96,6 +96,15 @@ are derived state. Any projection/view table should be safe to wipe and rebuild
 from immutable events. Human decisions, external signals, publish flags, and
 review verdicts should be event-sourced before they appear in a view.
 
+Event logs are append-only by default and retained in full. Streams may opt into
+**compaction** (`evt.Compactor.CompactBelow`) to truncate events that a durable
+snapshot already captures. Once a stream is compacted, rebuilds must seed from
+its snapshot (`RebuildConfig.SeedEntity` / `evt.SnapshotStreamer`) rather than
+replay from event 1. The raw `dynamo.Delete` is for local/staging fixtures only
+and is excluded from production builds (`-tags prod`); use `CompactBelow` for
+principled truncation. See
+[ADR 0001](docs/adr/0001-event-compaction-and-snapshot-truncation.md).
+
 See [`BEHAVIORAL_INVARIANTS.md`](BEHAVIORAL_INVARIANTS.md) for the exact
 serialization and DynamoDB schema guarantees.
 

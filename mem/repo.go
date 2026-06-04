@@ -4,6 +4,7 @@ package mem
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/photon-grove/evt"
@@ -170,6 +171,149 @@ func (repo Repository) StreamAllEvents(
 	}()
 
 	return channel
+}
+
+// CompactBelow deletes events for an entity whose sequence is in [1, throughSequence], but only
+// after verifying a durable snapshot covers (>=) throughSequence. It implements evt.Compactor.
+func (repo Repository) CompactBelow(
+	_ context.Context,
+	entityID evt.EntityID,
+	throughSequence evt.EventSequence,
+) (int, error) {
+	if throughSequence < 1 {
+		return 0, nil
+	}
+
+	id := string(entityID)
+
+	snapshot, ok := repo.snapshots[id]
+	if !ok {
+		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
+	}
+	if snapshot.EventSequence < throughSequence {
+		return 0, fmt.Errorf(
+			"%w: entity %s snapshot covers through event %d but compaction was requested through %d",
+			evt.ErrCompactionUncovered, entityID, snapshot.EventSequence, throughSequence,
+		)
+	}
+
+	events := repo.events[id]
+	kept := make([]evt.SerializedEvent, 0, len(events))
+	deleted := 0
+
+	for _, event := range events {
+		if event.Sequence >= 1 && event.Sequence <= throughSequence {
+			deleted++
+			continue
+		}
+
+		kept = append(kept, event)
+	}
+
+	repo.events[id] = kept
+
+	return deleted, nil
+}
+
+// StreamEntitiesFromSnapshots streams collected Entities, seeding each from its snapshot (when
+// present) before applying post-snapshot events. entityType, when non-empty, restricts the stream
+// to entities of that type. It implements evt.SnapshotStreamer.
+func (repo Repository) StreamEntitiesFromSnapshots(
+	ctx context.Context,
+	entityType evt.EntityType,
+	seedEntity evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
+) <-chan result.Result[evt.Entity] {
+	channel := make(chan result.Result[evt.Entity])
+
+	go func() {
+		defer close(channel)
+
+		for id, serialized := range repo.events {
+			if entityType != "" && !memEventsMatchType(serialized, repo.snapshots[id], entityType) {
+				continue
+			}
+
+			entity, through, ok := repo.seedFromSnapshot(ctx, id, seedEntity, channel)
+			if !ok {
+				continue
+			}
+
+			entity, ok = applyMemEvents(ctx, serialized, entity, through, applyEvent, channel)
+			if !ok {
+				continue
+			}
+
+			if entity != nil {
+				channel <- result.Ok(entity)
+			}
+		}
+	}()
+
+	return channel
+}
+
+// seedFromSnapshot reconstructs an entity from its snapshot when one exists. It returns the
+// seeded entity (nil when there is no snapshot), the covered event sequence, and false only when
+// seeding errored (the error is already emitted).
+func (repo Repository) seedFromSnapshot(
+	ctx context.Context,
+	id string,
+	seedEntity evt.SnapshotSeeder,
+	channel chan<- result.Result[evt.Entity],
+) (evt.Entity, evt.EventSequence, bool) {
+	snapshot, ok := repo.snapshots[id]
+	if !ok {
+		return nil, 0, true
+	}
+
+	entity, err := seedEntity(ctx, snapshot)
+	if err != nil {
+		channel <- result.Err[evt.Entity](err)
+		return nil, 0, false
+	}
+
+	return entity, snapshot.EventSequence, true
+}
+
+// memEventsMatchType reports whether a partition belongs to the given entity type, checking the
+// stored events first and falling back to the snapshot's recorded type.
+func memEventsMatchType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot, entityType evt.EntityType) bool {
+	for _, event := range serialized {
+		if event.Sequence == 0 {
+			continue
+		}
+
+		return event.EntityType == entityType
+	}
+
+	return snapshot.EntityType == entityType
+}
+
+// applyMemEvents applies events above the snapshot boundary to the (possibly seeded) entity.
+func applyMemEvents(
+	ctx context.Context,
+	serialized []evt.SerializedEvent,
+	entity evt.Entity,
+	through evt.EventSequence,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
+	channel chan<- result.Result[evt.Entity],
+) (evt.Entity, bool) {
+	for _, event := range serialized {
+		if event.Sequence == 0 || event.Sequence <= through {
+			continue
+		}
+
+		next, err := applyEvent(ctx, event, entity)
+		if err != nil {
+			channel <- result.Err[evt.Entity](err)
+			return entity, false
+		}
+
+		entity = next
+	}
+
+	return entity, true
 }
 
 // StreamEntities streams all collected Entities

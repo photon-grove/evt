@@ -10,6 +10,10 @@ builds:
   - id: evt-doctor
     main: ./cmd/evt-doctor
     binary: evt-doctor
+    # Build with the `prod` tag so dangerous, non-snapshot-safe helpers (e.g. dynamo.Delete,
+    # guarded by `//go:build !prod`) are physically excluded from released binaries.
+    flags:
+      - -tags=prod
     env:
       - CGO_ENABLED=0
     goos:

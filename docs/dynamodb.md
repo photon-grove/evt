@@ -11,6 +11,18 @@ The event log table uses:
 
 Event rows are append-only and protected by conditional writes.
 
+### Compaction
+
+Event rows are retained in full by default. A stream may opt into compaction with
+`evt.Compactor.CompactBelow(ctx, entityID, throughSequence)`, which deletes events
+in `[1, throughSequence]` — but only after confirming the inline `sk = 0` snapshot
+covers them (`snapshot.EventSequence >= throughSequence`), and never the snapshot
+row itself. Uncovered requests return `evt.ErrCompactionUncovered` and delete
+nothing. Rebuild compacted streams via the snapshot-aware path
+(`RebuildConfig.SeedEntity`). The raw `dynamo.Delete` is snapshot-unsafe, for
+local/staging fixtures only, and excluded from production builds (`-tags prod`).
+See [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
+
 ## Entity Views Table
 
 The view table uses:

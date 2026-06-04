@@ -73,6 +73,40 @@ log; the win here is bounded memory, incremental output, and parallel per-entity
 queries, not lower read cost. For genuinely cheaper enumeration, back it with a
 dedicated per-entity index or registry.
 
+## Rebuilding compacted streams
+
+By default a rebuild replays each stream from event sequence 1. If a stream has
+been **compacted** (`evt.Compactor.CompactBelow` truncates events that a durable
+snapshot already captures), those low events no longer exist, so a from-event-1
+replay would reconstruct incorrect state.
+
+For compacted streams, set `RebuildConfig.SeedEntity`. The rebuild then seeds each
+entity from its snapshot before applying only the post-snapshot events (via
+`evt.SnapshotStreamer`), and falls back to full replay for streams that have no
+snapshot. This is safe on uncompacted data too, so adopters that plan to compact
+should switch rebuilds to `SeedEntity` first:
+
+```go
+res, err := evt.RebuildProjections(ctx, repo, applyEvent, evt.RebuildConfig{
+    Projectors: projectors,
+    CommitGroup: commitGroup,
+    SeedEntity: func(ctx context.Context, snap evt.SerializedSnapshot) (evt.Entity, error) {
+        entity, err := newEntityForType(snap.EntityType) // your factory
+        if err != nil {
+            return nil, err
+        }
+        return entity, json.Unmarshal(snap.Payload, entity)
+    },
+})
+```
+
+Like `StreamEntitiesByQuery`, the snapshot-aware path enumerates entity IDs and
+queries each partition (seeding from the `sk=0` snapshot, then applying events
+after it), so it is bounded-memory and does not depend on scan ordering. If
+`SeedEntity` is set but the repository does not implement `evt.SnapshotStreamer`,
+`RebuildProjections` returns an error rather than silently producing partial state.
+See [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
+
 ## Reading views without buffering
 
 The view repository's `ListViewsByEntityType` and `ListViewsByPK` buffer their
