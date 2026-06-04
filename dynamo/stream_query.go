@@ -62,25 +62,30 @@ func (repo *Repository) StreamEntitiesByQuery(
 	go func() {
 		defer close(results)
 
+		// Enumerate the full set of entity IDs first. If enumeration fails (a partial scan), treat
+		// it as fatal and emit no entities — otherwise workers could query and commit a subset of
+		// IDs while the caller sees an "ok-ish" result, leaving a silently under-rebuilt projection.
+		// This holds the same set of IDs in memory that enumeration already deduplicates, so it does
+		// not change the memory profile.
+		idList, err := repo.collectEntityIDs(ctx, opts.EntityType, opts.Skip)
+		if err != nil {
+			repo.sendEntity(ctx, results, result.Err[evt.Entity](err))
+			return
+		}
+
 		ids := make(chan evt.EntityID)
 
-		// Enumerator: feed unique, non-skipped entity IDs to the workers, then close ids.
-		var enumErr error
+		// Feed the pre-collected IDs to the workers.
 		go func() {
 			defer close(ids)
 
-			enumErr = repo.enumerateEntityIDs(ctx, opts.EntityType, func(id evt.EntityID) bool {
-				if opts.Skip != nil && opts.Skip(id) {
-					return true
-				}
-
+			for _, id := range idList {
 				select {
 				case ids <- id:
-					return true
 				case <-ctx.Done():
-					return false
+					return
 				}
-			})
+			}
 		}()
 
 		// Worker pool: each worker queries an entity partition and reconstitutes the entity.
@@ -119,16 +124,35 @@ func (repo *Repository) StreamEntitiesByQuery(
 		}
 
 		wg.Wait()
-
-		// Surface any enumeration error once workers have drained. The write to enumErr is
-		// sequenced before close(ids), which the workers' range observes before wg.Done, so this
-		// read happens-after the write.
-		if enumErr != nil {
-			repo.sendEntity(ctx, results, result.Err[evt.Entity](enumErr))
-		}
 	}()
 
 	return results
+}
+
+// collectEntityIDs enumerates the distinct entity IDs in the event log, applying the optional Skip
+// predicate, and returns them as a slice. It returns an error if the underlying scan fails, so the
+// caller can treat enumeration as all-or-nothing.
+func (repo *Repository) collectEntityIDs(
+	ctx context.Context,
+	entityType evt.EntityType,
+	skip func(evt.EntityID) bool,
+) ([]evt.EntityID, error) {
+	var ids []evt.EntityID
+
+	err := repo.enumerateEntityIDs(ctx, entityType, func(id evt.EntityID) bool {
+		if skip != nil && skip(id) {
+			return true
+		}
+
+		ids = append(ids, id)
+
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return ids, nil
 }
 
 // enumerateEntityIDs paginates a key-only Scan of the event log and invokes visit once per distinct

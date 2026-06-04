@@ -266,8 +266,9 @@ func TestCommit_UpdateSnapshotError(t *testing.T) {
 
 	_, err := setup.store.Commit(ctx, result, eventContext, metadata)
 	require.Error(t, err)
-	// The error comes from the DeserializeEvent method, not MarshalJSON
-	require.Contains(t, err.Error(), "not implemented")
+	// The snapshot payload is captured from the entity's current state, so the failure surfaces
+	// from MarshalJSON during snapshot generation.
+	require.Contains(t, err.Error(), "snapshot generation failed")
 }
 
 // Test edge case of nil CurrentSnapshot no longer panics and initializes to 1
@@ -668,4 +669,82 @@ func Test_EventStore_MultiBoundaryBatch_ReloadIsCurrent(t *testing.T) {
 	// Reloading from snapshot + tail must reflect the final event, not a stale prefix.
 	setup.refresh(t)
 	require.Equal(t, finalValue, setup.entity.Value)
+}
+
+// --- Additive aggregate: proves snapshots are not double-applied via Execute ---
+
+type counterEntity struct {
+	evt.BaseEntity
+	Count int `json:"count"`
+}
+
+func (c *counterEntity) Type() evt.EntityType                { return "counter" }
+func (c *counterEntity) GetID() evt.EntityID                 { return c.ID }
+func (c *counterEntity) Base() evt.BaseEntity                { return c.BaseEntity }
+func (c *counterEntity) EventUpcasters() []evt.EventUpcaster { return nil }
+func (c *counterEntity) Projectors() []evt.EventProjector    { return nil }
+
+func (c *counterEntity) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
+	add, ok := command.(*addCommand)
+	if !ok {
+		return evt.CommandResult{}, evt.NewBadCommandError(command)
+	}
+
+	events := make([]evt.Event, add.N)
+	for i := range events {
+		events[i] = incrementedEvent{}
+	}
+
+	return evt.CommandResult{Events: events}, nil
+}
+
+func (c *counterEntity) Apply(event evt.Event) error {
+	if _, ok := event.(incrementedEvent); !ok {
+		return evt.NewBadEventError(event)
+	}
+
+	c.Count++
+
+	return nil
+}
+
+func (c *counterEntity) DeserializeEvent(se evt.SerializedEvent) (evt.Event, error) {
+	if se.Type == "counter.incremented" {
+		return incrementedEvent{}, nil
+	}
+
+	return nil, errors.New("unknown event type")
+}
+
+type addCommand struct{ N int }
+
+func (a *addCommand) Type() evt.CommandType      { return "counter.add" }
+func (a *addCommand) EntityType() evt.EntityType { return "counter" }
+
+type incrementedEvent struct{}
+
+func (incrementedEvent) Type() evt.EventType        { return "counter.incremented" }
+func (incrementedEvent) Version() evt.EventVersion  { return 1 }
+func (incrementedEvent) EntityID() evt.EntityID     { return "" }
+func (incrementedEvent) EntityType() evt.EntityType { return "counter" }
+
+// TestExecute_AdditiveSnapshot_NoDoubleApply is a regression test for the snapshot double-apply
+// bug. With additive events, replaying the batch into an entity that Execute already mutated would
+// store double-counted state in the snapshot (e.g. 6 increments captured as 12). A reload must
+// restore the true count.
+func TestExecute_AdditiveSnapshot_NoDoubleApply(t *testing.T) {
+	ctx := context.Background()
+	repo := mem.NewRepository()
+	store := snapshots.NewStore(repo, 2) // snapshot every 2 events; one command crosses boundaries
+
+	id := evt.EntityID("counter-1")
+	entity := &counterEntity{BaseEntity: evt.NewEntity(id)}
+
+	require.NoError(t, store.Execute(ctx, entity, id, &addCommand{N: 6}, evt.Metadata{}))
+	require.Equal(t, 6, entity.Count)
+
+	reloaded := &counterEntity{BaseEntity: evt.NewEntity(id)}
+	_, err := store.LoadEntity(ctx, reloaded, id)
+	require.NoError(t, err)
+	require.Equal(t, 6, reloaded.Count, "reloaded count must not be double-applied")
 }

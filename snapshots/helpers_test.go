@@ -91,10 +91,18 @@ func combineResults(results ...evt.CommandResult) evt.CommandResult {
 	return combined
 }
 
-// commitEvents commits events and returns serialized events
+// commitEvents commits events and returns serialized events.
+//
+// Per the Store.Commit contract, the entity must already reflect result.Events before Commit (in
+// production, Execute applies them first). These tests construct results without going through
+// Execute, so apply the events to the context entity here before committing.
 func commitEvents(t *testing.T, store evt.Store, result evt.CommandResult, eventContext evt.Context, metadata evt.Metadata) []evt.SerializedEvent {
 	t.Helper()
 	ctx := context.Background()
+
+	for _, event := range result.Events {
+		require.NoError(t, eventContext.Entity.Apply(event), "Error applying event before commit")
+	}
 
 	serializedEvents, err := store.Commit(ctx, result, eventContext, metadata)
 	require.NoError(t, err, "Error committing events")

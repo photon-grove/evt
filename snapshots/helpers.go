@@ -50,31 +50,6 @@ func applyEventsToEntity(serializedEvents []evt.SerializedEvent, eventContext *e
 	return nil
 }
 
-// applyEventsForSnapshot applies events for snapshot creation up to a sequence limit.
-func applyEventsForSnapshot(serializedEvents []evt.SerializedEvent, eventContext *evt.Context, commitSnapshotToEvent int) error {
-	for i, serializedEvent := range serializedEvents {
-		// Convert from the 0-indexed i value to the 1-indexed sequence value
-		seq := i + 1
-
-		event, err := evt.DeserializeEvent(serializedEvent, eventContext.Entity)
-		if err != nil {
-			return err
-		}
-
-		// If this is one of the Events that should be included in the Snapshot, apply the
-		// event to the Entity
-		if seq <= commitSnapshotToEvent {
-			if err := eventContext.Entity.Apply(event); err != nil {
-				return err
-			}
-
-			*eventContext.CurrentSequence++
-		}
-	}
-
-	return nil
-}
-
 // updateSnapshotSequence sets or increments the snapshot sequence in the context.
 func updateSnapshotSequence(eventContext *evt.Context) {
 	if eventContext.CurrentSnapshot == nil {

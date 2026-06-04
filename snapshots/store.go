@@ -119,6 +119,11 @@ func (store *Store) LoadEntity(
 // If the metadata carries a CommandID that was already seen during event replay,
 // the commit is skipped and a DuplicateCommandError is returned so the caller
 // can treat the retry as an idempotent success.
+//
+// Contract: the entity in eventContext must already reflect result.Events before Commit is called.
+// Execute satisfies this (it applies the events, then runs in-band projectors, then commits). When
+// a snapshot is taken, its payload is the entity's current state — events are not re-applied — so a
+// caller that commits without first applying the events would persist a stale snapshot.
 func (store *Store) Commit(
 	ctx context.Context,
 	result evt.CommandResult,
@@ -155,11 +160,10 @@ func (store *Store) Commit(
 		return serializedEvents, nil
 	}
 
-	// Otherwise, generate the payload for the Snapshot to be taken
+	// Otherwise, capture the Snapshot payload from the (already-applied) entity state
 	payload, err := store.updateSnapshotWithEvents(
 		serializedEvents,
 		&eventContext,
-		commitSnapshotToEvent,
 	)
 	if err != nil {
 		return nil, err
@@ -260,21 +264,26 @@ func (store *Store) ExecuteWithFactory(
 	return evt.ExecuteWithFactory(ctx, store, factory, entityID, command, metadata)
 }
 
-// Generate the Snapshot payload when a new Snapshot needs to be taken
+// updateSnapshotWithEvents advances the context's sequence counters and captures the entity's
+// current state as the snapshot payload.
+//
+// The entity must already reflect the committed events before Commit is called (Execute applies
+// result.Events first; direct Commit callers must do the same). The events are therefore NOT
+// re-applied here — re-applying them into an already-updated entity would double-apply additive
+// events and corrupt the snapshot.
 func (store *Store) updateSnapshotWithEvents(
 	serializedEvents []evt.SerializedEvent,
 	eventContext *evt.Context,
-	commitSnapshotToEvent int,
 ) ([]byte, error) {
-	// Apply events up to the snapshot point
-	if err := applyEventsForSnapshot(serializedEvents, eventContext, commitSnapshotToEvent); err != nil {
-		return nil, err
+	// Advance the running event sequence to account for the committed batch.
+	if eventContext.CurrentSequence != nil {
+		*eventContext.CurrentSequence += evt.EventSequence(len(serializedEvents))
 	}
 
 	// Update snapshot sequence
 	updateSnapshotSequence(eventContext)
 
-	// Generate and return the snapshot payload
+	// Capture the entity's current (already-applied) state as the snapshot payload
 	return generateSnapshotPayload(eventContext.Entity)
 }
 

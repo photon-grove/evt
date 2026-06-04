@@ -361,14 +361,19 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_EnumerationError() {
 	}
 
 	var gotErr error
+	okCount := 0
 	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 2}, applyFunc) {
 		if _, err := entityResult.Unwrap(); err != nil {
 			gotErr = err
+		} else {
+			okCount++
 		}
 	}
 
 	require.Error(s.T(), gotErr)
 	require.Contains(s.T(), gotErr.Error(), "scan boom")
+	// Enumeration failure is fatal: no entities are emitted (and thus none committed).
+	require.Equal(s.T(), 0, okCount)
 	s.client.AssertExpectations(s.T())
 }
 
