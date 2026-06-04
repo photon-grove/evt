@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/dynamo"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -187,5 +188,186 @@ func (s *RepositorySuite) Test_StreamEntities_ParallelSegments() {
 	}
 
 	require.ElementsMatch(s.T(), []evt.EntityID{"a", "b"}, ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// pkItem builds a key-only scan item (what enumeration projects).
+func pkItem(pk string) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: pk}}
+}
+
+// queryForPK matches a GetEvents query for a specific partition key.
+func queryForPK(pk string) func(*dynamodb.QueryInput) bool {
+	return func(in *dynamodb.QueryInput) bool {
+		v, ok := in.ExpressionAttributeValues[":pk"].(*types.AttributeValueMemberS)
+		return ok && v.Value == pk
+	}
+}
+
+// Test_StreamEntitiesByQuery_EnumeratesAndQueries verifies the enumerate-then-query path:
+// duplicate partition keys are de-duplicated during enumeration, and each entity is rebuilt from
+// its own ordered partition query.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_EnumeratesAndQueries() {
+	ctx := context.Background()
+
+	// Enumeration scan: key-only, with a duplicate pk to exercise de-duplication.
+	s.client.On("Scan", mock.Anything, mock.MatchedBy(func(in *dynamodb.ScanInput) bool {
+		return in.ProjectionExpression != nil && *in.ProjectionExpression == "pk"
+	}), mock.Anything).Return(&dynamodb.ScanOutput{
+		Items: []map[string]types.AttributeValue{pkItem("a"), pkItem("b"), pkItem("a")},
+	}, nil).Once()
+
+	// Per-entity partition queries.
+	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("a")), mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("a", 1), eventItem("a", 2)}}, nil).Once()
+	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("b")), mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("b", 1)}}, nil).Once()
+
+	applied := map[evt.EntityID][]int{}
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+		applied[event.EntityID] = append(applied[event.EntityID], int(event.Sequence))
+		if entity == nil {
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		}
+
+		return entity, nil
+	}
+
+	ids := make([]evt.EntityID, 0, 2)
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, applyFunc) {
+		entity, err := entityResult.Unwrap()
+		require.NoError(s.T(), err)
+		ids = append(ids, entity.GetID())
+	}
+
+	require.ElementsMatch(s.T(), []evt.EntityID{"a", "b"}, ids)
+	require.Equal(s.T(), []int{1, 2}, applied["a"])
+	require.Equal(s.T(), []int{1}, applied["b"])
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesByQuery_Skip verifies that skipped entity IDs are never queried.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_Skip() {
+	ctx := context.Background()
+
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.ScanOutput{
+		Items: []map[string]types.AttributeValue{pkItem("a"), pkItem("b")},
+	}, nil).Once()
+
+	// Only "a" should be queried; a query for "b" would be an unexpected call.
+	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("a")), mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("a", 1)}}, nil).Once()
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+		if entity == nil {
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		}
+
+		return entity, nil
+	}
+
+	opts := dynamo.StreamByQueryOptions{
+		Workers: 1,
+		Skip:    func(id evt.EntityID) bool { return id == "b" },
+	}
+
+	ids := make([]evt.EntityID, 0, 1)
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) {
+		entity, err := entityResult.Unwrap()
+		require.NoError(s.T(), err)
+		ids = append(ids, entity.GetID())
+	}
+
+	require.Equal(s.T(), []evt.EntityID{"a"}, ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesByQuery_EntityTypeFilter verifies enumeration filters the scan by entity type.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_EntityTypeFilter() {
+	ctx := context.Background()
+
+	s.client.On("Scan", mock.Anything, mock.MatchedBy(func(in *dynamodb.ScanInput) bool {
+		v, ok := in.ExpressionAttributeValues[":et"].(*types.AttributeValueMemberS)
+		return in.FilterExpression != nil && ok && v.Value == "TestEntity"
+	}), mock.Anything).Return(&dynamodb.ScanOutput{
+		Items: []map[string]types.AttributeValue{pkItem("a")},
+	}, nil).Once()
+
+	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("a")), mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("a", 1)}}, nil).Once()
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+		if entity == nil {
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		}
+
+		return entity, nil
+	}
+
+	opts := dynamo.StreamByQueryOptions{Workers: 1, EntityType: evt.EntityType("TestEntity")}
+
+	count := 0
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) {
+		_, err := entityResult.Unwrap()
+		require.NoError(s.T(), err)
+		count++
+	}
+
+	require.Equal(s.T(), 1, count)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesByQuery_ParallelWorkers exercises the worker pool over several entities.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_ParallelWorkers() {
+	ctx := context.Background()
+
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.ScanOutput{
+		Items: []map[string]types.AttributeValue{pkItem("a"), pkItem("b"), pkItem("c"), pkItem("d")},
+	}, nil).Once()
+
+	for _, id := range []string{"a", "b", "c", "d"} {
+		s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK(id)), mock.Anything).
+			Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem(id, 1)}}, nil).Once()
+	}
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+		if entity == nil {
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		}
+
+		return entity, nil
+	}
+
+	ids := make([]evt.EntityID, 0, 4)
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 4}, applyFunc) {
+		entity, err := entityResult.Unwrap()
+		require.NoError(s.T(), err)
+		ids = append(ids, entity.GetID())
+	}
+
+	require.ElementsMatch(s.T(), []evt.EntityID{"a", "b", "c", "d"}, ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesByQuery_EnumerationError surfaces a scan failure as an error result.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_EnumerationError() {
+	ctx := context.Background()
+
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).
+		Return((*dynamodb.ScanOutput)(nil), errors.New("scan boom")).Once()
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+	}
+
+	var gotErr error
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 2}, applyFunc) {
+		if _, err := entityResult.Unwrap(); err != nil {
+			gotErr = err
+		}
+	}
+
+	require.Error(s.T(), gotErr)
+	require.Contains(s.T(), gotErr.Error(), "scan boom")
 	s.client.AssertExpectations(s.T())
 }

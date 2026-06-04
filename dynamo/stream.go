@@ -132,7 +132,7 @@ func (repo *Repository) buildEntity(
 				With("event_type", event.Type).
 				Error("Error during applyEvent", "error", err.Error())
 
-			results <- result.Err[evt.Entity](err)
+			repo.sendEntity(ctx, results, result.Err[evt.Entity](err))
 
 			return nil, false
 		}

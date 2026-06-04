@@ -37,6 +37,34 @@ res, err := evt.RebuildProjections(ctx, repo, applyEvent, cfg)
 read throughput (and consumed capacity) for a faster rebuild. Leave it at the
 default (a single sequential scan) for small tables.
 
+### Bounded-memory rebuilds for large tables
+
+Because `StreamEntities` must regroup an unordered scan, it holds the matched
+events in memory until the scan finishes. For large event logs, use the dynamo
+repository's `StreamEntitiesByQuery`, which first enumerates the distinct entity
+IDs (a cheap key-only scan) and then queries each entity's partition — returning
+its events already in order — folding and emitting one entity at a time. Memory is
+bounded to the set of entity IDs plus a worker pool of in-flight aggregates, and
+entities stream out as they are rebuilt. Pass the resulting stream to
+`RebuildProjectionsFromStream`:
+
+```go
+repo := dynamo.NewRepository(client, eventsTable)
+stream := repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{
+    EntityType: cfg.EntityType, // optional filter
+    Workers:    8,              // partitions queried concurrently
+    // Skip lets you resume an interrupted run; rebuilds are idempotent, so a
+    // full restart is also always safe.
+    Skip: func(id evt.EntityID) bool { return false },
+}, applyEvent)
+
+res, err := evt.RebuildProjectionsFromStream(ctx, stream, cfg)
+```
+
+`RebuildProjections` is the convenience wrapper that builds the scan-based stream
+for you; `RebuildProjectionsFromStream` accepts any entity stream so you can pick
+the strategy that fits your table size.
+
 ## Reading views without buffering
 
 The view repository's `ListViewsByEntityType` and `ListViewsByPK` buffer their
