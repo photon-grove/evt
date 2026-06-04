@@ -2,7 +2,9 @@ package dynamo
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -37,6 +39,13 @@ func (repo *Repository) GetSnapshot(
 // Snapshots are stored inline in the event-log table at sk=0.
 // This is intended for use by projectors and background processes that need to
 // write snapshots outside of the transactional command handler flow.
+//
+// The write is monotonic in eventSeq: it never overwrites an existing snapshot with one whose
+// EventSequence is lower. The sk=0 snapshot is the durable floor for both snapshot-aware load and
+// CompactBelow — if a stale/background writer could regress it below already-compacted events, a
+// later load would seed from the older snapshot and query events that compaction has deleted,
+// rebuilding with missing history. A regressing write is treated as a no-op (the existing, newer
+// snapshot already covers it), so background catch-up writers do not see spurious errors.
 func (repo *Repository) PutSnapshot(
 	ctx context.Context,
 	entityType evt.EntityType,
@@ -62,10 +71,23 @@ func (repo *Repository) PutSnapshot(
 	input := &dynamodb.PutItemInput{
 		TableName: &repo.EventsTable,
 		Item:      item,
+		// Monotonic floor: allow the write only when no snapshot exists yet or the stored snapshot's
+		// EventSequence is not ahead of this one. This prevents the sk=0 floor from regressing below
+		// compacted events.
+		ConditionExpression: aws.String("attribute_not_exists(eventSeq) OR eventSeq <= :new"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":new": &types.AttributeValueMemberN{Value: strconv.Itoa(int(eventSequence))},
+		},
 	}
 
 	_, err = repo.client.PutItem(ctx, input)
 	if err != nil {
+		// A newer-or-equal snapshot already exists; the write would regress the floor, so skip it.
+		var condFailed *types.ConditionalCheckFailedException
+		if errors.As(err, &condFailed) {
+			return nil
+		}
+
 		return fmt.Errorf("failed to put snapshot: %w", err)
 	}
 

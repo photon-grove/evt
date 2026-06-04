@@ -126,6 +126,36 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_RefusesWithoutCoveringS
 	require.Equal(s.T(), []evt.EventSequence{1, 2, 3}, s.sequencesFor(ctx, id))
 }
 
+// Test_PutSnapshot_MonotonicFloor verifies that the sk=0 snapshot floor cannot regress: a
+// PutSnapshot with a lower eventSeq is a no-op, while a higher eventSeq advances it. This is the
+// guard that keeps a stale background snapshot writer from regressing below compacted events.
+func (s *DynamoEventsIntegrationSuite) Test_PutSnapshot_MonotonicFloor() {
+	ctx := context.Background()
+
+	id := evt.EntityID(newID())
+	et := evt.EntityType("test")
+
+	// Establish a snapshot at eventSeq=6.
+	require.NoError(s.T(), s.repo.PutSnapshot(ctx, et, id, []byte(`{"value":"v6"}`), 1, 6))
+
+	// A regressing write (lower eventSeq) is a silent no-op and does not lower the floor.
+	require.NoError(s.T(), s.repo.PutSnapshot(ctx, et, id, []byte(`{"value":"v3"}`), 2, 3))
+
+	snap, err := s.repo.GetSnapshot(ctx, id)
+	require.NoError(s.T(), err)
+	require.NotNil(s.T(), snap)
+	require.Equal(s.T(), evt.EventSequence(6), snap.EventSequence)
+	require.JSONEq(s.T(), `{"value":"v6"}`, string(snap.Payload))
+
+	// A forward write (higher eventSeq) advances the floor.
+	require.NoError(s.T(), s.repo.PutSnapshot(ctx, et, id, []byte(`{"value":"v8"}`), 3, 8))
+
+	snap, err = s.repo.GetSnapshot(ctx, id)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), evt.EventSequence(8), snap.EventSequence)
+	require.JSONEq(s.T(), `{"value":"v8"}`, string(snap.Payload))
+}
+
 // Test_CompactBelow_ConcurrentWithAppends runs compaction concurrently with new commits and
 // verifies the stream stays loadable and correct. Compaction only removes already-snapshotted
 // low events, which concurrent appenders never touch.

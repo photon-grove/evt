@@ -17,11 +17,10 @@ Accepted (2026-06-04)
 - The only existing deletion path was `dynamo.Repository.Delete`, a raw point-delete by `(pk, sk)`
   with no snapshot-safety logic and a comment warning "use only in local and staging". It was unsafe
   to use as a compaction primitive and carried no enforcement.
-- Consuming apps rely on **wipe-and-replay** to rebuild projections. In `photon-grove/apps`,
-  [ADR 0012 — _Views are projections of immutable events_](https://github.com/photon-grove/apps/blob/main/docs/adr/0012-views-are-projections-of-immutable-events.md)
-  guarantees that any view table can be wiped and rebuilt by replaying the event log, and
-  `cmd/rebuild-projections` does exactly that. Historically that replay started from event sequence
-  1. Any compaction interacts directly with this guarantee.
+- Downstream consumers rely on **wipe-and-replay** to rebuild projections — a common event-sourcing
+  guarantee that any view/read-model table is derived state, safe to wipe and rebuild by replaying
+  the event log. A consumer's rebuild job historically replayed each stream from event sequence 1.
+  Any compaction interacts directly with that guarantee.
 
 ## Decision
 
@@ -45,9 +44,12 @@ CompactBelow(ctx, entityID, throughSequence) (deleted int, err error)
 
 ### 2. Snapshot-aware rebuild
 
-- New `SnapshotStreamer.StreamEntitiesFromSnapshots(ctx, expr, seedEntity, applyEvent)` seeds each
-  entity from its inline snapshot before applying only the events recorded **after** the snapshot.
-  Streams with no snapshot fall back to full replay from sequence 1 (unchanged behavior).
+- New `SnapshotStreamer.StreamEntitiesFromSnapshots(ctx, entityType, seedEntity, applyEvent)` seeds
+  each entity from its inline snapshot before applying only the events recorded **after** the
+  snapshot. Streams with no snapshot fall back to full replay from sequence 1 (unchanged behavior).
+  The DynamoDB implementation uses the bounded-memory **enumerate-then-query** model: it enumerates
+  distinct entity IDs and reconstructs each from its own partition (`GetSnapshot` + `GetLatestEvents`,
+  sort-key ordered), so it does not depend on scan ordering.
 - `RebuildProjections` gains an opt-in `RebuildConfig.SeedEntity` callback. When set, the rebuild
   uses the snapshot-aware stream (required for correctness after compaction); when nil, it uses the
   legacy `StreamEntities` full-replay path. If `SeedEntity` is set but the repository does not
@@ -68,9 +70,9 @@ consumer repos). Backends opt in by implementing the methods; `dynamo` and `mem`
   `//go:build !prod`. Released artifacts build with `-tags prod` (wired in `.goreleaser.yml`), so a
   production binary physically does not contain `Delete` and cannot call it. Consumers that build
   their own production binaries from source should add `-tags prod`.
-- **Why keep it at all?** A survey of consumers found **no production callers** (in
-  `photon-grove/apps` the only `Delete` references are unrelated connection-registry / view-store
-  methods; within `evt` it is used only by tests). `Delete` still has a legitimate local/staging
+- **Why keep it at all?** A survey of known consumers found **no production callers** (the only
+  `Delete` references in consumer code are unrelated connection-registry / view-store methods of the
+  same name; within `evt` it is used only by tests). `Delete` still has a legitimate local/staging
   role — point-deleting fixtures to reset test data — that `CompactBelow` deliberately cannot serve,
   because `CompactBelow` refuses to remove anything not covered by a snapshot. Removing `Delete`
   entirely would break that fixture-reset workflow for no safety gain beyond the build tag.
@@ -85,22 +87,41 @@ consumer repos). Backends opt in by implementing the methods; `dynamo` and `mem`
 - Correct rebuild of a compacted stream **requires** the snapshot-aware path
   (`SnapshotStreamer` / `RebuildConfig.SeedEntity`). Legacy full-replay-from-1 over a compacted
   stream would reconstruct incorrect state and must not be used once compaction has run.
+- **The `sk = 0` snapshot floor is monotonic in `eventSeq`.** `dynamo.PutSnapshot` writes
+  conditionally and never lowers a stream's recorded `eventSeq`, so the floor cannot regress below
+  already-compacted events. Without this, a stale background snapshot writer could overwrite `sk = 0`
+  with an older `eventSeq`, and a later snapshot-aware load would query events in
+  `(staleEventSeq, throughSequence]` that compaction has already deleted — rebuilding with missing
+  history. The transactional commit path was already monotonic (its snapshot put is conditioned on
+  the previous snapshot sequence); this extends the same guarantee to the standalone catch-up writer.
 
 ## Consequences
 
 - **Forfeited property:** "replay from the very first event" no longer holds for compacted streams.
   This is the deliberate trade for bounded log growth.
-- **Coordination with ADR 0012:** wipe-and-replay of *projections* remains fully valid — but the
-  replay must seed from snapshots (`RebuildConfig.SeedEntity`) rather than assume events 1..N
-  exist. ADR 0012's guarantee is preserved in substance (views are still rebuildable from the event
-  store); only the rebuild's starting point moves from "event 1" to "latest durable snapshot".
-  `cmd/rebuild-projections` in `photon-grove/apps` should pass a `SeedEntity` callback
-  (`NewEntityForType` + `json.Unmarshal` of the snapshot payload) when it adopts a compacting
-  version of `evt`.
+- **Coordination with consumer wipe-and-replay:** wipe-and-replay of *projections* remains fully
+  valid — but the replay must seed from snapshots (`RebuildConfig.SeedEntity`) rather than assume
+  events 1..N exist. The "views are rebuildable from the event store" guarantee is preserved in
+  substance; only the rebuild's starting point moves from "event 1" to "latest durable snapshot". A
+  consumer's rebuild/backfill job should pass a `SeedEntity` callback (an entity factory keyed by
+  type + `json.Unmarshal` of the snapshot payload) when it adopts a compacting version of `evt`.
 - **Concurrency:** `CompactBelow` only removes low, immutable, already-snapshotted events. Concurrent
   command handlers only append higher sequences and advance the `sk = 0` snapshot forward (coverage
-  only grows), so they never touch the deleted range; the coverage check is safe without a
-  transaction. Verified by an integration test that compacts while appending.
+  only grows, and the floor is monotonic — see above), so they never touch the deleted range; the
+  coverage check is safe without a transaction. Verified by integration tests that compact while
+  appending and that reject a regressing snapshot write.
+- **Known limitation — stale-context sequence reuse.** Deleting the covered event rows also removes
+  the `attribute_not_exists(sk)` optimistic-lock evidence below the floor. A command handler that
+  loaded a stale context *before* the covering snapshot existed (so its `CurrentSequence` is below
+  the compacted floor) and then commits a plain, non-snapshot commit *after* compaction could
+  re-create a sub-floor sequence number that DynamoDB would now accept. This does **not** corrupt
+  reconstructed state: the post-compaction invariant requires the snapshot-aware path, which only
+  applies events with `sk > snapshot.EventSequence` and therefore ignores any sub-floor rows — they
+  are log-hygiene debris, not part of the rebuilt entity. In normal operation the window does not
+  arise: a handler loads via `LoadEntity`, which seeds `CurrentSequence` from the snapshot, so its
+  next sequence is always above the floor. Durable commit-side floor enforcement (e.g. a tombstone
+  the commit path checks) is noted as future hardening for deployments that hold load contexts open
+  across a snapshot and a compaction.
 
 ## Backward compatibility
 
