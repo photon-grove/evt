@@ -441,3 +441,72 @@ func (e *otherTypeEntity) Apply(_ evt.Event) error { return nil }
 func (e *otherTypeEntity) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
 	return nil, fmt.Errorf("not implemented")
 }
+
+// streamOf returns a closed channel yielding the given entities as Ok results.
+func streamOf(entities ...evt.Entity) <-chan result.Result[evt.Entity] {
+	ch := make(chan result.Result[evt.Entity])
+	go func() {
+		defer close(ch)
+		for _, e := range entities {
+			ch <- result.Ok(e)
+		}
+	}()
+	return ch
+}
+
+func TestRebuildProjectionsFromStream_ProcessesEntities(t *testing.T) {
+	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "hello"}
+	e2 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e2"}, Value: "world"}
+
+	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
+	var committed int
+
+	res, err := evt.RebuildProjectionsFromStream(context.Background(), streamOf(e1, e2), evt.RebuildConfig{
+		Projectors:  []evt.EventProjector{proj},
+		CommitGroup: func(_ context.Context, _ evt.TransactionGroup) error { committed++; return nil },
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Processed)
+	assert.Equal(t, 2, committed)
+	assert.Len(t, proj.getCalls(), 2)
+}
+
+func TestRebuildProjectionsFromStream_RequiresProjectors(t *testing.T) {
+	_, err := evt.RebuildProjectionsFromStream(context.Background(), streamOf(), evt.RebuildConfig{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least one projector is required")
+}
+
+func TestRebuildProjectionsFromStream_PropagatesStreamError(t *testing.T) {
+	ch := make(chan result.Result[evt.Entity])
+	go func() {
+		defer close(ch)
+		ch <- result.Err[evt.Entity](errors.New("stream broke"))
+	}()
+
+	res, err := evt.RebuildProjectionsFromStream(context.Background(), ch, evt.RebuildConfig{
+		Projectors:  []evt.EventProjector{&stubProjector{group: &stubTransactionGroup{size: 1}}},
+		CommitGroup: func(_ context.Context, _ evt.TransactionGroup) error { return nil },
+	})
+
+	require.NoError(t, err)
+	require.Len(t, res.Errors, 1)
+	assert.Contains(t, res.Errors[0].Error(), "stream broke")
+}
+
+func TestRebuildProjectionsFromStream_CancelledStreamReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// An already-closed, empty stream models a producer that stopped on cancellation without
+	// delivering a final item. The rebuild must report the cancellation, not success.
+	res, err := evt.RebuildProjectionsFromStream(ctx, streamOf(), evt.RebuildConfig{
+		Projectors:  []evt.EventProjector{&stubProjector{group: &stubTransactionGroup{size: 1}}},
+		CommitGroup: func(_ context.Context, _ evt.TransactionGroup) error { return nil },
+	})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotNil(t, res)
+}

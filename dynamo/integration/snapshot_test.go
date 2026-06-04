@@ -12,6 +12,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// applyEvents applies events to the suite entity to satisfy the Store.Commit contract (the entity
+// must reflect the events before Commit; Execute does this in production, but these tests drive
+// Commit directly).
+func (s *DynamoEventsIntegrationSuite) applyEvents(events []evt.Event) {
+	for _, event := range events {
+		require.NoError(s.T(), s.entity.Apply(event))
+	}
+}
+
 func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	ctx := context.Background()
 
@@ -49,6 +58,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	result.Events = append(result.Events, updateOtherResult.Events...)
 	result.Transaction = append(result.Transaction, updateOtherResult.Transaction...)
 
+	s.applyEvents(result.Events)
 	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
 	require.NoError(s.T(), err)
 
@@ -97,6 +107,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	newResult.Events = append(newResult.Events, newOtherResult.Events...)
 	newResult.Transaction = append(newResult.Transaction, newOtherResult.Transaction...)
 
+	s.applyEvents(newResult.Events)
 	_, err = s.store.Commit(ctx, newResult, s.eventContext, metadata)
 	require.NoError(s.T(), err)
 
@@ -184,6 +195,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	result.Events = append(result.Events, updateOtherResult.Events...)
 	result.Transaction = append(result.Transaction, updateOtherResult.Transaction...)
 
+	s.applyEvents(result.Events)
 	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
 	require.NoError(s.T(), err)
 
@@ -195,6 +207,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	require.NoError(s.T(), err)
 
 	// This sequence of events should leave 1 trailing event after the last snapshot
+	s.applyEvents(newResult.Events)
 	_, err = s.store.Commit(ctx, newResult, s.eventContext, metadata)
 	require.NoError(s.T(), err)
 

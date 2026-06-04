@@ -6,6 +6,8 @@ import (
 	"log/slog"
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
+
+	"github.com/photon-grove/evt/result"
 )
 
 // RebuildConfig configures a projection rebuild run.
@@ -62,6 +64,10 @@ type RebuildResult struct {
 // The applyEvent callback is the same function used by StreamEntities to reconstitute entities
 // from serialized events. Callers typically pass the same function they use for normal event
 // replay (deserialize + apply).
+//
+// StreamEntities buffers the matched events in memory for the duration of a table scan. For large
+// event logs, build the entity stream with a bounded-memory source (e.g. a DynamoDB repository's
+// StreamEntitiesByQuery) and pass it to RebuildProjectionsFromStream instead.
 func RebuildProjections(
 	ctx context.Context,
 	repo Repository,
@@ -71,16 +77,12 @@ func RebuildProjections(
 	if applyEvent == nil {
 		return nil, fmt.Errorf("applyEvent callback is required")
 	}
+	// Validate before starting the stream so a config error does not strand the producer goroutine.
 	if len(cfg.Projectors) == 0 {
 		return nil, fmt.Errorf("at least one projector is required")
 	}
 	if !cfg.DryRun && cfg.CommitGroup == nil {
 		return nil, fmt.Errorf("CommitGroup is required when DryRun is false")
-	}
-
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
 	}
 
 	// Build an optional filter expression for the entity type.
@@ -96,9 +98,41 @@ func RebuildProjections(
 		expr = &built
 	}
 
+	return RebuildProjectionsFromStream(ctx, repo.StreamEntities(ctx, expr, applyEvent), cfg)
+}
+
+// RebuildProjectionsFromStream runs the configured projectors against a caller-supplied stream of
+// reconstituted entities. RebuildProjections is the common case (it builds the stream from a
+// Repository); use this directly when you need a different streaming strategy, such as a
+// bounded-memory, parallel enumerate-then-query source for very large tables.
+//
+// The caller owns the stream's reconstitution semantics (entity-type filtering, ordering); the
+// per-entity type check below is a defensive backstop, not the primary filter.
+func RebuildProjectionsFromStream(
+	ctx context.Context,
+	stream <-chan result.Result[Entity],
+	cfg RebuildConfig,
+) (*RebuildResult, error) {
+	// The stream may already be running (its producer started when the caller built it). On a
+	// config error, drain it in the background so that producer does not block forever on an
+	// abandoned consumer.
+	if len(cfg.Projectors) == 0 {
+		go drainEntityStream(stream)
+		return nil, fmt.Errorf("at least one projector is required")
+	}
+	if !cfg.DryRun && cfg.CommitGroup == nil {
+		go drainEntityStream(stream)
+		return nil, fmt.Errorf("CommitGroup is required when DryRun is false")
+	}
+
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	res := &RebuildResult{}
 
-	for entityResult := range repo.StreamEntities(ctx, expr, applyEvent) {
+	for entityResult := range stream {
 		if ctx.Err() != nil {
 			return res, ctx.Err()
 		}
@@ -143,6 +177,12 @@ func RebuildProjections(
 		reportProgress(cfg.OnProgress, res.Processed, len(res.Errors))
 	}
 
+	// A cancelled context can close the stream without delivering a final item (the producer's
+	// send loses the race to ctx.Done). Surface the cancellation rather than reporting success.
+	if ctx.Err() != nil {
+		return res, ctx.Err()
+	}
+
 	logger.Info("Projection rebuild complete",
 		slog.Int("processed", res.Processed),
 		slog.Int("skipped", res.Skipped),
@@ -150,6 +190,13 @@ func RebuildProjections(
 	)
 
 	return res, nil
+}
+
+// drainEntityStream consumes a stream to completion, discarding results. It is used to release a
+// prestarted stream's producer when the rebuild returns before consuming the stream itself.
+func drainEntityStream(stream <-chan result.Result[Entity]) {
+	for range stream {
+	}
 }
 
 // projectEntity runs all projectors for a single entity and commits the resulting view writes.

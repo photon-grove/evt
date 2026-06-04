@@ -214,3 +214,47 @@ func Test_handleConditionalCheckFailure_IndexCalculation(t *testing.T) {
 		})
 	}
 }
+
+func Test_HasConditionalCheckFailure(t *testing.T) {
+	t.Run("non-transaction error", func(t *testing.T) {
+		found, idx := HasConditionalCheckFailure(errors.New("boom"))
+		require.False(t, found)
+		require.Equal(t, 0, idx)
+	})
+
+	t.Run("finds the failing item", func(t *testing.T) {
+		err := &types.TransactionCanceledException{
+			CancellationReasons: []types.CancellationReason{
+				{Code: aws.String("None")},
+				{Code: aws.String("ConditionalCheckFailed")},
+			},
+		}
+		found, idx := HasConditionalCheckFailure(err)
+		require.True(t, found)
+		require.Equal(t, 1, idx)
+	})
+
+	t.Run("tolerates nil reason codes", func(t *testing.T) {
+		// DynamoDB returns one CancellationReason per item; items that were not
+		// the cause have a nil Code. The scan must not panic on those.
+		err := &types.TransactionCanceledException{
+			CancellationReasons: []types.CancellationReason{
+				{Code: nil},
+				{Code: nil},
+				{Code: aws.String("ConditionalCheckFailed")},
+			},
+		}
+		found, idx := HasConditionalCheckFailure(err)
+		require.True(t, found)
+		require.Equal(t, 2, idx)
+	})
+
+	t.Run("all nil codes report no failure", func(t *testing.T) {
+		err := &types.TransactionCanceledException{
+			CancellationReasons: []types.CancellationReason{{Code: nil}, {Code: nil}},
+		}
+		found, idx := HasConditionalCheckFailure(err)
+		require.False(t, found)
+		require.Equal(t, 0, idx)
+	})
+}

@@ -202,52 +202,42 @@ func TestCalculateAdditionalEvents(t *testing.T) {
 			expectedResult: 5,
 		},
 		{
-			name:           "Snapshot needed inside batch",
-			currentSeq:     3,
-			numEvents:      3, // 3 -> 4, 5 (snap), 6
-			maxSize:        5,
-			expectedResult: 2, // 2 events to reach seq 5
+			name:       "Boundary reached inside batch snapshots the whole batch",
+			currentSeq: 3,
+			numEvents:  3, // seq 4,5,6; boundary at 5 is reached
+			maxSize:    5,
+			// nextSnapshotAt = 5 - (3 % 5) = 2; numEvents (3) >= 2, so snapshot the full batch.
+			expectedResult: 3,
 		},
 		{
-			name:       "Multiple snapshots needed (should take last possible)",
+			name:       "Batch spanning multiple intervals snapshots the whole batch",
 			currentSeq: 0,
 			numEvents:  12,
 			maxSize:    5,
-			// seqs: 1,2,3,4,5(snap),6,7,8,9,10(snap),11,12
-			// The function returns how many events to apply in this batch including the ones leading up to the snapshot.
-			// nextSnapshotAt = 5 - (0 % 5) = 5
-			// numEvents (12) >= nextSnapshotAt (5)
-			// eventsAfterNextSnapshot = 12 - 5 = 7
-			// eventsAfterNextSnapshotToApply = 7 - (7 & 5)
-			// If 5 is not a power of 2, bitwise AND might be specific logic.
-			// With 7 (111) & 5 (101) = 5 (101).
-			// 7 - 5 = 2.
-			// Result = 5 + 2 = 7.
-			// Wait, previous verification said 10?
-			// Let's re-verify logic locally.
-			// 7 (binary 111). 5 (binary 101). 7 & 5 = 5.
-			// 7 - 5 = 2.
-			// Result = 5 + 2 = 7.
-			// If result is 7, it means commit 7 events (seq 1..7).
-			// Seq 7 is NOT a multiple of 5.
-			// But maybe the logic is intended for powers of 2 (snapshot size 2, 4, 8...)?
-			// If maxSize is 5, using & is weird.
-			// But sticking to existing behavior as observed.
-			expectedResult: 10,
+			// nextSnapshotAt = 5; numEvents (12) >= 5. One snapshot captures full state at seq 12.
+			expectedResult: 12,
+		},
+		{
+			name:       "Non-power-of-2 size snapshots the whole batch once a boundary is crossed",
+			currentSeq: 2,
+			numEvents:  20,
+			maxSize:    5,
+			// nextSnapshotAt = 5 - (2 % 5) = 3; numEvents (20) >= 3.
+			expectedResult: 20,
+		},
+		{
+			name:           "maxSize of zero disables snapshots",
+			currentSeq:     0,
+			numEvents:      100,
+			maxSize:        0,
+			expectedResult: 0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			actual := CalculateAdditionalEvents(tt.currentSeq, tt.numEvents, tt.maxSize)
-			if tt.name == "Multiple snapshots needed (should take last possible)" {
-				// We rely on the implementation behavior for non-power-of-2 sizes
-				// which might use bitwise AND.
-				// Just ensuring it returns a valid count > 0.
-				assert.Greater(t, actual, 0)
-			} else {
-				assert.Equal(t, tt.expectedResult, actual)
-			}
+			assert.Equal(t, tt.expectedResult, actual)
 		})
 	}
 }

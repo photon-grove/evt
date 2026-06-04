@@ -12,7 +12,9 @@ func HasConditionalCheckFailure(err error) (bool, int) {
 	var transactionCanceled *types.TransactionCanceledException
 	if errors.As(err, &transactionCanceled) {
 		for i, reason := range transactionCanceled.CancellationReasons {
-			if *reason.Code == "ConditionalCheckFailed" {
+			// Code is a *string and is nil for items that were not the cause of the
+			// cancellation, so guard before dereferencing.
+			if reason.Code != nil && *reason.Code == "ConditionalCheckFailed" {
 				return true, i
 			}
 		}

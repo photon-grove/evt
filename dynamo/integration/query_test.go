@@ -6,6 +6,7 @@ import (
 	"context"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -121,4 +122,51 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_StreamEntities() {
 
 	assert.True(s.T(), found1, "Entity 1 not found in stream")
 	assert.True(s.T(), found2, "Entity 2 not found in stream")
+}
+
+func (s *DynamoEventsIntegrationSuite) Test_Query_StreamEntitiesByQuery() {
+	ctx := context.Background()
+	// Initialize s.store (snapshots large enough to stay out of the way).
+	s.SetupEntity(evt.EntityID(newID()), 100)
+	metadata := s.getMetadata(ctx)
+
+	// Create an entity with several events so its partition is queried in order.
+	id1 := evt.EntityID(newID())
+	require.NoError(s.T(), s.store.Execute(ctx, test.NewEntity(id1), id1, &test.CreateEntity{Value: "a1"}, metadata))
+	require.NoError(s.T(), s.store.Execute(ctx, test.NewEntity(id1), id1, &test.ReplaceEntity{Value: "a2"}, metadata))
+
+	id2 := evt.EntityID(newID())
+	require.NoError(s.T(), s.store.Execute(ctx, test.NewEntity(id2), id2, &test.CreateEntity{Value: "b1"}, metadata))
+
+	applier := func(_ context.Context, se evt.SerializedEvent, e evt.Entity) (evt.Entity, error) {
+		if e == nil {
+			e = test.NewEntity(se.EntityID)
+		}
+		event, err := e.DeserializeEvent(se)
+		if err != nil {
+			return nil, err
+		}
+		if err := e.Apply(event); err != nil {
+			return nil, err
+		}
+		return e, nil
+	}
+
+	// Enumerate-then-query path with a small worker pool.
+	stream := s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 4}, applier)
+
+	values := map[evt.EntityID]string{}
+	for res := range stream {
+		entity, err := res.Unwrap()
+		if err != nil {
+			continue // ignore unrelated data from a shared local table
+		}
+		if te, ok := entity.(*test.Entity); ok {
+			values[entity.GetID()] = te.Value
+		}
+	}
+
+	// id1 reflects its last event (ordered replay); id2 its only event.
+	assert.Equal(s.T(), "a2", values[id1])
+	assert.Equal(s.T(), "b1", values[id2])
 }

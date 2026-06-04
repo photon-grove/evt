@@ -34,6 +34,13 @@ const maxBatchWriteItems = 25
 const maxBatchGetItems = 100
 const maxBatchGetRetries = 3
 
+// Compile-time checks that the DynamoDB view repository satisfies both the core read/write
+// interface and the optional streaming interface.
+var (
+	_ evt.ViewRepository = (*ViewRepository)(nil)
+	_ evt.ViewStreamer   = (*ViewRepository)(nil)
+)
+
 // NewViewRepository constructs a view repository for the given table.
 func NewViewRepository(client Client, viewsTable string) evt.ViewRepository {
 	encoder := attributevalue.NewEncoder(func(opts *attributevalue.EncoderOptions) {
@@ -312,7 +319,26 @@ func (repo *ViewRepository) toSerializedView(view View) *evt.SerializedView {
 }
 
 // ListViewsByEntityType queries the entity views table via a GSI for the provided entity type.
+//
+// It buffers the full result set; for large entity types use ListViewsByEntityTypePaged or
+// ListViewsByEntityTypeEach instead.
 func (repo *ViewRepository) ListViewsByEntityType(ctx context.Context, entityType evt.EntityType) ([]*evt.SerializedView, error) {
+	views := make([]*evt.SerializedView, 0)
+
+	err := repo.ListViewsByEntityTypeEach(ctx, entityType, func(view *evt.SerializedView) error {
+		views = append(views, view)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return views, nil
+}
+
+// ListViewsByEntityTypeEach streams views for the provided entity type via the entityType GSI,
+// invoking fn per view without buffering the whole result set.
+func (repo *ViewRepository) ListViewsByEntityTypeEach(ctx context.Context, entityType evt.EntityType, fn func(*evt.SerializedView) error) error {
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
 		IndexName:              aws.String(entityTypeIndexName),
@@ -322,29 +348,7 @@ func (repo *ViewRepository) ListViewsByEntityType(ctx context.Context, entityTyp
 		},
 	}
 
-	paginator := dynamodb.NewQueryPaginator(repo.client, &input)
-	views := make([]*evt.SerializedView, 0)
-
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if page == nil {
-			continue
-		}
-
-		for _, item := range page.Items {
-			var view View
-			if err := repo.unmarshalMap(item, &view); err != nil {
-				return nil, err
-			}
-
-			views = append(views, repo.toSerializedView(view))
-		}
-	}
-
-	return views, nil
+	return repo.eachViewPage(ctx, &input, fn)
 }
 
 // ListViewsByEntityTypePaged queries by entity type with cursor-based pagination.
@@ -434,7 +438,26 @@ func decodeCursor(cursor string) (map[string]types.AttributeValue, error) {
 
 // ListViewsByPK queries all views with the given partition key.
 // Used for composite key tables where pk identifies a collection (e.g., USER#<id>#teams).
+//
+// It buffers the full result set; for partition keys with many rows use ListViewsByPKPaged or
+// ListViewsByPKEach instead.
 func (repo *ViewRepository) ListViewsByPK(ctx context.Context, pk string) ([]*evt.SerializedView, error) {
+	views := make([]*evt.SerializedView, 0)
+
+	err := repo.ListViewsByPKEach(ctx, pk, func(view *evt.SerializedView) error {
+		views = append(views, view)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return views, nil
+}
+
+// ListViewsByPKEach streams views for the given partition key, invoking fn per view without
+// buffering the whole result set.
+func (repo *ViewRepository) ListViewsByPKEach(ctx context.Context, pk string, fn func(*evt.SerializedView) error) error {
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
 		KeyConditionExpression: aws.String("pk = :pk"),
@@ -443,13 +466,22 @@ func (repo *ViewRepository) ListViewsByPK(ctx context.Context, pk string) ([]*ev
 		},
 	}
 
-	paginator := dynamodb.NewQueryPaginator(repo.client, &input)
-	views := make([]*evt.SerializedView, 0)
+	return repo.eachViewPage(ctx, &input, fn)
+}
+
+// eachViewPage paginates the given query and invokes fn for each decoded view. Iteration stops and
+// the error is returned when fn returns an error, a page fails to load, or the context is cancelled.
+func (repo *ViewRepository) eachViewPage(ctx context.Context, input *dynamodb.QueryInput, fn func(*evt.SerializedView) error) error {
+	paginator := dynamodb.NewQueryPaginator(repo.client, input)
 
 	for paginator.HasMorePages() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if page == nil {
 			continue
@@ -458,14 +490,16 @@ func (repo *ViewRepository) ListViewsByPK(ctx context.Context, pk string) ([]*ev
 		for _, item := range page.Items {
 			var view View
 			if err := repo.unmarshalMap(item, &view); err != nil {
-				return nil, err
+				return err
 			}
 
-			views = append(views, repo.toSerializedView(view))
+			if err := fn(repo.toSerializedView(view)); err != nil {
+				return err
+			}
 		}
 	}
 
-	return views, nil
+	return nil
 }
 
 // ListViewsByPKPaged queries one partition key with a bounded result page.

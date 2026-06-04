@@ -191,14 +191,18 @@ type TransactionGroup interface {
 
 ### Snapshot Timing
 
-- Controlled by `snapshotSize` parameter (default: 5)
-- `CalculateAdditionalEvents(currentSequence, numEvents, maxSize)` determines when to snapshot
+- Controlled by `snapshotSize` parameter (default: 5); a size of 0 or less disables snapshots
+- `CalculateAdditionalEvents(currentSequence, numEvents, maxSize)` decides whether a commit takes a
+  snapshot: it returns 0 when the batch does not reach the next snapshot boundary, otherwise the
+  full batch length
+- When a snapshot is taken it captures the entity state through the **last** event in the batch, so
+  `eventSeq` always equals that last event's sequence and the payload is consistent with it
 
 ### Snapshot Creation
 
-1. Apply events up to snapshot point
+1. Apply the batch's events to the entity
 2. Increment snapshot sequence (`seq`)
-3. Record current event sequence (`eventSeq`)
+3. Record the last event sequence (`eventSeq`)
 4. Marshal entity state to JSON payload
 
 ### Entity Loading Priority
