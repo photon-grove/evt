@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/photon-grove/evt/compare/v0.2.0...v0.3.0) (2026-06-04)
+
+
+### Features
+
+* **dynamo:** per-entity-type TTL retention for transient streams ([#19](https://github.com/photon-grove/evt/issues/19)) ([f07b38c](https://github.com/photon-grove/evt/commit/f07b38c76ecd51c726df13b4a50416e0c0aca611))
+
 ## [0.2.0](https://github.com/photon-grove/evt/compare/v0.1.0...v0.2.0) (2026-06-04)
 
 
