@@ -1,5 +1,5 @@
 actionlint = "~1.7"
-go = "1.26.3"
+go = "1.26.4"
 golangci-lint = "~2.12"
 moon = "2.2.4"
 node = "~24.5"
