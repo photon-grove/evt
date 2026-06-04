@@ -79,7 +79,7 @@ func WithAddress(address string) MetadataOption {
 }
 
 // NewMetadata initializes a Metadata k-v store
-func NewMetadata(ctx context.Context, region *string, opts ...MetadataOption) Metadata {
+func NewMetadata(_ context.Context, region *string, opts ...MetadataOption) Metadata {
 	m := Metadata{}
 
 	// Add the Region, which should always be in the Metadata

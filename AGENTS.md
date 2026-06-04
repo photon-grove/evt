@@ -63,7 +63,7 @@
 
 - Package manager: `pnpm` 10.x.
 - Node: 24.x, with Moon configured around Node `~24.5`.
-- Go toolchain: Go 1.25.9 via `go.mod`.
+- Go toolchain: Go 1.26.3 via `go.mod`.
 - Common commands:
   - Install dependencies: `pnpm install`
   - Go tests: `go test ./...`

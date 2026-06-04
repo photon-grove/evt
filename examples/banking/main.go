@@ -1,3 +1,4 @@
+// Command banking is a runnable example of an evt-based event-sourced aggregate.
 package main
 
 import (
