@@ -60,6 +60,7 @@ func NewRuntime(projector Projector, idempotency IdempotencyGuard, logger *slog.
 	}
 }
 
+// Logger returns the runtime's logger, falling back to slog.Default() when unset.
 func (r *Runtime) Logger() *slog.Logger {
 	if r == nil || r.logger == nil {
 		return slog.Default()

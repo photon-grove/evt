@@ -1,8 +1,8 @@
 module github.com/photon-grove/evt
 
-go 1.25.0
+go 1.26.0
 
-toolchain go1.25.9
+toolchain go1.26.3
 
 require (
 	github.com/aws/aws-lambda-go v1.54.0

@@ -3,6 +3,7 @@ package evt
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
@@ -357,7 +358,7 @@ func Test_Metadata_ConcurrentCreation(t *testing.T) {
 
 	for i := 0; i < numRoutines; i++ {
 		go func(id int) {
-			cmdID := CommandID("cmd-" + string(rune('0'+id)))
+			cmdID := CommandID("cmd-" + strconv.Itoa(id))
 			metadata := NewMetadata(ctx, &region, WithCommandID(cmdID))
 			results <- metadata
 		}(i)

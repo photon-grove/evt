@@ -1,3 +1,4 @@
+// Command evt-doctor is a CLI for inspecting and diagnosing an evt DynamoDB event log.
 package main
 
 import (
