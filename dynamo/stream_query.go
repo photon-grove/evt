@@ -39,9 +39,12 @@ type StreamByQueryOptions struct {
 // during enumeration plus up to Workers in-flight aggregates, rather than the entire event log. It
 // is the preferred source for RebuildProjectionsFromStream on large tables.
 //
-// Note: enumeration is a key-only Scan, so it still reads every row once (cheaply, keys only) and
-// holds the distinct IDs in memory. For constant-memory enumeration, back it with a dedicated
-// per-entity index or registry instead.
+// Note on cost: enumeration is still a table Scan. The ProjectionExpression on pk reduces the data
+// returned, but DynamoDB charges scan read capacity by the size of the items read, not the
+// attributes projected — so enumeration consumes read capacity comparable to scanning the full log
+// and holds the distinct IDs in memory. The win is bounded memory, streaming output, and parallel
+// per-entity queries, not lower read cost. For genuinely cheaper, constant-memory enumeration, back
+// it with a dedicated per-entity index or registry instead.
 func (repo *Repository) StreamEntitiesByQuery(
 	ctx context.Context,
 	opts StreamByQueryOptions,
@@ -91,16 +94,26 @@ func (repo *Repository) StreamEntitiesByQuery(
 				for id := range ids {
 					events, err := repo.GetEvents(ctx, id)
 					if err != nil {
-						repo.sendEntity(ctx, results, result.Err[evt.Entity](fmt.Errorf("querying entity %s: %w", id, err)))
+						if !repo.sendEntity(ctx, results, result.Err[evt.Entity](fmt.Errorf("querying entity %s: %w", id, err))) {
+							return
+						}
+
 						continue
 					}
 
 					entity, ok := repo.buildEntity(ctx, id, events, applyEvent, results, logger)
 					if !ok {
+						// buildEntity reported an apply error (or produced no entity); keep going.
+						if ctx.Err() != nil {
+							return
+						}
+
 						continue
 					}
 
-					repo.sendEntity(ctx, results, result.Ok(entity))
+					if !repo.sendEntity(ctx, results, result.Ok(entity)) {
+						return
+					}
 				}
 			}()
 		}

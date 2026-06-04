@@ -329,9 +329,12 @@ func Test_ViewRepository_ListViewsByEntityTypeEach_StreamsAndStops(t *testing.T)
 	// Registered Once: a second Query (for page two) would be an unexpected call and fail the test.
 	client.On("Query", mock.Anything, mock.Anything, mock.Anything).Return(page1, nil).Once()
 
+	streamer, ok := repo.(evt.ViewStreamer)
+	require.True(t, ok, "dynamo view repository should implement evt.ViewStreamer")
+
 	stop := errors.New("stop")
 	seen := make([]string, 0, 1)
-	err := repo.ListViewsByEntityTypeEach(ctx, evt.EntityType("t1"), func(view *evt.SerializedView) error {
+	err := streamer.ListViewsByEntityTypeEach(ctx, evt.EntityType("t1"), func(view *evt.SerializedView) error {
 		seen = append(seen, view.PK)
 		return stop
 	})
@@ -354,8 +357,11 @@ func Test_ViewRepository_ListViewsByPKEach_Streams(t *testing.T) {
 	}
 	client.On("Query", mock.Anything, mock.Anything, mock.Anything).Return(out, nil).Once()
 
+	streamer, ok := repo.(evt.ViewStreamer)
+	require.True(t, ok, "dynamo view repository should implement evt.ViewStreamer")
+
 	seen := make([]string, 0, 2)
-	err := repo.ListViewsByPKEach(ctx, "pk1", func(view *evt.SerializedView) error {
+	err := streamer.ListViewsByPKEach(ctx, "pk1", func(view *evt.SerializedView) error {
 		seen = append(seen, view.SK)
 		return nil
 	})

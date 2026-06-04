@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/photon-grove/evt"
@@ -635,4 +636,36 @@ func stringPtr(s string) *string {
 
 func intPtr(i evt.EventSequence) *evt.EventSequence {
 	return &i
+}
+
+// Test_EventStore_MultiBoundaryBatch_ReloadIsCurrent is a regression test for the snapshot-timing
+// bug where a commit batch crossing a snapshot boundary captured only a partial prefix while the
+// repository recorded the snapshot's eventSeq as the last event. Reloading then restored stale
+// state. It commits a single batch that spans multiple boundaries (10 events, snapshot size 5) and
+// asserts the reloaded entity reflects the final event.
+func Test_EventStore_MultiBoundaryBatch_ReloadIsCurrent(t *testing.T) {
+	setup := newTestSetup(t, "batch-id", 5)
+	metadata := newTestMetadata()
+	otherValue := "o"
+
+	// Build a single 10-event batch: 1 create + 9 replaces. The last replace sets the final value.
+	results := []evt.CommandResult{
+		handleCommand(t, setup.entity, &test.CreateEntity{Value: "v0", Other: &otherValue}),
+	}
+	var finalValue string
+	for i := 1; i <= 9; i++ {
+		finalValue = "v" + strconv.Itoa(i)
+		results = append(results, handleCommand(t, setup.entity, &test.ReplaceEntity{Value: finalValue, Other: &otherValue}))
+	}
+
+	commitEvents(t, setup.store, combineResults(results...), setup.eventContext, metadata)
+
+	// The snapshot should cover the full batch (eventSeq == 10).
+	snapshot := getSnapshot(t, setup.repo, setup.entityID)
+	require.NotNil(t, snapshot)
+	require.Equal(t, evt.EventSequence(10), snapshot.EventSequence)
+
+	// Reloading from snapshot + tail must reflect the final event, not a stale prefix.
+	setup.refresh(t)
+	require.Equal(t, finalValue, setup.entity.Value)
 }

@@ -89,36 +89,6 @@ func (r *fakeRepo) ListViewsByPKPaged(ctx context.Context, pk string, _ int, _ s
 	return &evt.PagedResult{Views: views}, err
 }
 
-func (r *fakeRepo) ListViewsByEntityTypeEach(ctx context.Context, entityType evt.EntityType, fn func(*evt.SerializedView) error) error {
-	views, err := r.ListViewsByEntityType(ctx, entityType)
-	if err != nil {
-		return err
-	}
-
-	for _, view := range views {
-		if err := fn(view); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (r *fakeRepo) ListViewsByPKEach(ctx context.Context, pk string, fn func(*evt.SerializedView) error) error {
-	views, err := r.ListViewsByPK(ctx, pk)
-	if err != nil {
-		return err
-	}
-
-	for _, view := range views {
-		if err := fn(view); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 type testItem struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`

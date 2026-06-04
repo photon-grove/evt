@@ -34,6 +34,13 @@ const maxBatchWriteItems = 25
 const maxBatchGetItems = 100
 const maxBatchGetRetries = 3
 
+// Compile-time checks that the DynamoDB view repository satisfies both the core read/write
+// interface and the optional streaming interface.
+var (
+	_ evt.ViewRepository = (*ViewRepository)(nil)
+	_ evt.ViewStreamer   = (*ViewRepository)(nil)
+)
+
 // NewViewRepository constructs a view repository for the given table.
 func NewViewRepository(client Client, viewsTable string) evt.ViewRepository {
 	encoder := attributevalue.NewEncoder(func(opts *attributevalue.EncoderOptions) {

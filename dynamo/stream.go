@@ -69,7 +69,7 @@ func (repo *Repository) StreamEntities(
 		for eventResults := range repo.StreamAllEvents(ctx, expr) {
 			serialized, err := eventResults.Unwrap()
 			if err != nil {
-				results <- result.Err[evt.Entity](err)
+				repo.sendEntity(ctx, results, result.Err[evt.Entity](err))
 				continue
 			}
 
@@ -88,7 +88,7 @@ func (repo *Repository) StreamEntities(
 		}
 
 		if ctx.Err() != nil {
-			results <- result.Err[evt.Entity](ctx.Err())
+			repo.sendEntity(ctx, results, result.Err[evt.Entity](ctx.Err()))
 			return
 		}
 
@@ -98,7 +98,9 @@ func (repo *Repository) StreamEntities(
 				continue
 			}
 
-			results <- result.Ok(entity)
+			if !repo.sendEntity(ctx, results, result.Ok(entity)) {
+				return
+			}
 		}
 	}()
 
