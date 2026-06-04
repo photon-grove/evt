@@ -198,10 +198,10 @@ func (store *Store) Execute(
 		return err
 	}
 
-	// Ensure the entity's internal ID matches the store key. Event metadata may
-	// carry an abbreviated ID (e.g. "portfolio:BTC-USD") while the store key
-	// includes strategy scope and date window (e.g. "portfolio:grid:BTC-USD:2026-02-23").
-	// Without this, projectors write views to the wrong PK.
+	// Ensure the entity's internal ID matches the store key. An entity may carry
+	// an abbreviated internal ID (e.g. "account:123") while the store key is a
+	// fuller composite key (e.g. "account:tenant-a:123:2026-02-23"). Without this,
+	// projectors write views to the wrong PK.
 	if setter, ok := entity.(interface{ SetID(evt.EntityID) }); ok {
 		setter.SetID(entityID)
 	}
