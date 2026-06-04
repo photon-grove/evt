@@ -133,7 +133,8 @@ func (repo *Repository) buildEventPutTransactions(serializedEvents []evt.Seriali
 			return nil, currentSequence, err
 		}
 
-		// Create the serialized representation of a DynamoDB Event
+		// Create the serialized representation of a DynamoDB Event. TTL is non-zero only when the
+		// entity type has a retention policy; otherwise omitempty drops the attribute entirely.
 		evt := Event{
 			PK:         event.EntityID,
 			SK:         event.Sequence,
@@ -142,6 +143,7 @@ func (repo *Repository) buildEventPutTransactions(serializedEvents []evt.Seriali
 			Type:       event.Type,
 			Payload:    string(event.Payload),
 			Metadata:   string(metadataBytes),
+			TTL:        repo.ttlFor(event.EntityType),
 		}
 
 		// Convert to a map of AttributeValues
@@ -180,7 +182,9 @@ func (repo *Repository) buildSnapshotPutTransactions(
 		return nil, err
 	}
 
-	// Create the serialized representation of a DynamoDB Snapshot (inline at sk=0)
+	// Create the serialized representation of a DynamoDB Snapshot (inline at sk=0). TTL mirrors the
+	// events' policy so a snapshot never outlives the stream it summarizes; omitempty drops it for
+	// un-policed entity types.
 	event := Snapshot{
 		PK:            entityID,
 		SK:            0,
@@ -188,6 +192,7 @@ func (repo *Repository) buildSnapshotPutTransactions(
 		EventSequence: currentSequence,
 		EntityType:    entityType,
 		Payload:       string(payload),
+		TTL:           repo.ttlFor(entityType),
 	}
 
 	// Convert to a map of AttributeValues

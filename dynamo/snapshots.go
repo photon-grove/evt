@@ -11,4 +11,8 @@ type Snapshot struct {
 	EventSequence evt.EventSequence `json:"eventSeq"`   // the last event sequence at the time of snapshotting
 	EntityType    evt.EntityType    `json:"entityType"` // the entity type
 	Payload       string            `json:"payload"`    // JSON-serialized entity state
+	// TTL is the optional DynamoDB time-to-live expiry (Unix epoch seconds), written only for entity
+	// types covered by a Repository retention policy so an inline snapshot never outlives the events it
+	// summarizes. The omitempty tag drops it for un-policed types. See Repository.WithRetention.
+	TTL int64 `json:"ttl,omitempty"`
 }

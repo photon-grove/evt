@@ -105,6 +105,21 @@ and is excluded from production builds (`-tags prod`); use `CompactBelow` for
 principled truncation. See
 [ADR 0001](docs/adr/0001-event-compaction-and-snapshot-truncation.md).
 
+For **terminal, short-lived, fully transient** entity types — process/scaffolding
+streams that drive a one-time side effect and that no projection rebuild ever
+replays — a per-entity-type retention policy
+(`dynamo.Repository.WithRetention(dynamo.Retention{...})`) stamps a DynamoDB `ttl`
+attribute on those rows so the table auto-expires them after the configured
+duration. This is selective by design: only policy'd entity types ever carry a
+`ttl`; durable types are written without one and are never expired. Because
+DynamoDB TTL expires items individually (it cannot atomically drop a whole stream),
+each event is stamped `committedAt + duration` — so retention is safe **only** when
+a stream's entire lifetime is much shorter than the duration and it is not appended
+to after going terminal; otherwise an older prefix can expire while newer events
+survive and a load replays a partial suffix. Use it only when a wipe-and-replay does
+not depend on the events; for streams that accumulate events over time, keep a
+snapshot and use compaction instead. See the `dynamo.Retention` doc comment.
+
 See [`BEHAVIORAL_INVARIANTS.md`](BEHAVIORAL_INVARIANTS.md) for the exact
 serialization and DynamoDB schema guarantees.
 
