@@ -100,7 +100,7 @@ func (r *fakeRepo) StreamAllEvents(_ context.Context, _ *expression.Expression) 
 	return ch
 }
 func (r *fakeRepo) StreamEntities(
-	_ context.Context,
+	ctx context.Context,
 	_ *expression.Expression,
 	_ func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
 ) <-chan result.Result[evt.Entity] {
@@ -108,11 +108,19 @@ func (r *fakeRepo) StreamEntities(
 	go func() {
 		defer close(ch)
 		if r.streamErr != nil {
-			ch <- result.Err[evt.Entity](r.streamErr)
+			select {
+			case ch <- result.Err[evt.Entity](r.streamErr):
+			case <-ctx.Done():
+			}
 			return
 		}
 		for _, e := range r.entities {
-			ch <- result.Ok(e)
+			// Honor cancellation so an early-returning consumer does not strand this producer.
+			select {
+			case ch <- result.Ok(e):
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 	return ch
