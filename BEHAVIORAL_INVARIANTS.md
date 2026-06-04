@@ -1,7 +1,7 @@
 # Go evt Library - Behavioral Invariants
 
 This document captures the behavioral guarantees, serialization formats, error conditions, and key
-invariants of the `go/evt` library.
+invariants of the `evt` library.
 
 ## Core Types
 
