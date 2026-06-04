@@ -96,17 +96,15 @@ func (repo *ViewRepository) GetView(ctx context.Context, pk string) (*evt.Serial
 // that exist are returned; missing keys are omitted and order is not guaranteed,
 // so callers should index the result by PK or by a payload identifier. Reads are
 // strongly consistent to match GetView. Use BatchGetViewsAtSK to batch rows
-// stored at a non-default sort key (e.g. projections.DetailSK).
+// stored at a non-default sort key.
 func (repo *ViewRepository) BatchGetViews(ctx context.Context, pks []string) ([]*evt.SerializedView, error) {
 	return repo.BatchGetViewsAtSK(ctx, pks, evt.DefaultViewSK)
 }
 
 // BatchGetViewsAtSK retrieves multiple views by partition key at the given sort
 // key. It shares BatchGetViews' de-duplication, chunking, retry, and strong-read
-// semantics; only the sort key differs. Callers reading detail rows that live at
-// a custom SK (the review-detail and catalog-item rows are materialized at
-// projections.DetailSK) batch them through here instead of the DefaultViewSK
-// shorthand.
+// semantics; only the sort key differs. Callers reading rows that live at a custom
+// sort key batch them through here instead of the DefaultViewSK shorthand.
 func (repo *ViewRepository) BatchGetViewsAtSK(ctx context.Context, pks []string, sk string) ([]*evt.SerializedView, error) {
 	keys := make([]map[string]types.AttributeValue, 0, len(pks))
 	seen := make(map[string]struct{}, len(pks))
@@ -208,8 +206,8 @@ func (repo *ViewRepository) PutView(ctx context.Context, view *evt.SerializedVie
 // PutViews writes/replaces multiple views, coalescing them into BatchWriteItem
 // requests of up to maxBatchWriteItems each and retrying UnprocessedItems. nil
 // views are skipped. This lets hot-path callers that emit many views per record
-// (e.g. catalog materialization) collapse N single-item writes into ceil(N/25)
-// round trips. If SK is empty on a view, it defaults to "VIEW".
+// (e.g. one record fanning out to several views) collapse N single-item writes
+// into ceil(N/25) round trips. If SK is empty on a view, it defaults to "VIEW".
 func (repo *ViewRepository) PutViews(ctx context.Context, views []*evt.SerializedView) error {
 	writes := make([]types.WriteRequest, 0, len(views))
 	for _, view := range views {

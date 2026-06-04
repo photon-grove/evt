@@ -71,7 +71,18 @@ func (r *Runtime) Logger() *slog.Logger {
 
 // Process runs the projector over the given records, skipping already-processed
 // events (idempotency) and classifying errors for retry vs DLQ routing.
-// It returns partial batch failures for records that should be retried.
+//
+// On a batch-level projector error, the error is classified:
+//   - Permanent: the batch's records are reported as partial-batch failures
+//     ([]BatchItemFailure). Lambda retries them up to the event source mapping's
+//     configured limit and then routes them to its on-failure destination (DLQ);
+//     there is no handler-initiated "send straight to DLQ" in Lambda.
+//   - Transient or unknown: the error is returned so Lambda fails and retries the
+//     whole invocation.
+//
+// Per-record failures returned by the projector itself (with a nil error) are
+// passed through as partial-batch failures and the successful records are marked
+// processed for idempotency.
 func (r *Runtime) Process(ctx context.Context, records []StreamRecord) ([]BatchItemFailure, error) {
 	logger := r.Logger().With("projector", r.projector.Name())
 

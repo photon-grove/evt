@@ -1,6 +1,8 @@
 package dynamo
 
 import (
+	"fmt"
+
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
@@ -10,9 +12,12 @@ func (repo *Repository) marshalMap(in any) (map[string]types.AttributeValue, err
 	if err != nil {
 		return nil, err
 	}
+	if av == nil {
+		return nil, fmt.Errorf("encoder returned nil AttributeValue")
+	}
 	asMap, ok := av.(*types.AttributeValueMemberM)
-	if !ok || av == nil {
-		return nil, err
+	if !ok {
+		return nil, fmt.Errorf("encoder returned unexpected AttributeValue type: %T, expected *types.AttributeValueMemberM", av)
 	}
 	return asMap.Value, nil
 }
