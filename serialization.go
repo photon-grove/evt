@@ -183,18 +183,29 @@ func DeserializeEvent(serializedEvent SerializedEvent, entity Entity) (Event, er
 	return deserializedEvent, nil
 }
 
-// CalculateAdditionalEvents calculates the number of additional events that can be applied
-// after the next snapshot is taken.
+// CalculateAdditionalEvents reports how many events from a commit batch should be folded into a
+// snapshot, given the entity's current sequence, the number of events in the batch, and the
+// snapshot interval (maxSize).
+//
+// It returns 0 when the batch does not reach the next snapshot boundary, meaning no snapshot is
+// taken for this commit. Otherwise it returns numEvents: a snapshot is written capturing the
+// entity state through the entire batch.
+//
+// The full batch is captured (rather than only the events up to the boundary) because both the
+// in-memory and DynamoDB repositories record the snapshot's EventSequence as the last event in the
+// batch. Capturing a partial batch would leave the snapshot payload inconsistent with that recorded
+// sequence, so a reload would restore stale state. A maxSize of 0 or less disables snapshots.
 func CalculateAdditionalEvents(currentSequence EventSequence, numEvents int, maxSize int) int {
+	if maxSize <= 0 {
+		return 0
+	}
+
 	nextSnapshotAt := maxSize - (int(currentSequence) % maxSize)
 	if numEvents < nextSnapshotAt {
 		return 0
 	}
 
-	eventsAfterNextSnapshot := numEvents - nextSnapshotAt
-	eventsAfterNextSnapshotToApply := eventsAfterNextSnapshot - (eventsAfterNextSnapshot & maxSize)
-
-	return nextSnapshotAt + eventsAfterNextSnapshotToApply
+	return numEvents
 }
 
 // ByCommandID allows you to sort SerializedEvents by the CommandID in the Metadata, falling back to

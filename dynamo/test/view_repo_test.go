@@ -305,3 +305,61 @@ func Test_ViewRepository_ListViewsByPKPaged(t *testing.T) {
 
 	client.AssertExpectations(t)
 }
+
+func Test_ViewRepository_ListViewsByEntityTypeEach_StreamsAndStops(t *testing.T) {
+	ctx := context.Background()
+	client := dynamomock.NewClient()
+	repo := dynamo.NewViewRepository(client, "views")
+
+	// Two pages available. fn stops after the first item, so the second page must never be fetched.
+	page1 := &dynamodb.QueryOutput{
+		Items: []map[string]types.AttributeValue{
+			{
+				"pk":         &types.AttributeValueMemberS{Value: "pk1"},
+				"entityID":   &types.AttributeValueMemberS{Value: "e1"},
+				"entityType": &types.AttributeValueMemberS{Value: "t1"},
+				"payload":    &types.AttributeValueMemberS{Value: `{}`},
+			},
+		},
+		LastEvaluatedKey: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "pk1"},
+		},
+	}
+
+	// Registered Once: a second Query (for page two) would be an unexpected call and fail the test.
+	client.On("Query", mock.Anything, mock.Anything, mock.Anything).Return(page1, nil).Once()
+
+	stop := errors.New("stop")
+	seen := make([]string, 0, 1)
+	err := repo.ListViewsByEntityTypeEach(ctx, evt.EntityType("t1"), func(view *evt.SerializedView) error {
+		seen = append(seen, view.PK)
+		return stop
+	})
+
+	require.ErrorIs(t, err, stop)
+	require.Equal(t, []string{"pk1"}, seen)
+	client.AssertExpectations(t)
+}
+
+func Test_ViewRepository_ListViewsByPKEach_Streams(t *testing.T) {
+	ctx := context.Background()
+	client := dynamomock.NewClient()
+	repo := dynamo.NewViewRepository(client, "views")
+
+	out := &dynamodb.QueryOutput{
+		Items: []map[string]types.AttributeValue{
+			{"pk": &types.AttributeValueMemberS{Value: "pk1"}, "sk": &types.AttributeValueMemberS{Value: "a"}, "payload": &types.AttributeValueMemberS{Value: `{}`}},
+			{"pk": &types.AttributeValueMemberS{Value: "pk1"}, "sk": &types.AttributeValueMemberS{Value: "b"}, "payload": &types.AttributeValueMemberS{Value: `{}`}},
+		},
+	}
+	client.On("Query", mock.Anything, mock.Anything, mock.Anything).Return(out, nil).Once()
+
+	seen := make([]string, 0, 2)
+	err := repo.ListViewsByPKEach(ctx, "pk1", func(view *evt.SerializedView) error {
+		seen = append(seen, view.SK)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b"}, seen)
+	client.AssertExpectations(t)
+}

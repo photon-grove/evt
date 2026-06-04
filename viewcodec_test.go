@@ -67,6 +67,21 @@ func (r *codecTestRepo) ListViewsByEntityTypePaged(_ context.Context, entityType
 	}, nil
 }
 
+func (r *codecTestRepo) ListViewsByEntityTypeEach(ctx context.Context, entityType EntityType, fn func(*SerializedView) error) error {
+	views, err := r.ListViewsByEntityType(ctx, entityType)
+	if err != nil {
+		return err
+	}
+
+	for _, view := range views {
+		if err := fn(view); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (r *codecTestRepo) ListViewsByPK(_ context.Context, pk string) ([]*SerializedView, error) {
 	out := make([]*SerializedView, 0, len(r.views))
 	for _, view := range r.views {
@@ -79,6 +94,21 @@ func (r *codecTestRepo) ListViewsByPK(_ context.Context, pk string) ([]*Serializ
 		out = append(out, &dup)
 	}
 	return out, nil
+}
+
+func (r *codecTestRepo) ListViewsByPKEach(ctx context.Context, pk string, fn func(*SerializedView) error) error {
+	views, err := r.ListViewsByPK(ctx, pk)
+	if err != nil {
+		return err
+	}
+
+	for _, view := range views {
+		if err := fn(view); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (r *codecTestRepo) ListViewsByPKPaged(ctx context.Context, pk string, _ int, _ string) (*PagedResult, error) {

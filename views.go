@@ -35,19 +35,37 @@ type ViewRepository interface {
 	PutView(ctx context.Context, view *SerializedView) error
 
 	// ListViewsByEntityType returns serialized views for the provided entity type.
+	//
+	// This buffers the entire result set in memory. For large entity types prefer
+	// ListViewsByEntityTypePaged (caller-driven paging) or ListViewsByEntityTypeEach
+	// (bounded-memory streaming).
 	ListViewsByEntityType(ctx context.Context, entityType EntityType) ([]*SerializedView, error)
 
 	// ListViewsByEntityTypePaged returns a page of views for the provided entity type.
 	// limit controls page size; cursor is an opaque pagination token (empty for the first page).
 	ListViewsByEntityTypePaged(ctx context.Context, entityType EntityType, limit int, cursor string) (*PagedResult, error)
 
+	// ListViewsByEntityTypeEach streams views for the provided entity type, invoking fn for each
+	// view without buffering the whole result set. Iteration stops and the error is returned if fn
+	// returns an error or the context is cancelled.
+	ListViewsByEntityTypeEach(ctx context.Context, entityType EntityType, fn func(*SerializedView) error) error
+
 	// ListViewsByPK returns all serialized views for the given partition key.
 	// Used for composite keys where pk identifies a collection (e.g., USER#<id>#teams).
+	//
+	// This buffers the entire result set in memory. For partition keys that can hold many rows
+	// prefer ListViewsByPKPaged (caller-driven paging) or ListViewsByPKEach (bounded-memory
+	// streaming).
 	ListViewsByPK(ctx context.Context, pk string) ([]*SerializedView, error)
 
 	// ListViewsByPKPaged returns a page of views for the given partition key.
 	// limit controls page size; cursor is an opaque pagination token (empty for the first page).
 	ListViewsByPKPaged(ctx context.Context, pk string, limit int, cursor string) (*PagedResult, error)
+
+	// ListViewsByPKEach streams views for the given partition key, invoking fn for each view
+	// without buffering the whole result set. Iteration stops and the error is returned if fn
+	// returns an error or the context is cancelled.
+	ListViewsByPKEach(ctx context.Context, pk string, fn func(*SerializedView) error) error
 }
 
 // NewJSONViewValueFunc creates a destination value for JSON view decoding.
