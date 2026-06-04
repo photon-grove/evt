@@ -91,3 +91,42 @@ func (s *RepositorySuite) Test_GetSnapshot_Error() {
 	require.Contains(s.T(), err.Error(), expectedError)
 	s.client.AssertExpectations(s.T())
 }
+
+// Test PutSnapshot writes with a monotonic-floor condition expression.
+func (s *RepositorySuite) Test_PutSnapshot_UsesMonotonicCondition() {
+	ctx := context.Background()
+
+	s.client.On("PutItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.PutItemInput) bool {
+		return in.ConditionExpression != nil && *in.ConditionExpression == "attribute_not_exists(eventSeq) OR eventSeq <= :new"
+	}), mock.Anything).Return(&dynamodb.PutItemOutput{}, nil)
+
+	err := s.repo.PutSnapshot(ctx, "test", "id-1", []byte("{}"), 1, 6)
+	require.NoError(s.T(), err)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test PutSnapshot treats a regressing write (rejected by the condition) as a silent no-op.
+func (s *RepositorySuite) Test_PutSnapshot_NoOpOnRegression() {
+	ctx := context.Background()
+
+	s.client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
+		Return((*dynamodb.PutItemOutput)(nil), &types.ConditionalCheckFailedException{})
+
+	// A regression attempt must not surface as an error — the existing newer snapshot already covers it.
+	err := s.repo.PutSnapshot(ctx, "test", "id-1", []byte("{}"), 2, 3)
+	require.NoError(s.T(), err)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test PutSnapshot propagates non-conditional errors.
+func (s *RepositorySuite) Test_PutSnapshot_PropagatesError() {
+	ctx := context.Background()
+
+	s.client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
+		Return((*dynamodb.PutItemOutput)(nil), errors.New("put failed"))
+
+	err := s.repo.PutSnapshot(ctx, "test", "id-1", []byte("{}"), 1, 6)
+	require.Error(s.T(), err)
+	require.Contains(s.T(), err.Error(), "put failed")
+	s.client.AssertExpectations(s.T())
+}

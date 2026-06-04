@@ -30,6 +30,14 @@ type RebuildConfig struct {
 	// Zero means no limit.
 	MaxErrors int
 
+	// SeedEntity, when non-nil, switches the rebuild onto the snapshot-aware replay path: each
+	// entity is reconstructed from its latest durable snapshot before its post-snapshot events
+	// are applied. This is REQUIRED to rebuild correctly after CompactBelow has truncated events
+	// below a snapshot, because events 1..N are no longer guaranteed to exist. When set, the
+	// repository must implement SnapshotStreamer or RebuildProjections returns an error. When nil,
+	// the legacy full-replay path (StreamEntities, sequence 1..N) is used.
+	SeedEntity SnapshotSeeder
+
 	// OnProgress, if non-nil, is called after each entity is successfully processed
 	// by the projectors or when an error is encountered (stream, projector, or commit).
 	// Skipped entities (nil or wrong type) do not trigger this callback.
@@ -98,7 +106,12 @@ func RebuildProjections(
 		expr = &built
 	}
 
-	return RebuildProjectionsFromStream(ctx, repo.StreamEntities(ctx, expr, applyEvent), cfg)
+	stream, err := selectRebuildStream(ctx, repo, applyEvent, expr, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return RebuildProjectionsFromStream(ctx, stream, cfg)
 }
 
 // RebuildProjectionsFromStream runs the configured projectors against a caller-supplied stream of
@@ -195,8 +208,34 @@ func RebuildProjectionsFromStream(
 // drainEntityStream consumes a stream to completion, discarding results. It is used to release a
 // prestarted stream's producer when the rebuild returns before consuming the stream itself.
 func drainEntityStream(stream <-chan result.Result[Entity]) {
-	for range stream {
+	for range stream { //nolint:revive // intentional drain: empty body releases the producer
 	}
+}
+
+// selectRebuildStream chooses the entity stream for a rebuild. When cfg.SeedEntity is set it uses
+// the snapshot-aware path (required for correctness after compaction); otherwise it uses the
+// default scan-based StreamEntities path. The returned stream is already running, so callers must
+// consume or drain it.
+func selectRebuildStream(
+	ctx context.Context,
+	repo Repository,
+	applyEvent func(context.Context, SerializedEvent, Entity) (Entity, error),
+	expr *expression.Expression,
+	cfg RebuildConfig,
+) (<-chan result.Result[Entity], error) {
+	if cfg.SeedEntity == nil {
+		return repo.StreamEntities(ctx, expr, applyEvent), nil
+	}
+
+	streamer, ok := repo.(SnapshotStreamer)
+	if !ok {
+		return nil, fmt.Errorf(
+			"repository %T does not support snapshot-aware rebuild (SnapshotStreamer); omit SeedEntity to use full replay",
+			repo,
+		)
+	}
+
+	return streamer.StreamEntitiesFromSnapshots(ctx, cfg.EntityType, cfg.SeedEntity, applyEvent), nil
 }
 
 // projectEntity runs all projectors for a single entity and commits the resulting view writes.
