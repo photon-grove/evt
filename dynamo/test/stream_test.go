@@ -371,3 +371,36 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_EnumerationError() {
 	require.Contains(s.T(), gotErr.Error(), "scan boom")
 	s.client.AssertExpectations(s.T())
 }
+
+// Test_StreamEntities_ScanErrorAborts verifies that a scan error aborts the stream without emitting
+// any entities, since a failed/partial scan means some events are missing.
+func (s *RepositorySuite) Test_StreamEntities_ScanErrorAborts() {
+	ctx := context.Background()
+
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).
+		Return((*dynamodb.ScanOutput)(nil), errors.New("scan failed")).Once()
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+		if entity == nil {
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		}
+
+		return entity, nil
+	}
+
+	var errCount, okCount int
+	var lastErr error
+	for r := range s.repo.StreamEntities(ctx, nil, applyFunc) {
+		if _, err := r.Unwrap(); err != nil {
+			errCount++
+			lastErr = err
+		} else {
+			okCount++
+		}
+	}
+
+	require.Equal(s.T(), 0, okCount, "no entities should be emitted after a scan error")
+	require.Equal(s.T(), 1, errCount)
+	require.ErrorContains(s.T(), lastErr, "scan failed")
+	s.client.AssertExpectations(s.T())
+}

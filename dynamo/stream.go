@@ -61,15 +61,34 @@ func (repo *Repository) StreamEntities(
 	go func() {
 		defer close(results)
 
+		// Use a cancellable context so a scan failure (e.g. one failed segment of a parallel scan)
+		// can stop the remaining segments instead of leaving them running.
+		scanCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
 		// Group serialized events by entity ID. order preserves first-seen entity order so the
 		// output is deterministic for a given scan.
 		grouped := make(map[evt.EntityID][]evt.SerializedEvent)
 		order := make([]evt.EntityID, 0)
+		scanFailed := false
 
-		for eventResults := range repo.StreamAllEvents(ctx, expr) {
+		for eventResults := range repo.StreamAllEvents(scanCtx, expr) {
 			serialized, err := eventResults.Unwrap()
 			if err != nil {
-				repo.sendEntity(ctx, results, result.Err[evt.Entity](err))
+				if !scanFailed {
+					// First scan error: surface it and stop the other segments. Do not emit any
+					// entities — a failed or partial scan means some events are missing, so the
+					// reconstituted entities would be incomplete.
+					scanFailed = true
+					repo.sendEntity(ctx, results, result.Err[evt.Entity](err))
+					cancel()
+				}
+
+				continue
+			}
+
+			if scanFailed {
+				// Already failing; drain the remaining pages/segments without grouping them.
 				continue
 			}
 
@@ -85,6 +104,10 @@ func (repo *Repository) StreamEntities(
 
 				grouped[event.EntityID] = append(grouped[event.EntityID], event)
 			}
+		}
+
+		if scanFailed {
+			return
 		}
 
 		if ctx.Err() != nil {

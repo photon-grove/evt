@@ -494,3 +494,19 @@ func TestRebuildProjectionsFromStream_PropagatesStreamError(t *testing.T) {
 	require.Len(t, res.Errors, 1)
 	assert.Contains(t, res.Errors[0].Error(), "stream broke")
 }
+
+func TestRebuildProjectionsFromStream_CancelledStreamReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// An already-closed, empty stream models a producer that stopped on cancellation without
+	// delivering a final item. The rebuild must report the cancellation, not success.
+	res, err := evt.RebuildProjectionsFromStream(ctx, streamOf(), evt.RebuildConfig{
+		Projectors:  []evt.EventProjector{&stubProjector{group: &stubTransactionGroup{size: 1}}},
+		CommitGroup: func(_ context.Context, _ evt.TransactionGroup) error { return nil },
+	})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotNil(t, res)
+}

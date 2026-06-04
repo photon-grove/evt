@@ -113,10 +113,15 @@ func RebuildProjectionsFromStream(
 	stream <-chan result.Result[Entity],
 	cfg RebuildConfig,
 ) (*RebuildResult, error) {
+	// The stream may already be running (its producer started when the caller built it). On a
+	// config error, drain it in the background so that producer does not block forever on an
+	// abandoned consumer.
 	if len(cfg.Projectors) == 0 {
+		go drainEntityStream(stream)
 		return nil, fmt.Errorf("at least one projector is required")
 	}
 	if !cfg.DryRun && cfg.CommitGroup == nil {
+		go drainEntityStream(stream)
 		return nil, fmt.Errorf("CommitGroup is required when DryRun is false")
 	}
 
@@ -172,6 +177,12 @@ func RebuildProjectionsFromStream(
 		reportProgress(cfg.OnProgress, res.Processed, len(res.Errors))
 	}
 
+	// A cancelled context can close the stream without delivering a final item (the producer's
+	// send loses the race to ctx.Done). Surface the cancellation rather than reporting success.
+	if ctx.Err() != nil {
+		return res, ctx.Err()
+	}
+
 	logger.Info("Projection rebuild complete",
 		slog.Int("processed", res.Processed),
 		slog.Int("skipped", res.Skipped),
@@ -179,6 +190,13 @@ func RebuildProjectionsFromStream(
 	)
 
 	return res, nil
+}
+
+// drainEntityStream consumes a stream to completion, discarding results. It is used to release a
+// prestarted stream's producer when the rebuild returns before consuming the stream itself.
+func drainEntityStream(stream <-chan result.Result[Entity]) {
+	for range stream {
+	}
 }
 
 // projectEntity runs all projectors for a single entity and commits the resulting view writes.
