@@ -12,12 +12,12 @@ import (
 	evttest "github.com/photon-grove/evt/test"
 )
 
-// TestRetryReplayRoundTrip_ChatIntentPattern validates retry + replay
-// semantics using the pattern from Chat Intent: create an entity, update it,
-// then replay and verify state.
-func TestRetryReplayRoundTrip_ChatIntentPattern(t *testing.T) {
+// TestRetryReplayRoundTrip_CreateThenUpdate validates retry + replay semantics
+// for a basic create-then-update lifecycle: create an entity, update it, then
+// replay and verify state.
+func TestRetryReplayRoundTrip_CreateThenUpdate(t *testing.T) {
 	store := mem.NewStore()
-	factory := func() evt.Entity { return evttest.NewEntity("msg-1") }
+	factory := func() evt.Entity { return evttest.NewEntity("entity-1") }
 
 	cfg := policy.Config{
 		MaxAttempts: 3,
@@ -25,10 +25,10 @@ func TestRetryReplayRoundTrip_ChatIntentPattern(t *testing.T) {
 		Sleep:       noSleep,
 	}
 
-	// Step 1: Create entity (mimics Chat Intent message creation)
+	// Step 1: Create the entity.
 	entity, err := policy.ExecuteWithRetry(
-		context.Background(), store, factory, "msg-1",
-		&evttest.CreateEntity{Value: "initial-content"},
+		context.Background(), store, factory, "entity-1",
+		&evttest.CreateEntity{Value: "initial"},
 		evt.Metadata{},
 		cfg, policy.Hooks{},
 	)
@@ -39,14 +39,14 @@ func TestRetryReplayRoundTrip_ChatIntentPattern(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *evttest.Entity, got %T", entity)
 	}
-	if testEntity.Value != "initial-content" {
-		t.Fatalf("expected initial-content, got %s", testEntity.Value)
+	if testEntity.Value != "initial" {
+		t.Fatalf("expected initial, got %s", testEntity.Value)
 	}
 
-	// Step 2: Update entity (mimics message status update)
+	// Step 2: Update the entity.
 	_, err = policy.ExecuteWithRetry(
-		context.Background(), store, factory, "msg-1",
-		&evttest.ReplaceEntity{Value: "interpreted"},
+		context.Background(), store, factory, "entity-1",
+		&evttest.ReplaceEntity{Value: "updated"},
 		evt.Metadata{},
 		cfg, policy.Hooks{},
 	)
@@ -55,13 +55,13 @@ func TestRetryReplayRoundTrip_ChatIntentPattern(t *testing.T) {
 	}
 
 	// Step 3: Replay — load fresh entity and verify state
-	fresh := evttest.NewEntity("msg-1")
-	_, loadErr := store.LoadEntity(context.Background(), fresh, "msg-1")
+	fresh := evttest.NewEntity("entity-1")
+	_, loadErr := store.LoadEntity(context.Background(), fresh, "entity-1")
 	if loadErr != nil {
 		t.Fatalf("replay failed: %v", loadErr)
 	}
-	if fresh.Value != "interpreted" {
-		t.Fatalf("replayed Value=%s, want interpreted", fresh.Value)
+	if fresh.Value != "updated" {
+		t.Fatalf("replayed Value=%s, want updated", fresh.Value)
 	}
 }
 
@@ -70,7 +70,7 @@ func TestRetryReplayRoundTrip_ChatIntentPattern(t *testing.T) {
 // and factory-based reload.
 func TestRetryReplayRoundTrip_EventSourcedPattern(t *testing.T) {
 	store := mem.NewStore()
-	factory := func() evt.Entity { return evttest.NewEntity("portfolio-1") }
+	factory := func() evt.Entity { return evttest.NewEntity("account-1") }
 
 	cfg := policy.Config{
 		MaxAttempts: 5,
@@ -78,10 +78,10 @@ func TestRetryReplayRoundTrip_EventSourcedPattern(t *testing.T) {
 		Sleep:       noSleep,
 	}
 
-	// Step 1: Create portfolio entity
+	// Step 1: Create the entity.
 	_, err := policy.ExecuteWithRetry(
-		context.Background(), store, factory, "portfolio-1",
-		&evttest.CreateEntity{Value: "BTC-USD"},
+		context.Background(), store, factory, "account-1",
+		&evttest.CreateEntity{Value: "initial"},
 		evt.Metadata{},
 		cfg, policy.Hooks{},
 	)
@@ -89,11 +89,11 @@ func TestRetryReplayRoundTrip_EventSourcedPattern(t *testing.T) {
 		t.Fatalf("create failed: %v", err)
 	}
 
-	// Step 2: Update portfolio (mimics order placement)
+	// Step 2: Update the entity, also setting a correlated field.
 	other := "order-123"
 	entity, err := policy.ExecuteWithRetry(
-		context.Background(), store, factory, "portfolio-1",
-		&evttest.ReplaceEntity{Value: "BTC-USD-updated", Other: &other},
+		context.Background(), store, factory, "account-1",
+		&evttest.ReplaceEntity{Value: "updated", Other: &other},
 		evt.Metadata{},
 		cfg, policy.Hooks{},
 	)
@@ -105,8 +105,8 @@ func TestRetryReplayRoundTrip_EventSourcedPattern(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *evttest.Entity, got %T", entity)
 	}
-	if testEntity.Value != "BTC-USD-updated" {
-		t.Fatalf("expected BTC-USD-updated, got %s", testEntity.Value)
+	if testEntity.Value != "updated" {
+		t.Fatalf("expected updated, got %s", testEntity.Value)
 	}
 	if testEntity.Other == nil || *testEntity.Other != "order-123" {
 		t.Fatal("expected Other=order-123")
@@ -115,7 +115,7 @@ func TestRetryReplayRoundTrip_EventSourcedPattern(t *testing.T) {
 	// Step 3: Command deduplication — same CommandID should not produce new events
 	cmdID := evt.CommandID("dedup-test-1")
 	_, err = policy.ExecuteWithRetry(
-		context.Background(), store, factory, "portfolio-1",
+		context.Background(), store, factory, "account-1",
 		&evttest.ReplaceEntity{Value: "should-dedup"},
 		evt.Metadata{CommandID: &cmdID},
 		cfg, policy.Hooks{},
@@ -126,7 +126,7 @@ func TestRetryReplayRoundTrip_EventSourcedPattern(t *testing.T) {
 
 	// Retry with same CommandID — should return DuplicateCommandError
 	_, err = policy.ExecuteWithRetry(
-		context.Background(), store, factory, "portfolio-1",
+		context.Background(), store, factory, "account-1",
 		&evttest.ReplaceEntity{Value: "duplicate"},
 		evt.Metadata{CommandID: &cmdID},
 		cfg, policy.Hooks{},
@@ -139,8 +139,8 @@ func TestRetryReplayRoundTrip_EventSourcedPattern(t *testing.T) {
 	}
 
 	// Verify final state via replay
-	fresh := evttest.NewEntity("portfolio-1")
-	_, loadErr := store.LoadEntity(context.Background(), fresh, "portfolio-1")
+	fresh := evttest.NewEntity("account-1")
+	_, loadErr := store.LoadEntity(context.Background(), fresh, "account-1")
 	if loadErr != nil {
 		t.Fatalf("replay failed: %v", loadErr)
 	}

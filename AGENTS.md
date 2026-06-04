@@ -91,7 +91,7 @@
 
 ## CI and Workflow
 
-- CI runs on ARM64 Blacksmith Ubuntu runners.
+- CI runs on ARM64 Ubuntu runners (`ubuntu-24.04-arm`).
 - Use upstream `actions/cache@v5`; do not introduce archived cache forks.
 - CI quality checks include:
   - `go mod tidy` with no `go.mod`/`go.sum` diff.
