@@ -45,11 +45,12 @@
 ## Codebase Patterns
 
 - Structure:
-  - Root Go module: core `evt` package and support packages such as `dynamo`, `mem`,
+  - Root Go module: core `evt` package and support packages such as `dynamo`, `postgres`, `mem`,
     `snapshots`, `projectors`, `publishers`, `viewstore`, and `test`.
   - `website/`: Vite documentation site.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
+  - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
   - `examples/`: public examples; keep names and scenarios neutral.
 - Go:
   - Prefer small, explicit APIs that preserve existing package contracts.

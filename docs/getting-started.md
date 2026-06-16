@@ -187,6 +187,11 @@ and a views table — both detailed in the [DynamoDB guide](dynamodb.md). Run th
 locally against the Moto emulator with the `infra/local` Terraform stack before
 touching real AWS.
 
+Prefer a relational store? The same swap targets PostgreSQL — `postgres.NewStore`
+(or `postgres.NewRepository` + `snapshots.NewStore`) over a `pgxpool.Pool`. The
+aggregate still does not change. See the [PostgreSQL guide](postgres.md) for the
+schema and local setup.
+
 ## 5. Project views deliberately
 
 Views are derived state. A projection table must always be safe to wipe and
@@ -200,5 +205,6 @@ straight to a view.
 
 - [Concepts](concepts.md) — the vocabulary and the contracts behind each type.
 - [DynamoDB integration](dynamodb.md) — table shapes, snapshots, and compaction.
+- [PostgreSQL integration](postgres.md) — the relational schema and local setup.
 - [Projections and rebuilds](projections.md) — building and rebuilding read models.
 - [Streams, projectors, and publishers](streams.md) — async fanout on Lambda.
