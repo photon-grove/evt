@@ -398,18 +398,19 @@ evt.Metadata{
 ## Backend Storage Contract
 
 The `evt.Repository` interface is backend-neutral: it carries no DynamoDB (or other vendor) types,
-so the same contract can be satisfied by the in-memory backend, DynamoDB, and a future SQL/PostgreSQL
-backend. Any backend that implements `evt.Repository` MUST uphold the following invariants. They are
+so the same contract is satisfied by the in-memory backend, DynamoDB, and PostgreSQL (`evt/postgres`).
+Any backend that implements `evt.Repository` MUST uphold the following invariants. They are
 exercised by the backend-neutral suite in `conformance` (`conformance.RunRepositorySuite`); each
 backend wires that suite and declares the optional guarantees it provides via `conformance.SuiteOptions`.
+DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimisticConcurrency` on.
 
 - **Per-entity sequence uniqueness** — for a given entity, each `EventSequence` is written at most
   once. Sequences start at 1 and increase by 1 per committed event.
 - **Optimistic concurrency on commit** — a commit that reuses an already-committed `(EntityID,
   EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with a conditional
-  write (`attribute_not_exists(sk)`); a SQL backend would use a unique constraint. (The in-memory
-  backend is a permissive test double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency`
-  is false for it.)
+  write (`attribute_not_exists(sk)`); PostgreSQL with the `(entity_id, sequence)` primary key, whose
+  unique violation surfaces as an `evt.ConflictError`. (The in-memory backend is a permissive test
+  double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency` is false for it.)
 - **Stable event ordering** — `GetEvents` returns an entity's events in ascending sequence order,
   and `GetLatestEvents(lastSequence)` returns only events with `sequence > lastSequence`.
 - **Read isolation by entity** — `GetEvents`/`GetLatestEvents`/`GetSnapshot` return only the
@@ -419,11 +420,18 @@ backend wires that suite and declares the optional guarantees it provides via `c
   `nil, nil` when none exists. The snapshot's `EventSequence` is the authoritative floor after
   compaction (see ADR-0001).
 - **Event/view transaction behavior** — events and any projector-produced view writes in a single
-  `SerializedResult` are committed atomically. On DynamoDB this is a `TransactWriteItems` call;
-  partial commits must not be observable.
+  `SerializedResult` are committed atomically. On DynamoDB this is a `TransactWriteItems` call; on
+  PostgreSQL it is a single SQL transaction; partial commits must not be observable.
 - **Backend-neutral filtering** — `StreamAllEvents`/`StreamEntities` honor `evt.StreamFilter`
   (entity-type narrowing today). Richer, vendor-specific server-side filtering is offered through a
   backend extension interface (e.g. `dynamo.ExpressionStreamer`), never through the core contract.
+
+The PostgreSQL backend stores the log as an append-only `evt_events` table keyed by `(entity_id,
+sequence)` and durable snapshots in a sibling `evt_snapshots` table keyed by `entity_id`. That
+schema is owned by `postgres.Repository.EnsureSchema` (idempotent DDL) so it stays in lockstep with
+the Go types that read and write it; the local Terraform stack under `infra/local-postgres`
+provisions only the database. Compaction deletes event rows in `[1, throughSequence]` once a covering
+snapshot exists and never touches the snapshot row, so it preserves the snapshot-as-floor invariant.
 
 See `docs/adr/0002-backend-neutral-storage-contracts.md` for the rationale and the decision to keep
 `result.Result` channels as the streaming shape.

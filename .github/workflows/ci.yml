@@ -116,19 +116,81 @@ jobs:
           AWS_SECRET_ACCESS_KEY: test
         run: pnpm exec moon run evt:integration
 
+  postgres-integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.5
+          cache: pnpm
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
+
+      - name: Cache Terraform providers
+        uses: actions/cache@v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-postgres-${{ hashFiles('infra/local-postgres/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-postgres-
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Start PostgreSQL
+        run: |
+          docker run -d --name postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
+          for _ in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres >/dev/null 2>&1; then
+              echo "PostgreSQL is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs postgres
+          exit 1
+
+      - name: Apply local Terraform
+        run: |
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform -chdir=infra/local-postgres init
+          terraform -chdir=infra/local-postgres apply -auto-approve
+
+      - name: Run PostgreSQL integration tests
+        env:
+          DATABASE_URL: postgres://evt:evt@localhost:5432/evt_local?sslmode=disable
+        run: pnpm exec moon run evt:integration-postgres
+
   summary:
     name: Summary
     runs-on: ubuntu-24.04-arm
-    needs: [quality, integration]
+    needs: [quality, integration, postgres-integration]
     if: always()
     steps:
       - name: Check required jobs
         env:
           QUALITY: ${{ needs.quality.result }}
           INTEGRATION: ${{ needs.integration.result }}
+          POSTGRES_INTEGRATION: ${{ needs.postgres-integration.result }}
         run: |
-          if [ "$QUALITY" != "success" ] || [ "$INTEGRATION" != "success" ]; then
-            echo "::error::CI failed: quality=$QUALITY integration=$INTEGRATION"
+          if [ "$QUALITY" != "success" ] || [ "$INTEGRATION" != "success" ] || [ "$POSTGRES_INTEGRATION" != "success" ]; then
+            echo "::error::CI failed: quality=$QUALITY integration=$INTEGRATION postgres-integration=$POSTGRES_INTEGRATION"
             exit 1
           fi
           echo "All required jobs passed."

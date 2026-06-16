@@ -6,7 +6,8 @@
 
 `evt` gives you the parts of event sourcing that are genuinely hard to get
 right — append-only logs, optimistic concurrency, snapshots, replayable read
-models, and DynamoDB persistence — as small, composable Go packages. There is no
+models, and pluggable persistence (DynamoDB or PostgreSQL) — as small, composable
+Go packages. There is no
 runtime to adopt, no base application to inherit from, and no magic. You wire the
 pieces you need and ignore the rest.
 
@@ -18,8 +19,9 @@ It grew out of patterns we run in production.
   view, projection, and read model is derived state you can delete and rebuild by
   replaying the log.
 - **The same aggregate runs everywhere.** Write your command and event logic once.
-  Test it against an in-memory store in microseconds, then point it at DynamoDB in
-  production without touching the aggregate.
+  Test it against an in-memory store in microseconds, then point it at DynamoDB or
+  PostgreSQL in production without touching the aggregate. A backend-neutral
+  conformance suite holds every backend to the same storage contract.
 - **Concurrency and ordering are handled.** Conditional writes protect per-entity
   sequence ordering. Stable command IDs make retries safe instead of duplicating
   facts.
@@ -103,6 +105,7 @@ account, err := evt.ExecuteWithFactory(ctx, store, func() evt.Entity {
 | `evt` | Core aggregate, command, event, metadata, transaction, repository, and rebuild contracts |
 | `evt/mem` | In-memory repository and store for unit tests |
 | `evt/dynamo` | DynamoDB event log, snapshots, views, stream helpers, and transaction groups |
+| `evt/postgres` | PostgreSQL event log and snapshots — the same `evt.Repository` contract on a relational store |
 | `evt/snapshots` | Store with snapshot loading and write thresholds |
 | `evt/stream` | Stream handler and publisher helpers for event fanout |
 | `evt/projectors` | DynamoDB Streams Lambda projector runtime with idempotency and retry classification |
@@ -158,6 +161,16 @@ docker run -d --name evt-moto -p 4566:5000 motoserver/moto:5.1.22
 terraform -chdir=infra/local init
 terraform -chdir=infra/local apply -auto-approve
 AWS_ENDPOINT_URL=http://localhost:4566 moon run evt:integration
+```
+
+PostgreSQL integration tests run against a local PostgreSQL server. Terraform
+provisions the database; `postgres.Repository.EnsureSchema` owns the tables:
+
+```sh
+docker run -d --name evt-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
+terraform -chdir=infra/local-postgres init
+terraform -chdir=infra/local-postgres apply -auto-approve
+moon run evt:integration-postgres
 ```
 
 ## Documentation
