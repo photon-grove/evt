@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 
@@ -265,7 +266,7 @@ func (repo *Repository) GetSnapshot(
 		&snapshot.Payload,
 	)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 
@@ -285,8 +286,11 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 		return fmt.Errorf("postgres: begin: %w", err)
 	}
 
+	// Roll back on any early return — an error from fn or a panic unwinding through it. This is a
+	// no-op once Commit has succeeded, so the happy path is unaffected.
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	if err := fn(tx); err != nil {
-		_ = tx.Rollback(ctx)
 		return err
 	}
 
@@ -330,7 +334,12 @@ func (repo *Repository) insertEvents(ctx context.Context, db DB, events []evt.Se
 	return nil
 }
 
-// upsertSnapshot writes (or replaces) an entity's durable snapshot.
+// upsertSnapshot writes (or replaces) an entity's durable snapshot. The conflict guard keeps the
+// recorded event_sequence monotonic: a write whose snapshot covers fewer events than the stored one
+// is ignored, so a snapshot can never regress the authoritative compaction floor. This mirrors the
+// DynamoDB backend's monotonic snapshot semantics. On the normal Store path the same-transaction
+// event insert already rejects a stale commit via the (entity_id, sequence) primary key; this guard
+// additionally protects any out-of-band snapshot writer.
 func (repo *Repository) upsertSnapshot(ctx context.Context, db DB, snapshot evt.SerializedSnapshot) error {
 	query := fmt.Sprintf(
 		`INSERT INTO %s (entity_id, entity_type, sequence, event_sequence, payload, updated_at)
@@ -340,8 +349,9 @@ func (repo *Repository) upsertSnapshot(ctx context.Context, db DB, snapshot evt.
 		     sequence = EXCLUDED.sequence,
 		     event_sequence = EXCLUDED.event_sequence,
 		     payload = EXCLUDED.payload,
-		     updated_at = now()`,
-		repo.snapshotsTable,
+		     updated_at = now()
+		 WHERE EXCLUDED.event_sequence >= %s.event_sequence`,
+		repo.snapshotsTable, repo.snapshotsTable,
 	)
 
 	_, err := db.Exec(ctx, query,
