@@ -41,3 +41,6 @@ fileGroups:
     - package.json
     - tsconfig.json
     - vite.config.ts
+    # The site bundles the repo-root docs/ Markdown at build time (see src/docs.ts), so doc edits
+    # must invalidate the build/typecheck cache. A leading "/" is workspace-relative in Moon.
+    - /docs/**/*.md

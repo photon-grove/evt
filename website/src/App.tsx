@@ -1,26 +1,55 @@
 import {DiagramViewer} from '@photon-grove/react-flow-diagrams'
+import {useEffect} from 'react'
 
 import {EventGarden, ToolkitShelf} from './ClipArt'
-import {capabilities, cookbook, examples, gettingStarted} from './content'
+import {capabilities, type ContentCard, cookbook, examples, gettingStarted} from './content'
 import {diagrams} from './diagrams'
+import {DocPage, DocsIndex} from './DocsView'
 import {photonGroveUrl} from './siteConfig'
+import {useHashRoute} from './useHashRoute'
 
-export function App() {
+function Nav() {
   return (
-    <main>
-      <header className="nav">
-        <a className="brand" href="#top" aria-label="evt home">
-          <span className="brand-mark">evt</span>
-          <span>Event sourcing for Go</span>
-        </a>
-        <nav aria-label="Primary navigation">
-          <a href="#docs">Docs</a>
-          <a href="#diagrams">Diagrams</a>
-          <a href="#cookbook">Cookbook</a>
-          <a href="https://github.com/photon-grove/evt">GitHub</a>
-        </nav>
-      </header>
+    <header className="nav">
+      <a className="brand" href="#/" aria-label="evt home">
+        <span className="brand-mark">evt</span>
+        <span>Event sourcing for Go</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#/docs">Docs</a>
+        <a href="#diagrams">Diagrams</a>
+        <a href="#cookbook">Cookbook</a>
+        <a href="https://github.com/photon-grove/evt">GitHub</a>
+      </nav>
+    </header>
+  )
+}
 
+function CardLink({doc}: {doc?: string}) {
+  if (!doc) {
+    return null
+  }
+
+  return (
+    <a className="card-link" href={`#/docs/${doc}`}>
+      Read the guide →
+    </a>
+  )
+}
+
+function FeatureCard({item}: {item: ContentCard}) {
+  return (
+    <article className="feature-card">
+      <h3>{item.title}</h3>
+      <p>{item.body}</p>
+      <CardLink doc={item.doc} />
+    </article>
+  )
+}
+
+function Home() {
+  return (
+    <>
       <section className="hero" id="top">
         <div className="hero-copy">
           <p className="eyebrow">Immutable events · deterministic views · DynamoDB-ready</p>
@@ -31,8 +60,12 @@ export function App() {
             helpers that stay testable from day one.
           </p>
           <div className="hero-actions">
-            <a className="button primary" href="#docs">Start building</a>
-            <a className="button secondary" href="#diagrams">Explore architecture</a>
+            <a className="button primary" href="#/docs">
+              Read the docs
+            </a>
+            <a className="button secondary" href="#diagrams">
+              Explore architecture
+            </a>
           </div>
         </div>
         <div className="hero-art" aria-hidden="true">
@@ -44,13 +77,13 @@ export function App() {
         <div className="section-heading">
           <p className="eyebrow">Framework surface</p>
           <h2>Everything needed for an event-sourced Go service.</h2>
+          <p className="section-lead">
+            Each capability links to its guide. <a href="#/docs">Browse all documentation →</a>
+          </p>
         </div>
         <div className="capability-grid">
           {capabilities.map((item) => (
-            <article className="feature-card" key={item.title}>
-              <h3>{item.title}</h3>
-              <p>{item.body}</p>
-            </article>
+            <FeatureCard item={item} key={item.title} />
           ))}
         </div>
       </section>
@@ -88,6 +121,7 @@ export function App() {
             <article className="recipe" key={item.title}>
               <h3>{item.title}</h3>
               <p>{item.body}</p>
+              <CardLink doc={item.doc} />
             </article>
           ))}
         </div>
@@ -108,11 +142,39 @@ export function App() {
           ))}
         </div>
       </section>
+    </>
+  )
+}
+
+export function App() {
+  const route = useHashRoute()
+
+  // Scroll handling on navigation: doc routes start at the top; the home route honors a plain
+  // "#section" fragment (so cross-page nav like Diagrams/Cookbook still scrolls once home mounts).
+  useEffect(() => {
+    if (route.name !== 'home') {
+      window.scrollTo(0, 0)
+
+      return
+    }
+
+    const fragment = window.location.hash.replace(/^#/, '')
+    if (fragment && !fragment.startsWith('/')) {
+      requestAnimationFrame(() => document.getElementById(fragment)?.scrollIntoView())
+    }
+  }, [route])
+
+  return (
+    <main>
+      <Nav />
+
+      {route.name === 'home' && <Home />}
+      {route.name === 'docs-index' && <DocsIndex />}
+      {route.name === 'doc' && route.slug ? <DocPage slug={route.slug} /> : null}
 
       <footer className="site-footer">
         <p className="attribution">
-          Built with care by{' '}
-          <a href={photonGroveUrl}>Photon Grove</a> — a Colorado software studio.
+          Built with care by <a href={photonGroveUrl}>Photon Grove</a> — a Colorado software studio.
         </p>
       </footer>
     </main>
