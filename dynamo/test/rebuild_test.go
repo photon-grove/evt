@@ -169,6 +169,60 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_DefaultsEntityTypeFromC
 	s.client.AssertExpectations(s.T())
 }
 
+// Test_RebuildProjectionsByQuery_ScanEntityTypeFromConfig verifies the scan path also inherits
+// cfg.EntityType: with no HeadSource, the enumeration Scan carries the entityType filter and the
+// rebuild's per-entity check passes for matching entities.
+func (s *RepositorySuite) Test_RebuildProjectionsByQuery_ScanEntityTypeFromConfig() {
+	ctx := context.Background()
+
+	// Enumeration scan must filter on the inherited entity type.
+	s.client.On("Scan", mock.Anything, mock.MatchedBy(func(in *dynamodb.ScanInput) bool {
+		v, ok := in.ExpressionAttributeValues[":et"].(*types.AttributeValueMemberS)
+		return in.FilterExpression != nil && ok && v.Value == "TestEntity"
+	}), mock.Anything).Return(&dynamodb.ScanOutput{
+		Items: []map[string]types.AttributeValue{pkItem("a")},
+	}, nil).Once()
+
+	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("a")), mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("a", 1)}}, nil).Once()
+
+	proj := &rebuildProjector{group: &rebuildTxnGroup{}}
+	cfg := evt.RebuildConfig{
+		EntityType:  evt.EntityType("TestEntity"),
+		Projectors:  []evt.EventProjector{proj},
+		CommitGroup: func(context.Context, evt.TransactionGroup) error { return nil },
+	}
+
+	// opts.EntityType empty: defaults to cfg.EntityType and scopes the enumeration scan.
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, typedApplyFunc(), cfg)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 1, res.Processed)
+	require.Equal(s.T(), []evt.EntityID{"a"}, proj.projected())
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_RebuildProjectionsByQuery_ConfigErrorDrainsStream confirms the documented "never strands"
+// guarantee end to end: a config error (here, a missing CommitGroup) surfaces from the wrapper even
+// though StreamEntitiesByQuery has already started its producer, because
+// RebuildProjectionsFromStream drains the started stream. The Scan/Query mocks are optional so the
+// drain may consume them without an unexpected-call failure.
+func (s *RepositorySuite) Test_RebuildProjectionsByQuery_ConfigErrorDrainsStream() {
+	ctx := context.Background()
+
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.ScanOutput{
+		Items: []map[string]types.AttributeValue{pkItem("a"), pkItem("b")},
+	}, nil).Maybe()
+	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("a", 1)}}, nil).Maybe()
+
+	// DryRun false with no CommitGroup is a config error caught after the stream has started.
+	cfg := evt.RebuildConfig{Projectors: []evt.EventProjector{&rebuildProjector{}}}
+
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), cfg)
+	require.Nil(s.T(), res)
+	require.ErrorContains(s.T(), err, "CommitGroup is required")
+}
+
 // Test_RebuildProjectionsByQuery_NilApplyEvent rejects a nil replay callback before starting a
 // stream, mirroring evt.RebuildProjections.
 func (s *RepositorySuite) Test_RebuildProjectionsByQuery_NilApplyEvent() {
