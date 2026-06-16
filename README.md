@@ -70,12 +70,15 @@ Drive it with an in-memory store in tests:
 
 ```go
 store := mem.NewStore()
-account := NewAccount("acct-1")
 
-store.Execute(ctx, account, "acct-1", &OpenAccount{AccountID: "acct-1", InitialBalance: 100}, evt.Metadata{})
-store.Execute(ctx, account, "acct-1", &Deposit{AccountID: "acct-1", Amount: 25}, evt.Metadata{})
+// Execute loads a fresh aggregate from the log, so pass a new instance per command.
+acct := NewAccount("acct-1")
+store.Execute(ctx, acct, "acct-1", &OpenAccount{AccountID: "acct-1", InitialBalance: 100}, evt.Metadata{})
 
-fmt.Println(account.Balance) // 125
+acct = NewAccount("acct-1")
+store.Execute(ctx, acct, "acct-1", &Deposit{AccountID: "acct-1", Amount: 25}, evt.Metadata{})
+
+fmt.Println(acct.Balance) // 125
 ```
 
 Move the same aggregate to DynamoDB for production — the contract does not change:
@@ -128,8 +131,12 @@ trim them safely:
   [ADR 0001](docs/adr/0001-event-compaction-and-snapshot-truncation.md).
 - **Per-type retention** (`dynamo.Repository.WithRetention`) stamps a DynamoDB
   `ttl` on terminal, short-lived, fully transient streams so the table expires
-  them automatically. Use it only when a wipe-and-replay never depends on those
-  events; for streams that accumulate, keep a snapshot and compact instead.
+  them automatically. Because TTL expires rows individually — it cannot atomically
+  drop a whole stream — each event expires at `committedAt + duration`, so this is
+  safe **only** when a stream's entire lifetime is much shorter than the duration
+  and it is never appended to after going terminal; otherwise an older prefix can
+  expire while newer events survive and a load replays a partial suffix. For
+  streams that accumulate, keep a snapshot and compact instead.
 
 The raw `dynamo.Delete` is snapshot-unsafe, for local fixtures only, and excluded
 from production builds (`-tags prod`). See
