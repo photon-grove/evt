@@ -1,27 +1,38 @@
-import {DiagramViewer} from '@photon-grove/react-flow-diagrams'
-import {useEffect} from 'react'
+import {useEffect, useState} from 'react'
 
-import {EventGarden, ToolkitShelf} from './ClipArt'
-import {capabilities, type ContentCard, cookbook, examples, gettingStarted} from './content'
+import {DiagramViewer} from '@photon-grove/react-flow-diagrams'
+
+import {EventLogArt} from './ClipArt'
+import {
+  capabilities,
+  type ContentCard,
+  cookbook,
+  examples,
+  gettingStarted,
+  installCommand,
+  packages,
+  quickStartCode,
+  repoUrl,
+} from './content'
 import {diagrams} from './diagrams'
 import {DocPage, DocsIndex} from './DocsView'
 import {photonGroveUrl} from './siteConfig'
 import {useHashRoute} from './useHashRoute'
 
-function Nav() {
+function CopyButton({value, label}: {value: string; label: string}) {
+  const [copied, setCopied] = useState(false)
+
+  const onCopy = () => {
+    void navigator.clipboard?.writeText(value).then(() => {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1600)
+    })
+  }
+
   return (
-    <header className="nav">
-      <a className="brand" href="#/" aria-label="evt home">
-        <span className="brand-mark">evt</span>
-        <span>Event sourcing for Go</span>
-      </a>
-      <nav aria-label="Primary navigation">
-        <a href="#/docs">Docs</a>
-        <a href="#diagrams">Diagrams</a>
-        <a href="#cookbook">Cookbook</a>
-        <a href="https://github.com/photon-grove/evt">GitHub</a>
-      </nav>
-    </header>
+    <button type="button" className="copy" onClick={onCopy} aria-label={label}>
+      {copied ? 'Copied' : 'Copy'}
+    </button>
   )
 }
 
@@ -40,10 +51,31 @@ function CardLink({doc}: {doc?: string}) {
 function FeatureCard({item}: {item: ContentCard}) {
   return (
     <article className="feature-card">
+      {item.tag ? <code className="card-tag">{item.tag}</code> : null}
       <h3>{item.title}</h3>
       <p>{item.body}</p>
       <CardLink doc={item.doc} />
     </article>
+  )
+}
+
+function Nav() {
+  return (
+    <header className="nav">
+      <a className="brand" href="#/" aria-label="evt home">
+        <span className="brand-mark">evt</span>
+        <span className="brand-text">Event sourcing for Go</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#start">Quick start</a>
+        <a href="#packages">Packages</a>
+        <a href="#diagrams">Architecture</a>
+        <a href="#/docs">Docs</a>
+        <a className="nav-cta" href={repoUrl}>
+          GitHub ↗
+        </a>
+      </nav>
+    </header>
   )
 }
 
@@ -52,33 +84,41 @@ function Home() {
     <>
       <section className="hero" id="top">
         <div className="hero-copy">
-          <p className="eyebrow">Immutable events · deterministic views · DynamoDB-ready</p>
-          <h1>evt</h1>
+          <p className="eyebrow">A Go event-sourcing framework</p>
+          <h1>
+            Immutable events as truth. <span className="accent">Views you can rebuild.</span>
+          </h1>
           <p className="lede">
-            A compact Go framework for event-sourced systems: aggregate commands, append-only event
-            logs, snapshots, rebuildable projections, DynamoDB Streams projectors, and publisher
-            helpers that stay testable from day one.
+            <strong>evt</strong> is a compact Go framework for event-sourced services: aggregate
+            commands, append-only event logs, snapshots, rebuildable projections, DynamoDB Streams
+            projectors, and publisher helpers — testable from the first line you write.
           </p>
+          <div className="install">
+            <span className="prompt">$</span>
+            <code>{installCommand}</code>
+            <CopyButton value={installCommand} label="Copy install command" />
+          </div>
           <div className="hero-actions">
-            <a className="button primary" href="#/docs">
-              Read the docs
+            <a className="button primary" href="#start">
+              Quick start
             </a>
             <a className="button secondary" href="#diagrams">
-              Explore architecture
+              Explore the architecture
             </a>
           </div>
         </div>
         <div className="hero-art" aria-hidden="true">
-          <EventGarden />
+          <EventLogArt />
         </div>
       </section>
 
-      <section className="band intro-band" id="docs">
+      <section className="band intro-band" id="features">
         <div className="section-heading">
           <p className="eyebrow">Framework surface</p>
-          <h2>Everything needed for an event-sourced Go service.</h2>
+          <h2>Everything an event-sourced Go service needs — and nothing it doesn&rsquo;t.</h2>
           <p className="section-lead">
-            Each capability links to its guide. <a href="#/docs">Browse all documentation →</a>
+            Small, explicit packages with stable contracts. Each capability links to its guide.{' '}
+            <a href="#/docs">Browse all documentation →</a>
           </p>
         </div>
         <div className="capability-grid">
@@ -88,33 +128,68 @@ function Home() {
         </div>
       </section>
 
-      <section className="band split-band">
-        <div>
+      <section className="band split-band" id="start">
+        <div className="split-copy">
           <p className="eyebrow">First path</p>
-          <h2>Use memory first, then move the same model to DynamoDB.</h2>
+          <h2>Test in memory, ship to DynamoDB — same model.</h2>
+          <p className="section-sub">
+            Your aggregates never learn which store they run against. Prove behavior with fast
+            in-memory tests, then move production writes over without rewriting domain code.
+          </p>
           <ol className="steps">
             {gettingStarted.map((step) => (
               <li key={step}>{step}</li>
             ))}
           </ol>
         </div>
-        <ToolkitShelf />
+        <figure className="code-card">
+          <figcaption className="code-head">
+            <span className="dots" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+            </span>
+            <span className="code-file">account_test.go</span>
+            <CopyButton value={quickStartCode} label="Copy quick start example" />
+          </figcaption>
+          <pre>
+            <code>{quickStartCode}</code>
+          </pre>
+        </figure>
       </section>
 
-      <section className="diagram-section" id="diagrams">
-        <div className="section-heading diagram-heading">
+      <section className="band diagram-section" id="diagrams">
+        <div className="section-heading">
           <p className="eyebrow">Interactive architecture</p>
-          <h2>Trace the runtime from command to projections and async fanout.</h2>
+          <h2>Trace the runtime from command to projection and async fanout.</h2>
         </div>
         <div className="diagram-frame">
           <DiagramViewer diagrams={diagrams} title="evt" subtitle="Architecture guide" />
         </div>
       </section>
 
-      <section className="band" id="cookbook">
+      <section className="band packages-band" id="packages">
+        <div className="section-heading">
+          <p className="eyebrow">Package reference</p>
+          <h2>Import only what the service uses.</h2>
+          <p className="section-sub">
+            Every package lives under <code>github.com/photon-grove/evt</code>.
+          </p>
+        </div>
+        <ul className="package-list">
+          {packages.map((pkg) => (
+            <li className="package" key={pkg.name}>
+              <code className="package-name">{pkg.name}</code>
+              <p>{pkg.body}</p>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section className="band cookbook-band" id="cookbook">
         <div className="section-heading">
           <p className="eyebrow">Integration cookbook</p>
-          <h2>Patterns worth copying directly into adopter projects.</h2>
+          <h2>Patterns worth copying straight into an adopter project.</h2>
         </div>
         <div className="cookbook-grid">
           {cookbook.map((item) => (
@@ -129,8 +204,8 @@ function Home() {
 
       <section className="band examples-band">
         <div className="section-heading">
-          <p className="eyebrow">Examples</p>
-          <h2>Concrete entry points for local adoption.</h2>
+          <p className="eyebrow">Run it locally</p>
+          <h2>Concrete entry points for adoption.</h2>
         </div>
         <div className="examples">
           {examples.map((item) => (
@@ -150,7 +225,8 @@ export function App() {
   const route = useHashRoute()
 
   // Scroll handling on navigation: doc routes start at the top; the home route honors a plain
-  // "#section" fragment (so cross-page nav like Diagrams/Cookbook still scrolls once home mounts).
+  // "#section" fragment (so cross-page nav like Quick start/Architecture still scrolls once home
+  // mounts).
   useEffect(() => {
     if (route.name !== 'home') {
       window.scrollTo(0, 0)
@@ -173,8 +249,21 @@ export function App() {
       {route.name === 'doc' && route.slug ? <DocPage slug={route.slug} /> : null}
 
       <footer className="site-footer">
+        <div className="footer-inner">
+          <a className="brand" href="#/" aria-label="evt home">
+            <span className="brand-mark">evt</span>
+            <span className="brand-text">Event sourcing for Go</span>
+          </a>
+          <nav aria-label="Footer navigation">
+            <a href="#/docs">Docs</a>
+            <a href="#start">Quick start</a>
+            <a href="#diagrams">Architecture</a>
+            <a href={repoUrl}>GitHub ↗</a>
+          </nav>
+        </div>
         <p className="attribution">
-          Built with care by <a href={photonGroveUrl}>Photon Grove</a> — a Colorado software studio.
+          Apache-2.0 · Built with care by <a href={photonGroveUrl}>Photon Grove</a>, a Colorado
+          software studio.
         </p>
       </footer>
     </main>
