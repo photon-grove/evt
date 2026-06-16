@@ -27,12 +27,17 @@ import (
 // it scope enumeration too. When both are set and differ, this returns an error rather than silently
 // enumerating one type while the rebuild skips it as the wrong type.
 //
-// cfg is validated by evt.RebuildProjectionsFromStream, which drains the already-started stream on a
-// config error so its producer never strands. applyEvent is required.
+// cfg is validated up front — applyEvent, Projectors, and CommitGroup are checked before the stream
+// starts, mirroring evt.RebuildProjections, so an invalid config fails fast without launching the
+// enumeration scan and per-entity queries (which would otherwise consume read capacity and invoke
+// applyEvent after the caller already had an error).
 //
-// This wires the scan-vs-registry choice; the snapshot-seeded path (cfg.SeedEntity, for streams
-// truncated by CompactBelow) remains on evt.RebuildProjections via evt.SnapshotStreamer and is not
-// combinable with opts here.
+// This wires the scan-vs-registry choice only. The snapshot-seeded path (cfg.SeedEntity, for streams
+// truncated by CompactBelow) is NOT combinable here: StreamEntitiesByQuery reads each partition with
+// GetEvents and never consults the seeder, so a compacted stream would replay only its surviving
+// events and commit projections built from truncated history. A non-nil cfg.SeedEntity is therefore
+// rejected — use evt.RebuildProjections (which routes through evt.SnapshotStreamer) for compacted
+// streams.
 func (repo *Repository) RebuildProjectionsByQuery(
 	ctx context.Context,
 	opts StreamByQueryOptions,
@@ -41,6 +46,23 @@ func (repo *Repository) RebuildProjectionsByQuery(
 ) (*evt.RebuildResult, error) {
 	if applyEvent == nil {
 		return nil, fmt.Errorf("applyEvent callback is required")
+	}
+
+	// Validate cfg before starting the stream so an invalid config does not strand a producer or burn
+	// read capacity. evt.RebuildProjectionsFromStream re-checks these and drains on error, but by then
+	// the stream is already running.
+	if len(cfg.Projectors) == 0 {
+		return nil, fmt.Errorf("at least one projector is required")
+	}
+
+	if !cfg.DryRun && cfg.CommitGroup == nil {
+		return nil, fmt.Errorf("CommitGroup is required when DryRun is false")
+	}
+
+	// The query path cannot honor a snapshot seeder, so accepting one would silently rebuild compacted
+	// streams from truncated history. Reject it rather than ignore it.
+	if cfg.SeedEntity != nil {
+		return nil, fmt.Errorf("cfg.SeedEntity is not supported by RebuildProjectionsByQuery; use evt.RebuildProjections for snapshot-seeded (compacted) streams")
 	}
 
 	if opts.EntityType == "" {

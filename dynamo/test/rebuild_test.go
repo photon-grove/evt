@@ -201,26 +201,46 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_ScanEntityTypeFromConfi
 	s.client.AssertExpectations(s.T())
 }
 
-// Test_RebuildProjectionsByQuery_ConfigErrorDrainsStream confirms the documented "never strands"
-// guarantee end to end: a config error (here, a missing CommitGroup) surfaces from the wrapper even
-// though StreamEntitiesByQuery has already started its producer, because
-// RebuildProjectionsFromStream drains the started stream. The Scan/Query mocks are optional so the
-// drain may consume them without an unexpected-call failure.
-func (s *RepositorySuite) Test_RebuildProjectionsByQuery_ConfigErrorDrainsStream() {
+// Test_RebuildProjectionsByQuery_ConfigErrorFailsFast confirms an invalid config (missing
+// CommitGroup, or no projectors) is rejected before any stream is started — no Scan or Query is
+// registered, so a launched enumeration would surface as an unexpected mock call.
+func (s *RepositorySuite) Test_RebuildProjectionsByQuery_ConfigErrorFailsFast() {
 	ctx := context.Background()
 
-	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.ScanOutput{
-		Items: []map[string]types.AttributeValue{pkItem("a"), pkItem("b")},
-	}, nil).Maybe()
-	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("a", 1)}}, nil).Maybe()
+	// DryRun false with no CommitGroup must fail before consuming read capacity.
+	missingCommit := evt.RebuildConfig{Projectors: []evt.EventProjector{&rebuildProjector{}}}
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), missingCommit)
+	require.Nil(s.T(), res)
+	require.ErrorContains(s.T(), err, "CommitGroup is required")
 
-	// DryRun false with no CommitGroup is a config error caught after the stream has started.
-	cfg := evt.RebuildConfig{Projectors: []evt.EventProjector{&rebuildProjector{}}}
+	// No projectors must also fail before streaming.
+	noProjectors := evt.RebuildConfig{CommitGroup: func(context.Context, evt.TransactionGroup) error { return nil }}
+	res, err = s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), noProjectors)
+	require.Nil(s.T(), res)
+	require.ErrorContains(s.T(), err, "at least one projector is required")
+
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_RebuildProjectionsByQuery_RejectsSeedEntity confirms the query path refuses a snapshot seeder
+// rather than silently ignoring it: StreamEntitiesByQuery replays only surviving events, so honoring
+// a SeedEntity config on a compacted stream would commit projections built from truncated history.
+// The rejection happens before any stream starts, so no Scan/Query is registered.
+func (s *RepositorySuite) Test_RebuildProjectionsByQuery_RejectsSeedEntity() {
+	ctx := context.Background()
+
+	cfg := evt.RebuildConfig{
+		Projectors:  []evt.EventProjector{&rebuildProjector{}},
+		CommitGroup: func(context.Context, evt.TransactionGroup) error { return nil },
+		SeedEntity: func(context.Context, evt.SerializedSnapshot) (evt.Entity, error) {
+			return nil, nil
+		},
+	}
 
 	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), cfg)
 	require.Nil(s.T(), res)
-	require.ErrorContains(s.T(), err, "CommitGroup is required")
+	require.ErrorContains(s.T(), err, "SeedEntity is not supported")
+	s.client.AssertExpectations(s.T())
 }
 
 // Test_RebuildProjectionsByQuery_NilApplyEvent rejects a nil replay callback before starting a
