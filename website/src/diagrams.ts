@@ -69,6 +69,32 @@ export const diagrams: DiagramSpec[] = [
     ],
   },
   {
+    id: 'incremental-rebuild',
+    title: 'Incremental rebuild',
+    group: 'Operations',
+    description:
+      'A heads projector keeps one small row per entity (its highest sequence). The rebuild reads that table, not the log, and reprojects only entities whose head moved past their checkpoint — no secondary index, no global counter, no commit-path change.',
+    layout: {direction: 'DOWN'},
+    nodes: [
+      {id: 'eventlog', kind: 'datastore', label: 'event-log stream', sublabel: 'DynamoDB NEW_IMAGE', domain: 'event', icon: 'datastore'},
+      {id: 'headsproj', kind: 'service', label: 'Heads projector', sublabel: 'HeadStore · monotonic upsert', domain: 'api', icon: 'worker'},
+      {id: 'headstable', kind: 'datastore', label: 'heads table', sublabel: 'pk=entityID · headSeq', domain: 'data', icon: 'datastore'},
+      {id: 'rebuild', kind: 'service', label: 'Incremental rebuild', sublabel: 'detect · reproject', domain: 'api', icon: 'worker'},
+      {id: 'checkpoint', kind: 'datastore', label: 'Projection checkpoint', sublabel: 'last-built sequence', domain: 'data', icon: 'archive'},
+      {id: 'projectors', kind: 'process', label: 'Projectors', sublabel: 'changed entities only', domain: 'domain', icon: 'projector'},
+      {id: 'views', kind: 'datastore', label: 'entity-views', sublabel: 'replacement rows', domain: 'data', icon: 'datastore'},
+    ],
+    edges: [
+      {id: 'log-headsproj', source: 'eventlog', target: 'headsproj', label: 'INSERT batch', variant: 'event'},
+      {id: 'headsproj-headstable', source: 'headsproj', target: 'headstable', label: 'max(seq)', variant: 'data'},
+      {id: 'headstable-rebuild', source: 'headstable', target: 'rebuild', label: 'StreamEntityHeads', variant: 'data'},
+      {id: 'checkpoint-rebuild', source: 'checkpoint', target: 'rebuild', label: 'last sequence', variant: 'dependency'},
+      {id: 'rebuild-projectors', source: 'rebuild', target: 'projectors', label: 'changed only', variant: 'event'},
+      {id: 'projectors-views', source: 'projectors', target: 'views', label: 'derived rows', variant: 'data'},
+      {id: 'rebuild-checkpoint', source: 'rebuild', target: 'checkpoint', label: 'advance', variant: 'async'},
+    ],
+  },
+  {
     id: 'streams',
     title: 'Streams, projectors, and publishers',
     group: 'Async flows',
@@ -81,7 +107,7 @@ export const diagrams: DiagramSpec[] = [
       {id: 'readmodel', kind: 'datastore', label: 'read models', sublabel: 'views or search rows', domain: 'data', icon: 'datastore'},
       {id: 'publisher', kind: 'service', label: 'Publisher handler', sublabel: 'ingress + retry budget', domain: 'event', icon: 'topic'},
       {id: 'sns', kind: 'topic', label: 'SNS topic', sublabel: 'standard + optional FIFO', domain: 'queue', icon: 'topic'},
-      {id: 'consumers', kind: 'external', label: 'Consumers', sublabel: 'feeds · webhooks · projections', domain: 'external', icon: 'external'},
+      {id: 'consumers', kind: 'external', label: 'Consumers', sublabel: 'feeds · webhooks · projections · heads', domain: 'external', icon: 'external'},
     ],
     edges: [
       {id: 'log-runtime', source: 'eventlog', target: 'projector-runtime', label: 'INSERT batch', variant: 'event'},
