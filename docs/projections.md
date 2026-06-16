@@ -98,7 +98,7 @@ flowchart TB
 
   subgraph rebuild ["incremental rebuild tool"]
     direction TB
-    read["StreamEntityHeads()"] --> detect{"head != checkpoint?"}
+    read["StreamEntityHeads()"] --> detect{"head > checkpoint?"}
     ckpt[("per-entity<br/>projection checkpoint")] --> detect
     detect -- "changed only" --> reproject["reproject entity"]
     reproject --> views2[("views")]
@@ -143,8 +143,28 @@ view was last built from), and reproject only the entities whose head moved.
 ```go
 current, err := heads.StreamEntityHeads(ctx, "") // all types; few-MB scan
 // for id, head := range current:
-//   if head != checkpoint[id] { reproject(id); checkpoint[id] = head }
+//   if head > checkpoint[id] { reproject(id); checkpoint[id] = head }
 ```
+
+Compare with `>`, not `!=`: heads only advance, so a strictly-greater test reprojects
+exactly the entities that moved. It also keeps detection correct under the eventually
+consistent read above — a stale head that briefly reads *behind* the checkpoint is
+simply skipped, never regressing the checkpoint or forcing a redundant reprojection.
+
+The reader is eventually consistent by default (half the RCU cost); a head that lags
+a beat only defers an entity to the next rebuild, never skips it. Derive a strongly
+consistent variant with `heads.WithConsistentRead(true)` if a read must reflect the
+latest projector write.
+
+**Recovering a lagged head.** The heads table is a projection, so it is only as
+current as its projector. If a delivery is permanently dropped (for example, a record
+exhausted its retries and went to a dead-letter queue), that entity's head can lag the
+log, and change detection would treat it as unchanged and skip its reprojection. The
+fix is the same operation that seeds the table: re-run `Backfill` from the log, whose
+heads are authoritative. Because the upsert is monotonic, backfill only ever advances a
+lagging head and is safe to run anytime — concurrently with the live projector and as
+often as you like — so a periodic backfill (or one after draining a DLQ) keeps the
+table from drifting.
 
 `EntityHeadStreamer` is backend-neutral, so a non-DynamoDB backend can satisfy it
 its own way (for example, a SQL backend with `SELECT entity_id, MAX(sequence) …`).

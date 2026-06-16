@@ -138,14 +138,28 @@ type HeadStore struct {
 	consistentRead bool
 }
 
-// NewHeadStore builds a HeadStore over the given heads table.
+// NewHeadStore builds a HeadStore over the given heads table. Reads default to eventually
+// consistent (half the RCU cost): change detection is inherently re-runnable, and a head that
+// lags a beat only defers an entity's reprojection to the next rebuild, never skips it. Derive a
+// strongly consistent variant with WithConsistentRead(true) when a read must reflect the latest
+// projector write.
 func NewHeadStore(client Client, headsTable string) *HeadStore {
 	return &HeadStore{
 		client:         client,
 		headsTable:     headsTable,
 		name:           DefaultHeadsProjectorName,
-		consistentRead: true,
+		consistentRead: false,
 	}
+}
+
+// WithConsistentRead returns a shallow copy of the HeadStore with the consistent-read setting
+// updated. When true, StreamEntityHeads uses strongly consistent reads; when false (the default),
+// it uses eventually consistent reads at half the RCU cost. The original HeadStore is not
+// modified, so a strong- and an eventual-consistency variant can be derived from the same base.
+func (h *HeadStore) WithConsistentRead(consistent bool) *HeadStore {
+	c := *h
+	c.consistentRead = consistent
+	return &c
 }
 
 // Name implements projectors.Projector.
@@ -215,7 +229,9 @@ func (h *HeadStore) upsertHead(
 
 // StreamEntityHeads implements evt.EntityHeadStreamer by scanning the heads table. The heads table
 // holds one small row per entity, so this reads only a few MB regardless of event-log size — the
-// cheap change-detection path. entityType, when non-empty, restricts the result to that type.
+// cheap change-detection path. The scan is eventually consistent by default (see NewHeadStore);
+// use WithConsistentRead(true) for a strongly consistent read. entityType, when non-empty,
+// restricts the result to that type.
 func (h *HeadStore) StreamEntityHeads(
 	ctx context.Context,
 	entityType evt.EntityType,
