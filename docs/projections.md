@@ -73,6 +73,43 @@ log; the win here is bounded memory, incremental output, and parallel per-entity
 queries, not lower read cost. For genuinely cheaper enumeration, back it with a
 dedicated per-entity index or registry.
 
+### Incremental rebuilds with an entity-heads table
+
+A full rebuild reprocesses every entity even when only a handful changed since the
+last run, and (per the note above) enumeration reads capacity comparable to the
+whole log. To rebuild only what changed, keep a small **heads table**: one row per
+entity (`pk` = entity ID) holding that entity's highest event sequence. Reading it
+is a scan of a few small rows, not the event log, so change detection is cheap.
+
+The heads table is maintained like any other read model — by a projector on the
+event stream — so it adds nothing to the commit path, and its per-entity-keyed
+writes stay distributed (no hot partition, no global counter, no secondary index).
+`dynamo.HeadStore` is both the projector (`projectors.Projector`) and the reader
+(`evt.EntityHeadStreamer`):
+
+```go
+heads := dynamo.NewHeadStore(client, "my-entity-heads")
+
+// In the projector Lambda: upsert each event's head, monotonically. Re-deliveries
+// and out-of-order events fail the condition and are no-ops, so it is idempotent.
+runtime := projectors.NewRuntime(heads, idempotencyGuard, logger)
+
+// In the rebuild tool: read every entity's head, compare against your per-entity
+// projection checkpoint, and reproject only the entities whose head moved.
+current, err := heads.StreamEntityHeads(ctx, "" /* all types */)
+```
+
+`EntityHeadStreamer` is backend-neutral, so a non-DynamoDB backend can satisfy it
+its own way (for example, a SQL backend with `SELECT entity_id, MAX(sequence) …`).
+The in-memory repository implements it directly over its event map for tests.
+
+Seed the table once from the existing log before the first incremental run with
+`HeadStore.Backfill`, passing any `EntityHeadStreamer` source (typically a
+`Repository`, whose `StreamEntityHeads` folds the log — the one place a full scan
+remains). After that, the projector keeps the table complete as new entities emit
+their first event. The head accounts for a compacted stream's snapshot floor, so it
+stays correct after `CompactBelow`.
+
 ## Rebuilding compacted streams
 
 By default a rebuild replays each stream from event sequence 1. If a stream has

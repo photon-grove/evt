@@ -25,6 +25,12 @@ func NewRepository() evt.Repository {
 	}
 }
 
+// The in-memory repository also satisfies the snapshot-aware and head-streaming capabilities.
+var (
+	_ evt.SnapshotStreamer   = (*Repository)(nil)
+	_ evt.EntityHeadStreamer = (*Repository)(nil)
+)
+
 // Commit Events to memory
 func (repo Repository) Commit(
 	_ context.Context,
@@ -171,6 +177,50 @@ func (repo Repository) StreamAllEvents(
 	}()
 
 	return channel
+}
+
+// StreamEntityHeads implements evt.EntityHeadStreamer over the in-memory log. The head is the
+// larger of the highest stored event sequence and the snapshot's recorded EventSequence, so it
+// stays correct for streams whose early events were compacted away. entityType, when non-empty,
+// restricts the result to that type.
+func (repo Repository) StreamEntityHeads(
+	_ context.Context,
+	entityType evt.EntityType,
+) (map[evt.EntityID]evt.EventSequence, error) {
+	heads := make(map[evt.EntityID]evt.EventSequence)
+
+	for id, events := range repo.events {
+		snapshot := repo.snapshots[id]
+		if entityType != "" && !memEventsMatchType(events, snapshot, entityType) {
+			continue
+		}
+
+		var head evt.EventSequence
+		for _, event := range events {
+			if event.Sequence > head {
+				head = event.Sequence
+			}
+		}
+		if snapshot.EventSequence > head {
+			head = snapshot.EventSequence
+		}
+
+		heads[evt.EntityID(id)] = head
+	}
+
+	// Entities present only as a snapshot (events compacted away with no event key) still have a head.
+	for id, snapshot := range repo.snapshots {
+		if _, seen := heads[evt.EntityID(id)]; seen {
+			continue
+		}
+		if entityType != "" && snapshot.EntityType != entityType {
+			continue
+		}
+
+		heads[evt.EntityID(id)] = snapshot.EventSequence
+	}
+
+	return heads, nil
 }
 
 // CompactBelow deletes events for an entity whose sequence is in [1, throughSequence], but only
