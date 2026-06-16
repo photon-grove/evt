@@ -23,8 +23,10 @@ It grew out of patterns we run in production.
 - **Concurrency and ordering are handled.** Conditional writes protect per-entity
   sequence ordering. Stable command IDs make retries safe instead of duplicating
   facts.
-- **Replay stays fast as logs grow.** Inline snapshots, versioned upcasters, and
-  snapshot-verified compaction keep rebuilds quick without rewriting history.
+- **Rebuilds stay cheap as logs grow.** Inline snapshots, versioned upcasters, and
+  snapshot-verified compaction keep replay quick without rewriting history. An
+  optional entity-heads table tracks each entity's latest sequence so you can
+  rebuild only the entities that changed instead of reprocessing the whole log.
 - **Built for AWS-native systems.** First-class DynamoDB Streams projectors and
   SNS publishers, with idempotency and retry classification, not as an afterthought.
 
