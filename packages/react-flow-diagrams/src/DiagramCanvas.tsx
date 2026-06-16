@@ -17,7 +17,11 @@ import {nodeTypes} from './nodes/nodes'
 import {domainColor} from './theme/tokens'
 import type {DiagramNodeData, DiagramSpec} from './types'
 
-const MIN_READABLE_INITIAL_ZOOM = 0.38
+// fitView scales a long, single-file flow down until its whole length fits,
+// which leaves nodes too small to read. Floor the initial zoom so cards stay
+// legible on load; the long diagrams then exceed the viewport and the reader
+// pans/scrolls through them (the minimap and controls make that obvious).
+const MIN_READABLE_INITIAL_ZOOM = 0.62
 
 interface ZoomController {
   getZoom(): number
