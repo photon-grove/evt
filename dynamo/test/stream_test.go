@@ -419,9 +419,9 @@ type headEntry struct {
 
 // fakeHeadVisitor is an evt.EntityHeadVisitor that streams a fixed set of heads to the visitor one
 // at a time, never building a slice or map of its own — the registry-backed, constant-memory
-// enumeration source StreamEntitiesByQuery consumes when StreamByQueryOptions.HeadSource is set. It
-// records each ID it streamed so a test can assert the registry (not an event-log scan) drove
-// enumeration.
+// enumeration source both rebuild paths consume when their HeadSource option is set
+// (StreamByQueryOptions.HeadSource / StreamFromSnapshotsOptions.HeadSource). It records each ID it
+// streamed so a test can assert the registry (not an event-log scan) drove enumeration.
 type fakeHeadVisitor struct {
 	heads    []headEntry
 	gotType  evt.EntityType

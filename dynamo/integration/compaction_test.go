@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/snapshots"
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
@@ -96,6 +97,63 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_RebuildAfterCompaction(
 			count++
 		}
 	}
+	require.Equal(s.T(), 1, count)
+	rebuiltEntity, ok := rebuilt.(*test.Entity)
+	require.True(s.T(), ok)
+	require.Equal(s.T(), "v7", rebuiltEntity.Value)
+}
+
+// Test_StreamFromSnapshots_HeadSourceRebuildAfterCompaction verifies the constant-memory
+// enumeration path for snapshot-aware rebuilds: after compacting a stream below its snapshot, a
+// HeadStore registry (whose head folds in the snapshot floor) drives ID enumeration instead of a
+// full-log scan, and the rebuild still seeds from the snapshot and reproduces the correct
+// post-snapshot state.
+func (s *DynamoEventsIntegrationSuite) Test_StreamFromSnapshots_HeadSourceRebuildAfterCompaction() {
+	ctx := context.Background()
+
+	id := evt.EntityID(newID())
+	s.SetupEntity(id, 2) // snapshot every 2 events
+	metadata := s.getMetadata(ctx)
+
+	require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.CreateEntity{Value: "v1"}, metadata))
+	for i := 2; i <= 7; i++ {
+		require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.ReplaceEntity{Value: "v" + strconv.Itoa(i)}, metadata))
+	}
+
+	snapshot, err := s.repo.GetSnapshot(ctx, id)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), evt.EventSequence(6), snapshot.EventSequence)
+
+	// Compact everything captured by the snapshot (events 1..6); only event 7 survives in the log.
+	deleted, err := s.repo.CompactBelow(ctx, id, snapshot.EventSequence)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 6, deleted)
+	require.Equal(s.T(), []evt.EventSequence{7}, s.sequencesFor(ctx, id))
+
+	// Populate the heads registry from the (now compacted) log. The head folds in the snapshot floor,
+	// so the compacted entity is still registered at sequence 7 even though events 1..6 are gone.
+	heads := dynamo.NewHeadStore(s.client, headsTable)
+	_, err = heads.Backfill(ctx, s.repo, s.entityType)
+	require.NoError(s.T(), err)
+
+	// Rebuild enumerating entity IDs from the registry (constant memory) rather than a full-log scan.
+	opts := dynamo.StreamFromSnapshotsOptions{
+		EntityType: s.entityType,
+		Workers:    4,
+		HeadSource: heads,
+	}
+
+	var rebuilt evt.Entity
+	count := 0
+	for res := range s.repo.StreamEntitiesFromSnapshotsWithOptions(ctx, opts, seedIntegrationEntity, applyIntegrationEvent) {
+		entity, uerr := res.Unwrap()
+		require.NoError(s.T(), uerr)
+		if entity.GetID() == id {
+			rebuilt = entity
+			count++
+		}
+	}
+
 	require.Equal(s.T(), 1, count)
 	rebuiltEntity, ok := rebuilt.(*test.Entity)
 	require.True(s.T(), ok)

@@ -272,6 +272,41 @@ after it), so it is bounded-memory and does not depend on scan ordering. If
 `RebuildProjections` returns an error rather than silently producing partial state.
 See [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
 
+By default this path still enumerates entity IDs with a key-only event-log scan and
+a dedup set, so its memory ceiling grows with the entity count. For the same
+**constant-memory** enumeration the from-events path gets from
+`StreamByQueryOptions.HeadSource`, the DynamoDB repository exposes
+`StreamEntitiesFromSnapshotsWithOptions` with a matching
+`StreamFromSnapshotsOptions.HeadSource` (any `EntityHeadVisitor`, e.g. a
+`HeadStore`):
+
+```go
+stream := repo.StreamEntitiesFromSnapshotsWithOptions(ctx, dynamo.StreamFromSnapshotsOptions{
+    EntityType: entityType,
+    Workers:    8,
+    HeadSource: heads, // enumerate IDs from the registry, not a key-only event-log scan
+}, seedEntity, applyEvent)
+
+res, err := evt.RebuildProjectionsFromStream(ctx, stream, evt.RebuildConfig{
+    Projectors:  projectors,
+    CommitGroup: commitGroup,
+})
+```
+
+The heads registry is a correct ID source for compacted streams because each head is
+`MAX(highest event sk, snapshot EventSequence)` — so a stream whose early events were
+truncated is still registered at the sequence its snapshot covers. As with the
+from-events path, enumeration streams IDs straight to the workers with no dedup set,
+each entity is still seeded from its own `sk=0` snapshot and rebuilt from its own
+partition, and the trade-off is the same: the default scan path collects every ID up
+front and fails before emitting anything if enumeration errors, while the registry
+path emits entities as it enumerates, so a mid-enumeration failure surfaces as a
+stream error after some entities were already emitted. Rebuilds are idempotent, so
+re-run from scratch or resume past finished work with `Skip`. It is opt-in and
+requires the heads table to be populated (maintained by the heads projector and
+seeded with `Backfill`); leave `HeadSource` nil to keep the no-schema-change
+scan-and-dedup default that `evt.RebuildConfig.SeedEntity` uses.
+
 ## Reading views without buffering
 
 The view repository's `ListViewsByEntityType` and `ListViewsByPK` buffer their
