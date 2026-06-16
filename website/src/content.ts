@@ -53,8 +53,8 @@ export const capabilities: ContentCard[] = [
     doc: 'concepts',
   },
   {
-    title: 'Stream projectors',
-    body: 'Run DynamoDB Streams Lambda projectors with idempotency, retry classification, and partial-batch failure responses.',
+    title: 'Fan-out projectors',
+    body: 'Projectors subscribe to the SNS fan-out (SNS→SQS) with idempotency, retry classification, and partial-batch failure responses.',
     doc: 'streams',
   },
   {
@@ -78,8 +78,8 @@ export const packages = [
   {name: 'evt/dynamo', body: 'DynamoDB event log, snapshots, views, stream helpers, and transaction groups.'},
   {name: 'evt/snapshots', body: 'Store with snapshot loading and configurable write thresholds.'},
   {name: 'evt/stream', body: 'Stream handler and publisher helpers for event fanout.'},
-  {name: 'evt/projectors', body: 'Streams Lambda projector runtime with idempotency and retry classification.'},
-  {name: 'evt/publishers', body: 'Streams publisher handler with ingress and retry budgets.'},
+  {name: 'evt/projectors', body: 'Projector runtime for the SNS fan-out (or direct stream) with idempotency and retry classification.'},
+  {name: 'evt/publishers', body: 'DynamoDB Streams publisher that fans events out to SNS, with ingress and retry budgets.'},
   {name: 'evt/policy', body: 'Backend-neutral retry helpers for commit paths (+ policy/dynamodb).'},
   {name: 'evt/viewstore', body: 'Typed JSON helper around evt.ViewRepository.'},
   {name: 'evt/test', body: 'Shared test aggregate, commands, events, and helpers for adopters.'},

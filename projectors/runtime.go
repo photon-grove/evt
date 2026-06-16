@@ -7,7 +7,9 @@ import (
 	"time"
 )
 
-// Projector processes events from a DynamoDB Stream and maintains read models.
+// Projector processes committed events and maintains read models. Records are
+// normally delivered via the SNS fan-out (see the package doc), but a Projector
+// is transport-agnostic — it just receives StreamRecord batches.
 type Projector interface {
 	// Process handles a batch of stream records, returning identifiers of records
 	// that should be retried (partial batch failure).
@@ -18,8 +20,9 @@ type Projector interface {
 	Name() string
 }
 
-// StreamRecord represents a single event from a DynamoDB Streams trigger,
-// converted from the raw DynamoDB record into a domain-friendly shape.
+// StreamRecord is one event in a domain-friendly shape, ready for a Projector.
+// It is decoded from whichever transport delivered it — the SNS/SQS envelope via
+// StreamRecordFromEnvelope, or a raw DynamoDB stream record.
 type StreamRecord struct {
 	EventID                     string
 	EntityID                    string
