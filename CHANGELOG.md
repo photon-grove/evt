@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/photon-grove/evt/compare/v0.3.0...v0.4.0) (2026-06-16)
+
+
+### Features
+
+* **dynamo:** default HeadStore reads to eventual consistency ([#26](https://github.com/photon-grove/evt/issues/26)) ([38e9306](https://github.com/photon-grove/evt/commit/38e93065e98f7d5ee16d17904e033352a38223a0))
+* **dynamo:** entity-heads projector + reader for incremental rebuild change detection ([#22](https://github.com/photon-grove/evt/issues/22)) ([67a271b](https://github.com/photon-grove/evt/commit/67a271b3d73363d4dbba888e7a770c8030eac6d9))
+
 ## [0.3.0](https://github.com/photon-grove/evt/compare/v0.2.0...v0.3.0) (2026-06-04)
 
 
