@@ -218,6 +218,26 @@ entities as it enumerates, so a mid-enumeration failure surfaces as a stream err
 after some entities were already emitted. Rebuilds are idempotent, so re-run from
 scratch or resume past finished work with `Skip`.
 
+To skip the hand-wiring entirely, the dynamo repository's
+`RebuildProjectionsByQuery` builds the `StreamEntitiesByQuery` stream — registry or
+scan — and feeds it to `RebuildProjectionsFromStream` for you. It is the
+bounded-memory counterpart to `evt.RebuildProjections`:
+
+```go
+res, err := repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{
+    Workers:    8,
+    HeadSource: heads, // omit to use the scan-and-dedup enumeration instead
+}, applyEvent, cfg)
+```
+
+Set `cfg.EntityType` to scope the rebuild: when `StreamByQueryOptions.EntityType`
+is empty it inherits `cfg.EntityType`, so the type is declared once and scopes
+enumeration too. (Setting both to different types is rejected, since the stream
+would enumerate one type while the rebuild's per-entity check skips it as another.)
+This wrapper covers the scan-vs-registry choice; for streams truncated by
+`CompactBelow`, stay on `evt.RebuildProjections` with `RebuildConfig.SeedEntity` —
+see [Rebuilding compacted streams](#rebuilding-compacted-streams).
+
 ## Rebuilding compacted streams
 
 By default a rebuild replays each stream from event sequence 1. If a stream has
