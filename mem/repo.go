@@ -172,7 +172,7 @@ func (repo Repository) StreamAllEvents(
 		defer close(channel)
 
 		for id, events := range repo.events {
-			if filter.EntityType != "" && !memEventsMatchType(events, repo.snapshots[id], filter.EntityType) {
+			if !filter.Matches(memPartitionType(events, repo.snapshots[id])) {
 				continue
 			}
 
@@ -330,18 +330,23 @@ func (repo Repository) seedFromSnapshot(
 	return entity, snapshot.EventSequence, true
 }
 
-// memEventsMatchType reports whether a partition belongs to the given entity type, checking the
-// stored events first and falling back to the snapshot's recorded type.
-func memEventsMatchType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot, entityType evt.EntityType) bool {
+// memPartitionType reports a partition's entity type, reading the first non-snapshot event and
+// falling back to the snapshot's recorded type when only a snapshot remains (events compacted away).
+func memPartitionType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot) evt.EntityType {
 	for _, event := range serialized {
 		if event.Sequence == 0 {
 			continue
 		}
 
-		return event.EntityType == entityType
+		return event.EntityType
 	}
 
-	return snapshot.EntityType == entityType
+	return snapshot.EntityType
+}
+
+// memEventsMatchType reports whether a partition belongs to the given entity type.
+func memEventsMatchType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot, entityType evt.EntityType) bool {
+	return memPartitionType(serialized, snapshot) == entityType
 }
 
 // applyMemEvents applies events above the snapshot boundary to the (possibly seeded) entity.
@@ -387,7 +392,7 @@ func (repo Repository) StreamEntities(
 		entityEvents := 0
 
 		for id, serialized := range repo.events {
-			if filter.EntityType != "" && !memEventsMatchType(serialized, repo.snapshots[id], filter.EntityType) {
+			if !filter.Matches(memPartitionType(serialized, repo.snapshots[id])) {
 				continue
 			}
 
