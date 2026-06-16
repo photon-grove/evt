@@ -73,11 +73,6 @@ const DOC_CONFIG: Record<string, DocConfig> = {
     order: 7,
     summary: 'Copy-ready patterns for adopters: rebuilds, dedup, schema evolution, and local testing.',
   },
-  security: {
-    group: GUIDES,
-    order: 8,
-    summary: 'Keeping a public-safe configuration: neutral examples and local-emulator credentials.',
-  },
 }
 
 function metaFor(path: string, markdown: string): DocMeta {
