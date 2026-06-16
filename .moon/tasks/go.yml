@@ -82,5 +82,27 @@ tasks:
     inputs:
       - '@globs(sources)'
       - '@globs(tests)'
+  check-postgres-readiness:
+    command: bash
+    args:
+      - scripts/check-postgres-readiness.sh
+      - --host
+      - '${POSTGRES_HOST:-localhost}'
+      - --port
+      - '${POSTGRES_PORT:-5432}'
+  integration-postgres:
+    command: go
+    args:
+      - test
+      - -race
+      - -tags=integration
+      - ./postgres/integration
+    deps:
+      - check-postgres-readiness
+    env:
+      DATABASE_URL: postgres://evt:evt@localhost:5432/evt_local?sslmode=disable
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
 inheritedBy:
   toolchain: go

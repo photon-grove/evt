@@ -63,14 +63,19 @@ const DOC_CONFIG: Record<string, DocConfig> = {
     order: 5,
     summary: 'The single-table event-log layout, key patterns, and conditional-write ordering.',
   },
-  'integration-cookbook': {
+  postgres: {
     group: GUIDES,
     order: 6,
+    summary: 'The relational event-log schema, optimistic concurrency, and snapshot-aware compaction.',
+  },
+  'integration-cookbook': {
+    group: GUIDES,
+    order: 7,
     summary: 'Copy-ready patterns for adopters: rebuilds, dedup, schema evolution, and local testing.',
   },
   security: {
     group: GUIDES,
-    order: 7,
+    order: 8,
     summary: 'Keeping a public-safe configuration: neutral examples and local-emulator credentials.',
   },
 }
