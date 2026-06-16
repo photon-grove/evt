@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
-
 	"github.com/photon-grove/evt/result"
 )
 
@@ -93,20 +91,11 @@ func RebuildProjections(
 		return nil, fmt.Errorf("CommitGroup is required when DryRun is false")
 	}
 
-	// Build an optional filter expression for the entity type.
-	var expr *expression.Expression
-	if cfg.EntityType != "" {
-		builder := expression.NewBuilder().WithFilter(
-			expression.Name("entityType").Equal(expression.Value(string(cfg.EntityType))),
-		)
-		built, err := builder.Build()
-		if err != nil {
-			return nil, fmt.Errorf("building filter expression: %w", err)
-		}
-		expr = &built
-	}
+	// Narrow the stream to the configured entity type with a backend-neutral filter; each
+	// Repository translates it into its own query mechanism.
+	filter := StreamFilter{EntityType: cfg.EntityType}
 
-	stream, err := selectRebuildStream(ctx, repo, applyEvent, expr, cfg)
+	stream, err := selectRebuildStream(ctx, repo, applyEvent, filter, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -220,11 +209,11 @@ func selectRebuildStream(
 	ctx context.Context,
 	repo Repository,
 	applyEvent func(context.Context, SerializedEvent, Entity) (Entity, error),
-	expr *expression.Expression,
+	filter StreamFilter,
 	cfg RebuildConfig,
 ) (<-chan result.Result[Entity], error) {
 	if cfg.SeedEntity == nil {
-		return repo.StreamEntities(ctx, expr, applyEvent), nil
+		return repo.StreamEntities(ctx, filter, applyEvent), nil
 	}
 
 	streamer, ok := repo.(SnapshotStreamer)

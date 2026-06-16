@@ -40,7 +40,7 @@ func Test_Repository_StreamAllEvents(t *testing.T) {
 		{EntityID: "b", Sequence: 2, Type: "t2"},
 	}
 
-	ch := repo.StreamAllEvents(context.Background(), nil)
+	ch := repo.StreamAllEvents(context.Background(), evt.StreamFilter{})
 
 	got := make([][]evt.SerializedEvent, 0, 2)
 	for r := range ch {
@@ -90,7 +90,7 @@ func Test_Repository_StreamEntities(t *testing.T) {
 		return ent, nil
 	}
 
-	ch := repo.StreamEntities(context.Background(), nil, applyEvent)
+	ch := repo.StreamEntities(context.Background(), evt.StreamFilter{}, applyEvent)
 
 	gotIDs := make([]evt.EntityID, 0, 2)
 	for r := range ch {
@@ -116,7 +116,7 @@ func Test_Repository_StreamEntities_ApplyError(t *testing.T) {
 		return nil, errors.New("apply failed")
 	}
 
-	ch := repo.StreamEntities(context.Background(), nil, applyEvent)
+	ch := repo.StreamEntities(context.Background(), evt.StreamFilter{}, applyEvent)
 
 	var sawErr bool
 	for r := range ch {
