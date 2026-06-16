@@ -91,7 +91,7 @@ export const diagrams: DiagramSpec[] = [
       'A heads projector keeps one small row per entity (its highest sequence). The rebuild reads that table, not the log, and reprojects only entities whose head moved past their checkpoint — no secondary index, no global counter, no commit-path change.',
     layout: {direction: 'DOWN'},
     nodes: [
-      {id: 'eventlog', kind: 'datastore', label: 'event-log stream', sublabel: 'DynamoDB NEW_IMAGE', domain: 'event', icon: 'datastore'},
+      {id: 'topic', kind: 'topic', label: 'events topic', sublabel: 'SNS fan-out', domain: 'queue', icon: 'topic'},
       {id: 'headsproj', kind: 'service', label: 'Heads projector', sublabel: 'HeadStore · monotonic upsert', domain: 'api', icon: 'worker'},
       {id: 'headstable', kind: 'datastore', label: 'heads table', sublabel: 'pk=entityID · headSeq', domain: 'data', icon: 'datastore'},
       {id: 'rebuild', kind: 'service', label: 'Incremental rebuild', sublabel: 'detect · reproject', domain: 'api', icon: 'worker'},
@@ -100,7 +100,7 @@ export const diagrams: DiagramSpec[] = [
       {id: 'views', kind: 'datastore', label: 'entity-views', sublabel: 'replacement rows', domain: 'data', icon: 'datastore'},
     ],
     edges: [
-      {id: 'log-headsproj', source: 'eventlog', target: 'headsproj', label: 'INSERT batch', variant: 'event'},
+      {id: 'topic-headsproj', source: 'topic', target: 'headsproj', label: 'SNS→SQS', variant: 'async'},
       {id: 'headsproj-headstable', source: 'headsproj', target: 'headstable', label: 'max(seq)', variant: 'data'},
       {id: 'headstable-rebuild', source: 'headstable', target: 'rebuild', label: 'StreamEntityHeads', variant: 'data'},
       {id: 'checkpoint-rebuild', source: 'checkpoint', target: 'rebuild', label: 'last sequence', variant: 'dependency'},

@@ -77,6 +77,38 @@ describe('runSwimlaneLayout', () => {
     expect(widths.size).toBe(1)
   })
 
+  it('stacks cards that share a lane and column instead of overlapping', () => {
+    // `x` and `y` both sit in the top lane at column 0 (no edges → depth 0).
+    const shared: DiagramSpec = {
+      id: 'shared',
+      title: 'Shared cell',
+      layout: {lanes: [{id: 'top', label: 'Top'}, {id: 'bottom', label: 'Bottom'}]},
+      nodes: [
+        {id: 'x', kind: 'service', label: 'X', lane: 'top'},
+        {id: 'y', kind: 'service', label: 'Y', lane: 'top'},
+        {id: 'z', kind: 'datastore', label: 'Z', lane: 'bottom'},
+      ],
+      edges: [],
+    }
+
+    const {nodes} = runSwimlaneLayout(shared)
+    const x = nodes.find((n) => n.id === 'x')!
+    const y = nodes.find((n) => n.id === 'y')!
+    const lanes = nodes.filter((n) => n.type === 'lane')
+
+    // Same column, different vertical slot — the two cards do not overlap.
+    expect(x.position.x).toBe(y.position.x)
+    const gap = Math.abs((y.position.y ?? 0) - (x.position.y ?? 0))
+    expect(gap).toBeGreaterThanOrEqual(x.height ?? 0)
+
+    // The crowded top lane is taller than the single-card bottom lane.
+    const top = lanes.find((n) => n.id === 'lane:top')!
+    const bottom = lanes.find((n) => n.id === 'lane:bottom')!
+    expect(top.height ?? 0).toBeGreaterThan(bottom.height ?? 0)
+    // Bands still stack without overlap.
+    expect(bottom.position.y).toBe(top.height)
+  })
+
   it('keeps edge styling and routes them as smoothstep', () => {
     const {edges} = runSwimlaneLayout(spec)
 

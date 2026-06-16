@@ -1,7 +1,7 @@
 import type {Edge, Node} from '@xyflow/react'
 
 import {nodeSize} from '../theme/tokens'
-import type {DiagramNodeData, DiagramSpec, LaneNodeData} from '../types'
+import type {DiagramNode, DiagramNodeData, DiagramSpec, LaneNodeData} from '../types'
 import {baseEdge} from './edge'
 import type {LaidOutGraph} from './elk'
 
@@ -38,8 +38,7 @@ export function runSwimlaneLayout(spec: DiagramSpec): LaidOutGraph {
   const depth = column(spec)
   const columns = spec.nodes.reduce((max, n) => Math.max(max, depth.get(n.id) ?? 0), 0) + 1
 
-  // Column width = widest card in that column; lane height = tallest card overall
-  // plus padding, so every band is the same height and the grid stays even.
+  // Card slot is the tallest card; each column is as wide as its widest card.
   const colWidth = Array.from({length: columns}, () => 0)
   let tallest = 0
   for (const node of spec.nodes) {
@@ -48,7 +47,6 @@ export function runSwimlaneLayout(spec: DiagramSpec): LaidOutGraph {
     colWidth[c] = Math.max(colWidth[c]!, width)
     tallest = Math.max(tallest, height)
   }
-  const laneHeight = tallest + LANE_VPAD * 2
 
   // Left edge of each column in absolute (flow) coordinates.
   const colX: number[] = []
@@ -59,26 +57,61 @@ export function runSwimlaneLayout(spec: DiagramSpec): LaidOutGraph {
   }
   const totalWidth = cursor - COLUMN_GAP + COLUMN_PAD
 
+  // Group cards into (lane row, column) cells, preserving spec order. Several
+  // nodes can share a cell — same lane at the same longest-path depth (a branch
+  // handled by one actor, or two source nodes in one lane) — so cards in a cell
+  // stack vertically instead of rendering on top of each other.
+  const rowOf = (node: DiagramNode): number => laneIndex.get(laneOf(node.lane)) ?? 0
+  const cellKey = (r: number, c: number): string => `${r}:${c}`
+  const cells = new Map<string, DiagramNode[]>()
+  for (const node of spec.nodes) {
+    const key = cellKey(rowOf(node), depth.get(node.id) ?? 0)
+    cells.set(key, [...(cells.get(key) ?? []), node])
+  }
+
+  // Each lane is tall enough for its busiest cell; lanes stack with cumulative
+  // tops so a crowded lane never clips into the next.
+  const rowCount = Math.max(lanes.length, 1)
+  const rowHeight = Array.from({length: rowCount}, (_, r) => {
+    let stack = 1
+    for (let c = 0; c < columns; c++) {
+      stack = Math.max(stack, cells.get(cellKey(r, c))?.length ?? 0)
+    }
+    return stack * tallest + (stack + 1) * LANE_VPAD
+  })
+  const laneTop: number[] = []
+  rowHeight.reduce((top, height, r) => {
+    laneTop[r] = top
+    return top + height
+  }, 0)
+
   const laneNodes: Node<LaneNodeData>[] = lanes.map((lane, i) => ({
     id: laneId(lane.id),
     type: 'lane',
-    position: {x: 0, y: i * laneHeight},
+    position: {x: 0, y: laneTop[i]!},
     width: totalWidth,
-    height: laneHeight,
+    height: rowHeight[i]!,
     data: {label: lane.label, index: i},
     selectable: false,
     draggable: false,
     zIndex: LANE_Z,
-    style: {width: totalWidth, height: laneHeight},
+    style: {width: totalWidth, height: rowHeight[i]!},
   }))
 
   const cardNodes: Node<DiagramNodeData>[] = spec.nodes.map((node) => {
     const {width, height} = nodeSize(node.kind)
+    const r = rowOf(node)
     const c = depth.get(node.id) ?? 0
-    // Position is relative to the parent lane band (extent: 'parent'): centered
-    // in the column slot horizontally and in the band vertically.
+    const bucket = cells.get(cellKey(r, c)) ?? [node]
+    const slot = bucket.indexOf(node)
+    const stack = bucket.length
+
+    // Center the stack of cards within the lane band, then drop this card into
+    // its slot. Positions are relative to the parent band (extent: 'parent').
+    const stackHeight = stack * tallest + (stack - 1) * LANE_VPAD
+    const stackTop = (rowHeight[r]! - stackHeight) / 2
     const x = colX[c]! + (colWidth[c]! - width) / 2
-    const y = (laneHeight - height) / 2
+    const y = stackTop + slot * (tallest + LANE_VPAD) + (tallest - height) / 2
 
     return {
       id: node.id,

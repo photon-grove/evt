@@ -53,8 +53,14 @@ func StreamRecordFromEnvelope(body []byte) (StreamRecord, error) {
 		return StreamRecord{}, fmt.Errorf("unmarshalling serialized event from envelope: %w", err)
 	}
 
+	// Both IDs are required: EntityID anchors the record, and EventID is the
+	// idempotency key and the SQS partial-batch-failure identifier — an empty one
+	// would collide across records, so drop the message as malformed instead.
 	if event.EntityID == "" {
 		return StreamRecord{}, errors.New("event envelope has no entity id")
+	}
+	if event.ID == "" {
+		return StreamRecord{}, errors.New("event envelope has no event id")
 	}
 
 	return FromSerializedEvent(event), nil
