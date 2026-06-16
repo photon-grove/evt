@@ -29,6 +29,7 @@ func NewRepository() evt.Repository {
 var (
 	_ evt.SnapshotStreamer   = (*Repository)(nil)
 	_ evt.EntityHeadStreamer = (*Repository)(nil)
+	_ evt.EntityHeadVisitor  = (*Repository)(nil)
 )
 
 // Commit Events to memory
@@ -184,11 +185,33 @@ func (repo Repository) StreamAllEvents(
 // stays correct for streams whose early events were compacted away. entityType, when non-empty,
 // restricts the result to that type.
 func (repo Repository) StreamEntityHeads(
-	_ context.Context,
+	ctx context.Context,
 	entityType evt.EntityType,
 ) (map[evt.EntityID]evt.EventSequence, error) {
 	heads := make(map[evt.EntityID]evt.EventSequence)
 
+	err := repo.StreamEntityHeadsFunc(ctx, entityType, func(id evt.EntityID, head evt.EventSequence) error {
+		heads[id] = head
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return heads, nil
+}
+
+// StreamEntityHeadsFunc implements evt.EntityHeadVisitor over the in-memory log, invoking visit once
+// per entity without building the full map StreamEntityHeads returns. The in-memory backend holds
+// the whole log anyway, so this is not constant-memory the way a paged heads table is; it exists so
+// the in-memory repository can stand in for a streaming head source in tests and examples. The head
+// has the same meaning as StreamEntityHeads (the larger of the highest stored event sequence and the
+// snapshot's recorded EventSequence). If visit returns an error, enumeration stops and returns it.
+func (repo Repository) StreamEntityHeadsFunc(
+	_ context.Context,
+	entityType evt.EntityType,
+	visit func(evt.EntityID, evt.EventSequence) error,
+) error {
 	for id, events := range repo.events {
 		snapshot := repo.snapshots[id]
 		if entityType != "" && !memEventsMatchType(events, snapshot, entityType) {
@@ -205,22 +228,27 @@ func (repo Repository) StreamEntityHeads(
 			head = snapshot.EventSequence
 		}
 
-		heads[evt.EntityID(id)] = head
+		if err := visit(evt.EntityID(id), head); err != nil {
+			return err
+		}
 	}
 
-	// Entities present only as a snapshot (events compacted away with no event key) still have a head.
+	// Entities present only as a snapshot (events compacted away with no event key) still have a
+	// head. Skip any id that already has an events entry — it was visited above.
 	for id, snapshot := range repo.snapshots {
-		if _, seen := heads[evt.EntityID(id)]; seen {
+		if _, hasEvents := repo.events[id]; hasEvents {
 			continue
 		}
 		if entityType != "" && snapshot.EntityType != entityType {
 			continue
 		}
 
-		heads[evt.EntityID(id)] = snapshot.EventSequence
+		if err := visit(evt.EntityID(id), snapshot.EventSequence); err != nil {
+			return err
+		}
 	}
 
-	return heads, nil
+	return nil
 }
 
 // CompactBelow deletes events for an entity whose sequence is in [1, throughSequence], but only
