@@ -1,74 +1,106 @@
-export function EventGarden() {
+// Hero illustration for the docs site.
+//
+// It draws the core mental model of evt: an append-only event log (a durable
+// snapshot at sk=0 followed by immutable event rows) that projects into a
+// rebuildable read model. Kept deliberately schematic so it reads as a systems
+// diagram, not decoration.
+export function EventLogArt() {
+  const cells = [
+    {x: 40, label: 'sk 0', kind: 'snapshot'},
+    {x: 124, label: 'sk 1', kind: 'event'},
+    {x: 208, label: 'sk 2', kind: 'event'},
+    {x: 292, label: 'sk 3', kind: 'event'},
+    {x: 376, label: 'sk 4', kind: 'event'},
+  ]
+
   return (
-    <svg className="clip clip-garden" viewBox="0 0 520 420" role="img" aria-label="Event streams growing into read models">
+    <svg
+      className="clip clip-log"
+      viewBox="0 0 500 380"
+      role="img"
+      aria-label="An append-only event log with a snapshot at sk 0, projected into a rebuildable view"
+    >
       <defs>
-        <linearGradient id="garden-sky" x1="0" x2="1" y1="0" y2="1">
-          <stop offset="0" stopColor="#fef3c7" />
-          <stop offset="0.54" stopColor="#dbeafe" />
-          <stop offset="1" stopColor="#dcfce7" />
-        </linearGradient>
-        <linearGradient id="garden-leaf" x1="0" x2="1">
-          <stop offset="0" stopColor="#0f766e" />
-          <stop offset="1" stopColor="#65a30d" />
+        <linearGradient id="log-panel" x1="0" x2="1" y1="0" y2="1">
+          <stop offset="0" stopColor="#fffdf8" />
+          <stop offset="1" stopColor="#f1f7f4" />
         </linearGradient>
       </defs>
-      <rect x="18" y="18" width="484" height="384" rx="28" fill="url(#garden-sky)" />
-      <path d="M66 306c68-24 130-30 186-18 58 12 123 7 198-25v72H66z" fill="#164e63" opacity="0.16" />
-      <path d="M80 308c80-48 157-62 232-42 44 12 83 8 126-15" fill="none" stroke="#0f766e" strokeWidth="8" strokeLinecap="round" />
-      <g fill="#ffffff" stroke="#0f172a" strokeWidth="4">
-        <rect x="78" y="96" width="110" height="74" rx="18" />
-        <rect x="220" y="70" width="110" height="74" rx="18" />
-        <rect x="348" y="116" width="94" height="70" rx="18" />
-      </g>
-      <g fill="#fed7aa" stroke="#0f172a" strokeWidth="4">
-        <circle cx="112" cy="224" r="18" />
-        <circle cx="188" cy="228" r="18" />
-        <circle cx="264" cy="215" r="18" />
-        <circle cx="342" cy="223" r="18" />
-      </g>
-      <g fill="none" stroke="#0f172a" strokeLinecap="round" strokeLinejoin="round" strokeWidth="5">
-        <path d="M104 224c6 26 16 48 34 67" />
-        <path d="M190 228c14 24 31 41 52 52" />
-        <path d="M268 215c18 26 38 43 60 52" />
-        <path d="M344 223c18 18 30 37 38 58" />
-      </g>
-      <g fill="url(#garden-leaf)">
-        <path d="M132 272c-26-24-48-28-67-11 24 24 46 27 67 11z" />
-        <path d="M238 276c-29-14-51-12-67 6 28 15 51 13 67-6z" />
-        <path d="M326 264c-19-24-39-31-61-20 19 24 40 30 61 20z" />
-        <path d="M386 278c-4-30-19-48-45-55 3 31 18 49 45 55z" />
-      </g>
-      <g fill="#0f172a">
-        <circle cx="116" cy="128" r="5" />
-        <circle cx="138" cy="128" r="5" />
-        <circle cx="160" cy="128" r="5" />
-        <path d="M250 100h50v10h-50zM250 120h34v10h-34z" />
-        <path d="M378 146h34v8h-34zM378 164h20v8h-20z" />
-      </g>
-    </svg>
-  )
-}
 
-export function ToolkitShelf() {
-  return (
-    <svg className="clip clip-shelf" viewBox="0 0 520 220" role="img" aria-label="Reusable evt package toolkit">
-      <rect x="24" y="32" width="472" height="156" rx="24" fill="#fff7ed" />
-      <path d="M54 160h412" stroke="#0f172a" strokeWidth="6" strokeLinecap="round" />
-      {[
-        ['#bfdbfe', 78, 72, 70, 88],
-        ['#bbf7d0', 158, 58, 72, 102],
-        ['#fde68a', 240, 82, 68, 78],
-        ['#fecdd3', 318, 64, 74, 96],
-        ['#ddd6fe', 402, 76, 54, 84],
-      ].map(([fill, x, y, w, h], index) => (
-        <g key={index}>
-          <rect x={x as number} y={y as number} width={w as number} height={h as number} rx="10" fill={fill as string} stroke="#0f172a" strokeWidth="5" />
-          <path d={`M${(x as number) + 18} ${(y as number) + 24}h${(w as number) - 36}`} stroke="#0f172a" strokeWidth="4" strokeLinecap="round" />
-          <path d={`M${(x as number) + 18} ${(y as number) + 44}h${(w as number) - 28}`} stroke="#0f172a" strokeWidth="4" strokeLinecap="round" opacity="0.55" />
+      <rect x="4" y="4" width="492" height="372" rx="20" fill="url(#log-panel)" stroke="rgba(23,32,51,0.14)" />
+
+      <text x="40" y="48" className="art-label art-label-strong">event-log</text>
+      <text x="416" y="48" className="art-meta">append-only</text>
+
+      {cells.map((cell, index) => {
+        const isSnapshot = cell.kind === 'snapshot'
+        return (
+          <g key={cell.label}>
+            {index > 0 ? (
+              <path
+                d={`M${cell.x - 10} 92h8`}
+                stroke="#0f766e"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                opacity="0.5"
+              />
+            ) : null}
+            <rect
+              x={cell.x}
+              y={64}
+              width={68}
+              height={56}
+              rx={10}
+              fill={isSnapshot ? '#0f766e' : '#ffffff'}
+              stroke={isSnapshot ? '#0f766e' : 'rgba(23,32,51,0.55)'}
+              strokeWidth="2"
+            />
+            <text
+              x={cell.x + 34}
+              y={88}
+              textAnchor="middle"
+              className="art-cell"
+              style={{fill: isSnapshot ? '#fffdf8' : '#172033'}}
+            >
+              {cell.label}
+            </text>
+            <text
+              x={cell.x + 34}
+              y={106}
+              textAnchor="middle"
+              className="art-cell-sub"
+              style={{fill: isSnapshot ? 'rgba(255,253,248,0.78)' : 'rgba(23,32,51,0.5)'}}
+            >
+              {isSnapshot ? 'snapshot' : 'event'}
+            </text>
+          </g>
+        )
+      })}
+
+      {/* projection flow */}
+      <path
+        d="M250 132v40q0 12 12 12h0"
+        fill="none"
+        stroke="#0f766e"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeDasharray="3 6"
+      />
+      <path d="M250 132v54" fill="none" stroke="#0f766e" strokeWidth="2.5" strokeLinecap="round" strokeDasharray="3 6" />
+      <path d="M244 182l6 8 6-8" fill="none" stroke="#0f766e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+      <text x="262" y="170" className="art-meta">replay · project</text>
+
+      <rect x="96" y="206" width="308" height="138" rx="14" fill="#ffffff" stroke="rgba(23,32,51,0.14)" />
+      <text x="120" y="238" className="art-label art-label-strong">entity-views</text>
+      <text x="380" y="238" textAnchor="end" className="art-meta art-meta-accent">rebuildable</text>
+
+      {[0, 1, 2].map((row) => (
+        <g key={row}>
+          <rect x="120" y={258 + row * 26} width="14" height="14" rx="4" fill={row === 0 ? '#0f766e' : '#cfe6df'} />
+          <rect x="146" y={262 + row * 26} width={row === 1 ? 150 : 196} height="6" rx="3" fill="rgba(23,32,51,0.22)" />
+          <rect x={row === 1 ? 306 : 352} y={262 + row * 26} width={row === 1 ? 30 : 26} height="6" rx="3" fill="#cfe6df" />
         </g>
       ))}
-      <circle cx="61" cy="63" r="14" fill="#fb923c" stroke="#0f172a" strokeWidth="5" />
-      <path d="M461 57l18 18-18 18-18-18z" fill="#14b8a6" stroke="#0f172a" strokeWidth="5" />
     </svg>
   )
 }
