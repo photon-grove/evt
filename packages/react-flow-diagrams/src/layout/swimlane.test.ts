@@ -54,8 +54,9 @@ describe('runSwimlaneLayout', () => {
     const {nodes} = runSwimlaneLayout(spec)
     const byId = new Map(nodes.map((n) => [n.id, n]))
 
-    // Absolute x = column offset + the card's offset within its lane band.
-    // The chain a→b→c→d must be strictly increasing in x.
+    // Cards are parented to lane bands, but every band sits at x=0, so a card's
+    // parent-relative position.x equals its absolute x here. The chain a→b→c→d
+    // must be strictly increasing in x.
     const absX = (id: string): number => byId.get(id)!.position.x
     expect(absX('a')).toBeLessThan(absX('b'))
     expect(absX('b')).toBeLessThan(absX('c'))

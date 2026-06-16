@@ -25,6 +25,9 @@ func FromSerializedEvent(event evt.SerializedEvent) StreamRecord {
 		Payload:    event.Payload,
 	}
 
+	// Metadata is a plain struct, so marshaling cannot realistically fail; if it
+	// ever did, an absent Metadata is harmless (ToSerializedEvent treats it as
+	// empty), so leave the field nil rather than failing the whole record.
 	if raw, err := json.Marshal(event.Metadata); err == nil {
 		record.Metadata = raw
 	}
@@ -83,6 +86,9 @@ func NewSQSHandler(runtime *Runtime) func(ctx context.Context, event events.SQSE
 				continue
 			}
 			records = append(records, record)
+			// Assumes one message per event ID within a batch. A same-batch
+			// duplicate (rare under at-least-once delivery) would map only the last
+			// message; the idempotency guard makes the redelivered duplicate a no-op.
 			messageIDByEvent[record.EventID] = message.MessageId
 		}
 
