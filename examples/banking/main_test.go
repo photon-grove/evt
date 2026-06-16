@@ -12,10 +12,14 @@ func TestOpenThenDepositAndReplay(t *testing.T) {
 	ctx := context.Background()
 	store := mem.NewStore()
 
+	// Execute loads a fresh aggregate from the event log on every call, so each
+	// command needs its own instance.
 	account := NewAccount("acct-1")
 	if err := store.Execute(ctx, account, "acct-1", &OpenAccount{AccountID: "acct-1", InitialBalance: 100}, evt.Metadata{}); err != nil {
 		t.Fatalf("open: %v", err)
 	}
+
+	account = NewAccount("acct-1")
 	if err := store.Execute(ctx, account, "acct-1", &Deposit{AccountID: "acct-1", Amount: 25}, evt.Metadata{}); err != nil {
 		t.Fatalf("deposit: %v", err)
 	}
@@ -60,6 +64,7 @@ func TestDoubleOpenConflicts(t *testing.T) {
 		t.Fatalf("first open: %v", err)
 	}
 
+	account = NewAccount("acct-3")
 	err := store.Execute(ctx, account, "acct-3", &OpenAccount{AccountID: "acct-3", InitialBalance: 5}, evt.Metadata{})
 	if err == nil {
 		t.Fatal("expected a conflict opening an already-open account")
