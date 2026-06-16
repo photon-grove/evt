@@ -98,7 +98,7 @@ flowchart TB
 
   subgraph rebuild ["incremental rebuild tool"]
     direction TB
-    read["StreamEntityHeads()"] --> detect{"head != checkpoint?"}
+    read["StreamEntityHeads()"] --> detect{"head > checkpoint?"}
     ckpt[("per-entity<br/>projection checkpoint")] --> detect
     detect -- "changed only" --> reproject["reproject entity"]
     reproject --> views2[("views")]
@@ -143,8 +143,13 @@ view was last built from), and reproject only the entities whose head moved.
 ```go
 current, err := heads.StreamEntityHeads(ctx, "") // all types; few-MB scan
 // for id, head := range current:
-//   if head != checkpoint[id] { reproject(id); checkpoint[id] = head }
+//   if head > checkpoint[id] { reproject(id); checkpoint[id] = head }
 ```
+
+Compare with `>`, not `!=`: heads only advance, so a strictly-greater test reprojects
+exactly the entities that moved. It also keeps detection correct under the eventually
+consistent read above — a stale head that briefly reads *behind* the checkpoint is
+simply skipped, never regressing the checkpoint or forcing a redundant reprojection.
 
 The reader is eventually consistent by default (half the RCU cost); a head that lags
 a beat only defers an entity to the next rebuild, never skips it. Derive a strongly
