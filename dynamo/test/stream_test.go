@@ -557,3 +557,35 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_HeadSourceEnumerationError(
 	require.ErrorContains(s.T(), gotErr, "registry boom")
 	s.client.AssertExpectations(s.T())
 }
+
+// Test_StreamEntitiesByQuery_CancelMidStream cancels the context after the first entity is consumed
+// while more remain to be enumerated. Workers then exit early without draining the ids channel, so
+// reading the producer's enumeration error must still synchronize with the producer goroutine. Run
+// under -race, this guards the enumErr read against a data race with the producer's write.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_CancelMidStream() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	heads := &fakeHeadVisitor{}
+	for i := 0; i < 50; i++ {
+		id := evt.EntityID("e" + strconv.Itoa(i))
+		heads.heads = append(heads.heads, headEntry{id: id, seq: 1, typ: "TestEntity"})
+		s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK(string(id))), mock.Anything).
+			Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem(string(id), 1)}}, nil).Maybe()
+	}
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+	}
+
+	consumed := 0
+	for range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}, applyFunc) {
+		consumed++
+		if consumed == 1 {
+			cancel() // abandon the stream while entities are still being enumerated
+		}
+	}
+
+	// The stream drains and closes cleanly after cancellation; the exact count is timing-dependent.
+	require.GreaterOrEqual(s.T(), consumed, 1)
+}

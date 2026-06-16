@@ -79,11 +79,13 @@ func (repo *Repository) StreamEntitiesByQuery(
 		ids := make(chan evt.EntityID)
 
 		// Producer: enumerate entity IDs and feed them to the workers, then close ids. enumErr holds
-		// any enumeration failure; it is read after wg.Wait below, which is safe because the producer
-		// assigns it before close(ids), and a worker observing the closed channel happens-after that
-		// close.
+		// any enumeration failure. It is read only after producerDone closes — a worker that exits
+		// early on cancellation may return without ever observing the closed ids channel, so
+		// wg.Wait() alone does not synchronize with the producer's write to enumErr.
+		producerDone := make(chan struct{})
 		var enumErr error
 		go func() {
+			defer close(producerDone)
 			defer close(ids)
 			enumErr = repo.produceEntityIDs(ctx, opts, ids)
 		}()
@@ -124,6 +126,11 @@ func (repo *Repository) StreamEntitiesByQuery(
 		}
 
 		wg.Wait()
+
+		// Wait for the producer to finish before reading enumErr, establishing the happens-before
+		// edge the early-return workers above may not. On cancellation the producer unblocks via its
+		// own ctx.Done select, so this never deadlocks.
+		<-producerDone
 
 		// Surface an enumeration failure as a stream error. The default scan path fails before any
 		// worker runs (collectEntityIDs returns nothing on error), so this preserves its
