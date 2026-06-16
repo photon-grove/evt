@@ -71,7 +71,7 @@ Drive it with an in-memory store in tests:
 ```go
 store := mem.NewStore()
 
-// Execute loads a fresh aggregate from the log, so pass a new instance per command.
+// Execute replays history onto the instance you pass, so hand it a fresh one per command.
 acct := NewAccount("acct-1")
 store.Execute(ctx, acct, "acct-1", &OpenAccount{AccountID: "acct-1", InitialBalance: 100}, evt.Metadata{})
 
