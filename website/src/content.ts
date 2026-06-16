@@ -1,7 +1,4 @@
-const repo = 'https://github.com/photon-grove/evt'
-const blob = `${repo}/blob/main`
-
-export const repoUrl = repo
+export const repoUrl = 'https://github.com/photon-grove/evt'
 
 export const installCommand = 'go get github.com/photon-grove/evt'
 
@@ -19,36 +16,57 @@ err := store.Execute(ctx, entity, "acct-1",
 repo := dynamo.NewRepository(dynamoClient, "event-log")
 store := snapshots.NewStore(repo, 25)`
 
-export const capabilities = [
+// A linked content card. `doc`, when set, is the slug of the in-site guide it links to.
+// `tag`, when set, labels the card with the package the capability lives in.
+export interface ContentCard {
+  title: string
+  body: string
+  doc?: string
+  tag?: string
+}
+
+export const capabilities: ContentCard[] = [
   {
     tag: 'evt',
     title: 'Command execution',
-    body: 'Load an aggregate, run a command, serialize the produced events, and commit them under optimistic concurrency.',
+    body: 'Load an aggregate, run a command, serialize produced events, and commit them with optimistic concurrency.',
+    doc: 'getting-started',
   },
   {
     tag: 'evt/dynamo',
     title: 'DynamoDB event log',
-    body: 'Append immutable rows under stable pk/sk keys, with inline snapshots at sk=0 and conditional writes for ordering.',
+    body: 'Store immutable event rows under stable pk/sk keys, with inline snapshots at sk=0 and conditional writes for ordering.',
+    doc: 'dynamodb',
   },
   {
     tag: 'evt/projectors',
     title: 'Materialized views',
-    body: 'Write deterministic read-model rows through projection transactions — then rebuild them by replaying events.',
+    body: 'Write deterministic read-model rows through projection transactions and rebuild them by replaying events.',
+    doc: 'projections',
+  },
+  {
+    tag: 'evt/dynamo',
+    title: 'Incremental rebuilds',
+    body: 'Track each entity head in a small table to rebuild only what changed, with constant-memory enumeration that does not grow with entity count.',
+    doc: 'projections',
   },
   {
     tag: 'evt/snapshots',
-    title: 'Snapshots & upcasters',
-    body: 'Keep replay fast while old event payloads evolve forward through explicit, versioned upcasters.',
+    title: 'Snapshots and upcasters',
+    body: 'Keep replay fast while allowing old event payloads to evolve through explicit versioned upcasters.',
+    doc: 'concepts',
   },
   {
     tag: 'evt/projectors',
     title: 'Stream projectors',
-    body: 'Run DynamoDB Streams Lambda projectors with idempotency, retry classification, and partial-batch failures.',
+    body: 'Run DynamoDB Streams Lambda projectors with idempotency, retry classification, and partial-batch failure responses.',
+    doc: 'streams',
   },
   {
     tag: 'evt/publishers',
     title: 'Event publishers',
-    body: 'Fan event-log INSERT records out to SNS, with optional FIFO companion topics for ordered workflows.',
+    body: 'Fan out event-log INSERT records to SNS, including optional FIFO companion topics for ordered real-time workflows.',
+    doc: 'streams',
   },
 ]
 
@@ -73,63 +91,36 @@ export const packages = [
   {name: 'evt/test', body: 'Shared test aggregate, commands, events, and helpers for adopters.'},
 ]
 
-export const cookbook = [
+export const cookbook: ContentCard[] = [
   {
     title: 'Single-table event log',
     body: 'Keep one DynamoDB event-log table for events and inline snapshots — pk as entity ID, sk as numeric sequence.',
+    doc: 'dynamodb',
   },
   {
     title: 'Projection rebuilds',
     body: 'Treat view tables as disposable. Wipe a bad read model, replay entities, and write deterministic rows again.',
+    doc: 'projections',
   },
   {
     title: 'Command deduplication',
     body: 'Pass a stable command ID in metadata so duplicate retries fail safely instead of recording duplicate facts.',
+    doc: 'integration-cookbook',
   },
   {
     title: 'Schema evolution',
     body: 'Bump event versions when payload shape changes and register upcasters with fixtures for every historical shape.',
+    doc: 'concepts',
   },
   {
     title: 'Stream fanout',
     body: 'Publish only event-log INSERT records. Drop malformed rows deliberately and return partial-batch failures.',
+    doc: 'streams',
   },
   {
     title: 'Local integration',
     body: 'Run Moto, apply infra/local Terraform, then run the integration task with AWS_ENDPOINT_URL on the emulator.',
-  },
-]
-
-export const docLinks = [
-  {
-    title: 'Getting started',
-    body: 'Define an aggregate, handle commands, and apply events end to end.',
-    href: `${blob}/docs/getting-started.md`,
-  },
-  {
-    title: 'Concepts',
-    body: 'Entities, commands, events, metadata, and transactions explained.',
-    href: `${blob}/docs/concepts.md`,
-  },
-  {
-    title: 'DynamoDB integration',
-    body: 'Event-log table shape, key patterns, inline snapshots, and views.',
-    href: `${blob}/docs/dynamodb.md`,
-  },
-  {
-    title: 'Projections & rebuilds',
-    body: 'Deterministic read models and safe wipe-and-replay rebuilds.',
-    href: `${blob}/docs/projections.md`,
-  },
-  {
-    title: 'Streams & publishers',
-    body: 'Lambda projectors, idempotency, retry policy, and SNS fanout.',
-    href: `${blob}/docs/streams.md`,
-  },
-  {
-    title: 'Behavioral invariants',
-    body: 'The exact serialization and DynamoDB schema guarantees evt holds.',
-    href: `${blob}/BEHAVIORAL_INVARIANTS.md`,
+    doc: 'integration-cookbook',
   },
 ]
 

@@ -1,12 +1,12 @@
-import {useState} from 'react'
+import {useEffect, useState} from 'react'
 
 import {DiagramViewer} from '@photon-grove/react-flow-diagrams'
 
 import {EventLogArt} from './ClipArt'
 import {
   capabilities,
+  type ContentCard,
   cookbook,
-  docLinks,
   examples,
   gettingStarted,
   installCommand,
@@ -15,7 +15,9 @@ import {
   repoUrl,
 } from './content'
 import {diagrams} from './diagrams'
+import {DocPage, DocsIndex} from './DocsView'
 import {photonGroveUrl} from './siteConfig'
+import {useHashRoute} from './useHashRoute'
 
 function CopyButton({value, label}: {value: string; label: string}) {
   const [copied, setCopied] = useState(false)
@@ -34,25 +36,52 @@ function CopyButton({value, label}: {value: string; label: string}) {
   )
 }
 
-export function App() {
-  return (
-    <main>
-      <header className="nav">
-        <a className="brand" href="#top" aria-label="evt home">
-          <span className="brand-mark">evt</span>
-          <span className="brand-text">Event sourcing for Go</span>
-        </a>
-        <nav aria-label="Primary navigation">
-          <a href="#start">Quick start</a>
-          <a href="#packages">Packages</a>
-          <a href="#diagrams">Architecture</a>
-          <a href="#docs">Docs</a>
-          <a className="nav-cta" href={repoUrl}>
-            GitHub ↗
-          </a>
-        </nav>
-      </header>
+function CardLink({doc}: {doc?: string}) {
+  if (!doc) {
+    return null
+  }
 
+  return (
+    <a className="card-link" href={`#/docs/${doc}`}>
+      Read the guide →
+    </a>
+  )
+}
+
+function FeatureCard({item}: {item: ContentCard}) {
+  return (
+    <article className="feature-card">
+      {item.tag ? <code className="card-tag">{item.tag}</code> : null}
+      <h3>{item.title}</h3>
+      <p>{item.body}</p>
+      <CardLink doc={item.doc} />
+    </article>
+  )
+}
+
+function Nav() {
+  return (
+    <header className="nav">
+      <a className="brand" href="#/" aria-label="evt home">
+        <span className="brand-mark">evt</span>
+        <span className="brand-text">Event sourcing for Go</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#start">Quick start</a>
+        <a href="#packages">Packages</a>
+        <a href="#diagrams">Architecture</a>
+        <a href="#/docs">Docs</a>
+        <a className="nav-cta" href={repoUrl}>
+          GitHub ↗
+        </a>
+      </nav>
+    </header>
+  )
+}
+
+function Home() {
+  return (
+    <>
       <section className="hero" id="top">
         <div className="hero-copy">
           <p className="eyebrow">A Go event-sourcing framework</p>
@@ -83,22 +112,18 @@ export function App() {
         </div>
       </section>
 
-      <section className="band intro-band">
+      <section className="band intro-band" id="features">
         <div className="section-heading">
           <p className="eyebrow">Framework surface</p>
           <h2>Everything an event-sourced Go service needs — and nothing it doesn&rsquo;t.</h2>
-          <p className="section-sub">
-            Small, explicit packages with stable contracts. Adopt the pieces you need; the rest stay
-            out of your way.
+          <p className="section-lead">
+            Small, explicit packages with stable contracts. Each capability links to its guide.{' '}
+            <a href="#/docs">Browse all documentation →</a>
           </p>
         </div>
         <div className="capability-grid">
           {capabilities.map((item) => (
-            <article className="feature-card" key={`${item.tag}-${item.title}`}>
-              <code className="card-tag">{item.tag}</code>
-              <h3>{item.title}</h3>
-              <p>{item.body}</p>
-            </article>
+            <FeatureCard item={item} key={item.title} />
           ))}
         </div>
       </section>
@@ -161,7 +186,7 @@ export function App() {
         </ul>
       </section>
 
-      <section className="band cookbook-band">
+      <section className="band cookbook-band" id="cookbook">
         <div className="section-heading">
           <p className="eyebrow">Integration cookbook</p>
           <h2>Patterns worth copying straight into an adopter project.</h2>
@@ -171,28 +196,8 @@ export function App() {
             <article className="recipe" key={item.title}>
               <h3>{item.title}</h3>
               <p>{item.body}</p>
+              <CardLink doc={item.doc} />
             </article>
-          ))}
-        </div>
-      </section>
-
-      <section className="band docs-band" id="docs">
-        <div className="section-heading">
-          <p className="eyebrow">Documentation</p>
-          <h2>Read the source of truth.</h2>
-          <p className="section-sub">
-            Concept guides, integration notes, and the invariants that keep stored events readable.
-          </p>
-        </div>
-        <div className="docs-grid">
-          {docLinks.map((doc) => (
-            <a className="doc-card" key={doc.title} href={doc.href}>
-              <span className="doc-arrow" aria-hidden="true">
-                →
-              </span>
-              <h3>{doc.title}</h3>
-              <p>{doc.body}</p>
-            </a>
           ))}
         </div>
       </section>
@@ -212,17 +217,47 @@ export function App() {
           ))}
         </div>
       </section>
+    </>
+  )
+}
+
+export function App() {
+  const route = useHashRoute()
+
+  // Scroll handling on navigation: doc routes start at the top; the home route honors a plain
+  // "#section" fragment (so cross-page nav like Quick start/Architecture still scrolls once home
+  // mounts).
+  useEffect(() => {
+    if (route.name !== 'home') {
+      window.scrollTo(0, 0)
+
+      return
+    }
+
+    const fragment = window.location.hash.replace(/^#/, '')
+    if (fragment && !fragment.startsWith('/')) {
+      requestAnimationFrame(() => document.getElementById(fragment)?.scrollIntoView())
+    }
+  }, [route])
+
+  return (
+    <main>
+      <Nav />
+
+      {route.name === 'home' && <Home />}
+      {route.name === 'docs-index' && <DocsIndex />}
+      {route.name === 'doc' && route.slug ? <DocPage slug={route.slug} /> : null}
 
       <footer className="site-footer">
         <div className="footer-inner">
-          <a className="brand" href="#top" aria-label="evt home">
+          <a className="brand" href="#/" aria-label="evt home">
             <span className="brand-mark">evt</span>
             <span className="brand-text">Event sourcing for Go</span>
           </a>
           <nav aria-label="Footer navigation">
-            <a href={`${repoUrl}#install`}>Install</a>
+            <a href="#/docs">Docs</a>
             <a href="#start">Quick start</a>
-            <a href="#docs">Docs</a>
+            <a href="#diagrams">Architecture</a>
             <a href={repoUrl}>GitHub ↗</a>
           </nav>
         </div>

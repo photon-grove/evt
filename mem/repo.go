@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/result"
 )
@@ -29,6 +28,7 @@ func NewRepository() evt.Repository {
 var (
 	_ evt.SnapshotStreamer   = (*Repository)(nil)
 	_ evt.EntityHeadStreamer = (*Repository)(nil)
+	_ evt.EntityHeadVisitor  = (*Repository)(nil)
 )
 
 // Commit Events to memory
@@ -161,17 +161,22 @@ func (repo Repository) GetSnapshot(
 	return nil, nil
 }
 
-// StreamAllEvents streams all Events
+// StreamAllEvents streams all Events, honoring the StreamFilter's entity-type narrowing
+// client-side (the in-memory repository has no server-side filter to push down to).
 func (repo Repository) StreamAllEvents(
 	_ context.Context,
-	_ *expression.Expression,
+	filter evt.StreamFilter,
 ) <-chan result.Result[[]evt.SerializedEvent] {
 	channel := make(chan result.Result[[]evt.SerializedEvent])
 
 	go func() {
 		defer close(channel)
 
-		for _, events := range repo.events {
+		for id, events := range repo.events {
+			if !filter.Matches(memPartitionType(events, repo.snapshots[id])) {
+				continue
+			}
+
 			channel <- result.Ok(events)
 		}
 	}()
@@ -184,11 +189,33 @@ func (repo Repository) StreamAllEvents(
 // stays correct for streams whose early events were compacted away. entityType, when non-empty,
 // restricts the result to that type.
 func (repo Repository) StreamEntityHeads(
-	_ context.Context,
+	ctx context.Context,
 	entityType evt.EntityType,
 ) (map[evt.EntityID]evt.EventSequence, error) {
 	heads := make(map[evt.EntityID]evt.EventSequence)
 
+	err := repo.StreamEntityHeadsFunc(ctx, entityType, func(id evt.EntityID, head evt.EventSequence) error {
+		heads[id] = head
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return heads, nil
+}
+
+// StreamEntityHeadsFunc implements evt.EntityHeadVisitor over the in-memory log, invoking visit once
+// per entity without building the full map StreamEntityHeads returns. The in-memory backend holds
+// the whole log anyway, so this is not constant-memory the way a paged heads table is; it exists so
+// the in-memory repository can stand in for a streaming head source in tests and examples. The head
+// has the same meaning as StreamEntityHeads (the larger of the highest stored event sequence and the
+// snapshot's recorded EventSequence). If visit returns an error, enumeration stops and returns it.
+func (repo Repository) StreamEntityHeadsFunc(
+	_ context.Context,
+	entityType evt.EntityType,
+	visit func(evt.EntityID, evt.EventSequence) error,
+) error {
 	for id, events := range repo.events {
 		snapshot := repo.snapshots[id]
 		if entityType != "" && !memEventsMatchType(events, snapshot, entityType) {
@@ -205,22 +232,27 @@ func (repo Repository) StreamEntityHeads(
 			head = snapshot.EventSequence
 		}
 
-		heads[evt.EntityID(id)] = head
+		if err := visit(evt.EntityID(id), head); err != nil {
+			return err
+		}
 	}
 
-	// Entities present only as a snapshot (events compacted away with no event key) still have a head.
+	// Entities present only as a snapshot (events compacted away with no event key) still have a
+	// head. Skip any id that already has an events entry — it was visited above.
 	for id, snapshot := range repo.snapshots {
-		if _, seen := heads[evt.EntityID(id)]; seen {
+		if _, hasEvents := repo.events[id]; hasEvents {
 			continue
 		}
 		if entityType != "" && snapshot.EntityType != entityType {
 			continue
 		}
 
-		heads[evt.EntityID(id)] = snapshot.EventSequence
+		if err := visit(evt.EntityID(id), snapshot.EventSequence); err != nil {
+			return err
+		}
 	}
 
-	return heads, nil
+	return nil
 }
 
 // CompactBelow deletes events for an entity whose sequence is in [1, throughSequence], but only
@@ -326,18 +358,23 @@ func (repo Repository) seedFromSnapshot(
 	return entity, snapshot.EventSequence, true
 }
 
-// memEventsMatchType reports whether a partition belongs to the given entity type, checking the
-// stored events first and falling back to the snapshot's recorded type.
-func memEventsMatchType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot, entityType evt.EntityType) bool {
+// memPartitionType reports a partition's entity type, reading the first non-snapshot event and
+// falling back to the snapshot's recorded type when only a snapshot remains (events compacted away).
+func memPartitionType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot) evt.EntityType {
 	for _, event := range serialized {
 		if event.Sequence == 0 {
 			continue
 		}
 
-		return event.EntityType == entityType
+		return event.EntityType
 	}
 
-	return snapshot.EntityType == entityType
+	return snapshot.EntityType
+}
+
+// memEventsMatchType reports whether a partition belongs to the given entity type.
+func memEventsMatchType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot, entityType evt.EntityType) bool {
+	return memPartitionType(serialized, snapshot) == entityType
 }
 
 // applyMemEvents applies events above the snapshot boundary to the (possibly seeded) entity.
@@ -366,10 +403,11 @@ func applyMemEvents(
 	return entity, true
 }
 
-// StreamEntities streams all collected Entities
+// StreamEntities streams all collected Entities, honoring the StreamFilter's entity-type narrowing
+// client-side (the in-memory repository has no server-side filter to push down to).
 func (repo Repository) StreamEntities(
 	ctx context.Context,
-	_ *expression.Expression,
+	filter evt.StreamFilter,
 	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
 ) <-chan result.Result[evt.Entity] {
 	channel := make(chan result.Result[evt.Entity])
@@ -381,7 +419,11 @@ func (repo Repository) StreamEntities(
 		var err error
 		entityEvents := 0
 
-		for _, serialized := range repo.events {
+		for id, serialized := range repo.events {
+			if !filter.Matches(memPartitionType(serialized, repo.snapshots[id])) {
+				continue
+			}
+
 			for _, event := range serialized {
 				if event.Sequence == 0 {
 					// This is a Snapshot, so skip it
@@ -410,8 +452,11 @@ func (repo Repository) StreamEntities(
 			}
 		}
 
-		// Yield the final Entity to the channel
-		channel <- result.Ok(entity)
+		// Yield the final Entity to the channel. Guard against nil so a stream whose partitions were
+		// all filtered out (or an empty repository) does not emit a spurious nil result.
+		if entity != nil {
+			channel <- result.Ok(entity)
+		}
 	}()
 
 	return channel

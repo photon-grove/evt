@@ -94,7 +94,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_StreamEntities() {
 		return e, nil
 	}
 
-	stream := s.repo.StreamEntities(ctx, nil, applier)
+	stream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applier)
 
 	found1 := false
 	found2 := false

@@ -3,7 +3,6 @@ package snapshots_test
 import (
 	"context"
 
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/result"
 )
@@ -79,13 +78,13 @@ func (m *MockRepository) CommitStream(_ context.Context, _ <-chan result.Result[
 	return nil
 }
 
-func (m *MockRepository) StreamAllEvents(_ context.Context, _ *expression.Expression) <-chan result.Result[[]evt.SerializedEvent] {
+func (m *MockRepository) StreamAllEvents(_ context.Context, _ evt.StreamFilter) <-chan result.Result[[]evt.SerializedEvent] {
 	ch := make(chan result.Result[[]evt.SerializedEvent])
 	close(ch)
 	return ch
 }
 
-func (m *MockRepository) StreamEntities(_ context.Context, _ *expression.Expression, _ func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error)) <-chan result.Result[evt.Entity] {
+func (m *MockRepository) StreamEntities(_ context.Context, _ evt.StreamFilter, _ func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error)) <-chan result.Result[evt.Entity] {
 	ch := make(chan result.Result[evt.Entity])
 	close(ch)
 	return ch

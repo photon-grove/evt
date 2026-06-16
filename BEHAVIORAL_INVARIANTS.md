@@ -358,14 +358,20 @@ evt.Metadata{
 ### StreamAllEvents
 
 - Returns channel of `result.Result[[]SerializedEvent]`
-- Skips items with `snap` attribute (snapshots)
-- Uses scan pagination
+- Takes a backend-neutral `evt.StreamFilter`; a zero filter streams every event, a non-empty
+  `EntityType` narrows to that type. The core contract carries no DynamoDB types.
+- DynamoDB compiles the filter into a Scan `FilterExpression`; the in-memory repository applies it
+  client-side. Skips items with the inline-snapshot marker (`sk = 0`). Uses scan pagination.
+- Callers needing a raw DynamoDB filter beyond entity type type-assert the repository to
+  `dynamo.ExpressionStreamer` and call `StreamAllEventsByExpression`.
 
 ### StreamEntities
 
+- Takes a backend-neutral `evt.StreamFilter` with the same semantics as `StreamAllEvents`
 - Yields complete entities after all their events are processed
 - Skips `sequence = 0` events (snapshot markers)
 - Errors during `applyEvent` are yielded to channel, then continues
+- DynamoDB raw-expression variant: `dynamo.ExpressionStreamer.StreamEntitiesByExpression`
 
 ### StreamEntitiesFromSnapshots (optional: `evt.SnapshotStreamer`)
 
@@ -388,3 +394,36 @@ evt.Metadata{
 - Raw, snapshot-unsafe point-delete by `(pk, sk)`; for local/staging fixtures only
 - Excluded from production builds (`-tags prod`); released binaries set this tag
 - Use `CompactBelow` for principled, snapshot-verified truncation instead
+
+## Backend Storage Contract
+
+The `evt.Repository` interface is backend-neutral: it carries no DynamoDB (or other vendor) types,
+so the same contract can be satisfied by the in-memory backend, DynamoDB, and a future SQL/PostgreSQL
+backend. Any backend that implements `evt.Repository` MUST uphold the following invariants. They are
+exercised by the backend-neutral suite in `conformance` (`conformance.RunRepositorySuite`); each
+backend wires that suite and declares the optional guarantees it provides via `conformance.SuiteOptions`.
+
+- **Per-entity sequence uniqueness** — for a given entity, each `EventSequence` is written at most
+  once. Sequences start at 1 and increase by 1 per committed event.
+- **Optimistic concurrency on commit** — a commit that reuses an already-committed `(EntityID,
+  EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with a conditional
+  write (`attribute_not_exists(sk)`); a SQL backend would use a unique constraint. (The in-memory
+  backend is a permissive test double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency`
+  is false for it.)
+- **Stable event ordering** — `GetEvents` returns an entity's events in ascending sequence order,
+  and `GetLatestEvents(lastSequence)` returns only events with `sequence > lastSequence`.
+- **Read isolation by entity** — `GetEvents`/`GetLatestEvents`/`GetSnapshot` return only the
+  requested entity's data; an unknown entity yields an empty result (no error).
+- **Snapshot consistency** — a snapshot written by `CommitWithSnapshot` is read back intact by
+  `GetSnapshot` (same `EntityType`, `EntityID`, `EventSequence`, and payload). `GetSnapshot` returns
+  `nil, nil` when none exists. The snapshot's `EventSequence` is the authoritative floor after
+  compaction (see ADR-0001).
+- **Event/view transaction behavior** — events and any projector-produced view writes in a single
+  `SerializedResult` are committed atomically. On DynamoDB this is a `TransactWriteItems` call;
+  partial commits must not be observable.
+- **Backend-neutral filtering** — `StreamAllEvents`/`StreamEntities` honor `evt.StreamFilter`
+  (entity-type narrowing today). Richer, vendor-specific server-side filtering is offered through a
+  backend extension interface (e.g. `dynamo.ExpressionStreamer`), never through the core contract.
+
+See `docs/adr/0002-backend-neutral-storage-contracts.md` for the rationale and the decision to keep
+`result.Result` channels as the streaming shape.

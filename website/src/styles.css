@@ -14,6 +14,8 @@
   --teal-soft: #e4f1ec;
   --teal-ink: #0b5750;
   --gold: #f6c453;
+  --mint: #dff8ea;
+  --blue: #2563eb;
   --code-bg: #131a2b;
   --code-ink: #e6ecf5;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -577,55 +579,6 @@ h3 {
   padding: 20px 22px;
 }
 
-/* ---------- docs ---------- */
-
-.docs-grid {
-  display: grid;
-  gap: 14px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.doc-card {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  display: block;
-  padding: 20px 22px;
-  position: relative;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
-}
-
-.doc-card:hover {
-  border-color: var(--teal);
-  box-shadow: 0 12px 26px rgba(15, 118, 110, 0.12);
-  transform: translateY(-2px);
-}
-
-.doc-arrow {
-  color: var(--teal);
-  font-size: 1.1rem;
-  font-weight: 700;
-  position: absolute;
-  right: 20px;
-  top: 18px;
-  transition: transform 0.15s ease;
-}
-
-.doc-card:hover .doc-arrow {
-  transform: translate(3px, -3px);
-}
-
-.doc-card h3 {
-  padding-right: 28px;
-}
-
-.doc-card p {
-  color: var(--muted);
-  font-size: 0.92rem;
-  line-height: 1.5;
-  margin: 0;
-}
-
 /* ---------- examples ---------- */
 
 .examples {
@@ -729,7 +682,6 @@ h3 {
 
   .capability-grid,
   .cookbook-grid,
-  .docs-grid,
   .examples {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -747,7 +699,6 @@ h3 {
 
   .capability-grid,
   .cookbook-grid,
-  .docs-grid,
   .examples,
   .package-list {
     grid-template-columns: 1fr;
@@ -770,5 +721,234 @@ h3 {
   .diagram-frame {
     height: 74svh;
     min-height: 480px;
+  }
+}
+
+/* ---------- in-site documentation pages ---------- */
+
+.card-link {
+  color: var(--teal);
+  display: inline-block;
+  font-weight: 650;
+  margin-top: 14px;
+}
+
+.card-link:hover {
+  text-decoration: underline;
+}
+
+.section-lead {
+  color: var(--muted);
+  margin-top: 10px;
+}
+
+.section-lead a {
+  color: var(--teal);
+  font-weight: 650;
+}
+
+/* Documentation pages: sidebar + rendered Markdown content. */
+.docs-band {
+  background: var(--paper);
+  border-block: 1px solid var(--line);
+}
+
+.docs-layout {
+  display: grid;
+  gap: clamp(24px, 4vw, 56px);
+  grid-template-columns: minmax(200px, 248px) minmax(0, 1fr);
+  margin: 0 auto;
+  max-width: 1100px;
+}
+
+.docs-sidebar {
+  align-self: start;
+  position: sticky;
+  top: 96px;
+}
+
+.docs-sidebar-home {
+  color: var(--teal);
+  display: inline-block;
+  font-weight: 700;
+  margin-bottom: 18px;
+}
+
+.docs-sidebar-heading {
+  color: var(--app-subtle);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin: 18px 0 8px;
+  text-transform: uppercase;
+}
+
+.docs-sidebar ul {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.docs-sidebar a {
+  border-radius: 6px;
+  color: var(--ink);
+  display: block;
+  font-size: 0.94rem;
+  padding: 6px 10px;
+}
+
+.docs-sidebar a:hover {
+  background: var(--app-hover);
+}
+
+.docs-sidebar a.is-active {
+  background: var(--mint);
+  font-weight: 650;
+}
+
+.docs-main {
+  min-width: 0;
+}
+
+.docs-index-group {
+  margin-top: 28px;
+}
+
+.docs-card-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  margin-top: 14px;
+}
+
+.docs-card {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 14px 30px rgba(23, 32, 51, 0.06);
+  display: block;
+  padding: 18px 20px;
+  transition: transform 0.12s ease;
+}
+
+.docs-card:hover {
+  transform: translateY(-2px);
+}
+
+.docs-card h4 {
+  margin: 0 0 6px;
+}
+
+.docs-card p {
+  color: var(--muted);
+  line-height: 1.55;
+  margin: 0;
+}
+
+/* Rendered Markdown typography. */
+.doc-article {
+  min-width: 0;
+}
+
+.doc-content {
+  line-height: 1.68;
+  overflow-wrap: anywhere;
+}
+
+.doc-content h1,
+.doc-content h2,
+.doc-content h3,
+.doc-content h4 {
+  line-height: 1.25;
+  scroll-margin-top: 96px;
+}
+
+.doc-content h1 {
+  font-size: clamp(1.8rem, 3vw, 2.3rem);
+  margin: 0 0 18px;
+}
+
+.doc-content h2 {
+  border-top: 1px solid var(--line);
+  margin-top: 40px;
+  padding-top: 28px;
+}
+
+.doc-content a {
+  color: var(--blue);
+}
+
+.doc-content a:hover {
+  text-decoration: underline;
+}
+
+.doc-content code {
+  background: rgba(23, 32, 51, 0.06);
+  border-radius: 4px;
+  font-size: 0.9em;
+  padding: 1px 5px;
+}
+
+.doc-content pre {
+  background: #0f1729;
+  border-radius: 10px;
+  color: #e6edf7;
+  overflow-x: auto;
+  padding: 16px 18px;
+}
+
+.doc-content pre code {
+  background: transparent;
+  color: inherit;
+  font-size: 0.86rem;
+  padding: 0;
+}
+
+.doc-content blockquote {
+  border-left: 3px solid var(--teal);
+  color: var(--muted);
+  margin: 18px 0;
+  padding: 4px 0 4px 16px;
+}
+
+.doc-content table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+  width: 100%;
+}
+
+.doc-content th,
+.doc-content td {
+  border: 1px solid var(--line);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.doc-content .mermaid {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin: 18px 0;
+  overflow-x: auto;
+  padding: 16px;
+  text-align: center;
+}
+
+.doc-missing {
+  padding: 20px 0;
+}
+
+@media (max-width: 860px) {
+  .docs-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .docs-sidebar {
+    position: static;
+    top: auto;
   }
 }
