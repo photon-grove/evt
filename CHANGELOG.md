@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0](https://github.com/photon-grove/evt/compare/v0.5.0...v0.6.0) (2026-06-16)
+
+
+### Features
+
+* **evt:** backend-neutral storage contracts for a future PostgreSQL backend ([#37](https://github.com/photon-grove/evt/issues/37)) ([27fb74f](https://github.com/photon-grove/evt/commit/27fb74f37bf67e3eb6ece10062cc62f9dd8db455))
+* **postgres:** PostgreSQL storage backend ([#40](https://github.com/photon-grove/evt/issues/40)) ([6f4efdb](https://github.com/photon-grove/evt/commit/6f4efdbb020627921ed1e64f79be8bae10dd3e4b))
+* **website:** render the docs/ guides in-site with routing ([#35](https://github.com/photon-grove/evt/issues/35)) ([747b912](https://github.com/photon-grove/evt/commit/747b91219323e6e8bebea7d8a14b7bf199b9a389))
+
 ## [0.5.0](https://github.com/photon-grove/evt/compare/v0.4.0...v0.5.0) (2026-06-16)
 
 
