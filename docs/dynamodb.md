@@ -121,5 +121,4 @@ The [`infra/local`](https://github.com/photon-grove/evt/tree/main/infra/local)
 Terraform stack creates emulator tables that match the integration suite —
 `evt-local-event-log`, `evt-local-entity-views`, and `evt-local-entity-heads`.
 Apply it against a local DynamoDB-compatible emulator (Moto) before running
-integration tests; keep real account IDs, ARNs, and hostnames out of this repo
-(see [Public-safe configuration](security.md)).
+integration tests; keep real account IDs, ARNs, and hostnames out of this repo.
