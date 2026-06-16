@@ -47,17 +47,17 @@ export const RFD_STYLESHEET = `
   background: linear-gradient(90deg, var(--rfd-accent), color-mix(in srgb, var(--rfd-accent) 28%, transparent) 72%, transparent);
   box-shadow: 0 0 14px -2px var(--rfd-accent);
 }
-.rfd-node__body { padding: 11px 13px; display: flex; flex-direction: column; gap: 5px; height: calc(100% - 3px); box-sizing: border-box; }
-.rfd-node__head { display: flex; align-items: center; gap: 10px; }
+.rfd-node__body { padding: 9px 12px; display: flex; flex-direction: column; gap: 4px; height: calc(100% - 3px); box-sizing: border-box; }
+.rfd-node__head { display: flex; align-items: center; gap: 9px; }
 .rfd-node__icon {
-  width: 32px; height: 32px; border-radius: 10px; flex: 0 0 auto;
+  width: 28px; height: 28px; border-radius: 9px; flex: 0 0 auto;
   display: flex; align-items: center; justify-content: center;
   color: var(--rfd-accent);
   background: linear-gradient(140deg, color-mix(in srgb, var(--rfd-accent) 28%, transparent), color-mix(in srgb, var(--rfd-accent) 9%, transparent));
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rfd-accent) 32%, transparent);
 }
-.rfd-node__title { font-weight: 670; font-size: 14px; line-height: 1.2; color: var(--rfd-ink); letter-spacing: -0.01em; }
-.rfd-node__sub { font-size: 12px; line-height: 1.3; color: var(--rfd-muted); }
+.rfd-node__title { font-weight: 670; font-size: 13.5px; line-height: 1.2; color: var(--rfd-ink); letter-spacing: -0.01em; }
+.rfd-node__sub { font-size: 11.5px; line-height: 1.3; color: var(--rfd-muted); }
 .rfd-node__meta { margin-top: auto; display: flex; flex-wrap: wrap; gap: 4px; padding-top: 2px; }
 .rfd-chip {
   font-size: 10px; padding: 2px 7px; border-radius: 999px;

@@ -36,13 +36,13 @@ export function domainColor(domain?: string): DomainColor {
 
 /** Fixed render box per kind. Boundary containers are sized by ELK from children. */
 export const NODE_SIZE: Record<Exclude<NodeKind, 'boundary'>, {width: number; height: number}> = {
-  service: {width: 248, height: 96},
-  datastore: {width: 224, height: 96},
-  queue: {width: 224, height: 88},
-  topic: {width: 224, height: 88},
-  external: {width: 226, height: 90},
-  process: {width: 238, height: 88},
-  client: {width: 230, height: 94},
+  service: {width: 214, height: 84},
+  datastore: {width: 196, height: 84},
+  queue: {width: 196, height: 78},
+  topic: {width: 196, height: 78},
+  external: {width: 198, height: 80},
+  process: {width: 206, height: 80},
+  client: {width: 200, height: 82},
 }
 
 export function nodeSize(kind: NodeKind): {width: number; height: number} {
