@@ -151,13 +151,17 @@ func (e MoneyDeposited) EntityType() evt.EntityType { return entityType }
 func main() {
 	ctx := context.Background()
 	store := mem.NewStore()
-	account := NewAccount("acct-1")
 
+	// Execute loads a fresh aggregate from the event log on every call, so each
+	// command needs its own instance. Reusing an already-applied entity would
+	// double-apply events (e.g. MoneyDeposited adds to the existing Balance).
+	account := NewAccount("acct-1")
 	err := store.Execute(ctx, account, "acct-1", &OpenAccount{AccountID: "acct-1", InitialBalance: 100}, evt.Metadata{})
 	if err != nil {
 		panic(err)
 	}
 
+	account = NewAccount("acct-1")
 	err = store.Execute(ctx, account, "acct-1", &Deposit{AccountID: "acct-1", Amount: 25}, evt.Metadata{})
 	if err != nil {
 		panic(err)
