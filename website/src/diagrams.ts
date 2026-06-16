@@ -7,14 +7,21 @@ export const diagrams: DiagramSpec[] = [
     group: 'Core runtime',
     description:
       'A command is handled by a fresh aggregate, becomes immutable events, and commits under optimistic concurrency.',
-    layout: {direction: 'DOWN'},
+    layout: {
+      lanes: [
+        {id: 'caller', label: 'Caller'},
+        {id: 'runtime', label: 'evt runtime'},
+        {id: 'domain', label: 'Domain'},
+        {id: 'storage', label: 'Storage'},
+      ],
+    },
     nodes: [
-      {id: 'caller', kind: 'client', label: 'Caller', sublabel: 'API · worker · CLI', domain: 'web', icon: 'browser'},
-      {id: 'store', kind: 'service', label: 'evt.Store', sublabel: 'Load · handle · commit', domain: 'api', icon: 'lambda'},
-      {id: 'entity', kind: 'process', label: 'Aggregate', sublabel: 'Handle(command)', domain: 'domain', icon: 'entity'},
-      {id: 'events', kind: 'topic', label: 'New events', sublabel: 'Immutable facts', domain: 'event', icon: 'event'},
-      {id: 'repo', kind: 'service', label: 'Repository', sublabel: 'Commit serialized result', domain: 'api', icon: 'worker'},
-      {id: 'eventlog', kind: 'datastore', label: 'event-log', sublabel: 'DynamoDB pk/sk', domain: 'data', icon: 'datastore'},
+      {id: 'caller', kind: 'client', label: 'Caller', sublabel: 'API · worker · CLI', domain: 'web', icon: 'browser', lane: 'caller'},
+      {id: 'store', kind: 'service', label: 'evt.Store', sublabel: 'Load · handle · commit', domain: 'api', icon: 'lambda', lane: 'runtime'},
+      {id: 'entity', kind: 'process', label: 'Aggregate', sublabel: 'Handle(command)', domain: 'domain', icon: 'entity', lane: 'domain'},
+      {id: 'events', kind: 'topic', label: 'New events', sublabel: 'Immutable facts', domain: 'event', icon: 'event', lane: 'domain'},
+      {id: 'repo', kind: 'service', label: 'Repository', sublabel: 'Commit serialized result', domain: 'api', icon: 'worker', lane: 'runtime'},
+      {id: 'eventlog', kind: 'datastore', label: 'event-log', sublabel: 'DynamoDB pk/sk', domain: 'data', icon: 'datastore', lane: 'storage'},
     ],
     edges: [
       {id: 'caller-store', source: 'caller', target: 'store', label: 'Execute', variant: 'request'},
@@ -51,14 +58,22 @@ export const diagrams: DiagramSpec[] = [
     group: 'Operations',
     description:
       'Rebuilds stream entities, run projectors against final state, and write replacement view rows without treating views as truth.',
-    layout: {direction: 'DOWN'},
+    layout: {
+      lanes: [
+        {id: 'operator', label: 'Operator'},
+        {id: 'rebuild', label: 'Rebuild'},
+        {id: 'eventlog', label: 'Event log'},
+        {id: 'projection', label: 'Projection'},
+        {id: 'views', label: 'Views'},
+      ],
+    },
     nodes: [
-      {id: 'operator', kind: 'client', label: 'Operator', sublabel: 'CLI or job', domain: 'web', icon: 'terminal'},
-      {id: 'rebuild', kind: 'service', label: 'RebuildProjections', sublabel: 'stream · filter · project', domain: 'api', icon: 'worker'},
-      {id: 'repo', kind: 'datastore', label: 'event-log', sublabel: 'source of truth', domain: 'event', icon: 'datastore'},
-      {id: 'projectors', kind: 'process', label: 'Projectors', sublabel: 'full-state projection', domain: 'domain', icon: 'projector'},
-      {id: 'views', kind: 'datastore', label: 'entity-views', sublabel: 'safe to wipe', domain: 'data', icon: 'datastore'},
-      {id: 'report', kind: 'process', label: 'Progress report', sublabel: 'processed · skipped · errors', domain: 'ops', icon: 'metrics'},
+      {id: 'operator', kind: 'client', label: 'Operator', sublabel: 'CLI or job', domain: 'web', icon: 'terminal', lane: 'operator'},
+      {id: 'rebuild', kind: 'service', label: 'RebuildProjections', sublabel: 'stream · filter · project', domain: 'api', icon: 'worker', lane: 'rebuild'},
+      {id: 'repo', kind: 'datastore', label: 'event-log', sublabel: 'source of truth', domain: 'event', icon: 'datastore', lane: 'eventlog'},
+      {id: 'projectors', kind: 'process', label: 'Projectors', sublabel: 'full-state projection', domain: 'domain', icon: 'projector', lane: 'projection'},
+      {id: 'views', kind: 'datastore', label: 'entity-views', sublabel: 'safe to wipe', domain: 'data', icon: 'datastore', lane: 'views'},
+      {id: 'report', kind: 'process', label: 'Progress report', sublabel: 'processed · skipped · errors', domain: 'ops', icon: 'metrics', lane: 'rebuild'},
     ],
     edges: [
       {id: 'operator-rebuild', source: 'operator', target: 'rebuild', label: 'start run', variant: 'request'},

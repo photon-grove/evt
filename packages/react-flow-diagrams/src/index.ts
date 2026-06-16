@@ -5,6 +5,7 @@ export {Legend} from './Legend'
 
 export {runElkLayout} from './layout/elk'
 export type {LaidOutGraph} from './layout/elk'
+export {runSwimlaneLayout} from './layout/swimlane'
 
 export {nodeTypes} from './nodes/nodes'
 export {DiagramIcon} from './theme/icons'
@@ -24,10 +25,12 @@ export type {DomainColor, EdgeStyle} from './theme/tokens'
 export type {
   DiagramDomain,
   DiagramEdge,
+  DiagramLane,
   DiagramLayout,
   DiagramNode,
   DiagramNodeData,
   DiagramSpec,
   EdgeVariant,
+  LaneNodeData,
   NodeKind,
 } from './types'
