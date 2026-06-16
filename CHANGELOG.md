@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.0](https://github.com/photon-grove/evt/compare/v0.4.0...v0.5.0) (2026-06-16)
+
+
+### Features
+
+* **dynamo:** constant-memory enumeration for snapshot-aware rebuilds ([#34](https://github.com/photon-grove/evt/issues/34)) ([3a91cf2](https://github.com/photon-grove/evt/commit/3a91cf220cd75c6f02a358d2cd95f3542c480871))
+* **dynamo:** constant-memory streaming enumeration for rebuilds ([#28](https://github.com/photon-grove/evt/issues/28)) ([68dac42](https://github.com/photon-grove/evt/commit/68dac426ef935593d770701f79cea13a813c9ac2))
+* **dynamo:** convenience rebuild wrapper wiring HeadSource enumeration ([#33](https://github.com/photon-grove/evt/issues/33)) ([39b01be](https://github.com/photon-grove/evt/commit/39b01bec4a7c4891779dea055c6677824aeb825d))
+* **mem:** implement EntityHeadVisitor on the in-memory repository ([#32](https://github.com/photon-grove/evt/issues/32)) ([a76fe38](https://github.com/photon-grove/evt/commit/a76fe3866c9c5aff4c7057fc7238b289ce350d84))
+
 ## [0.4.0](https://github.com/photon-grove/evt/compare/v0.3.0...v0.4.0) (2026-06-16)
 
 
