@@ -7,7 +7,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -94,14 +93,14 @@ func (r *fakeRepo) GetLatestEvents(_ context.Context, _ evt.EntityID, _ evt.Even
 func (r *fakeRepo) GetSnapshot(_ context.Context, _ evt.EntityID) (*evt.SerializedSnapshot, error) {
 	return nil, nil
 }
-func (r *fakeRepo) StreamAllEvents(_ context.Context, _ *expression.Expression) <-chan result.Result[[]evt.SerializedEvent] {
+func (r *fakeRepo) StreamAllEvents(_ context.Context, _ evt.StreamFilter) <-chan result.Result[[]evt.SerializedEvent] {
 	ch := make(chan result.Result[[]evt.SerializedEvent])
 	close(ch)
 	return ch
 }
 func (r *fakeRepo) StreamEntities(
 	ctx context.Context,
-	_ *expression.Expression,
+	_ evt.StreamFilter,
 	_ func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
 ) <-chan result.Result[evt.Entity] {
 	ch := make(chan result.Result[evt.Entity])

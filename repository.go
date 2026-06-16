@@ -3,13 +3,33 @@ package evt
 import (
 	"context"
 
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
-
 	"github.com/photon-grove/evt/result"
 )
 
 // StorageType identifies the backend storage system a Repository uses.
 type StorageType string
+
+// StreamFilter narrows which entities a table-wide stream or projection rebuild visits. It is a
+// backend-neutral description of the filter: each Repository translates it into its own query
+// mechanism (the DynamoDB backend, for example, compiles it into a Scan FilterExpression; a future
+// SQL backend would translate it into a WHERE clause). The zero value imposes no constraint and
+// matches every entity.
+//
+// It deliberately exposes only entity-type filtering — the single predicate the framework's rebuild
+// paths require — so the core Repository contract carries no backend-specific query types. Backends
+// that support richer server-side filtering may offer it through their own extension interface (for
+// example the dynamo package's ExpressionStreamer) without widening this type.
+type StreamFilter struct {
+	// EntityType, when non-empty, restricts the stream to entities of that type.
+	EntityType EntityType
+}
+
+// Matches reports whether an entity of the given type passes the filter. A zero filter (empty
+// EntityType) matches every entity. Backends without server-side filtering can use this to filter
+// client-side and still honor the contract.
+func (f StreamFilter) Matches(entityType EntityType) bool {
+	return f.EntityType == "" || f.EntityType == entityType
+}
 
 // Store handles executing Commands, committing Events yielded by those Commands,
 // and loading Entity instances from a Repository.
@@ -80,19 +100,19 @@ type Repository interface {
 		entityID EntityID,
 	) (*SerializedSnapshot, error)
 
-	// StreamAllEvents returns a channel of all Events in the Repository, optionally filtered by the
-	// given DynamoDB expression.
+	// StreamAllEvents returns a channel of all Events in the Repository, optionally narrowed by the
+	// backend-neutral StreamFilter. A zero filter streams every event.
 	StreamAllEvents(
 		ctx context.Context,
-		expr *expression.Expression,
+		filter StreamFilter,
 	) <-chan result.Result[[]SerializedEvent]
 
-	// StreamEntities returns a channel of all Entities in the Repository, optionally filtered by
-	// the given DynamoDB expression, and with the given function applied to each Entity to apply
-	// the application-specific Events to each instance.
+	// StreamEntities returns a channel of all Entities in the Repository, optionally narrowed by the
+	// backend-neutral StreamFilter, with the given function applied to each Entity to fold the
+	// application-specific Events into each instance. A zero filter streams every entity.
 	StreamEntities(
 		ctx context.Context,
-		expr *expression.Expression,
+		filter StreamFilter,
 		applyEvent func(context.Context, SerializedEvent, Entity) (Entity, error),
 	) <-chan result.Result[Entity]
 }

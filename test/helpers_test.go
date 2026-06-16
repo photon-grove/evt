@@ -5,7 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/result"
 	"github.com/stretchr/testify/mock"
@@ -31,12 +30,12 @@ func (stubRepo) GetLatestEvents(context.Context, evt.EntityID, evt.EventSequence
 func (stubRepo) GetSnapshot(context.Context, evt.EntityID) (*evt.SerializedSnapshot, error) {
 	return nil, nil
 }
-func (stubRepo) StreamAllEvents(context.Context, *expression.Expression) <-chan result.Result[[]evt.SerializedEvent] {
+func (stubRepo) StreamAllEvents(context.Context, evt.StreamFilter) <-chan result.Result[[]evt.SerializedEvent] {
 	ch := make(chan result.Result[[]evt.SerializedEvent])
 	close(ch)
 	return ch
 }
-func (stubRepo) StreamEntities(context.Context, *expression.Expression, func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error)) <-chan result.Result[evt.Entity] {
+func (stubRepo) StreamEntities(context.Context, evt.StreamFilter, func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error)) <-chan result.Result[evt.Entity] {
 	ch := make(chan result.Result[evt.Entity])
 	close(ch)
 	return ch

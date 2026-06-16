@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/result"
 )
@@ -162,17 +161,22 @@ func (repo Repository) GetSnapshot(
 	return nil, nil
 }
 
-// StreamAllEvents streams all Events
+// StreamAllEvents streams all Events, honoring the StreamFilter's entity-type narrowing
+// client-side (the in-memory repository has no server-side filter to push down to).
 func (repo Repository) StreamAllEvents(
 	_ context.Context,
-	_ *expression.Expression,
+	filter evt.StreamFilter,
 ) <-chan result.Result[[]evt.SerializedEvent] {
 	channel := make(chan result.Result[[]evt.SerializedEvent])
 
 	go func() {
 		defer close(channel)
 
-		for _, events := range repo.events {
+		for id, events := range repo.events {
+			if !filter.Matches(memPartitionType(events, repo.snapshots[id])) {
+				continue
+			}
+
 			channel <- result.Ok(events)
 		}
 	}()
@@ -354,18 +358,23 @@ func (repo Repository) seedFromSnapshot(
 	return entity, snapshot.EventSequence, true
 }
 
-// memEventsMatchType reports whether a partition belongs to the given entity type, checking the
-// stored events first and falling back to the snapshot's recorded type.
-func memEventsMatchType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot, entityType evt.EntityType) bool {
+// memPartitionType reports a partition's entity type, reading the first non-snapshot event and
+// falling back to the snapshot's recorded type when only a snapshot remains (events compacted away).
+func memPartitionType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot) evt.EntityType {
 	for _, event := range serialized {
 		if event.Sequence == 0 {
 			continue
 		}
 
-		return event.EntityType == entityType
+		return event.EntityType
 	}
 
-	return snapshot.EntityType == entityType
+	return snapshot.EntityType
+}
+
+// memEventsMatchType reports whether a partition belongs to the given entity type.
+func memEventsMatchType(serialized []evt.SerializedEvent, snapshot evt.SerializedSnapshot, entityType evt.EntityType) bool {
+	return memPartitionType(serialized, snapshot) == entityType
 }
 
 // applyMemEvents applies events above the snapshot boundary to the (possibly seeded) entity.
@@ -394,10 +403,11 @@ func applyMemEvents(
 	return entity, true
 }
 
-// StreamEntities streams all collected Entities
+// StreamEntities streams all collected Entities, honoring the StreamFilter's entity-type narrowing
+// client-side (the in-memory repository has no server-side filter to push down to).
 func (repo Repository) StreamEntities(
 	ctx context.Context,
-	_ *expression.Expression,
+	filter evt.StreamFilter,
 	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
 ) <-chan result.Result[evt.Entity] {
 	channel := make(chan result.Result[evt.Entity])
@@ -409,7 +419,11 @@ func (repo Repository) StreamEntities(
 		var err error
 		entityEvents := 0
 
-		for _, serialized := range repo.events {
+		for id, serialized := range repo.events {
+			if !filter.Matches(memPartitionType(serialized, repo.snapshots[id])) {
+				continue
+			}
+
 			for _, event := range serialized {
 				if event.Sequence == 0 {
 					// This is a Snapshot, so skip it
@@ -438,8 +452,11 @@ func (repo Repository) StreamEntities(
 			}
 		}
 
-		// Yield the final Entity to the channel
-		channel <- result.Ok(entity)
+		// Yield the final Entity to the channel. Guard against nil so a stream whose partitions were
+		// all filtered out (or an empty repository) does not emit a spurious nil result.
+		if entity != nil {
+			channel <- result.Ok(entity)
+		}
 	}()
 
 	return channel

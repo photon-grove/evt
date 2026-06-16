@@ -62,7 +62,7 @@ func (s *RepositorySuite) Test_StreamEntities_Success() {
 		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
 	}
 
-	entityStream := s.repo.StreamEntities(ctx, nil, applyFunc)
+	entityStream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc)
 	allEntities := make([]evt.Entity, 0, 1)
 	for entityResult := range entityStream {
 		require.True(s.T(), entityResult.IsOk())
@@ -97,7 +97,7 @@ func (s *RepositorySuite) Test_StreamEntities_ApplyError() {
 		return nil, errors.New("apply function failed")
 	}
 
-	entityStream := s.repo.StreamEntities(ctx, nil, applyFunc)
+	entityStream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc)
 	entityResult := <-entityStream
 	require.True(s.T(), entityResult.IsErr())
 	_, err := entityResult.Unwrap()
@@ -137,7 +137,7 @@ func (s *RepositorySuite) Test_StreamEntities_GroupsAndOrdersInterleavedScan() {
 	}
 
 	ids := make([]evt.EntityID, 0, 2)
-	for entityResult := range s.repo.StreamEntities(ctx, nil, applyFunc) {
+	for entityResult := range s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc) {
 		entity, err := entityResult.Unwrap()
 		require.NoError(s.T(), err)
 		ids = append(ids, entity.GetID())
@@ -181,7 +181,7 @@ func (s *RepositorySuite) Test_StreamEntities_ParallelSegments() {
 	repo := s.repo.WithScanSegments(2)
 
 	ids := make([]evt.EntityID, 0, 2)
-	for entityResult := range repo.StreamEntities(ctx, nil, applyFunc) {
+	for entityResult := range repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc) {
 		entity, err := entityResult.Unwrap()
 		require.NoError(s.T(), err)
 		ids = append(ids, entity.GetID())
@@ -395,7 +395,7 @@ func (s *RepositorySuite) Test_StreamEntities_ScanErrorAborts() {
 
 	var errCount, okCount int
 	var lastErr error
-	for r := range s.repo.StreamEntities(ctx, nil, applyFunc) {
+	for r := range s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc) {
 		if _, err := r.Unwrap(); err != nil {
 			errCount++
 			lastErr = err
