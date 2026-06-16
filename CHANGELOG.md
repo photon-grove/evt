@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/photon-grove/evt/compare/v0.6.0...v0.7.0) (2026-06-16)
+
+
+### Features
+
+* **diagrams:** swimlanes, 100% initial view, and SNS fan-out guidance ([#46](https://github.com/photon-grove/evt/issues/46)) ([a5a02b1](https://github.com/photon-grove/evt/commit/a5a02b1f94e55c93d75799e4baa372570421bb38))
+
+
+### Bug Fixes
+
+* **diagrams:** denser nodes and a legible initial zoom ([#42](https://github.com/photon-grove/evt/issues/42)) ([1df6aa4](https://github.com/photon-grove/evt/commit/1df6aa471e760ed8180530d27f388ce2c79067ef))
+
 ## [0.6.0](https://github.com/photon-grove/evt/compare/v0.5.0...v0.6.0) (2026-06-16)
 
 
