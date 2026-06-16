@@ -409,3 +409,183 @@ func (s *RepositorySuite) Test_StreamEntities_ScanErrorAborts() {
 	require.ErrorContains(s.T(), lastErr, "scan failed")
 	s.client.AssertExpectations(s.T())
 }
+
+// headEntry is one row of a fake heads registry.
+type headEntry struct {
+	id  evt.EntityID
+	seq evt.EventSequence
+	typ evt.EntityType
+}
+
+// fakeHeadVisitor is an evt.EntityHeadVisitor that streams a fixed set of heads to the visitor one
+// at a time, never building a slice or map of its own — the registry-backed, constant-memory
+// enumeration source StreamEntitiesByQuery consumes when StreamByQueryOptions.HeadSource is set. It
+// records each ID it streamed so a test can assert the registry (not an event-log scan) drove
+// enumeration.
+type fakeHeadVisitor struct {
+	heads    []headEntry
+	gotType  evt.EntityType
+	streamed []evt.EntityID
+	err      error
+}
+
+func (f *fakeHeadVisitor) StreamEntityHeadsFunc(
+	_ context.Context,
+	entityType evt.EntityType,
+	visit func(evt.EntityID, evt.EventSequence) error,
+) error {
+	f.gotType = entityType
+
+	for _, h := range f.heads {
+		if entityType != "" && h.typ != entityType {
+			continue
+		}
+
+		f.streamed = append(f.streamed, h.id)
+
+		if err := visit(h.id, h.seq); err != nil {
+			return err
+		}
+	}
+
+	return f.err
+}
+
+// Test_StreamEntitiesByQuery_HeadSourceEnumeration verifies the opt-in registry path: with a
+// HeadSource set, entity IDs are streamed from the heads registry (no key-only event-log scan), and
+// each entity is still rebuilt from its own ordered partition query. No Scan is registered on the
+// mock, so any fallback to the scan-and-dedup path would surface as an unexpected call.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_HeadSourceEnumeration() {
+	ctx := context.Background()
+
+	heads := &fakeHeadVisitor{heads: []headEntry{
+		{id: "a", seq: 2, typ: "TestEntity"},
+		{id: "b", seq: 1, typ: "TestEntity"},
+	}}
+
+	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("a")), mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("a", 1), eventItem("a", 2)}}, nil).Once()
+	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("b")), mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("b", 1)}}, nil).Once()
+
+	applied := map[evt.EntityID][]int{}
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+		applied[event.EntityID] = append(applied[event.EntityID], int(event.Sequence))
+		if entity == nil {
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		}
+
+		return entity, nil
+	}
+
+	ids := make([]evt.EntityID, 0, 2)
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}, applyFunc) {
+		entity, err := entityResult.Unwrap()
+		require.NoError(s.T(), err)
+		ids = append(ids, entity.GetID())
+	}
+
+	require.ElementsMatch(s.T(), []evt.EntityID{"a", "b"}, ids)
+	require.Equal(s.T(), []int{1, 2}, applied["a"])
+	require.Equal(s.T(), []int{1}, applied["b"])
+	require.Equal(s.T(), []evt.EntityID{"a", "b"}, heads.streamed, "IDs came from the registry, streamed in order")
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesByQuery_HeadSourceSkipAndType verifies the registry path honors the Skip
+// predicate (a skipped ID is never queried) and forwards EntityType to the head source so
+// enumeration is scoped to one type.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_HeadSourceSkipAndType() {
+	ctx := context.Background()
+
+	heads := &fakeHeadVisitor{heads: []headEntry{
+		{id: "a", seq: 1, typ: "TestEntity"},
+		{id: "b", seq: 1, typ: "TestEntity"},
+		{id: "z", seq: 1, typ: "OtherEntity"},
+	}}
+
+	// Only "a" should be queried: "b" is skipped, "z" is filtered out by entity type.
+	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("a")), mock.Anything).
+		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem("a", 1)}}, nil).Once()
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+		if entity == nil {
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		}
+
+		return entity, nil
+	}
+
+	opts := dynamo.StreamByQueryOptions{
+		Workers:    1,
+		EntityType: evt.EntityType("TestEntity"),
+		HeadSource: heads,
+		Skip:       func(id evt.EntityID) bool { return id == "b" },
+	}
+
+	ids := make([]evt.EntityID, 0, 1)
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) {
+		entity, err := entityResult.Unwrap()
+		require.NoError(s.T(), err)
+		ids = append(ids, entity.GetID())
+	}
+
+	require.Equal(s.T(), []evt.EntityID{"a"}, ids)
+	require.Equal(s.T(), evt.EntityType("TestEntity"), heads.gotType, "EntityType is forwarded to the head source")
+	require.Equal(s.T(), []evt.EntityID{"a", "b"}, heads.streamed, "only matching-type heads are streamed")
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesByQuery_HeadSourceEnumerationError surfaces a head-source failure as an error
+// result on the stream.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_HeadSourceEnumerationError() {
+	ctx := context.Background()
+
+	heads := &fakeHeadVisitor{err: errors.New("registry boom")}
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+	}
+
+	var gotErr error
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 2, HeadSource: heads}, applyFunc) {
+		if _, err := entityResult.Unwrap(); err != nil {
+			gotErr = err
+		}
+	}
+
+	require.ErrorContains(s.T(), gotErr, "registry boom")
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesByQuery_CancelMidStream cancels the context after the first entity is consumed
+// while more remain to be enumerated. Workers then exit early without draining the ids channel, so
+// reading the producer's enumeration error must still synchronize with the producer goroutine. Run
+// under -race, this guards the enumErr read against a data race with the producer's write.
+func (s *RepositorySuite) Test_StreamEntitiesByQuery_CancelMidStream() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	heads := &fakeHeadVisitor{}
+	for i := 0; i < 50; i++ {
+		id := evt.EntityID("e" + strconv.Itoa(i))
+		heads.heads = append(heads.heads, headEntry{id: id, seq: 1, typ: "TestEntity"})
+		s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK(string(id))), mock.Anything).
+			Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{eventItem(string(id), 1)}}, nil).Maybe()
+	}
+
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+	}
+
+	consumed := 0
+	for range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}, applyFunc) {
+		consumed++
+		if consumed == 1 {
+			cancel() // abandon the stream while entities are still being enumerated
+		}
+	}
+
+	// The stream drains and closes cleanly after cancellation; the exact count is timing-dependent.
+	require.GreaterOrEqual(s.T(), consumed, 1)
+}

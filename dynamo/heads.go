@@ -21,6 +21,7 @@ const DefaultHeadsProjectorName = "entity-heads"
 var (
 	_ evt.EntityHeadStreamer = (*Repository)(nil)
 	_ evt.EntityHeadStreamer = (*HeadStore)(nil)
+	_ evt.EntityHeadVisitor  = (*HeadStore)(nil)
 	_ projectors.Projector   = (*HeadStore)(nil)
 )
 
@@ -238,6 +239,32 @@ func (h *HeadStore) StreamEntityHeads(
 ) (map[evt.EntityID]evt.EventSequence, error) {
 	heads := make(map[evt.EntityID]evt.EventSequence)
 
+	err := h.StreamEntityHeadsFunc(ctx, entityType, func(id evt.EntityID, seq evt.EventSequence) error {
+		heads[id] = seq
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return heads, nil
+}
+
+// StreamEntityHeadsFunc implements evt.EntityHeadVisitor: it pages the heads table and invokes visit
+// once per row without ever holding more than one page in memory, so a rebuild that enumerates
+// through it has a memory ceiling that does not grow with the entity count. This is what the
+// map-returning StreamEntityHeads cannot offer — the map is O(entities) by construction.
+//
+// Constant memory is sound here because the heads table holds exactly one row per entity: the rows
+// are already unique, so enumeration needs no dedup set (unlike an event-log scan, where a partition
+// key repeats per event), and the paginator resumes naturally from each page's LastEvaluatedKey.
+// The scan is eventually consistent by default (see NewHeadStore); use WithConsistentRead(true) for
+// a strongly consistent read. entityType, when non-empty, restricts enumeration to that type.
+func (h *HeadStore) StreamEntityHeadsFunc(
+	ctx context.Context,
+	entityType evt.EntityType,
+	visit func(evt.EntityID, evt.EventSequence) error,
+) error {
 	input := dynamodb.ScanInput{
 		TableName:      &h.headsTable,
 		ConsistentRead: aws.Bool(h.consistentRead),
@@ -254,12 +281,12 @@ func (h *HeadStore) StreamEntityHeads(
 
 	for p.HasMorePages() {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 
 		page, err := p.NextPage(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if page == nil {
 			continue
@@ -276,11 +303,13 @@ func (h *HeadStore) StreamEntityHeads(
 				continue
 			}
 
-			heads[evt.EntityID(pkAttr.Value)] = evt.EventSequence(seq)
+			if err := visit(evt.EntityID(pkAttr.Value), evt.EventSequence(seq)); err != nil {
+				return err
+			}
 		}
 	}
 
-	return heads, nil
+	return nil
 }
 
 // Backfill seeds the heads table from a source of entity heads — typically a Repository whose

@@ -29,3 +29,27 @@ type EntityHeadStreamer interface {
 	// lower read cost. It replaces re-reading and re-projecting every stream on every rebuild.
 	StreamEntityHeads(ctx context.Context, entityType EntityType) (map[EntityID]EventSequence, error)
 }
+
+// EntityHeadVisitor is an optional streaming variant of EntityHeadStreamer. Where StreamEntityHeads
+// materializes every head into a map (O(entities) memory), StreamEntityHeadsFunc delivers heads one
+// at a time to a visitor callback and never accumulates them — so a rebuild's enumeration memory
+// ceiling stays constant no matter how many entities exist.
+//
+// This is only constant-memory when the underlying store holds one row per entity (a registry such
+// as a heads table): such a source is naturally unique, needs no dedup set, and is resumable from
+// the last key it paged. It is deliberately backend-neutral — no DynamoDB types appear here — so a
+// future SQL backend can satisfy it with a streamed cursor over SELECT entity_id, MAX(sequence) ….
+// Like EntityHeadStreamer, it is kept off the core Repository interface and detected via a type
+// assertion (source.(EntityHeadVisitor)).
+type EntityHeadVisitor interface {
+	// StreamEntityHeadsFunc enumerates entity heads and invokes visit once per entity, in whatever
+	// order the store pages them, without holding the full set in memory. The head sequence has the
+	// same meaning as StreamEntityHeads. entityType, when non-empty, restricts enumeration to that
+	// type. If visit returns an error, enumeration stops and that error is returned; a paging error
+	// is returned as-is. A nil error means every entity was visited exactly once.
+	StreamEntityHeadsFunc(
+		ctx context.Context,
+		entityType EntityType,
+		visit func(EntityID, EventSequence) error,
+	) error
+}

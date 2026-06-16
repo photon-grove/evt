@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
@@ -52,4 +53,51 @@ func (s *DynamoEventsIntegrationSuite) TestHeadStore_ProjectAndRead() {
 	typed, err := store.StreamEntityHeads(ctx, "heads-it-widget")
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), evt.EventSequence(3), typed[id])
+}
+
+// TestHeadStore_StreamEntityHeadsFunc exercises the constant-memory visitor path against the local
+// emulator: the heads-table scan is paged and each row delivered to a callback without the store
+// ever materializing the full set. The heads table is shared across runs, so assertions read a
+// specific entity ID rather than the whole table to stay isolated from other tests' rows.
+func (s *DynamoEventsIntegrationSuite) TestHeadStore_StreamEntityHeadsFunc() {
+	ctx := context.Background()
+	store := dynamo.NewHeadStore(s.client, headsTable)
+
+	id := evt.EntityID("heads-it-visit")
+
+	rec := func(seq int) projectors.StreamRecord {
+		return projectors.StreamRecord{
+			EventID:    string(id) + ":" + string(rune('0'+seq)),
+			EntityID:   string(id),
+			EntityType: "heads-it-visit-widget",
+			Sequence:   seq,
+		}
+	}
+
+	failures, err := store.Process(ctx, []projectors.StreamRecord{rec(1), rec(2), rec(3)})
+	require.NoError(s.T(), err)
+	require.Empty(s.T(), failures)
+
+	// Visit every head and capture the one under test. The callback receives heads one at a time;
+	// nothing here accumulates the whole table.
+	var got evt.EventSequence
+	visits := 0
+	err = store.StreamEntityHeadsFunc(ctx, "", func(visited evt.EntityID, seq evt.EventSequence) error {
+		visits++
+		if visited == id {
+			got = seq
+		}
+
+		return nil
+	})
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), evt.EventSequence(3), got)
+	require.GreaterOrEqual(s.T(), visits, 1)
+
+	// A visit error stops enumeration and propagates unchanged.
+	sentinel := errors.New("stop")
+	err = store.StreamEntityHeadsFunc(ctx, "heads-it-visit-widget", func(_ evt.EntityID, _ evt.EventSequence) error {
+		return sentinel
+	})
+	require.ErrorIs(s.T(), err, sentinel)
 }

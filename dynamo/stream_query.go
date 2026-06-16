@@ -27,6 +27,20 @@ type StreamByQueryOptions struct {
 	// (rebuilds are idempotent, so re-running from scratch is always safe; Skip just avoids redoing
 	// finished work).
 	Skip func(evt.EntityID) bool
+
+	// HeadSource, if set, enumerates entity IDs from a heads registry (one row per entity) instead
+	// of the default key-only event-log scan. Because the registry is already unique, enumeration
+	// streams IDs straight to the workers with no dedup set — constant memory, regardless of entity
+	// count — and is naturally resumable. This is opt-in and requires the heads table to be
+	// populated (maintained by the heads projector and seeded via HeadStore.Backfill); leave it nil
+	// to keep the no-schema-change scan-and-dedup default. The events themselves are still read from
+	// the event log per entity; the registry only supplies the IDs to rebuild.
+	//
+	// Unlike the default path, which collects every ID up front and treats an enumeration failure as
+	// fatal before emitting anything, this path emits entities as it enumerates. A mid-enumeration
+	// failure therefore surfaces as a stream error after some entities were already emitted; because
+	// rebuilds are idempotent, re-run from scratch or resume with Skip.
+	HeadSource evt.EntityHeadVisitor
 }
 
 // StreamEntitiesByQuery reconstitutes entities with bounded memory by first enumerating the distinct
@@ -43,8 +57,8 @@ type StreamByQueryOptions struct {
 // returned, but DynamoDB charges scan read capacity by the size of the items read, not the
 // attributes projected — so enumeration consumes read capacity comparable to scanning the full log
 // and holds the distinct IDs in memory. The win is bounded memory, streaming output, and parallel
-// per-entity queries, not lower read cost. For genuinely cheaper, constant-memory enumeration, back
-// it with a dedicated per-entity index or registry instead.
+// per-entity queries, not lower read cost. For genuinely cheaper, constant-memory enumeration, set
+// opts.HeadSource to enumerate IDs from a heads registry (one row per entity) instead of this scan.
 func (repo *Repository) StreamEntitiesByQuery(
 	ctx context.Context,
 	opts StreamByQueryOptions,
@@ -62,30 +76,18 @@ func (repo *Repository) StreamEntitiesByQuery(
 	go func() {
 		defer close(results)
 
-		// Enumerate the full set of entity IDs first. If enumeration fails (a partial scan), treat
-		// it as fatal and emit no entities — otherwise workers could query and commit a subset of
-		// IDs while the caller sees an "ok-ish" result, leaving a silently under-rebuilt projection.
-		// This holds the same set of IDs in memory that enumeration already deduplicates, so it does
-		// not change the memory profile.
-		idList, err := repo.collectEntityIDs(ctx, opts.EntityType, opts.Skip)
-		if err != nil {
-			repo.sendEntity(ctx, results, result.Err[evt.Entity](err))
-			return
-		}
-
 		ids := make(chan evt.EntityID)
 
-		// Feed the pre-collected IDs to the workers.
+		// Producer: enumerate entity IDs and feed them to the workers, then close ids. enumErr holds
+		// any enumeration failure. It is read only after producerDone closes — a worker that exits
+		// early on cancellation may return without ever observing the closed ids channel, so
+		// wg.Wait() alone does not synchronize with the producer's write to enumErr.
+		producerDone := make(chan struct{})
+		var enumErr error
 		go func() {
+			defer close(producerDone)
 			defer close(ids)
-
-			for _, id := range idList {
-				select {
-				case ids <- id:
-				case <-ctx.Done():
-					return
-				}
-			}
+			enumErr = repo.produceEntityIDs(ctx, opts, ids)
 		}()
 
 		// Worker pool: each worker queries an entity partition and reconstitutes the entity.
@@ -124,9 +126,69 @@ func (repo *Repository) StreamEntitiesByQuery(
 		}
 
 		wg.Wait()
+
+		// Wait for the producer to finish before reading enumErr, establishing the happens-before
+		// edge the early-return workers above may not. On cancellation the producer unblocks via its
+		// own ctx.Done select, so this never deadlocks.
+		<-producerDone
+
+		// Surface an enumeration failure as a stream error. The default scan path fails before any
+		// worker runs (collectEntityIDs returns nothing on error), so this preserves its
+		// emit-nothing-then-error behavior; the HeadSource path may have emitted entities first.
+		if enumErr != nil {
+			repo.sendEntity(ctx, results, result.Err[evt.Entity](enumErr))
+		}
 	}()
 
 	return results
+}
+
+// produceEntityIDs enumerates the entity IDs to rebuild and feeds them to ids, applying the optional
+// Skip predicate. With opts.HeadSource set it streams IDs from the heads registry one at a time
+// (constant memory); otherwise it collects the distinct IDs from a key-only event-log scan first —
+// preserving the default all-or-nothing semantics, where an enumeration failure emits no IDs at all.
+func (repo *Repository) produceEntityIDs(
+	ctx context.Context,
+	opts StreamByQueryOptions,
+	ids chan<- evt.EntityID,
+) error {
+	send := func(id evt.EntityID) error {
+		if opts.Skip != nil && opts.Skip(id) {
+			return nil
+		}
+
+		select {
+		case ids <- id:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	if opts.HeadSource != nil {
+		return opts.HeadSource.StreamEntityHeadsFunc(ctx, opts.EntityType, func(id evt.EntityID, _ evt.EventSequence) error {
+			return send(id)
+		})
+	}
+
+	// Default: collect the full distinct ID set first. If enumeration fails (a partial scan), return
+	// the error without feeding any IDs — otherwise workers could query and commit a subset while
+	// the caller sees an "ok-ish" result, leaving a silently under-rebuilt projection. This holds
+	// the same set the scan already deduplicates, so it does not change the memory profile.
+	idList, err := repo.collectEntityIDs(ctx, opts.EntityType, opts.Skip)
+	if err != nil {
+		return err
+	}
+
+	for _, id := range idList {
+		select {
+		case ids <- id:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return nil
 }
 
 // collectEntityIDs enumerates the distinct entity IDs in the event log, applying the optional Skip

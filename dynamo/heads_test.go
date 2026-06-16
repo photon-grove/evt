@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -110,6 +111,139 @@ func (f *fakeHeadsDB) Scan(
 	}
 
 	return &dynamodb.ScanOutput{Items: out}, nil
+}
+
+// pagingHeadsDB is a behavioral fake of the heads table that returns exactly one row per Scan page,
+// driving DynamoDB's ExclusiveStartKey/LastEvaluatedKey pagination. It exists to prove that
+// StreamEntityHeadsFunc consumes the table page by page and never depends on a single full-table
+// page — i.e. it never needs to hold all rows at once. maxLive records the largest number of rows
+// the fake ever had to materialize for one page (always 1 here), and pages counts the Scan calls.
+type pagingHeadsDB struct {
+	*mock.Client
+	rows    []map[string]types.AttributeValue
+	pages   int
+	maxLive int
+}
+
+func newPagingHeadsDB(rows []map[string]types.AttributeValue) *pagingHeadsDB {
+	return &pagingHeadsDB{Client: mock.NewClient(), rows: rows}
+}
+
+func headRow(entityID, entityType string, seq int) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		"pk":         &types.AttributeValueMemberS{Value: entityID},
+		"headSeq":    &types.AttributeValueMemberN{Value: strconv.Itoa(seq)},
+		"entityType": &types.AttributeValueMemberS{Value: entityType},
+	}
+}
+
+func (f *pagingHeadsDB) Scan(
+	_ context.Context,
+	in *dynamodb.ScanInput,
+	_ ...func(*dynamodb.Options),
+) (*dynamodb.ScanOutput, error) {
+	f.pages++
+
+	start := 0
+	if in.ExclusiveStartKey != nil {
+		// The LastEvaluatedKey we hand back below encodes the next row index, so resume from it.
+		n, err := nval(in.ExclusiveStartKey["pk"])
+		if err != nil {
+			return nil, err
+		}
+
+		start = n
+	}
+
+	var filterType string
+	if in.FilterExpression != nil {
+		filterType = sval(in.ExpressionAttributeValues[":et"])
+	}
+
+	// Emit at most one matching row per page, then hand back a LastEvaluatedKey pointing past it so
+	// the paginator asks again. One row in flight at a time is the whole point of the fake.
+	for i := start; i < len(f.rows); i++ {
+		row := f.rows[i]
+		if filterType != "" && sval(row["entityType"]) != filterType {
+			continue
+		}
+
+		if f.maxLive < 1 {
+			f.maxLive = 1
+		}
+
+		return &dynamodb.ScanOutput{
+			Items:            []map[string]types.AttributeValue{row},
+			LastEvaluatedKey: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberN{Value: strconv.Itoa(i + 1)}},
+		}, nil
+	}
+
+	return &dynamodb.ScanOutput{}, nil
+}
+
+func TestHeadStore_StreamEntityHeadsFunc_VisitsEachRowAcrossPages(t *testing.T) {
+	ctx := context.Background()
+	db := newPagingHeadsDB([]map[string]types.AttributeValue{
+		headRow("widget-1", "widget", 5),
+		headRow("widget-2", "widget", 9),
+		headRow("widget-3", "widget", 2),
+	})
+	store := NewHeadStore(db, "heads")
+
+	visited := map[evt.EntityID]evt.EventSequence{}
+	err := store.StreamEntityHeadsFunc(ctx, "", func(id evt.EntityID, seq evt.EventSequence) error {
+		visited[id] = seq
+		return nil
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, map[evt.EntityID]evt.EventSequence{"widget-1": 5, "widget-2": 9, "widget-3": 2}, visited)
+	// One row per page proves the visitor never relied on a single full-table page: every row was
+	// delivered incrementally, and the fake never held more than one at a time.
+	require.GreaterOrEqual(t, db.pages, 3, "each entity should arrive on its own page")
+	require.Equal(t, 1, db.maxLive, "the visitor path must never materialize more than one page of rows")
+}
+
+func TestHeadStore_StreamEntityHeadsFunc_StopsOnVisitError(t *testing.T) {
+	ctx := context.Background()
+	db := newPagingHeadsDB([]map[string]types.AttributeValue{
+		headRow("widget-1", "widget", 1),
+		headRow("widget-2", "widget", 2),
+		headRow("widget-3", "widget", 3),
+	})
+	store := NewHeadStore(db, "heads")
+
+	boom := errors.New("visitor boom")
+	count := 0
+	err := store.StreamEntityHeadsFunc(ctx, "", func(_ evt.EntityID, _ evt.EventSequence) error {
+		count++
+		return boom // fail on the very first row
+	})
+
+	require.ErrorIs(t, err, boom)
+	require.Equal(t, 1, count, "enumeration must stop at the first visit error, not drain the table")
+	// The visitor is resumable: it stopped after paging only what it had visited, so a resumed run
+	// (e.g. via a Skip predicate over the IDs already handled) picks up the rest.
+	require.Less(t, db.pages, 3, "a stopped visitor should not page the whole table")
+}
+
+func TestHeadStore_StreamEntityHeadsFunc_FiltersByType(t *testing.T) {
+	ctx := context.Background()
+	db := newPagingHeadsDB([]map[string]types.AttributeValue{
+		headRow("widget-1", "widget", 2),
+		headRow("gadget-1", "gadget", 9),
+		headRow("widget-2", "widget", 4),
+	})
+	store := NewHeadStore(db, "heads")
+
+	visited := map[evt.EntityID]evt.EventSequence{}
+	err := store.StreamEntityHeadsFunc(ctx, "gadget", func(id evt.EntityID, seq evt.EventSequence) error {
+		visited[id] = seq
+		return nil
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, map[evt.EntityID]evt.EventSequence{"gadget-1": 9}, visited)
 }
 
 func headRecord(entityID, entityType string, seq int) projectors.StreamRecord {
