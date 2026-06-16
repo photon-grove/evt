@@ -83,7 +83,7 @@ entity (`pk` = entity ID) holding that entity's highest event sequence. Reading 
 is a scan of a few small rows, not the event log, so change detection is cheap.
 
 The heads table is maintained like any other read model — by a projector on the
-event stream — so it adds nothing to the commit path, and its per-entity-keyed
+[events topic](streams.md) — so it adds nothing to the commit path, and its per-entity-keyed
 writes stay distributed (no hot partition, no global counter, no secondary index).
 
 ```mermaid
@@ -115,7 +115,7 @@ together:
 **1. Provision the heads table** — one attribute, the partition key (`pk`); no sort
 key, no index. `entityType` is a plain attribute the reader filters on, not a key.
 
-**2. Maintain it with a projector Lambda**, subscribed to the same event stream your
+**2. Maintain it with a projector Lambda**, subscribed to the same events topic your
 other projectors use. The upsert is monotonic, so re-deliveries and out-of-order
 events fail the condition and are no-ops — durable idempotency is optional:
 

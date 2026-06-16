@@ -29,8 +29,8 @@ It grew out of patterns we run in production.
   snapshot-verified compaction keep replay quick without rewriting history. An
   optional entity-heads table tracks each entity's latest sequence so you can
   rebuild only the entities that changed instead of reprocessing the whole log.
-- **Built for AWS-native systems.** First-class DynamoDB Streams projectors and
-  SNS publishers, with idempotency and retry classification, not as an afterthought.
+- **Built for AWS-native systems.** A single DynamoDB Streams publisher fans events
+  out over SNS to idempotent, retry-classified projectors — not as an afterthought.
 
 ## Install
 
@@ -108,8 +108,8 @@ account, err := evt.ExecuteWithFactory(ctx, store, func() evt.Entity {
 | `evt/postgres` | PostgreSQL event log and snapshots — the same `evt.Repository` contract on a relational store |
 | `evt/snapshots` | Store with snapshot loading and write thresholds |
 | `evt/stream` | Stream handler and publisher helpers for event fanout |
-| `evt/projectors` | DynamoDB Streams Lambda projector runtime with idempotency and retry classification |
-| `evt/publishers` | DynamoDB Streams publisher handler with ingress and retry budgets |
+| `evt/projectors` | Projector runtime (SNS/SQS fan-out, or direct stream) with idempotency and retry classification |
+| `evt/publishers` | DynamoDB Streams publisher handler that fans events out to SNS, with ingress and retry budgets |
 | `evt/policy` | Backend-neutral retry helpers for commit paths |
 | `evt/policy/dynamodb` | DynamoDB-specific retry classification |
 | `evt/viewstore` | Typed JSON helper around `evt.ViewRepository` |

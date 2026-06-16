@@ -3,7 +3,7 @@ import type {CSSProperties, ReactElement} from 'react'
 
 import {DiagramIcon} from '../theme/icons'
 import {domainColor} from '../theme/tokens'
-import type {DiagramNodeData} from '../types'
+import type {DiagramNodeData, LaneNodeData} from '../types'
 
 function accentVars(domain?: string): CSSProperties {
   const {accent, soft} = domainColor(domain)
@@ -60,6 +60,17 @@ function BoundaryNode({data}: NodeProps): ReactElement {
   )
 }
 
+/** Full-width background band for one swimlane row, with its label in the
+ *  left gutter. Sits behind the cards (see runSwimlaneLayout z-order). */
+function LaneNode({data}: NodeProps): ReactElement {
+  const {label, index} = data as LaneNodeData
+  return (
+    <div className={'rfd-lane' + (index % 2 === 1 ? ' rfd-lane--alt' : '')}>
+      <span className="rfd-lane__label">{label}</span>
+    </div>
+  )
+}
+
 export const nodeTypes: NodeTypes = {
   service: LeafNode,
   datastore: LeafNode,
@@ -69,4 +80,5 @@ export const nodeTypes: NodeTypes = {
   process: LeafNode,
   client: LeafNode,
   boundary: BoundaryNode,
+  lane: LaneNode,
 }

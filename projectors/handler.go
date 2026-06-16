@@ -14,8 +14,13 @@ type DynamoDBStreamResponse struct {
 	BatchItemFailures []BatchItemFailure `json:"batchItemFailures"`
 }
 
-// NewLambdaHandler returns a function suitable for lambda.Start() that
-// processes DynamoDB Streams events through the provided Runtime.
+// NewLambdaHandler returns a function suitable for lambda.Start() that processes
+// DynamoDB Streams events directly through the provided Runtime.
+//
+// This wires a projector straight to the event-log stream, bypassing the SNS
+// fan-out. Prefer NewSQSHandler (the blessed path) for most projectors; reach
+// for this only for a consumer that should read the stream directly. See the
+// package doc for the trade-off.
 func NewLambdaHandler(runtime *Runtime) func(ctx context.Context, event events.DynamoDBEvent) (DynamoDBStreamResponse, error) {
 	return func(ctx context.Context, event events.DynamoDBEvent) (DynamoDBStreamResponse, error) {
 		logger := runtime.Logger()

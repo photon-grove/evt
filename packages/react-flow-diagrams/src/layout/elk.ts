@@ -1,8 +1,9 @@
-import {MarkerType, type Edge, type Node} from '@xyflow/react'
+import {type Edge, type Node} from '@xyflow/react'
 import ELK, {type ElkNode} from 'elkjs/lib/elk.bundled.js'
 
-import {EDGE_STYLE, domainColor, nodeSize} from '../theme/tokens'
+import {domainColor, nodeSize} from '../theme/tokens'
 import type {DiagramNode, DiagramNodeData, DiagramSpec} from '../types'
+import {baseEdge} from './edge'
 
 export interface LaidOutGraph {
   nodes: Node<DiagramNodeData>[]
@@ -244,40 +245,16 @@ export async function runElkLayout(spec: DiagramSpec): Promise<LaidOutGraph> {
   }
 
   const edges: Edge[] = spec.edges.map((edge) => {
-    const variant = edge.variant ?? 'data'
-    const style = EDGE_STYLE[variant]
     const routing = routingFor(edge)
     const routed = routing.points.length >= 2
     return {
-      id: edge.id,
-      source: edge.source,
-      target: edge.target,
-      sourceHandle: 'out',
-      targetHandle: 'in',
-      label: edge.label,
+      ...baseEdge(edge),
       // Follow ELK's waypoints when we have them; fall back to React Flow's own
       // smoothstep only if a route somehow came back empty.
       type: routed ? 'orthogonal' : 'smoothstep',
       ...(routed
         ? {data: {points: routing.points, labelX: routing.labelX, labelY: routing.labelY}}
         : {}),
-      animated: edge.animated ?? style.animated,
-      style: {stroke: style.stroke, strokeWidth: style.strokeWidth, strokeDasharray: style.dash},
-      markerEnd:
-        variant === 'dependency'
-          ? undefined
-          : {type: MarkerType.ArrowClosed, color: style.stroke, width: 15, height: 15},
-      // Opaque, bordered chip so a label stays legible even when it lands on or
-      // near another edge.
-      labelBgStyle: {
-        fill: 'var(--rfd-card)',
-        fillOpacity: 1,
-        stroke: 'var(--rfd-border)',
-        strokeWidth: 1,
-      },
-      labelStyle: {fill: 'var(--rfd-ink)', fontWeight: 600, fontSize: 11},
-      labelBgPadding: [7, 3],
-      labelBgBorderRadius: 6,
     } satisfies Edge
   })
 

@@ -36,6 +36,9 @@ export interface DiagramNode {
   icon?: string
   /** Parent boundary node id — nests this node inside a container. */
   parent?: string
+  /** Swimlane id (see {@link DiagramLayout.lanes}) this node sits in. Ignored
+   *  unless the layout defines lanes. */
+  lane?: string
   /** Arbitrary key/value detail surfaced on hover / in a side panel. */
   meta?: Record<string, string>
 }
@@ -58,9 +61,22 @@ export interface DiagramEdge {
   animated?: boolean
 }
 
+/** One horizontal lane (row) in a swimlane layout. */
+export interface DiagramLane {
+  id: string
+  label: string
+}
+
 export interface DiagramLayout {
   /** Primary flow direction. 'RIGHT' = left-to-right (default), 'DOWN' = top-to-bottom. */
   direction?: 'RIGHT' | 'DOWN'
+  /**
+   * Swimlane rows. When set (and nodes carry a matching `lane`), the diagram is
+   * laid out as horizontal lanes: each node sits in its lane's row and the flow
+   * runs left-to-right across columns (one column per step). Lanes replace the
+   * ELK layout for that diagram; `direction` is ignored.
+   */
+  lanes?: DiagramLane[]
 }
 
 export interface DiagramSpec {
@@ -79,4 +95,11 @@ export interface DiagramSpec {
 export interface DiagramNodeData extends Record<string, unknown> {
   node: DiagramNode
   direction: 'RIGHT' | 'DOWN'
+}
+
+/** Data carried into the swimlane band (background) node component. */
+export interface LaneNodeData extends Record<string, unknown> {
+  label: string
+  /** Row index, used for alternating band shading. */
+  index: number
 }

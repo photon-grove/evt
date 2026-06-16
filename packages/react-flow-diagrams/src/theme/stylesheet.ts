@@ -87,6 +87,19 @@ export const RFD_STYLESHEET = `
   background: color-mix(in srgb, var(--rfd-accent) 90%, #000);
   box-shadow: 0 4px 12px -4px color-mix(in srgb, var(--rfd-accent) 70%, transparent);
 }
+.rfd-lane {
+  position: relative; width: 100%; height: 100%;
+  border-top: 1px solid var(--rfd-border);
+  border-bottom: 1px solid color-mix(in srgb, var(--rfd-border) 50%, transparent);
+  background: color-mix(in srgb, var(--pg-ink, #0f172a) 2.5%, transparent);
+}
+.rfd-lane--alt { background: color-mix(in srgb, var(--pg-ink, #0f172a) 5.5%, transparent); }
+.rfd-lane__label {
+  position: absolute; left: 18px; top: 50%; transform: translateY(-50%);
+  max-width: 104px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--rfd-muted);
+}
 .rfd-root .react-flow__edge-text { font-size: 11px; font-weight: 600; fill: var(--rfd-ink); }
 .rfd-root .react-flow__edge-textbg { fill: var(--rfd-card); opacity: 1; }
 .rfd-root .react-flow__controls { box-shadow: 0 6px 18px -8px rgba(10,15,30,0.4); border-radius: 10px; overflow: hidden; }

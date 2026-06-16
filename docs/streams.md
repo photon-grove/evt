@@ -1,20 +1,37 @@
 # Streams, Projectors, and Publishers
 
-Once events land in the [DynamoDB event log](dynamodb.md), a DynamoDB Stream
-(configured with `NEW_IMAGE`) can drive asynchronous work: updating read models
-out of band, or fanning events out to other systems. The `projectors` and
-`publishers` packages are Lambda-oriented runtimes for exactly that, and both
-process **only `INSERT` records** — the append of a new event — skipping `MODIFY`
-and `REMOVE` silently.
+Once events land in the [DynamoDB event log](dynamodb.md), they fan out to
+asynchronous consumers — read-model projectors, change-detection
+[heads](projections.md), search indexers, feeds, webhooks — through a single hop:
 
-Both follow the same reliability contract: process records independently, return
-**partial-batch failures** so Lambda retries only the affected records, and stay
-**idempotent** because the same record can be delivered more than once.
+```text
+event log ──DynamoDB Stream──▶ publisher ──▶ SNS topic ──┬──▶ SNS→SQS ──▶ projector
+              (NEW_IMAGE)      (one reader)               ├──▶ SNS→SQS ──▶ heads / search / …
+                                                          └──▶ SNS→Lambda ──▶ feeds / webhooks
+```
+
+The **blessed path is this SNS fan-out.** Exactly one consumer reads the DynamoDB
+Stream — the **publisher** — and republishes each event to an SNS topic. Every
+other consumer subscribes to that topic (usually over SNS→SQS with raw message
+delivery) and runs independently, so the stream keeps a single cheap reader and
+consumers scale and fail in isolation. The `publishers` and `projectors` packages
+are the Lambda runtimes for the two ends of that path; both process **only
+`INSERT` records** — the append of a new event — skipping `MODIFY`/`REMOVE`.
+
+Every consumer follows the same reliability contract: process records
+independently, return **partial-batch failures** so only affected records retry,
+and stay **idempotent** because the same event can be delivered more than once.
+
+> A projector can also read the DynamoDB Stream **directly** via
+> `projectors.NewLambdaHandler`, skipping the topic. That's a supported
+> alternative for the occasional consumer that warrants it — but prefer the
+> SNS/SQS handlers below unless you have a specific reason.
 
 ## Projectors
 
-`evt/projectors` runs an idempotent, retry-classified handler over a stream batch.
-You implement the `Projector` interface and wrap it in a runtime:
+A projector consumes events from the SNS fan-out and maintains a read model. You
+implement the `Projector` interface, wrap it in a runtime, and serve it with the
+SQS handler — the topic delivered over SNS→SQS with raw message delivery:
 
 ```go
 type Projector interface {
@@ -28,9 +45,18 @@ func main() {
         idempotencyGuard,   // projectors.IdempotencyGuard
         slog.Default(),
     )
-    lambda.Start(projectors.NewLambdaHandler(runtime))
+    lambda.Start(projectors.NewSQSHandler(runtime))
 }
 ```
+
+`NewSQSHandler` decodes each SQS message — the CloudWatchEvent envelope the
+publisher emitted — into a `StreamRecord` with `StreamRecordFromEnvelope`, runs
+the batch through the runtime, and returns an `events.SQSEventResponse` so Lambda
+redelivers only the failed messages. For a latency-sensitive consumer wired as a
+**direct** SNS→Lambda subscription, use `NewSNSHandler` instead; SNS has no
+partial-batch protocol, so a failure retries the whole invocation — give that
+subscription a redrive policy. (`NewLambdaHandler` is the direct-from-stream
+variant noted above.)
 
 The runtime adds:
 
@@ -42,16 +68,17 @@ The runtime adds:
   `projectors.NewPermanentError(err)` to route them to partial-batch failures
   (and ultimately a DLQ); transient errors (timeouts, context deadlines) retry the
   whole invocation.
-- **partial-batch failure responses** — the handler returns a
-  `DynamoDBStreamResponse{BatchItemFailures: […]}` so Lambda re-delivers only the
-  failed records.
+- **partial-batch failure responses** — `NewSQSHandler` returns an
+  `events.SQSEventResponse{BatchItemFailures: […]}` (and `NewLambdaHandler` a
+  `DynamoDBStreamResponse{…}`) so Lambda re-delivers only the failed records.
 - **structured logging** through the `*slog.Logger` you pass in (falling back to
   `slog.Default()` when nil).
 
 ## Publishers
 
-`evt/publishers` forwards committed events to downstream consumers. The handler
-takes a `StreamPublisher` and a `BudgetController`:
+`evt/publishers` is the single DynamoDB-Stream consumer: it reads committed
+events and republishes them to the SNS topic the consumers above subscribe to.
+The handler takes a `StreamPublisher` and a `BudgetController`:
 
 ```go
 func HandleDynamoDBEvent(
