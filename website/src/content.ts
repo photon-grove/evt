@@ -17,53 +17,47 @@ repo := dynamo.NewRepository(dynamoClient, "event-log")
 store := snapshots.NewStore(repo, 25)`
 
 // A linked content card. `doc`, when set, is the slug of the in-site guide it links to.
-// `tag`, when set, labels the card with the package the capability lives in.
 export interface ContentCard {
   title: string
   body: string
   doc?: string
-  tag?: string
 }
 
+// Capability-focused cards: what the framework does and where to learn it. The
+// "Package reference" list below is the authoritative "what do I import" map, so
+// these stay deliberately package-agnostic.
 export const capabilities: ContentCard[] = [
   {
-    tag: 'evt',
     title: 'Command execution',
     body: 'Load an aggregate, run a command, serialize produced events, and commit them with optimistic concurrency.',
     doc: 'getting-started',
   },
   {
-    tag: 'evt/dynamo',
     title: 'DynamoDB event log',
     body: 'Store immutable event rows under stable pk/sk keys, with inline snapshots at sk=0 and conditional writes for ordering.',
     doc: 'dynamodb',
   },
   {
-    tag: 'evt/projectors',
     title: 'Materialized views',
     body: 'Write deterministic read-model rows through projection transactions and rebuild them by replaying events.',
     doc: 'projections',
   },
   {
-    tag: 'evt/dynamo',
     title: 'Incremental rebuilds',
     body: 'Track each entity head in a small table to rebuild only what changed, with constant-memory enumeration that does not grow with entity count.',
     doc: 'projections',
   },
   {
-    tag: 'evt/snapshots',
     title: 'Snapshots and upcasters',
     body: 'Keep replay fast while allowing old event payloads to evolve through explicit versioned upcasters.',
     doc: 'concepts',
   },
   {
-    tag: 'evt/projectors',
     title: 'Stream projectors',
     body: 'Run DynamoDB Streams Lambda projectors with idempotency, retry classification, and partial-batch failure responses.',
     doc: 'streams',
   },
   {
-    tag: 'evt/publishers',
     title: 'Event publishers',
     body: 'Fan out event-log INSERT records to SNS, including optional FIFO companion topics for ordered real-time workflows.',
     doc: 'streams',

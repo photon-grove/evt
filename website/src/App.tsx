@@ -51,7 +51,6 @@ function CardLink({doc}: {doc?: string}) {
 function FeatureCard({item}: {item: ContentCard}) {
   return (
     <article className="feature-card">
-      {item.tag ? <code className="card-tag">{item.tag}</code> : null}
       <h3>{item.title}</h3>
       <p>{item.body}</p>
       <CardLink doc={item.doc} />
