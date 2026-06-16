@@ -84,31 +84,73 @@ is a scan of a few small rows, not the event log, so change detection is cheap.
 The heads table is maintained like any other read model — by a projector on the
 event stream — so it adds nothing to the commit path, and its per-entity-keyed
 writes stay distributed (no hot partition, no global counter, no secondary index).
-`dynamo.HeadStore` is both the projector (`projectors.Projector`) and the reader
-(`evt.EntityHeadStreamer`):
+
+```mermaid
+flowchart TB
+  cmd[Command] --> commit[Repository.Commit]
+  commit --> log[("event-log<br/>append-only")]
+  log -- "DynamoDB Stream" --> pub[publisher]
+  pub -- "SNS / SQS" --> topic(["events topic"])
+  topic --> heads["HeadStore<br/>(heads projector)"]
+  topic --> other["your view projectors"]
+  heads -- "monotonic upsert" --> ht[("heads table<br/>pk = entity, headSeq")]
+  other --> views[("views")]
+
+  subgraph rebuild ["incremental rebuild tool"]
+    direction TB
+    read["StreamEntityHeads()"] --> detect{"head != checkpoint?"}
+    ckpt[("per-entity<br/>projection checkpoint")] --> detect
+    detect -- "changed only" --> reproject["reproject entity"]
+    reproject --> views2[("views")]
+    reproject --> ckpt
+  end
+
+  ht -.->|"read, not the log"| read
+```
+
+`dynamo.HeadStore` plays both projector and reader roles. Putting the pieces
+together:
+
+**1. Provision the heads table** — one attribute, the partition key (`pk`); no sort
+key, no index. `entityType` is a plain attribute the reader filters on, not a key.
+
+**2. Maintain it with a projector Lambda**, subscribed to the same event stream your
+other projectors use. The upsert is monotonic, so re-deliveries and out-of-order
+events fail the condition and are no-ops — durable idempotency is optional:
 
 ```go
 heads := dynamo.NewHeadStore(client, "my-entity-heads")
+runtime := projectors.NewRuntime(heads, projectors.NewInMemoryIdempotencyGuard(), logger)
+// runtime.Process(ctx, records) from your SNS/SQS handler — see streams.md.
+```
 
-// In the projector Lambda: upsert each event's head, monotonically. Re-deliveries
-// and out-of-order events fail the condition and are no-ops, so it is idempotent.
-runtime := projectors.NewRuntime(heads, idempotencyGuard, logger)
+**3. Seed it once** from the existing log before the first incremental run, so
+entities that predate the projector are present. `Backfill` takes any
+`EntityHeadStreamer` source — typically a `Repository`, whose `StreamEntityHeads`
+folds the log (the one place a full scan remains). Call once per entity type to
+record the type on each row:
 
-// In the rebuild tool: read every entity's head, compare against your per-entity
-// projection checkpoint, and reproject only the entities whose head moved.
-current, err := heads.StreamEntityHeads(ctx, "" /* all types */)
+```go
+for _, t := range myEntityTypes {
+    if _, err := heads.Backfill(ctx, repo, t); err != nil { /* ... */ }
+}
+```
+
+**4. Detect and reproject** in the rebuild tool: read every head, compare against a
+per-entity projection checkpoint you store alongside your views (the sequence each
+view was last built from), and reproject only the entities whose head moved.
+
+```go
+current, err := heads.StreamEntityHeads(ctx, "") // all types; few-MB scan
+// for id, head := range current:
+//   if head != checkpoint[id] { reproject(id); checkpoint[id] = head }
 ```
 
 `EntityHeadStreamer` is backend-neutral, so a non-DynamoDB backend can satisfy it
 its own way (for example, a SQL backend with `SELECT entity_id, MAX(sequence) …`).
-The in-memory repository implements it directly over its event map for tests.
-
-Seed the table once from the existing log before the first incremental run with
-`HeadStore.Backfill`, passing any `EntityHeadStreamer` source (typically a
-`Repository`, whose `StreamEntityHeads` folds the log — the one place a full scan
-remains). After that, the projector keeps the table complete as new entities emit
-their first event. The head accounts for a compacted stream's snapshot floor, so it
-stays correct after `CompactBelow`.
+The in-memory repository implements it directly over its event map for tests. The
+head accounts for a compacted stream's snapshot floor, so it stays correct after
+`CompactBelow`.
 
 ## Rebuilding compacted streams
 
