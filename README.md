@@ -10,8 +10,7 @@ models, and DynamoDB persistence — as small, composable Go packages. There is 
 runtime to adopt, no base application to inherit from, and no magic. You wire the
 pieces you need and ignore the rest.
 
-It grew out of patterns we run in production. This repository is deliberately
-public-safe: neutral examples, local emulator credentials, and nothing private.
+It grew out of patterns we run in production.
 
 ## Why evt
 
