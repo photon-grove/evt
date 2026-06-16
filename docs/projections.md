@@ -146,6 +146,21 @@ current, err := heads.StreamEntityHeads(ctx, "") // all types; few-MB scan
 //   if head != checkpoint[id] { reproject(id); checkpoint[id] = head }
 ```
 
+The reader is eventually consistent by default (half the RCU cost); a head that lags
+a beat only defers an entity to the next rebuild, never skips it. Derive a strongly
+consistent variant with `heads.WithConsistentRead(true)` if a read must reflect the
+latest projector write.
+
+**Recovering a lagged head.** The heads table is a projection, so it is only as
+current as its projector. If a delivery is permanently dropped (for example, a record
+exhausted its retries and went to a dead-letter queue), that entity's head can lag the
+log, and change detection would treat it as unchanged and skip its reprojection. The
+fix is the same operation that seeds the table: re-run `Backfill` from the log, whose
+heads are authoritative. Because the upsert is monotonic, backfill only ever advances a
+lagging head and is safe to run anytime — concurrently with the live projector and as
+often as you like — so a periodic backfill (or one after draining a DLQ) keeps the
+table from drifting.
+
 `EntityHeadStreamer` is backend-neutral, so a non-DynamoDB backend can satisfy it
 its own way (for example, a SQL backend with `SELECT entity_id, MAX(sequence) …`).
 The in-memory repository implements it directly over its event map for tests. The

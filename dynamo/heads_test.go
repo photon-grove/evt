@@ -41,8 +41,9 @@ func nval(av types.AttributeValue) (int, error) {
 // mock.Client supplies the rest of the Client interface (never called here).
 type fakeHeadsDB struct {
 	*mock.Client
-	mu    sync.Mutex
-	items map[string]map[string]types.AttributeValue
+	mu                 sync.Mutex
+	items              map[string]map[string]types.AttributeValue
+	lastScanConsistent bool
 }
 
 func newFakeHeadsDB() *fakeHeadsDB {
@@ -91,6 +92,8 @@ func (f *fakeHeadsDB) Scan(
 ) (*dynamodb.ScanOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	f.lastScanConsistent = in.ConsistentRead != nil && *in.ConsistentRead
 
 	var filterType string
 	if in.FilterExpression != nil {
@@ -197,4 +200,25 @@ func TestHeadStore_Backfill_FromEventLogSource(t *testing.T) {
 	heads, err := store.StreamEntityHeads(ctx, "widget")
 	require.NoError(t, err)
 	require.Equal(t, map[evt.EntityID]evt.EventSequence{"widget-1": 2, "widget-2": 1}, heads)
+}
+
+func TestHeadStore_StreamEntityHeads_EventuallyConsistentByDefault(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeHeadsDB()
+	store := NewHeadStore(db, "heads")
+
+	// Default reads are eventually consistent (half the RCU cost).
+	_, err := store.StreamEntityHeads(ctx, "")
+	require.NoError(t, err)
+	require.False(t, db.lastScanConsistent)
+
+	// WithConsistentRead(true) opts into strongly consistent reads without mutating the original.
+	strong := store.WithConsistentRead(true)
+	_, err = strong.StreamEntityHeads(ctx, "")
+	require.NoError(t, err)
+	require.True(t, db.lastScanConsistent)
+
+	_, err = store.StreamEntityHeads(ctx, "")
+	require.NoError(t, err)
+	require.False(t, db.lastScanConsistent, "original store must remain eventually consistent")
 }
