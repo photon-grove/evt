@@ -110,10 +110,13 @@ md := evt.NewMetadata(ctx, region,
 
 A repository persists serialized events and snapshots and replays them back. It
 is backend-neutral: the same `evt.Repository` contract is implemented by `mem`
-(in-memory, for tests) and `dynamo` (production). The DynamoDB repository stores
-event rows under stable `pk`/`sk` keys and uses **conditional writes** to protect
-per-entity ordering, so two writers racing on the same entity can't both win the
-same sequence. See [DynamoDB integration](dynamodb.md) for the exact key layout.
+(in-memory, for tests), `dynamo` (production), and `postgres` (production). The
+DynamoDB repository stores event rows under stable `pk`/`sk` keys and uses
+**conditional writes** to protect per-entity ordering; the PostgreSQL repository
+keys the log on `(entity_id, sequence)` and relies on that primary key for the
+same guarantee, so two writers racing on the same entity can't both win the same
+sequence. See [DynamoDB integration](dynamodb.md) and
+[PostgreSQL integration](postgres.md) for the exact layouts.
 
 Some capabilities are optional and detected by type assertion rather than baked
 into the core interface — `Compactor` (truncate covered events), `SnapshotStreamer`
