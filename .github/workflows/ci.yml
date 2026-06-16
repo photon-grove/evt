@@ -35,16 +35,6 @@ jobs:
           node-version: 24.5
           cache: pnpm
 
-      - name: Cache Go
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
       - run: pnpm install --frozen-lockfile
 
       - name: Go checks
@@ -83,16 +73,6 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.14.0
-
-      - name: Cache Go
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
 
       - name: Cache Terraform providers
         uses: actions/cache@v5
