@@ -87,7 +87,7 @@ func (repo *Repository) StreamEntitiesByQuery(
 		go func() {
 			defer close(producerDone)
 			defer close(ids)
-			enumErr = repo.produceEntityIDs(ctx, opts, ids)
+			enumErr = repo.produceEntityIDs(ctx, opts.EntityType, opts.Skip, opts.HeadSource, ids)
 		}()
 
 		// Worker pool: each worker queries an entity partition and reconstitutes the entity.
@@ -144,16 +144,21 @@ func (repo *Repository) StreamEntitiesByQuery(
 }
 
 // produceEntityIDs enumerates the entity IDs to rebuild and feeds them to ids, applying the optional
-// Skip predicate. With opts.HeadSource set it streams IDs from the heads registry one at a time
-// (constant memory); otherwise it collects the distinct IDs from a key-only event-log scan first —
-// preserving the default all-or-nothing semantics, where an enumeration failure emits no IDs at all.
+// skip predicate. With headSource set it streams IDs from the heads registry one at a time (constant
+// memory); otherwise it collects the distinct IDs from a key-only event-log scan first — preserving
+// the default all-or-nothing semantics, where an enumeration failure emits no IDs at all. It is
+// shared by both the from-events (StreamEntitiesByQuery) and snapshot-aware
+// (StreamEntitiesFromSnapshotsWithOptions) rebuild paths, which differ only in how each enumerated
+// ID is then reconstructed.
 func (repo *Repository) produceEntityIDs(
 	ctx context.Context,
-	opts StreamByQueryOptions,
+	entityType evt.EntityType,
+	skip func(evt.EntityID) bool,
+	headSource evt.EntityHeadVisitor,
 	ids chan<- evt.EntityID,
 ) error {
 	send := func(id evt.EntityID) error {
-		if opts.Skip != nil && opts.Skip(id) {
+		if skip != nil && skip(id) {
 			return nil
 		}
 
@@ -165,8 +170,8 @@ func (repo *Repository) produceEntityIDs(
 		}
 	}
 
-	if opts.HeadSource != nil {
-		return opts.HeadSource.StreamEntityHeadsFunc(ctx, opts.EntityType, func(id evt.EntityID, _ evt.EventSequence) error {
+	if headSource != nil {
+		return headSource.StreamEntityHeadsFunc(ctx, entityType, func(id evt.EntityID, _ evt.EventSequence) error {
 			return send(id)
 		})
 	}
@@ -175,7 +180,7 @@ func (repo *Repository) produceEntityIDs(
 	// the error without feeding any IDs — otherwise workers could query and commit a subset while
 	// the caller sees an "ok-ish" result, leaving a silently under-rebuilt projection. This holds
 	// the same set the scan already deduplicates, so it does not change the memory profile.
-	idList, err := repo.collectEntityIDs(ctx, opts.EntityType, opts.Skip)
+	idList, err := repo.collectEntityIDs(ctx, entityType, skip)
 	if err != nil {
 		return err
 	}
