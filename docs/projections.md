@@ -70,8 +70,9 @@ reduces the data returned over the wire but **not** the read capacity consumed �
 DynamoDB charges scan RCUs by the size of the items read, not the attributes
 projected. So enumeration consumes read capacity comparable to scanning the full
 log; the win here is bounded memory, incremental output, and parallel per-entity
-queries, not lower read cost. For genuinely cheaper enumeration, back it with a
-dedicated per-entity index or registry.
+queries, not lower read cost. For genuinely cheaper, constant-memory enumeration,
+back it with a heads registry — see [Constant-memory enumeration](#constant-memory-enumeration)
+below.
 
 ### Incremental rebuilds with an entity-heads table
 
@@ -171,6 +172,51 @@ its own way (for example, a SQL backend with `SELECT entity_id, MAX(sequence) �
 The in-memory repository implements it directly over its event map for tests. The
 head accounts for a compacted stream's snapshot floor, so it stays correct after
 `CompactBelow`.
+
+#### Constant-memory enumeration
+
+`StreamEntityHeads` returns a `map[EntityID]EventSequence` — convenient, but the
+map grows with the number of entities, so a rebuild's memory ceiling scales with
+the table. For a genuinely constant-memory pass, `HeadStore` also implements the
+streaming `evt.EntityHeadVisitor`:
+
+```go
+err := heads.StreamEntityHeadsFunc(ctx, "", func(id evt.EntityID, head evt.EventSequence) error {
+    if head > checkpoint(id) { // your per-entity projection checkpoint
+        reproject(id)
+    }
+    return nil // return an error to stop enumeration early
+})
+```
+
+This pages the heads table and invokes the callback once per row, never holding
+more than one page in memory. It is sound here precisely because the heads table
+holds **one row per entity**: the rows are already unique, so enumeration needs no
+dedup set (unlike the event-log scan, where a partition key repeats once per event)
+and resumes naturally from each page's last key. `EntityHeadVisitor` is
+backend-neutral for the same reason `EntityHeadStreamer` is — a SQL backend can
+stream a cursor over `SELECT entity_id, MAX(sequence) …`.
+
+To drive a bounded-memory **rebuild** from the registry instead of a scan, set
+`StreamByQueryOptions.HeadSource` (any `EntityHeadVisitor`, e.g. a `HeadStore`):
+
+```go
+stream := repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{
+    Workers:    8,
+    HeadSource: heads, // enumerate IDs from the registry, not a key-only event-log scan
+}, applyEvent)
+```
+
+With `HeadSource` set, entity IDs stream straight from the registry to the worker
+pool with no dedup set — so enumeration memory no longer grows with entity count —
+while each entity's events are still read from its own event-log partition. It is
+opt-in and requires the heads table to be populated (maintained by the projector
+and seeded with `Backfill`); leave it nil to keep the no-schema-change
+scan-and-dedup default. Unlike that default — which collects every ID up front and
+fails before emitting anything if enumeration errors — the registry path emits
+entities as it enumerates, so a mid-enumeration failure surfaces as a stream error
+after some entities were already emitted. Rebuilds are idempotent, so re-run from
+scratch or resume past finished work with `Skip`.
 
 ## Rebuilding compacted streams
 
