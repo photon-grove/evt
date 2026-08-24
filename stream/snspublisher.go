@@ -27,17 +27,9 @@ type fifoTarget struct {
 	extractor GroupIDExtractor
 }
 
-// SNSPublisher publishes DynamoDB stream records to an SNS topic.
-// Each INSERT event from the event log is converted to an EventBridge-style
-// CloudWatchEvent envelope carrying the serialized domain event as Detail,
-// then sent as the SNS message body. This preserves compatibility with
-// existing consumers (e.g. the audit log projector) that expect the
-// EventBridge event shape.
-//
-// When a FIFO companion topic is configured via WithFIFOTarget, eligible
-// events (as decided by the GroupIDExtractor) are also published to the FIFO
-// topic with MessageGroupId for per-group ordering and MessageDeduplicationId
-// set to the serialized event ID for SNS-side idempotency across retries.
+// SNSPublisher converts event-log INSERT records into CloudWatchEvent envelopes and publishes them
+// to SNS. WithFIFOTarget, eligible events also go to a FIFO topic with a group ID and event-ID
+// deduplication key.
 type SNSPublisher struct {
 	client   snsPublishClient
 	topicARN string
@@ -257,14 +249,8 @@ func (p *SNSPublisher) Publish(ctx context.Context, records []events.DynamoDBEve
 			}
 		}
 
-		// Flush FIFO first so a FIFO failure that marks records as failed
-		// drives retries back through *both* topics; the FIFO dedup window
-		// (keyed on MessageDeduplicationId = event ID) absorbs the duplicate
-		// FIFO publish, while the standard topic sees the publish exactly
-		// once. If we flushed standard first, a subsequent FIFO failure
-		// would make the whole index fail, and retries would re-publish to
-		// the standard topic — which has no dedup — producing duplicate
-		// deliveries to the feed projector and webhook dispatcher.
+		// Flush FIFO first. Retrying a FIFO failure after a standard publish would duplicate the
+		// non-deduplicated standard topic; FIFO deduplicates by event ID.
 		if p.fifo != nil && len(fifoBatch) >= maxBatchSize {
 			p.flushFIFOBatch(ctx, fifoBatch, result, logger)
 			fifoBatch = fifoBatch[:0]

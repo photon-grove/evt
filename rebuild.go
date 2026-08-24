@@ -28,12 +28,9 @@ type RebuildConfig struct {
 	// Zero means no limit.
 	MaxErrors int
 
-	// SeedEntity, when non-nil, switches the rebuild onto the snapshot-aware replay path: each
-	// entity is reconstructed from its latest durable snapshot before its post-snapshot events
-	// are applied. This is REQUIRED to rebuild correctly after CompactBelow has truncated events
-	// below a snapshot, because events 1..N are no longer guaranteed to exist. When set, the
-	// repository must implement SnapshotStreamer or RebuildProjections returns an error. When nil,
-	// the legacy full-replay path (StreamEntities, sequence 1..N) is used.
+	// SeedEntity enables snapshot-aware replay. It is required after CompactBelow because deleted
+	// events cannot be fully replayed. The repository must implement SnapshotStreamer; nil uses
+	// StreamEntities for full replay.
 	SeedEntity SnapshotSeeder
 
 	// OnProgress, if non-nil, is called after each entity is successfully processed

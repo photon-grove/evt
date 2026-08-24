@@ -34,8 +34,7 @@ func IsInvalidEventError(err error) bool {
 	return errors.As(err, &invalidEventErr)
 }
 
-// MarshalJSON takes a SerializedEvent encoded as a DynamoDB AttributeValue map and returns the JSON
-// representation for publishing to an event bus
+// MarshalJSON converts a DynamoDB attribute map to a serialized event and its JSON encoding.
 func MarshalJSON(item map[string]lambdaevents.DynamoDBAttributeValue) (evt.SerializedEvent, []byte, error) {
 	var event evt.SerializedEvent
 	var data Event

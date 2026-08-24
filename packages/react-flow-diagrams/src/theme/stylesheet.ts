@@ -65,10 +65,8 @@ export const RFD_STYLESHEET = `
   white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
 }
 .rfd-handle {
-  /* Anchors React Flow still needs, but the visible line is ELK's routed path,
-     which touches the node border wherever ELK chose to attach it. A fixed
-     left/right dot next to a top/bottom-entering line reads as detached, so the
-     dot is hidden and the path itself is the connection. */
+  /* React Flow needs handles, but hide them: ELK paths attach at their actual
+     border points, while fixed dots can appear detached. */
   width: 8px; height: 8px; border-radius: 999px;
   background: var(--rfd-accent); border: 2px solid var(--rfd-handle-ring);
   opacity: 0;

@@ -123,15 +123,9 @@ func numAttr(item map[string]types.AttributeValue, name string) (int, bool) {
 	return n, true
 }
 
-// HeadStore maintains and reads a heads table: one row per entity (pk = entity ID) recording the
-// highest event sequence observed for that entity. It is the change-detection backing for
-// incremental projection rebuilds, and it is filled the same way every other read model is — by a
-// projector on the event stream — so it adds no work to the commit path.
-//
-//   - As a projectors.Projector it upserts heads from the stream (the SNS->SQS path other
-//     projectors use), monotonically, so re-deliveries and out-of-order events are no-ops.
-//   - As an evt.EntityHeadStreamer it reads the heads back with a cheap scan of the small heads
-//     table instead of the full event log.
+// HeadStore maintains one monotonic event head per entity for incremental rebuilds. A stream
+// projector updates it asynchronously, so it adds no commit-path work and tolerates duplicate or
+// out-of-order delivery. As an evt.EntityHeadStreamer, it scans the heads table instead of the log.
 type HeadStore struct {
 	client         Client
 	headsTable     string

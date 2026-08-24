@@ -189,13 +189,10 @@ err := heads.StreamEntityHeadsFunc(ctx, "", func(id evt.EntityID, head evt.Event
 })
 ```
 
-This pages the heads table and invokes the callback once per row, never holding
-more than one page in memory. It is sound here precisely because the heads table
-holds **one row per entity**: the rows are already unique, so enumeration needs no
-dedup set (unlike the event-log scan, where a partition key repeats once per event)
-and resumes naturally from each page's last key. `EntityHeadVisitor` is
-backend-neutral for the same reason `EntityHeadStreamer` is — a SQL backend can
-stream a cursor over `SELECT entity_id, MAX(sequence) …`.
+This pages the heads table and invokes the callback once per row. One row per
+entity means no dedup set is needed, unlike an event-log scan. `EntityHeadVisitor`
+is backend-neutral, so a SQL backend can stream a cursor over
+`SELECT entity_id, MAX(sequence) …`.
 
 To drive a bounded-memory **rebuild** from the registry instead of a scan, set
 `StreamByQueryOptions.HeadSource` (any `EntityHeadVisitor`, e.g. a `HeadStore`):
@@ -207,16 +204,12 @@ stream := repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{
 }, applyEvent)
 ```
 
-With `HeadSource` set, entity IDs stream straight from the registry to the worker
-pool with no dedup set — so enumeration memory no longer grows with entity count —
-while each entity's events are still read from its own event-log partition. It is
-opt-in and requires the heads table to be populated (maintained by the projector
-and seeded with `Backfill`); leave it nil to keep the no-schema-change
-scan-and-dedup default. Unlike that default — which collects every ID up front and
-fails before emitting anything if enumeration errors — the registry path emits
-entities as it enumerates, so a mid-enumeration failure surfaces as a stream error
-after some entities were already emitted. Rebuilds are idempotent, so re-run from
-scratch or resume past finished work with `Skip`.
+With `HeadSource`, IDs stream from the registry to workers without a dedup set;
+each entity's events still come from its event-log partition. This opt-in path
+requires a projector-maintained, `Backfill`-seeded heads table. Leave it nil for
+scan-and-dedup enumeration. The scan path reports enumeration errors before output,
+while the registry can report an error after emitting entities. Rerun or resume with
+`Skip`.
 
 To skip the hand-wiring entirely, the dynamo repository's
 `RebuildProjectionsByQuery` builds the `StreamEntitiesByQuery` stream — registry or
@@ -293,19 +286,12 @@ res, err := evt.RebuildProjectionsFromStream(ctx, stream, evt.RebuildConfig{
 })
 ```
 
-The heads registry is a correct ID source for compacted streams because each head is
-`MAX(highest event sk, snapshot EventSequence)` — so a stream whose early events were
-truncated is still registered at the sequence its snapshot covers. As with the
-from-events path, enumeration streams IDs straight to the workers with no dedup set,
-each entity is still seeded from its own `sk=0` snapshot and rebuilt from its own
-partition, and the trade-off is the same: the default scan path collects every ID up
-front and fails before emitting anything if enumeration errors, while the registry
-path emits entities as it enumerates, so a mid-enumeration failure surfaces as a
-stream error after some entities were already emitted. Rebuilds are idempotent, so
-re-run from scratch or resume past finished work with `Skip`. It is opt-in and
-requires the heads table to be populated (maintained by the heads projector and
-seeded with `Backfill`); leave `HeadSource` nil to keep the no-schema-change
-scan-and-dedup default that `evt.RebuildConfig.SeedEntity` uses.
+The heads registry includes `MAX(highest event sk, snapshot EventSequence)`, so it
+remains a valid ID source after compaction. `StreamEntitiesFromSnapshotsWithOptions`
+uses the same `HeadSource` trade-offs: it seeds each entity from `sk=0`, reads its
+partition, and avoids a dedup set. Without `HeadSource`, it uses scan-and-dedup
+enumeration. The registry requires projector-maintained, `Backfill`-seeded heads
+and can report an error after emitting entities; rerun or resume with `Skip`.
 
 ## Reading views without buffering
 

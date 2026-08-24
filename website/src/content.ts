@@ -42,7 +42,7 @@ export const capabilities: ContentCard[] = [
   },
   {
     title: 'Incremental rebuilds',
-    body: 'Track each entity head in a small table to rebuild only what changed, with constant-memory enumeration that does not grow with entity count.',
+    body: 'Track entity heads in a small table to rebuild only what changed with constant-memory enumeration.',
     doc: 'projections',
   },
   {

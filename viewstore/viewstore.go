@@ -1,22 +1,8 @@
-// Package viewstore provides a typed wrapper around evt.ViewRepository that
-// binds a JSON codec, an evt.EntityType, and an optional value factory so
-// individual stores only need to express their domain key conventions
-// (pk/sk builders) rather than re-implementing JSON encode/decode plumbing.
+// Package viewstore binds evt.ViewRepository to JSON values, an entity type, and optional decode
+// factories. Codec accepts keys per call; Single binds a primary-key function.
 //
-// Two shapes are supported:
-//
-//   - Codec[T]: low-level binding that accepts caller-supplied pk/sk/entityID
-//     on every call. Use this when key builders take more than one argument
-//     (e.g., compound keys derived from world+location+object).
-//
-//   - Single[K, T]: a Codec[T] with a bound pk function pkFor(K) and an
-//     optional entity-ID extractor entityIDOf(T). Use this for the common
-//     "one PK per entity ID" view-store shape.
-//
-// All List methods skip payloads that fail to decode and forward the error
-// to an optional onDecodeError callback. Callers needing strict behavior
-// can fall back to evt.ListJSONViewsByPK / evt.ListJSONViewsByEntityType
-// directly.
+// List methods skip invalid payloads and report them to an optional DecodeErrorHandler. Use
+// evt.ListJSONViewsByPK or evt.ListJSONViewsByEntityType for strict decoding.
 package viewstore
 
 import (

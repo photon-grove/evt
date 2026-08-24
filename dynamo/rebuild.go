@@ -7,27 +7,12 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// RebuildProjectionsByQuery runs a bounded-memory projection rebuild by combining
-// StreamEntitiesByQuery with evt.RebuildProjectionsFromStream.
+// RebuildProjectionsByQuery rebuilds with per-entity queries and bounded in-flight aggregates.
+// HeadSource can enumerate IDs from a heads registry.
 //
-// Unlike evt.RebuildProjections, this path queries one partition at a time and emits each rebuilt
-// entity. Memory is bounded to the enumerated IDs plus opts.Workers in-flight aggregates. Set
-// opts.HeadSource to enumerate IDs from a heads registry instead of a key-only event-log scan.
-//
-// Entity-type filtering: opts.EntityType scopes enumeration and cfg.EntityType is the rebuild's
-// defensive per-entity check, so the two must agree. When opts.EntityType is empty it defaults to
-// cfg.EntityType, so a caller can set the type once in cfg (as with evt.RebuildProjections) and have
-// it scope enumeration too. When both are set and differ, this returns an error rather than silently
-// enumerating one type while the rebuild skips it as the wrong type.
-//
-// The method validates applyEvent and cfg before starting enumeration.
-//
-// This wires the scan-vs-registry choice only. The snapshot-seeded path (cfg.SeedEntity, for streams
-// truncated by CompactBelow) is NOT combinable here: StreamEntitiesByQuery reads each partition with
-// GetEvents and never consults the seeder, so a compacted stream would replay only its surviving
-// events and commit projections built from truncated history. A non-nil cfg.SeedEntity is therefore
-// rejected — use evt.RebuildProjections (which routes through evt.SnapshotStreamer) for compacted
-// streams.
+// opts.EntityType defaults to cfg.EntityType; if both are set, they must match.
+// This path rejects SeedEntity because it cannot safely rebuild compacted streams. Use
+// evt.RebuildProjections for snapshot-seeded replay.
 func (repo *Repository) RebuildProjectionsByQuery(
 	ctx context.Context,
 	opts StreamByQueryOptions,

@@ -1,21 +1,8 @@
-// Package conformance provides a backend-neutral contract test suite for evt.Repository
-// implementations. Run it against any backend — the in-memory repository, the DynamoDB repository,
-// or the PostgreSQL repository — to verify the implementation honors the storage
-// invariants the framework relies on:
+// Package conformance verifies evt.Repository implementations against backend-neutral guarantees:
+// ordering, entity isolation, snapshots, filtering, and optional optimistic concurrency.
 //
-//   - per-entity sequence ordering: GetEvents returns an entity's events in ascending sequence;
-//   - read isolation by entity: GetEvents/GetLatestEvents return only the requested entity;
-//   - snapshot consistency: a written snapshot is read back intact (when supported);
-//   - backend-neutral filtering: StreamAllEvents/StreamEntities honor evt.StreamFilter;
-//   - optimistic concurrency: a duplicate (entityID, sequence) commit is rejected (when supported).
-//
-// Each backend wires the suite from its own test package, supplying a factory that returns a fresh,
-// empty repository and a SuiteOptions describing which optional guarantees it provides. The
-// in-memory backend, for example, is a permissive test double that does not enforce optimistic
-// concurrency, so it leaves that option false.
-//
-// Cases namespace entity IDs and types, so the suite supports backends that share
-// a durable store across subtests.
+// Run the suite with a fresh repository factory and SuiteOptions for optional guarantees. Cases
+// namespace IDs and types so durable backends may share a store across subtests.
 package conformance
 
 import (

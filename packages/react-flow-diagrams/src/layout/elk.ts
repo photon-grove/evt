@@ -171,14 +171,9 @@ export async function runElkLayout(spec: DiagramSpec): Promise<LaidOutGraph> {
     walk(child)
   }
 
-  // Read back ELK's routing. With INCLUDE_CHILDREN, ELK reports each edge's
-  // section/label coordinates relative to the LOWEST container that holds both
-  // endpoints (their common ancestor boundary) — not relative to the root. A
-  // boundary-internal edge (e.g. two children of `backend`) therefore comes back
-  // in backend-local coordinates and must be shifted by backend's absolute
-  // origin, or it renders detached from its nodes. We compute every node's
-  // absolute position, then translate each edge by its endpoints' common-ancestor
-  // offset into root (flow) coordinates — the space React Flow positions nodes in.
+  // With INCLUDE_CHILDREN, ELK reports an edge relative to its endpoints' lowest
+  // common container. Translate it by that container's absolute origin into root
+  // coordinates; otherwise boundary-internal edges render detached.
   const absById = new Map<string, {x: number; y: number}>()
   const computeAbs = (elkNode: ElkNode, ax: number, ay: number): void => {
     absById.set(elkNode.id, {x: ax, y: ay})

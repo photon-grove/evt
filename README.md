@@ -127,14 +127,12 @@ trim them safely:
   snapshot already covers, then rebuilds seed from that snapshot rather than
   replaying from event 1. See
   [ADR 0001](docs/adr/0001-event-compaction-and-snapshot-truncation.md).
-- **Per-type retention** (`dynamo.Repository.WithRetention`) stamps a DynamoDB
-  `ttl` on terminal, short-lived, fully transient streams so the table expires
-  them automatically. Because TTL expires rows individually — it cannot atomically
-  drop a whole stream — each event expires at `committedAt + duration`, so this is
-  safe **only** when a stream's entire lifetime is much shorter than the duration
-  and it is never appended to after going terminal; otherwise an older prefix can
-  expire while newer events survive and a load replays a partial suffix. For
-  streams that accumulate, keep a snapshot and compact instead.
+- **Per-type retention** (`dynamo.Repository.WithRetention`) sets DynamoDB `ttl`
+  to `committedAt + duration` for terminal, short-lived, transient streams. TTL
+  expires rows individually, so use it only when a stream's lifetime is much
+  shorter than the duration and no events are appended after it becomes terminal.
+  Otherwise an older prefix can expire while newer events remain. For accumulating
+  streams, keep a snapshot and compact instead.
 
 The raw `dynamo.Delete` is snapshot-unsafe, for local fixtures only, and excluded
 from production builds (`-tags prod`). See
