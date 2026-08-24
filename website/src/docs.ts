@@ -45,7 +45,7 @@ const DOC_CONFIG: Record<string, DocConfig> = {
   concepts: {
     group: GUIDES,
     order: 2,
-    summary: 'Events, entities, snapshots, projections, and the invariants that keep them honest.',
+    summary: 'Events, entities, snapshots, projections, and framework invariants.',
   },
   projections: {
     group: GUIDES,

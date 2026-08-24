@@ -22,13 +22,9 @@ const ROOT_OPTIONS: Record<string, string> = {
   'elk.spacing.edgeEdge': '12',
   'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
   'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
-  // Route edges orthogonally and KEEP the result: the rendered edges follow
-  // ELK's waypoints (see runElkLayout below), so they bend around nodes instead
-  // of cutting through them. Without consuming these, back/cycle edges wrap all
-  // the way around nodes and the diagram turns into a tangle.
+  // Render edges from ELK's orthogonal waypoints so they avoid nodes.
   'elk.edgeRouting': 'ORTHOGONAL',
-  // Let ELK place edge labels (centered, with breathing room) so they land in
-  // the inter-layer gap rather than colliding on top of the bundled edges.
+  // Place labels in the inter-layer gap instead of on bundled edges.
   'elk.edgeLabels.placement': 'CENTER',
   'elk.spacing.edgeLabel': '6',
   // Bias toward a balanced (less extreme) aspect ratio so wide fan-outs don't

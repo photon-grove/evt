@@ -19,11 +19,8 @@ import {nodeTypes} from './nodes/nodes'
 import {domainColor} from './theme/tokens'
 import type {DiagramNodeData, DiagramSpec} from './types'
 
-// Diagrams load at 100% so every card is legible immediately, anchored to where
-// the flow begins (the left edge for horizontal/swimlane flows, the top for
-// vertical ones). Longer diagrams overflow the viewport and the reader pans /
-// scrolls — or zooms out — with the minimap and controls. The cross axis is
-// centered when the content fits, so short diagrams sit balanced.
+// Start at 100% zoom, aligned to the flow origin. Center the cross axis when the
+// graph fits in the viewport.
 const INITIAL_ZOOM = 1
 const VIEW_PAD = 28
 

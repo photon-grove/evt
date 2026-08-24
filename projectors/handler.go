@@ -17,10 +17,8 @@ type DynamoDBStreamResponse struct {
 // NewLambdaHandler returns a function suitable for lambda.Start() that processes
 // DynamoDB Streams events directly through the provided Runtime.
 //
-// This wires a projector straight to the event-log stream, bypassing the SNS
-// fan-out. Prefer NewSQSHandler (the blessed path) for most projectors; reach
-// for this only for a consumer that should read the stream directly. See the
-// package doc for the trade-off.
+// This wires a projector directly to the event-log stream, bypassing SNS fan-out.
+// Use it when the projector must consume DynamoDB Streams directly.
 func NewLambdaHandler(runtime *Runtime) func(ctx context.Context, event events.DynamoDBEvent) (DynamoDBStreamResponse, error) {
 	return func(ctx context.Context, event events.DynamoDBEvent) (DynamoDBStreamResponse, error) {
 		logger := runtime.Logger()

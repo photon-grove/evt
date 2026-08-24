@@ -29,17 +29,13 @@ type StreamByQueryOptions struct {
 	Skip func(evt.EntityID) bool
 
 	// HeadSource, if set, enumerates entity IDs from a heads registry (one row per entity) instead
-	// of the default key-only event-log scan. Because the registry is already unique, enumeration
-	// streams IDs straight to the workers with no dedup set — constant memory, regardless of entity
-	// count — and is naturally resumable. This is opt-in and requires the heads table to be
-	// populated (maintained by the heads projector and seeded via HeadStore.Backfill); leave it nil
-	// to keep the no-schema-change scan-and-dedup default. The events themselves are still read from
-	// the event log per entity; the registry only supplies the IDs to rebuild.
+	// of the default key-only event-log scan. It streams unique IDs directly to workers without a
+	// deduplication set. Populate the heads table with its projector and HeadStore.Backfill. The event
+	// log still supplies each entity's events.
 	//
-	// Unlike the default path, which collects every ID up front and treats an enumeration failure as
-	// fatal before emitting anything, this path emits entities as it enumerates. A mid-enumeration
-	// failure therefore surfaces as a stream error after some entities were already emitted; because
-	// rebuilds are idempotent, re-run from scratch or resume with Skip.
+	// The default path collects every ID before emitting an entity. HeadSource emits while enumerating,
+	// so an enumeration error can follow emitted entities. Rebuilds are idempotent, so resume with Skip
+	// or rerun the rebuild.
 	HeadSource evt.EntityHeadVisitor
 }
 
@@ -53,12 +49,9 @@ type StreamByQueryOptions struct {
 // during enumeration plus up to Workers in-flight aggregates, rather than the entire event log. It
 // is the preferred source for RebuildProjectionsFromStream on large tables.
 //
-// Note on cost: enumeration is still a table Scan. The ProjectionExpression on pk reduces the data
-// returned, but DynamoDB charges scan read capacity by the size of the items read, not the
-// attributes projected — so enumeration consumes read capacity comparable to scanning the full log
-// and holds the distinct IDs in memory. The win is bounded memory, streaming output, and parallel
-// per-entity queries, not lower read cost. For genuinely cheaper, constant-memory enumeration, set
-// opts.HeadSource to enumerate IDs from a heads registry (one row per entity) instead of this scan.
+// Enumeration still uses a table Scan. Its ProjectionExpression reduces returned data, not read
+// capacity, which DynamoDB charges by item size. Set opts.HeadSource to enumerate IDs from a heads
+// registry without scanning the event log.
 func (repo *Repository) StreamEntitiesByQuery(
 	ctx context.Context,
 	opts StreamByQueryOptions,
@@ -178,7 +171,7 @@ func (repo *Repository) produceEntityIDs(
 
 	// Default: collect the full distinct ID set first. If enumeration fails (a partial scan), return
 	// the error without feeding any IDs — otherwise workers could query and commit a subset while
-	// the caller sees an "ok-ish" result, leaving a silently under-rebuilt projection. This holds
+	// the caller sees a partial rebuild result, leaving a silently under-rebuilt projection. This holds
 	// the same set the scan already deduplicates, so it does not change the memory profile.
 	idList, err := repo.collectEntityIDs(ctx, entityType, skip)
 	if err != nil {

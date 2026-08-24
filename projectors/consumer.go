@@ -66,11 +66,9 @@ func StreamRecordFromEnvelope(body []byte) (StreamRecord, error) {
 	return FromSerializedEvent(event), nil
 }
 
-// NewSQSHandler returns a lambda.Start-compatible handler for the blessed
-// fan-out path: the events topic delivered over SNS->SQS (with raw message
-// delivery), driven through the Runtime. This is the recommended way to run a
-// projector — the publisher is the single DynamoDB Streams consumer, and every
-// projector subscribes to its SNS topic.
+// NewSQSHandler returns a lambda.Start-compatible handler for raw-delivery
+// SNS-to-SQS messages from the events topic. It processes the messages through
+// the Runtime and reports partial batch failures.
 //
 // It reports partial batch failures, so only messages whose events fail to
 // project are redelivered (enable ReportBatchItemFailures on the event source
