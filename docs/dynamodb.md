@@ -1,10 +1,9 @@
 # DynamoDB Integration
 
-The `dynamo` package is the production storage backend. It implements the same
+The `dynamo` package is the DynamoDB storage backend. It implements the same
 [`evt.Repository`](concepts.md#repository) contract as `mem`, so aggregates move
-between them unchanged. This page documents the table shapes it expects, how to
-wire it up, and the operational levers — snapshots, compaction, and retention —
-that keep a growing log healthy.
+between them unchanged. This page documents the required table shapes, wiring, and
+the snapshot, compaction, and retention options for growing logs.
 
 > The key patterns, attribute names, and serialized formats below are a stability
 > contract. Treat changes to them as breaking and document them. See
@@ -77,21 +76,18 @@ live in [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
 
 ### Retention
 
-For **terminal, short-lived, fully transient** streams — scaffolding that drives a
-one-time side effect and is never replayed by a rebuild — a per-entity-type
-retention policy stamps a DynamoDB `ttl` so the table auto-expires those rows:
+For **terminal, short-lived, fully transient** streams that no rebuild replays,
+`WithRetention` stamps a DynamoDB `ttl`:
 
 ```go
 repo := dynamo.NewRepository(client, eventsTable).
     WithRetention(dynamo.Retention{"scratch_job": 24 * time.Hour})
 ```
 
-Only policed types ever carry a `ttl`; durable types are written without one and
-are never expired. **This is dangerous for any stream a rebuild replays:** TTL
-expires items individually, so an older prefix can vanish while newer events
-survive, leaving a partial suffix on load. Use retention only when wipe-and-replay
-does not depend on the events; for streams that accumulate over time, keep a
-snapshot and use [compaction](#compaction) instead.
+Only policed types receive `ttl`; durable types never expire. TTL expires items
+individually, so an older prefix can disappear while newer events remain. Use
+retention only for streams never replayed and never appended after becoming
+terminal. For accumulating streams, keep a snapshot and use [compaction](#compaction).
 
 ## Entity-views table
 

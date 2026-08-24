@@ -88,9 +88,9 @@ function Home() {
             Immutable events as truth. <span className="accent">Views you can rebuild.</span>
           </h1>
           <p className="lede">
-            <strong>evt</strong> is a compact Go framework for event-sourced services: aggregate
-            commands, append-only event logs, snapshots, rebuildable projections, DynamoDB Streams
-            projectors, and publisher helpers — testable from the first line you write.
+            <strong>evt</strong> is a Go framework for event-sourced services with aggregate commands,
+            append-only event logs, snapshots, rebuildable projections, DynamoDB Streams projectors,
+            and publisher helpers.
           </p>
           <div className="install">
             <span className="prompt">$</span>
@@ -114,7 +114,7 @@ function Home() {
       <section className="band intro-band" id="features">
         <div className="section-heading">
           <p className="eyebrow">Framework surface</p>
-          <h2>Everything an event-sourced Go service needs — and nothing it doesn&rsquo;t.</h2>
+          <h2>Components for event-sourced Go services.</h2>
           <p className="section-lead">
             Small, explicit packages with stable contracts. Each capability links to its guide.{' '}
             <a href="#/docs">Browse all documentation →</a>
@@ -130,10 +130,10 @@ function Home() {
       <section className="band split-band" id="start">
         <div className="split-copy">
           <p className="eyebrow">First path</p>
-          <h2>Test in memory, ship to DynamoDB — same model.</h2>
+          <h2>Use the same aggregate model with memory and DynamoDB.</h2>
           <p className="section-sub">
-            Your aggregates never learn which store they run against. Prove behavior with fast
-            in-memory tests, then move production writes over without rewriting domain code.
+            Aggregates use the same contracts with both stores. Test behavior in memory, then use
+            DynamoDB for production writes without rewriting domain code.
           </p>
           <ol className="steps">
             {gettingStarted.map((step) => (
@@ -188,7 +188,7 @@ function Home() {
       <section className="band cookbook-band" id="cookbook">
         <div className="section-heading">
           <p className="eyebrow">Integration cookbook</p>
-          <h2>Patterns worth copying straight into an adopter project.</h2>
+          <h2>Integration patterns.</h2>
         </div>
         <div className="cookbook-grid">
           {cookbook.map((item) => (
@@ -204,7 +204,7 @@ function Home() {
       <section className="band examples-band">
         <div className="section-heading">
           <p className="eyebrow">Run it locally</p>
-          <h2>Concrete entry points for adoption.</h2>
+          <h2>Examples and commands.</h2>
         </div>
         <div className="examples">
           {examples.map((item) => (
@@ -261,7 +261,7 @@ export function App() {
           </nav>
         </div>
         <p className="attribution">
-          Apache-2.0 · Built with care by <a href={photonGroveUrl}>Photon Grove</a>, a Colorado
+          Apache-2.0 · Built by <a href={photonGroveUrl}>Photon Grove</a>, a Colorado
           software studio.
         </p>
       </footer>

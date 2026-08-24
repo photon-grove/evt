@@ -21,9 +21,7 @@ const DOMAIN_TITLES: Record<string, string> = {
 }
 
 /**
- * A compact, self-explaining key. By default it only lists the node kinds,
- * domains, and edge variants actually present in `spec`, so each diagram's
- * legend stays relevant.
+ * Renders the node kinds, domains, and edge variants present in `spec`.
  */
 export function Legend({spec}: {spec?: DiagramSpec}): ReactElement {
   const kinds = new Set<NodeKind>()

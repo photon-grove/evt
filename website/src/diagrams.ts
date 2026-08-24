@@ -6,7 +6,7 @@ export const diagrams: DiagramSpec[] = [
     title: 'Command execution',
     group: 'Core runtime',
     description:
-      'A command is handled by a fresh aggregate, becomes immutable events, and commits under optimistic concurrency.',
+      'An aggregate handles a command, emits immutable events, and commits them with optimistic concurrency.',
     layout: {
       lanes: [
         {id: 'caller', label: 'Caller'},
@@ -57,7 +57,7 @@ export const diagrams: DiagramSpec[] = [
     title: 'Projection rebuild',
     group: 'Operations',
     description:
-      'Rebuilds stream entities, run projectors against final state, and write replacement view rows without treating views as truth.',
+      'A rebuild streams entities, runs projectors against final state, and writes replacement view rows.',
     layout: {
       lanes: [
         {id: 'operator', label: 'Operator'},
@@ -88,7 +88,7 @@ export const diagrams: DiagramSpec[] = [
     title: 'Incremental rebuild',
     group: 'Operations',
     description:
-      'A heads projector keeps one small row per entity (its highest sequence). The rebuild reads that table, not the log, and reprojects only entities whose head moved past their checkpoint — no secondary index, no global counter, no commit-path change.',
+      'A heads projector records each entity’s highest sequence. A rebuild reads the heads table and reprojects entities whose heads exceed their checkpoints.',
     layout: {direction: 'DOWN'},
     nodes: [
       {id: 'topic', kind: 'topic', label: 'events topic', sublabel: 'SNS fan-out', domain: 'queue', icon: 'topic'},

@@ -9,16 +9,9 @@ import (
 // StorageType identifies the backend storage system a Repository uses.
 type StorageType string
 
-// StreamFilter narrows which entities a table-wide stream or projection rebuild visits. It is a
-// backend-neutral description of the filter: each Repository translates it into its own query
-// mechanism (the DynamoDB backend, for example, compiles it into a Scan FilterExpression; a future
-// SQL backend would translate it into a WHERE clause). The zero value imposes no constraint and
-// matches every entity.
-//
-// It deliberately exposes only entity-type filtering — the single predicate the framework's rebuild
-// paths require — so the core Repository contract carries no backend-specific query types. Backends
-// that support richer server-side filtering may offer it through their own extension interface (for
-// example the dynamo package's ExpressionStreamer) without widening this type.
+// StreamFilter is a backend-neutral filter for table-wide streams and rebuilds. Its zero value
+// matches every entity. The core contract supports entity-type filtering only; backends may expose
+// richer filters through extensions.
 type StreamFilter struct {
 	// EntityType, when non-empty, restricts the stream to entities of that type.
 	EntityType EntityType

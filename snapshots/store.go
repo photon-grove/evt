@@ -115,15 +115,11 @@ func (store *Store) LoadEntity(
 	return eventContext, nil
 }
 
-// Commit new Events to the Entity within the given context, with Metadata.
-// If the metadata carries a CommandID that was already seen during event replay,
-// the commit is skipped and a DuplicateCommandError is returned so the caller
-// can treat the retry as an idempotent success.
+// Commit persists result events and snapshots the entity when needed. A previously replayed
+// CommandID returns DuplicateCommandError for idempotent success.
 //
-// Contract: the entity in eventContext must already reflect result.Events before Commit is called.
-// Execute satisfies this (it applies the events, then runs in-band projectors, then commits). When
-// a snapshot is taken, its payload is the entity's current state — events are not re-applied — so a
-// caller that commits without first applying the events would persist a stale snapshot.
+// eventContext.Entity must already reflect result.Events; otherwise a snapshot would be stale.
+// Execute maintains this contract.
 func (store *Store) Commit(
 	ctx context.Context,
 	result evt.CommandResult,
@@ -264,13 +260,8 @@ func (store *Store) ExecuteWithFactory(
 	return evt.ExecuteWithFactory(ctx, store, factory, entityID, command, metadata)
 }
 
-// updateSnapshotWithEvents advances the context's sequence counters and captures the entity's
-// current state as the snapshot payload.
-//
-// The entity must already reflect the committed events before Commit is called (Execute applies
-// result.Events first; direct Commit callers must do the same). The events are therefore NOT
-// re-applied here — re-applying them into an already-updated entity would double-apply additive
-// events and corrupt the snapshot.
+// updateSnapshotWithEvents advances sequence counters and captures current entity state.
+// The entity must already include the events; they are not reapplied to avoid corrupting additive state.
 func (store *Store) updateSnapshotWithEvents(
 	serializedEvents []evt.SerializedEvent,
 	eventContext *evt.Context,

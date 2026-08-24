@@ -7,37 +7,12 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// RebuildProjectionsByQuery runs a bounded-memory projection rebuild: it builds the
-// enumerate-then-query entity stream described by opts and feeds it to
-// evt.RebuildProjectionsFromStream. It is the convenience wrapper for the registry-backed,
-// constant-memory rebuild that StreamByQueryOptions.HeadSource enables — equivalent to wiring
-// StreamEntitiesByQuery and evt.RebuildProjectionsFromStream by hand, so callers no longer
-// hand-assemble the two.
+// RebuildProjectionsByQuery rebuilds with per-entity queries and bounded in-flight aggregates.
+// HeadSource can enumerate IDs from a heads registry.
 //
-// Use it as a drop-in alternative to evt.RebuildProjections for large tables. evt.RebuildProjections
-// stays the scan-based default that buffers the whole log; this path queries one partition at a time
-// and emits each entity as soon as it is rebuilt, bounding memory to the enumerated IDs plus
-// opts.Workers in-flight aggregates. Set opts.HeadSource to enumerate IDs from a heads registry (one
-// row per entity) instead of a key-only event-log scan — the opt-in, constant-memory path — and
-// leave it nil to keep the scan-and-dedup enumeration. The default stays unchanged either way.
-//
-// Entity-type filtering: opts.EntityType scopes enumeration and cfg.EntityType is the rebuild's
-// defensive per-entity check, so the two must agree. When opts.EntityType is empty it defaults to
-// cfg.EntityType, so a caller can set the type once in cfg (as with evt.RebuildProjections) and have
-// it scope enumeration too. When both are set and differ, this returns an error rather than silently
-// enumerating one type while the rebuild skips it as the wrong type.
-//
-// cfg is validated up front — applyEvent, Projectors, and CommitGroup are checked before the stream
-// starts, mirroring evt.RebuildProjections, so an invalid config fails fast without launching the
-// enumeration scan and per-entity queries (which would otherwise consume read capacity and invoke
-// applyEvent after the caller already had an error).
-//
-// This wires the scan-vs-registry choice only. The snapshot-seeded path (cfg.SeedEntity, for streams
-// truncated by CompactBelow) is NOT combinable here: StreamEntitiesByQuery reads each partition with
-// GetEvents and never consults the seeder, so a compacted stream would replay only its surviving
-// events and commit projections built from truncated history. A non-nil cfg.SeedEntity is therefore
-// rejected — use evt.RebuildProjections (which routes through evt.SnapshotStreamer) for compacted
-// streams.
+// opts.EntityType defaults to cfg.EntityType; if both are set, they must match.
+// This path rejects SeedEntity because it cannot safely rebuild compacted streams. Use
+// evt.RebuildProjections for snapshot-seeded replay.
 func (repo *Repository) RebuildProjectionsByQuery(
 	ctx context.Context,
 	opts StreamByQueryOptions,

@@ -1,9 +1,5 @@
-// Hero illustration for the docs site.
-//
-// It draws the core mental model of evt: an append-only event log (a durable
-// snapshot at sk=0 followed by immutable event rows) that projects into a
-// rebuildable read model. Kept deliberately schematic so it reads as a systems
-// diagram, not decoration.
+// Hero diagram: an append-only event log (snapshot at sk=0 plus immutable event rows)
+// projected into a rebuildable read model.
 export function EventLogArt() {
   const cells = [
     {x: 40, label: 'sk 0', kind: 'snapshot'},

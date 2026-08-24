@@ -1,8 +1,7 @@
 # Integration Cookbook
 
-Patterns adopters reach for repeatedly, distilled. Each one is a rule plus the
-reason it exists — copy the rule, keep the reason in mind. They all serve the same
-invariant: **events are the source of truth; everything derived must survive a
+Common integration rules and the constraints behind them. They all follow the
+same invariant: **events are the source of truth, and derived state must survive a
 wipe-and-replay.**
 
 ## Keep fact tables and projection tables separate
@@ -14,25 +13,24 @@ broader write access to a projector. See the [table shapes](dynamodb.md).
 
 ## Rebuild before you patch
 
-If a view is wrong, fix the projector and [rebuild](projections.md) — don't hand-
-edit view rows. A manual edit disappears on the next rebuild and quietly hides the
-fact that an event was missing or a projector was buggy. The rebuild path is the
-real fix; the hand edit is a time bomb.
+If a view is wrong, fix the projector and [rebuild](projections.md). Do not edit
+view rows by hand. A later rebuild removes the edit and can hide a missing event or
+projector defect.
 
 ## Treat command IDs as retry keys
 
 Set `Metadata.CommandID` from an idempotency key, request ID, job ID, or message
 ID, and build it with `evt.WithCommandID(...)`. A duplicate attempt then fails as
 an `evt.DuplicateCommandError` (test with `evt.IsDuplicateCommandErr`) instead of
-appending the same fact twice. This is the cheapest insurance against double
-submits and at-least-once retries.
+appending the same fact twice. This prevents duplicate submissions and
+at-least-once retry duplicates.
 
 ## Upcast historical shapes, always
 
-Never assume a stored payload has the latest struct shape. The moment an event's
-JSON changes, bump its `Version()`, add an [`EventUpcaster`](concepts.md#upcaster),
-and write a fixture test for every historical version. Old rows must keep loading
-forever — there is no migration window for an append-only log.
+Never assume a stored payload has the latest struct shape. When an event's JSON
+changes, bump its `Version()`, add an [`EventUpcaster`](concepts.md#upcaster), and
+write a fixture test for every historical version. Append-only logs have no
+migration window, so old rows must keep loading.
 
 ## Don't persist decisions straight to a view
 

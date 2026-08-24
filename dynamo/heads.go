@@ -123,15 +123,9 @@ func numAttr(item map[string]types.AttributeValue, name string) (int, bool) {
 	return n, true
 }
 
-// HeadStore maintains and reads a heads table: one row per entity (pk = entity ID) recording the
-// highest event sequence observed for that entity. It is the change-detection backing for
-// incremental projection rebuilds, and it is filled the same way every other read model is — by a
-// projector on the event stream — so it adds no work to the commit path.
-//
-//   - As a projectors.Projector it upserts heads from the stream (the SNS->SQS path other
-//     projectors use), monotonically, so re-deliveries and out-of-order events are no-ops.
-//   - As an evt.EntityHeadStreamer it reads the heads back with a cheap scan of the small heads
-//     table instead of the full event log.
+// HeadStore maintains one monotonic event head per entity for incremental rebuilds. A stream
+// projector updates it asynchronously, so it adds no commit-path work and tolerates duplicate or
+// out-of-order delivery. As an evt.EntityHeadStreamer, it scans the heads table instead of the log.
 type HeadStore struct {
 	client         Client
 	headsTable     string
@@ -140,8 +134,8 @@ type HeadStore struct {
 }
 
 // NewHeadStore builds a HeadStore over the given heads table. Reads default to eventually
-// consistent (half the RCU cost): change detection is inherently re-runnable, and a head that
-// lags a beat only defers an entity's reprojection to the next rebuild, never skips it. Derive a
+// consistent (half the RCU cost): a stale read only defers an entity's reprojection to the next
+// rebuild, never skips it. Derive a
 // strongly consistent variant with WithConsistentRead(true) when a read must reflect the latest
 // projector write.
 func NewHeadStore(client Client, headsTable string) *HeadStore {
@@ -251,13 +245,11 @@ func (h *HeadStore) StreamEntityHeads(
 }
 
 // StreamEntityHeadsFunc implements evt.EntityHeadVisitor: it pages the heads table and invokes visit
-// once per row without ever holding more than one page in memory, so a rebuild that enumerates
-// through it has a memory ceiling that does not grow with the entity count. This is what the
-// map-returning StreamEntityHeads cannot offer — the map is O(entities) by construction.
+// once per row while holding at most one page in memory. A rebuild using this method has a memory
+// ceiling independent of entity count. The map returned by StreamEntityHeads is O(entities).
 //
-// Constant memory is sound here because the heads table holds exactly one row per entity: the rows
-// are already unique, so enumeration needs no dedup set (unlike an event-log scan, where a partition
-// key repeats per event), and the paginator resumes naturally from each page's LastEvaluatedKey.
+// The heads table has one row per entity, so enumeration requires no deduplication set and retains
+// only one page at a time.
 // The scan is eventually consistent by default (see NewHeadStore); use WithConsistentRead(true) for
 // a strongly consistent read. entityType, when non-empty, restricts enumeration to that type.
 func (h *HeadStore) StreamEntityHeadsFunc(

@@ -7,21 +7,14 @@ import (
 	"github.com/photon-grove/evt/result"
 )
 
-// ErrCompactionUncovered is returned by a Compactor when a compaction request cannot be
-// proven safe: either the stream has no durable snapshot, or its latest snapshot does not
-// cover the requested sequence. Compaction must never delete an event that is not already
-// captured by a durable snapshot, so the operation is refused rather than risking data loss.
+// ErrCompactionUncovered is returned when no durable snapshot covers the requested range.
+// Compaction must not delete events absent from a durable snapshot.
 var ErrCompactionUncovered = errors.New("compaction refused: no durable snapshot covers the requested range")
 
-// Compactor is an optional capability implemented by Repositories that can truncate an
-// entity's event log below a durable snapshot. It is intentionally NOT part of the core
-// Repository interface so that adding it remains backward compatible for the shared module:
-// callers detect support with a type assertion (repo.(Compactor)).
+// Compactor optionally deletes events covered by a durable snapshot. It remains separate from
+// Repository for compatibility and is detected by type assertion.
 //
-// Compaction forfeits the "replay from sequence 1" property for the affected stream. After a
-// successful CompactBelow, the stream's authoritative starting point is its latest durable
-// snapshot, not its first event. Rebuilds must therefore use a SnapshotStreamer (see
-// RebuildConfig.SeedEntity) rather than assuming events 1..N are present.
+// After CompactBelow, rebuild with SnapshotStreamer and RebuildConfig.SeedEntity, not from sequence 1.
 type Compactor interface {
 	// CompactBelow deletes events for the given entity whose sequence is in the range
 	// [1, throughSequence], but only after verifying that a durable snapshot exists whose

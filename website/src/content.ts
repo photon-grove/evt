@@ -2,9 +2,8 @@ export const repoUrl = 'https://github.com/photon-grove/evt'
 
 export const installCommand = 'go get github.com/photon-grove/evt'
 
-// A single, honest "test today, ship tomorrow" snippet. The aggregate
-// contracts never change between the two stores — only the wiring does.
-export const quickStartCode = `// Start in memory — the same contracts you ship to production.
+// The aggregate contract is the same for the memory and DynamoDB stores.
+export const quickStartCode = `// Start with the in-memory repository.
 repo := mem.NewRepository()
 store := mem.NewStoreFromRepo(repo)
 
@@ -12,7 +11,7 @@ entity := account.NewEntity("acct-1")
 err := store.Execute(ctx, entity, "acct-1",
     &account.Open{InitialBalance: 100}, evt.Metadata{})
 
-// Move writes to DynamoDB without touching your aggregates.
+// Use the same aggregate contract with DynamoDB.
 repo := dynamo.NewRepository(dynamoClient, "event-log")
 store := snapshots.NewStore(repo, 25)`
 
@@ -23,9 +22,8 @@ export interface ContentCard {
   doc?: string
 }
 
-// Capability-focused cards: what the framework does and where to learn it. The
-// "Package reference" list below is the authoritative "what do I import" map, so
-// these stay deliberately package-agnostic.
+// Capability-focused cards link to guides. The package list below identifies the
+// import path for each component.
 export const capabilities: ContentCard[] = [
   {
     title: 'Command execution',
@@ -44,7 +42,7 @@ export const capabilities: ContentCard[] = [
   },
   {
     title: 'Incremental rebuilds',
-    body: 'Track each entity head in a small table to rebuild only what changed, with constant-memory enumeration that does not grow with entity count.',
+    body: 'Track entity heads in a small table to rebuild only what changed with constant-memory enumeration.',
     doc: 'projections',
   },
   {

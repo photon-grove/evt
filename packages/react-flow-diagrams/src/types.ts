@@ -1,9 +1,8 @@
 /**
  * The diagram data contract.
  *
- * This is the schema that diagram *data* files (or an LLM) populate. The
- * package owns the visual system and layout; callers only supply semantic
- * nodes and edges. Keep this stable — it is the public, reusable interface.
+ * Diagram data files supply semantic nodes and edges. The package owns the
+ * visual system and layout. Keep this stable because it is the public interface.
  */
 
 /** Visual category of a node. Drives which component renders it. */

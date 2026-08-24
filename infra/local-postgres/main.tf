@@ -1,6 +1,5 @@
-# PostgreSQL provider configured for a local development server. It connects as the local superuser
-# to provision the application role and the event-log database the integration tests use. It is for
-# local development only and must never target a managed or production instance.
+# Local-only PostgreSQL provider: connects as superuser to provision the integration-test role and
+# event-log database. Never target managed or production instances.
 terraform {
   backend "local" {}
 
@@ -30,9 +29,8 @@ resource "postgresql_role" "app" {
   password = var.app_password
 }
 
-# Event-log database owned by the application role. The Repository owns the tables inside it
-# (postgres.Repository.EnsureSchema applies idempotent CREATE TABLE statements), so no table DDL
-# lives here — the relational schema must stay in lockstep with the Go types that read and write it.
+# Repository-owned EnsureSchema applies table DDL to keep it aligned with Go types; Terraform
+# provisions only the event-log database.
 resource "postgresql_database" "event_log" {
   name  = var.database
   owner = postgresql_role.app.name
