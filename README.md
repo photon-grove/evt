@@ -1,36 +1,32 @@
 # evt
 
-**Event sourcing for Go, without the framework tax.**
+**Event sourcing for Go without a framework runtime.**
 
 [Documentation](https://photon-grove.github.io/evt/) · [Concepts](docs/concepts.md) · [Getting Started](docs/getting-started.md) · [Invariants](BEHAVIORAL_INVARIANTS.md)
 
-`evt` gives you the parts of event sourcing that are genuinely hard to get
-right — append-only logs, optimistic concurrency, snapshots, replayable read
-models, and pluggable persistence (DynamoDB or PostgreSQL) — as small, composable
-Go packages. There is no
-runtime to adopt, no base application to inherit from, and no magic. You wire the
-pieces you need and ignore the rest.
-
-It grew out of patterns we run in production.
+`evt` provides append-only logs, optimistic concurrency, snapshots, replayable
+read models, and DynamoDB or PostgreSQL persistence as small Go packages. There
+is no runtime to adopt or base application to inherit from. Use only the pieces
+your application needs.
 
 ## Why evt
 
 - **Events are the source of truth.** Domain events are immutable facts. Every
   view, projection, and read model is derived state you can delete and rebuild by
   replaying the log.
-- **The same aggregate runs everywhere.** Write your command and event logic once.
-  Test it against an in-memory store in microseconds, then point it at DynamoDB or
-  PostgreSQL in production without touching the aggregate. A backend-neutral
-  conformance suite holds every backend to the same storage contract.
-- **Concurrency and ordering are handled.** Conditional writes protect per-entity
-  sequence ordering. Stable command IDs make retries safe instead of duplicating
+- **The same aggregate runs across backends.** Test command and event logic against
+  an in-memory store, then use DynamoDB or PostgreSQL without changing the
+  aggregate. A backend-neutral conformance suite checks every backend against the
+  same storage contract.
+- **Concurrency and ordering are protected.** Conditional writes preserve
+  per-entity sequence ordering. Stable command IDs prevent retries from duplicating
   facts.
-- **Rebuilds stay cheap as logs grow.** Inline snapshots, versioned upcasters, and
-  snapshot-verified compaction keep replay quick without rewriting history. An
-  optional entity-heads table tracks each entity's latest sequence so you can
-  rebuild only the entities that changed instead of reprocessing the whole log.
-- **Built for AWS-native systems.** A single DynamoDB Streams publisher fans events
-  out over SNS to idempotent, retry-classified projectors — not as an afterthought.
+- **Long logs can be rebuilt efficiently.** Inline snapshots, versioned upcasters,
+  and snapshot-verified compaction limit replay work without rewriting history. An
+  optional entity-heads table tracks each entity's latest sequence so rebuilds can
+  target changed entities.
+- **DynamoDB Streams support.** A publisher fans committed events out over SNS to
+  idempotent projectors with retry classification.
 
 ## Install
 
@@ -83,7 +79,7 @@ store.Execute(ctx, acct, "acct-1", &Deposit{AccountID: "acct-1", Amount: 25}, ev
 fmt.Println(acct.Balance) // 125
 ```
 
-Move the same aggregate to DynamoDB for production — the contract does not change:
+Use the same aggregate with DynamoDB in production:
 
 ```go
 repo := dynamo.NewRepository(dynamoClient, "event-log")
@@ -117,13 +113,12 @@ account, err := evt.ExecuteWithFactory(ctx, store, func() evt.Entity {
 
 All packages live under `github.com/photon-grove/evt`.
 
-## The Core Discipline
+## Core Discipline
 
-One rule holds the design together: **event rows are the source of truth; view
-rows are derived state.** Any projection or view table must be safe to wipe and
-rebuild from the immutable log. Human decisions, external signals, publish flags,
-and review verdicts have to become events before they show up in a view — never
-written straight to a view table with no backing fact.
+**Event rows are the source of truth. View rows are derived state.** Any projection
+or view table must be safe to wipe and rebuild from the immutable log. Record human
+decisions, external signals, publish flags, and review verdicts as events before a
+projector writes them to a view.
 
 Event logs are append-only and retained in full by default. Two opt-in mechanisms
 trim them safely:
@@ -190,4 +185,4 @@ Apache-2.0. See [`LICENSE`](LICENSE).
 
 ---
 
-Built with care by [Photon Grove](https://photon-grove.com), a Colorado software studio.
+Built by [Photon Grove](https://photon-grove.com), a Colorado software studio.

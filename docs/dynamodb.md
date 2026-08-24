@@ -1,10 +1,9 @@
 # DynamoDB Integration
 
-The `dynamo` package is the production storage backend. It implements the same
+The `dynamo` package is the DynamoDB storage backend. It implements the same
 [`evt.Repository`](concepts.md#repository) contract as `mem`, so aggregates move
-between them unchanged. This page documents the table shapes it expects, how to
-wire it up, and the operational levers — snapshots, compaction, and retention —
-that keep a growing log healthy.
+between them unchanged. This page documents the required table shapes, wiring, and
+the snapshot, compaction, and retention options for growing logs.
 
 > The key patterns, attribute names, and serialized formats below are a stability
 > contract. Treat changes to them as breaking and document them. See

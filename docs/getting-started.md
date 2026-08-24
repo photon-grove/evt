@@ -1,8 +1,7 @@
 # Getting Started
 
-This guide takes you from `go get` to a replayable aggregate with passing tests,
-then shows the one-line switch from in-memory storage to DynamoDB. The complete,
-runnable version of everything below lives in
+This guide builds a replayable aggregate, tests it with in-memory storage, and
+then switches it to DynamoDB. The complete runnable example lives in
 [`examples/banking`](https://github.com/photon-grove/evt/tree/main/examples/banking).
 
 ## Install
@@ -173,7 +172,7 @@ recording.
 
 ## 4. Move the same model to DynamoDB
 
-Nothing about the aggregate changes. You swap the store's backing repository:
+The aggregate does not change. Swap the store's backing repository:
 
 ```go
 repo := dynamo.NewRepository(dynamoClient, "evt-local-event-log")

@@ -10,12 +10,12 @@ event log ──DynamoDB Stream──▶ publisher ──▶ SNS topic ──┬
                                                           └──▶ SNS→Lambda ──▶ feeds / webhooks
 ```
 
-The **blessed path is this SNS fan-out.** Exactly one consumer reads the DynamoDB
-Stream — the **publisher** — and republishes each event to an SNS topic. Every
-other consumer subscribes to that topic (usually over SNS→SQS with raw message
-delivery) and runs independently, so the stream keeps a single cheap reader and
-consumers scale and fail in isolation. The `publishers` and `projectors` packages
-are the Lambda runtimes for the two ends of that path; both process **only
+Use SNS fan-out for the standard topology. Exactly one consumer reads the DynamoDB
+Stream, the **publisher**, and republishes each event to an SNS topic. Every other
+consumer subscribes to that topic (usually over SNS→SQS with raw message delivery)
+and runs independently. This keeps a single stream reader while consumers scale
+and fail in isolation. The `publishers` and `projectors` packages are the Lambda
+runtimes for the two ends of that path. Both process **only
 `INSERT` records** — the append of a new event — skipping `MODIFY`/`REMOVE`.
 
 Every consumer follows the same reliability contract: process records
