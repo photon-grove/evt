@@ -57,20 +57,20 @@ through the repository, and the loaded state.
 ### 4. Each implementation runs its own conformance suite
 
 Go's `conformance` package and Rust's `photon_evt::conformance` module check each backend against
-the repository contract. They are not shared code; the fixtures and the live run cover
+the repository contract. They are not shared code. The fixtures and the live run cover
 cross-language agreement.
 
 ## Consequences
 
 - Each language has an API that fits it: Rust uses traits, `async fn`, typed event enums, and
-  `Result` errors; Go keeps its existing packages unchanged.
+  `Result` errors. Go keeps its existing packages unchanged.
 - Neither build depends on the other language's toolchain. Only the compatibility checks need both.
 - Behavior can drift between the implementations, so the fixtures are the guard. Any change to the
   storage format must regenerate the fixtures and pass in both languages, as described in the
   spec's "Changing the Format" section. CI runs the Rust checks when Rust or shared fixture files
   change, and the live cross-language run when the storage format may have changed.
 - Features are ported deliberately, not automatically. The Rust crate covers the event log,
-  snapshots, upcasting, compaction, entity heads, in-band projectors, and the stream envelope;
+  snapshots, upcasting, compaction, entity heads, in-band projectors, and the stream envelope.
   Go-only features (stream publishers, projector runtimes, rebuild tooling) stay Go-only until
   needed.
 - The documented differences (`null` payloads, float formatting, `jsonb` metadata) are tested and

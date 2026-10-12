@@ -53,18 +53,19 @@ Use neutral example names and local emulator values in docs and tests.
 
 Published GitHub releases trigger GoReleaser to build `evt-doctor` artifacts.
 
-Release Please versions the Rust crate separately (`crates/evt`, tags
-`photon-evt-vX.Y.Z`; in 0.x, features bump the patch version and breaking
-changes the minor version). Merging its release pull request runs the
-`publish-crate` job in `release.yml`, which publishes `photon-evt` to crates.io.
-crates.io only allows trusted publishing for crates that already exist, so the
-first release authenticates with a `CARGO_REGISTRY_TOKEN` secret. After that
-release, configure a trusted publisher on crates.io (repository
-`photon-grove/evt`, workflow `release.yml`, environment `crates-io`) and delete
-the secret; later releases authenticate over OIDC.
 Release Please runs on every push to `main`, maintaining a release pull request
 with the next version and changelog. It can also be triggered manually via
 `workflow_dispatch`. Creating that pull request relies on the organization
 setting that allows GitHub Actions to create pull requests; if that is ever
 disabled again, supply a bot or PAT token via a secret (with permission to open
 pull requests) and pass it to the action instead.
+
+Release Please versions the Rust crate separately (`crates/evt`, tags
+`photon-evt-vX.Y.Z`). In 0.x, features bump the patch version and breaking
+changes bump the minor version. Merging its release pull request runs the
+`publish-crate` job in `release.yml`, which publishes `photon-evt` to crates.io.
+crates.io only allows trusted publishing for crates that already exist, so the
+first release authenticates with a `CARGO_REGISTRY_TOKEN` secret. After that
+release, configure a trusted publisher on crates.io (repository
+`photon-grove/evt`, workflow `release.yml`, environment `crates-io`) and delete
+the secret. Later releases authenticate over OIDC.

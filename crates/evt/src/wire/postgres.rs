@@ -1,7 +1,7 @@
 //! The PostgreSQL table layout of the event log, independent of any driver.
 //!
-//! Events live in one table keyed by `(entity_id, sequence)`; snapshots live in a second table
-//! keyed by `entity_id`. `payload` is the raw JSON bytes (`bytea`); `metadata` is `jsonb`, so
+//! Events live in one table keyed by `(entity_id, sequence)`, and snapshots live in a second table
+//! keyed by `entity_id`. `payload` is the raw JSON bytes (`bytea`). `metadata` is `jsonb`, so
 //! PostgreSQL normalizes its whitespace and key order and readers must compare it as JSON.
 
 use crate::error::Error;

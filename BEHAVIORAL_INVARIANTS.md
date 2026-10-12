@@ -446,13 +446,16 @@ services can append to and load the same streams in DynamoDB or PostgreSQL. See
 - **One format, two implementations.** DynamoDB items, PostgreSQL rows, serialized event, snapshot,
   and metadata JSON, SNS envelopes and message attributes, conditional-write expressions, and the
   snapshot policy are identical in both languages, byte for byte except for the differences below.
-- **Fixtures are the contract.** `go test ./internal/compat -run TestFixtures -update` regenerates
+- **Fixtures enforce the contract.** `go test ./internal/compat -run TestFixtures -update` regenerates
   `compat/fixtures/` from the Go implementation. `go test ./...` and `cargo test --workspace` both
   fail when either language drifts from them.
 - **Format changes regenerate fixtures and pass in both languages**, including the live
   cross-language run (`scripts/compat-integration.sh dynamo|postgres`), and keep older stored data
   readable through upcasters.
-- **Documented differences**: a JSON `null` event payload round-trips as `null` in Go and `""` in
-  Rust (stores never write one); floats are not normalized across languages, so cross-language
-  payloads should use integers; PostgreSQL `metadata` is `jsonb` and must be compared as JSON. The
-  duplicate-command window (events after the latest snapshot) is the same in both languages.
+- **Documented differences**:
+  - A JSON `null` event payload round-trips as `null` in Go and `""` in Rust. Stores never write
+    one.
+  - Floats are not normalized across languages, so cross-language payloads should use integers.
+  - PostgreSQL `metadata` is `jsonb` and must be compared as JSON.
+
+  The duplicate-command window (events after the latest snapshot) is the same in both languages.

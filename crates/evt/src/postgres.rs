@@ -1,7 +1,7 @@
 //! A PostgreSQL event log, row-for-row compatible with Go's `postgres.Repository`.
 //!
-//! It uses a [`deadpool_postgres::Pool`]. Call [`PostgresRepository::ensure_schema`] at startup;
-//! it runs the same idempotent DDL as Go's `EnsureSchema`. See [`crate::wire::postgres`] for the
+//! It uses a [`deadpool_postgres::Pool`]. Call [`PostgresRepository::ensure_schema`] at startup.
+//! It runs the same idempotent DDL as Go's `EnsureSchema`. See [`crate::wire::postgres`] for the
 //! table layout.
 
 use std::collections::BTreeMap;

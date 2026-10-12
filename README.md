@@ -28,8 +28,8 @@ your application needs.
 - **DynamoDB Streams support.** A publisher fans committed events out over SNS to
   idempotent projectors with retry classification.
 - **A Rust crate shares the log.** [`photon-evt`](crates/evt) reads and writes the
-  same DynamoDB items, PostgreSQL rows, and stream envelopes, byte for byte, so Go
-  and Rust services can append to the same streams.
+  same DynamoDB items, PostgreSQL rows, and stream envelopes, so Go and Rust
+  services can append to the same streams.
 
 ## Install
 
@@ -122,7 +122,7 @@ The [`photon-evt`](crates/evt) crate is a native Rust implementation of the same
 event log: aggregates, a snapshotting store, upcasters, compaction, in-band
 projectors, and DynamoDB and PostgreSQL repositories. It is not a binding to the Go
 code. The [storage format](docs/spec/storage-format.md) is the contract between the
-two; golden fixtures and a live run where Go and Rust take turns writing the same
+two. Golden fixtures and a live run where Go and Rust take turns writing the same
 streams enforce it (see [`compat/`](compat) and
 [ADR 0003](docs/adr/0003-rust-implementation-and-cross-language-compatibility.md)).
 
@@ -160,7 +160,7 @@ go test ./...
 moon run evt:test
 ```
 
-The Rust toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on first use:
+The Rust toolchain is pinned in `rust-toolchain.toml`, and `rustup` installs it on first use:
 
 ```sh
 cargo test --workspace

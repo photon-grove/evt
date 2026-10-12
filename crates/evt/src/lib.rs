@@ -1,7 +1,7 @@
 //! Event sourcing for Rust, wire-compatible with the Go [`evt`](https://github.com/photon-grove/evt)
 //! framework.
 //!
-//! Aggregates handle commands and fold events; a [`Store`] loads them from a [`Repository`],
+//! Aggregates handle commands and fold events. A [`Store`] loads them from a [`Repository`],
 //! commits new events, and writes snapshots. Events written by this crate and by Go's `evt` are
 //! byte-for-byte interchangeable in DynamoDB, PostgreSQL, and stream envelopes, so services in
 //! either language can share one event log. The `compat/` directory in the repository holds the

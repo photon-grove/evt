@@ -1,6 +1,6 @@
 //! A DynamoDB event log, item-for-item compatible with Go's `dynamo.Repository`.
 //!
-//! Bring your own [`aws_sdk_dynamodb::Client`]; this crate disables the SDK's default HTTP and
+//! Bring your own [`aws_sdk_dynamodb::Client`]. This crate disables the SDK's default HTTP and
 //! runtime features, so enable them in your application (for example by depending on
 //! `aws-config` with its defaults). The table needs a string partition key `pk` and a number sort
 //! key `sk`. See [`crate::wire::dynamo`] for the item layout.

@@ -111,7 +111,7 @@ func (AccountLabeled) EntityType() evt.EntityType { return AccountType }
 func (AccountRenamed) EntityType() evt.EntityType { return AccountType }
 func (AccountClosed) EntityType() evt.EntityType  { return AccountType }
 
-// Events carry no entity ID; the store assigns it when serializing.
+// Events carry no entity ID. The store assigns it when serializing.
 func (AccountOpened) EntityID() evt.EntityID  { return "" }
 func (MoneyDeposited) EntityID() evt.EntityID { return "" }
 func (MoneyWithdrawn) EntityID() evt.EntityID { return "" }
@@ -156,7 +156,7 @@ func (a *Account) Type() evt.EntityType { return AccountType }
 // GetID returns the entity ID.
 func (a *Account) GetID() evt.EntityID { return a.id }
 
-// SetID sets the entity ID; the store calls it after loading.
+// SetID sets the entity ID. The store calls it after loading.
 func (a *Account) SetID(id evt.EntityID) { a.id = id }
 
 // Base returns the base entity fields.

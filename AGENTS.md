@@ -57,7 +57,7 @@
   - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
   - `examples/`: public examples; keep names and scenarios neutral.
   - `crates/evt` (`photon-evt`): the Rust crate. `crates/evt-compat` (unpublished) and
-    `internal/compat` (Go) are the two halves of the compatibility harness; `compat/` holds the
+    `internal/compat` (Go) are the two halves of the compatibility harness. `compat/` holds the
     shared scenarios and generated fixtures.
 - Rust:
   - Keep the core dependency-light (serde, serde_json, thiserror); SDKs stay behind the `dynamodb`

@@ -161,7 +161,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
     /// Applies events to a loaded aggregate and commits them, snapshotting when the commit
     /// reaches the snapshot interval. Consumes `loaded` so a failed commit cannot leave stale
-    /// state in use; on success it returns the updated state and the stored events.
+    /// state in use. On success it returns the updated state and the stored events.
     pub async fn commit(
         &self,
         mut loaded: Loaded<A>,

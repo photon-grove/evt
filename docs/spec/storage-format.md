@@ -6,7 +6,7 @@ stream envelopes, so services in either language can share one event log.
 
 The golden fixtures in [`compat/fixtures/`](../../compat/fixtures) are the executable form of this
 document. The Go implementation generates them, and both test suites check against them. If this
-document and the fixtures disagree, the fixtures are what the code enforces; fix whichever is wrong.
+document and the fixtures disagree, the fixtures are what the code enforces. Fix whichever is wrong.
 See [`compat/README.md`](../../compat/README.md) and
 [ADR 0003](../adr/0003-rust-implementation-and-cross-language-compatibility.md).
 
@@ -120,7 +120,7 @@ Keys, in order: `entityType`, `entityID` (capital `ID`, unlike the event's `enti
 ## DynamoDB
 
 One table holds every stream: a string partition key `pk` and a number sort key `sk`. Events use
-`sk = 1, 2, 3, …`; the entity's single snapshot lives inline at `sk = 0`.
+`sk = 1, 2, 3, …`. The entity's single snapshot lives inline at `sk = 0`.
 
 | Attribute    | Type | Event item                    | Snapshot item (`sk = 0`)        |
 | ------------ | ---- | ----------------------------- | ------------------------------- |
@@ -149,11 +149,18 @@ operations, one put per event, then the snapshot put if the commit takes one.
 | snapshot put in a commit      | `attribute_not_exists(seq) OR (seq = :seq)`, where `:seq` is the new snapshot sequence minus one |
 | snapshot put outside a commit | `attribute_not_exists(eventSeq) OR eventSeq <= :new`, where `:new` is the new `eventSeq`         |
 
-A transaction cancelled with a `ConditionalCheckFailed` reason is an optimistic-concurrency
-conflict: another writer committed the same sequence or moved the snapshot. The caller reloads and
-retries. A cancellation reason of `TransactionConflict` (another transaction writing the same items
-at the same time) is also a conflict. A failed condition on a projector operation is a projector error, not a conflict, so it is
-not retried. A failed out-of-band snapshot condition is not an error; the newer snapshot stays.
+A transaction cancelled with a `ConditionalCheckFailed` reason on an event or snapshot put is an
+optimistic-concurrency conflict: another writer committed the same sequence or moved the snapshot.
+The caller reloads and retries. A failed out-of-band snapshot condition is not an error. The newer
+snapshot stays.
+
+The languages report the other cancellations differently:
+
+| Cancellation                | Go                                    | Rust                            |
+| --------------------------- | ------------------------------------- | ------------------------------- |
+| event or snapshot condition | `dynamo.ErrSnapshotRaceCondition`     | `Error::Conflict`               |
+| projector condition         | the transaction group's `HandleError` | `Error::Projector`, not retried |
+| `TransactionConflict`       | classified as transient               | `Error::Conflict`, retried      |
 
 ### Reads
 
@@ -216,7 +223,7 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
   (`ON CONFLICT (entity_id) DO UPDATE … WHERE EXCLUDED.event_sequence >= evt_snapshots.event_sequence`).
   PostgreSQL does not check the snapshot sequence: a racing writer already fails on the event key.
 - `metadata` is `jsonb`, which normalizes whitespace and key order. Compare it as JSON, not bytes.
-  `payload` is stored byte for byte.
+  `payload` is `bytea` and keeps its exact bytes.
 - Entity heads take `MAX` over event sequences and snapshot event sequences per entity.
 
 ## Stream Envelope
@@ -296,10 +303,10 @@ These differences are deliberate and covered by tests. Keep them documented here
 
 - **`null` payloads.** Go keeps a JSON `null` payload as a nil `[]byte` and re-encodes it as
   `null`; Rust decodes it to empty bytes and writes `""`. Only hand-built JSON can contain a `null`
-  payload; neither store writes one.
+  payload. Neither store writes one.
 - **Floats.** Not normalized across languages, as described under [JSON Encoding](#json-encoding).
 - **Duplicate-command window.** Both languages only see command IDs in events after the latest
-  snapshot. This is shared behavior, listed here because it surprises readers; the `dedupe-window`
+  snapshot. This is shared behavior, listed here because it surprises readers. The `dedupe-window`
   scenario covers it.
 - **PostgreSQL metadata.** Stored as `jsonb`, so its bytes differ from the encoded JSON. Compare it
   as JSON.

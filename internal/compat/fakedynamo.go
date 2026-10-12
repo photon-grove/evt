@@ -346,7 +346,7 @@ func (f *FakeDynamo) BatchWriteItem(
 
 var errUnsupported = errors.New("fake dynamo: operation not supported")
 
-// Scan is not supported; the harness never scans.
+// Scan is not supported. The harness never scans.
 func (f *FakeDynamo) Scan(context.Context, *dynamodb.ScanInput, ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
 	return nil, errUnsupported
 }

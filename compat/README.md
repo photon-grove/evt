@@ -2,7 +2,7 @@
 
 This directory holds the shared inputs and golden outputs that keep the Go `evt` packages and the
 Rust `photon-evt` crate wire-compatible. The contract itself is
-[`docs/spec/storage-format.md`](../docs/spec/storage-format.md); the reasoning is in
+[`docs/spec/storage-format.md`](../docs/spec/storage-format.md), and the reasoning is in
 [ADR 0003](../docs/adr/0003-rust-implementation-and-cross-language-compatibility.md).
 
 | Path                      | Written by   | Contents                                                                                                                          |
@@ -36,13 +36,13 @@ go test ./internal/compat -run TestFixtures -update
 cargo test --workspace
 ```
 
-Review the fixture diff; every changed byte is a format change that existing data and the other
+Review the fixture diff. Every changed byte is a format change that existing data and the other
 language must handle. Then update the Rust side until it passes, add upcasters if stored payloads
 changed, and update the spec.
 
 ## Adding a scenario
 
-1. Add an entry to `scenarios.json`. Steps run in order; `by` is `go` or `rust`. Ops:
+1. Add an entry to `scenarios.json`. Steps run in order, and `by` is `go` or `rust`. Ops:
 
    | `op`            | Fields                                                           | Outcome `result`                                             |
    | --------------- | ---------------------------------------------------------------- | ------------------------------------------------------------ |
@@ -54,4 +54,4 @@ changed, and update the spec.
 2. If the scenario needs a new command or event, add it to both account domains.
 3. Regenerate the fixtures and run both test suites and both live runs.
 
-Use neutral names and local values only; this repository is public.
+Use neutral names and local values only. This repository is public.
