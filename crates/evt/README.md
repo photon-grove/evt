@@ -21,7 +21,7 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
 ## Example
 
 ```rust
-use photon_evt::{Aggregate, MemRepository, Metadata, Store, domain_events};
+use photon_evt::{Aggregate, MemRepository, Metadata, RetryPolicy, Store, domain_events};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,6 +37,7 @@ domain_events! {
     }
 }
 
+#[derive(Clone)]
 pub enum AccountCommand {
     Deposit { amount_cents: i64 },
 }
@@ -89,9 +90,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let duplicate = store.execute("acct-1", again, metadata).await;
     assert!(duplicate.is_err_and(|err| err.is_duplicate_command()));
 
+    // Conflicts and transient backend failures can be retried with backoff.
+    let policy = RetryPolicy::default();
+    let deposit = AccountCommand::Deposit { amount_cents: 100 };
+    let metadata = Metadata::new("us-west-2").with_command_id("cmd-2");
+    let executed = store
+        .execute_with_retry("acct-1", deposit, metadata, &policy, tokio::time::sleep)
+        .await?;
+    assert_eq!(executed.state.aggregate().balance_cents, 350);
+
     Ok(())
 }
 ```
+
+## Events and versions
+
+Each `domain_events!` variant declares its stored type and version. Loading a stored event whose
+version, after upcasting, is not the declared one fails with `PayloadError::VersionMismatch`
+rather than decoding it into the wrong shape. The macro implements `From<Payload>` for each
+variant. Add `no_from` to skip it when two variants share a payload type:
+
+```rust,ignore
+domain_events! {
+    pub enum AccountEvent {
+        Frozen(Empty) => ("account:frozen", 1, no_from),
+        Unfrozen(Empty) => ("account:unfrozen", 1, no_from),
+    }
+}
+```
+
+## Async runtime and sharing
+
+The core crate does not depend on an async runtime. The `dynamodb` and `postgres` features use
+Tokio through the AWS SDK and `tokio-postgres`. `execute_with_retry` takes the sleep function from
+the caller, such as `tokio::time::sleep`.
+
+A `Store` is `Send + Sync` when its repository and services are, so share it with `Arc`. It is
+`Clone` when they are `Clone`. `Repository` uses `async fn` in traits, so it cannot be used as
+`dyn Repository`: pick the backend with a generic parameter, or wrap the backends in an enum.
+
+`Store::execute` is not cancellation safe. If its future is dropped while the commit is in flight,
+the events may or may not have been stored. Reload before deciding what to do, and set a command
+ID so running the command again is safe.
 
 ## DynamoDB
 
@@ -142,6 +182,8 @@ photon_evt::conformance::Suite::new(&my_repository).run().await;
 - Declare payload and aggregate fields in the same order as the Go structs, and use `BTreeMap` for
   maps, so the JSON bytes match.
 - Use `photon_evt::json::to_vec` for any JSON you want byte-identical to Go's `json.Marshal`.
+- Rust refuses to decode an event at a version it does not declare. Go decodes it anyway. Deploy
+  readers before writers when you bump an event version.
 
 The known differences are listed in the
 [storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md#known-differences).

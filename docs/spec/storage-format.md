@@ -167,11 +167,12 @@ snapshot stays.
 
 The languages report the other cancellations differently:
 
-| Cancellation                | Go                                    | Rust                            |
-| --------------------------- | ------------------------------------- | ------------------------------- |
-| event or snapshot condition | `dynamo.ErrSnapshotRaceCondition`     | `Error::Conflict`               |
-| projector condition         | the transaction group's `HandleError` | `Error::Projector`, not retried |
-| `TransactionConflict`       | classified as transient               | `Error::Conflict`, retried      |
+| Cancellation                                         | Go                                    | Rust                            |
+| ---------------------------------------------------- | ------------------------------------- | ------------------------------- |
+| event or snapshot condition                          | `dynamo.ErrSnapshotRaceCondition`     | `Error::Conflict`               |
+| projector condition                                  | the transaction group's `HandleError` | `Error::Projector`, not retried |
+| `TransactionConflict`                                | classified as transient               | `Error::Conflict`, retried      |
+| `ThrottlingError` or `ProvisionedThroughputExceeded` | classified as transient               | `Error::Transient`, retried     |
 
 ### Reads
 
@@ -230,6 +231,8 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
   upsert. Projector statements are Rust-only: Go's `postgres.Repository` ignores projector
   transaction groups. A failed projector statement is a projector error.
 - A unique violation (`23505`) on the event primary key is an optimistic-concurrency conflict.
+  In Rust, a serialization failure (`40001`) or deadlock (`40P01`) is `Error::Transient` and is
+  retried.
 - After the inserts, the commit checks the floor in the same transaction: a snapshot row with
   `event_sequence >= ` the commit's first sequence is a conflict. Checking after the inserts closes
   the race: a concurrent writer can raise the floor past that sequence only by inserting it first.
@@ -316,6 +319,9 @@ These differences are deliberate and covered by tests. Keep them documented here
 - **`null` payloads.** Go keeps a JSON `null` payload as a nil `[]byte` and re-encodes it as
   `null`; Rust decodes it to empty bytes and writes `""`. Only hand-built JSON can contain a `null`
   payload. Neither store writes one.
+- **Event versions.** Rust refuses to decode a stored event whose version, after upcasting, is not
+  the version its type declares (`PayloadError::VersionMismatch`). Go decodes it into the current
+  struct. Deploy readers before writers when an event version changes.
 - **Floats.** Not normalized across languages, as described under [JSON Encoding](#json-encoding).
 - **Duplicate-command window.** Both languages only see command IDs in events after the latest
   snapshot. This is shared behavior, listed here because it surprises readers. The `dedupe-window`
