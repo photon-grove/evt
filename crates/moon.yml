@@ -30,7 +30,9 @@ tasks:
     inputs:
       - '@globs(sources)'
   test:
-    command: cargo test --workspace --features photon-evt/conformance
+    # photon-evt's unit tests include the DynamoDB and PostgreSQL modules, which need their features.
+    # evt-compat stays on default features: its drivers tests need live backends.
+    script: cargo test -p photon-evt --all-features && cargo test -p evt-compat
     inputs:
       - '@globs(sources)'
       - '@globs(compat)'
