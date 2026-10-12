@@ -5,6 +5,7 @@
 //! cargo test -p evt-compat --features drivers --test conformance
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
@@ -185,6 +186,56 @@ async fn dynamo_projector_condition_failure_is_not_a_conflict() {
         "want a projector error, got {err:?}"
     );
     assert!(repository.events(&id).await.unwrap().is_empty());
+}
+
+/// Fails the first commit with a deadlock (`40P01`), the way PostgreSQL aborts a deadlock victim.
+struct DeadlockOnce {
+    raised: AtomicBool,
+}
+
+impl Projector<Ledger, PgStatement> for DeadlockOnce {
+    fn project(
+        &self,
+        _: &EntityId,
+        _: &Ledger,
+        _: &[LedgerEvent],
+    ) -> Result<Vec<PgStatement>, BoxError> {
+        if self.raised.swap(true, Ordering::SeqCst) {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![PgStatement::new(
+            "DO $$ BEGIN RAISE EXCEPTION 'deadlock' USING ERRCODE = '40P01'; END $$",
+            Vec::new(),
+        )])
+    }
+}
+
+#[tokio::test]
+async fn postgres_projector_deadlock_is_retried() {
+    let repository = drivers::postgres().await.expect("connect to PostgreSQL");
+    let store = Store::<Ledger, _>::new(&repository, ()).with_projector(DeadlockOnce {
+        raised: AtomicBool::new(false),
+    });
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = EntityId::new(format!("conf-{nanos}-projector-deadlock"));
+
+    let executed = store
+        .execute_with_retry(
+            &id,
+            Add(1),
+            Metadata::new("local"),
+            &RetryPolicy::immediate(2),
+            |_| async {},
+        )
+        .await
+        .expect("the retry succeeds after the deadlock");
+
+    assert_eq!(executed.state.sequence().get(), 1);
+    assert_eq!(repository.events(&id).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

@@ -174,6 +174,10 @@ The languages report the other cancellations differently:
 | `TransactionConflict`                                | classified as transient               | `Error::Conflict`, retried      |
 | `ThrottlingError` or `ProvisionedThroughputExceeded` | classified as transient               | `Error::Transient`, retried     |
 
+In Rust, a commit that times out, loses its response, or fails with an internal server error is
+`Error::Backend`, not retried: the transaction may have been applied, and running the command again
+could write its events twice. Reload the entity to find out.
+
 ### Reads
 
 - Events: query `pk = :id AND sk > :after`, ascending, skipping `sk = 0`. Reads are strongly
@@ -231,8 +235,8 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
   upsert. Projector statements are Rust-only: Go's `postgres.Repository` ignores projector
   transaction groups. A failed projector statement is a projector error.
 - A unique violation (`23505`) on the event primary key is an optimistic-concurrency conflict.
-  In Rust, a serialization failure (`40001`) or deadlock (`40P01`) is `Error::Transient` and is
-  retried.
+  In Rust, a serialization failure (`40001`) or deadlock (`40P01`), including one raised by a
+  projector statement, is `Error::Transient` and is retried.
 - After the inserts, the commit checks the floor in the same transaction: a snapshot row with
   `event_sequence >= ` the commit's first sequence is a conflict. Checking after the inserts closes
   the race: a concurrent writer can raise the floor past that sequence only by inserting it first.

@@ -235,9 +235,13 @@ impl Repository for PostgresRepository {
                 .iter()
                 .map(|param| param.as_ref() as &(dyn ToSql + Sync))
                 .collect();
-            tx.execute(&statement.sql, &params)
-                .await
-                .map_err(|err| Error::Projector(Box::new(err)))?;
+            tx.execute(&statement.sql, &params).await.map_err(|err| {
+                if transient(&err) {
+                    Error::Transient(Box::new(err))
+                } else {
+                    Error::Projector(Box::new(err))
+                }
+            })?;
         }
 
         let insert = format!(
@@ -413,12 +417,15 @@ fn classify(entity_id: &EntityId, err: tokio_postgres::Error) -> Error {
             entity_id: entity_id.clone(),
             message: err.to_string(),
         },
-        Some(code)
-            if *code == SqlState::T_R_SERIALIZATION_FAILURE
-                || *code == SqlState::T_R_DEADLOCK_DETECTED =>
-        {
-            Error::Transient(Box::new(err))
-        }
+        _ if transient(&err) => Error::Transient(Box::new(err)),
         _ => Error::backend(err),
     }
+}
+
+/// Reports whether PostgreSQL rolled the transaction back for a reason a retry may not hit again:
+/// a serialization failure or a deadlock.
+fn transient(err: &tokio_postgres::Error) -> bool {
+    err.code().is_some_and(|code| {
+        *code == SqlState::T_R_SERIALIZATION_FAILURE || *code == SqlState::T_R_DEADLOCK_DETECTED
+    })
 }
