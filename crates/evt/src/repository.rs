@@ -10,6 +10,7 @@ use crate::ids::{EntityId, EntityType, EventSequence};
 
 /// A snapshot to write with a commit. Its event sequence is the last event in the commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NewSnapshot {
     /// The aggregate type.
     pub entity_type: EntityType,
@@ -19,8 +20,25 @@ pub struct NewSnapshot {
     pub payload: Vec<u8>,
 }
 
-/// Everything a repository writes atomically for one command.
+impl NewSnapshot {
+    /// Creates a snapshot to write with a commit.
+    pub fn new(
+        entity_type: impl Into<EntityType>,
+        sequence: EventSequence,
+        payload: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            entity_type: entity_type.into(),
+            sequence,
+            payload: payload.into(),
+        }
+    }
+}
+
+/// Everything a repository writes atomically for one command. A commit with no events is a
+/// no-op: repositories ignore its snapshot and operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Commit<Op> {
     /// The entity whose stream is appended to.
     pub entity_id: EntityId,
@@ -30,6 +48,32 @@ pub struct Commit<Op> {
     pub snapshot: Option<NewSnapshot>,
     /// Extra backend operations from in-band projectors. Written first, in order.
     pub operations: Vec<Op>,
+}
+
+impl<Op> Commit<Op> {
+    /// Creates a commit of events with no snapshot and no operations.
+    pub fn new(entity_id: impl Into<EntityId>, events: Vec<SerializedEvent>) -> Self {
+        Self {
+            entity_id: entity_id.into(),
+            events,
+            snapshot: None,
+            operations: Vec::new(),
+        }
+    }
+
+    /// Writes a snapshot with the events.
+    #[must_use]
+    pub fn with_snapshot(mut self, snapshot: NewSnapshot) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Adds backend operations, written before the events in the same transaction.
+    #[must_use]
+    pub fn with_operations(mut self, operations: impl IntoIterator<Item = Op>) -> Self {
+        self.operations.extend(operations);
+        self
+    }
 }
 
 /// An append-only event log with one optional snapshot per entity.

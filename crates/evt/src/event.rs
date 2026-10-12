@@ -100,10 +100,23 @@ impl SerializedSnapshot {
 
 /// Why a stored payload could not be turned into a typed event.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PayloadError {
     /// No variant is registered for the event type.
     #[error("unknown event type: {0}")]
     UnknownType(String),
+
+    /// The stored version, after upcasting, is not the version the event type declares. Either an
+    /// upcaster is missing, or a newer writer stored a version this code does not know yet.
+    #[error("{event_type} is stored at v{stored}, but this code reads v{expected}")]
+    VersionMismatch {
+        /// The stored event type.
+        event_type: String,
+        /// The stored (or upcast) version.
+        stored: EventVersion,
+        /// The version the event type declares.
+        expected: EventVersion,
+    },
 
     /// The payload did not match the variant's shape.
     #[error(transparent)]
@@ -137,8 +150,12 @@ pub trait DomainEvent: Sized + Send + Sync + 'static {
 
 /// Declares a domain event enum and implements [`DomainEvent`] for it.
 ///
-/// Each variant wraps a payload struct and names its stored event type and schema version. The
-/// macro also implements `From<Payload>` for each variant.
+/// Each variant wraps a payload struct and names its stored event type and schema version.
+/// Decoding fails with [`PayloadError::VersionMismatch`] when a stored event, after upcasting, is
+/// not at the declared version.
+///
+/// The macro implements `From<Payload>` for each variant. Mark a variant `no_from` to skip it, for
+/// example when two variants share a payload type.
 ///
 /// ```
 /// use serde::{Deserialize, Serialize};
@@ -154,19 +171,27 @@ pub trait DomainEvent: Sized + Send + Sync + 'static {
 ///     pub amount_cents: i64,
 /// }
 ///
+/// #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// pub struct Empty {}
+///
 /// photon_evt::domain_events! {
 ///     #[derive(Clone, Debug, PartialEq)]
 ///     pub enum AccountEvent {
 ///         Opened(Opened) => ("account:opened", 1),
-///         Deposited(Deposited) => ("account:deposited", 1),
+///         Deposited(Deposited) => ("account:deposited", 2),
+///         Frozen(Empty) => ("account:frozen", 1, no_from),
+///         Unfrozen(Empty) => ("account:unfrozen", 1, no_from),
 ///     }
 /// }
 ///
-/// use photon_evt::DomainEvent;
+/// use photon_evt::{DomainEvent, EventVersion, PayloadError};
 ///
 /// let event = AccountEvent::from(Deposited { amount_cents: 250 });
 /// assert_eq!(event.event_type(), "account:deposited");
 /// assert_eq!(event.to_payload().unwrap(), br#"{"amountCents":250}"#);
+///
+/// let stale = AccountEvent::from_payload("account:deposited", EventVersion(1), b"{}");
+/// assert!(matches!(stale, Err(PayloadError::VersionMismatch { .. })));
 /// ```
 #[macro_export]
 macro_rules! domain_events {
@@ -175,7 +200,7 @@ macro_rules! domain_events {
         $vis:vis enum $name:ident {
             $(
                 $(#[$variant_meta:meta])*
-                $variant:ident($payload:ty) => ($event_type:literal, $version:literal)
+                $variant:ident($payload:ty) => ($event_type:literal, $version:literal $(, $flag:ident)?)
             ),+ $(,)?
         }
     ) => {
@@ -208,9 +233,22 @@ macro_rules! domain_events {
 
             fn from_payload(
                 event_type: &str,
-                _version: $crate::EventVersion,
+                version: $crate::EventVersion,
                 payload: &[u8],
             ) -> ::std::result::Result<Self, $crate::PayloadError> {
+                let expected = match event_type {
+                    $($event_type => $crate::EventVersion($version),)+
+                    other => return Err($crate::PayloadError::UnknownType(other.to_owned())),
+                };
+
+                if version != expected {
+                    return Err($crate::PayloadError::VersionMismatch {
+                        event_type: event_type.to_owned(),
+                        stored: version,
+                        expected,
+                    });
+                }
+
                 match event_type {
                     $($event_type => Ok(Self::$variant($crate::__private::serde_json::from_slice(payload)?)),)+
                     other => Err($crate::PayloadError::UnknownType(other.to_owned())),
@@ -218,12 +256,28 @@ macro_rules! domain_events {
             }
         }
 
-        $(
-            impl ::std::convert::From<$payload> for $name {
-                fn from(payload: $payload) -> Self {
-                    Self::$variant(payload)
-                }
+        $($crate::__domain_event_from!($name, $variant, $payload $(, $flag)?);)+
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __domain_event_from {
+    ($name:ident, $variant:ident, $payload:ty) => {
+        impl ::std::convert::From<$payload> for $name {
+            fn from(payload: $payload) -> Self {
+                Self::$variant(payload)
             }
-        )+
+        }
+    };
+    ($name:ident, $variant:ident, $payload:ty, no_from) => {};
+    ($name:ident, $variant:ident, $payload:ty, $flag:ident) => {
+        ::std::compile_error!(::std::concat!(
+            "unknown domain_events! flag `",
+            ::std::stringify!($flag),
+            "` on ",
+            ::std::stringify!($variant),
+            "; the only flag is `no_from`"
+        ));
     };
 }

@@ -80,10 +80,11 @@ impl PostgresRepository {
 
     /// Uses other table names, so several logical event logs can share a database. Names must be
     /// plain SQL identifiers.
+    #[must_use = "with_tables returns the reconfigured repository"]
     pub fn with_tables(mut self, events_table: &str, snapshots_table: &str) -> Result<Self, Error> {
         for name in [events_table, snapshots_table] {
             if !is_valid_identifier(name) {
-                return Err(Error::backend(format!(
+                return Err(Error::InvalidConfig(format!(
                     "postgres: invalid table name {name:?}"
                 )));
             }
@@ -407,12 +408,17 @@ impl Repository for PostgresRepository {
 }
 
 fn classify(entity_id: &EntityId, err: tokio_postgres::Error) -> Error {
-    if err.code() == Some(&SqlState::UNIQUE_VIOLATION) {
-        return Error::Conflict {
+    match err.code() {
+        Some(code) if *code == SqlState::UNIQUE_VIOLATION => Error::Conflict {
             entity_id: entity_id.clone(),
             message: err.to_string(),
-        };
+        },
+        Some(code)
+            if *code == SqlState::T_R_SERIALIZATION_FAILURE
+                || *code == SqlState::T_R_DEADLOCK_DETECTED =>
+        {
+            Error::Transient(Box::new(err))
+        }
+        _ => Error::backend(err),
     }
-
-    Error::backend(err)
 }

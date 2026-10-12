@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::config::AsyncSleep;
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
@@ -29,7 +30,9 @@ use crate::wire::dynamo::{self as wire, AttributeValue, Item};
 pub const MAX_TRANSACTION_ITEMS: usize = 100;
 
 const BATCH_DELETE_SIZE: usize = 25;
-const MAX_UNPROCESSED_RETRIES: usize = 8;
+const MAX_UNPROCESSED_RETRIES: u32 = 8;
+const UNPROCESSED_BASE_DELAY: Duration = Duration::from_millis(50);
+const UNPROCESSED_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// A DynamoDB-backed [`Repository`]. Clones share the client.
 #[derive(Clone, Debug)]
@@ -52,6 +55,7 @@ impl DynamoRepository {
     }
 
     /// Uses eventually consistent reads (half the read cost) when `false`.
+    #[must_use]
     pub fn with_consistent_read(mut self, consistent: bool) -> Self {
         self.consistent_read = consistent;
         self
@@ -60,6 +64,7 @@ impl DynamoRepository {
     /// Stamps a `ttl` attribute on events and snapshots of `entity_type`, expiring them after
     /// `duration`. Only for short-lived streams that are never rebuilt: DynamoDB TTL deletes items
     /// independently and can leave gaps. Prefer snapshots plus compaction for retained history.
+    #[must_use]
     pub fn with_retention(
         mut self,
         entity_type: impl Into<EntityType>,
@@ -109,7 +114,7 @@ impl DynamoRepository {
                 .set_exclusive_start_key(start)
                 .send()
                 .await
-                .map_err(Error::backend)?;
+                .map_err(sdk_error)?;
 
             items.extend(page.items().iter().map(from_sdk_item));
 
@@ -135,7 +140,7 @@ impl DynamoRepository {
             .limit(1)
             .send()
             .await
-            .map_err(Error::backend)?;
+            .map_err(sdk_error)?;
 
         let Some(item) = page.items().first() else {
             return Ok(EventSequence::ZERO);
@@ -166,7 +171,7 @@ impl DynamoRepository {
                 .set_exclusive_start_key(start)
                 .send()
                 .await
-                .map_err(Error::backend)?;
+                .map_err(sdk_error)?;
 
             for item in page.items() {
                 let item = from_sdk_item(item);
@@ -204,7 +209,7 @@ impl DynamoRepository {
                 .set_exclusive_start_key(start)
                 .send()
                 .await
-                .map_err(Error::backend)?;
+                .map_err(sdk_error)?;
 
             for item in page.items() {
                 if let (Some(pk), Some(sk)) = (item.get("pk"), item.get("sk")) {
@@ -219,6 +224,15 @@ impl DynamoRepository {
                 Some(key) if !key.is_empty() => start = Some(key),
                 _ => return Ok(keys),
             }
+        }
+    }
+
+    /// Waits before retrying unprocessed items, using the SDK's sleep implementation so the crate
+    /// stays runtime-agnostic. Without one configured, it retries immediately.
+    async fn back_off(&self, attempt: u32) {
+        if let Some(sleep) = self.client.config().sleep_impl() {
+            let delay = UNPROCESSED_BASE_DELAY.saturating_mul(2u32.saturating_pow(attempt));
+            sleep.sleep(delay.min(UNPROCESSED_MAX_DELAY)).await;
         }
     }
 
@@ -249,7 +263,7 @@ impl DynamoRepository {
                     .request_items(&self.table, pending.clone())
                     .send()
                     .await
-                    .map_err(Error::backend)?;
+                    .map_err(sdk_error)?;
 
                 pending = output
                     .unprocessed_items
@@ -260,11 +274,16 @@ impl DynamoRepository {
                     break;
                 }
                 if attempt >= MAX_UNPROCESSED_RETRIES {
-                    return Err(Error::backend(format!(
-                        "compaction: {} items still unprocessed after {MAX_UNPROCESSED_RETRIES} retries",
-                        pending.len()
-                    )));
+                    return Err(Error::Transient(
+                        format!(
+                            "compaction: {} items still unprocessed after {MAX_UNPROCESSED_RETRIES} retries",
+                            pending.len()
+                        )
+                        .into(),
+                    ));
                 }
+
+                self.back_off(attempt).await;
             }
 
             deleted += total;
@@ -354,7 +373,7 @@ impl Repository for DynamoRepository {
             .key("sk", n(wire::SNAPSHOT_SORT_KEY))
             .send()
             .await
-            .map_err(Error::backend)?;
+            .map_err(sdk_error)?;
 
         match output.item {
             Some(item) if !item.is_empty() => {
@@ -384,7 +403,7 @@ impl Repository for DynamoRepository {
             {
                 Ok(false)
             }
-            Err(err) => Err(Error::backend(err)),
+            Err(err) => Err(sdk_error(err)),
         }
     }
 
@@ -439,7 +458,7 @@ impl Repository for DynamoRepository {
                     .expression_attribute_values(":et", s(entity_type.as_str()));
             }
 
-            let page = scan.send().await.map_err(Error::backend)?;
+            let page = scan.send().await.map_err(sdk_error)?;
 
             for item in page.items() {
                 let Some(sdk::AttributeValue::S(pk)) = item.get("pk") else {
@@ -547,6 +566,8 @@ enum Cancellation {
     ProjectorCondition,
     /// Another transaction was writing the same items at the same time.
     TransactionConflict,
+    /// DynamoDB throttled the transaction.
+    Throttled,
 }
 
 /// Classifies cancellation reason codes, which are in transaction order: the first `operations`
@@ -563,6 +584,11 @@ fn classify_cancellation(operations: usize, codes: &[Option<&str>]) -> Option<Ca
     if failed("TransactionConflict").next().is_some() {
         return Some(Cancellation::TransactionConflict);
     }
+    if failed("ThrottlingError").next().is_some()
+        || failed("ProvisionedThroughputExceeded").next().is_some()
+    {
+        return Some(Cancellation::Throttled);
+    }
 
     None
 }
@@ -577,8 +603,8 @@ fn failed_items<'a>(codes: &'a [Option<&str>], code: &'a str) -> impl Iterator<I
 }
 
 /// Maps a failed commit to an error. A failed stream condition or a concurrent transaction is an
-/// optimistic-concurrency conflict, which `execute_with_retry` retries. A failed projector
-/// condition is a projector error, so the command is not rerun for it.
+/// optimistic-concurrency conflict, and throttling is transient: `execute_with_retry` retries
+/// both. A failed projector condition is a projector error, so the command is not rerun for it.
 fn classify_transaction_error<R>(
     entity_id: &EntityId,
     operations: usize,
@@ -612,7 +638,38 @@ where
             conflict("transaction conflict: another writer was committing at the same time")
         }
         Some(Cancellation::ProjectorCondition) => Error::Projector(Box::new(err)),
-        None => Error::backend(err),
+        Some(Cancellation::Throttled) => Error::Transient(Box::new(err)),
+        None => sdk_error(err),
+    }
+}
+
+/// Maps an SDK error, marking failures that may succeed on retry as [`Error::Transient`]: timeouts,
+/// dispatch failures, throttling, and internal server errors. The SDK has already retried these
+/// with its own retry policy by the time they reach here.
+fn sdk_error<E, R>(err: SdkError<E, R>) -> Error
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+    R: std::fmt::Debug + Send + Sync + 'static,
+{
+    let transient = match &err {
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => true,
+        SdkError::ServiceError(service) => matches!(
+            service.err().code(),
+            Some(
+                "ThrottlingException"
+                    | "ProvisionedThroughputExceededException"
+                    | "RequestLimitExceeded"
+                    | "TransactionInProgressException"
+                    | "InternalServerError"
+            )
+        ),
+        _ => false,
+    };
+
+    if transient {
+        Error::Transient(Box::new(err))
+    } else {
+        Error::backend(err)
     }
 }
 
@@ -721,6 +778,10 @@ mod tests {
             (
                 vec![CONFLICT, NONE],
                 Some(Cancellation::TransactionConflict),
+            ),
+            (
+                vec![NONE, Some("ThrottlingError")],
+                Some(Cancellation::Throttled),
             ),
             (vec![NONE, Some("ValidationError")], None),
             (vec![], None),

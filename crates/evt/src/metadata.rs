@@ -14,6 +14,7 @@ use crate::json::null_default;
 /// Readers are lenient the way Go is: missing fields and `null` decode to their empty values and
 /// unknown fields are ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Metadata {
     /// The command that produced the event. Used to reject duplicate commands on replay.
     #[serde(rename = "commandId", default)]
@@ -42,6 +43,7 @@ pub struct Metadata {
 
 /// The system (`source`) and entry point (`endpoint`) that initiated a command.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Origin {
     /// The initiating system.
     #[serde(default, deserialize_with = "null_default")]
@@ -73,18 +75,21 @@ impl Metadata {
     }
 
     /// Sets the command ID used for duplicate-command detection.
+    #[must_use]
     pub fn with_command_id(mut self, command_id: impl Into<CommandId>) -> Self {
         self.command_id = Some(command_id.into());
         self
     }
 
     /// Sets the origin.
+    #[must_use]
     pub fn with_origin(mut self, source: impl Into<String>, endpoint: impl Into<String>) -> Self {
         self.origin = Some(Origin::new(source, endpoint));
         self
     }
 
     /// Sets the address. An empty address clears it, matching Go's `evt.WithAddress`.
+    #[must_use]
     pub fn with_address(mut self, address: impl Into<String>) -> Self {
         let address = address.into();
         self.address = (!address.is_empty()).then_some(address);
@@ -92,6 +97,7 @@ impl Metadata {
     }
 
     /// Sets the trace-context carrier.
+    #[must_use]
     pub fn with_trace<I, K, V>(mut self, carrier: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -108,6 +114,7 @@ impl Metadata {
     }
 
     /// Overrides the timestamp. Useful for deterministic tests and imports.
+    #[must_use]
     pub fn with_timestamp(mut self, timestamp: impl Into<String>) -> Self {
         self.timestamp = timestamp.into();
         self

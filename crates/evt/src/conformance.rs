@@ -24,7 +24,7 @@ use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,7 @@ use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::metadata::Metadata;
 use crate::repository::{Commit, NewSnapshot, Repository};
+use crate::retry::RetryPolicy;
 use crate::store::Store;
 
 /// The aggregate the [`Store`] cases use: a running total of positive amounts.
@@ -879,6 +880,8 @@ impl<R: Repository> Repository for Interfering<'_, R> {
     }
 }
 
+async fn no_sleep(_: Duration) {}
+
 async fn store_retry<R: Repository>(repo: &R) -> CaseResult {
     let interfering = |inner| Interfering {
         inner,
@@ -887,7 +890,15 @@ async fn store_retry<R: Repository>(repo: &R) -> CaseResult {
 
     let store = Store::<Ledger, _>::new(interfering(repo), ()).with_snapshot_interval(0);
     let id = ledger_id();
-    let executed = store.execute_with_retry(&id, Add(5), metadata(), 2).await?;
+    let executed = store
+        .execute_with_retry(
+            &id,
+            Add(5),
+            metadata(),
+            &RetryPolicy::immediate(2),
+            no_sleep,
+        )
+        .await?;
     ensure_eq!(
         (executed.state.aggregate().total, executed.state.sequence()),
         (105, EventSequence(2)),
@@ -896,7 +907,13 @@ async fn store_retry<R: Repository>(repo: &R) -> CaseResult {
 
     let store = Store::<Ledger, _>::new(interfering(repo), ()).with_snapshot_interval(0);
     let result = store
-        .execute_with_retry(&ledger_id(), Add(5), metadata(), 1)
+        .execute_with_retry(
+            &ledger_id(),
+            Add(5),
+            metadata(),
+            &RetryPolicy::immediate(1),
+            no_sleep,
+        )
         .await;
     ensure!(
         result.as_ref().is_err_and(|err| err.is_conflict()),

@@ -1,6 +1,10 @@
 //! The [`Store`]: load aggregates, handle commands, and commit events with snapshots.
 
 use std::collections::HashSet;
+use std::fmt;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::aggregate::{Aggregate, Projector};
 use crate::error::{Error, ExecuteError, ReplayPhase};
@@ -9,6 +13,7 @@ use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
 use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
+use crate::retry::RetryPolicy;
 use crate::upcast::upcast_event;
 
 /// The default number of events between snapshots, matching the Go backends' defaults.
@@ -16,11 +21,42 @@ pub const DEFAULT_SNAPSHOT_INTERVAL: usize = 5;
 
 /// Loads aggregates of type `A` from a repository, handles commands, and commits the resulting
 /// events, writing a snapshot every [`snapshot interval`](Store::with_snapshot_interval) events.
+///
+/// A store is `Send + Sync` when its repository and services are, so it can be shared across
+/// tasks behind an `Arc`. It is `Clone` when the repository and services are `Clone`; projectors
+/// are shared between clones.
 pub struct Store<A: Aggregate, R: Repository> {
     repository: R,
     services: A::Services,
     snapshot_interval: usize,
-    projectors: Vec<Box<dyn Projector<A, R::Operation>>>,
+    projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
+}
+
+impl<A, R> Clone for Store<A, R>
+where
+    A: Aggregate,
+    A::Services: Clone,
+    R: Repository + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            repository: self.repository.clone(),
+            services: self.services.clone(),
+            snapshot_interval: self.snapshot_interval,
+            projectors: self.projectors.clone(),
+        }
+    }
+}
+
+impl<A: Aggregate, R: Repository + fmt::Debug> fmt::Debug for Store<A, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Store")
+            .field("aggregate", &A::TYPE)
+            .field("repository", &self.repository)
+            .field("snapshot_interval", &self.snapshot_interval)
+            .field("projectors", &self.projectors.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<A: Aggregate, R: Repository> Store<A, R> {
@@ -35,14 +71,16 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     }
 
     /// Sets the number of events between snapshots. 0 disables snapshots.
+    #[must_use]
     pub fn with_snapshot_interval(mut self, interval: usize) -> Self {
         self.snapshot_interval = interval;
         self
     }
 
     /// Adds an in-band projector whose operations commit atomically with each command's events.
+    #[must_use]
     pub fn with_projector(mut self, projector: impl Projector<A, R::Operation> + 'static) -> Self {
-        self.projectors.push(Box::new(projector));
+        self.projectors.push(Arc::new(projector));
         self
     }
 
@@ -108,6 +146,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     ///
     /// When `metadata` carries a command ID already recorded by an event replayed since the
     /// latest snapshot, it returns [`Error::DuplicateCommand`] without calling the handler.
+    ///
+    /// # Cancellation
+    ///
+    /// Not cancellation safe. If the future is dropped while the commit is in flight, the events
+    /// may or may not have been stored. Reload the entity before deciding what to do; a command ID
+    /// in `metadata` makes running it again safe.
     pub async fn execute(
         &self,
         entity_id: impl Into<EntityId>,
@@ -133,27 +177,35 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         Ok(Executed { state, events })
     }
 
-    /// Like [`execute`](Store::execute), but reloads and re-handles the command after an
-    /// optimistic-concurrency conflict, up to `max_attempts` attempts in total.
-    pub async fn execute_with_retry(
+    /// Like [`execute`](Store::execute), but reloads and re-handles the command after a
+    /// [retryable](Error::is_retryable) error (a conflict or a transient backend failure), waiting
+    /// [`RetryPolicy::delay`] between attempts with `sleep`, such as `tokio::time::sleep`.
+    pub async fn execute_with_retry<S, F>(
         &self,
         entity_id: impl Into<EntityId>,
         command: A::Command,
         metadata: Metadata,
-        max_attempts: usize,
+        policy: &RetryPolicy,
+        sleep: S,
     ) -> Result<Executed<A>, ExecuteError<A::Error>>
     where
         A::Command: Clone,
+        S: Fn(Duration) -> F + Send,
+        F: Future<Output = ()> + Send,
     {
         let entity_id = entity_id.into();
-        let mut attempt = 1;
+        let max_attempts = policy.max_attempts.max(1);
+        let mut retry = 0;
 
         loop {
             match self
                 .execute(entity_id.clone(), command.clone(), metadata.clone())
                 .await
             {
-                Err(err) if err.is_conflict() && attempt < max_attempts => attempt += 1,
+                Err(err) if err.is_retryable() && retry + 1 < max_attempts => {
+                    sleep(policy.delay(retry)).await;
+                    retry += 1;
+                }
                 result => return result,
             }
         }
@@ -326,6 +378,7 @@ impl<A: Aggregate> Loaded<A> {
 
 /// The result of a successful [`Store::execute`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Executed<A> {
     /// The aggregate state after the new events.
     pub state: Loaded<A>,

@@ -84,6 +84,15 @@ pub enum Error {
     #[error("projector failed: {0}")]
     Projector(#[source] BoxError),
 
+    /// The backend failed in a way that may succeed on retry: throttling, a timeout, a deadlock, or
+    /// a serialization failure. Nothing was committed.
+    #[error("transient backend failure: {0}")]
+    Transient(#[source] BoxError),
+
+    /// The repository was configured with an invalid value, such as an unsafe table name.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+
     /// The storage backend failed.
     #[error(transparent)]
     Backend(BoxError),
@@ -104,10 +113,17 @@ impl Error {
     pub fn is_duplicate_command(&self) -> bool {
         matches!(self, Self::DuplicateCommand(_))
     }
+
+    /// Reports whether reloading and running the command again may succeed: a conflict or a
+    /// transient backend failure.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Conflict { .. } | Self::Transient(_))
+    }
 }
 
 /// The replay phase that failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReplayPhase {
     /// Running upcasters.
     Upcast,
@@ -126,6 +142,7 @@ impl fmt::Display for ReplayPhase {
 
 /// The outcome of [`Store::execute`](crate::Store::execute) when it does not succeed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ExecuteError<E> {
     /// The aggregate rejected the command. Nothing was committed.
     #[error("command rejected: {0}")]
@@ -154,5 +171,10 @@ impl<E> ExecuteError<E> {
     pub fn is_duplicate_command(&self) -> bool {
         self.as_store_error()
             .is_some_and(Error::is_duplicate_command)
+    }
+
+    /// Reports whether running the command again may succeed. Rejections are never retryable.
+    pub fn is_retryable(&self) -> bool {
+        self.as_store_error().is_some_and(Error::is_retryable)
     }
 }

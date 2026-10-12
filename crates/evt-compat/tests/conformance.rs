@@ -15,7 +15,7 @@ use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository};
 use photon_evt::wire::dynamo::DEFAULT_VIEW_SORT_KEY;
 use photon_evt::{
-    Aggregate, BoxError, EntityId, Error, Metadata, Projector, Repository, Store, json,
+    Aggregate, BoxError, EntityId, Error, Metadata, Projector, Repository, RetryPolicy, Store, json,
 };
 
 /// Reads the single-item views `ViewProjector` writes.
@@ -170,7 +170,13 @@ async fn dynamo_projector_condition_failure_is_not_a_conflict() {
     let id = EntityId::new(format!("conf-{nanos}-projector-condition"));
 
     let err = store
-        .execute_with_retry(&id, Add(1), Metadata::new("local"), 3)
+        .execute_with_retry(
+            &id,
+            Add(1),
+            Metadata::new("local"),
+            &RetryPolicy::immediate(3),
+            |_| async {},
+        )
         .await
         .expect_err("the projector condition fails");
 

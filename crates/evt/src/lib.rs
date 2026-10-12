@@ -14,7 +14,8 @@
 //! - Bound log growth with [`Repository::compact_below`], which only deletes events a durable
 //!   snapshot covers.
 //!
-//! The storage contract is documented in `docs/spec/storage-format.md`.
+//! The storage contract is documented in the
+//! [storage format spec](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md).
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
@@ -29,6 +30,7 @@ pub mod json;
 mod mem;
 mod metadata;
 mod repository;
+mod retry;
 mod store;
 mod upcast;
 pub mod wire;
@@ -48,6 +50,7 @@ pub use ids::{CommandId, EntityId, EntityType, EventId, EventSequence, EventType
 pub use mem::MemRepository;
 pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};
 pub use repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
+pub use retry::RetryPolicy;
 pub use store::{DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, serialize_events};
 pub use upcast::{JsonUpcaster, Upcaster};
 

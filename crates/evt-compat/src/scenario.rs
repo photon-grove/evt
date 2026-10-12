@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Commit, EntityId, EntityType, Error, EventId, EventSequence, EventType, EventVersion,
-    ExecuteError, Metadata, Origin, Repository, SerializedEvent, Store, json,
+    ExecuteError, Metadata, Repository, SerializedEvent, Store, json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -97,22 +97,25 @@ impl Step {
     /// The step's metadata. Every field is determined by the step, so both languages write the
     /// same bytes for it.
     pub fn metadata(&self) -> Metadata {
-        Metadata {
-            command_id: self
-                .command_id
-                .clone()
-                .filter(|id| !id.is_empty())
-                .map(Into::into),
-            trace: self.trace.clone(),
-            origin: Some(Origin::new(ORIGIN_SOURCE, self.by.clone())),
-            address: self.address.clone().filter(|address| !address.is_empty()),
-            region: REGION.to_owned(),
-            timestamp: self
-                .timestamp
-                .clone()
-                .filter(|timestamp| !timestamp.is_empty())
-                .unwrap_or_else(|| DEFAULT_TIMESTAMP.to_owned()),
-        }
+        let mut metadata = Metadata::default()
+            .with_origin(ORIGIN_SOURCE, &self.by)
+            .with_address(self.address.clone().unwrap_or_default())
+            .with_timestamp(
+                self.timestamp
+                    .clone()
+                    .filter(|timestamp| !timestamp.is_empty())
+                    .unwrap_or_else(|| DEFAULT_TIMESTAMP.to_owned()),
+            );
+
+        metadata.command_id = self
+            .command_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .map(Into::into);
+        metadata.trace = self.trace.clone();
+        metadata.region = REGION.to_owned();
+
+        metadata
     }
 }
 
@@ -196,6 +199,8 @@ pub enum StepError {
     UnknownOp(String),
     #[error(transparent)]
     Store(#[from] Error),
+    #[error("unexpected outcome: {0}")]
+    Unexpected(String),
 }
 
 /// Executes steps against one repository through the Rust store.
@@ -270,6 +275,7 @@ impl<R: Repository> Runner<R> {
             Err(err) if err.is_duplicate_command() => Ok(Outcome::of("duplicate")),
             Err(err) if err.is_conflict() => Ok(Outcome::of("conflict")),
             Err(ExecuteError::Store(err)) => Err(err.into()),
+            Err(other) => Err(StepError::Unexpected(other.to_string())),
         }
     }
 
@@ -291,12 +297,7 @@ impl<R: Repository> Runner<R> {
             metadata: step.metadata(),
         };
 
-        let commit = Commit {
-            entity_id: entity_id.clone(),
-            events: vec![event],
-            snapshot: None,
-            operations: Vec::new(),
-        };
+        let commit = Commit::new(entity_id, vec![event]);
 
         match self.store.repository().commit(commit).await {
             Ok(()) => Ok(Outcome {

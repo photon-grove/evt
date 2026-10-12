@@ -10,13 +10,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
+include = ["src/**", "README.md", "Cargo.toml"]
 
 [features]
 default = []
-# DynamoDB event log via the AWS SDK. Bring your own `aws_sdk_dynamodb::Client`.
+# DynamoDB event log via the AWS SDK, which runs on Tokio. Bring your own `aws_sdk_dynamodb::Client`.
 dynamodb = ["dep:aws-sdk-dynamodb"]
-# PostgreSQL event log via tokio-postgres with a deadpool connection pool.
+# PostgreSQL event log via tokio-postgres with a deadpool connection pool. Requires Tokio.
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 # The backend conformance suite (`photon_evt::conformance`), for testing Repository implementations.
 conformance = []
