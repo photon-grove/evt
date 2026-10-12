@@ -1,7 +1,7 @@
 actionlint = "~1.7"
 go = "1.26.4"
 golangci-lint = "~2.12"
-moon = "2.2.4"
+moon = "2.6.1"
 node = "~24.5"
 npm = "~11.7"
 pnpm = "~10"
