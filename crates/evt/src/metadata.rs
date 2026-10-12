@@ -180,24 +180,16 @@ mod tests {
 
     #[test]
     fn formats_rfc3339_seconds() {
-        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(format_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
-        assert_eq!(format_rfc3339(1_791_763_200), "2026-10-12T00:00:00Z");
-        assert_eq!(format_rfc3339(1_791_766_861), "2026-10-12T01:01:01Z");
-    }
+        let cases = [
+            (0, "1970-01-01T00:00:00Z"),
+            (946_684_799, "1999-12-31T23:59:59Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (4_107_542_400, "2100-03-01T00:00:00Z"),
+        ];
 
-    #[test]
-    fn null_trace_values_decode_to_empty_strings() {
-        let metadata: Metadata =
-            serde_json::from_str(r#"{"trace":{"traceparent":null,"tracestate":"a"}}"#).unwrap();
-
-        assert_eq!(
-            metadata.trace,
-            Some(BTreeMap::from([
-                ("traceparent".to_owned(), String::new()),
-                ("tracestate".to_owned(), "a".to_owned()),
-            ]))
-        );
+        for (seconds, formatted) in cases {
+            assert_eq!(format_rfc3339(seconds), formatted);
+        }
     }
 
     #[test]

@@ -438,6 +438,11 @@
       "name": "whitespace-and-escapes",
       "input": "{ \"region\" : \"us\\u002dwest\\u002d2\", \"timestamp\":\"t\" }",
       "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"t\"}"
+    },
+    {
+      "name": "null-trace-value",
+      "input": "{\"trace\":{\"traceparent\":null,\"tracestate\":\"a\"}}",
+      "canonical": "{\"commandId\":null,\"trace\":{\"traceparent\":\"\",\"tracestate\":\"a\"},\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
     }
   ],
   "eventDecode": [
@@ -455,6 +460,11 @@
       "name": "empty-payload",
       "input": "{\"id\":\"a:3\",\"sequence\":3,\"type\":\"t\",\"version\":2,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":\"\",\"metadata\":{}}",
       "canonical": "{\"id\":\"a:3\",\"sequence\":3,\"type\":\"t\",\"version\":2,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":\"\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}"
+    },
+    {
+      "name": "null-identifiers",
+      "input": "{\"id\":null,\"sequence\":null,\"type\":null,\"version\":null,\"entityId\":null,\"entityType\":null,\"payload\":\"\",\"metadata\":{}}",
+      "canonical": "{\"id\":\"\",\"sequence\":0,\"type\":\"\",\"version\":0,\"entityId\":\"\",\"entityType\":\"\",\"payload\":\"\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}"
     }
   ],
   "snapshotPolicy": [

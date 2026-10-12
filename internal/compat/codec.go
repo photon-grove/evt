@@ -121,12 +121,14 @@ var metadataDecodeInputs = []struct{ name, input string }{
 	{"trace-keys-sorted", `{"trace":{"b":"2","a":"1","c":"3"},"region":"eu-west-1"}`},
 	{"empty-address-kept", `{"address":"","origin":{"source":null,"endpoint":"e"}}`},
 	{"whitespace-and-escapes", "{ \"region\" : \"us\\u002dwest\\u002d2\", \"timestamp\":\"t\" }"},
+	{"null-trace-value", `{"trace":{"traceparent":null,"tracestate":"a"}}`},
 }
 
 var eventDecodeInputs = []struct{ name, input string }{
 	{"null-payload-and-metadata", `{"id":"a:1","sequence":1,"type":"t","version":1,"entityId":"a","entityType":"x","payload":null,"metadata":null}`},
 	{"missing-fields", `{"id":"a:2","sequence":2,"payload":"e30=","metadata":{"region":"r"},"extra":"ignored"}`},
 	{"empty-payload", `{"id":"a:3","sequence":3,"type":"t","version":2,"entityId":"a","entityType":"x","payload":"","metadata":{}}`},
+	{"null-identifiers", `{"id":null,"sequence":null,"type":null,"version":null,"entityId":null,"entityType":null,"payload":"","metadata":{}}`},
 }
 
 // GenerateCodecFixtures encodes every codec case through the Go implementation: JSON via

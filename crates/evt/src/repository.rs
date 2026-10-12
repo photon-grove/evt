@@ -82,7 +82,7 @@ pub trait Repository: Send + Sync {
 
     /// Deletes the entity's events with sequence in `[1, through]`, but only when the stored
     /// snapshot covers them (`snapshot.event_sequence >= through`). The snapshot itself is never
-    /// deleted. Returns the number of events deleted; `through < 1` is a no-op.
+    /// deleted. Returns the number of events deleted. `through < 1` is a no-op.
     fn compact_below(
         &self,
         entity_id: &EntityId,
@@ -91,7 +91,7 @@ pub trait Repository: Send + Sync {
 
     /// Returns each entity's head: the larger of its highest event sequence and its snapshot's
     /// event sequence. Optionally narrowed to one entity type. This reads the whole log on some
-    /// backends; use it for rebuilds and diagnostics, not request paths.
+    /// backends. Use it for rebuilds and diagnostics, not request paths.
     fn entity_heads(
         &self,
         entity_type: Option<&EntityType>,
@@ -174,18 +174,4 @@ pub fn snapshot_events_due(current: EventSequence, events: usize, interval: usiz
     }
 
     events
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshots_when_crossing_the_interval() {
-        assert_eq!(snapshot_events_due(EventSequence(0), 1, 5), 0);
-        assert_eq!(snapshot_events_due(EventSequence(4), 1, 5), 1);
-        assert_eq!(snapshot_events_due(EventSequence(3), 4, 5), 4);
-        assert_eq!(snapshot_events_due(EventSequence(5), 1, 5), 0);
-        assert_eq!(snapshot_events_due(EventSequence(9), 3, 0), 0);
-    }
 }

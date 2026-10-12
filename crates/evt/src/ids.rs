@@ -195,24 +195,3 @@ impl EventSequence {
         Self(self.0 + 1)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn event_id_joins_entity_and_sequence() {
-        let id = EventId::for_event(&EntityId::new("account-1"), EventSequence(7));
-
-        assert_eq!(id, "account-1:7");
-    }
-
-    #[test]
-    fn null_decodes_to_empty_values() {
-        let id: EntityId = serde_json::from_str("null").unwrap();
-        let sequence: EventSequence = serde_json::from_str("null").unwrap();
-
-        assert!(id.is_empty());
-        assert_eq!(sequence, EventSequence::ZERO);
-    }
-}

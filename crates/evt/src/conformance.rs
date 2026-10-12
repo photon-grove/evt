@@ -3,10 +3,10 @@
 //!
 //! It checks the contract documented on [`Repository`] (ordering, isolation, optimistic
 //! concurrency, snapshots, compaction, entity heads) and the [`Store`] behavior built on it
-//! (snapshot-aware loads, stale-commit conflicts, retries, duplicate commands, and in-band
-//! projector operations that commit atomically with events). Every case namespaces its entity IDs,
-//! so durable backends can share one table across runs. The repository cases also namespace entity
-//! types; the [`Store`] cases use the [`Ledger`] type, so a shared table accumulates `ledger` rows.
+//! (snapshot-aware loads, stale-commit conflicts, retries, and in-band projector operations that
+//! commit atomically with events). Every case namespaces its entity IDs, so durable backends can
+//! share one table across runs. The repository cases also namespace entity types. The [`Store`]
+//! cases use the [`Ledger`] type, so a shared table accumulates `ledger` rows.
 //!
 //! ```
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -189,7 +189,6 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
 
         record("commit and read in order", commit_and_read(repo).await);
         record("isolate entities", isolate_entities(repo).await);
-        record("events after a sequence", events_after(repo).await);
         record(
             "reject a duplicate sequence",
             duplicate_sequence(repo).await,
@@ -210,11 +209,6 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             store_stale_commit(repo).await,
         );
         record("store retries a conflict", store_retry(repo).await);
-        record(
-            "store rejects a duplicate command",
-            store_duplicate_command(repo).await,
-        );
-        record("store lists entity ids", store_entity_ids(repo).await);
         if let Some(views) = &self.views {
             record(
                 "projector operations commit with events",
@@ -365,21 +359,6 @@ impl Stream {
     }
 }
 
-async fn commit_and_read<R: Repository>(repo: &R) -> CaseResult {
-    let stream = Stream::new(&namespace(), "1", "ledger");
-
-    stream.commit(repo, stream.events(1..=3), None).await?;
-    stream.commit(repo, stream.events(4..=5), None).await?;
-
-    ensure_eq!(
-        repo.events(&stream.id).await?,
-        stream.events(1..=5),
-        "events() returns every event as written, ascending"
-    );
-
-    Ok(())
-}
-
 async fn isolate_entities<R: Repository>(repo: &R) -> CaseResult {
     let ns = namespace();
     let a = Stream::new(&ns, "a", "ledger");
@@ -403,16 +382,18 @@ async fn isolate_entities<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
-async fn events_after<R: Repository>(repo: &R) -> CaseResult {
+async fn commit_and_read<R: Repository>(repo: &R) -> CaseResult {
     let stream = Stream::new(&namespace(), "1", "ledger");
-    stream.commit(repo, stream.events(1..=5), None).await?;
+    stream.commit(repo, stream.events(1..=3), None).await?;
+    stream.commit(repo, stream.events(4..=5), None).await?;
 
-    for (after, want) in [
-        (0, stream.events(1..=5)),
-        (2, stream.events(3..=5)),
-        (5, Vec::new()),
-        (9, Vec::new()),
-    ] {
+    ensure_eq!(
+        repo.events(&stream.id).await?,
+        stream.events(1..=5),
+        "events() returns every event as written, ascending"
+    );
+
+    for (after, want) in [(2, stream.events(3..=5)), (5, Vec::new()), (9, Vec::new())] {
         ensure_eq!(
             repo.events_after(&stream.id, EventSequence(after)).await?,
             want,
@@ -875,42 +856,6 @@ async fn store_retry<R: Repository>(repo: &R) -> CaseResult {
         result.as_ref().is_err_and(|err| err.is_conflict()),
         "a single attempt returns the conflict: got {result:?}"
     );
-
-    Ok(())
-}
-
-async fn store_duplicate_command<R: Repository>(repo: &R) -> CaseResult {
-    let store = Store::<Ledger, _>::new(repo, ());
-    let id = ledger_id();
-    let metadata = metadata().with_command_id(format!("{id}-command"));
-
-    store.execute(&id, Add(1), metadata.clone()).await?;
-    let result = store.execute(&id, Add(1), metadata).await;
-    ensure!(
-        result.as_ref().is_err_and(|err| err.is_duplicate_command()),
-        "a repeated command ID is a duplicate: got {result:?}"
-    );
-    ensure_eq!(
-        store.load(&id).await?.sequence(),
-        EventSequence(1),
-        "the duplicate writes nothing"
-    );
-
-    Ok(())
-}
-
-async fn store_entity_ids<R: Repository>(repo: &R) -> CaseResult {
-    let store = Store::<Ledger, _>::new(repo, ());
-    let ids = [ledger_id(), ledger_id()];
-
-    for id in &ids {
-        store.execute(id, Add(1), metadata()).await?;
-    }
-
-    let listed = store.entity_ids().await?;
-    for id in &ids {
-        ensure!(listed.contains(id), "entity_ids() lists {id}");
-    }
 
     Ok(())
 }

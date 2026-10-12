@@ -9,9 +9,9 @@
 //! | `pk`         | S    | entity ID                | entity ID                       |
 //! | `sk`         | N    | event sequence           | `0`                             |
 //! | `type`       | S    | event type               |                                 |
-//! | `version`    | N    | payload version          |                                 |
+//! | `version`    | N    | event version            |                                 |
 //! | `entityType` | S    | aggregate type           | aggregate type                  |
-//! | `payload`    | S    | event JSON (raw text)    | aggregate state JSON (raw text) |
+//! | `payload`    | S    | payload JSON (raw text)  | aggregate state JSON (raw text) |
 //! | `metadata`   | S    | metadata JSON            |                                 |
 //! | `seq`        | N    |                          | snapshot sequence               |
 //! | `eventSeq`   | N    |                          | last event sequence covered     |
@@ -154,8 +154,8 @@ pub fn is_snapshot_item(item: &Item) -> bool {
     matches!(item.get("sk"), Some(AttributeValue::N(sk)) if sk.parse::<i64>() == Ok(SNAPSHOT_SORT_KEY))
 }
 
-/// Decodes an event-log item. Missing non-key attributes decode to empty values, as in Go;
-/// missing or empty metadata is an error, and `null` metadata decodes to the default, as in Go.
+/// Decodes an event-log item. As in Go, missing non-key attributes decode to empty values,
+/// `null` metadata decodes to the default, and missing or empty metadata is an error.
 pub fn event_from_item(item: &Item) -> Result<SerializedEvent, Error> {
     let entity_id = EntityId::new(required_string(item, "pk")?);
     let sequence = EventSequence(required_number(item, "sk")?);
@@ -239,26 +239,22 @@ fn optional_number(item: &Item, name: &str) -> Result<Option<i64>, Error> {
 mod tests {
     use super::*;
 
-    fn item_with_metadata(metadata: &str) -> Item {
-        Item::from([
-            ("pk".into(), s("acct-1")),
-            ("sk".into(), n(1)),
-            ("metadata".into(), s(metadata)),
-        ])
-    }
-
     #[test]
-    fn null_metadata_decodes_to_the_default() {
-        let event = event_from_item(&item_with_metadata("null")).unwrap();
+    fn decodes_metadata_like_go() {
+        let item = |metadata: &str| {
+            Item::from([
+                ("pk".into(), s("acct-1")),
+                ("sk".into(), n(1)),
+                ("metadata".into(), s(metadata)),
+            ])
+        };
 
-        assert_eq!(event.metadata, Metadata::default());
-    }
+        let event = event_from_item(&item("null")).unwrap();
+        assert_eq!(event.metadata, Metadata::default(), "null metadata");
 
-    #[test]
-    fn empty_metadata_is_invalid() {
-        assert!(matches!(
-            event_from_item(&item_with_metadata(" ")),
-            Err(Error::InvalidRecord(_))
-        ));
+        assert!(
+            matches!(event_from_item(&item(" ")), Err(Error::InvalidRecord(_))),
+            "empty metadata"
+        );
     }
 }

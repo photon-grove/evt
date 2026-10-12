@@ -188,33 +188,45 @@ pub mod base64_bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::base64_bytes::{decode, encode};
 
     #[test]
-    fn escapes_html_and_line_separators_like_go() {
-        let encoded = to_string("a<b>&c\u{2028}d\u{2029}é\n\"\\\u{1}").unwrap();
+    fn base64_matches_rfc_4648() {
+        let vectors = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
 
-        assert_eq!(
-            encoded,
-            r#""a\u003cb\u003e\u0026c\u2028d\u2029é\n\"\\\u0001""#
-        );
+        for (plain, encoded) in vectors {
+            assert_eq!(encode(plain.as_bytes()), encoded, "encode {plain:?}");
+            assert_eq!(
+                decode(encoded).unwrap(),
+                plain.as_bytes(),
+                "decode {encoded:?}"
+            );
+        }
     }
 
     #[test]
-    fn base64_round_trips_every_padding_length() {
-        for input in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar"] {
-            let encoded = base64_bytes::encode(input);
+    fn base64_round_trips_every_byte_value() {
+        for len in 0..=258 {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + len) as u8).collect();
 
-            assert_eq!(base64_bytes::decode(&encoded).unwrap(), input);
+            assert_eq!(decode(&encode(&bytes)).unwrap(), bytes, "length {len}");
+        }
+    }
+
+    #[test]
+    fn base64_rejects_what_go_rejects() {
+        for invalid in ["Zm8", "Zm=8", "Zg==Zg==", "Z===", "Zm9v!A=="] {
+            assert!(decode(invalid).is_err(), "{invalid:?}");
         }
 
-        assert_eq!(base64_bytes::encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64_bytes::encode(b"fo"), "Zm8=");
-    }
-
-    #[test]
-    fn base64_rejects_missing_padding() {
-        assert!(base64_bytes::decode("Zm8").is_err());
-        assert!(base64_bytes::decode("Zm=8").is_err());
+        assert_eq!(decode("Zm9v\r\nYmFy").unwrap(), b"foobar");
     }
 }
