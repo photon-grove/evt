@@ -155,7 +155,7 @@ pub fn is_snapshot_item(item: &Item) -> bool {
 }
 
 /// Decodes an event-log item. Missing non-key attributes decode to empty values, as in Go;
-/// missing or empty metadata is an error, as in Go.
+/// missing or empty metadata is an error, and `null` metadata decodes to the default, as in Go.
 pub fn event_from_item(item: &Item) -> Result<SerializedEvent, Error> {
     let entity_id = EntityId::new(required_string(item, "pk")?);
     let sequence = EventSequence(required_number(item, "sk")?);
@@ -167,9 +167,12 @@ pub fn event_from_item(item: &Item) -> Result<SerializedEvent, Error> {
         )));
     }
 
-    let metadata: Metadata = serde_json::from_str(metadata_json).map_err(|err| {
-        Error::InvalidRecord(format!("event {entity_id}:{sequence} metadata: {err}"))
-    })?;
+    // Go's json.Unmarshal leaves metadata at its zero value for a JSON null.
+    let metadata = serde_json::from_str::<Option<Metadata>>(metadata_json)
+        .map_err(|err| {
+            Error::InvalidRecord(format!("event {entity_id}:{sequence} metadata: {err}"))
+        })?
+        .unwrap_or_default();
 
     Ok(SerializedEvent {
         id: EventId::for_event(&entity_id, sequence),
@@ -229,5 +232,33 @@ fn optional_number(item: &Item, name: &str) -> Result<Option<i64>, Error> {
         Some(other) => Err(Error::InvalidRecord(format!(
             "attribute {name} is not a number: {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item_with_metadata(metadata: &str) -> Item {
+        Item::from([
+            ("pk".into(), s("acct-1")),
+            ("sk".into(), n(1)),
+            ("metadata".into(), s(metadata)),
+        ])
+    }
+
+    #[test]
+    fn null_metadata_decodes_to_the_default() {
+        let event = event_from_item(&item_with_metadata("null")).unwrap();
+
+        assert_eq!(event.metadata, Metadata::default());
+    }
+
+    #[test]
+    fn empty_metadata_is_invalid() {
+        assert!(matches!(
+            event_from_item(&item_with_metadata(" ")),
+            Err(Error::InvalidRecord(_))
+        ));
     }
 }

@@ -93,14 +93,16 @@ impl EventRow {
         })
     }
 
-    /// Decodes a row into an event. Empty metadata decodes to the default.
+    /// Decodes a row into an event. Empty or `null` metadata decodes to the default, as in Go.
     pub fn into_event(self) -> Result<SerializedEvent, Error> {
-        let metadata: Metadata = if self.metadata.trim().is_empty() {
+        let metadata = if self.metadata.trim().is_empty() {
             Metadata::default()
         } else {
-            serde_json::from_str(&self.metadata).map_err(|err| {
-                Error::InvalidRecord(format!("event {} metadata: {err}", self.event_id))
-            })?
+            serde_json::from_str::<Option<Metadata>>(&self.metadata)
+                .map_err(|err| {
+                    Error::InvalidRecord(format!("event {} metadata: {err}", self.event_id))
+                })?
+                .unwrap_or_default()
         };
 
         Ok(SerializedEvent {
@@ -151,6 +153,29 @@ impl SnapshotRow {
             sequence: EventSequence(self.sequence),
             event_sequence: EventSequence(self.event_sequence),
             payload: self.payload,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_or_empty_metadata_decodes_to_the_default() {
+        for metadata in ["null", ""] {
+            let row = EventRow {
+                entity_id: "acct-1".into(),
+                sequence: 1,
+                event_id: "acct-1:1".into(),
+                event_type: "account:opened".into(),
+                version: 1,
+                entity_type: "account".into(),
+                payload: b"{}".to_vec(),
+                metadata: metadata.into(),
+            };
+
+            assert_eq!(row.into_event().unwrap().metadata, Metadata::default());
         }
     }
 }
