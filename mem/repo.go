@@ -31,11 +31,16 @@ var (
 	_ evt.EntityHeadVisitor  = (*Repository)(nil)
 )
 
-// Commit Events to memory
+// Commit Events to memory. It does not reject reused sequences, but like the durable backends it
+// rejects a commit at or below the entity's snapshot, which compaction may have deleted below.
 func (repo Repository) Commit(
 	_ context.Context,
 	result evt.SerializedResult,
 ) error {
+	if err := repo.checkFloor(result.Events); err != nil {
+		return err
+	}
+
 	for _, event := range result.Events {
 		id := string(event.EntityID)
 
@@ -64,6 +69,11 @@ func (repo Repository) CommitStream(
 			continue
 		}
 
+		if err := repo.checkFloor(serializedResult.Events); err != nil {
+			errors = append(errors, err)
+			continue
+		}
+
 		for _, event := range serializedResult.Events {
 			id := string(event.EntityID)
 
@@ -81,6 +91,21 @@ func (repo Repository) CommitStream(
 	}
 
 	return errors
+}
+
+// checkFloor returns an evt.ConflictError when an entity's snapshot covers an event being committed.
+func (repo Repository) checkFloor(events []evt.SerializedEvent) error {
+	for _, event := range events {
+		snapshot, ok := repo.snapshots[string(event.EntityID)]
+		if ok && event.Sequence <= snapshot.EventSequence {
+			return evt.NewConflictError(fmt.Sprintf(
+				"mem: event %d for %s is at or below the snapshot floor %d",
+				event.Sequence, event.EntityID, snapshot.EventSequence,
+			))
+		}
+	}
+
+	return nil
 }
 
 // CommitWithSnapshot commits Events with a Snapshot
