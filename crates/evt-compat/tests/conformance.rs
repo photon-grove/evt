@@ -124,6 +124,9 @@ impl ViewTarget<PostgresRepository> for PostgresViews {
     }
 }
 
+// One test, run in sequence: Moto rolls back a failed transaction by restoring a copy of every
+// table it touched, which drops writes that a concurrent test made in the meantime. Real DynamoDB
+// does not, but the projector-condition case deliberately fails a transaction.
 #[tokio::test]
 async fn dynamo_conforms() {
     let repository = drivers::dynamo().await;
@@ -133,6 +136,7 @@ async fn dynamo_conforms() {
     };
 
     Suite::new(&repository).with_views(views).run().await;
+    projector_condition_failure_is_not_a_conflict(&repository).await;
 }
 
 /// Writes a view only if it already exists, so its condition fails for a new entity.
@@ -158,10 +162,8 @@ impl Projector<Ledger, TransactWriteItem> for RequireExistingView {
     }
 }
 
-#[tokio::test]
-async fn dynamo_projector_condition_failure_is_not_a_conflict() {
-    let repository = drivers::dynamo().await;
-    let store = Store::<Ledger, _>::new(&repository, ()).with_projector(RequireExistingView {
+async fn projector_condition_failure_is_not_a_conflict(repository: &DynamoRepository) {
+    let store = Store::<Ledger, _>::new(repository, ()).with_projector(RequireExistingView {
         table: drivers::views_table(),
     });
     let nanos = SystemTime::now()
@@ -236,6 +238,57 @@ async fn postgres_projector_deadlock_is_retried() {
 
     assert_eq!(executed.state.sequence().get(), 1);
     assert_eq!(repository.events(&id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn postgres_snapshot_deadlock_is_retried() {
+    // Dedicated tables, so the trigger never touches the shared ones. The trigger uses a sequence
+    // rather than a flag row, because a flag row would roll back with the failed transaction.
+    let repository = PostgresRepository::new(drivers::postgres_pool().expect("pool"))
+        .with_tables("evt_deadlock_events", "evt_deadlock_snapshots")
+        .expect("valid table names");
+    repository.ensure_schema().await.expect("create the tables");
+    repository
+        .pool()
+        .get()
+        .await
+        .expect("connect to PostgreSQL")
+        .batch_execute(
+            "DROP SEQUENCE IF EXISTS evt_deadlock_attempts;
+             CREATE SEQUENCE evt_deadlock_attempts;
+             CREATE OR REPLACE FUNCTION evt_deadlock_once() RETURNS trigger AS $$
+             BEGIN
+                 IF nextval('evt_deadlock_attempts') = 1 THEN
+                     RAISE EXCEPTION 'deadlock' USING ERRCODE = '40P01';
+                 END IF;
+                 RETURN NEW;
+             END $$ LANGUAGE plpgsql;
+             CREATE OR REPLACE TRIGGER evt_deadlock_once BEFORE INSERT OR UPDATE
+                 ON evt_deadlock_snapshots FOR EACH ROW EXECUTE FUNCTION evt_deadlock_once();",
+        )
+        .await
+        .expect("install the trigger");
+
+    let store = Store::<Ledger, _>::new(&repository, ()).with_snapshot_interval(1);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = EntityId::new(format!("conf-{nanos}-snapshot-deadlock"));
+
+    let executed = store
+        .execute_with_retry(
+            &id,
+            Add(1),
+            Metadata::new("local"),
+            &RetryPolicy::immediate(2),
+            |_| async {},
+        )
+        .await
+        .expect("the retry succeeds after the deadlock");
+
+    assert_eq!(executed.state.snapshot_sequence().get(), 1);
+    assert!(repository.snapshot(&id).await.unwrap().is_some());
 }
 
 #[tokio::test]

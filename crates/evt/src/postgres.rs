@@ -208,7 +208,7 @@ impl PostgresRepository {
                 ],
             )
             .await
-            .map_err(Error::backend)
+            .map_err(statement_error)
     }
 }
 
@@ -280,7 +280,7 @@ impl Repository for PostgresRepository {
         if let Some(row) = tx
             .query_opt(&floor, &[&commit.entity_id.as_str(), &first])
             .await
-            .map_err(Error::backend)?
+            .map_err(statement_error)?
         {
             return Err(Error::Conflict {
                 entity_id: commit.entity_id,
@@ -419,6 +419,16 @@ fn classify(entity_id: &EntityId, err: tokio_postgres::Error) -> Error {
         },
         _ if transient(&err) => Error::Transient(Box::new(err)),
         _ => Error::backend(err),
+    }
+}
+
+/// Maps a failed statement inside a commit: [`Error::Transient`] when PostgreSQL rolled the
+/// transaction back for a retryable reason, otherwise [`Error::Backend`].
+fn statement_error(err: tokio_postgres::Error) -> Error {
+    if transient(&err) {
+        Error::Transient(Box::new(err))
+    } else {
+        Error::backend(err)
     }
 }
 
