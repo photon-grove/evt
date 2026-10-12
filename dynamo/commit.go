@@ -79,14 +79,32 @@ func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.T
 	return checks
 }
 
-// CommitStream commits a stream of events using batches under the 100-item limit.
+// CommitStream commits a stream of events using batches under the 100-item limit. Each batch
+// carries one floor check per entity (see FloorCondition), built when the batch is flushed: a
+// transaction cannot touch an entity's snapshot item twice.
 func (repo *Repository) CommitStream(
 	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],
 ) []error {
 	var errors []error
 
-	var batch []types.TransactWriteItem
+	var (
+		batch       []types.TransactWriteItem
+		batchEvents []evt.SerializedEvent
+	)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		items := append(batch, repo.buildFloorChecks(batchEvents)...)
+		if err := repo.commitEventsWithTransaction(ctx, items, nil); err != nil {
+			errors = append(errors, err)
+		}
+
+		batch, batchEvents = nil, nil
+	}
 
 	for result := range channel {
 		serializedResult, err := result.Unwrap()
@@ -112,37 +130,39 @@ func (repo *Repository) CommitStream(
 		combined := append(transactItems, items...)
 
 		// Guard against a single result that already exceeds the 100-item transaction limit
-		if len(combined) > 100 {
+		if size := len(combined) + countEntities(serializedResult.Events); size > 100 {
 			errors = append(errors, fmt.Errorf(
 				"single result produces %d items, exceeding DynamoDB 100-item transaction limit",
-				len(combined),
+				size,
 			))
 			continue
 		}
 
-		// Check to see if the batch would overrun the limit of 100 items
-		if len(batch)+len(combined) > 99 {
-			// Commit the batch
-			if err = repo.commitEventsWithTransaction(ctx, batch, nil); err != nil {
-				errors = append(errors, err)
-			}
-
-			// Reset the batch
-			batch = combined
-		} else {
-			// Add the combined items to the batch
-			batch = append(batch, combined...)
+		// Flush first if adding this result, and its floor checks, would overrun the limit
+		merged := append(append([]evt.SerializedEvent{}, batchEvents...), serializedResult.Events...)
+		if len(batch)+len(combined)+countEntities(merged) > 100 {
+			flush()
 		}
+
+		batch = append(batch, combined...)
+		batchEvents = append(batchEvents, serializedResult.Events...)
 	}
 
 	// Flush the final items from the batch
-	if len(batch) > 0 {
-		if err := repo.commitEventsWithTransaction(ctx, batch, nil); err != nil {
-			errors = append(errors, err)
-		}
-	}
+	flush()
 
 	return errors
+}
+
+// countEntities returns the number of distinct entities, which is the number of floor checks a
+// batch of these events needs.
+func countEntities(events []evt.SerializedEvent) int {
+	seen := make(map[evt.EntityID]struct{}, len(events))
+	for _, event := range events {
+		seen[event.EntityID] = struct{}{}
+	}
+
+	return len(seen)
 }
 
 // CommitWithSnapshot commits events and a snapshot in a single transaction.

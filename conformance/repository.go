@@ -285,6 +285,11 @@ func testCompactedFloor(t *testing.T, repo evt.Repository) {
 	stale := serialize(t, id, "test", 1, &test.EntityUpdated{ID: id, Value: "stale"})
 	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: stale}), "a commit below the floor must be rejected")
 
+	streamed := make(chan result.Result[evt.SerializedResult], 1)
+	streamed <- result.Ok(evt.SerializedResult{Events: stale})
+	close(streamed)
+	require.NotEmpty(t, repo.CommitStream(ctx, streamed), "a streamed commit below the floor must be rejected")
+
 	events, err := repo.GetEvents(ctx, id)
 	require.NoError(t, err)
 	require.Empty(t, events, "the rejected commit writes nothing")
