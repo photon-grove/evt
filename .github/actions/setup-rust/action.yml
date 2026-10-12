@@ -1,0 +1,34 @@
+name: Set up Rust
+description: Installs the toolchain pinned in rust-toolchain.toml and restores the Cargo cache.
+
+inputs:
+  cache-key:
+    description: Separates caches for jobs that build different feature sets.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install toolchain
+      shell: bash
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+        fi
+        channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+        rustup toolchain install "$channel" --profile minimal -c rustfmt -c clippy
+        rustup show active-toolchain
+
+    - name: Cache Cargo
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ inputs.cache-key }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-cargo-${{ inputs.cache-key }}-

@@ -1,0 +1,59 @@
+id: evt-rust
+language: rust
+stack: backend
+layer: library
+toolchains:
+  default: system
+project:
+  name: evt-rust
+  description: Rust crates that read and write the same event log as the Go framework.
+fileGroups:
+  sources:
+    - '**/*.rs'
+    - '**/Cargo.toml'
+    - /Cargo.toml
+    - /Cargo.lock
+    - /rust-toolchain.toml
+  compat:
+    - /compat/**/*
+taskOptions:
+  runFromWorkspaceRoot: true
+tasks:
+  format:
+    command: cargo fmt --all
+    inputs:
+      - '@globs(sources)'
+    options:
+      cache: false
+  check:
+    script: cargo fmt --all --check && cargo clippy --workspace --all-features --all-targets -- -D warnings
+    inputs:
+      - '@globs(sources)'
+  test:
+    command: cargo test --workspace --features photon-evt/conformance
+    inputs:
+      - '@globs(sources)'
+      - '@globs(compat)'
+  integration:
+    script: >-
+      cargo test -p evt-compat --features drivers --test conformance dynamo &&
+      bash scripts/compat-integration.sh dynamo
+    deps:
+      - evt:check-integration-readiness
+    env:
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_REGION: us-west-2
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    options:
+      cache: false
+  integration-postgres:
+    script: >-
+      cargo test -p evt-compat --features drivers --test conformance postgres &&
+      bash scripts/compat-integration.sh postgres
+    deps:
+      - evt:check-postgres-readiness
+    env:
+      DATABASE_URL: postgres://evt:evt@localhost:5432/evt_local?sslmode=disable
+    options:
+      cache: false
