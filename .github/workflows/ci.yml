@@ -51,7 +51,7 @@ jobs:
                 rust=true compat=true ;;
               compat/* | internal/compat/* | scripts/compat-integration.sh)
                 go=true rust=true compat=true ;;
-              serialization.go | metadata.go | compaction.go | dynamo/* | postgres/* | publishers/*)
+              serialization.go | metadata.go | compaction.go | dynamo/* | postgres/* | publishers/* | stream/* | projectors/*)
                 go=true compat=true ;;
               *)
                 go=true ;;
