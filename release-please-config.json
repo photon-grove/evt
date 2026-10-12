@@ -5,7 +5,13 @@
     ".": {
       "release-type": "go",
       "package-name": "evt",
-      "changelog-path": "CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "exclude-paths": [
+        "crates",
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml"
+      ]
     },
     "crates/evt": {
       "release-type": "rust",
