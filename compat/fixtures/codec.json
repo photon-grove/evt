@@ -1,0 +1,2982 @@
+{
+  "events": [
+    {
+      "name": "minimal",
+      "input": {
+        "id": "acct-1:1",
+        "sequence": 1,
+        "type": "account:opened",
+        "version": 1,
+        "entityId": "acct-1",
+        "entityType": "account",
+        "payload": "{\"owner\":\"Ada\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}",
+        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+      },
+      "serializedEventJson": "{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        },
+        "payload": {
+          "S": "{\"owner\":\"Ada\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+        },
+        "pk": {
+          "S": "acct-1"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "type": {
+          "S": "account:opened"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsAttributes": {
+        "entityType": "account",
+        "eventType": "account:opened"
+      }
+    },
+    {
+      "name": "full-metadata",
+      "input": {
+        "id": "acct-1:2",
+        "sequence": 2,
+        "type": "account:deposited",
+        "version": 1,
+        "entityId": "acct-1",
+        "entityType": "account",
+        "payload": "{\"amountCents\":2500,\"memo\":\"rent\"}",
+        "metadataJson": "{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+      },
+      "serializedEventJson": "{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwMCwibWVtbyI6InJlbnQifQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        },
+        "payload": {
+          "S": "{\"amountCents\":2500,\"memo\":\"rent\"}"
+        },
+        "pk": {
+          "S": "acct-1"
+        },
+        "sk": {
+          "N": "2"
+        },
+        "type": {
+          "S": "account:deposited"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwMCwibWVtbyI6InJlbnQifQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsAttributes": {
+        "commandId": "cmd-0001",
+        "correlationId": "cmd-0001",
+        "entityType": "account",
+        "eventType": "account:deposited",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      }
+    },
+    {
+      "name": "escaping",
+      "input": {
+        "id": "acct-1:3",
+        "sequence": 3,
+        "type": "account:deposited",
+        "version": 1,
+        "entityId": "acct-1",
+        "entityType": "account",
+        "payload": "{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 ☕ \\\"q\\\" \\\\ \\t\"}",
+        "metadataJson": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+      },
+      "serializedEventJson": "{\"id\":\"acct-1:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        },
+        "payload": {
+          "S": "{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 ☕ \\\"q\\\" \\\\ \\t\"}"
+        },
+        "pk": {
+          "S": "acct-1"
+        },
+        "sk": {
+          "N": "3"
+        },
+        "type": {
+          "S": "account:deposited"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsAttributes": {
+        "commandId": "cmd <&> \u2028 \u2029",
+        "correlationId": "cmd <&> \u2028 \u2029",
+        "entityType": "account",
+        "eventType": "account:deposited"
+      }
+    },
+    {
+      "name": "empty-values",
+      "input": {
+        "id": "acct-2:1",
+        "sequence": 1,
+        "type": "account:closed",
+        "version": 1,
+        "entityId": "acct-2",
+        "entityType": "account",
+        "payload": "{}",
+        "metadataJson": "{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+      },
+      "serializedEventJson": "{\"id\":\"acct-2:1\",\"sequence\":1,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+        },
+        "payload": {
+          "S": "{}"
+        },
+        "pk": {
+          "S": "acct-2"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "type": {
+          "S": "account:closed"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-2:1\",\"detail-type\":\"account:closed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-2:1\",\"sequence\":1,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}}",
+      "snsAttributes": {
+        "entityType": "account",
+        "eventType": "account:closed"
+      }
+    },
+    {
+      "name": "trace-without-command",
+      "input": {
+        "id": "acct-2:2",
+        "sequence": 2,
+        "type": "account:closed",
+        "version": 1,
+        "entityId": "acct-2",
+        "entityType": "account",
+        "payload": "{\"reason\":null}",
+        "metadataJson": "{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+      },
+      "serializedEventJson": "{\"id\":\"acct-2:2\",\"sequence\":2,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOm51bGx9\",\"metadata\":{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        },
+        "payload": {
+          "S": "{\"reason\":null}"
+        },
+        "pk": {
+          "S": "acct-2"
+        },
+        "sk": {
+          "N": "2"
+        },
+        "type": {
+          "S": "account:closed"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-2:2\",\"detail-type\":\"account:closed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-2:2\",\"sequence\":2,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOm51bGx9\",\"metadata\":{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsAttributes": {
+        "correlationId": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        "entityType": "account",
+        "eventType": "account:closed",
+        "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+      }
+    },
+    {
+      "name": "large-numbers",
+      "input": {
+        "id": "acct-3:9007199254740993",
+        "sequence": 9007199254740993,
+        "type": "account:renamed",
+        "version": 12,
+        "entityId": "acct-3",
+        "entityType": "account",
+        "payload": "{\"owner\":\"Grace\"}",
+        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+      },
+      "serializedEventJson": "{\"id\":\"acct-3:9007199254740993\",\"sequence\":9007199254740993,\"type\":\"account:renamed\",\"version\":12,\"entityId\":\"acct-3\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        },
+        "payload": {
+          "S": "{\"owner\":\"Grace\"}"
+        },
+        "pk": {
+          "S": "acct-3"
+        },
+        "sk": {
+          "N": "9007199254740993"
+        },
+        "type": {
+          "S": "account:renamed"
+        },
+        "version": {
+          "N": "12"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-3:9007199254740993\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-3:9007199254740993\",\"sequence\":9007199254740993,\"type\":\"account:renamed\",\"version\":12,\"entityId\":\"acct-3\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsAttributes": {
+        "entityType": "account",
+        "eventType": "account:renamed"
+      }
+    },
+    {
+      "name": "unicode-entity-id",
+      "input": {
+        "id": "konto-ø-漢-1:1",
+        "sequence": 1,
+        "type": "account:tagged",
+        "version": 1,
+        "entityId": "konto-ø-漢-1",
+        "entityType": "account",
+        "payload": "{\"tags\":[\"vip\",\"ü\"]}",
+        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+      },
+      "serializedEventJson": "{\"id\":\"konto-ø-漢-1:1\",\"sequence\":1,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"konto-ø-漢-1\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsIsO8Il19\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        },
+        "payload": {
+          "S": "{\"tags\":[\"vip\",\"ü\"]}"
+        },
+        "pk": {
+          "S": "konto-ø-漢-1"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "type": {
+          "S": "account:tagged"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"konto-ø-漢-1:1\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"konto-ø-漢-1:1\",\"sequence\":1,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"konto-ø-漢-1\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsIsO8Il19\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsAttributes": {
+        "entityType": "account",
+        "eventType": "account:tagged"
+      }
+    },
+    {
+      "name": "raw-payload-formatting",
+      "input": {
+        "id": "acct-4:1",
+        "sequence": 1,
+        "type": "account:labeled",
+        "version": 1,
+        "entityId": "acct-4",
+        "entityType": "account",
+        "payload": "{ \"labels\" : { \"b\": \"2\", \"a\": \"1\" } }\n",
+        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+      },
+      "serializedEventJson": "{\"id\":\"acct-4:1\",\"sequence\":1,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"acct-4\",\"entityType\":\"account\",\"payload\":\"eyAibGFiZWxzIiA6IHsgImIiOiAiMiIsICJhIjogIjEiIH0gfQo=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        },
+        "payload": {
+          "S": "{ \"labels\" : { \"b\": \"2\", \"a\": \"1\" } }\n"
+        },
+        "pk": {
+          "S": "acct-4"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "type": {
+          "S": "account:labeled"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-4:1\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-4:1\",\"sequence\":1,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"acct-4\",\"entityType\":\"account\",\"payload\":\"eyAibGFiZWxzIiA6IHsgImIiOiAiMiIsICJhIjogIjEiIH0gfQo=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsAttributes": {
+        "entityType": "account",
+        "eventType": "account:labeled"
+      }
+    }
+  ],
+  "snapshots": [
+    {
+      "name": "basic",
+      "input": {
+        "entityType": "account",
+        "entityId": "acct-1",
+        "sequence": 2,
+        "eventSequence": 10,
+        "payload": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":1200}"
+      },
+      "serializedSnapshotJson": "{\"entityType\":\"account\",\"entityID\":\"acct-1\",\"sequence\":2,\"eventSequence\":10,\"payload\":\"eyJvd25lciI6IkFkYSIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjEyMDB9\"}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "eventSeq": {
+          "N": "10"
+        },
+        "payload": {
+          "S": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":1200}"
+        },
+        "pk": {
+          "S": "acct-1"
+        },
+        "seq": {
+          "N": "2"
+        },
+        "sk": {
+          "N": "0"
+        }
+      }
+    },
+    {
+      "name": "escaping",
+      "input": {
+        "entityType": "account",
+        "entityId": "konto-ø-1",
+        "sequence": 1,
+        "eventSequence": 3,
+        "payload": "{\"lastMemo\":\"<b> & \u2028\"}"
+      },
+      "serializedSnapshotJson": "{\"entityType\":\"account\",\"entityID\":\"konto-ø-1\",\"sequence\":1,\"eventSequence\":3,\"payload\":\"eyJsYXN0TWVtbyI6IjxiPiAmIOKAqCJ9\"}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "eventSeq": {
+          "N": "3"
+        },
+        "payload": {
+          "S": "{\"lastMemo\":\"<b> & \u2028\"}"
+        },
+        "pk": {
+          "S": "konto-ø-1"
+        },
+        "seq": {
+          "N": "1"
+        },
+        "sk": {
+          "N": "0"
+        }
+      }
+    }
+  ],
+  "metadataDecode": [
+    {
+      "name": "empty-object",
+      "input": "{}",
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+    },
+    {
+      "name": "nulls",
+      "input": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":null,\"timestamp\":null}",
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+    },
+    {
+      "name": "unknown-fields-ignored",
+      "input": "{\"commandId\":\"c-1\",\"unknown\":true,\"origin\":{\"source\":\"s\",\"extra\":1}}",
+      "canonical": "{\"commandId\":\"c-1\",\"trace\":null,\"origin\":{\"source\":\"s\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+    },
+    {
+      "name": "trace-keys-sorted",
+      "input": "{\"trace\":{\"b\":\"2\",\"a\":\"1\",\"c\":\"3\"},\"region\":\"eu-west-1\"}",
+      "canonical": "{\"commandId\":null,\"trace\":{\"a\":\"1\",\"b\":\"2\",\"c\":\"3\"},\"origin\":null,\"address\":null,\"region\":\"eu-west-1\",\"timestamp\":\"\"}"
+    },
+    {
+      "name": "empty-address-kept",
+      "input": "{\"address\":\"\",\"origin\":{\"source\":null,\"endpoint\":\"e\"}}",
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"\",\"endpoint\":\"e\"},\"address\":\"\",\"region\":\"\",\"timestamp\":\"\"}"
+    },
+    {
+      "name": "whitespace-and-escapes",
+      "input": "{ \"region\" : \"us\\u002dwest\\u002d2\", \"timestamp\":\"t\" }",
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"t\"}"
+    }
+  ],
+  "eventDecode": [
+    {
+      "name": "null-payload-and-metadata",
+      "input": "{\"id\":\"a:1\",\"sequence\":1,\"type\":\"t\",\"version\":1,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":null,\"metadata\":null}",
+      "canonical": "{\"id\":\"a:1\",\"sequence\":1,\"type\":\"t\",\"version\":1,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":null,\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}"
+    },
+    {
+      "name": "missing-fields",
+      "input": "{\"id\":\"a:2\",\"sequence\":2,\"payload\":\"e30=\",\"metadata\":{\"region\":\"r\"},\"extra\":\"ignored\"}",
+      "canonical": "{\"id\":\"a:2\",\"sequence\":2,\"type\":\"\",\"version\":0,\"entityId\":\"\",\"entityType\":\"\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"r\",\"timestamp\":\"\"}}"
+    },
+    {
+      "name": "empty-payload",
+      "input": "{\"id\":\"a:3\",\"sequence\":3,\"type\":\"t\",\"version\":2,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":\"\",\"metadata\":{}}",
+      "canonical": "{\"id\":\"a:3\",\"sequence\":3,\"type\":\"t\",\"version\":2,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":\"\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}"
+    }
+  ],
+  "snapshotPolicy": [
+    [
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      0,
+      0
+    ],
+    [
+      0,
+      2,
+      0,
+      0
+    ],
+    [
+      0,
+      3,
+      0,
+      0
+    ],
+    [
+      0,
+      4,
+      0,
+      0
+    ],
+    [
+      0,
+      5,
+      0,
+      0
+    ],
+    [
+      0,
+      6,
+      0,
+      0
+    ],
+    [
+      1,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      1,
+      0,
+      0
+    ],
+    [
+      1,
+      2,
+      0,
+      0
+    ],
+    [
+      1,
+      3,
+      0,
+      0
+    ],
+    [
+      1,
+      4,
+      0,
+      0
+    ],
+    [
+      1,
+      5,
+      0,
+      0
+    ],
+    [
+      1,
+      6,
+      0,
+      0
+    ],
+    [
+      2,
+      0,
+      0,
+      0
+    ],
+    [
+      2,
+      1,
+      0,
+      0
+    ],
+    [
+      2,
+      2,
+      0,
+      0
+    ],
+    [
+      2,
+      3,
+      0,
+      0
+    ],
+    [
+      2,
+      4,
+      0,
+      0
+    ],
+    [
+      2,
+      5,
+      0,
+      0
+    ],
+    [
+      2,
+      6,
+      0,
+      0
+    ],
+    [
+      3,
+      0,
+      0,
+      0
+    ],
+    [
+      3,
+      1,
+      0,
+      0
+    ],
+    [
+      3,
+      2,
+      0,
+      0
+    ],
+    [
+      3,
+      3,
+      0,
+      0
+    ],
+    [
+      3,
+      4,
+      0,
+      0
+    ],
+    [
+      3,
+      5,
+      0,
+      0
+    ],
+    [
+      3,
+      6,
+      0,
+      0
+    ],
+    [
+      4,
+      0,
+      0,
+      0
+    ],
+    [
+      4,
+      1,
+      0,
+      0
+    ],
+    [
+      4,
+      2,
+      0,
+      0
+    ],
+    [
+      4,
+      3,
+      0,
+      0
+    ],
+    [
+      4,
+      4,
+      0,
+      0
+    ],
+    [
+      4,
+      5,
+      0,
+      0
+    ],
+    [
+      4,
+      6,
+      0,
+      0
+    ],
+    [
+      5,
+      0,
+      0,
+      0
+    ],
+    [
+      5,
+      1,
+      0,
+      0
+    ],
+    [
+      5,
+      2,
+      0,
+      0
+    ],
+    [
+      5,
+      3,
+      0,
+      0
+    ],
+    [
+      5,
+      4,
+      0,
+      0
+    ],
+    [
+      5,
+      5,
+      0,
+      0
+    ],
+    [
+      5,
+      6,
+      0,
+      0
+    ],
+    [
+      6,
+      0,
+      0,
+      0
+    ],
+    [
+      6,
+      1,
+      0,
+      0
+    ],
+    [
+      6,
+      2,
+      0,
+      0
+    ],
+    [
+      6,
+      3,
+      0,
+      0
+    ],
+    [
+      6,
+      4,
+      0,
+      0
+    ],
+    [
+      6,
+      5,
+      0,
+      0
+    ],
+    [
+      6,
+      6,
+      0,
+      0
+    ],
+    [
+      7,
+      0,
+      0,
+      0
+    ],
+    [
+      7,
+      1,
+      0,
+      0
+    ],
+    [
+      7,
+      2,
+      0,
+      0
+    ],
+    [
+      7,
+      3,
+      0,
+      0
+    ],
+    [
+      7,
+      4,
+      0,
+      0
+    ],
+    [
+      7,
+      5,
+      0,
+      0
+    ],
+    [
+      7,
+      6,
+      0,
+      0
+    ],
+    [
+      8,
+      0,
+      0,
+      0
+    ],
+    [
+      8,
+      1,
+      0,
+      0
+    ],
+    [
+      8,
+      2,
+      0,
+      0
+    ],
+    [
+      8,
+      3,
+      0,
+      0
+    ],
+    [
+      8,
+      4,
+      0,
+      0
+    ],
+    [
+      8,
+      5,
+      0,
+      0
+    ],
+    [
+      8,
+      6,
+      0,
+      0
+    ],
+    [
+      9,
+      0,
+      0,
+      0
+    ],
+    [
+      9,
+      1,
+      0,
+      0
+    ],
+    [
+      9,
+      2,
+      0,
+      0
+    ],
+    [
+      9,
+      3,
+      0,
+      0
+    ],
+    [
+      9,
+      4,
+      0,
+      0
+    ],
+    [
+      9,
+      5,
+      0,
+      0
+    ],
+    [
+      9,
+      6,
+      0,
+      0
+    ],
+    [
+      10,
+      0,
+      0,
+      0
+    ],
+    [
+      10,
+      1,
+      0,
+      0
+    ],
+    [
+      10,
+      2,
+      0,
+      0
+    ],
+    [
+      10,
+      3,
+      0,
+      0
+    ],
+    [
+      10,
+      4,
+      0,
+      0
+    ],
+    [
+      10,
+      5,
+      0,
+      0
+    ],
+    [
+      10,
+      6,
+      0,
+      0
+    ],
+    [
+      11,
+      0,
+      0,
+      0
+    ],
+    [
+      11,
+      1,
+      0,
+      0
+    ],
+    [
+      11,
+      2,
+      0,
+      0
+    ],
+    [
+      11,
+      3,
+      0,
+      0
+    ],
+    [
+      11,
+      4,
+      0,
+      0
+    ],
+    [
+      11,
+      5,
+      0,
+      0
+    ],
+    [
+      11,
+      6,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      1,
+      0
+    ],
+    [
+      0,
+      1,
+      1,
+      1
+    ],
+    [
+      0,
+      2,
+      1,
+      2
+    ],
+    [
+      0,
+      3,
+      1,
+      3
+    ],
+    [
+      0,
+      4,
+      1,
+      4
+    ],
+    [
+      0,
+      5,
+      1,
+      5
+    ],
+    [
+      0,
+      6,
+      1,
+      6
+    ],
+    [
+      1,
+      0,
+      1,
+      0
+    ],
+    [
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      1,
+      2,
+      1,
+      2
+    ],
+    [
+      1,
+      3,
+      1,
+      3
+    ],
+    [
+      1,
+      4,
+      1,
+      4
+    ],
+    [
+      1,
+      5,
+      1,
+      5
+    ],
+    [
+      1,
+      6,
+      1,
+      6
+    ],
+    [
+      2,
+      0,
+      1,
+      0
+    ],
+    [
+      2,
+      1,
+      1,
+      1
+    ],
+    [
+      2,
+      2,
+      1,
+      2
+    ],
+    [
+      2,
+      3,
+      1,
+      3
+    ],
+    [
+      2,
+      4,
+      1,
+      4
+    ],
+    [
+      2,
+      5,
+      1,
+      5
+    ],
+    [
+      2,
+      6,
+      1,
+      6
+    ],
+    [
+      3,
+      0,
+      1,
+      0
+    ],
+    [
+      3,
+      1,
+      1,
+      1
+    ],
+    [
+      3,
+      2,
+      1,
+      2
+    ],
+    [
+      3,
+      3,
+      1,
+      3
+    ],
+    [
+      3,
+      4,
+      1,
+      4
+    ],
+    [
+      3,
+      5,
+      1,
+      5
+    ],
+    [
+      3,
+      6,
+      1,
+      6
+    ],
+    [
+      4,
+      0,
+      1,
+      0
+    ],
+    [
+      4,
+      1,
+      1,
+      1
+    ],
+    [
+      4,
+      2,
+      1,
+      2
+    ],
+    [
+      4,
+      3,
+      1,
+      3
+    ],
+    [
+      4,
+      4,
+      1,
+      4
+    ],
+    [
+      4,
+      5,
+      1,
+      5
+    ],
+    [
+      4,
+      6,
+      1,
+      6
+    ],
+    [
+      5,
+      0,
+      1,
+      0
+    ],
+    [
+      5,
+      1,
+      1,
+      1
+    ],
+    [
+      5,
+      2,
+      1,
+      2
+    ],
+    [
+      5,
+      3,
+      1,
+      3
+    ],
+    [
+      5,
+      4,
+      1,
+      4
+    ],
+    [
+      5,
+      5,
+      1,
+      5
+    ],
+    [
+      5,
+      6,
+      1,
+      6
+    ],
+    [
+      6,
+      0,
+      1,
+      0
+    ],
+    [
+      6,
+      1,
+      1,
+      1
+    ],
+    [
+      6,
+      2,
+      1,
+      2
+    ],
+    [
+      6,
+      3,
+      1,
+      3
+    ],
+    [
+      6,
+      4,
+      1,
+      4
+    ],
+    [
+      6,
+      5,
+      1,
+      5
+    ],
+    [
+      6,
+      6,
+      1,
+      6
+    ],
+    [
+      7,
+      0,
+      1,
+      0
+    ],
+    [
+      7,
+      1,
+      1,
+      1
+    ],
+    [
+      7,
+      2,
+      1,
+      2
+    ],
+    [
+      7,
+      3,
+      1,
+      3
+    ],
+    [
+      7,
+      4,
+      1,
+      4
+    ],
+    [
+      7,
+      5,
+      1,
+      5
+    ],
+    [
+      7,
+      6,
+      1,
+      6
+    ],
+    [
+      8,
+      0,
+      1,
+      0
+    ],
+    [
+      8,
+      1,
+      1,
+      1
+    ],
+    [
+      8,
+      2,
+      1,
+      2
+    ],
+    [
+      8,
+      3,
+      1,
+      3
+    ],
+    [
+      8,
+      4,
+      1,
+      4
+    ],
+    [
+      8,
+      5,
+      1,
+      5
+    ],
+    [
+      8,
+      6,
+      1,
+      6
+    ],
+    [
+      9,
+      0,
+      1,
+      0
+    ],
+    [
+      9,
+      1,
+      1,
+      1
+    ],
+    [
+      9,
+      2,
+      1,
+      2
+    ],
+    [
+      9,
+      3,
+      1,
+      3
+    ],
+    [
+      9,
+      4,
+      1,
+      4
+    ],
+    [
+      9,
+      5,
+      1,
+      5
+    ],
+    [
+      9,
+      6,
+      1,
+      6
+    ],
+    [
+      10,
+      0,
+      1,
+      0
+    ],
+    [
+      10,
+      1,
+      1,
+      1
+    ],
+    [
+      10,
+      2,
+      1,
+      2
+    ],
+    [
+      10,
+      3,
+      1,
+      3
+    ],
+    [
+      10,
+      4,
+      1,
+      4
+    ],
+    [
+      10,
+      5,
+      1,
+      5
+    ],
+    [
+      10,
+      6,
+      1,
+      6
+    ],
+    [
+      11,
+      0,
+      1,
+      0
+    ],
+    [
+      11,
+      1,
+      1,
+      1
+    ],
+    [
+      11,
+      2,
+      1,
+      2
+    ],
+    [
+      11,
+      3,
+      1,
+      3
+    ],
+    [
+      11,
+      4,
+      1,
+      4
+    ],
+    [
+      11,
+      5,
+      1,
+      5
+    ],
+    [
+      11,
+      6,
+      1,
+      6
+    ],
+    [
+      0,
+      0,
+      2,
+      0
+    ],
+    [
+      0,
+      1,
+      2,
+      0
+    ],
+    [
+      0,
+      2,
+      2,
+      2
+    ],
+    [
+      0,
+      3,
+      2,
+      3
+    ],
+    [
+      0,
+      4,
+      2,
+      4
+    ],
+    [
+      0,
+      5,
+      2,
+      5
+    ],
+    [
+      0,
+      6,
+      2,
+      6
+    ],
+    [
+      1,
+      0,
+      2,
+      0
+    ],
+    [
+      1,
+      1,
+      2,
+      1
+    ],
+    [
+      1,
+      2,
+      2,
+      2
+    ],
+    [
+      1,
+      3,
+      2,
+      3
+    ],
+    [
+      1,
+      4,
+      2,
+      4
+    ],
+    [
+      1,
+      5,
+      2,
+      5
+    ],
+    [
+      1,
+      6,
+      2,
+      6
+    ],
+    [
+      2,
+      0,
+      2,
+      0
+    ],
+    [
+      2,
+      1,
+      2,
+      0
+    ],
+    [
+      2,
+      2,
+      2,
+      2
+    ],
+    [
+      2,
+      3,
+      2,
+      3
+    ],
+    [
+      2,
+      4,
+      2,
+      4
+    ],
+    [
+      2,
+      5,
+      2,
+      5
+    ],
+    [
+      2,
+      6,
+      2,
+      6
+    ],
+    [
+      3,
+      0,
+      2,
+      0
+    ],
+    [
+      3,
+      1,
+      2,
+      1
+    ],
+    [
+      3,
+      2,
+      2,
+      2
+    ],
+    [
+      3,
+      3,
+      2,
+      3
+    ],
+    [
+      3,
+      4,
+      2,
+      4
+    ],
+    [
+      3,
+      5,
+      2,
+      5
+    ],
+    [
+      3,
+      6,
+      2,
+      6
+    ],
+    [
+      4,
+      0,
+      2,
+      0
+    ],
+    [
+      4,
+      1,
+      2,
+      0
+    ],
+    [
+      4,
+      2,
+      2,
+      2
+    ],
+    [
+      4,
+      3,
+      2,
+      3
+    ],
+    [
+      4,
+      4,
+      2,
+      4
+    ],
+    [
+      4,
+      5,
+      2,
+      5
+    ],
+    [
+      4,
+      6,
+      2,
+      6
+    ],
+    [
+      5,
+      0,
+      2,
+      0
+    ],
+    [
+      5,
+      1,
+      2,
+      1
+    ],
+    [
+      5,
+      2,
+      2,
+      2
+    ],
+    [
+      5,
+      3,
+      2,
+      3
+    ],
+    [
+      5,
+      4,
+      2,
+      4
+    ],
+    [
+      5,
+      5,
+      2,
+      5
+    ],
+    [
+      5,
+      6,
+      2,
+      6
+    ],
+    [
+      6,
+      0,
+      2,
+      0
+    ],
+    [
+      6,
+      1,
+      2,
+      0
+    ],
+    [
+      6,
+      2,
+      2,
+      2
+    ],
+    [
+      6,
+      3,
+      2,
+      3
+    ],
+    [
+      6,
+      4,
+      2,
+      4
+    ],
+    [
+      6,
+      5,
+      2,
+      5
+    ],
+    [
+      6,
+      6,
+      2,
+      6
+    ],
+    [
+      7,
+      0,
+      2,
+      0
+    ],
+    [
+      7,
+      1,
+      2,
+      1
+    ],
+    [
+      7,
+      2,
+      2,
+      2
+    ],
+    [
+      7,
+      3,
+      2,
+      3
+    ],
+    [
+      7,
+      4,
+      2,
+      4
+    ],
+    [
+      7,
+      5,
+      2,
+      5
+    ],
+    [
+      7,
+      6,
+      2,
+      6
+    ],
+    [
+      8,
+      0,
+      2,
+      0
+    ],
+    [
+      8,
+      1,
+      2,
+      0
+    ],
+    [
+      8,
+      2,
+      2,
+      2
+    ],
+    [
+      8,
+      3,
+      2,
+      3
+    ],
+    [
+      8,
+      4,
+      2,
+      4
+    ],
+    [
+      8,
+      5,
+      2,
+      5
+    ],
+    [
+      8,
+      6,
+      2,
+      6
+    ],
+    [
+      9,
+      0,
+      2,
+      0
+    ],
+    [
+      9,
+      1,
+      2,
+      1
+    ],
+    [
+      9,
+      2,
+      2,
+      2
+    ],
+    [
+      9,
+      3,
+      2,
+      3
+    ],
+    [
+      9,
+      4,
+      2,
+      4
+    ],
+    [
+      9,
+      5,
+      2,
+      5
+    ],
+    [
+      9,
+      6,
+      2,
+      6
+    ],
+    [
+      10,
+      0,
+      2,
+      0
+    ],
+    [
+      10,
+      1,
+      2,
+      0
+    ],
+    [
+      10,
+      2,
+      2,
+      2
+    ],
+    [
+      10,
+      3,
+      2,
+      3
+    ],
+    [
+      10,
+      4,
+      2,
+      4
+    ],
+    [
+      10,
+      5,
+      2,
+      5
+    ],
+    [
+      10,
+      6,
+      2,
+      6
+    ],
+    [
+      11,
+      0,
+      2,
+      0
+    ],
+    [
+      11,
+      1,
+      2,
+      1
+    ],
+    [
+      11,
+      2,
+      2,
+      2
+    ],
+    [
+      11,
+      3,
+      2,
+      3
+    ],
+    [
+      11,
+      4,
+      2,
+      4
+    ],
+    [
+      11,
+      5,
+      2,
+      5
+    ],
+    [
+      11,
+      6,
+      2,
+      6
+    ],
+    [
+      0,
+      0,
+      3,
+      0
+    ],
+    [
+      0,
+      1,
+      3,
+      0
+    ],
+    [
+      0,
+      2,
+      3,
+      0
+    ],
+    [
+      0,
+      3,
+      3,
+      3
+    ],
+    [
+      0,
+      4,
+      3,
+      4
+    ],
+    [
+      0,
+      5,
+      3,
+      5
+    ],
+    [
+      0,
+      6,
+      3,
+      6
+    ],
+    [
+      1,
+      0,
+      3,
+      0
+    ],
+    [
+      1,
+      1,
+      3,
+      0
+    ],
+    [
+      1,
+      2,
+      3,
+      2
+    ],
+    [
+      1,
+      3,
+      3,
+      3
+    ],
+    [
+      1,
+      4,
+      3,
+      4
+    ],
+    [
+      1,
+      5,
+      3,
+      5
+    ],
+    [
+      1,
+      6,
+      3,
+      6
+    ],
+    [
+      2,
+      0,
+      3,
+      0
+    ],
+    [
+      2,
+      1,
+      3,
+      1
+    ],
+    [
+      2,
+      2,
+      3,
+      2
+    ],
+    [
+      2,
+      3,
+      3,
+      3
+    ],
+    [
+      2,
+      4,
+      3,
+      4
+    ],
+    [
+      2,
+      5,
+      3,
+      5
+    ],
+    [
+      2,
+      6,
+      3,
+      6
+    ],
+    [
+      3,
+      0,
+      3,
+      0
+    ],
+    [
+      3,
+      1,
+      3,
+      0
+    ],
+    [
+      3,
+      2,
+      3,
+      0
+    ],
+    [
+      3,
+      3,
+      3,
+      3
+    ],
+    [
+      3,
+      4,
+      3,
+      4
+    ],
+    [
+      3,
+      5,
+      3,
+      5
+    ],
+    [
+      3,
+      6,
+      3,
+      6
+    ],
+    [
+      4,
+      0,
+      3,
+      0
+    ],
+    [
+      4,
+      1,
+      3,
+      0
+    ],
+    [
+      4,
+      2,
+      3,
+      2
+    ],
+    [
+      4,
+      3,
+      3,
+      3
+    ],
+    [
+      4,
+      4,
+      3,
+      4
+    ],
+    [
+      4,
+      5,
+      3,
+      5
+    ],
+    [
+      4,
+      6,
+      3,
+      6
+    ],
+    [
+      5,
+      0,
+      3,
+      0
+    ],
+    [
+      5,
+      1,
+      3,
+      1
+    ],
+    [
+      5,
+      2,
+      3,
+      2
+    ],
+    [
+      5,
+      3,
+      3,
+      3
+    ],
+    [
+      5,
+      4,
+      3,
+      4
+    ],
+    [
+      5,
+      5,
+      3,
+      5
+    ],
+    [
+      5,
+      6,
+      3,
+      6
+    ],
+    [
+      6,
+      0,
+      3,
+      0
+    ],
+    [
+      6,
+      1,
+      3,
+      0
+    ],
+    [
+      6,
+      2,
+      3,
+      0
+    ],
+    [
+      6,
+      3,
+      3,
+      3
+    ],
+    [
+      6,
+      4,
+      3,
+      4
+    ],
+    [
+      6,
+      5,
+      3,
+      5
+    ],
+    [
+      6,
+      6,
+      3,
+      6
+    ],
+    [
+      7,
+      0,
+      3,
+      0
+    ],
+    [
+      7,
+      1,
+      3,
+      0
+    ],
+    [
+      7,
+      2,
+      3,
+      2
+    ],
+    [
+      7,
+      3,
+      3,
+      3
+    ],
+    [
+      7,
+      4,
+      3,
+      4
+    ],
+    [
+      7,
+      5,
+      3,
+      5
+    ],
+    [
+      7,
+      6,
+      3,
+      6
+    ],
+    [
+      8,
+      0,
+      3,
+      0
+    ],
+    [
+      8,
+      1,
+      3,
+      1
+    ],
+    [
+      8,
+      2,
+      3,
+      2
+    ],
+    [
+      8,
+      3,
+      3,
+      3
+    ],
+    [
+      8,
+      4,
+      3,
+      4
+    ],
+    [
+      8,
+      5,
+      3,
+      5
+    ],
+    [
+      8,
+      6,
+      3,
+      6
+    ],
+    [
+      9,
+      0,
+      3,
+      0
+    ],
+    [
+      9,
+      1,
+      3,
+      0
+    ],
+    [
+      9,
+      2,
+      3,
+      0
+    ],
+    [
+      9,
+      3,
+      3,
+      3
+    ],
+    [
+      9,
+      4,
+      3,
+      4
+    ],
+    [
+      9,
+      5,
+      3,
+      5
+    ],
+    [
+      9,
+      6,
+      3,
+      6
+    ],
+    [
+      10,
+      0,
+      3,
+      0
+    ],
+    [
+      10,
+      1,
+      3,
+      0
+    ],
+    [
+      10,
+      2,
+      3,
+      2
+    ],
+    [
+      10,
+      3,
+      3,
+      3
+    ],
+    [
+      10,
+      4,
+      3,
+      4
+    ],
+    [
+      10,
+      5,
+      3,
+      5
+    ],
+    [
+      10,
+      6,
+      3,
+      6
+    ],
+    [
+      11,
+      0,
+      3,
+      0
+    ],
+    [
+      11,
+      1,
+      3,
+      1
+    ],
+    [
+      11,
+      2,
+      3,
+      2
+    ],
+    [
+      11,
+      3,
+      3,
+      3
+    ],
+    [
+      11,
+      4,
+      3,
+      4
+    ],
+    [
+      11,
+      5,
+      3,
+      5
+    ],
+    [
+      11,
+      6,
+      3,
+      6
+    ],
+    [
+      0,
+      0,
+      5,
+      0
+    ],
+    [
+      0,
+      1,
+      5,
+      0
+    ],
+    [
+      0,
+      2,
+      5,
+      0
+    ],
+    [
+      0,
+      3,
+      5,
+      0
+    ],
+    [
+      0,
+      4,
+      5,
+      0
+    ],
+    [
+      0,
+      5,
+      5,
+      5
+    ],
+    [
+      0,
+      6,
+      5,
+      6
+    ],
+    [
+      1,
+      0,
+      5,
+      0
+    ],
+    [
+      1,
+      1,
+      5,
+      0
+    ],
+    [
+      1,
+      2,
+      5,
+      0
+    ],
+    [
+      1,
+      3,
+      5,
+      0
+    ],
+    [
+      1,
+      4,
+      5,
+      4
+    ],
+    [
+      1,
+      5,
+      5,
+      5
+    ],
+    [
+      1,
+      6,
+      5,
+      6
+    ],
+    [
+      2,
+      0,
+      5,
+      0
+    ],
+    [
+      2,
+      1,
+      5,
+      0
+    ],
+    [
+      2,
+      2,
+      5,
+      0
+    ],
+    [
+      2,
+      3,
+      5,
+      3
+    ],
+    [
+      2,
+      4,
+      5,
+      4
+    ],
+    [
+      2,
+      5,
+      5,
+      5
+    ],
+    [
+      2,
+      6,
+      5,
+      6
+    ],
+    [
+      3,
+      0,
+      5,
+      0
+    ],
+    [
+      3,
+      1,
+      5,
+      0
+    ],
+    [
+      3,
+      2,
+      5,
+      2
+    ],
+    [
+      3,
+      3,
+      5,
+      3
+    ],
+    [
+      3,
+      4,
+      5,
+      4
+    ],
+    [
+      3,
+      5,
+      5,
+      5
+    ],
+    [
+      3,
+      6,
+      5,
+      6
+    ],
+    [
+      4,
+      0,
+      5,
+      0
+    ],
+    [
+      4,
+      1,
+      5,
+      1
+    ],
+    [
+      4,
+      2,
+      5,
+      2
+    ],
+    [
+      4,
+      3,
+      5,
+      3
+    ],
+    [
+      4,
+      4,
+      5,
+      4
+    ],
+    [
+      4,
+      5,
+      5,
+      5
+    ],
+    [
+      4,
+      6,
+      5,
+      6
+    ],
+    [
+      5,
+      0,
+      5,
+      0
+    ],
+    [
+      5,
+      1,
+      5,
+      0
+    ],
+    [
+      5,
+      2,
+      5,
+      0
+    ],
+    [
+      5,
+      3,
+      5,
+      0
+    ],
+    [
+      5,
+      4,
+      5,
+      0
+    ],
+    [
+      5,
+      5,
+      5,
+      5
+    ],
+    [
+      5,
+      6,
+      5,
+      6
+    ],
+    [
+      6,
+      0,
+      5,
+      0
+    ],
+    [
+      6,
+      1,
+      5,
+      0
+    ],
+    [
+      6,
+      2,
+      5,
+      0
+    ],
+    [
+      6,
+      3,
+      5,
+      0
+    ],
+    [
+      6,
+      4,
+      5,
+      4
+    ],
+    [
+      6,
+      5,
+      5,
+      5
+    ],
+    [
+      6,
+      6,
+      5,
+      6
+    ],
+    [
+      7,
+      0,
+      5,
+      0
+    ],
+    [
+      7,
+      1,
+      5,
+      0
+    ],
+    [
+      7,
+      2,
+      5,
+      0
+    ],
+    [
+      7,
+      3,
+      5,
+      3
+    ],
+    [
+      7,
+      4,
+      5,
+      4
+    ],
+    [
+      7,
+      5,
+      5,
+      5
+    ],
+    [
+      7,
+      6,
+      5,
+      6
+    ],
+    [
+      8,
+      0,
+      5,
+      0
+    ],
+    [
+      8,
+      1,
+      5,
+      0
+    ],
+    [
+      8,
+      2,
+      5,
+      2
+    ],
+    [
+      8,
+      3,
+      5,
+      3
+    ],
+    [
+      8,
+      4,
+      5,
+      4
+    ],
+    [
+      8,
+      5,
+      5,
+      5
+    ],
+    [
+      8,
+      6,
+      5,
+      6
+    ],
+    [
+      9,
+      0,
+      5,
+      0
+    ],
+    [
+      9,
+      1,
+      5,
+      1
+    ],
+    [
+      9,
+      2,
+      5,
+      2
+    ],
+    [
+      9,
+      3,
+      5,
+      3
+    ],
+    [
+      9,
+      4,
+      5,
+      4
+    ],
+    [
+      9,
+      5,
+      5,
+      5
+    ],
+    [
+      9,
+      6,
+      5,
+      6
+    ],
+    [
+      10,
+      0,
+      5,
+      0
+    ],
+    [
+      10,
+      1,
+      5,
+      0
+    ],
+    [
+      10,
+      2,
+      5,
+      0
+    ],
+    [
+      10,
+      3,
+      5,
+      0
+    ],
+    [
+      10,
+      4,
+      5,
+      0
+    ],
+    [
+      10,
+      5,
+      5,
+      5
+    ],
+    [
+      10,
+      6,
+      5,
+      6
+    ],
+    [
+      11,
+      0,
+      5,
+      0
+    ],
+    [
+      11,
+      1,
+      5,
+      0
+    ],
+    [
+      11,
+      2,
+      5,
+      0
+    ],
+    [
+      11,
+      3,
+      5,
+      0
+    ],
+    [
+      11,
+      4,
+      5,
+      4
+    ],
+    [
+      11,
+      5,
+      5,
+      5
+    ],
+    [
+      11,
+      6,
+      5,
+      6
+    ]
+  ]
+}

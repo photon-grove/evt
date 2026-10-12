@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/evt"]
+members = ["crates/evt", "crates/evt-compat"]
 default-members = ["crates/evt"]
 
 [workspace.package]
@@ -16,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = { version = "1", default-features = false }
 tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
