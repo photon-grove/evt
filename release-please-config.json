@@ -6,6 +6,22 @@
       "release-type": "go",
       "package-name": "evt",
       "changelog-path": "CHANGELOG.md"
+    },
+    "crates/evt": {
+      "release-type": "rust",
+      "package-name": "photon-evt",
+      "component": "photon-evt",
+      "include-component-in-tag": true,
+      "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "/Cargo.lock",
+          "jsonpath": "$.package[?(@.name==='photon-evt')].version"
+        }
+      ]
     }
   }
 }
