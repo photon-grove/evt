@@ -20,7 +20,7 @@ pub struct Metadata {
     pub command_id: Option<CommandId>,
 
     /// W3C trace-context carrier (for example `traceparent`). Keys serialize in sorted order.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "trace_carrier")]
     pub trace: Option<BTreeMap<String, String>>,
 
     /// The system and entry point that initiated the command.
@@ -114,6 +114,21 @@ impl Metadata {
     }
 }
 
+/// Decodes the trace carrier, reading `null` values as `""` the way Go's `encoding/json` does for a
+/// `map[string]string`.
+fn trace_carrier<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, String>>, D::Error> {
+    let carrier = Option::<BTreeMap<String, Option<String>>>::deserialize(deserializer)?;
+
+    Ok(carrier.map(|carrier| {
+        carrier
+            .into_iter()
+            .map(|(key, value)| (key, value.unwrap_or_default()))
+            .collect()
+    }))
+}
+
 /// Formats the current time as RFC 3339 UTC with second precision, matching Go's
 /// `time.Now().UTC().Format(time.RFC3339)`.
 pub fn rfc3339_now() -> String {
@@ -169,6 +184,20 @@ mod tests {
         assert_eq!(format_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(format_rfc3339(1_791_763_200), "2026-10-12T00:00:00Z");
         assert_eq!(format_rfc3339(1_791_766_861), "2026-10-12T01:01:01Z");
+    }
+
+    #[test]
+    fn null_trace_values_decode_to_empty_strings() {
+        let metadata: Metadata =
+            serde_json::from_str(r#"{"trace":{"traceparent":null,"tracestate":"a"}}"#).unwrap();
+
+        assert_eq!(
+            metadata.trace,
+            Some(BTreeMap::from([
+                ("traceparent".to_owned(), String::new()),
+                ("tracestate".to_owned(), "a".to_owned()),
+            ]))
+        );
     }
 
     #[test]
