@@ -513,10 +513,47 @@ fn put(
         .build())
 }
 
-/// Maps a failed commit to an error. Cancellation reasons are in transaction order: the first
-/// `operations` belong to projectors, the rest to the stream's events and snapshot. Only a failed
-/// stream condition is an optimistic-concurrency conflict; a failed projector condition is a
-/// projector error, so `execute_with_retry` does not rerun the command for it.
+/// How a cancelled commit transaction failed.
+#[derive(Debug, PartialEq, Eq)]
+enum Cancellation {
+    /// A stream event or snapshot condition failed: another writer moved the stream.
+    StreamCondition,
+    /// Only projector conditions failed. Reloading cannot fix it.
+    ProjectorCondition,
+    /// Another transaction was writing the same items at the same time.
+    TransactionConflict,
+}
+
+/// Classifies cancellation reason codes, which are in transaction order: the first `operations`
+/// belong to projectors, the rest to the stream's events and snapshot.
+fn classify_cancellation(operations: usize, codes: &[Option<&str>]) -> Option<Cancellation> {
+    let failed = |code| failed_items(codes, code);
+
+    if failed("ConditionalCheckFailed").any(|index| index >= operations) {
+        return Some(Cancellation::StreamCondition);
+    }
+    if failed("ConditionalCheckFailed").next().is_some() {
+        return Some(Cancellation::ProjectorCondition);
+    }
+    if failed("TransactionConflict").next().is_some() {
+        return Some(Cancellation::TransactionConflict);
+    }
+
+    None
+}
+
+/// The indexes of the transaction items cancelled with the given reason code.
+fn failed_items<'a>(codes: &'a [Option<&str>], code: &'a str) -> impl Iterator<Item = usize> + 'a {
+    codes
+        .iter()
+        .enumerate()
+        .filter(move |(_, reason)| **reason == Some(code))
+        .map(|(index, _)| index)
+}
+
+/// Maps a failed commit to an error. A failed stream condition or a concurrent transaction is an
+/// optimistic-concurrency conflict, which `execute_with_retry` retries. A failed projector
+/// condition is a projector error, so the command is not rerun for it.
 fn classify_transaction_error<R>(
     entity_id: &EntityId,
     operations: usize,
@@ -525,33 +562,33 @@ fn classify_transaction_error<R>(
 where
     R: std::fmt::Debug + Send + Sync + 'static,
 {
-    let failed_conditions: Vec<usize> = match &err {
+    let codes: Vec<Option<&str>> = match &err {
         SdkError::ServiceError(service) => match service.err() {
             TransactWriteItemsError::TransactionCanceledException(cancelled) => cancelled
                 .cancellation_reasons()
                 .iter()
-                .enumerate()
-                .filter(|(_, reason)| reason.code() == Some("ConditionalCheckFailed"))
-                .map(|(index, _)| index)
+                .map(|reason| reason.code())
                 .collect(),
             _ => Vec::new(),
         },
         _ => Vec::new(),
     };
 
-    if failed_conditions.iter().any(|index| *index >= operations) {
-        return Error::Conflict {
-            entity_id: entity_id.clone(),
-            message: "conditional check failed: the sequence or snapshot changed since it was read"
-                .into(),
-        };
-    }
+    let conflict = |message: &str| Error::Conflict {
+        entity_id: entity_id.clone(),
+        message: message.into(),
+    };
 
-    if !failed_conditions.is_empty() {
-        return Error::Projector(Box::new(err));
+    match classify_cancellation(operations, &codes) {
+        Some(Cancellation::StreamCondition) => {
+            conflict("conditional check failed: the sequence or snapshot changed since it was read")
+        }
+        Some(Cancellation::TransactionConflict) => {
+            conflict("transaction conflict: another writer was committing at the same time")
+        }
+        Some(Cancellation::ProjectorCondition) => Error::Projector(Box::new(err)),
+        None => Error::backend(err),
     }
-
-    Error::backend(err)
 }
 
 fn s(value: &str) -> sdk::AttributeValue {
@@ -631,5 +668,41 @@ fn from_sdk(value: &sdk::AttributeValue) -> AttributeValue {
                 .collect(),
         ),
         _ => AttributeValue::Null(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_cancellations_by_item() {
+        const CHECK: Option<&str> = Some("ConditionalCheckFailed");
+        const CONFLICT: Option<&str> = Some("TransactionConflict");
+        const NONE: Option<&str> = Some("None");
+
+        let cases = [
+            (vec![NONE, CHECK], Some(Cancellation::StreamCondition)),
+            (vec![CHECK, CHECK], Some(Cancellation::StreamCondition)),
+            (vec![CHECK, NONE], Some(Cancellation::ProjectorCondition)),
+            (
+                vec![CHECK, CONFLICT],
+                Some(Cancellation::ProjectorCondition),
+            ),
+            (
+                vec![NONE, CONFLICT],
+                Some(Cancellation::TransactionConflict),
+            ),
+            (
+                vec![CONFLICT, NONE],
+                Some(Cancellation::TransactionConflict),
+            ),
+            (vec![NONE, Some("ValidationError")], None),
+            (vec![], None),
+        ];
+
+        for (codes, want) in cases {
+            assert_eq!(classify_cancellation(1, &codes), want, "{codes:?}");
+        }
     }
 }

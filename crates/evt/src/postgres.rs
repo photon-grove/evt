@@ -236,7 +236,7 @@ impl Repository for PostgresRepository {
                 .collect();
             tx.execute(&statement.sql, &params)
                 .await
-                .map_err(Error::backend)?;
+                .map_err(|err| Error::Projector(Box::new(err)))?;
         }
 
         let insert = format!(
