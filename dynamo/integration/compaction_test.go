@@ -89,7 +89,7 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_RebuildAfterCompaction(
 	// Snapshot-aware rebuild reproduces the same state from snapshot + tail.
 	var rebuilt evt.Entity
 	count := 0
-	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, "", seedIntegrationEntity, applyIntegrationEvent) {
+	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, test.EntityType, seedIntegrationEntity, applyIntegrationEvent) {
 		entity, uerr := res.Unwrap()
 		require.NoError(s.T(), uerr)
 		if entity.GetID() == id {
