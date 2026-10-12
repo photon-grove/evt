@@ -4,8 +4,9 @@
 //! It checks the contract documented on [`Repository`] (ordering, isolation, optimistic
 //! concurrency, snapshots, compaction, entity heads) and the [`Store`] behavior built on it
 //! (snapshot-aware loads, stale-commit conflicts, retries, duplicate commands, and in-band
-//! projector operations that commit atomically with events). Every case namespaces its entity IDs
-//! and types, so durable backends can share one table across runs.
+//! projector operations that commit atomically with events). Every case namespaces its entity IDs,
+//! so durable backends can share one table across runs. The repository cases also namespace entity
+//! types; the [`Store`] cases use the [`Ledger`] type, so a shared table accumulates `ledger` rows.
 //!
 //! ```
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {

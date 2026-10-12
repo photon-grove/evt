@@ -151,7 +151,8 @@ operations, one put per event, then the snapshot put if the commit takes one.
 
 A transaction cancelled with a `ConditionalCheckFailed` reason is an optimistic-concurrency
 conflict: another writer committed the same sequence or moved the snapshot. The caller reloads and
-retries. A failed condition on a projector operation is a projector error, not a conflict, so it is
+retries. A cancellation reason of `TransactionConflict` (another transaction writing the same items
+at the same time) is also a conflict. A failed condition on a projector operation is a projector error, not a conflict, so it is
 not retried. A failed out-of-band snapshot condition is not an error; the newer snapshot stays.
 
 ### Reads
@@ -208,7 +209,8 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
 ```
 
 - A commit is one transaction: projector statements, one insert per event, then the snapshot
-  upsert.
+  upsert. Projector statements are Rust-only: Go's `postgres.Repository` ignores projector
+  transaction groups. A failed projector statement is a projector error.
 - A unique violation (`23505`) on the event primary key is an optimistic-concurrency conflict.
 - The snapshot upsert only replaces a snapshot whose `event_sequence` is lower or equal
   (`ON CONFLICT (entity_id) DO UPDATE … WHERE EXCLUDED.event_sequence >= evt_snapshots.event_sequence`).
