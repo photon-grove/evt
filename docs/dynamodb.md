@@ -7,7 +7,9 @@ the snapshot, compaction, and retention options for growing logs.
 
 > The key patterns, attribute names, and serialized formats below are a stability
 > contract. Treat changes to them as breaking and document them. See
-> [`BEHAVIORAL_INVARIANTS.md`](https://github.com/photon-grove/evt/blob/main/BEHAVIORAL_INVARIANTS.md).
+> [`BEHAVIORAL_INVARIANTS.md`](https://github.com/photon-grove/evt/blob/main/BEHAVIORAL_INVARIANTS.md)
+> and the [storage format](spec/storage-format.md), which the Rust `photon-evt`
+> crate implements too: Go and Rust services can share one table.
 
 ## Wiring
 

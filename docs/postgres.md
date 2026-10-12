@@ -4,7 +4,9 @@ The `evt/postgres` package implements the same backend-neutral `evt.Repository`
 and `evt.Store` contracts as DynamoDB, on a relational store. The aggregate,
 projector, and snapshot code you write does not change between backends — only
 the wiring does. The backend passes `conformance.RunRepositorySuite` with
-`SupportsSnapshots` and `EnforcesOptimisticConcurrency` enabled.
+`SupportsSnapshots` and `EnforcesOptimisticConcurrency` enabled. The Rust
+`photon-evt` crate reads and writes the same tables (see the
+[storage format](spec/storage-format.md)).
 
 ## Wiring
 

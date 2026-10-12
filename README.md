@@ -2,7 +2,7 @@
 
 **Event sourcing for Go without a framework runtime.**
 
-[Documentation](https://photon-grove.github.io/evt/) · [Concepts](docs/concepts.md) · [Getting Started](docs/getting-started.md) · [Invariants](BEHAVIORAL_INVARIANTS.md)
+[Documentation](https://photon-grove.github.io/evt/) · [Concepts](docs/concepts.md) · [Getting Started](docs/getting-started.md) · [Invariants](BEHAVIORAL_INVARIANTS.md) · [Storage Format](docs/spec/storage-format.md)
 
 `evt` provides append-only logs, optimistic concurrency, snapshots, replayable
 read models, and DynamoDB or PostgreSQL persistence as small Go packages. There
@@ -27,6 +27,9 @@ your application needs.
   target changed entities.
 - **DynamoDB Streams support.** A publisher fans committed events out over SNS to
   idempotent projectors with retry classification.
+- **A Rust crate shares the log.** [`photon-evt`](crates/evt) reads and writes the
+  same DynamoDB items, PostgreSQL rows, and stream envelopes, byte for byte, so Go
+  and Rust services can append to the same streams.
 
 ## Install
 
@@ -113,6 +116,16 @@ account, err := evt.ExecuteWithFactory(ctx, store, func() evt.Entity {
 
 All packages live under `github.com/photon-grove/evt`.
 
+## Rust
+
+The [`photon-evt`](crates/evt) crate is a native Rust implementation of the same
+event log: aggregates, a snapshotting store, upcasters, compaction, in-band
+projectors, and DynamoDB and PostgreSQL repositories. It is not a binding to the Go
+code. The [storage format](docs/spec/storage-format.md) is the contract between the
+two; golden fixtures and a live run where Go and Rust take turns writing the same
+streams enforce it (see [`compat/`](compat) and
+[ADR 0003](docs/adr/0003-rust-implementation-and-cross-language-compatibility.md)).
+
 ## Core Discipline
 
 **Event rows are the source of truth. View rows are derived state.** Any projection
@@ -147,6 +160,13 @@ go test ./...
 moon run evt:test
 ```
 
+The Rust toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on first use:
+
+```sh
+cargo test --workspace
+moon run evt-rust:check evt-rust:test
+```
+
 DynamoDB integration tests run against a local AWS emulator (Moto), not real AWS:
 
 ```sh
@@ -165,6 +185,10 @@ terraform -chdir=infra/local-postgres init
 terraform -chdir=infra/local-postgres apply -auto-approve
 moon run evt:integration-postgres
 ```
+
+With both stacks running, `moon run evt-rust:integration evt-rust:integration-postgres`
+runs the Rust conformance suite and the Go/Rust cross-language suite against each
+backend.
 
 ## Documentation
 
