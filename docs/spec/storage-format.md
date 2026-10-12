@@ -151,7 +151,8 @@ operations, one put per event, then the snapshot put if the commit takes one.
 
 A transaction cancelled with a `ConditionalCheckFailed` reason is an optimistic-concurrency
 conflict: another writer committed the same sequence or moved the snapshot. The caller reloads and
-retries. A failed out-of-band snapshot condition is not an error; the newer snapshot stays.
+retries. A failed condition on a projector operation is a projector error, not a conflict, so it is
+not retried. A failed out-of-band snapshot condition is not an error; the newer snapshot stays.
 
 ### Reads
 
@@ -279,6 +280,11 @@ never rewritten. A failed upcast or decode fails the load.
   compaction-uncovered error.
 - Never deletes the snapshot. `through < 1` is a no-op. It is idempotent.
 - A compacted stream must be loaded or rebuilt from its snapshot, never by replaying from sequence 1.
+- Known limitation, shared by both languages: compaction deletes the rows that the event-sequence
+  condition relies on. A writer that loaded the stream before the covering snapshot and commits
+  without a snapshot after compaction can write a sequence at or below the snapshot's
+  `eventSequence`. Loads ignore such rows, but the commit's projector operations still apply. See
+  ADR 0001, "stale-context sequence reuse".
 
 See [ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
 
