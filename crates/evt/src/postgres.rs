@@ -1,0 +1,395 @@
+//! A PostgreSQL event log, row-for-row compatible with Go's `postgres.Repository`.
+//!
+//! It uses a [`deadpool_postgres::Pool`]. Call [`PostgresRepository::ensure_schema`] at startup;
+//! it runs the same idempotent DDL as Go's `EnsureSchema`. See [`crate::wire::postgres`] for the
+//! table layout.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use deadpool_postgres::{GenericClient, Pool};
+use tokio_postgres::error::SqlState;
+use tokio_postgres::types::ToSql;
+
+use crate::error::Error;
+use crate::event::{SerializedEvent, SerializedSnapshot};
+use crate::ids::{EntityId, EntityType, EventSequence};
+use crate::repository::{Commit, Repository};
+use crate::wire::postgres::{
+    DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, EventRow, SnapshotRow, is_valid_identifier,
+    schema_ddl,
+};
+
+/// A SQL statement that an in-band projector adds to a commit. It runs in the same transaction
+/// as the events, before them.
+pub struct PgStatement {
+    /// The SQL text, with `$1`-style placeholders.
+    pub sql: String,
+    /// The parameters.
+    pub params: Vec<Box<dyn ToSql + Sync + Send>>,
+}
+
+impl PgStatement {
+    /// Creates a statement.
+    pub fn new(sql: impl Into<String>, params: Vec<Box<dyn ToSql + Sync + Send>>) -> Self {
+        Self {
+            sql: sql.into(),
+            params,
+        }
+    }
+}
+
+impl fmt::Debug for PgStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PgStatement")
+            .field("sql", &self.sql)
+            .field("params", &self.params.len())
+            .finish()
+    }
+}
+
+/// A PostgreSQL-backed [`Repository`]. Clones share the pool.
+#[derive(Clone)]
+pub struct PostgresRepository {
+    pool: Pool,
+    events_table: String,
+    snapshots_table: String,
+}
+
+impl fmt::Debug for PostgresRepository {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresRepository")
+            .field("events_table", &self.events_table)
+            .field("snapshots_table", &self.snapshots_table)
+            .finish_non_exhaustive()
+    }
+}
+
+const EVENT_COLUMNS: &str =
+    "event_id, sequence, event_type, version, entity_id, entity_type, payload, metadata::text";
+
+impl PostgresRepository {
+    /// Creates a repository using the default tables (`evt_events`, `evt_snapshots`).
+    pub fn new(pool: Pool) -> Self {
+        Self {
+            pool,
+            events_table: DEFAULT_EVENTS_TABLE.to_owned(),
+            snapshots_table: DEFAULT_SNAPSHOTS_TABLE.to_owned(),
+        }
+    }
+
+    /// Uses other table names, so several logical event logs can share a database. Names must be
+    /// plain SQL identifiers.
+    pub fn with_tables(mut self, events_table: &str, snapshots_table: &str) -> Result<Self, Error> {
+        for name in [events_table, snapshots_table] {
+            if !is_valid_identifier(name) {
+                return Err(Error::backend(format!(
+                    "postgres: invalid table name {name:?}"
+                )));
+            }
+        }
+
+        self.events_table = events_table.to_owned();
+        self.snapshots_table = snapshots_table.to_owned();
+
+        Ok(self)
+    }
+
+    /// The connection pool.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// Creates the event and snapshot tables if they do not exist.
+    pub async fn ensure_schema(&self) -> Result<(), Error> {
+        let client = self.pool.get().await.map_err(Error::backend)?;
+        client
+            .batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
+            .await
+            .map_err(Error::backend)
+    }
+
+    /// Returns the raw event rows for an entity, ascending. Intended for diagnostics and
+    /// compatibility checks.
+    pub async fn event_rows(&self, entity_id: &EntityId) -> Result<Vec<EventRow>, Error> {
+        self.select_events(entity_id, None).await
+    }
+
+    /// Returns the raw snapshot row for an entity.
+    pub async fn snapshot_row(&self, entity_id: &EntityId) -> Result<Option<SnapshotRow>, Error> {
+        let client = self.pool.get().await.map_err(Error::backend)?;
+        let sql = format!(
+            "SELECT entity_type, entity_id, sequence, event_sequence, payload FROM {} WHERE entity_id = $1",
+            self.snapshots_table
+        );
+
+        let row = client
+            .query_opt(&sql, &[&entity_id.as_str()])
+            .await
+            .map_err(Error::backend)?;
+
+        Ok(row.map(|row| SnapshotRow {
+            entity_type: row.get(0),
+            entity_id: row.get(1),
+            sequence: row.get(2),
+            event_sequence: row.get(3),
+            payload: row.get(4),
+        }))
+    }
+
+    async fn select_events(
+        &self,
+        entity_id: &EntityId,
+        after: Option<EventSequence>,
+    ) -> Result<Vec<EventRow>, Error> {
+        let client = self.pool.get().await.map_err(Error::backend)?;
+
+        let rows = match after {
+            None => {
+                let sql = format!(
+                    "SELECT {EVENT_COLUMNS} FROM {} WHERE entity_id = $1 ORDER BY sequence ASC",
+                    self.events_table
+                );
+                client.query(&sql, &[&entity_id.as_str()]).await
+            }
+            Some(after) => {
+                let sql = format!(
+                    "SELECT {EVENT_COLUMNS} FROM {} WHERE entity_id = $1 AND sequence > $2 ORDER BY sequence ASC",
+                    self.events_table
+                );
+                client.query(&sql, &[&entity_id.as_str(), &after.0]).await
+            }
+        }
+        .map_err(Error::backend)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| EventRow {
+                event_id: row.get(0),
+                sequence: row.get(1),
+                event_type: row.get(2),
+                version: row.get(3),
+                entity_id: row.get(4),
+                entity_type: row.get(5),
+                payload: row.get(6),
+                metadata: row.get(7),
+            })
+            .collect())
+    }
+
+    async fn upsert_snapshot(
+        &self,
+        client: &impl GenericClient,
+        snapshot: &SnapshotRow,
+    ) -> Result<u64, Error> {
+        let sql = format!(
+            "INSERT INTO {table} (entity_id, entity_type, sequence, event_sequence, payload, updated_at)
+             VALUES ($1, $2, $3, $4, $5, now())
+             ON CONFLICT (entity_id) DO UPDATE SET
+                 entity_type = EXCLUDED.entity_type,
+                 sequence = EXCLUDED.sequence,
+                 event_sequence = EXCLUDED.event_sequence,
+                 payload = EXCLUDED.payload,
+                 updated_at = now()
+             WHERE EXCLUDED.event_sequence >= {table}.event_sequence",
+            table = self.snapshots_table
+        );
+
+        client
+            .execute(
+                &sql,
+                &[
+                    &snapshot.entity_id,
+                    &snapshot.entity_type,
+                    &snapshot.sequence,
+                    &snapshot.event_sequence,
+                    &snapshot.payload,
+                ],
+            )
+            .await
+            .map_err(Error::backend)
+    }
+}
+
+impl Repository for PostgresRepository {
+    type Operation = PgStatement;
+
+    async fn commit(&self, commit: Commit<PgStatement>) -> Result<(), Error> {
+        let Some(last_sequence) = commit.events.last().map(|event| event.sequence) else {
+            return Ok(());
+        };
+
+        let rows = commit
+            .events
+            .iter()
+            .map(EventRow::from_event)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut client = self.pool.get().await.map_err(Error::backend)?;
+        let tx = client.transaction().await.map_err(Error::backend)?;
+
+        for statement in &commit.operations {
+            let params: Vec<&(dyn ToSql + Sync)> = statement
+                .params
+                .iter()
+                .map(|param| param.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            tx.execute(&statement.sql, &params)
+                .await
+                .map_err(Error::backend)?;
+        }
+
+        let insert = format!(
+            "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)",
+            self.events_table
+        );
+
+        for row in &rows {
+            tx.execute(
+                &insert,
+                &[
+                    &row.entity_id,
+                    &row.sequence,
+                    &row.event_id,
+                    &row.event_type,
+                    &row.version,
+                    &row.entity_type,
+                    &row.payload,
+                    &row.metadata,
+                ],
+            )
+            .await
+            .map_err(|err| classify(&commit.entity_id, err))?;
+        }
+
+        if let Some(snapshot) = commit.snapshot {
+            let row = SnapshotRow {
+                entity_id: commit.entity_id.to_string(),
+                entity_type: snapshot.entity_type.to_string(),
+                sequence: snapshot.sequence.0,
+                event_sequence: last_sequence.0,
+                payload: snapshot.payload,
+            };
+            self.upsert_snapshot(&tx, &row).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|err| classify(&commit.entity_id, err))
+    }
+
+    async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
+        self.select_events(entity_id, None)
+            .await?
+            .into_iter()
+            .map(EventRow::into_event)
+            .collect()
+    }
+
+    async fn events_after(
+        &self,
+        entity_id: &EntityId,
+        after: EventSequence,
+    ) -> Result<Vec<SerializedEvent>, Error> {
+        self.select_events(entity_id, Some(after))
+            .await?
+            .into_iter()
+            .map(EventRow::into_event)
+            .collect()
+    }
+
+    async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
+        Ok(self
+            .snapshot_row(entity_id)
+            .await?
+            .map(SnapshotRow::into_snapshot))
+    }
+
+    async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+        let client = self.pool.get().await.map_err(Error::backend)?;
+        let written = self
+            .upsert_snapshot(&client, &SnapshotRow::from_snapshot(snapshot))
+            .await?;
+
+        Ok(written > 0)
+    }
+
+    async fn compact_below(
+        &self,
+        entity_id: &EntityId,
+        through: EventSequence,
+    ) -> Result<usize, Error> {
+        if through < EventSequence(1) {
+            return Ok(0);
+        }
+
+        let covered = self
+            .snapshot(entity_id)
+            .await?
+            .map(|snapshot| snapshot.event_sequence);
+        if covered.is_none_or(|covered| covered < through) {
+            return Err(Error::CompactionUncovered {
+                entity_id: entity_id.clone(),
+                through,
+                covered,
+            });
+        }
+
+        let client = self.pool.get().await.map_err(Error::backend)?;
+        let sql = format!(
+            "DELETE FROM {} WHERE entity_id = $1 AND sequence >= 1 AND sequence <= $2",
+            self.events_table
+        );
+        let deleted = client
+            .execute(&sql, &[&entity_id.as_str(), &through.0])
+            .await
+            .map_err(Error::backend)?;
+
+        Ok(deleted as usize)
+    }
+
+    async fn entity_heads(
+        &self,
+        entity_type: Option<&EntityType>,
+    ) -> Result<BTreeMap<EntityId, EventSequence>, Error> {
+        let client = self.pool.get().await.map_err(Error::backend)?;
+        let sql = format!(
+            "SELECT entity_id, MAX(head) AS head FROM (
+                 SELECT entity_id, sequence AS head, entity_type FROM {}
+                 UNION ALL
+                 SELECT entity_id, event_sequence AS head, entity_type FROM {}
+             ) sources
+             WHERE $1 = '' OR entity_type = $1
+             GROUP BY entity_id",
+            self.events_table, self.snapshots_table
+        );
+        let filter = entity_type.map(EntityType::as_str).unwrap_or_default();
+
+        let rows = client
+            .query(&sql, &[&filter])
+            .await
+            .map_err(Error::backend)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    EntityId::new(row.get::<_, String>(0)),
+                    EventSequence(row.get(1)),
+                )
+            })
+            .collect())
+    }
+}
+
+fn classify(entity_id: &EntityId, err: tokio_postgres::Error) -> Error {
+    if err.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+        return Error::Conflict {
+            entity_id: entity_id.clone(),
+            message: err.to_string(),
+        };
+    }
+
+    Error::backend(err)
+}

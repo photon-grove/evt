@@ -1,0 +1,37 @@
+[package]
+name = "photon-evt"
+version = "0.1.0"
+description = "Event sourcing for Rust with DynamoDB and PostgreSQL event logs that are wire-compatible with the Go evt framework."
+readme = "README.md"
+keywords = ["event-sourcing", "cqrs", "dynamodb", "postgres", "ddd"]
+categories = ["database", "asynchronous"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
+
+[features]
+default = []
+# DynamoDB event log via the AWS SDK. Bring your own `aws_sdk_dynamodb::Client`.
+dynamodb = ["dep:aws-sdk-dynamodb"]
+# PostgreSQL event log via tokio-postgres with a deadpool connection pool.
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+# The backend conformance suite (`photon_evt::conformance`), for testing Repository implementations.
+conformance = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+aws-sdk-dynamodb = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
