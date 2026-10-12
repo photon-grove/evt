@@ -280,6 +280,7 @@ impl Repository for DynamoRepository {
             return Ok(());
         };
 
+        let operations = commit.operations.len();
         let mut items = commit.operations;
 
         for event in &commit.events {
@@ -321,7 +322,7 @@ impl Repository for DynamoRepository {
             .send()
             .await
             .map(|_| ())
-            .map_err(|err| classify_transaction_error(&commit.entity_id, err))
+            .map_err(|err| classify_transaction_error(&commit.entity_id, operations, err))
     }
 
     async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
@@ -512,25 +513,42 @@ fn put(
         .build())
 }
 
+/// Maps a failed commit to an error. Cancellation reasons are in transaction order: the first
+/// `operations` belong to projectors, the rest to the stream's events and snapshot. Only a failed
+/// stream condition is an optimistic-concurrency conflict; a failed projector condition is a
+/// projector error, so `execute_with_retry` does not rerun the command for it.
 fn classify_transaction_error<R>(
     entity_id: &EntityId,
+    operations: usize,
     err: SdkError<TransactWriteItemsError, R>,
 ) -> Error
 where
     R: std::fmt::Debug + Send + Sync + 'static,
 {
-    if let SdkError::ServiceError(service) = &err
-        && let TransactWriteItemsError::TransactionCanceledException(cancelled) = service.err()
-        && cancelled
-            .cancellation_reasons()
-            .iter()
-            .any(|reason| reason.code() == Some("ConditionalCheckFailed"))
-    {
+    let failed_conditions: Vec<usize> = match &err {
+        SdkError::ServiceError(service) => match service.err() {
+            TransactWriteItemsError::TransactionCanceledException(cancelled) => cancelled
+                .cancellation_reasons()
+                .iter()
+                .enumerate()
+                .filter(|(_, reason)| reason.code() == Some("ConditionalCheckFailed"))
+                .map(|(index, _)| index)
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+
+    if failed_conditions.iter().any(|index| *index >= operations) {
         return Error::Conflict {
             entity_id: entity_id.clone(),
             message: "conditional check failed: the sequence or snapshot changed since it was read"
                 .into(),
         };
+    }
+
+    if !failed_conditions.is_empty() {
+        return Error::Projector(Box::new(err));
     }
 
     Error::backend(err)

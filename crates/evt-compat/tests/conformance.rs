@@ -5,15 +5,18 @@
 //! cargo test -p evt-compat --features drivers --test conformance
 //! ```
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use deadpool_postgres::Pool;
 use evt_compat::drivers;
-use photon_evt::conformance::{Ledger, LedgerEvent, Suite, ViewTarget};
+use photon_evt::conformance::{Add, Ledger, LedgerEvent, Suite, ViewTarget};
 use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository};
 use photon_evt::wire::dynamo::DEFAULT_VIEW_SORT_KEY;
-use photon_evt::{Aggregate, BoxError, EntityId, Projector, json};
-
-use aws_sdk_dynamodb::types::AttributeValue;
+use photon_evt::{
+    Aggregate, BoxError, EntityId, Error, Metadata, Projector, Repository, Store, json,
+};
 
 /// Reads the single-item views `ViewProjector` writes.
 struct DynamoViews {
@@ -129,6 +132,53 @@ async fn dynamo_conforms() {
     };
 
     Suite::new(&repository).with_views(views).run().await;
+}
+
+/// Writes a view only if it already exists, so its condition fails for a new entity.
+struct RequireExistingView {
+    table: String,
+}
+
+impl Projector<Ledger, TransactWriteItem> for RequireExistingView {
+    fn project(
+        &self,
+        entity_id: &EntityId,
+        _: &Ledger,
+        _: &[LedgerEvent],
+    ) -> Result<Vec<TransactWriteItem>, BoxError> {
+        let put = Put::builder()
+            .table_name(&self.table)
+            .item("pk", AttributeValue::S(format!("missing#{entity_id}")))
+            .item("sk", AttributeValue::S(DEFAULT_VIEW_SORT_KEY.into()))
+            .condition_expression("attribute_exists(pk)")
+            .build()?;
+
+        Ok(vec![TransactWriteItem::builder().put(put).build()])
+    }
+}
+
+#[tokio::test]
+async fn dynamo_projector_condition_failure_is_not_a_conflict() {
+    let repository = drivers::dynamo().await;
+    let store = Store::<Ledger, _>::new(&repository, ()).with_projector(RequireExistingView {
+        table: drivers::views_table(),
+    });
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = EntityId::new(format!("conf-{nanos}-projector-condition"));
+
+    let err = store
+        .execute_with_retry(&id, Add(1), Metadata::new("local"), 3)
+        .await
+        .expect_err("the projector condition fails");
+
+    assert!(
+        matches!(err.as_store_error(), Some(Error::Projector(_))),
+        "want a projector error, got {err:?}"
+    );
+    assert!(repository.events(&id).await.unwrap().is_empty());
 }
 
 #[tokio::test]
