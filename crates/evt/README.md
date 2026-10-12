@@ -130,8 +130,10 @@ A `Store` is `Send + Sync` when its repository and services are, so share it wit
 `dyn Repository`: pick the backend with a generic parameter, or wrap the backends in an enum.
 
 `Store::execute` is not cancellation safe. If its future is dropped while the commit is in flight,
-the events may or may not have been stored. Reload before deciding what to do, and set a command
-ID so running the command again is safe.
+the events may or may not have been stored. Reload before deciding what to do. A command ID only
+catches the repeat while the first run's events are after the latest snapshot: if that commit also
+wrote a snapshot, the reloaded entity no longer sees the ID, and running the command again applies
+it twice.
 
 ## DynamoDB
 

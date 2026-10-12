@@ -152,7 +152,8 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// Not cancellation safe. If the future is dropped while the commit is in flight, the events
     /// may or may not have been stored. The same holds for a commit that fails with
     /// [`Error::Backend`] after a timeout. Reload the entity before deciding what to do. A command
-    /// ID in `metadata` makes running it again safe while no snapshot has been taken since.
+    /// ID in `metadata` catches the repeat only if the lost commit did not write a snapshot and
+    /// none has been written since, because IDs folded into a snapshot are no longer checked.
     pub async fn execute(
         &self,
         entity_id: impl Into<EntityId>,
