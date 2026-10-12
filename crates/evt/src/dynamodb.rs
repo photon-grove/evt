@@ -639,37 +639,54 @@ where
         }
         Some(Cancellation::ProjectorCondition) => Error::Projector(Box::new(err)),
         Some(Cancellation::Throttled) => Error::Transient(Box::new(err)),
-        None => sdk_error(err),
+        // A failed commit is only retryable when DynamoDB rejected it. After a timeout or a lost
+        // response the transaction may have been applied, and running the command again would
+        // write its events twice.
+        None if throttled(&err) => Error::Transient(Box::new(err)),
+        None => Error::backend(err),
     }
 }
 
-/// Maps an SDK error, marking failures that may succeed on retry as [`Error::Transient`]: timeouts,
-/// dispatch failures, throttling, and internal server errors. The SDK has already retried these
-/// with its own retry policy by the time they reach here.
+/// Maps an SDK error from a read or an idempotent write, marking failures that may succeed on
+/// retry as [`Error::Transient`]: throttling, timeouts, dispatch failures, and internal server
+/// errors. The SDK has already retried these with its own retry policy by the time they reach here.
+/// Commits use [`classify_transaction_error`] instead, because a timed-out commit may have landed.
 fn sdk_error<E, R>(err: SdkError<E, R>) -> Error
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
     R: std::fmt::Debug + Send + Sync + 'static,
 {
-    let transient = match &err {
+    let outcome_unknown = match &err {
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => true,
+        SdkError::ServiceError(service) => matches!(
+            service.err().code(),
+            Some("InternalServerError" | "TransactionInProgressException")
+        ),
+        _ => false,
+    };
+
+    if outcome_unknown || throttled(&err) {
+        Error::Transient(Box::new(err))
+    } else {
+        Error::backend(err)
+    }
+}
+
+/// Reports whether DynamoDB rejected the request for capacity, so it did not take effect.
+fn throttled<E, R>(err: &SdkError<E, R>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    match err {
         SdkError::ServiceError(service) => matches!(
             service.err().code(),
             Some(
                 "ThrottlingException"
                     | "ProvisionedThroughputExceededException"
                     | "RequestLimitExceeded"
-                    | "TransactionInProgressException"
-                    | "InternalServerError"
             )
         ),
         _ => false,
-    };
-
-    if transient {
-        Error::Transient(Box::new(err))
-    } else {
-        Error::backend(err)
     }
 }
 
@@ -790,5 +807,17 @@ mod tests {
         for (codes, want) in cases {
             assert_eq!(classify_cancellation(1, &codes), want, "{codes:?}");
         }
+    }
+
+    #[test]
+    fn a_timed_out_commit_is_not_retryable() {
+        let err = SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost");
+
+        let classified = classify_transaction_error(&EntityId::new("acct-1"), 0, err);
+
+        assert!(
+            matches!(classified, Error::Backend(_)),
+            "the commit may have landed, so retrying could apply it twice: {classified:?}"
+        );
     }
 }

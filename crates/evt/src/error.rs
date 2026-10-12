@@ -84,8 +84,10 @@ pub enum Error {
     #[error("projector failed: {0}")]
     Projector(#[source] BoxError),
 
-    /// The backend failed in a way that may succeed on retry: throttling, a timeout, a deadlock, or
-    /// a serialization failure. Nothing was committed.
+    /// The backend failed in a way that may succeed on retry, and running the operation again is
+    /// safe: throttling, a deadlock, a serialization failure, or a timed-out read. A commit is only
+    /// transient when the backend rejected it. A commit whose outcome is unknown, such as one that
+    /// timed out, is [`Error::Backend`].
     #[error("transient backend failure: {0}")]
     Transient(#[source] BoxError),
 
