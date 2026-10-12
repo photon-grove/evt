@@ -42,6 +42,9 @@ jobs:
             exit 0
           fi
 
+          # Capture the list first so a failed diff fails the job instead of skipping everything.
+          files="$(git diff --name-only "$BASE...$HEAD")"
+
           go=false rust=false compat=false
           while IFS= read -r file; do
             case "$file" in
@@ -51,12 +54,14 @@ jobs:
                 rust=true compat=true ;;
               compat/* | internal/compat/* | scripts/compat-integration.sh)
                 go=true rust=true compat=true ;;
-              serialization.go | metadata.go | compaction.go | dynamo/* | postgres/* | publishers/* | stream/* | projectors/*)
+              serialization.go | metadata.go | compaction.go | types.go | repository.go | transactions.go | \
+                dynamo/* | postgres/* | publishers/* | stream/* | projectors/* | snapshots/* | policy/* | \
+                go.mod | go.sum | infra/*)
                 go=true compat=true ;;
               *)
                 go=true ;;
             esac
-          done < <(git diff --name-only "$BASE...$HEAD")
+          done <<< "$files"
 
           printf 'go=%s\nrust=%s\ncompat=%s\n' "$go" "$rust" "$compat" | tee -a "$GITHUB_OUTPUT"
 
