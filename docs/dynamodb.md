@@ -42,7 +42,9 @@ A single table holds events and inline snapshots for every entity.
 
 Event rows are **append-only and protected by conditional writes** — a commit only
 succeeds if the next sequence is unclaimed, which is how concurrent writers on one
-entity stay correctly ordered. The `sk = 0` snapshot row records the entity's
+entity stay correctly ordered. Each commit also checks the `sk = 0` snapshot row: a
+commit that starts at or below the snapshot's `eventSequence` is rejected, so a writer
+that loaded before a compaction cannot recreate the deleted events. The `sk = 0` snapshot row records the entity's
 serialized state plus the `eventSequence` it covers, and snapshot writes are
 monotonic: a write that would move the covered sequence backwards is a no-op, so a
 slow background writer can never regress the floor.

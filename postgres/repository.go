@@ -145,7 +145,11 @@ CREATE TABLE IF NOT EXISTS %[2]s (
 // same transaction as the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
-		return repo.insertEvents(ctx, tx, res.Events)
+		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		return repo.checkFloor(ctx, tx, res.Events)
 	})
 }
 
@@ -191,6 +195,10 @@ func (repo *Repository) CommitWithSnapshot(
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
 		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		if err := repo.checkFloor(ctx, tx, res.Events); err != nil {
 			return err
 		}
 
@@ -296,6 +304,43 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 
 	if err := tx.Commit(ctx); err != nil {
 		return classifyWriteError(fmt.Errorf("postgres: commit: %w", err))
+	}
+
+	return nil
+}
+
+// checkFloor rejects a commit whose first event for an entity is at or below that entity's
+// snapshot event_sequence. Compaction deletes the events a snapshot covers, so the primary key
+// alone would let a writer that loaded before the snapshot recreate a compacted sequence. It runs
+// after the inserts: a concurrent writer can only raise the floor past our first sequence by
+// inserting that sequence, which our uncommitted insert already holds.
+func (repo *Repository) checkFloor(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
+	first := make(map[evt.EntityID]evt.EventSequence)
+	for _, event := range events {
+		if current, ok := first[event.EntityID]; !ok || event.Sequence < current {
+			first[event.EntityID] = event.Sequence
+		}
+	}
+
+	query := fmt.Sprintf(
+		`SELECT event_sequence FROM %s WHERE entity_id = $1 AND event_sequence >= $2`,
+		repo.snapshotsTable,
+	)
+
+	for entityID, sequence := range first {
+		var floor int64
+
+		err := tx.QueryRow(ctx, query, string(entityID), int64(sequence)).Scan(&floor)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("postgres: check snapshot floor: %w", err)
+		}
+
+		return evt.NewConflictError(fmt.Sprintf(
+			"postgres: event %d for %s is at or below the snapshot floor %d", sequence, entityID, floor,
+		))
 	}
 
 	return nil

@@ -102,38 +102,68 @@ func conditionHolds(
 	case "attribute_not_exists(sk)":
 		return existing == nil, nil
 
-	case "attribute_not_exists(seq) OR (seq = :seq)":
-		seq, ok := existing["seq"]
-		if !ok {
-			return true, nil
-		}
-		want, err := number(values, ":seq")
-		if err != nil {
+	case dynamo.FloorCondition:
+		return compareIfExists(existing, "eventSeq", values, ":first", func(have, first int64) bool { return have < first })
+
+	case dynamo.SnapshotCondition:
+		sameSnapshot, err := compareIfExists(existing, "seq", values, ":seq", func(have, want int64) bool { return have == want })
+		if err != nil || !sameSnapshot {
 			return false, err
 		}
-		have, err := number(map[string]types.AttributeValue{"seq": seq}, "seq")
-		if err != nil {
-			return false, err
-		}
-		return have == want, nil
+		return compareIfExists(existing, "eventSeq", values, ":first", func(have, first int64) bool { return have < first })
 
 	case "attribute_not_exists(eventSeq) OR eventSeq <= :new":
-		eventSeq, ok := existing["eventSeq"]
-		if !ok {
-			return true, nil
-		}
-		limit, err := number(values, ":new")
-		if err != nil {
-			return false, err
-		}
-		have, err := number(map[string]types.AttributeValue{"eventSeq": eventSeq}, "eventSeq")
-		if err != nil {
-			return false, err
-		}
-		return have <= limit, nil
+		return compareIfExists(existing, "eventSeq", values, ":new", func(have, limit int64) bool { return have <= limit })
 	}
 
 	return false, fmt.Errorf("fake dynamo: unsupported condition %q", condition)
+}
+
+// compareIfExists evaluates `attribute_not_exists(name) OR <compare(name, value)>` for a numeric
+// attribute and expression value.
+func compareIfExists(
+	existing map[string]types.AttributeValue,
+	name string,
+	values map[string]types.AttributeValue,
+	value string,
+	compare func(have, want int64) bool,
+) (bool, error) {
+	if _, ok := existing[name]; !ok {
+		return true, nil
+	}
+
+	have, err := number(existing, name)
+	if err != nil {
+		return false, err
+	}
+	want, err := number(values, value)
+	if err != nil {
+		return false, err
+	}
+
+	return compare(have, want), nil
+}
+
+// transactTarget is the item a transaction action touches and the condition it carries.
+type transactTarget struct {
+	pk        string
+	sk        int64
+	put       map[string]types.AttributeValue
+	condition string
+	values    map[string]types.AttributeValue
+}
+
+func targetOf(write types.TransactWriteItem) (transactTarget, error) {
+	switch {
+	case write.Put != nil:
+		pk, sk, err := keyOf(write.Put.Item)
+		return transactTarget{pk, sk, write.Put.Item, aws.ToString(write.Put.ConditionExpression), write.Put.ExpressionAttributeValues}, err
+	case write.ConditionCheck != nil:
+		pk, sk, err := keyOf(write.ConditionCheck.Key)
+		return transactTarget{pk, sk, nil, aws.ToString(write.ConditionCheck.ConditionExpression), write.ConditionCheck.ExpressionAttributeValues}, err
+	}
+
+	return transactTarget{}, errors.New("fake dynamo: only Put and ConditionCheck are supported in transactions")
 }
 
 // TransactWriteItems applies puts atomically, cancelling the whole transaction on any failed
@@ -147,20 +177,26 @@ func (f *FakeDynamo) TransactWriteItems(
 	defer f.mu.Unlock()
 
 	reasons := make([]types.CancellationReason, len(params.TransactItems))
+	targets := make([]transactTarget, len(params.TransactItems))
+	touched := make(map[string]bool, len(params.TransactItems))
 	failed := false
 
 	for i, write := range params.TransactItems {
-		reasons[i] = types.CancellationReason{Code: aws.String("None")}
-		if write.Put == nil {
-			return nil, errors.New("fake dynamo: only Put is supported in transactions")
-		}
-
-		pk, sk, err := keyOf(write.Put.Item)
+		target, err := targetOf(write)
 		if err != nil {
 			return nil, err
 		}
 
-		ok, err := conditionHolds(f.items[pk][sk], aws.ToString(write.Put.ConditionExpression), write.Put.ExpressionAttributeValues)
+		// DynamoDB rejects a transaction that touches one item twice.
+		key := fmt.Sprintf("%s/%d", target.pk, target.sk)
+		if touched[key] {
+			return nil, fmt.Errorf("fake dynamo: transaction touches %s more than once", key)
+		}
+		touched[key] = true
+		targets[i] = target
+
+		reasons[i] = types.CancellationReason{Code: aws.String("None")}
+		ok, err := conditionHolds(f.items[target.pk][target.sk], target.condition, target.values)
 		if err != nil {
 			return nil, err
 		}
@@ -177,9 +213,10 @@ func (f *FakeDynamo) TransactWriteItems(
 		}
 	}
 
-	for _, write := range params.TransactItems {
-		pk, sk, _ := keyOf(write.Put.Item)
-		f.putLocked(pk, sk, write.Put.Item)
+	for _, target := range targets {
+		if target.put != nil {
+			f.putLocked(target.pk, target.sk, target.put)
+		}
 	}
 
 	return &dynamodb.TransactWriteItemsOutput{}, nil

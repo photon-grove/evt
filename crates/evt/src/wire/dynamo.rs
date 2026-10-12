@@ -39,9 +39,16 @@ pub const DEFAULT_VIEW_SORT_KEY: &str = "VIEW";
 /// Condition for event puts: the `(pk, sk)` must not exist yet.
 pub const EVENT_CONDITION: &str = "attribute_not_exists(sk)";
 
-/// Condition for snapshot puts in a commit: no snapshot yet, or the stored snapshot sequence is
-/// the one the writer loaded (`:seq`).
-pub const SNAPSHOT_CONDITION: &str = "attribute_not_exists(seq) OR (seq = :seq)";
+/// Condition for the snapshot-item check in a commit without a snapshot: the commit's first event
+/// (`:first`) is above the stored snapshot's `eventSeq`. Compaction deletes the events a snapshot
+/// covers, so [`EVENT_CONDITION`] alone would let a writer that loaded before the snapshot recreate
+/// a compacted sequence.
+pub const FLOOR_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq < :first";
+
+/// Condition for snapshot puts in a commit: the stored snapshot sequence is the one the writer
+/// loaded (`:seq`), and the commit starts above its floor (`:first`). It folds in
+/// [`FLOOR_CONDITION`] because a transaction cannot touch the snapshot item twice.
+pub const SNAPSHOT_CONDITION: &str = "(attribute_not_exists(seq) OR seq = :seq) AND (attribute_not_exists(eventSeq) OR eventSeq < :first)";
 
 /// Condition for out-of-band snapshot puts: never lower the stored `eventSeq` (`:new`).
 pub const PUT_SNAPSHOT_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq <= :new";

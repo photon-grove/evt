@@ -50,6 +50,19 @@ func (s *RepositorySuite) Test_Commit_Ok() {
 				ConditionExpression: aws.String("attribute_not_exists(sk)"),
 			},
 		},
+		{
+			ConditionCheck: &types.ConditionCheck{
+				TableName: &s.repo.EventsTable,
+				Key: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: "test-id"},
+					"sk": &types.AttributeValueMemberN{Value: "0"},
+				},
+				ConditionExpression: aws.String("attribute_not_exists(eventSeq) OR eventSeq < :first"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":first": &types.AttributeValueMemberN{Value: "1"},
+				},
+			},
+		},
 	}
 
 	input := dynamodb.TransactWriteItemsInput{TransactItems: expected}
@@ -113,9 +126,12 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 					"entityType": &types.AttributeValueMemberS{Value: "test"},
 					"payload":    &types.AttributeValueMemberS{Value: ""},
 				},
-				ConditionExpression: aws.String("attribute_not_exists(seq) OR (seq = :seq)"),
+				ConditionExpression: aws.String(
+					"(attribute_not_exists(seq) OR seq = :seq) AND (attribute_not_exists(eventSeq) OR eventSeq < :first)",
+				),
 				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":seq": &types.AttributeValueMemberN{Value: "0"},
+					":seq":   &types.AttributeValueMemberN{Value: "0"},
+					":first": &types.AttributeValueMemberN{Value: "2"},
 				},
 			},
 		},

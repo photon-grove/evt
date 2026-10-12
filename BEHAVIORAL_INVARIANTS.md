@@ -334,12 +334,17 @@ evt.Metadata{
 
 - Empty events: no-op, returns nil
 - Builds `TransactWriteItem` with conditional expression `attribute_not_exists(sk)`
+- Adds a `ConditionCheck` on the entity's `sk = 0` item: `attribute_not_exists(eventSeq) OR
+  eventSeq < :first`, so a commit cannot write at or below a snapshot's floor after compaction
+  deleted those keys
 - Includes any transaction groups from projectors
 
 ### CommitWithSnapshot
 
 - Same as Commit, plus snapshot item
-- Snapshot conditional: `attribute_not_exists(seq) OR (seq = :previousSeq)`
+- Snapshot conditional: `(attribute_not_exists(seq) OR seq = :seq) AND (attribute_not_exists(eventSeq)
+  OR eventSeq < :first)`. The floor check is folded into the snapshot put because a transaction
+  cannot touch `sk = 0` twice
 
 ### GetEvents
 

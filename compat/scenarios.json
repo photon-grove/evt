@@ -47,7 +47,7 @@
     },
     {
       "name": "compaction-handoff",
-      "description": "One language compacts a stream the other wrote, the other keeps writing from the snapshot, and compaction stays idempotent and refuses ranges no snapshot covers.",
+      "description": "One language compacts a stream the other wrote, the other keeps writing from the snapshot, compaction stays idempotent and refuses ranges no snapshot covers, and neither language can write a sequence the snapshot covers after its event was compacted.",
       "snapshotInterval": 3,
       "steps": [
         { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Katherine Johnson" }, "expect": { "result": "ok", "events": 1 } },
@@ -60,7 +60,9 @@
         { "by": "go", "op": "compact", "through": 6, "expect": { "result": "compacted", "deleted": 2 } },
         { "by": "rust", "op": "execute", "commandId": "c5", "command": { "type": "withdraw", "amountCents": 15 }, "expect": { "result": "ok", "events": 1 } },
         { "by": "rust", "op": "compact", "through": 7, "expect": { "result": "uncovered" } },
-        { "by": "go", "op": "conflictProbe", "sequence": 7, "expect": { "result": "conflict" } }
+        { "by": "go", "op": "conflictProbe", "sequence": 7, "expect": { "result": "conflict" } },
+        { "by": "rust", "op": "conflictProbe", "sequence": 2, "expect": { "result": "conflict" } },
+        { "by": "go", "op": "conflictProbe", "sequence": 5, "expect": { "result": "conflict" } }
       ]
     },
     {

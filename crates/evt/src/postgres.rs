@@ -263,6 +263,29 @@ impl Repository for PostgresRepository {
             .map_err(|err| classify(&commit.entity_id, err))?;
         }
 
+        // Compaction deletes the events a snapshot covers, so the primary key alone would let a
+        // writer that loaded before the snapshot recreate a compacted sequence. Checking after the
+        // inserts is race-free: a concurrent writer can only raise the floor past our first
+        // sequence by inserting that sequence, which our uncommitted insert already holds.
+        let first = rows.first().map_or(0, |row| row.sequence);
+        let floor = format!(
+            "SELECT event_sequence FROM {} WHERE entity_id = $1 AND event_sequence >= $2",
+            self.snapshots_table
+        );
+        if let Some(row) = tx
+            .query_opt(&floor, &[&commit.entity_id.as_str(), &first])
+            .await
+            .map_err(Error::backend)?
+        {
+            return Err(Error::Conflict {
+                entity_id: commit.entity_id,
+                message: format!(
+                    "event sequence {first} is at or below the snapshot floor {}",
+                    row.get::<_, i64>(0)
+                ),
+            });
+        }
+
         if let Some(snapshot) = commit.snapshot {
             let row = SnapshotRow {
                 entity_id: commit.entity_id.to_string(),

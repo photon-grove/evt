@@ -76,6 +76,12 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 			testOptimisticConcurrency(t, newRepo())
 		})
 	}
+
+	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
+		t.Run("RejectsCommitsBelowCompactedFloor", func(t *testing.T) {
+			testCompactedFloor(t, newRepo())
+		})
+	}
 }
 
 // --- contract cases ---
@@ -250,6 +256,41 @@ func testOptimisticConcurrency(t *testing.T, repo evt.Repository) {
 
 	err := repo.Commit(ctx, evt.SerializedResult{Events: duplicate})
 	require.Error(t, err, "expected a conflict committing a duplicate sequence")
+}
+
+func testCompactedFloor(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	compactor, ok := repo.(evt.Compactor)
+	if !ok {
+		t.Skip("repository does not implement evt.Compactor")
+	}
+
+	id := evt.EntityID(ns + "-1")
+	serialized := serialize(t, id, "test", 0,
+		&test.EntityCreated{ID: id, Value: "one"},
+		&test.EntityUpdated{ID: id, Value: "two"},
+	)
+	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"two"}`, id))
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1))
+
+	deleted, err := compactor.CompactBelow(ctx, id, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, deleted)
+
+	// A writer that loaded before the snapshot would commit sequence 2 again. Its key is gone, so
+	// only the snapshot floor rejects it.
+	stale := serialize(t, id, "test", 1, &test.EntityUpdated{ID: id, Value: "stale"})
+	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: stale}), "a commit below the floor must be rejected")
+
+	events, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Empty(t, events, "the rejected commit writes nothing")
+
+	next := serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "three"})
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: next}))
 }
 
 // --- helpers ---

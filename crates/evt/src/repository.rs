@@ -37,6 +37,9 @@ pub struct Commit<Op> {
 /// Implementations must:
 ///
 /// - reject a commit that reuses an existing `(entity_id, sequence)` with [`Error::Conflict`];
+/// - reject a commit whose first event is at or below the stored snapshot's event sequence with
+///   [`Error::Conflict`], because compaction may have deleted the events that sequence would
+///   collide with;
 /// - reject a snapshot whose sequence is not the stored snapshot's sequence plus one with
 ///   [`Error::Conflict`] (DynamoDB), or keep the stored snapshot's event sequence monotonic
 ///   (PostgreSQL, where the event-sequence conflict already covers racing writers);

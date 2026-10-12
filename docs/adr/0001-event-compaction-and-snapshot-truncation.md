@@ -122,6 +122,13 @@ consumer repos). Backends opt in by implementing the methods; `dynamo` and `mem`
   next sequence is always above the floor. Durable commit-side floor enforcement (e.g. a tombstone
   the commit path checks) is noted as future hardening for deployments that hold load contexts open
   across a snapshot and a compaction.
+- **Amendment (2026-10-12): the floor is enforced on commit.** The stale-context window also let the
+  stale commit's projector operations apply, regressing views. Commits now reject a first sequence at
+  or below the snapshot's `eventSeq`. DynamoDB adds a `ConditionCheck` on the `sk = 0` item
+  (`attribute_not_exists(eventSeq) OR eventSeq < :first`), folded into the snapshot put's condition
+  when the commit writes a snapshot. PostgreSQL checks the snapshot row after inserting the events,
+  in the same transaction. The Go and Rust implementations share these conditions; see
+  `docs/spec/storage-format.md`.
 
 ## Backward compatibility
 

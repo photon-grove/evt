@@ -141,16 +141,27 @@ item with missing or empty `metadata` is invalid. Readers ignore other attribute
 ### Writes
 
 A commit is one `TransactWriteItems` call, at most 100 actions, in this order: projector
-operations, one put per event, then the snapshot put if the commit takes one.
+operations, one put per event, then either the snapshot put or a floor check on the snapshot item.
 
-| Write                         | Condition                                                                                        |
-| ----------------------------- | ------------------------------------------------------------------------------------------------ |
-| event put                     | `attribute_not_exists(sk)`                                                                       |
-| snapshot put in a commit      | `attribute_not_exists(seq) OR (seq = :seq)`, where `:seq` is the new snapshot sequence minus one |
-| snapshot put outside a commit | `attribute_not_exists(eventSeq) OR eventSeq <= :new`, where `:new` is the new `eventSeq`         |
+| Write                         | Condition                                                                                             |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------- |
+| event put                     | `attribute_not_exists(sk)`                                                                            |
+| floor check (no snapshot put) | `attribute_not_exists(eventSeq) OR eventSeq < :first`                                                 |
+| snapshot put in a commit      | `(attribute_not_exists(seq) OR seq = :seq) AND (attribute_not_exists(eventSeq) OR eventSeq < :first)` |
+| snapshot put outside a commit | `attribute_not_exists(eventSeq) OR eventSeq <= :new`                                                  |
 
-A transaction cancelled with a `ConditionalCheckFailed` reason on an event or snapshot put is an
-optimistic-concurrency conflict: another writer committed the same sequence or moved the snapshot.
+`:first` is the commit's first event sequence, `:seq` is the new snapshot sequence minus one, and
+`:new` is the new `eventSeq`. The floor check is a `ConditionCheck` on `(pk, sk = 0)`. When the
+commit writes a snapshot, the floor condition is part of the snapshot put instead, because a
+transaction cannot touch one item twice.
+
+The floor exists because compaction deletes the events a snapshot covers, which removes the keys
+`attribute_not_exists(sk)` relies on. Without it, a writer that loaded the stream before the covering
+snapshot could recreate a compacted sequence.
+
+A transaction cancelled with a `ConditionalCheckFailed` reason on an event put, the floor check, or
+the snapshot put is an optimistic-concurrency conflict: another writer committed the same sequence,
+moved the snapshot, or compacted past the commit.
 The caller reloads and retries. A failed out-of-band snapshot condition is not an error. The newer
 snapshot stays.
 
@@ -219,6 +230,9 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
   upsert. Projector statements are Rust-only: Go's `postgres.Repository` ignores projector
   transaction groups. A failed projector statement is a projector error.
 - A unique violation (`23505`) on the event primary key is an optimistic-concurrency conflict.
+- After the inserts, the commit checks the floor in the same transaction: a snapshot row with
+  `event_sequence >= ` the commit's first sequence is a conflict. Checking after the inserts closes
+  the race: a concurrent writer can raise the floor past that sequence only by inserting it first.
 - The snapshot upsert only replaces a snapshot whose `event_sequence` is lower or equal
   (`ON CONFLICT (entity_id) DO UPDATE … WHERE EXCLUDED.event_sequence >= evt_snapshots.event_sequence`).
   PostgreSQL does not check the snapshot sequence: a racing writer already fails on the event key.
@@ -289,11 +303,9 @@ never rewritten. A failed upcast or decode fails the load.
   compaction-uncovered error.
 - Never deletes the snapshot. `through < 1` is a no-op. It is idempotent.
 - A compacted stream must be loaded or rebuilt from its snapshot, never by replaying from sequence 1.
-- Known limitation, shared by both languages: compaction deletes the rows that the event-sequence
-  condition relies on. A writer that loaded the stream before the covering snapshot and commits
-  without a snapshot after compaction can write a sequence at or below the snapshot's
-  `eventSequence`. Loads ignore such rows, but the commit's projector operations still apply. See
-  ADR 0001, "stale-context sequence reuse".
+- A commit whose first event is at or below the snapshot's `eventSequence` is a conflict in both
+  backends (see the floor checks above), so a writer that loaded before compaction cannot recreate
+  compacted events.
 
 See [ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
 

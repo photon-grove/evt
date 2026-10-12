@@ -202,6 +202,10 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
         }
         record("put snapshot is monotonic", put_snapshot(repo).await);
         record("compact below a snapshot", compact_below(repo).await);
+        record(
+            "reject a commit below the compacted floor",
+            compacted_floor(repo).await,
+        );
         record("entity heads", entity_heads(repo).await);
         record("store loads from a snapshot", store_snapshots(repo).await);
         record(
@@ -624,6 +628,48 @@ async fn compact_below<R: Repository>(repo: &R) -> CaseResult {
             |err| matches!(err, Error::CompactionUncovered { covered: None, .. }),
         )?;
     }
+
+    Ok(())
+}
+
+async fn compacted_floor<R: Repository>(repo: &R) -> CaseResult {
+    let stream = Stream::new(&namespace(), "1", "ledger");
+    stream
+        .commit(
+            repo,
+            stream.events(1..=4),
+            Some(stream.new_snapshot(1, "{}")),
+        )
+        .await?;
+    repo.compact_below(&stream.id, EventSequence(4)).await?;
+
+    // A writer that loaded before the snapshot commits sequence 3 again. Its key was compacted
+    // away, so only the snapshot floor rejects it.
+    expect_conflict(
+        stream.commit(repo, stream.events(3..=3), None).await,
+        "a commit below the floor",
+    )?;
+    expect_conflict(
+        stream
+            .commit(
+                repo,
+                stream.events(4..=5),
+                Some(stream.new_snapshot(2, "{}")),
+            )
+            .await,
+        "a snapshot commit that starts at the floor",
+    )?;
+    ensure!(
+        repo.events(&stream.id).await?.is_empty(),
+        "rejected commits write nothing"
+    );
+
+    stream.commit(repo, stream.events(5..=5), None).await?;
+    ensure_eq!(
+        repo.events(&stream.id).await?,
+        stream.events(5..=5),
+        "a commit above the floor succeeds"
+    );
 
     Ok(())
 }

@@ -79,6 +79,18 @@ impl Repository for MemRepository {
             }
         }
 
+        if let (Some(first), Some(existing)) = (commit.events.first(), &stream.snapshot)
+            && first.sequence <= existing.event_sequence
+        {
+            return Err(Error::Conflict {
+                entity_id: commit.entity_id,
+                message: format!(
+                    "event sequence {} is at or below the snapshot floor {}",
+                    first.sequence, existing.event_sequence
+                ),
+            });
+        }
+
         if let (Some(new), Some(existing)) = (&commit.snapshot, &stream.snapshot)
             && existing.sequence.next() != new.sequence
         {

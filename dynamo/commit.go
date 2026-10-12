@@ -3,6 +3,7 @@ package dynamo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -29,8 +30,53 @@ func (repo *Repository) Commit(
 		return err
 	}
 
+	writeItems = append(writeItems, repo.buildFloorChecks(result.Events)...)
+
 	// Commit the transactions to DynamoDB
 	return repo.commitEventsWithTransaction(ctx, writeItems, result.Transaction)
+}
+
+// FloorCondition rejects a commit whose first event is at or below the stored snapshot's
+// eventSeq. Compaction deletes the events a snapshot covers, so attribute_not_exists(sk) alone
+// would let a writer that loaded before the snapshot recreate a compacted sequence.
+const FloorCondition = "attribute_not_exists(eventSeq) OR eventSeq < :first"
+
+// SnapshotCondition guards the snapshot put in a commit: the stored snapshot is still the one the
+// writer loaded (:seq), and the commit starts above its floor (:first).
+const SnapshotCondition = "(attribute_not_exists(seq) OR seq = :seq) AND (" + FloorCondition + ")"
+
+// buildFloorChecks returns one ConditionCheck on each entity's snapshot item (sk = 0) that the
+// commit starts above the snapshot's eventSeq.
+func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.TransactWriteItem {
+	first := make(map[evt.EntityID]evt.EventSequence)
+	order := make([]evt.EntityID, 0, 1)
+
+	for _, event := range events {
+		current, seen := first[event.EntityID]
+		if !seen {
+			order = append(order, event.EntityID)
+		}
+		if !seen || event.Sequence < current {
+			first[event.EntityID] = event.Sequence
+		}
+	}
+
+	checks := make([]types.TransactWriteItem, 0, len(order))
+	for _, entityID := range order {
+		checks = append(checks, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName: &repo.EventsTable,
+			Key: map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: string(entityID)},
+				"sk": &types.AttributeValueMemberN{Value: "0"},
+			},
+			ConditionExpression: aws.String(FloorCondition),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(first[entityID]), 10)},
+			},
+		}})
+	}
+
+	return checks
 }
 
 // CommitStream commits a stream of events using batches under the 100-item limit.
@@ -174,6 +220,10 @@ func (repo *Repository) buildSnapshotPutTransactions(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) ([]types.TransactWriteItem, error) {
+	if len(serializedEvents) == 0 {
+		return nil, errors.New("commit with snapshot requires at least one event")
+	}
+
 	expectedSnapshot := evt.EventSequence(int(currentSnapshot) - 1)
 
 	// Generate the initial Put transactions that are needed to commit the Events themselves
@@ -202,14 +252,16 @@ func (repo *Repository) buildSnapshotPutTransactions(
 	}
 
 	// Include it within a TransactWriteItem statement that ensures the existing Snapshot
-	// matches the previous Snapshot number (more optimistic locking).
+	// matches the previous Snapshot number and that the commit starts above its floor. A separate
+	// floor ConditionCheck is not possible here: a transaction cannot touch sk=0 twice.
 	// Snapshots are stored inline in the event-log table at sk=0.
 	putItem := types.Put{
 		TableName:           &repo.EventsTable,
 		Item:                item,
-		ConditionExpression: aws.String("attribute_not_exists(seq) OR (seq = :seq)"),
+		ConditionExpression: aws.String(SnapshotCondition),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":seq": &types.AttributeValueMemberN{Value: strconv.Itoa(int(expectedSnapshot))},
+			":seq":   &types.AttributeValueMemberN{Value: strconv.Itoa(int(expectedSnapshot))},
+			":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(serializedEvents[0].Sequence), 10)},
 		},
 	}
 

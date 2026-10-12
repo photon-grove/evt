@@ -13,7 +13,9 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::{self as sdk, DeleteRequest, Put, TransactWriteItem, WriteRequest};
+use aws_sdk_dynamodb::types::{
+    self as sdk, ConditionCheck, DeleteRequest, Put, TransactWriteItem, WriteRequest,
+};
 
 use crate::aggregate::{Aggregate, Projector};
 use crate::error::{BoxError, Error};
@@ -276,7 +278,10 @@ impl Repository for DynamoRepository {
     type Operation = TransactWriteItem;
 
     async fn commit(&self, commit: Commit<TransactWriteItem>) -> Result<(), Error> {
-        let Some(last_sequence) = commit.events.last().map(|event| event.sequence) else {
+        let (Some(first), Some(last_sequence)) = (
+            commit.events.first().map(|event| n(event.sequence.0)),
+            commit.events.last().map(|event| event.sequence),
+        ) else {
             return Ok(());
         };
 
@@ -285,7 +290,7 @@ impl Repository for DynamoRepository {
 
         for event in &commit.events {
             let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
-            items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), None)?);
+            items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
         }
 
         if let Some(snapshot) = commit.snapshot {
@@ -305,8 +310,10 @@ impl Repository for DynamoRepository {
                 &self.table,
                 item,
                 Some(wire::SNAPSHOT_CONDITION),
-                Some((":seq", expected)),
+                &[(":seq", expected), (":first", first)],
             )?);
+        } else {
+            items.push(floor_check(&self.table, &commit.entity_id, first)?);
         }
 
         if items.len() > MAX_TRANSACTION_ITEMS {
@@ -489,7 +496,7 @@ impl<A: Aggregate> Projector<A, TransactWriteItem> for ViewProjector {
         let payload = json::to_vec(aggregate)?;
         let item = wire::view_item(&EntityType::new(A::TYPE), entity_id, &payload)?;
 
-        Ok(vec![put(&self.table, item, None, None)?])
+        Ok(vec![put(&self.table, item, None, &[])?])
     }
 }
 
@@ -497,20 +504,38 @@ fn put(
     table: &str,
     item: Item,
     condition: Option<&str>,
-    value: Option<(&str, sdk::AttributeValue)>,
+    values: &[(&str, sdk::AttributeValue)],
 ) -> Result<TransactWriteItem, Error> {
     let mut put = Put::builder()
         .table_name(table)
         .set_item(Some(to_sdk_item(&item)))
         .set_condition_expression(condition.map(str::to_owned));
 
-    if let Some((name, value)) = value {
-        put = put.expression_attribute_values(name, value);
+    for (name, value) in values {
+        put = put.expression_attribute_values(*name, value.clone());
     }
 
     Ok(TransactWriteItem::builder()
         .put(put.build().map_err(Error::backend)?)
         .build())
+}
+
+/// Checks that a commit starting at `first` is above the entity's snapshot floor.
+fn floor_check(
+    table: &str,
+    entity_id: &EntityId,
+    first: sdk::AttributeValue,
+) -> Result<TransactWriteItem, Error> {
+    let check = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(entity_id.as_str()))
+        .key("sk", n(wire::SNAPSHOT_SORT_KEY))
+        .condition_expression(wire::FLOOR_CONDITION)
+        .expression_attribute_values(":first", first)
+        .build()
+        .map_err(Error::backend)?;
+
+    Ok(TransactWriteItem::builder().condition_check(check).build())
 }
 
 /// How a cancelled commit transaction failed.
