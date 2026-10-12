@@ -30,6 +30,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+        update-types: [minor, patch]
 
   - package-ecosystem: terraform
     directories:
@@ -42,3 +43,4 @@ updates:
     groups:
       terraform:
         patterns: ["*"]
+        update-types: [minor, patch]
