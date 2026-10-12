@@ -191,6 +191,10 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
         record("commit and read in order", commit_and_read(repo).await);
         record("isolate entities", isolate_entities(repo).await);
         record(
+            "reject events for another entity",
+            foreign_events(repo).await,
+        );
+        record(
             "reject a duplicate sequence",
             duplicate_sequence(repo).await,
         );
@@ -409,6 +413,24 @@ async fn commit_and_read<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+async fn foreign_events<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+
+    expect_err(
+        a.commit(repo, b.events(1..=1), None).await,
+        "a commit of entity b's event under entity a",
+        |err| matches!(err, Error::InvalidCommit(_)),
+    )?;
+    ensure!(
+        repo.events(&a.id).await?.is_empty() && repo.events(&b.id).await?.is_empty(),
+        "the rejected commit writes nothing"
+    );
+
+    Ok(())
+}
+
 async fn duplicate_sequence<R: Repository>(repo: &R) -> CaseResult {
     let stream = Stream::new(&namespace(), "1", "ledger");
     stream.commit(repo, stream.events(1..=2), None).await?;
@@ -471,7 +493,20 @@ async fn snapshot_round_trip<R: Repository>(repo: &R) -> CaseResult {
 }
 
 async fn snapshot_sequence_conflict<R: Repository>(repo: &R) -> CaseResult {
-    let stream = Stream::new(&namespace(), "1", "ledger");
+    let ns = namespace();
+    let first = Stream::new(&ns, "first", "ledger");
+    expect_conflict(
+        first
+            .commit(repo, first.events(1..=2), Some(first.new_snapshot(2, "{}")))
+            .await,
+        "a first snapshot whose sequence is not 1",
+    )?;
+    ensure!(
+        repo.snapshot(&first.id).await?.is_none() && repo.events(&first.id).await?.is_empty(),
+        "the rejected first snapshot writes nothing"
+    );
+
+    let stream = Stream::new(&ns, "1", "ledger");
     stream
         .commit(
             repo,
@@ -701,6 +736,23 @@ async fn entity_heads<R: Repository>(repo: &R) -> CaseResult {
     for (id, head) in want_alpha.iter().chain([(&b1.id, &EventSequence(1))]) {
         ensure_eq!(all.get(id), Some(head), format!("unfiltered head of {id}"));
     }
+
+    // An explicit empty type matches only streams stored with an empty type, not every stream.
+    let untyped = Stream {
+        id: EntityId::new(format!("{ns}-untyped")),
+        entity_type: EntityType::default(),
+    };
+    untyped.commit(repo, untyped.events(1..=1), None).await?;
+    let empty = repo.entity_heads(Some(&EntityType::default())).await?;
+    ensure_eq!(
+        empty.get(&untyped.id),
+        Some(&EventSequence(1)),
+        "the empty-type filter includes the untyped stream"
+    );
+    ensure!(
+        !empty.contains_key(&a1.id) && !empty.contains_key(&b1.id),
+        "the empty-type filter excludes typed streams"
+    );
 
     let unknown = EntityType::new(format!("{ns}-unknown"));
     ensure!(

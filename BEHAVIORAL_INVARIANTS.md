@@ -342,8 +342,9 @@ evt.Metadata{
 ### CommitWithSnapshot
 
 - Same as Commit, plus snapshot item
-- Snapshot conditional: `(attribute_not_exists(seq) OR seq = :seq) AND (attribute_not_exists(eventSeq)
-  OR eventSeq < :first)`. The floor check is folded into the snapshot put because a transaction
+- Snapshot conditional for the first snapshot (sequence 1): `attribute_not_exists(seq)`
+- Snapshot conditional for later snapshots: `seq = :seq AND eventSeq < :first`, where `:seq` is the
+  new sequence minus one. The floor check is folded into the snapshot put because a transaction
   cannot touch `sk = 0` twice
 
 ### GetEvents

@@ -90,6 +90,12 @@ impl PostgresRepository {
             }
         }
 
+        if events_table == snapshots_table {
+            return Err(Error::InvalidConfig(format!(
+                "postgres: events and snapshots need separate tables, both are {events_table:?}"
+            )));
+        }
+
         self.events_table = events_table.to_owned();
         self.snapshots_table = snapshots_table.to_owned();
 
@@ -216,6 +222,8 @@ impl Repository for PostgresRepository {
     type Operation = PgStatement;
 
     async fn commit(&self, commit: Commit<PgStatement>) -> Result<(), Error> {
+        commit.validate()?;
+
         let Some(last_sequence) = commit.events.last().map(|event| event.sequence) else {
             return Ok(());
         };
@@ -388,11 +396,11 @@ impl Repository for PostgresRepository {
                  UNION ALL
                  SELECT entity_id, event_sequence AS head, entity_type FROM {}
              ) sources
-             WHERE $1 = '' OR entity_type = $1
+             WHERE $1::text IS NULL OR entity_type = $1
              GROUP BY entity_id",
             self.events_table, self.snapshots_table
         );
-        let filter = entity_type.map(EntityType::as_str).unwrap_or_default();
+        let filter = entity_type.map(EntityType::as_str);
 
         let rows = client
             .query(&sql, &[&filter])
@@ -438,4 +446,36 @@ fn transient(err: &tokio_postgres::Error) -> bool {
     err.code().is_some_and(|code| {
         *code == SqlState::T_R_SERIALIZATION_FAILURE || *code == SqlState::T_R_DEADLOCK_DETECTED
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use deadpool_postgres::Manager;
+    use tokio_postgres::NoTls;
+
+    use super::*;
+
+    fn repository() -> PostgresRepository {
+        let manager = Manager::new(tokio_postgres::Config::new(), NoTls);
+
+        PostgresRepository::new(Pool::builder(manager).build().unwrap())
+    }
+
+    #[test]
+    fn rejects_unsafe_or_shared_table_names() {
+        for (events, snapshots) in [
+            ("evt_events", "evt_events"),
+            ("evt_events; drop", "evt_snapshots"),
+        ] {
+            assert!(
+                matches!(
+                    repository().with_tables(events, snapshots),
+                    Err(Error::InvalidConfig(_))
+                ),
+                "{events:?}, {snapshots:?}"
+            );
+        }
+
+        assert!(repository().with_tables("a_events", "a_snapshots").is_ok());
+    }
 }

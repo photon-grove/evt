@@ -297,6 +297,8 @@ impl Repository for DynamoRepository {
     type Operation = TransactWriteItem;
 
     async fn commit(&self, commit: Commit<TransactWriteItem>) -> Result<(), Error> {
+        commit.validate()?;
+
         let (Some(first), Some(last_sequence)) = (
             commit.events.first().map(|event| n(event.sequence.0)),
             commit.events.last().map(|event| event.sequence),
@@ -314,7 +316,6 @@ impl Repository for DynamoRepository {
 
         if let Some(snapshot) = commit.snapshot {
             let ttl = self.ttl_for(&snapshot.entity_type);
-            let expected = n(snapshot.sequence.0 - 1);
             let item = wire::snapshot_item(
                 &SerializedSnapshot {
                     entity_type: snapshot.entity_type,
@@ -325,12 +326,19 @@ impl Repository for DynamoRepository {
                 },
                 ttl,
             )?;
-            items.push(put(
-                &self.table,
-                item,
-                Some(wire::SNAPSHOT_CONDITION),
-                &[(":seq", expected), (":first", first)],
-            )?);
+            // A snapshot sequence below 1 has no valid predecessor, so it takes the second branch
+            // and fails its condition.
+            let expected = snapshot.sequence.0 - 1;
+            items.push(if expected == 0 {
+                put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
+            } else {
+                put(
+                    &self.table,
+                    item,
+                    Some(wire::NEXT_SNAPSHOT_CONDITION),
+                    &[(":seq", n(expected)), (":first", first)],
+                )?
+            });
         } else {
             items.push(floor_check(&self.table, &commit.entity_id, first)?);
         }

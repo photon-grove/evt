@@ -41,9 +41,13 @@ func (repo *Repository) Commit(
 // would let a writer that loaded before the snapshot recreate a compacted sequence.
 const FloorCondition = "attribute_not_exists(eventSeq) OR eventSeq < :first"
 
-// SnapshotCondition guards the snapshot put in a commit: the stored snapshot is still the one the
-// writer loaded (:seq), and the commit starts above its floor (:first).
-const SnapshotCondition = "(attribute_not_exists(seq) OR seq = :seq) AND (" + FloorCondition + ")"
+// FirstSnapshotCondition guards the first snapshot put in a commit (snapshot sequence 1): no
+// snapshot exists yet.
+const FirstSnapshotCondition = "attribute_not_exists(seq)"
+
+// NextSnapshotCondition guards later snapshot puts in a commit: the stored snapshot is still the one
+// the writer loaded (:seq), and the commit starts above its floor (:first).
+const NextSnapshotCondition = "seq = :seq AND eventSeq < :first"
 
 // buildFloorChecks returns one ConditionCheck on each entity's snapshot item (sk = 0) that the
 // commit starts above the snapshot's eventSeq.
@@ -271,18 +275,23 @@ func (repo *Repository) buildSnapshotPutTransactions(
 		return nil, fmt.Errorf("error marshalling item to map: %w", err)
 	}
 
-	// Include it within a TransactWriteItem statement that ensures the existing Snapshot
-	// matches the previous Snapshot number and that the commit starts above its floor. A separate
-	// floor ConditionCheck is not possible here: a transaction cannot touch sk=0 twice.
+	// Include it within a TransactWriteItem statement that ensures the existing Snapshot matches
+	// the previous Snapshot number (none for the first) and that the commit starts above its floor.
+	// A separate floor ConditionCheck is not possible here: a transaction cannot touch sk=0 twice.
 	// Snapshots are stored inline in the event-log table at sk=0.
+	// A snapshot sequence below 1 has no valid predecessor, so it takes the second branch and fails
+	// its condition.
 	putItem := types.Put{
 		TableName:           &repo.EventsTable,
 		Item:                item,
-		ConditionExpression: aws.String(SnapshotCondition),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
+		ConditionExpression: aws.String(FirstSnapshotCondition),
+	}
+	if expectedSnapshot != 0 {
+		putItem.ConditionExpression = aws.String(NextSnapshotCondition)
+		putItem.ExpressionAttributeValues = map[string]types.AttributeValue{
 			":seq":   &types.AttributeValueMemberN{Value: strconv.Itoa(int(expectedSnapshot))},
 			":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(serializedEvents[0].Sequence), 10)},
-		},
+		}
 	}
 
 	transactions = append(transactions, types.TransactWriteItem{Put: &putItem})

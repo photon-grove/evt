@@ -143,15 +143,17 @@ item with missing or empty `metadata` is invalid. Readers ignore other attribute
 A commit is one `TransactWriteItems` call, at most 100 actions, in this order: projector
 operations, one put per event, then either the snapshot put or a floor check on the snapshot item.
 
-| Write                         | Condition                                                                                             |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------- |
-| event put                     | `attribute_not_exists(sk)`                                                                            |
-| floor check (no snapshot put) | `attribute_not_exists(eventSeq) OR eventSeq < :first`                                                 |
-| snapshot put in a commit      | `(attribute_not_exists(seq) OR seq = :seq) AND (attribute_not_exists(eventSeq) OR eventSeq < :first)` |
-| snapshot put outside a commit | `attribute_not_exists(eventSeq) OR eventSeq <= :new`                                                  |
+| Write                                  | Condition                                             |
+| -------------------------------------- | ----------------------------------------------------- |
+| event put                              | `attribute_not_exists(sk)`                            |
+| floor check (no snapshot put)          | `attribute_not_exists(eventSeq) OR eventSeq < :first` |
+| first snapshot put (`:seq` would be 0) | `attribute_not_exists(seq)`                           |
+| later snapshot put in a commit         | `seq = :seq AND eventSeq < :first`                    |
+| snapshot put outside a commit          | `attribute_not_exists(eventSeq) OR eventSeq <= :new`  |
 
 `:first` is the commit's first event sequence, `:seq` is the new snapshot sequence minus one, and
-`:new` is the new `eventSeq`. The floor check is a `ConditionCheck` on `(pk, sk = 0)`. When the
+`:new` is the new `eventSeq`. The first snapshot must have sequence 1, and every later one the stored sequence plus
+one. A later snapshot put carries the floor check in its own condition. The floor check is a `ConditionCheck` on `(pk, sk = 0)`. When the
 commit writes a snapshot, the floor condition is part of the snapshot put instead, because a
 transaction cannot touch one item twice.
 

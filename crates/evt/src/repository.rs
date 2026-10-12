@@ -74,18 +74,36 @@ impl<Op> Commit<Op> {
         self.operations.extend(operations);
         self
     }
+
+    /// Checks that every event belongs to the commit's entity. Repositories call it before writing,
+    /// because the floor and snapshot checks only look at `entity_id`.
+    pub fn validate(&self) -> Result<(), Error> {
+        match self
+            .events
+            .iter()
+            .find(|event| event.entity_id != self.entity_id)
+        {
+            Some(event) => Err(Error::InvalidCommit(format!(
+                "event {} belongs to entity {}, not {}",
+                event.id, event.entity_id, self.entity_id
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
 /// An append-only event log with one optional snapshot per entity.
 ///
 /// Implementations must:
 ///
+/// - reject a commit with an event for another entity with [`Error::InvalidCommit`] (see
+///   [`Commit::validate`]);
 /// - reject a commit that reuses an existing `(entity_id, sequence)` with [`Error::Conflict`];
 /// - reject a commit whose first event is at or below the stored snapshot's event sequence with
 ///   [`Error::Conflict`], because compaction may have deleted the events that sequence would
 ///   collide with;
-/// - reject a snapshot whose sequence is not the stored snapshot's sequence plus one with
-///   [`Error::Conflict`] (DynamoDB), or keep the stored snapshot's event sequence monotonic
+/// - reject a snapshot whose sequence is not the stored snapshot's sequence plus one (or 1 when
+///   there is no stored snapshot) with [`Error::Conflict`] (DynamoDB), or keep the stored snapshot's event sequence monotonic
 ///   (PostgreSQL, where the event-sequence conflict already covers racing writers);
 /// - write events, snapshot, and operations atomically;
 /// - return events in ascending sequence order.

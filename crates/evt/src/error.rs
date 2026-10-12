@@ -91,6 +91,11 @@ pub enum Error {
     #[error("transient backend failure: {0}")]
     Transient(#[source] BoxError),
 
+    /// A commit was built wrong, for example with an event for another entity. Nothing was
+    /// written.
+    #[error("invalid commit: {0}")]
+    InvalidCommit(String),
+
     /// The repository was configured with an invalid value, such as an unsafe table name.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),

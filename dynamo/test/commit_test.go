@@ -126,13 +126,7 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 					"entityType": &types.AttributeValueMemberS{Value: "test"},
 					"payload":    &types.AttributeValueMemberS{Value: ""},
 				},
-				ConditionExpression: aws.String(
-					"(attribute_not_exists(seq) OR seq = :seq) AND (attribute_not_exists(eventSeq) OR eventSeq < :first)",
-				),
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":seq":   &types.AttributeValueMemberN{Value: "0"},
-					":first": &types.AttributeValueMemberN{Value: "2"},
-				},
+				ConditionExpression: aws.String("attribute_not_exists(seq)"),
 			},
 		},
 	}
@@ -150,6 +144,31 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 	require.NoError(s.T(), err)
 
 	s.client.AssertExpectations(s.T())
+}
+
+// Test that a later snapshot requires the loaded snapshot sequence and the floor
+func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
+	ctx := context.Background()
+
+	serializedEvents := []evt.SerializedEvent{{
+		EntityType: "test", EntityID: "test-id", Sequence: 7, Type: "test-event", Version: 1,
+		Payload: []byte{}, Metadata: evt.Metadata{Region: "us-east-1"},
+	}}
+
+	var input *dynamodb.TransactWriteItemsInput
+	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { input = args.Get(1).(*dynamodb.TransactWriteItemsInput) }).
+		Return(new(dynamodb.TransactWriteItemsOutput), nil)
+
+	err := s.repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serializedEvents}, "test", "test-id", []byte{}, 3)
+	require.NoError(s.T(), err)
+
+	put := input.TransactItems[len(input.TransactItems)-1].Put
+	require.Equal(s.T(), "seq = :seq AND eventSeq < :first", aws.ToString(put.ConditionExpression))
+	require.Equal(s.T(), map[string]types.AttributeValue{
+		":seq":   &types.AttributeValueMemberN{Value: "2"},
+		":first": &types.AttributeValueMemberN{Value: "7"},
+	}, put.ExpressionAttributeValues)
 }
 
 // Test CommitStream method with successful stream processing

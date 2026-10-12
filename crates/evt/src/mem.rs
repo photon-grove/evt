@@ -64,6 +64,8 @@ impl Repository for MemRepository {
     type Operation = Infallible;
 
     async fn commit(&self, commit: Commit<Infallible>) -> Result<(), Error> {
+        commit.validate()?;
+
         let mut streams = self.lock();
         let stream = streams.entry(commit.entity_id.clone()).or_default();
 
@@ -91,17 +93,21 @@ impl Repository for MemRepository {
             });
         }
 
-        if let (Some(new), Some(existing)) = (&commit.snapshot, &stream.snapshot)
-            && existing.sequence.next() != new.sequence
-        {
-            return Err(Error::Conflict {
-                entity_id: commit.entity_id,
-                message: format!(
-                    "snapshot sequence moved: stored {}, expected {}",
-                    existing.sequence,
-                    new.sequence.0 - 1
-                ),
-            });
+        if let Some(new) = &commit.snapshot {
+            let stored = stream
+                .snapshot
+                .as_ref()
+                .map_or(EventSequence::ZERO, |existing| existing.sequence);
+
+            if stored.next() != new.sequence {
+                return Err(Error::Conflict {
+                    entity_id: commit.entity_id,
+                    message: format!(
+                        "snapshot sequence moved: stored {stored}, expected {}",
+                        new.sequence.0 - 1
+                    ),
+                });
+            }
         }
 
         let last_sequence = commit.events.last().map(|event| event.sequence);
