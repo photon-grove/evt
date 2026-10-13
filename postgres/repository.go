@@ -48,9 +48,9 @@ func init() {
 	}
 }
 
-// maxIdentifierLen is the longest identifier PostgreSQL keeps. Longer names are silently truncated,
-// so two names that share their first 63 bytes would name the same table.
-const maxIdentifierLen = 63
+// maxTableNameLen is the longest table name allowed. PostgreSQL truncates identifiers to 63 bytes,
+// and the longest name derived from a table name, "{events}_entity_type_idx", adds 16.
+const maxTableNameLen = 63 - len("_entity_type_idx")
 
 // entityLockQuery takes the per-entity transaction lock ($1 is the entity ID) that serializes
 // commits and snapshot writes for one entity, so a snapshot cannot raise the floor while a commit
@@ -62,7 +62,24 @@ const entityLockQuery = "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))"
 func validIdentifier(name string) bool {
 	_, reserved := reservedKeywords[strings.ToLower(name)]
 
-	return len(name) <= maxIdentifierLen && identifierPattern.MatchString(name) && !reserved
+	return len(name) <= maxTableNameLen && identifierPattern.MatchString(name) && !reserved
+}
+
+// sharedRelationName returns a name that two relations created by EnsureSchema would share, or ""
+// when there is none: the tables, "{events}_entity_type_idx", and each table's "{table}_pkey".
+// CREATE TABLE IF NOT EXISTS would otherwise skip a table whose name an index already took.
+// Unquoted identifiers fold to lower case, so names are compared that way.
+func sharedRelationName(eventsTable, snapshotsTable string) string {
+	events, snapshots := strings.ToLower(eventsTable), strings.ToLower(snapshotsTable)
+	relations := []string{events, events + "_pkey", events + "_entity_type_idx", snapshots, snapshots + "_pkey"}
+
+	for i, relation := range relations {
+		if slices.Contains(relations[:i], relation) {
+			return relation
+		}
+	}
+
+	return ""
 }
 
 // lockEntities takes the entity lock for every entity in events, in sorted order so concurrent
@@ -147,6 +164,11 @@ func NewRepository(db DB, opts ...Option) *Repository {
 		if !validIdentifier(name) {
 			panic(fmt.Sprintf("postgres: invalid table name %q", name))
 		}
+	}
+
+	if shared := sharedRelationName(repo.eventsTable, repo.snapshotsTable); shared != "" {
+		panic(fmt.Sprintf("postgres: tables %q and %q would both use the name %q",
+			repo.eventsTable, repo.snapshotsTable, shared))
 	}
 
 	return repo
@@ -385,12 +407,17 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 // checkContiguous rejects events whose sequences are not contiguous (each one more than the last)
 // for each entity. The floor check reads the first event and the snapshot records the last, so a
 // commit like [6, 5] after compacting through 5 would recreate sequence 5, and loads reject a
-// stream with a gap such as [1, 3].
+// stream with a gap such as [1, 3]. Sequences start at 1: DynamoDB keeps the snapshot at sk = 0 and
+// reads events after it.
 func checkContiguous(events []evt.SerializedEvent) error {
 	last := make(map[evt.EntityID]evt.EventSequence, 1)
 
 	for _, event := range events {
-		if previous, seen := last[event.EntityID]; seen && event.Sequence != previous+1 {
+		previous, seen := last[event.EntityID]
+		if !seen && event.Sequence < 1 {
+			return fmt.Errorf("postgres: event %s has sequence %d; sequences start at 1", event.ID, event.Sequence)
+		}
+		if seen && event.Sequence != previous+1 {
 			return fmt.Errorf("postgres: event %s follows sequence %d; sequences must be contiguous", event.ID, previous)
 		}
 		last[event.EntityID] = event.Sequence

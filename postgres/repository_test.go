@@ -63,10 +63,22 @@ func TestNewRepositoryTableNames(t *testing.T) {
 		})
 	})
 
-	t.Run("name over 63 bytes panics", func(t *testing.T) {
+	t.Run("name over 47 bytes panics", func(t *testing.T) {
 		require.Panics(t, func() {
-			NewRepository(nil, WithEventsTable(strings.Repeat("e", 64)))
+			NewRepository(nil, WithEventsTable(strings.Repeat("e", 48)))
 		})
+	})
+
+	t.Run("names that collide with each other or a derived index panic", func(t *testing.T) {
+		for _, names := range [][2]string{
+			{"evt_events", "Evt_Events"},
+			{"events", "events_entity_type_idx"},
+			{"events_pkey", "events"},
+		} {
+			require.Panics(t, func() {
+				NewRepository(nil, WithEventsTable(names[0]), WithSnapshotsTable(names[1]))
+			}, "%v", names)
+		}
 	})
 
 	t.Run("reserved keyword panics", func(t *testing.T) {

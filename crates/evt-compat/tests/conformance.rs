@@ -418,6 +418,62 @@ async fn postgres_writes_wait_for_the_entity_lock() {
     );
 }
 
+/// Inserts one view row per ledger version with a plain `INSERT`, so two writers committing from
+/// the same load collide on it.
+struct PlainInsertView;
+
+impl Projector<Ledger, PgStatement> for PlainInsertView {
+    fn project(
+        &self,
+        entity_id: &EntityId,
+        ledger: &Ledger,
+        _: &[LedgerEvent],
+    ) -> Result<Vec<PgStatement>, BoxError> {
+        Ok(vec![PgStatement::new(
+            "INSERT INTO evt_plain_views (key) VALUES ($1)",
+            vec![Box::new(format!("{entity_id}:{}", ledger.entries))],
+        )])
+    }
+}
+
+#[tokio::test]
+async fn postgres_lost_race_is_a_conflict_with_a_plain_insert_projector() {
+    let repository = drivers::postgres().await.expect("connect to PostgreSQL");
+    repository
+        .pool()
+        .get()
+        .await
+        .expect("connect to PostgreSQL")
+        .batch_execute("CREATE TABLE IF NOT EXISTS evt_plain_views (key text PRIMARY KEY)")
+        .await
+        .expect("create the view table");
+
+    let store = Store::<Ledger, _>::new(&repository, ()).with_projector(PlainInsertView);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = EntityId::new(format!("conf-{nanos}-plain-insert"));
+
+    let first = store.load(&id).await.unwrap();
+    let second = store.load(&id).await.unwrap();
+    let event = || {
+        vec![LedgerEvent::from(photon_evt::conformance::Added {
+            amount: 1,
+        })]
+    };
+    store
+        .commit(first, event(), &Metadata::new("local"))
+        .await
+        .unwrap();
+
+    let lost = store.commit(second, event(), &Metadata::new("local")).await;
+    assert!(
+        matches!(lost, Err(Error::Conflict { .. })),
+        "the loser fails on the event key: {lost:?}"
+    );
+}
+
 #[tokio::test]
 async fn postgres_conforms() {
     let repository = drivers::postgres().await.expect("connect to PostgreSQL");

@@ -17,7 +17,7 @@ use crate::ids::{EntityId, EntityType, EventSequence};
 use crate::repository::{Commit, Repository};
 use crate::wire::postgres::{
     DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, SnapshotRow,
-    is_valid_identifier, schema_ddl,
+    check_table_names, schema_ddl,
 };
 
 /// A SQL statement that an in-band projector adds to a commit. It runs in the same transaction
@@ -82,20 +82,8 @@ impl PostgresRepository {
     /// plain SQL identifiers.
     #[must_use = "with_tables returns the reconfigured repository"]
     pub fn with_tables(mut self, events_table: &str, snapshots_table: &str) -> Result<Self, Error> {
-        for name in [events_table, snapshots_table] {
-            if !is_valid_identifier(name) {
-                return Err(Error::InvalidConfig(format!(
-                    "postgres: invalid table name {name:?}"
-                )));
-            }
-        }
-
-        // Unquoted identifiers fold to lower case, so `Events` and `events` name the same table.
-        if events_table.eq_ignore_ascii_case(snapshots_table) {
-            return Err(Error::InvalidConfig(format!(
-                "postgres: events and snapshots need separate tables, both are {events_table:?}"
-            )));
-        }
+        check_table_names(events_table, snapshots_table)
+            .map_err(|message| Error::InvalidConfig(format!("postgres: {message}")))?;
 
         self.events_table = events_table.to_owned();
         self.snapshots_table = snapshots_table.to_owned();
@@ -241,21 +229,6 @@ impl Repository for PostgresRepository {
             .await
             .map_err(statement_error)?;
 
-        for statement in &commit.operations {
-            let params: Vec<&(dyn ToSql + Sync)> = statement
-                .params
-                .iter()
-                .map(|param| param.as_ref() as &(dyn ToSql + Sync))
-                .collect();
-            tx.execute(&statement.sql, &params).await.map_err(|err| {
-                if transient(&err) {
-                    Error::Transient(Box::new(err))
-                } else {
-                    Error::Projector(Box::new(err))
-                }
-            })?;
-        }
-
         let insert = format!(
             "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)",
@@ -301,6 +274,19 @@ impl Repository for PostgresRepository {
                     row.get::<_, i64>(0)
                 ),
             });
+        }
+
+        // Projector statements run after the events, so a writer that lost a race fails on the
+        // event key (a conflict) rather than on a view row (a projector error).
+        for statement in &commit.operations {
+            let params: Vec<&(dyn ToSql + Sync)> = statement
+                .params
+                .iter()
+                .map(|param| param.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            tx.execute(&statement.sql, &params)
+                .await
+                .map_err(projector_error)?;
         }
 
         if let Some(snapshot) = commit.snapshot {
@@ -438,6 +424,18 @@ fn classify(entity_id: &EntityId, err: tokio_postgres::Error) -> Error {
     }
 }
 
+/// Maps a failed projector statement. Only an error the database raised is the projector's
+/// fault. A lost connection or a pool timeout is a backend failure.
+fn projector_error(err: tokio_postgres::Error) -> Error {
+    if transient(&err) {
+        Error::Transient(Box::new(err))
+    } else if err.as_db_error().is_some() {
+        Error::Projector(Box::new(err))
+    } else {
+        Error::backend(err)
+    }
+}
+
 /// Maps a failed `COMMIT`. The event inserts and the snapshot upsert check their own keys, so an
 /// integrity violation raised at commit comes from a deferred constraint on a projector's table.
 fn commit_error(err: tokio_postgres::Error) -> Error {
@@ -483,12 +481,13 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_or_shared_table_names() {
-        // PostgreSQL truncates identifiers to 63 bytes.
-        let too_long = "e".repeat(64);
+        let too_long = "e".repeat(48);
 
         for (events, snapshots) in [
             ("evt_events", "evt_events"),
             ("Evt_Events", "evt_events"),
+            ("events", "events_entity_type_idx"),
+            ("events_pkey", "events"),
             ("evt_events; drop", "evt_snapshots"),
             ("Select", "evt_snapshots"),
             (too_long.as_str(), "evt_snapshots"),
