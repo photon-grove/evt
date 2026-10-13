@@ -291,6 +291,67 @@ async fn postgres_snapshot_deadlock_is_retried() {
     assert!(repository.snapshot(&id).await.unwrap().is_some());
 }
 
+/// Inserts a row that already exists into a table whose unique constraint is checked at `COMMIT`.
+struct DeferredDuplicate;
+
+impl Projector<Ledger, PgStatement> for DeferredDuplicate {
+    fn project(
+        &self,
+        _: &EntityId,
+        _: &Ledger,
+        _: &[LedgerEvent],
+    ) -> Result<Vec<PgStatement>, BoxError> {
+        Ok(vec![PgStatement::new(
+            "INSERT INTO evt_deferred_views (key) VALUES ('taken')",
+            Vec::new(),
+        )])
+    }
+}
+
+#[tokio::test]
+async fn postgres_deferred_projector_violation_is_not_a_conflict() {
+    let repository = drivers::postgres().await.expect("connect to PostgreSQL");
+    repository
+        .pool()
+        .get()
+        .await
+        .expect("connect to PostgreSQL")
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS evt_deferred_views (
+                 key text,
+                 CONSTRAINT evt_deferred_views_key UNIQUE (key) DEFERRABLE INITIALLY DEFERRED
+             );
+             INSERT INTO evt_deferred_views (key)
+                 SELECT 'taken' WHERE NOT EXISTS (SELECT 1 FROM evt_deferred_views);",
+        )
+        .await
+        .expect("create the view table");
+
+    let store = Store::<Ledger, _>::new(&repository, ()).with_projector(DeferredDuplicate);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = EntityId::new(format!("conf-{nanos}-deferred-projector"));
+
+    let err = store
+        .execute_with_retry(
+            &id,
+            Add(1),
+            Metadata::new("local"),
+            &RetryPolicy::immediate(3),
+            |_| async {},
+        )
+        .await
+        .expect_err("the deferred constraint fails at commit");
+
+    assert!(
+        matches!(err.as_store_error(), Some(Error::Projector(_))),
+        "want a projector error, got {err:?}"
+    );
+    assert!(repository.events(&id).await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn postgres_conforms() {
     let repository = drivers::postgres().await.expect("connect to PostgreSQL");

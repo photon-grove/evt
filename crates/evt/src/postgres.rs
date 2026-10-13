@@ -311,9 +311,7 @@ impl Repository for PostgresRepository {
             self.upsert_snapshot(&tx, &row).await?;
         }
 
-        tx.commit()
-            .await
-            .map_err(|err| classify(&commit.entity_id, err))
+        tx.commit().await.map_err(commit_error)
     }
 
     async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
@@ -431,6 +429,18 @@ fn classify(entity_id: &EntityId, err: tokio_postgres::Error) -> Error {
     }
 }
 
+/// Maps a failed `COMMIT`. The event inserts and the snapshot upsert check their own keys, so an
+/// integrity violation raised at commit comes from a deferred constraint on a projector's table.
+fn commit_error(err: tokio_postgres::Error) -> Error {
+    if transient(&err) {
+        Error::Transient(Box::new(err))
+    } else if err.code().is_some_and(|code| code.code().starts_with("23")) {
+        Error::Projector(Box::new(err))
+    } else {
+        Error::backend(err)
+    }
+}
+
 /// Maps a failed statement inside a commit: [`Error::Transient`] when PostgreSQL rolled the
 /// transaction back for a retryable reason, otherwise [`Error::Backend`].
 fn statement_error(err: tokio_postgres::Error) -> Error {
@@ -468,6 +478,7 @@ mod tests {
             ("evt_events", "evt_events"),
             ("Evt_Events", "evt_events"),
             ("evt_events; drop", "evt_snapshots"),
+            ("Select", "evt_snapshots"),
         ] {
             assert!(
                 matches!(
