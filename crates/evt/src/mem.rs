@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::Error;
@@ -65,6 +66,9 @@ impl Repository for MemRepository {
 
     async fn commit(&self, commit: Commit<Infallible>) -> Result<(), Error> {
         commit.validate()?;
+        if commit.events.is_empty() {
+            return Ok(());
+        }
 
         let mut streams = self.lock();
         let stream = streams.entry(commit.entity_id.clone()).or_default();
@@ -145,7 +149,7 @@ impl Repository for MemRepository {
             .map(|stream| {
                 stream
                     .events
-                    .range(after.next()..)
+                    .range((Bound::Excluded(after), Bound::Unbounded))
                     .map(|(_, e)| e.clone())
                     .collect()
             })

@@ -90,7 +90,8 @@ impl PostgresRepository {
             }
         }
 
-        if events_table == snapshots_table {
+        // Unquoted identifiers fold to lower case, so `Events` and `events` name the same table.
+        if events_table.eq_ignore_ascii_case(snapshots_table) {
             return Err(Error::InvalidConfig(format!(
                 "postgres: events and snapshots need separate tables, both are {events_table:?}"
             )));
@@ -465,6 +466,7 @@ mod tests {
     fn rejects_unsafe_or_shared_table_names() {
         for (events, snapshots) in [
             ("evt_events", "evt_events"),
+            ("Evt_Events", "evt_events"),
             ("evt_events; drop", "evt_snapshots"),
         ] {
             assert!(

@@ -195,6 +195,11 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             foreign_events(repo).await,
         );
         record(
+            "reject events out of order",
+            out_of_order_events(repo).await,
+        );
+        record("an empty commit is a no-op", empty_commit(repo).await);
+        record(
             "reject a duplicate sequence",
             duplicate_sequence(repo).await,
         );
@@ -402,7 +407,12 @@ async fn commit_and_read<R: Repository>(repo: &R) -> CaseResult {
         "events() returns every event as written, ascending"
     );
 
-    for (after, want) in [(2, stream.events(3..=5)), (5, Vec::new()), (9, Vec::new())] {
+    for (after, want) in [
+        (2, stream.events(3..=5)),
+        (5, Vec::new()),
+        (9, Vec::new()),
+        (i64::MAX, Vec::new()),
+    ] {
         ensure_eq!(
             repo.events_after(&stream.id, EventSequence(after)).await?,
             want,
@@ -426,6 +436,52 @@ async fn foreign_events<R: Repository>(repo: &R) -> CaseResult {
     ensure!(
         repo.events(&a.id).await?.is_empty() && repo.events(&b.id).await?.is_empty(),
         "the rejected commit writes nothing"
+    );
+
+    Ok(())
+}
+
+async fn out_of_order_events<R: Repository>(repo: &R) -> CaseResult {
+    let stream = Stream::new(&namespace(), "1", "ledger");
+    stream
+        .commit(
+            repo,
+            stream.events(1..=5),
+            Some(stream.new_snapshot(1, "{}")),
+        )
+        .await?;
+    repo.compact_below(&stream.id, EventSequence(5)).await?;
+
+    // Only the first event is checked against the floor, so [6, 5] would recreate compacted 5.
+    let reversed = vec![stream.event(6, 6), stream.event(5, 5)];
+    expect_err(
+        stream.commit(repo, reversed, None).await,
+        "a commit whose sequences descend",
+        |err| matches!(err, Error::InvalidCommit(_)),
+    )?;
+    ensure!(
+        repo.events(&stream.id).await?.is_empty(),
+        "the rejected commit writes nothing"
+    );
+
+    Ok(())
+}
+
+async fn empty_commit<R: Repository>(repo: &R) -> CaseResult {
+    let stream = Stream::new(&namespace(), "1", "ledger");
+
+    stream
+        .commit(repo, Vec::new(), Some(stream.new_snapshot(2, "{}")))
+        .await?;
+    ensure!(
+        repo.snapshot(&stream.id).await?.is_none(),
+        "an empty commit ignores its snapshot"
+    );
+    ensure!(
+        repo.entity_heads(Some(&stream.entity_type))
+            .await?
+            .is_empty(),
+        "an empty commit creates no stream"
     );
 
     Ok(())
