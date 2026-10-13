@@ -198,6 +198,53 @@ func (s *RepositorySuite) Test_CommitStream_Ok() {
 	s.client.AssertExpectations(s.T())
 }
 
+// Test CommitStream adds one floor check per stream per batch, using the batch's lowest sequence
+// whatever order the results arrive in
+func (s *RepositorySuite) Test_CommitStream_OneFloorCheckPerStream() {
+	ctx := context.Background()
+
+	event := func(id evt.EntityID, sequence evt.EventSequence) evt.SerializedEvent {
+		return evt.SerializedEvent{
+			EntityType: "test", EntityID: id, Sequence: sequence, Type: "test-event", Version: 1,
+			Payload: []byte(`{}`), Metadata: evt.Metadata{Region: "us-east-1"},
+		}
+	}
+
+	resultChannel := make(chan result.Result[evt.SerializedResult], 4)
+	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{event("entity-1", 5)}})
+	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{event("entity-2", 1)}})
+	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{event("entity-1", 4)}})
+	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{event("entity-2", 2)}})
+	close(resultChannel)
+
+	var checks []*types.ConditionCheck
+
+	capture := mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
+		for _, item := range in.TransactItems {
+			if item.ConditionCheck != nil {
+				checks = append(checks, item.ConditionCheck)
+			}
+		}
+
+		return true
+	})
+
+	output := new(dynamodb.TransactWriteItemsOutput)
+	s.client.On("TransactWriteItems", mock.Anything, capture, mock.Anything).Return(output, nil).Once()
+
+	require.Empty(s.T(), s.repo.CommitStream(ctx, resultChannel))
+
+	floors := make(map[string]string)
+	for _, check := range checks {
+		pk := check.Key["pk"].(*types.AttributeValueMemberS).Value
+		floors[pk] = check.ExpressionAttributeValues[":first"].(*types.AttributeValueMemberN).Value
+	}
+
+	require.Len(s.T(), checks, 2)
+	require.Equal(s.T(), map[string]string{"entity-1": "4", "entity-2": "1"}, floors)
+	s.client.AssertExpectations(s.T())
+}
+
 // Test CommitStream with channel containing errors
 func (s *RepositorySuite) Test_CommitStream_WithErrors() {
 	ctx := context.Background()
