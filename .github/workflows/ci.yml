@@ -82,7 +82,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10.20.0
 
@@ -121,7 +121,7 @@ jobs:
         with:
           cache-key: quality
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10.20.0
 
@@ -157,7 +157,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10.20.0
 
@@ -243,7 +243,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10.20.0
 
