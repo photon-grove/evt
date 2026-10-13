@@ -106,8 +106,10 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// from every event. An entity with no events loads as `A::default()` at sequence 0.
     ///
     /// Event sequences must be contiguous. A gap means the stream was compacted between reading
-    /// the snapshot and the events, so the load starts over, up to three times. A gap that
-    /// persists, for example from expired events, fails with [`Error::Conflict`].
+    /// the snapshot and the events, so the load starts over, up to three times. When the event
+    /// read is empty, the load reads the snapshot again and starts over if it advanced, because a
+    /// compaction can leave no gap to detect. A gap that persists, for example from expired
+    /// events, fails with [`Error::Conflict`].
     pub async fn load(&self, entity_id: impl Into<EntityId>) -> Result<Loaded<A>, Error> {
         let entity_id = entity_id.into();
         let mut attempt = 1;
@@ -153,6 +155,24 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         } else {
             self.repository.events(&loaded.entity_id).await?
         };
+
+        // An empty read cannot show a gap. If another writer snapshotted past this point and
+        // compacted between the two reads, the events it compacted are missing, so check that the
+        // snapshot has not moved.
+        if events.is_empty() {
+            let moved = self
+                .repository
+                .snapshot(&loaded.entity_id)
+                .await?
+                .is_some_and(|snapshot| snapshot.event_sequence > loaded.sequence);
+
+            if moved {
+                return Err(Error::Conflict {
+                    entity_id: loaded.entity_id,
+                    message: "the snapshot advanced during the load".into(),
+                });
+            }
+        }
 
         for event in events {
             loaded.replay(event)?;

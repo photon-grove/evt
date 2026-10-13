@@ -195,7 +195,7 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             foreign_events(repo).await,
         );
         record(
-            "reject events out of order, with gaps, below 1, or with wrong IDs",
+            "reject events out of order, with gaps, below 1, or with wrong IDs or snapshot sequences",
             out_of_order_events(repo).await,
         );
         record("an empty commit is a no-op", empty_commit(repo).await);
@@ -482,8 +482,22 @@ async fn out_of_order_events<R: Repository>(repo: &R) -> CaseResult {
         "an event whose ID is not {entity_id}:{sequence}",
         |err| matches!(err, Error::InvalidCommit(_)),
     )?;
+    // Snapshot sequences start at 1, and the DynamoDB condition subtracts one from them.
+    for sequence in [0, i64::MIN] {
+        expect_err(
+            low.commit(
+                repo,
+                low.events(1..=1),
+                Some(low.new_snapshot(sequence, "{}")),
+            )
+            .await,
+            &format!("a snapshot at sequence {sequence}"),
+            |err| matches!(err, Error::InvalidCommit(_)),
+        )?;
+    }
+
     ensure!(
-        repo.events(&low.id).await?.is_empty(),
+        repo.events(&low.id).await?.is_empty() && repo.snapshot(&low.id).await?.is_none(),
         "the rejected commits write nothing"
     );
 
@@ -973,9 +987,9 @@ struct Interfering<'a, R> {
 enum Interference {
     /// Commit the same sequences just before the first commit.
     CompetingCommit,
-    /// Between the snapshot read and the event read of the first load: append six events (a
-    /// snapshot at the fifth), commit one more, and compact through the new snapshot.
-    CompactDuringLoad,
+    /// Between the snapshot read and the event read of the first load: append `appended` events
+    /// with a snapshot every five, and compact through the new snapshot.
+    CompactDuringLoad { appended: usize },
 }
 
 impl<R: Repository> Interfering<'_, R> {
@@ -984,10 +998,10 @@ impl<R: Repository> Interfering<'_, R> {
             && self.armed.swap(false, Ordering::SeqCst)
     }
 
-    async fn compact_ahead(&self, entity_id: &EntityId) -> Result<(), Error> {
+    async fn compact_ahead(&self, entity_id: &EntityId, appended: usize) -> Result<(), Error> {
         let other = Store::<Ledger, _>::new(self.inner, ()).with_snapshot_interval(5);
 
-        for _ in 0..6 {
+        for _ in 0..appended {
             other
                 .execute(entity_id, Add(1), metadata())
                 .await
@@ -1042,8 +1056,10 @@ impl<R: Repository> Repository for Interfering<'_, R> {
         entity_id: &EntityId,
         after: EventSequence,
     ) -> Result<Vec<SerializedEvent>, Error> {
-        if self.fires(&Interference::CompactDuringLoad) {
-            self.compact_ahead(entity_id).await?;
+        if let Interference::CompactDuringLoad { appended } = self.interference
+            && self.fires(&self.interference)
+        {
+            self.compact_ahead(entity_id, appended).await?;
         }
 
         self.inner.events_after(entity_id, after).await
@@ -1074,25 +1090,28 @@ impl<R: Repository> Repository for Interfering<'_, R> {
 }
 
 async fn store_load_during_compaction<R: Repository>(repo: &R) -> CaseResult {
-    let id = ledger_id();
-    let store = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(5);
-    for _ in 0..5 {
-        store.execute(&id, Add(1), metadata()).await?;
-    }
+    // The load reads the snapshot at 5, then another writer appends events, snapshots at 10, and
+    // compacts through 10. With six appended, reading after 5 returns only 11: a gap. With five,
+    // it returns nothing, and only a second snapshot read shows the load fell behind.
+    for (appended, head) in [(6, 11), (5, 10)] {
+        let id = ledger_id();
+        let store = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(5);
+        for _ in 0..5 {
+            store.execute(&id, Add(1), metadata()).await?;
+        }
 
-    // The load reads the snapshot at 5, then another writer reaches 11 and compacts through 10.
-    // Reading events after 5 now returns only 11, which must not be applied to the state at 5.
-    let racing = Interfering {
-        inner: repo,
-        armed: AtomicBool::new(true),
-        interference: Interference::CompactDuringLoad,
-    };
-    let loaded = Store::<Ledger, _>::new(racing, ()).load(&id).await?;
-    ensure_eq!(
-        (loaded.aggregate().total, loaded.sequence()),
-        (11, EventSequence(11)),
-        "the load starts over from the newer snapshot"
-    );
+        let racing = Interfering {
+            inner: repo,
+            armed: AtomicBool::new(true),
+            interference: Interference::CompactDuringLoad { appended },
+        };
+        let loaded = Store::<Ledger, _>::new(racing, ()).load(&id).await?;
+        ensure_eq!(
+            (loaded.aggregate().total, loaded.sequence()),
+            (head, EventSequence(head)),
+            format!("the load starts over from the newer snapshot ({appended} appended)")
+        );
+    }
 
     Ok(())
 }

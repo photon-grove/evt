@@ -77,3 +77,46 @@ func TestExecuteWithRetryRetriesALoadGap(t *testing.T) {
 	require.Equal(t, 1, retries, "the gap is retried once")
 	require.Equal(t, "six", entity.(*test.Entity).Value)
 }
+
+// compactDuringLoad snapshots and compacts the stream between the load's snapshot read and its
+// event read, leaving no event after the old snapshot and so no gap to detect.
+type compactDuringLoad struct {
+	evt.Repository
+	advance func()
+	fired   bool
+}
+
+func (r *compactDuringLoad) GetLatestEvents(ctx context.Context, id evt.EntityID, after evt.EventSequence) ([]evt.SerializedEvent, error) {
+	if !r.fired {
+		r.fired = true
+		r.advance()
+	}
+
+	return r.Repository.GetLatestEvents(ctx, id, after)
+}
+
+// A snapshot that advances during the load fails it with a transient conflict, even when the
+// event read returns nothing.
+func TestLoadEntityRejectsASnapshotThatAdvanced(t *testing.T) {
+	ctx := context.Background()
+	repo := mem.NewRepository()
+	id := evt.EntityID("advance-1")
+
+	store := snapshots.NewStore(repo, 3)
+	execute := func(values ...string) {
+		for _, value := range values {
+			require.NoError(t, store.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: value}, newTestMetadata()))
+		}
+	}
+	execute("one", "two", "three")
+
+	racing := &compactDuringLoad{Repository: repo, advance: func() {
+		execute("four", "five", "six")
+		_, err := repo.(evt.Compactor).CompactBelow(ctx, id, 6)
+		require.NoError(t, err)
+	}}
+
+	_, err := snapshots.NewStore(racing, 3).LoadEntity(ctx, test.NewEntity(id), id)
+	require.True(t, evt.IsConflictErr(err), "want a conflict, got %v", err)
+	require.True(t, policy.IsTransient(err), "want a transient error, got %v", err)
+}
