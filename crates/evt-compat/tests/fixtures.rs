@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 
 use evt_compat::scenario::{FIXTURE_RUN, ORIGIN_SOURCE, compat_dir};
-use evt_compat::{Runner, ScenarioFixtures, Scenarios};
+use evt_compat::{Account, Runner, ScenarioFixtures, Scenarios};
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
-    EntityId, EntityType, EventId, EventSequence, EventType, EventVersion, MemRepository, Metadata,
-    SerializedEvent, SerializedSnapshot, json, snapshot_events_due,
+    Aggregate, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion,
+    MemRepository, Metadata, SerializedEvent, SerializedSnapshot, json, snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,6 +21,16 @@ struct CodecFixtures {
     metadata_decode: Vec<DecodeVector>,
     event_decode: Vec<DecodeVector>,
     snapshot_policy: Vec<[i64; 4]>,
+    views: Vec<ViewVector>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewVector {
+    name: String,
+    entity_id: String,
+    state: String,
+    dynamo_item: Value,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +226,28 @@ fn lenient_decoding_matches_go() {
             .canonical
             .replace(r#""payload":null"#, r#""payload":"""#);
         assert_eq!(canonical, expected, "event {}", vector.name);
+    }
+}
+
+#[test]
+fn view_items_match_go() {
+    for vector in codec_fixtures().views {
+        let name = &vector.name;
+        let account: Account = serde_json::from_str(&vector.state).unwrap();
+        let payload = json::to_vec(&account).unwrap();
+        assert_eq!(utf8(payload.clone()), vector.state, "{name}: state");
+
+        let item = dynamo::view_item(
+            &EntityType::new(Account::TYPE),
+            &EntityId::new(vector.entity_id),
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            vector.dynamo_item,
+            "{name}: view item"
+        );
     }
 }
 

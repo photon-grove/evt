@@ -2988,5 +2988,29 @@
       5,
       6
     ]
+  ],
+  "views": [
+    {
+      "name": "account",
+      "entityId": "acct-1",
+      "state": "{\"owner\":\"Ada \\u003c\\u0026\\u003e \\u2028\",\"status\":\"open\",\"balanceCents\":1200,\"deposits\":2,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":[\"vip\"],\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"},\"lastMemo\":null}",
+      "dynamoItem": {
+        "entityID": {
+          "S": "acct-1"
+        },
+        "entityType": {
+          "S": "account"
+        },
+        "payload": {
+          "S": "{\"owner\":\"Ada \\u003c\\u0026\\u003e \\u2028\",\"status\":\"open\",\"balanceCents\":1200,\"deposits\":2,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":[\"vip\"],\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"},\"lastMemo\":null}"
+        },
+        "pk": {
+          "S": "account#acct-1"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      }
+    }
   ]
 }

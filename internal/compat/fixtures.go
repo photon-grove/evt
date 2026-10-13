@@ -74,6 +74,15 @@ type CodecFixtures struct {
 	MetadataDecode []DecodeVector   `json:"metadataDecode"`
 	EventDecode    []DecodeVector   `json:"eventDecode"`
 	SnapshotPolicy [][4]int64       `json:"snapshotPolicy"`
+	Views          []ViewVector     `json:"views"`
+}
+
+// ViewVector is the single-item view row dynamo.NewViewProjector writes for an account.
+type ViewVector struct {
+	Name       string         `json:"name"`
+	EntityID   evt.EntityID   `json:"entityId"`
+	State      string         `json:"state"`
+	DynamoItem map[string]any `json:"dynamoItem"`
 }
 
 // EventInput describes a serialized event field by field. Metadata is given as its Go encoding.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/otel/propagation"
 
@@ -176,6 +177,12 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 		fixtures.EventDecode = append(fixtures.EventDecode, DecodeVector{c.name, c.input, string(canonical)})
 	}
 
+	view, err := viewVector(ctx)
+	if err != nil {
+		return fixtures, fmt.Errorf("view: %w", err)
+	}
+	fixtures.Views = append(fixtures.Views, view)
+
 	for _, interval := range []int{0, 1, 2, 3, 5} {
 		for current := int64(0); current <= 11; current++ {
 			for count := 0; count <= 6; count++ {
@@ -265,5 +272,39 @@ func snapshotVector(ctx context.Context, c namedSnapshot) (SnapshotVector, error
 		},
 		SerializedSnapshotJSON: string(serialized),
 		DynamoItem:             DynamoItemJSON(items[0]),
+	}, nil
+}
+
+// viewVector projects an account through the real view projector and records the item it writes.
+func viewVector(ctx context.Context) (ViewVector, error) {
+	account := NewAccount("acct-1")
+	account.Owner = "Ada <&> \u2028"
+	account.Status = "open"
+	account.BalanceCents = 1200
+	account.Deposits = 2
+	account.OpenedAt = time.Date(2026, 1, 2, 3, 4, 5, 123_000_000, time.UTC)
+	account.Tags = []string{"vip"}
+	account.Labels = map[string]string{"tier": "gold", "region": "emea"}
+
+	state, err := json.Marshal(account)
+	if err != nil {
+		return ViewVector{}, err
+	}
+
+	group, err := dynamo.NewViewProjector("views").Project(ctx, account, nil)
+	if err != nil {
+		return ViewVector{}, err
+	}
+
+	items := group.(dynamo.TransactionGroup).ToWriteItems()
+	if len(items) != 1 || items[0].Put == nil {
+		return ViewVector{}, fmt.Errorf("want one put, got %d items", len(items))
+	}
+
+	return ViewVector{
+		Name:       "account",
+		EntityID:   account.GetID(),
+		State:      string(state),
+		DynamoItem: DynamoItemJSON(items[0].Put.Item),
 	}, nil
 }
