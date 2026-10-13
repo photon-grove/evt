@@ -1115,28 +1115,43 @@ impl<R: Repository> Repository for Interfering<'_, R> {
 }
 
 async fn store_load_during_compaction<R: Repository>(repo: &R) -> CaseResult {
-    // The load reads the snapshot at 5, then another writer appends events, snapshots at 10, and
-    // compacts through 10. With six appended, reading after 5 returns only 11: a gap. With five,
-    // it returns nothing, and only a second snapshot read shows the load fell behind.
-    for (appended, head) in [(6, 11), (5, 10)] {
+    let racing = |appended| Interfering {
+        inner: repo,
+        armed: AtomicBool::new(true),
+        interference: Interference::CompactDuringLoad { appended },
+    };
+    let prepare = || async {
         let id = ledger_id();
         let store = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(5);
         for _ in 0..5 {
             store.execute(&id, Add(1), metadata()).await?;
         }
 
-        let racing = Interfering {
-            inner: repo,
-            armed: AtomicBool::new(true),
-            interference: Interference::CompactDuringLoad { appended },
-        };
-        let loaded = Store::<Ledger, _>::new(racing, ()).load(&id).await?;
-        ensure_eq!(
-            (loaded.aggregate().total, loaded.sequence()),
-            (head, EventSequence(head)),
-            format!("the load starts over from the newer snapshot ({appended} appended)")
-        );
-    }
+        Ok::<_, Failure>(id)
+    };
+
+    // The load reads the snapshot at 5, then another writer reaches 11 and compacts through 10.
+    // Reading events after 5 returns only 11, which must not be applied to the state at 5.
+    let id = prepare().await?;
+    let loaded = Store::<Ledger, _>::new(racing(6), ()).load(&id).await?;
+    ensure_eq!(
+        (loaded.aggregate().total, loaded.sequence()),
+        (11, EventSequence(11)),
+        "the load starts over from the newer snapshot"
+    );
+
+    // With five appended, the other writer stops at 10 and compacts through it, so the event read
+    // is empty and the load returns the older state. A commit from it is below the new floor.
+    let id = prepare().await?;
+    let store = Store::<Ledger, _>::new(racing(5), ()).with_snapshot_interval(5);
+    let stale = store.load(&id).await?;
+    ensure_eq!(stale.sequence(), EventSequence(5), "the stale load");
+    expect_conflict(
+        store
+            .commit(stale, vec![Added { amount: 1 }.into()], &metadata())
+            .await,
+        "a commit from a load that fell behind a compaction",
+    )?;
 
     Ok(())
 }

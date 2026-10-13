@@ -3,12 +3,10 @@ package snapshots
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"math"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/policy"
 )
 
 // Store handles executing Commands, committing Events that are yielded by those Commands,
@@ -77,15 +75,6 @@ func (store *Store) LoadEntity(
 		}
 
 		serializedEvents = events
-	}
-
-	// An empty read cannot show a gap. If another writer snapshotted past this point and
-	// compacted between the two reads, the events it compacted are missing, so check that the
-	// snapshot has not moved.
-	if len(serializedEvents) == 0 {
-		if err = store.checkSnapshotUnmoved(ctx, entityID, eventContext.CurrentSequence); err != nil {
-			return eventContext, err
-		}
 	}
 
 	// Apply all events to the entity to build up the current state
@@ -391,25 +380,4 @@ func logCatchUpError(
 	if sample != nil {
 		sample.CatchUpError = err.Error()
 	}
-}
-
-// checkSnapshotUnmoved returns a transient conflict when the entity's snapshot now covers events
-// past current, the sequence the load reached.
-func (store *Store) checkSnapshotUnmoved(ctx context.Context, entityID evt.EntityID, current *evt.EventSequence) error {
-	snapshot, err := store.repo.GetSnapshot(ctx, entityID)
-	if err != nil || snapshot == nil {
-		return err
-	}
-
-	var reached evt.EventSequence
-	if current != nil {
-		reached = *current
-	}
-	if snapshot.EventSequence <= reached {
-		return nil
-	}
-
-	return &policy.ClassifiedError{Class: policy.ClassTransient, Err: evt.NewConflictError(fmt.Sprintf(
-		"stream %s: the snapshot advanced from %d to %d during the load", entityID, reached, snapshot.EventSequence,
-	))}
 }

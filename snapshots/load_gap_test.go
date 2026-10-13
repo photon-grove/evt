@@ -95,9 +95,9 @@ func (r *compactDuringLoad) GetLatestEvents(ctx context.Context, id evt.EntityID
 	return r.Repository.GetLatestEvents(ctx, id, after)
 }
 
-// A snapshot that advances during the load fails it with a transient conflict, even when the
-// event read returns nothing.
-func TestLoadEntityRejectsASnapshotThatAdvanced(t *testing.T) {
+// A load that falls behind a compaction returns the older state, like any read that another writer
+// overtakes. The floor check rejects a commit from it.
+func TestFloorRejectsACommitFromALoadBehindACompaction(t *testing.T) {
 	ctx := context.Background()
 	repo := mem.NewRepository()
 	id := evt.EntityID("advance-1")
@@ -116,7 +116,6 @@ func TestLoadEntityRejectsASnapshotThatAdvanced(t *testing.T) {
 		require.NoError(t, err)
 	}}
 
-	_, err := snapshots.NewStore(racing, 3).LoadEntity(ctx, test.NewEntity(id), id)
+	err := snapshots.NewStore(racing, 3).Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: "stale"}, newTestMetadata())
 	require.True(t, evt.IsConflictErr(err), "want a conflict, got %v", err)
-	require.True(t, policy.IsTransient(err), "want a transient error, got %v", err)
 }

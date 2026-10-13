@@ -457,7 +457,7 @@ func (repo *Repository) checkFloor(ctx context.Context, tx pgx.Tx, events []evt.
 			return fmt.Errorf("postgres: check snapshot floor: %w", err)
 		}
 
-		return evt.NewConflictError(fmt.Sprintf(
+		return transientConflict(fmt.Sprintf(
 			"postgres: event %d for %s is at or below the snapshot floor %d", sequence, entityID, floor,
 		))
 	}

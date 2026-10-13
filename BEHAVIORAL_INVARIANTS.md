@@ -421,7 +421,8 @@ DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimi
 - **Optimistic concurrency on commit** — a commit that reuses an already-committed `(EntityID,
   EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with a conditional
   write (`attribute_not_exists(sk)`); PostgreSQL with the `(entity_id, sequence)` primary key, whose
-  unique violation surfaces as an `evt.ConflictError`. (The in-memory backend is a permissive test
+  unique violation surfaces as an `evt.ConflictError`, classified as transient so
+  `policy.ExecuteWithRetry` retries it. (The in-memory backend is a permissive test
   double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency` is false for it.)
 - **Stable event ordering** — `GetEvents` returns an entity's events in ascending sequence order,
   and `GetLatestEvents(lastSequence)` returns only events with `sequence > lastSequence`.

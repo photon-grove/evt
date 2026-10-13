@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 )
 
 func TestClassifyWriteError(t *testing.T) {
@@ -23,6 +24,7 @@ func TestClassifyWriteError(t *testing.T) {
 
 		require.Error(t, err)
 		require.True(t, evt.IsConflictErr(err), "a 23505 violation should map to evt.ConflictError")
+		require.True(t, policy.IsTransient(err), "the conflict is transient so ExecuteWithRetry retries it")
 	})
 
 	t.Run("other errors pass through unchanged", func(t *testing.T) {
