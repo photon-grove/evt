@@ -2,6 +2,7 @@
 //! Regenerate them with `go test ./internal/compat -run TestFixtures -update`.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, UNIX_EPOCH};
 
 use evt_compat::scenario::{FIXTURE_RUN, ORIGIN_SOURCE, compat_dir};
 use evt_compat::{Account, Runner, ScenarioFixtures, Scenarios};
@@ -23,6 +24,24 @@ struct CodecFixtures {
     snapshot_policy: Vec<[i64; 4]>,
     views: Vec<ViewVector>,
     int_key_map: String,
+    ttl: TtlVector,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TtlVector {
+    clock_unix_nano: u64,
+    streams: Vec<TtlStream>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TtlStream {
+    name: String,
+    retention_nanos: u64,
+    events: Vec<String>,
+    snapshot: String,
+    dynamo_items: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -227,6 +246,30 @@ fn lenient_decoding_matches_go() {
             .canonical
             .replace(r#""payload":null"#, r#""payload":"""#);
         assert_eq!(canonical, expected, "event {}", vector.name);
+    }
+}
+
+#[test]
+fn ttl_matches_go() {
+    let vector = codec_fixtures().ttl;
+    let clock = UNIX_EPOCH + Duration::from_nanos(vector.clock_unix_nano);
+
+    for stream in vector.streams {
+        let name = &stream.name;
+        let ttl = dynamo::expiry(clock, Duration::from_nanos(stream.retention_nanos));
+
+        let snapshot = SerializedSnapshot::from_json(stream.snapshot.as_bytes()).unwrap();
+        let mut items = vec![dynamo::snapshot_item(&snapshot, ttl).unwrap()];
+        for event in &stream.events {
+            let event = SerializedEvent::from_json(event.as_bytes()).unwrap();
+            items.push(dynamo::event_item(&event, ttl).unwrap());
+        }
+
+        let items: Vec<Value> = items
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect();
+        assert_eq!(items, stream.dynamo_items, "{name}: items");
     }
 }
 

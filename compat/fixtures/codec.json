@@ -3013,5 +3013,250 @@
       }
     }
   ],
-  "intKeyMap": "{\"-1\":\"minus one\",\"10\":\"ten\",\"2\":\"two\"}"
+  "intKeyMap": "{\"-1\":\"minus one\",\"10\":\"ten\",\"2\":\"two\"}",
+  "ttl": {
+    "clockUnixNano": 1791763200900000000,
+    "streams": [
+      {
+        "name": "retained",
+        "retentionNanos": 86400500000000,
+        "events": [
+          "{\"id\":\"ttl-retained:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-retained\",\"entityType\":\"scratch\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+          "{\"id\":\"ttl-retained:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-retained\",\"entityType\":\"scratch\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+        ],
+        "snapshot": "{\"entityType\":\"scratch\",\"entityID\":\"ttl-retained\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
+        "dynamoItems": [
+          {
+            "entityType": {
+              "S": "scratch"
+            },
+            "eventSeq": {
+              "N": "2"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "ttl-retained"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            },
+            "ttl": {
+              "N": "1791849601"
+            }
+          },
+          {
+            "entityType": {
+              "S": "scratch"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "ttl-retained"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "ttl": {
+              "N": "1791849601"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          {
+            "entityType": {
+              "S": "scratch"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":5}"
+            },
+            "pk": {
+              "S": "ttl-retained"
+            },
+            "sk": {
+              "N": "2"
+            },
+            "ttl": {
+              "N": "1791849601"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          }
+        ]
+      },
+      {
+        "name": "zero-retention",
+        "retentionNanos": 0,
+        "events": [
+          "{\"id\":\"ttl-zero-retention:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-zero-retention\",\"entityType\":\"disabled\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+          "{\"id\":\"ttl-zero-retention:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-zero-retention\",\"entityType\":\"disabled\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+        ],
+        "snapshot": "{\"entityType\":\"disabled\",\"entityID\":\"ttl-zero-retention\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
+        "dynamoItems": [
+          {
+            "entityType": {
+              "S": "disabled"
+            },
+            "eventSeq": {
+              "N": "2"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "ttl-zero-retention"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          {
+            "entityType": {
+              "S": "disabled"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "ttl-zero-retention"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          {
+            "entityType": {
+              "S": "disabled"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":5}"
+            },
+            "pk": {
+              "S": "ttl-zero-retention"
+            },
+            "sk": {
+              "N": "2"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          }
+        ]
+      },
+      {
+        "name": "no-policy",
+        "retentionNanos": 0,
+        "events": [
+          "{\"id\":\"ttl-no-policy:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-no-policy\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+          "{\"id\":\"ttl-no-policy:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-no-policy\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+        ],
+        "snapshot": "{\"entityType\":\"account\",\"entityID\":\"ttl-no-policy\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
+        "dynamoItems": [
+          {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "2"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "ttl-no-policy"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "ttl-no-policy"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":5}"
+            },
+            "pk": {
+              "S": "ttl-no-policy"
+            },
+            "sk": {
+              "N": "2"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          }
+        ]
+      }
+    ]
+  }
 }

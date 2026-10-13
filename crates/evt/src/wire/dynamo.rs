@@ -21,6 +21,7 @@
 //! (`{"S": "..."}`), so they can be compared against fixtures and converted to SDK types.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -151,6 +152,23 @@ pub fn view_item(
     item.insert("payload".into(), s(utf8(payload, "view payload")?));
 
     Ok(item)
+}
+
+/// The `ttl` for an item written at `now` under a retention of `retention`: `now + retention` in
+/// whole Unix seconds, rounded down after adding, as Go's `time.Time.Add(...).Unix()` does. Returns
+/// `None` (no `ttl` attribute) for a zero retention, or when the expiry is out of range.
+pub fn expiry(now: SystemTime, retention: Duration) -> Option<i64> {
+    if retention.is_zero() {
+        return None;
+    }
+
+    let seconds = now
+        .checked_add(retention)?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+
+    i64::try_from(seconds).ok()
 }
 
 fn insert_ttl(item: &mut Item, ttl: Option<i64>) {

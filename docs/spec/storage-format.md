@@ -137,8 +137,10 @@ One table holds every stream: a string partition key `pk` and a number sort key 
 | `eventSeq`   | N    |                               | snapshot event sequence         |
 | `ttl`        | N    | optional, epoch seconds       | optional, epoch seconds         |
 
-`ttl` is written only for entity types with a retention policy, and only when positive. An event
-item with missing or empty `metadata` is invalid. Readers ignore other attributes.
+`ttl` is written only for entity types with a positive retention, on event items and on the
+snapshot item alike. Its value is the commit time plus the retention, in whole Unix seconds,
+rounded down after adding. View items never carry it. An event item with missing or empty
+`metadata` is invalid. Readers ignore other attributes.
 
 ### Writes
 
@@ -258,7 +260,9 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
   transaction groups. A projector statement that the database rejects is a projector error (a lost
   connection is a backend error), and so is an integrity
   violation raised at `COMMIT`, which only a deferred constraint on a projector's table can cause.
-- A unique violation (`23505`) on the event primary key is an optimistic-concurrency conflict.
+- A unique violation (`23505`) on the event primary key is an optimistic-concurrency conflict. In
+  Go, it and the floor-check conflict are `evt.ConflictError`s wrapped in a transient
+  `policy.ClassifiedError`, so `policy.ExecuteWithRetry` retries them as it does on DynamoDB.
   In Rust, a serialization failure (`40001`) or deadlock (`40P01`), raised by any statement in
   the commit (projector, insert, floor check, or snapshot upsert), is `Error::Transient` and is
   retried.
@@ -330,9 +334,13 @@ retries it with a fresh entity, and `evt.IsConflictErr` still matches it. A gap 
 such as a prefix that DynamoDB TTL expired under `WithRetention`, fails every load. Before this
 check, such a stream loaded with the wrong state.
 
-A compaction that ends exactly at the stream head leaves no event to show a gap: the event read
-returns nothing. When the event read is empty, both languages read the snapshot again, and a
-snapshot whose `eventSequence` is past the loaded sequence fails the load the same way as a gap.
+Like any read, a load can be one compaction behind. If another writer snapshots exactly at the
+stream head and compacts between the two reads, the event read is empty and the load returns the
+state at the older snapshot. That state was real when it was read, so this is ordinary staleness,
+not a wrong state. Neither language reads the snapshot again to detect it, which would cost a read
+on every load that ends at a snapshot. A commit from the stale load starts at or below the new
+snapshot's `eventSequence`, so the floor check rejects it with a conflict, and the retry policies
+reload and run the command again.
 
 A command whose metadata carries a command ID already recorded by an event **replayed since the
 latest snapshot** is a duplicate and writes nothing. Command IDs folded into a snapshot are no

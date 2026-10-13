@@ -184,6 +184,12 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 	}
 	fixtures.IntKeyMap = string(intKeyMap)
 
+	ttl, err := ttlVector(ctx)
+	if err != nil {
+		return fixtures, fmt.Errorf("ttl: %w", err)
+	}
+	fixtures.TTL = ttl
+
 	view, err := viewVector(ctx)
 	if err != nil {
 		return fixtures, fmt.Errorf("view: %w", err)
@@ -314,4 +320,67 @@ func viewVector(ctx context.Context) (ViewVector, error) {
 		State:      string(state),
 		DynamoItem: DynamoItemJSON(items[0].Put.Item),
 	}, nil
+}
+
+// ttlVector commits streams through a repository with a fixed clock and a retention policy. The
+// clock and the retention both have fractional seconds, so the vector shows that the expiry is
+// rounded down after adding them.
+func ttlVector(ctx context.Context) (TTLVector, error) {
+	clock := time.Unix(1_791_763_200, 900_000_000)
+	retention := 24*time.Hour + 500*time.Millisecond
+
+	fake := NewFakeDynamo()
+	repo := dynamo.NewRepository(fake, fakeTable).
+		WithClock(func() time.Time { return clock }).
+		WithRetention(dynamo.Retention{"scratch": retention, "disabled": 0})
+
+	vector := TTLVector{ClockUnixNano: clock.UnixNano()}
+
+	for _, c := range []struct {
+		name       string
+		entityType evt.EntityType
+		retention  time.Duration
+	}{
+		{"retained", "scratch", retention},
+		{"zero-retention", "disabled", 0},
+		{"no-policy", AccountType, 0},
+	} {
+		id := evt.EntityID("ttl-" + c.name)
+		events := []evt.SerializedEvent{
+			codecEvent(id, 1, OpenedEvent, 1, `{"owner":"Ada"}`, evt.Metadata{Region: Region, Timestamp: DefaultTimestamp}),
+			codecEvent(id, 2, DepositedEvent, 1, `{"amountCents":5}`, evt.Metadata{Region: Region, Timestamp: DefaultTimestamp}),
+		}
+		for i := range events {
+			events[i].EntityType = c.entityType
+		}
+		snapshot := evt.SerializedSnapshot{
+			EntityType: c.entityType, EntityID: id, Sequence: 1, EventSequence: 2, Payload: []byte(`{"owner":"Ada"}`),
+		}
+
+		err := repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, c.entityType, id, snapshot.Payload, 1)
+		if err != nil {
+			return vector, err
+		}
+
+		stream := TTLStream{Name: c.name, RetentionNanos: int64(c.retention)}
+		for _, event := range events {
+			encoded, err := json.Marshal(event)
+			if err != nil {
+				return vector, err
+			}
+			stream.Events = append(stream.Events, string(encoded))
+		}
+		encoded, err := json.Marshal(snapshot)
+		if err != nil {
+			return vector, err
+		}
+		stream.Snapshot = string(encoded)
+		for _, item := range fake.Items(string(id)) {
+			stream.DynamoItems = append(stream.DynamoItems, DynamoItemJSON(item))
+		}
+
+		vector.Streams = append(vector.Streams, stream)
+	}
+
+	return vector, nil
 }

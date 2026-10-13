@@ -6,7 +6,7 @@
 //! key `sk`. See [`crate::wire::dynamo`] for the item layout.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::config::AsyncSleep;
@@ -41,6 +41,7 @@ pub struct DynamoRepository {
     table: String,
     consistent_read: bool,
     retention: BTreeMap<EntityType, Duration>,
+    clock: fn() -> SystemTime,
 }
 
 impl DynamoRepository {
@@ -51,7 +52,15 @@ impl DynamoRepository {
             table: table.into(),
             consistent_read: true,
             retention: BTreeMap::new(),
+            clock: SystemTime::now,
         }
+    }
+
+    /// Uses `clock` instead of the system time to compute `ttl` expiries. For tests.
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Uses eventually consistent reads (half the read cost) when `false`.
@@ -85,16 +94,9 @@ impl DynamoRepository {
     }
 
     fn ttl_for(&self, entity_type: &EntityType) -> Option<i64> {
-        let duration = self
-            .retention
-            .get(entity_type)
-            .filter(|duration| !duration.is_zero())?;
-        let expires = SystemTime::now() + *duration;
+        let retention = self.retention.get(entity_type)?;
 
-        expires
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .map(|elapsed| elapsed.as_secs() as i64)
+        wire::expiry((self.clock)(), *retention)
     }
 
     /// Returns every item in an entity's partition, including the snapshot at `sk = 0`, in sort
@@ -836,6 +838,35 @@ mod tests {
         for (codes, want) in cases {
             assert_eq!(classify_cancellation(1, &codes), want, "{codes:?}");
         }
+    }
+
+    #[test]
+    fn ttl_applies_only_to_types_with_retention() {
+        fn clock() -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_000_900)
+        }
+
+        // No async runtime is configured, so turn off every client feature that sleeps. The test
+        // never sends a request.
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+            .timeout_config(aws_sdk_dynamodb::config::timeout::TimeoutConfig::disabled())
+            .stalled_stream_protection(
+                aws_sdk_dynamodb::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .identity_cache(aws_sdk_dynamodb::config::IdentityCache::no_cache())
+            .build();
+        let repository = DynamoRepository::new(Client::from_conf(config), "events")
+            .with_clock(clock)
+            .with_retention("scratch", Duration::from_millis(1_500))
+            .with_retention("disabled", Duration::ZERO);
+
+        // 1000.9 s + 1.5 s = 1002.4 s, rounded down after adding.
+        assert_eq!(repository.ttl_for(&"scratch".into()), Some(1_002));
+        assert_eq!(repository.ttl_for(&"disabled".into()), None);
+        assert_eq!(repository.ttl_for(&"account".into()), None);
+        assert_eq!(wire::expiry(clock(), Duration::MAX), None, "overflow");
     }
 
     #[test]

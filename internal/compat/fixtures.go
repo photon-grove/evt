@@ -76,6 +76,23 @@ type CodecFixtures struct {
 	SnapshotPolicy [][4]int64       `json:"snapshotPolicy"`
 	Views          []ViewVector     `json:"views"`
 	IntKeyMap      string           `json:"intKeyMap"`
+	TTL            TTLVector        `json:"ttl"`
+}
+
+// TTLVector pins the retention policy: streams committed with a snapshot through a repository with
+// a fixed clock, one stream per policy (a duration, zero, and none).
+type TTLVector struct {
+	ClockUnixNano int64       `json:"clockUnixNano"`
+	Streams       []TTLStream `json:"streams"`
+}
+
+// TTLStream is one committed stream and the items it produced, snapshot first.
+type TTLStream struct {
+	Name           string           `json:"name"`
+	RetentionNanos int64            `json:"retentionNanos"`
+	Events         []string         `json:"events"`
+	Snapshot       string           `json:"snapshot"`
+	DynamoItems    []map[string]any `json:"dynamoItems"`
 }
 
 // ViewVector is the single-item view row dynamo.NewViewProjector writes for an account.

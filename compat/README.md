@@ -5,11 +5,11 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 [`docs/spec/storage-format.md`](../docs/spec/storage-format.md), and the reasoning is in
 [ADR 0003](../docs/adr/0003-rust-implementation-and-cross-language-compatibility.md).
 
-| Path                      | Written by   | Contents                                                                                                                                      |
-| ------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome.                                                        |
-| `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, lenient decoding, the snapshot policy table. |
-| `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items, SNS messages, sequences, and loaded state.                                     |
+| Path                      | Written by   | Contents                                                                                                                                                                                              |
+| ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome.                                                                                                                |
+| `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
+| `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items, SNS messages, sequences, and loaded state.                                                                                             |
 
 Both sides implement the same account domain: `internal/compat/account.go` and
 `crates/evt-compat/src/account.rs`. Keep them identical, field for field and rule for rule.
