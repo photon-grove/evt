@@ -22,7 +22,7 @@ jobs:
       rust: ${{ steps.classify.outputs.rust }}
       compat: ${{ steps.classify.outputs.compat }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -113,7 +113,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -125,7 +125,7 @@ jobs:
         with:
           version: 10.20.0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24.5
           cache: pnpm
