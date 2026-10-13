@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -27,6 +28,31 @@ const (
 // identifierPattern guards table names interpolated into DDL/DML. Table names are configuration, not
 // user input, but validating them keeps the interpolation provably injection-free.
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// reservedKeywords are PostgreSQL's reserved keywords (pg_get_keywords() categories R and T), which
+// cannot be used as unquoted table names.
+var reservedKeywords = map[string]struct{}{}
+
+func init() {
+	for _, keyword := range strings.Fields(`
+		all analyse analyze and any array as asc asymmetric authorization binary both case cast check
+		collate collation column concurrently constraint create cross current_catalog current_date
+		current_role current_schema current_time current_timestamp current_user default deferrable desc
+		distinct do else end except false fetch for foreign freeze from full grant group having ilike in
+		initially inner intersect into is isnull join lateral leading left like limit localtime
+		localtimestamp natural not notnull null offset on only or order outer overlaps placing primary
+		references returning right select session_user similar some symmetric system_user table
+		tablesample then to trailing true union unique user using variadic verbose when where window with`) {
+		reservedKeywords[keyword] = struct{}{}
+	}
+}
+
+// validIdentifier reports whether a table name is safe to interpolate unquoted.
+func validIdentifier(name string) bool {
+	_, reserved := reservedKeywords[strings.ToLower(name)]
+
+	return identifierPattern.MatchString(name) && !reserved
+}
 
 // DB is the minimal subset of the pgx API the Repository depends on. Both *pgxpool.Pool and pgx.Tx
 // satisfy it, so callers can pass a pool (the common case) or an ambient transaction. It is the
@@ -87,7 +113,7 @@ func NewRepository(db DB, opts ...Option) *Repository {
 	}
 
 	for _, name := range []string{repo.eventsTable, repo.snapshotsTable} {
-		if !identifierPattern.MatchString(name) {
+		if !validIdentifier(name) {
 			panic(fmt.Sprintf("postgres: invalid table name %q", name))
 		}
 	}
@@ -144,6 +170,10 @@ CREATE TABLE IF NOT EXISTS %[2]s (
 // PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
 // same transaction as the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
+	if err := checkAscending(res.Events); err != nil {
+		return err
+	}
+
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
 		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
 			return err
@@ -189,6 +219,10 @@ func (repo *Repository) CommitWithSnapshot(
 ) error {
 	if len(res.Events) == 0 {
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
+	}
+
+	if err := checkAscending(res.Events); err != nil {
+		return err
 	}
 
 	eventSequence := res.Events[len(res.Events)-1].Sequence
@@ -304,6 +338,22 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 
 	if err := tx.Commit(ctx); err != nil {
 		return classifyWriteError(fmt.Errorf("postgres: commit: %w", err))
+	}
+
+	return nil
+}
+
+// checkAscending rejects events whose sequences do not strictly ascend for each entity. The floor
+// check reads the lowest sequence and the snapshot records the last, so a commit like [7, 6] would
+// otherwise record a snapshot event_sequence below an event it already folded in.
+func checkAscending(events []evt.SerializedEvent) error {
+	last := make(map[evt.EntityID]evt.EventSequence, 1)
+
+	for _, event := range events {
+		if previous, seen := last[event.EntityID]; seen && event.Sequence <= previous {
+			return fmt.Errorf("postgres: event %s follows sequence %d; sequences must ascend", event.ID, previous)
+		}
+		last[event.EntityID] = event.Sequence
 	}
 
 	return nil

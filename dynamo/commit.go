@@ -24,6 +24,10 @@ func (repo *Repository) Commit(
 		return nil
 	}
 
+	if err := checkAscending(result.Events); err != nil {
+		return err
+	}
+
 	// Generate Put transactions
 	writeItems, _, err := repo.buildEventPutTransactions(result.Events)
 	if err != nil {
@@ -48,6 +52,22 @@ const FirstSnapshotCondition = "attribute_not_exists(seq)"
 // NextSnapshotCondition guards later snapshot puts in a commit: the stored snapshot is still the one
 // the writer loaded (:seq), and the commit starts above its floor (:first).
 const NextSnapshotCondition = "seq = :seq AND eventSeq < :first"
+
+// checkAscending rejects events whose sequences do not strictly ascend for each entity. The floor
+// condition reads the first event and the snapshot records the last, so both assume ascending
+// order: [6, 5] after compacting through 5 would otherwise recreate sequence 5.
+func checkAscending(events []evt.SerializedEvent) error {
+	last := make(map[evt.EntityID]evt.EventSequence, 1)
+
+	for _, event := range events {
+		if previous, seen := last[event.EntityID]; seen && event.Sequence <= previous {
+			return fmt.Errorf("dynamo: event %s follows sequence %d; sequences must ascend", event.ID, previous)
+		}
+		last[event.EntityID] = event.Sequence
+	}
+
+	return nil
+}
 
 // buildFloorChecks returns one ConditionCheck on each entity's snapshot item (sk = 0) that the
 // commit starts above the snapshot's eventSeq.
@@ -117,6 +137,11 @@ func (repo *Repository) CommitStream(
 			continue
 		}
 
+		if err := checkAscending(serializedResult.Events); err != nil {
+			errors = append(errors, err)
+			continue
+		}
+
 		items, _, err := repo.buildEventPutTransactions(serializedResult.Events)
 		if err != nil {
 			errors = append(errors, err)
@@ -178,6 +203,10 @@ func (repo *Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := checkAscending(result.Events); err != nil {
+		return err
+	}
+
 	// Generate both the regular Put transactions, and a Put for the Snapshot
 	writeItems, err := repo.buildSnapshotPutTransactions(result.Events, entityType, entityID, payload, currentSnapshot)
 	if err != nil {

@@ -62,6 +62,12 @@ func TestNewRepositoryTableNames(t *testing.T) {
 			NewRepository(nil, WithEventsTable("events; DROP TABLE x"))
 		})
 	})
+
+	t.Run("reserved keyword panics", func(t *testing.T) {
+		require.Panics(t, func() {
+			NewRepository(nil, WithEventsTable("Select"))
+		})
+	})
 }
 
 func TestFoldEntityAppliesOnlyEventsAboveThrough(t *testing.T) {

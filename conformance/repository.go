@@ -81,6 +81,10 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		t.Run("RejectsCommitsBelowCompactedFloor", func(t *testing.T) {
 			testCompactedFloor(t, newRepo())
 		})
+
+		t.Run("RejectsOutOfOrderEvents", func(t *testing.T) {
+			testOutOfOrderEvents(t, newRepo())
+		})
 	}
 }
 
@@ -296,6 +300,41 @@ func testCompactedFloor(t *testing.T, repo evt.Repository) {
 
 	next := serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "three"})
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: next}))
+}
+
+func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	compactor, ok := repo.(evt.Compactor)
+	if !ok {
+		t.Skip("repository does not implement evt.Compactor")
+	}
+
+	id := evt.EntityID(ns + "-1")
+	serialized := serialize(t, id, "test", 0,
+		&test.EntityCreated{ID: id, Value: "one"},
+		&test.EntityUpdated{ID: id, Value: "two"},
+	)
+	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"two"}`, id))
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1))
+
+	_, err := compactor.CompactBelow(ctx, id, 2)
+	require.NoError(t, err)
+
+	// The floor check reads the first event, so [3, 2] would recreate compacted sequence 2.
+	later := serialize(t, id, "test", 1,
+		&test.EntityUpdated{ID: id, Value: "a"},
+		&test.EntityUpdated{ID: id, Value: "b"},
+	)
+	reversed := evt.SerializedResult{Events: []evt.SerializedEvent{later[1], later[0]}}
+	require.Error(t, repo.CommitWithSnapshot(ctx, reversed, "test", id, payload, 2), "a snapshot commit out of order")
+	require.Error(t, repo.Commit(ctx, reversed), "a commit out of order")
+
+	events, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Empty(t, events, "rejected commits write nothing")
 }
 
 // --- helpers ---
