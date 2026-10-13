@@ -161,6 +161,10 @@ The floor exists because compaction deletes the events a snapshot covers, which 
 `attribute_not_exists(sk)` relies on. Without it, a writer that loaded the stream before the covering
 snapshot could recreate a compacted sequence.
 
+Both implementations reject a commit whose sequences do not strictly ascend for each entity
+before writing anything. The floor check reads the first event and the snapshot records the last,
+so both depend on that order.
+
 A transaction cancelled with a `ConditionalCheckFailed` reason on an event put, the floor check, or
 the snapshot put is an optimistic-concurrency conflict: another writer committed the same sequence,
 moved the snapshot, or compacted past the commit.
@@ -206,7 +210,9 @@ one item per entity to a separate views table, in the same transaction as the ev
 
 The schema is created by Go's `postgres.Repository.EnsureSchema` or Rust's
 `PostgresRepository::ensure_schema`, which run the same idempotent DDL. Table names default to
-`evt_events` and `evt_snapshots` and can be changed in both implementations.
+`evt_events` and `evt_snapshots` and can be changed in both implementations. Names are interpolated
+unquoted, so both reject names that are not plain identifiers or that are PostgreSQL reserved
+keywords. Rust also rejects event and snapshot names that fold to the same table.
 
 ```sql
 CREATE TABLE IF NOT EXISTS evt_events (
@@ -235,7 +241,8 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
 
 - A commit is one transaction: projector statements, one insert per event, then the snapshot
   upsert. Projector statements are Rust-only: Go's `postgres.Repository` ignores projector
-  transaction groups. A failed projector statement is a projector error.
+  transaction groups. A failed projector statement is a projector error, and so is an integrity
+  violation raised at `COMMIT`, which only a deferred constraint on a projector's table can cause.
 - A unique violation (`23505`) on the event primary key is an optimistic-concurrency conflict.
   In Rust, a serialization failure (`40001`) or deadlock (`40P01`), raised by any statement in
   the commit (projector, insert, floor check, or snapshot upsert), is `Error::Transient` and is
@@ -293,6 +300,13 @@ commit at sequence 7 does not snapshot because the next boundary is 9.
 
 A store loads an entity from its snapshot plus events after the snapshot's `eventSequence`, or from
 every event when there is no snapshot. An entity with no events loads at sequence 0.
+
+Loaded events must continue the sequence without a gap: the first event after a snapshot is its
+`eventSequence` plus one, and a stream without a snapshot starts at 1. A gap means another writer
+snapshotted and compacted the stream between the snapshot read and the event read, or events
+expired. Applying events across the gap would build the wrong state. Rust's `Store::load` reads the
+stream again, up to three times, then returns `Error::Conflict`. Go's `snapshots.Store.LoadEntity`
+returns a conflict error at once, because it has already modified the entity the caller passed in.
 
 A command whose metadata carries a command ID already recorded by an event **replayed since the
 latest snapshot** is a duplicate and writes nothing. Command IDs folded into a snapshot are no

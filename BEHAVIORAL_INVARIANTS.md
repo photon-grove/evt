@@ -54,8 +54,8 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
 - Each event is stamped `committedAt + duration`, and DynamoDB TTL expires items individually, so
   retention cannot atomically drop a multi-event stream. It is safe only for terminal, short-lived
   streams (lifetime ≪ duration, no appends after terminal); a stream appended across a span near the
-  duration can lose its older prefix while newer events survive, and `sk > N` reads will not detect
-  the gap. Use compaction (snapshot + `CompactBelow`) for streams that accumulate events over time.
+  duration can lose its older prefix while newer events survive. Store loads detect the gap and fail
+  with a conflict, but rebuild scans do not. Use compaction (snapshot + `CompactBelow`) for streams that accumulate events over time.
 
 ### Inline Snapshots (sk=0)
 
@@ -333,6 +333,7 @@ evt.Metadata{
 ### Commit
 
 - Empty events: no-op, returns nil
+- Rejects events whose sequences do not strictly ascend for an entity, before writing
 - Builds `TransactWriteItem` with conditional expression `attribute_not_exists(sk)`
 - Adds a `ConditionCheck` on the entity's `sk = 0` item: `attribute_not_exists(eventSeq) OR
   eventSeq < :first`, so a commit cannot write at or below a snapshot's floor after compaction
