@@ -468,17 +468,7 @@ impl Repository for DynamoRepository {
 
             let page = scan.send().await.map_err(sdk_error)?;
 
-            for item in page.items() {
-                let Some(sdk::AttributeValue::S(pk)) = item.get("pk") else {
-                    continue;
-                };
-                let sk = number_attribute(item, "sk")?.unwrap_or_default();
-                let head = if sk == wire::SNAPSHOT_SORT_KEY {
-                    number_attribute(item, "eventSeq")?.unwrap_or_default()
-                } else {
-                    sk
-                };
-
+            for (pk, head) in page.items().iter().filter_map(item_head) {
                 let entry = heads
                     .entry(EntityId::new(pk))
                     .or_insert(EventSequence::ZERO);
@@ -563,6 +553,26 @@ fn floor_check(
         .map_err(Error::backend)?;
 
     Ok(TransactWriteItem::builder().condition_check(check).build())
+}
+
+/// Reads an entity-heads scan item: an event's `sk`, or a snapshot's `eventSeq`. Like Go's
+/// `headSeqFromItem`, it skips an item whose key or sequence is missing or not a number, so one bad
+/// row does not stop a rebuild.
+fn item_head(item: &HashMap<String, sdk::AttributeValue>) -> Option<(&str, i64)> {
+    let number = |name| match item.get(name) {
+        Some(sdk::AttributeValue::N(value)) => value.parse::<i64>().ok(),
+        _ => None,
+    };
+    let Some(sdk::AttributeValue::S(pk)) = item.get("pk") else {
+        return None;
+    };
+
+    let head = match number("sk")? {
+        wire::SNAPSHOT_SORT_KEY => number("eventSeq")?,
+        sk => sk,
+    };
+
+    Some((pk, head))
 }
 
 /// How a cancelled commit transaction failed.
@@ -815,6 +825,21 @@ mod tests {
         for (codes, want) in cases {
             assert_eq!(classify_cancellation(1, &codes), want, "{codes:?}");
         }
+    }
+
+    #[test]
+    fn entity_heads_skip_malformed_items() {
+        let item = |sk: sdk::AttributeValue, event_seq: Option<sdk::AttributeValue>| {
+            let mut item = HashMap::from([("pk".to_owned(), s("acct-1")), ("sk".to_owned(), sk)]);
+            item.extend(event_seq.map(|value| ("eventSeq".to_owned(), value)));
+            item
+        };
+
+        assert_eq!(item_head(&item(n(7), None)), Some(("acct-1", 7)));
+        assert_eq!(item_head(&item(n(0), Some(n(5)))), Some(("acct-1", 5)));
+        assert_eq!(item_head(&item(n(0), Some(s("five")))), None);
+        assert_eq!(item_head(&item(n(0), None)), None);
+        assert_eq!(item_head(&item(s("seven"), None)), None);
     }
 
     #[test]
