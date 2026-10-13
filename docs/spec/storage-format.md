@@ -328,6 +328,10 @@ retries it with a fresh entity, and `evt.IsConflictErr` still matches it. A gap 
 such as a prefix that DynamoDB TTL expired under `WithRetention`, fails every load. Before this
 check, such a stream loaded with the wrong state.
 
+A compaction that ends exactly at the stream head leaves no event to show a gap: the event read
+returns nothing. When the event read is empty, both languages read the snapshot again, and a
+snapshot whose `eventSequence` is past the loaded sequence fails the load the same way as a gap.
+
 A command whose metadata carries a command ID already recorded by an event **replayed since the
 latest snapshot** is a duplicate and writes nothing. Command IDs folded into a snapshot are no
 longer checked, so the dedupe window is the events after the snapshot.
@@ -346,6 +350,8 @@ never rewritten. A failed upcast or decode fails the load.
   (`snapshot.eventSequence >= through`). Otherwise it deletes nothing and returns the
   compaction-uncovered error.
 - Never deletes the snapshot. `through < 1` is a no-op. It is idempotent.
+- On DynamoDB, the snapshot read and the key query are strongly consistent even when the repository
+  is configured for eventually consistent reads, so compaction cannot miss recent events.
 - A compacted stream must be loaded or rebuilt from its snapshot, never by replaying from sequence 1.
 - A commit whose first event is at or below the snapshot's `eventSequence` is a conflict in both
   backends (see the floor checks above), so a writer that loaded before compaction cannot recreate
