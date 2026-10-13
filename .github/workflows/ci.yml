@@ -52,6 +52,8 @@ jobs:
                 go=true rust=true compat=true ;;
               crates/* | Cargo.toml | Cargo.lock | rust-toolchain.toml)
                 rust=true compat=true ;;
+              .moon/* | package.json | pnpm-lock.yaml | pnpm-workspace.yaml)
+                go=true rust=true ;;
               compat/* | internal/compat/* | scripts/compat-integration.sh)
                 go=true rust=true compat=true ;;
               serialization.go | metadata.go | compaction.go | types.go | repository.go | transactions.go | \
