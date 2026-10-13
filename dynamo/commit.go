@@ -24,7 +24,7 @@ func (repo *Repository) Commit(
 		return nil
 	}
 
-	if err := checkAscending(result.Events); err != nil {
+	if err := checkContiguous(result.Events); err != nil {
 		return err
 	}
 
@@ -53,15 +53,16 @@ const FirstSnapshotCondition = "attribute_not_exists(seq)"
 // the writer loaded (:seq), and the commit starts above its floor (:first).
 const NextSnapshotCondition = "seq = :seq AND eventSeq < :first"
 
-// checkAscending rejects events whose sequences do not strictly ascend for each entity. The floor
-// condition reads the first event and the snapshot records the last, so both assume ascending
-// order: [6, 5] after compacting through 5 would otherwise recreate sequence 5.
-func checkAscending(events []evt.SerializedEvent) error {
+// checkContiguous rejects events whose sequences are not contiguous (each one more than the last)
+// for each entity. The floor check reads the first event and the snapshot records the last, so a
+// commit like [6, 5] after compacting through 5 would recreate sequence 5, and loads reject a
+// stream with a gap such as [1, 3].
+func checkContiguous(events []evt.SerializedEvent) error {
 	last := make(map[evt.EntityID]evt.EventSequence, 1)
 
 	for _, event := range events {
-		if previous, seen := last[event.EntityID]; seen && event.Sequence <= previous {
-			return fmt.Errorf("dynamo: event %s follows sequence %d; sequences must ascend", event.ID, previous)
+		if previous, seen := last[event.EntityID]; seen && event.Sequence != previous+1 {
+			return fmt.Errorf("dynamo: event %s follows sequence %d; sequences must be contiguous", event.ID, previous)
 		}
 		last[event.EntityID] = event.Sequence
 	}
@@ -137,7 +138,7 @@ func (repo *Repository) CommitStream(
 			continue
 		}
 
-		if err := checkAscending(serializedResult.Events); err != nil {
+		if err := checkContiguous(serializedResult.Events); err != nil {
 			errors = append(errors, err)
 			continue
 		}
@@ -203,7 +204,7 @@ func (repo *Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
-	if err := checkAscending(result.Events); err != nil {
+	if err := checkContiguous(result.Events); err != nil {
 		return err
 	}
 

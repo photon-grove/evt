@@ -195,7 +195,7 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             foreign_events(repo).await,
         );
         record(
-            "reject events out of order",
+            "reject events out of order or with gaps",
             out_of_order_events(repo).await,
         );
         record("an empty commit is a no-op", empty_commit(repo).await);
@@ -446,7 +446,23 @@ async fn foreign_events<R: Repository>(repo: &R) -> CaseResult {
 }
 
 async fn out_of_order_events<R: Repository>(repo: &R) -> CaseResult {
-    let stream = Stream::new(&namespace(), "1", "ledger");
+    let ns = namespace();
+
+    // Loads reject a stream with a gap, so a commit must not create one.
+    let gapped = Stream::new(&ns, "gap", "ledger");
+    expect_err(
+        gapped
+            .commit(repo, vec![gapped.event(1, 1), gapped.event(3, 3)], None)
+            .await,
+        "a commit that skips a sequence",
+        |err| matches!(err, Error::InvalidCommit(_)),
+    )?;
+    ensure!(
+        repo.events(&gapped.id).await?.is_empty(),
+        "the rejected gap writes nothing"
+    );
+
+    let stream = Stream::new(&ns, "1", "ledger");
     stream
         .commit(
             repo,

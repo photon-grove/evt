@@ -75,9 +75,10 @@ impl<Op> Commit<Op> {
         self
     }
 
-    /// Checks that every event belongs to the commit's entity and that sequences strictly
-    /// ascend. Repositories call it before writing, because the floor and snapshot checks only look
-    /// at `entity_id` and the first event's sequence.
+    /// Checks that every event belongs to the commit's entity and that sequences are contiguous
+    /// (each one more than the last). Repositories call it before writing, because the floor and
+    /// snapshot checks only look at `entity_id` and the first event's sequence, and loads reject
+    /// streams with gaps.
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(event) = self
             .events
@@ -93,10 +94,10 @@ impl<Op> Commit<Op> {
         if let Some(pair) = self
             .events
             .windows(2)
-            .find(|pair| pair[1].sequence <= pair[0].sequence)
+            .find(|pair| pair[1].sequence != pair[0].sequence.next())
         {
             return Err(Error::InvalidCommit(format!(
-                "event sequence {} follows {}; sequences must ascend",
+                "event sequence {} follows {}; sequences must be contiguous",
                 pair[1].sequence, pair[0].sequence
             )));
         }
@@ -109,8 +110,8 @@ impl<Op> Commit<Op> {
 ///
 /// Implementations must:
 ///
-/// - reject a commit with an event for another entity, or with sequences that do not strictly
-///   ascend, with [`Error::InvalidCommit`] (see [`Commit::validate`]);
+/// - reject a commit with an event for another entity, or with sequences that are not contiguous,
+///   with [`Error::InvalidCommit`] (see [`Commit::validate`]);
 /// - reject a commit that reuses an existing `(entity_id, sequence)` with [`Error::Conflict`];
 /// - reject a commit whose first event is at or below the stored snapshot's event sequence with
 ///   [`Error::Conflict`], because compaction may have deleted the events that sequence would

@@ -332,6 +332,20 @@ func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
 	require.Error(t, repo.CommitWithSnapshot(ctx, reversed, "test", id, payload, 2), "a snapshot commit out of order")
 	require.Error(t, repo.Commit(ctx, reversed), "a commit out of order")
 
+	// Loads reject a stream with a gap, so a commit must not create one. A fresh entity keeps the
+	// floor check out of the way.
+	fresh := evt.EntityID(ns + "-gap")
+	gapped := serialize(t, fresh, "test", 0,
+		&test.EntityCreated{ID: fresh, Value: "one"},
+		&test.EntityUpdated{ID: fresh, Value: "three"},
+	)
+	gapped[1].Sequence = 3
+	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: gapped}), "a commit that skips a sequence")
+
+	stored, err := repo.GetEvents(ctx, fresh)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the rejected gap writes nothing")
+
 	events, err := repo.GetEvents(ctx, id)
 	require.NoError(t, err)
 	require.Empty(t, events, "rejected commits write nothing")
