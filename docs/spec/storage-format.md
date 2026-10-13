@@ -334,13 +334,14 @@ retries it with a fresh entity, and `evt.IsConflictErr` still matches it. A gap 
 such as a prefix that DynamoDB TTL expired under `WithRetention`, fails every load. Before this
 check, such a stream loaded with the wrong state.
 
-Like any read, a load can be one compaction behind. If another writer snapshots exactly at the
-stream head and compacts between the two reads, the event read is empty and the load returns the
-state at the older snapshot. That state was real when it was read, so this is ordinary staleness,
-not a wrong state. Neither language reads the snapshot again to detect it, which would cost a read
-on every load that ends at a snapshot. A commit from the stale load starts at or below the new
-snapshot's `eventSequence`, so the floor check rejects it with a conflict, and the retry policies
-reload and run the command again.
+Like any read, a load can be one compaction behind. If another writer snapshots and compacts the
+stream during the load, the event read can stop short without a gap: it is empty when the new
+snapshot is exactly at the head, and a paginated DynamoDB query can return a contiguous first page
+before the later events are deleted. The load then returns an older state. That state was real when
+it was read, so this is ordinary staleness, not a wrong state. Neither language reads the snapshot
+again to detect it, which would cost a read on every load. A commit from the stale load starts at or
+below the new snapshot's `eventSequence`, so the floor check rejects it with a conflict, and the
+retry policies reload and run the command again.
 
 A command whose metadata carries a command ID already recorded by an event **replayed since the
 latest snapshot** is a duplicate and writes nothing. Command IDs folded into a snapshot are no

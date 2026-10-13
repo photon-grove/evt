@@ -109,9 +109,10 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// the snapshot and the events, so the load starts over, up to three times. A gap that
     /// persists, for example from expired events, fails with [`Error::Conflict`].
     ///
-    /// Like any read, a load can be one compaction behind: if another writer snapshots exactly at
-    /// the head and compacts between the two reads, the load returns the state at the older
-    /// snapshot. That state was real when it was read. A commit from it starts at or below the new
+    /// Like any read, a load can be one compaction behind: if another writer snapshots and compacts
+    /// during the load, the event read can stop short without a gap (it is empty, or a paginated
+    /// query returns only its first page), and the load returns an older state. That state was real
+    /// when it was read. A commit from it starts at or below the new
     /// snapshot and fails with [`Error::Conflict`], which [`execute_with_retry`] retries.
     ///
     /// [`execute_with_retry`]: Store::execute_with_retry
