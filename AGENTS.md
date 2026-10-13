@@ -86,7 +86,8 @@
 - Package manager: `pnpm` 10.x.
 - Node: 24.x, with Moon configured around Node `~24.5`.
 - Go toolchain: Go 1.26.4 via `go.mod`.
-- Rust toolchain: 1.99.0 via `rust-toolchain.toml` (crate MSRV 1.88, `rust-version` in `Cargo.toml`).
+- Rust toolchain: 1.99.0 via `rust-toolchain.toml` (crate MSRV 1.88, `rust-version` in `Cargo.toml`,
+  checked in CI without the `dynamodb` feature, which follows the AWS SDK's MSRV).
 - Common commands:
   - Install dependencies: `pnpm install`
   - Go tests: `go test ./...`

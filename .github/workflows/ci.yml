@@ -135,6 +135,13 @@ jobs:
       - name: Rust checks
         run: pnpm exec moon run evt-rust:check evt-rust:test
 
+      # The dynamodb feature follows the AWS SDK's MSRV, so it is not part of this check.
+      - name: Check the minimum supported Rust version
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" check -p photon-evt --features postgres,conformance --locked
+
   integration:
     name: DynamoDB integration
     needs: changes

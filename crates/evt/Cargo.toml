@@ -15,6 +15,7 @@ include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
 [features]
 default = []
 # DynamoDB event log via the AWS SDK, which runs on Tokio. Bring your own `aws_sdk_dynamodb::Client`.
+# Its minimum Rust version is the SDK's, which can be higher than the crate's `rust-version`.
 dynamodb = ["dep:aws-sdk-dynamodb"]
 # PostgreSQL event log via tokio-postgres with a deadpool connection pool. Requires Tokio.
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]

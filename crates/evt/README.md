@@ -192,7 +192,12 @@ The known differences are listed in the
 
 ## Minimum Rust version
 
-Rust 1.88.
+Rust 1.88 for the core crate and the `postgres` and `conformance` features. CI checks this.
+
+The `dynamodb` feature follows the AWS SDK's minimum Rust version, which rises over time. On Rust
+1.84 and later, Cargo's MSRV-aware resolver (the default for edition 2024, or `resolver = "3"`)
+picks an SDK release that supports your `rust-version`. `aws-sdk-dynamodb` 1.104 is the latest
+release that supports 1.88.
 
 ## License
 
