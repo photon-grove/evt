@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use deadpool_postgres::{GenericClient, Pool};
+use deadpool_postgres::{GenericClient, Pool, PoolError};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 
@@ -99,7 +99,7 @@ impl PostgresRepository {
 
     /// Creates the event and snapshot tables if they do not exist.
     pub async fn ensure_schema(&self) -> Result<(), Error> {
-        let client = self.pool.get().await.map_err(Error::backend)?;
+        let client = self.pool.get().await.map_err(pool_error)?;
         client
             .batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
             .await
@@ -114,7 +114,7 @@ impl PostgresRepository {
 
     /// Returns the raw snapshot row for an entity.
     pub async fn snapshot_row(&self, entity_id: &EntityId) -> Result<Option<SnapshotRow>, Error> {
-        let client = self.pool.get().await.map_err(Error::backend)?;
+        let client = self.pool.get().await.map_err(pool_error)?;
         let sql = format!(
             "SELECT entity_type, entity_id, sequence, event_sequence, payload FROM {} WHERE entity_id = $1",
             self.snapshots_table
@@ -139,7 +139,7 @@ impl PostgresRepository {
         entity_id: &EntityId,
         after: Option<EventSequence>,
     ) -> Result<Vec<EventRow>, Error> {
-        let client = self.pool.get().await.map_err(Error::backend)?;
+        let client = self.pool.get().await.map_err(pool_error)?;
 
         let rows = match after {
             None => {
@@ -224,7 +224,7 @@ impl Repository for PostgresRepository {
             .map(EventRow::from_event)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut client = self.pool.get().await.map_err(Error::backend)?;
+        let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
         tx.execute(ENTITY_LOCK, &[&commit.entity_id.as_str()])
             .await
@@ -332,7 +332,7 @@ impl Repository for PostgresRepository {
     }
 
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
-        let mut client = self.pool.get().await.map_err(Error::backend)?;
+        let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
         tx.execute(ENTITY_LOCK, &[&snapshot.entity_id.as_str()])
             .await
@@ -367,7 +367,7 @@ impl Repository for PostgresRepository {
             });
         }
 
-        let client = self.pool.get().await.map_err(Error::backend)?;
+        let client = self.pool.get().await.map_err(pool_error)?;
         let sql = format!(
             "DELETE FROM {} WHERE entity_id = $1 AND sequence >= 1 AND sequence <= $2",
             self.events_table
@@ -384,7 +384,7 @@ impl Repository for PostgresRepository {
         &self,
         entity_type: Option<&EntityType>,
     ) -> Result<BTreeMap<EntityId, EventSequence>, Error> {
-        let client = self.pool.get().await.map_err(Error::backend)?;
+        let client = self.pool.get().await.map_err(pool_error)?;
         let sql = format!(
             "SELECT entity_id, MAX(head) AS head FROM (
                  SELECT entity_id, sequence AS head, entity_type FROM {}
@@ -422,6 +422,16 @@ fn classify(entity_id: &EntityId, err: tokio_postgres::Error) -> Error {
         },
         _ if transient(&err) => Error::Transient(Box::new(err)),
         _ => Error::backend(err),
+    }
+}
+
+/// Maps a failed connection checkout. A timeout means the pool was busy and no statement ran, so it
+/// is transient. A closed or misconfigured pool, or a failure to connect, is a backend error.
+fn pool_error(err: PoolError) -> Error {
+    if matches!(err, PoolError::Timeout(_)) {
+        Error::Transient(Box::new(err))
+    } else {
+        Error::backend(err)
     }
 }
 
@@ -478,6 +488,14 @@ mod tests {
         let manager = Manager::new(tokio_postgres::Config::new(), NoTls);
 
         PostgresRepository::new(Pool::builder(manager).build().unwrap())
+    }
+
+    #[test]
+    fn a_pool_timeout_is_transient() {
+        use deadpool_postgres::TimeoutType;
+
+        assert!(pool_error(PoolError::Timeout(TimeoutType::Wait)).is_retryable());
+        assert!(!pool_error(PoolError::Closed).is_retryable());
     }
 
     #[test]
