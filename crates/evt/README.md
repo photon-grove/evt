@@ -182,7 +182,8 @@ photon_evt::conformance::Suite::new(&my_repository).run().await;
 
 - Keep payload numbers integral (for example, cents): Go and Rust format some floats differently.
 - Declare payload and aggregate fields in the same order as the Go structs, and use `BTreeMap` for
-  maps, so the JSON bytes match.
+  maps, so the JSON bytes match. Go sorts map keys as strings, so a map with integer keys needs
+  `#[serde(serialize_with = "photon_evt::json::go_key_order")]`.
 - Use `photon_evt::json::to_vec` for any JSON you want byte-identical to Go's `json.Marshal`.
 - Go re-encodes a `time.Time` field in its own RFC 3339 form (`05.100Z` becomes `05.1Z`). If a Go
   struct parses a timestamp that a Rust struct keeps as a string, store timestamps in Go's form.

@@ -75,6 +75,7 @@ type CodecFixtures struct {
 	EventDecode    []DecodeVector   `json:"eventDecode"`
 	SnapshotPolicy [][4]int64       `json:"snapshotPolicy"`
 	Views          []ViewVector     `json:"views"`
+	IntKeyMap      string           `json:"intKeyMap"`
 }
 
 // ViewVector is the single-item view row dynamo.NewViewProjector writes for an account.

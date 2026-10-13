@@ -10,7 +10,9 @@
 //!
 //! Control characters, quotes, and backslashes already escape the same way in both encoders.
 //! Struct fields serialize in declaration order, so declare fields in the same order as the Go
-//! struct. Maps must be ordered by key (`BTreeMap`) because Go sorts map keys.
+//! struct. Maps must be ordered by key (`BTreeMap`) because Go sorts map keys. Go sorts them by
+//! their encoded string, so a map with integer keys needs [`go_key_order`]: Go writes `10` before
+//! `2`, while `BTreeMap<i64, _>` iterates `2` first.
 //!
 //! Floating-point numbers are not normalized: Go and Rust format some floats differently. Prefer
 //! integers (for example, cents) in event payloads that must be byte-identical across languages.
@@ -73,6 +75,37 @@ pub fn to_string<T: ?Sized + Serialize>(value: &T) -> serde_json::Result<String>
 /// Deserializes JSON bytes. Provided for symmetry with [`to_vec`].
 pub fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
     serde_json::from_slice(bytes)
+}
+
+/// Serializes a map with its keys in Go's order: sorted by their encoded string, so `10` comes
+/// before `2`. Use it on maps whose keys are not strings, such as integers.
+///
+/// ```
+/// use std::collections::BTreeMap;
+///
+/// #[derive(serde::Serialize)]
+/// struct Scores {
+///     #[serde(serialize_with = "photon_evt::json::go_key_order")]
+///     by_round: BTreeMap<i64, u32>,
+/// }
+///
+/// let scores = Scores { by_round: BTreeMap::from([(2, 5), (10, 7)]) };
+/// assert_eq!(photon_evt::json::to_vec(&scores).unwrap(), br#"{"by_round":{"10":7,"2":5}}"#);
+/// ```
+pub fn go_key_order<'a, M, K, V, S>(map: &'a M, serializer: S) -> Result<S::Ok, S::Error>
+where
+    &'a M: IntoIterator<Item = (&'a K, &'a V)>,
+    K: std::fmt::Display + 'a,
+    V: Serialize + 'a,
+    S: serde::Serializer,
+{
+    let mut entries: Vec<(String, &V)> = map
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    serializer.collect_map(entries)
 }
 
 /// Deserializes a field that Go would leave at its zero value when the JSON holds `null`.

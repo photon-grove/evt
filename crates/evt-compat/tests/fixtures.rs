@@ -22,6 +22,7 @@ struct CodecFixtures {
     event_decode: Vec<DecodeVector>,
     snapshot_policy: Vec<[i64; 4]>,
     views: Vec<ViewVector>,
+    int_key_map: String,
 }
 
 #[derive(Deserialize)]
@@ -227,6 +228,19 @@ fn lenient_decoding_matches_go() {
             .replace(r#""payload":null"#, r#""payload":"""#);
         assert_eq!(canonical, expected, "event {}", vector.name);
     }
+}
+
+#[test]
+fn integer_map_keys_sort_like_go() {
+    #[derive(serde::Serialize)]
+    struct Keys(#[serde(serialize_with = "json::go_key_order")] BTreeMap<i64, &'static str>);
+
+    let map = BTreeMap::from([(-1, "minus one"), (2, "two"), (10, "ten")]);
+
+    assert_eq!(
+        utf8(json::to_vec(&Keys(map)).unwrap()),
+        codec_fixtures().int_key_map
+    );
 }
 
 #[test]

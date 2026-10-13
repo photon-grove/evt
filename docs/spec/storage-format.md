@@ -29,7 +29,9 @@ Every JSON document in this format is produced by Go's `encoding/json` (`json.Ma
 crate reproduces it byte for byte (`photon_evt::json`):
 
 - No insignificant whitespace and no trailing newline.
-- Object keys appear in struct declaration order. Map keys are sorted.
+- Object keys appear in struct declaration order. Map keys are sorted by their encoded string, so
+  integer keys sort as text (`10` before `2`). Rust maps with non-string keys use
+  `photon_evt::json::go_key_order` to match.
 - `<`, `>`, and `&` are escaped as `\u003c`, `\u003e`, and `\u0026`; U+2028 and U+2029 as `\u2028`
   and `\u2029`. Other non-ASCII text is written as UTF-8. Control characters, `"`, and `\` use the
   standard JSON escapes.

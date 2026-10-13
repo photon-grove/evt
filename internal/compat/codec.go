@@ -177,6 +177,13 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 		fixtures.EventDecode = append(fixtures.EventDecode, DecodeVector{c.name, c.input, string(canonical)})
 	}
 
+	// Go sorts map keys by their encoded string, so integer keys sort as text.
+	intKeyMap, err := json.Marshal(map[int64]string{-1: "minus one", 2: "two", 10: "ten"})
+	if err != nil {
+		return fixtures, err
+	}
+	fixtures.IntKeyMap = string(intKeyMap)
+
 	view, err := viewVector(ctx)
 	if err != nil {
 		return fixtures, fmt.Errorf("view: %w", err)
