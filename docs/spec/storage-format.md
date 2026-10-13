@@ -161,9 +161,12 @@ The floor exists because compaction deletes the events a snapshot covers, which 
 `attribute_not_exists(sk)` relies on. Without it, a writer that loaded the stream before the covering
 snapshot could recreate a compacted sequence.
 
-Both implementations reject a commit whose sequences do not strictly ascend for each entity
-before writing anything. The floor check reads the first event and the snapshot records the last,
-so both depend on that order.
+Both implementations reject a commit whose sequences are not contiguous for each entity (each one
+more than the last) before writing anything. The floor check reads the first event and the snapshot
+records the last, so both depend on that order, and loads reject a stream with a gap. Repositories
+do not check that a commit's first sequence follows the stored head: DynamoDB cannot express it in
+one transaction once compaction has deleted the previous event. Stores always continue from the head
+they loaded.
 
 A transaction cancelled with a `ConditionalCheckFailed` reason on an event put, the floor check, or
 the snapshot put is an optimistic-concurrency conflict: another writer committed the same sequence,
@@ -211,8 +214,9 @@ one item per entity to a separate views table, in the same transaction as the ev
 The schema is created by Go's `postgres.Repository.EnsureSchema` or Rust's
 `PostgresRepository::ensure_schema`, which run the same idempotent DDL. Table names default to
 `evt_events` and `evt_snapshots` and can be changed in both implementations. Names are interpolated
-unquoted, so both reject names that are not plain identifiers or that are PostgreSQL reserved
-keywords. Rust also rejects event and snapshot names that fold to the same table.
+unquoted, so both reject names that are not plain identifiers, are longer than 63 bytes (PostgreSQL
+truncates longer ones), or are PostgreSQL reserved keywords. Rust also rejects event and snapshot
+names that fold to the same table.
 
 ```sql
 CREATE TABLE IF NOT EXISTS evt_events (
@@ -247,9 +251,12 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
   In Rust, a serialization failure (`40001`) or deadlock (`40P01`), raised by any statement in
   the commit (projector, insert, floor check, or snapshot upsert), is `Error::Transient` and is
   retried.
+- Commits and out-of-band snapshot writes first take a per-entity transaction lock,
+  `SELECT pg_advisory_xact_lock(1702261760, hashtext($1))` with the entity ID. Both languages run
+  this exact statement, so a snapshot write cannot raise the floor while a commit below it is in
+  flight. Go takes the locks in sorted entity order.
 - After the inserts, the commit checks the floor in the same transaction: a snapshot row with
-  `event_sequence >= ` the commit's first sequence is a conflict. Checking after the inserts closes
-  the race: a concurrent writer can raise the floor past that sequence only by inserting it first.
+  `event_sequence >= ` the commit's first sequence is a conflict.
 - The snapshot upsert only replaces a snapshot whose `event_sequence` is lower or equal
   (`ON CONFLICT (entity_id) DO UPDATE … WHERE EXCLUDED.event_sequence >= evt_snapshots.event_sequence`).
   PostgreSQL does not check the snapshot sequence: a racing writer already fails on the event key.

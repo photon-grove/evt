@@ -333,7 +333,7 @@ evt.Metadata{
 ### Commit
 
 - Empty events: no-op, returns nil
-- Rejects events whose sequences do not strictly ascend for an entity, before writing
+- Rejects events whose sequences are not contiguous for an entity, before writing
 - Builds `TransactWriteItem` with conditional expression `attribute_not_exists(sk)`
 - Adds a `ConditionCheck` on the entity's `sk = 0` item: `attribute_not_exists(eventSeq) OR
   eventSeq < :first`, so a commit cannot write at or below a snapshot's floor after compaction
