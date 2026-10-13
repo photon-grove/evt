@@ -78,12 +78,40 @@ impl<Op> Commit<Op> {
     }
 
     /// Checks that the events can be stored as written: each belongs to the commit's entity and
-    /// has the ID `{entity_id}:{sequence}`, the first sequence is at least 1, and sequences are
-    /// contiguous. Repositories call it before writing, because the floor and snapshot checks only
-    /// look at `entity_id` and the first event's sequence, loads reject streams with gaps, and
-    /// DynamoDB does not store the event ID. A snapshot's sequence must be at least 1.
+    /// has the ID `{entity_id}:{sequence}`, they share one entity type, the first sequence is at
+    /// least 1, and sequences are contiguous. A snapshot must have the events' entity type and a
+    /// sequence of at least 1. Repositories call it before writing, because the floor and snapshot
+    /// checks only look at `entity_id` and the first event's sequence, loads reject streams with
+    /// gaps, typed scans read each row's entity type, and DynamoDB does not store the event ID.
+    ///
+    /// A commit with no events is valid whatever its snapshot and operations, because
+    /// repositories ignore them.
     pub fn validate(&self) -> Result<(), Error> {
         let invalid = |message: String| Err(Error::InvalidCommit(message));
+
+        let Some(first) = self.events.first() else {
+            return Ok(());
+        };
+
+        if let Some(event) = self
+            .events
+            .iter()
+            .find(|event| event.entity_type != first.entity_type)
+        {
+            return invalid(format!(
+                "event {} has entity type {}, but the commit's first event has {}",
+                event.id, event.entity_type, first.entity_type
+            ));
+        }
+
+        if let Some(snapshot) = &self.snapshot
+            && snapshot.entity_type != first.entity_type
+        {
+            return invalid(format!(
+                "the snapshot has entity type {}, but the events have {}",
+                snapshot.entity_type, first.entity_type
+            ));
+        }
 
         if let Some(snapshot) = &self.snapshot
             && snapshot.sequence < EventSequence(1)
@@ -108,9 +136,7 @@ impl<Op> Commit<Op> {
             }
         }
 
-        if let Some(first) = self.events.first()
-            && first.sequence < EventSequence(1)
-        {
+        if first.sequence < EventSequence(1) {
             return invalid(format!(
                 "event sequence {} is below 1; sequences start at 1",
                 first.sequence
@@ -136,9 +162,9 @@ impl<Op> Commit<Op> {
 ///
 /// Implementations must:
 ///
-/// - reject a commit whose events belong to another entity, have non-canonical IDs, start below
-///   sequence 1, or are not contiguous, or whose snapshot sequence is below 1, with
-///   [`Error::InvalidCommit`] (see [`Commit::validate`]);
+/// - reject a commit whose events belong to another entity, have non-canonical IDs, mix entity
+///   types, start below sequence 1, or are not contiguous, or whose snapshot has another entity
+///   type or a sequence below 1, with [`Error::InvalidCommit`] (see [`Commit::validate`]);
 /// - reject a commit that reuses an existing `(entity_id, sequence)` with [`Error::Conflict`];
 /// - reject a commit whose first event is at or below the stored snapshot's event sequence with
 ///   [`Error::Conflict`], because compaction may have deleted the events that sequence would

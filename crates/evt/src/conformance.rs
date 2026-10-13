@@ -191,7 +191,7 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
         record("commit and read in order", commit_and_read(repo).await);
         record("isolate entities", isolate_entities(repo).await);
         record(
-            "reject events for another entity",
+            "reject events for another entity or of mixed types",
             foreign_events(repo).await,
         );
         record(
@@ -437,9 +437,30 @@ async fn foreign_events<R: Repository>(repo: &R) -> CaseResult {
         "a commit of entity b's event under entity a",
         |err| matches!(err, Error::InvalidCommit(_)),
     )?;
+
+    // Typed scans read each row's entity type, so one commit must not mix them.
+    let mixed = vec![
+        a.event(1, 1),
+        SerializedEvent {
+            entity_type: EntityType::new(format!("{}-other", a.entity_type)),
+            ..a.event(2, 2)
+        },
+    ];
+    expect_err(
+        a.commit(repo, mixed, None).await,
+        "a commit whose events have two entity types",
+        |err| matches!(err, Error::InvalidCommit(_)),
+    )?;
+    let other_type = NewSnapshot::new(format!("{}-other", a.entity_type), EventSequence(1), "{}");
+    expect_err(
+        a.commit(repo, a.events(1..=1), Some(other_type)).await,
+        "a snapshot whose entity type differs from the events'",
+        |err| matches!(err, Error::InvalidCommit(_)),
+    )?;
+
     ensure!(
         repo.events(&a.id).await?.is_empty() && repo.events(&b.id).await?.is_empty(),
-        "the rejected commit writes nothing"
+        "the rejected commits write nothing"
     );
 
     Ok(())
@@ -529,9 +550,13 @@ async fn out_of_order_events<R: Repository>(repo: &R) -> CaseResult {
 async fn empty_commit<R: Repository>(repo: &R) -> CaseResult {
     let stream = Stream::new(&namespace(), "1", "ledger");
 
-    stream
-        .commit(repo, Vec::new(), Some(stream.new_snapshot(2, "{}")))
-        .await?;
+    // The snapshot sequences are wrong for a new stream, and 0 is invalid, but an empty commit
+    // ignores its snapshot rather than validating it.
+    for sequence in [2, 0] {
+        stream
+            .commit(repo, Vec::new(), Some(stream.new_snapshot(sequence, "{}")))
+            .await?;
+    }
     ensure!(
         repo.snapshot(&stream.id).await?.is_none(),
         "an empty commit ignores its snapshot"
