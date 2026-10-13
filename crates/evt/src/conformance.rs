@@ -195,7 +195,7 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             foreign_events(repo).await,
         );
         record(
-            "reject events out of order or with gaps",
+            "reject events out of order, with gaps, below 1, or with wrong IDs",
             out_of_order_events(repo).await,
         );
         record("an empty commit is a no-op", empty_commit(repo).await);
@@ -460,6 +460,31 @@ async fn out_of_order_events<R: Repository>(repo: &R) -> CaseResult {
     ensure!(
         repo.events(&gapped.id).await?.is_empty(),
         "the rejected gap writes nothing"
+    );
+
+    // DynamoDB keeps the snapshot at sk = 0 and reads after it, so sequences start at 1.
+    let low = Stream::new(&ns, "low", "ledger");
+    for sequence in [0, -1] {
+        expect_err(
+            low.commit(repo, vec![low.event(sequence, 1)], None).await,
+            &format!("a commit at sequence {sequence}"),
+            |err| matches!(err, Error::InvalidCommit(_)),
+        )?;
+    }
+
+    // DynamoDB rebuilds the ID from the key, so a stored ID must already be canonical.
+    let renamed = SerializedEvent {
+        id: EventId::new("custom-id"),
+        ..low.event(1, 1)
+    };
+    expect_err(
+        low.commit(repo, vec![renamed], None).await,
+        "an event whose ID is not {entity_id}:{sequence}",
+        |err| matches!(err, Error::InvalidCommit(_)),
+    )?;
+    ensure!(
+        repo.events(&low.id).await?.is_empty(),
+        "the rejected commits write nothing"
     );
 
     let stream = Stream::new(&ns, "1", "ledger");

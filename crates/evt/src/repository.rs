@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
-use crate::ids::{EntityId, EntityType, EventSequence};
+use crate::ids::{EntityId, EntityType, EventId, EventSequence};
 
 /// A snapshot to write with a commit. Its event sequence is the last event in the commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,7 +46,9 @@ pub struct Commit<Op> {
     pub events: Vec<SerializedEvent>,
     /// The snapshot to write, if the commit crosses a snapshot boundary.
     pub snapshot: Option<NewSnapshot>,
-    /// Extra backend operations from in-band projectors. Written first, in order.
+    /// Extra backend operations from in-band projectors, written in order in the same
+    /// transaction. DynamoDB puts them before the events. PostgreSQL runs them after the event
+    /// inserts and the floor check, so a racing writer fails on the event key first.
     pub operations: Vec<Op>,
 }
 
@@ -68,38 +70,53 @@ impl<Op> Commit<Op> {
         self
     }
 
-    /// Adds backend operations, written before the events in the same transaction.
+    /// Adds backend operations, written in the same transaction as the events.
     #[must_use]
     pub fn with_operations(mut self, operations: impl IntoIterator<Item = Op>) -> Self {
         self.operations.extend(operations);
         self
     }
 
-    /// Checks that every event belongs to the commit's entity and that sequences are contiguous
-    /// (each one more than the last). Repositories call it before writing, because the floor and
-    /// snapshot checks only look at `entity_id` and the first event's sequence, and loads reject
-    /// streams with gaps.
+    /// Checks that the events can be stored as written: each belongs to the commit's entity and
+    /// has the ID `{entity_id}:{sequence}`, the first sequence is at least 1, and sequences are
+    /// contiguous. Repositories call it before writing, because the floor and snapshot checks only
+    /// look at `entity_id` and the first event's sequence, loads reject streams with gaps, and
+    /// DynamoDB does not store the event ID.
     pub fn validate(&self) -> Result<(), Error> {
-        if let Some(event) = self
-            .events
-            .iter()
-            .find(|event| event.entity_id != self.entity_id)
+        let invalid = |message: String| Err(Error::InvalidCommit(message));
+
+        for event in &self.events {
+            if event.entity_id != self.entity_id {
+                return invalid(format!(
+                    "event {} belongs to entity {}, not {}",
+                    event.id, event.entity_id, self.entity_id
+                ));
+            }
+
+            let id = EventId::for_event(&event.entity_id, event.sequence);
+            if event.id != id {
+                return invalid(format!("event {} should have the ID {id}", event.id));
+            }
+        }
+
+        if let Some(first) = self.events.first()
+            && first.sequence < EventSequence(1)
         {
-            return Err(Error::InvalidCommit(format!(
-                "event {} belongs to entity {}, not {}",
-                event.id, event.entity_id, self.entity_id
-            )));
+            return invalid(format!(
+                "event sequence {} is below 1; sequences start at 1",
+                first.sequence
+            ));
         }
 
         if let Some(pair) = self
             .events
             .windows(2)
-            .find(|pair| pair[1].sequence != pair[0].sequence.next())
+            .find(|pair| pair[0].sequence.checked_next() != Some(pair[1].sequence))
         {
-            return Err(Error::InvalidCommit(format!(
+            return invalid(format!(
                 "event sequence {} follows {}; sequences must be contiguous",
                 pair[1].sequence, pair[0].sequence
-            )));
+            ));
         }
 
         Ok(())
@@ -110,8 +127,8 @@ impl<Op> Commit<Op> {
 ///
 /// Implementations must:
 ///
-/// - reject a commit with an event for another entity, or with sequences that are not contiguous,
-///   with [`Error::InvalidCommit`] (see [`Commit::validate`]);
+/// - reject a commit whose events belong to another entity, have non-canonical IDs, start below
+///   sequence 1, or are not contiguous, with [`Error::InvalidCommit`] (see [`Commit::validate`]);
 /// - reject a commit that reuses an existing `(entity_id, sequence)` with [`Error::Conflict`];
 /// - reject a commit whose first event is at or below the stored snapshot's event sequence with
 ///   [`Error::Conflict`], because compaction may have deleted the events that sequence would

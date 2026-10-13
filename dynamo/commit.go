@@ -56,12 +56,17 @@ const NextSnapshotCondition = "seq = :seq AND eventSeq < :first"
 // checkContiguous rejects events whose sequences are not contiguous (each one more than the last)
 // for each entity. The floor check reads the first event and the snapshot records the last, so a
 // commit like [6, 5] after compacting through 5 would recreate sequence 5, and loads reject a
-// stream with a gap such as [1, 3].
+// stream with a gap such as [1, 3]. Sequences start at 1: DynamoDB keeps the snapshot at sk = 0 and
+// reads events after it.
 func checkContiguous(events []evt.SerializedEvent) error {
 	last := make(map[evt.EntityID]evt.EventSequence, 1)
 
 	for _, event := range events {
-		if previous, seen := last[event.EntityID]; seen && event.Sequence != previous+1 {
+		previous, seen := last[event.EntityID]
+		if !seen && event.Sequence < 1 {
+			return fmt.Errorf("dynamo: event %s has sequence %d; sequences start at 1", event.ID, event.Sequence)
+		}
+		if seen && event.Sequence != previous+1 {
 			return fmt.Errorf("dynamo: event %s follows sequence %d; sequences must be contiguous", event.ID, previous)
 		}
 		last[event.EntityID] = event.Sequence
@@ -111,7 +116,7 @@ func (repo *Repository) CommitStream(
 	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],
 ) []error {
-	var errors []error
+	var errs []error
 
 	var (
 		batch       []types.TransactWriteItem
@@ -125,7 +130,7 @@ func (repo *Repository) CommitStream(
 
 		items := append(batch, repo.buildFloorChecks(batchEvents)...)
 		if err := repo.commitEventsWithTransaction(ctx, items, nil); err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
 		}
 
 		batch, batchEvents = nil, nil
@@ -134,25 +139,25 @@ func (repo *Repository) CommitStream(
 	for result := range channel {
 		serializedResult, err := result.Unwrap()
 		if err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
 			continue
 		}
 
 		if err := checkContiguous(serializedResult.Events); err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
 			continue
 		}
 
 		items, _, err := repo.buildEventPutTransactions(serializedResult.Events)
 		if err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
 			continue
 		}
 
 		// Keep the batches under 100 items total, with transactions included
 		transactItems, err := toDynamoItems(serializedResult.Transaction)
 		if err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
 			continue
 		}
 
@@ -161,7 +166,7 @@ func (repo *Repository) CommitStream(
 
 		// Guard against a single result that already exceeds the 100-item transaction limit
 		if size := len(combined) + countEntities(serializedResult.Events); size > 100 {
-			errors = append(errors, fmt.Errorf(
+			errs = append(errs, fmt.Errorf(
 				"single result produces %d items, exceeding DynamoDB 100-item transaction limit",
 				size,
 			))
@@ -181,7 +186,7 @@ func (repo *Repository) CommitStream(
 	// Flush the final items from the batch
 	flush()
 
-	return errors
+	return errs
 }
 
 // countEntities returns the number of distinct entities, which is the number of floor checks a

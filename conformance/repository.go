@@ -342,9 +342,14 @@ func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
 	gapped[1].Sequence = 3
 	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: gapped}), "a commit that skips a sequence")
 
+	// Sequences start at 1: DynamoDB keeps the snapshot at sk = 0.
+	zero := serialize(t, fresh, "test", 0, &test.EntityCreated{ID: fresh, Value: "zero"})
+	zero[0].Sequence = 0
+	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: zero}), "a commit at sequence 0")
+
 	stored, err := repo.GetEvents(ctx, fresh)
 	require.NoError(t, err)
-	require.Empty(t, stored, "the rejected gap writes nothing")
+	require.Empty(t, stored, "the rejected commits write nothing")
 
 	events, err := repo.GetEvents(ctx, id)
 	require.NoError(t, err)

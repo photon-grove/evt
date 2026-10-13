@@ -190,8 +190,17 @@ impl EventSequence {
     /// The sequence of an entity with no events.
     pub const ZERO: Self = Self(0);
 
-    /// Returns the next sequence.
+    /// Returns the next sequence, saturating at `i64::MAX`. Use
+    /// [`checked_next`](Self::checked_next) where reaching the maximum must be an error.
     pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Returns the next sequence, or `None` at `i64::MAX`.
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
     }
 }

@@ -430,7 +430,11 @@ pub fn serialize_events<A: Aggregate>(
     events
         .iter()
         .map(|event| {
-            sequence = sequence.next();
+            sequence = sequence.checked_next().ok_or_else(|| {
+                Error::InvalidCommit(format!(
+                    "entity {entity_id} is at the maximum event sequence"
+                ))
+            })?;
 
             Ok(SerializedEvent {
                 id: EventId::for_event(entity_id, sequence),
@@ -444,4 +448,21 @@ pub fn serialize_events<A: Aggregate>(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conformance::{Added, Ledger};
+
+    #[test]
+    fn serializing_past_the_maximum_sequence_fails() {
+        let events = [Added { amount: 1 }.into()];
+        let id = EntityId::new("ledger-1");
+
+        let result =
+            serialize_events::<Ledger>(&id, EventSequence(i64::MAX), &events, &Metadata::default());
+
+        assert!(matches!(result, Err(Error::InvalidCommit(_))), "{result:?}");
+    }
 }
