@@ -16,6 +16,9 @@ use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
 use crate::retry::RetryPolicy;
 use crate::upcast::upcast_event;
 
+/// How many times [`Store::load`] reads the stream when it finds a sequence gap.
+const LOAD_ATTEMPTS: usize = 3;
+
 /// The default number of events between snapshots, matching the Go backends' defaults.
 pub const DEFAULT_SNAPSHOT_INTERVAL: usize = 5;
 
@@ -101,9 +104,25 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
     /// Loads an aggregate: from its snapshot plus later events when a snapshot exists, otherwise
     /// from every event. An entity with no events loads as `A::default()` at sequence 0.
+    ///
+    /// Event sequences must be contiguous. A gap means the stream was compacted between reading
+    /// the snapshot and the events, so the load starts over, up to three times. A gap that
+    /// persists, for example from expired events, fails with [`Error::Conflict`].
     pub async fn load(&self, entity_id: impl Into<EntityId>) -> Result<Loaded<A>, Error> {
         let entity_id = entity_id.into();
+        let mut attempt = 1;
 
+        // A sequence gap means another writer snapshotted and compacted the stream between the
+        // snapshot read and the event read. Loading again starts from the newer snapshot.
+        loop {
+            match self.load_once(entity_id.clone()).await {
+                Err(err) if err.is_conflict() && attempt < LOAD_ATTEMPTS => attempt += 1,
+                result => return result,
+            }
+        }
+    }
+
+    async fn load_once(&self, entity_id: EntityId) -> Result<Loaded<A>, Error> {
         let snapshot = self.repository.snapshot(&entity_id).await?;
         let has_snapshot = snapshot.is_some();
 
@@ -321,6 +340,17 @@ impl<A: Aggregate> Loaded<A> {
 
     /// Upcasts, decodes, and applies one stored event.
     fn replay(&mut self, stored: SerializedEvent) -> Result<(), Error> {
+        if stored.sequence != self.sequence.next() {
+            return Err(Error::Conflict {
+                entity_id: self.entity_id.clone(),
+                message: format!(
+                    "the stream skips from sequence {} to {}: it was compacted during the load, \
+                     or events expired",
+                    self.sequence, stored.sequence
+                ),
+            });
+        }
+
         let stored = upcast_event(A::upcasters(), stored).map_err(|failure| Error::Replay {
             event_type: failure.event_type,
             version: failure.version,

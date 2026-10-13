@@ -223,6 +223,10 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             store_stale_commit(repo).await,
         );
         record("store retries a conflict", store_retry(repo).await);
+        record(
+            "store reloads when compaction races a load",
+            store_load_during_compaction(repo).await,
+        );
         if let Some(views) = &self.views {
             record(
                 "projector operations commit with events",
@@ -918,17 +922,53 @@ async fn store_stale_commit<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
-/// Lets another writer commit the same sequences just before the first commit through it.
+/// Lets another writer act once, at a moment chosen by `interference`.
 struct Interfering<'a, R> {
     inner: &'a R,
     armed: AtomicBool,
+    interference: Interference,
+}
+
+enum Interference {
+    /// Commit the same sequences just before the first commit.
+    CompetingCommit,
+    /// Between the snapshot read and the event read of the first load: append six events (a
+    /// snapshot at the fifth), commit one more, and compact through the new snapshot.
+    CompactDuringLoad,
+}
+
+impl<R: Repository> Interfering<'_, R> {
+    fn fires(&self, interference: &Interference) -> bool {
+        std::mem::discriminant(&self.interference) == std::mem::discriminant(interference)
+            && self.armed.swap(false, Ordering::SeqCst)
+    }
+
+    async fn compact_ahead(&self, entity_id: &EntityId) -> Result<(), Error> {
+        let other = Store::<Ledger, _>::new(self.inner, ()).with_snapshot_interval(5);
+
+        for _ in 0..6 {
+            other
+                .execute(entity_id, Add(1), metadata())
+                .await
+                .map_err(|err| Error::backend(err.to_string()))?;
+        }
+
+        let covered = self
+            .inner
+            .snapshot(entity_id)
+            .await?
+            .map_or(EventSequence::ZERO, |snapshot| snapshot.event_sequence);
+        self.inner.compact_below(entity_id, covered).await?;
+
+        Ok(())
+    }
 }
 
 impl<R: Repository> Repository for Interfering<'_, R> {
     type Operation = R::Operation;
 
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
-        if self.armed.swap(false, Ordering::SeqCst) {
+        if self.fires(&Interference::CompetingCommit) {
             let competing = commit
                 .events
                 .iter()
@@ -961,6 +1001,10 @@ impl<R: Repository> Repository for Interfering<'_, R> {
         entity_id: &EntityId,
         after: EventSequence,
     ) -> Result<Vec<SerializedEvent>, Error> {
+        if self.fires(&Interference::CompactDuringLoad) {
+            self.compact_ahead(entity_id).await?;
+        }
+
         self.inner.events_after(entity_id, after).await
     }
 
@@ -988,12 +1032,37 @@ impl<R: Repository> Repository for Interfering<'_, R> {
     }
 }
 
+async fn store_load_during_compaction<R: Repository>(repo: &R) -> CaseResult {
+    let id = ledger_id();
+    let store = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(5);
+    for _ in 0..5 {
+        store.execute(&id, Add(1), metadata()).await?;
+    }
+
+    // The load reads the snapshot at 5, then another writer reaches 11 and compacts through 10.
+    // Reading events after 5 now returns only 11, which must not be applied to the state at 5.
+    let racing = Interfering {
+        inner: repo,
+        armed: AtomicBool::new(true),
+        interference: Interference::CompactDuringLoad,
+    };
+    let loaded = Store::<Ledger, _>::new(racing, ()).load(&id).await?;
+    ensure_eq!(
+        (loaded.aggregate().total, loaded.sequence()),
+        (11, EventSequence(11)),
+        "the load starts over from the newer snapshot"
+    );
+
+    Ok(())
+}
+
 async fn no_sleep(_: Duration) {}
 
 async fn store_retry<R: Repository>(repo: &R) -> CaseResult {
     let interfering = |inner| Interfering {
         inner,
         armed: AtomicBool::new(true),
+        interference: Interference::CompetingCommit,
     };
 
     let store = Store::<Ledger, _>::new(interfering(repo), ()).with_snapshot_interval(0);
