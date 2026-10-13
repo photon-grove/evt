@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/photon-grove/evt/compare/v0.7.0...v0.8.0) (2026-10-13)
+
+
+### Features
+
+* **rust:** add photon-evt, a wire-compatible Rust implementation ([#57](https://github.com/photon-grove/evt/issues/57)) ([7b40e4c](https://github.com/photon-grove/evt/commit/7b40e4cf9e32ec717fd2244448c4329acca13e28))
+
 ## [0.7.0](https://github.com/photon-grove/evt/compare/v0.6.0...v0.7.0) (2026-06-16)
 
 
