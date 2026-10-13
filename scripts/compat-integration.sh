@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Cross-language integration run: the Go and Rust drivers take turns writing the same streams
+# (each scenario step names its writer), then both verify every stream against the golden
+# fixtures. Usage: scripts/compat-integration.sh dynamo|postgres
+set -euo pipefail
+
+backend="${1:?usage: compat-integration.sh dynamo|postgres}"
+run="${EVT_COMPAT_RUN:-r$(date +%s)${RANDOM}}"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+mkdir -p target/compat
+go build -o "target/compat/evt-compat-go-${backend}" ./internal/compat/cmd/evt-compat
+cargo build --quiet -p evt-compat --features drivers --bin evt-compat
+
+go_driver="target/compat/evt-compat-go-${backend}"
+rust_driver="target/debug/evt-compat"
+
+steps="$("$go_driver" steps)"
+echo "run ${run}: ${steps} interleaved steps against ${backend}"
+
+for ((index = 0; index < steps; index++)); do
+  "$go_driver" step -backend "$backend" -run "$run" -index "$index"
+  "$rust_driver" step --backend "$backend" --run "$run" --index "$index"
+done
+
+"$go_driver" verify -backend "$backend" -run "$run"
+"$rust_driver" verify --backend "$backend" --run "$run"
+
+echo "run ${run}: Go and Rust agree on every ${backend} stream"

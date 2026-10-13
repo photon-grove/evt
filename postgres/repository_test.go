@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 )
 
 func TestClassifyWriteError(t *testing.T) {
@@ -23,6 +24,7 @@ func TestClassifyWriteError(t *testing.T) {
 
 		require.Error(t, err)
 		require.True(t, evt.IsConflictErr(err), "a 23505 violation should map to evt.ConflictError")
+		require.True(t, policy.IsTransient(err), "the conflict is transient so ExecuteWithRetry retries it")
 	})
 
 	t.Run("other errors pass through unchanged", func(t *testing.T) {
@@ -60,6 +62,30 @@ func TestNewRepositoryTableNames(t *testing.T) {
 	t.Run("invalid identifier panics", func(t *testing.T) {
 		require.Panics(t, func() {
 			NewRepository(nil, WithEventsTable("events; DROP TABLE x"))
+		})
+	})
+
+	t.Run("name over 47 bytes panics", func(t *testing.T) {
+		require.Panics(t, func() {
+			NewRepository(nil, WithEventsTable(strings.Repeat("e", 48)))
+		})
+	})
+
+	t.Run("names that collide with each other or a derived index panic", func(t *testing.T) {
+		for _, names := range [][2]string{
+			{"evt_events", "Evt_Events"},
+			{"events", "events_entity_type_idx"},
+			{"events_pkey", "events"},
+		} {
+			require.Panics(t, func() {
+				NewRepository(nil, WithEventsTable(names[0]), WithSnapshotsTable(names[1]))
+			}, "%v", names)
+		}
+	})
+
+	t.Run("reserved keyword panics", func(t *testing.T) {
+		require.Panics(t, func() {
+			NewRepository(nil, WithEventsTable("Select"))
 		})
 	})
 }

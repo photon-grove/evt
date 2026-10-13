@@ -1,0 +1,138 @@
+{
+  "scenarios": [
+    {
+      "name": "go-writes-rust-reads",
+      "description": "Go writes the whole stream, including two snapshots; Rust must load and verify it.",
+      "snapshotInterval": 3,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Ada Lovelace", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 1500, "memo": "Coffee & <cake>" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "batchDeposit", "amounts": [100, 200, 300] }, "expect": { "result": "ok", "events": 3 } },
+        { "by": "go", "op": "execute", "commandId": "c4", "command": { "type": "tag", "tags": ["vip", "early-adopter"] }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c5", "command": { "type": "setLabels", "labels": { "tier": "gold", "region": "emea" } }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c6", "command": { "type": "withdraw", "amountCents": 600 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c7", "command": { "type": "rename", "owner": "Ada King" }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
+      "name": "rust-writes-go-reads",
+      "description": "The mirror image: Rust writes the whole stream; Go must load and verify it.",
+      "snapshotInterval": 3,
+      "steps": [
+        { "by": "rust", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Ada Lovelace", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 1500, "memo": "Coffee & <cake>" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c3", "command": { "type": "batchDeposit", "amounts": [100, 200, 300] }, "expect": { "result": "ok", "events": 3 } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "command": { "type": "tag", "tags": ["vip", "early-adopter"] }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c5", "command": { "type": "setLabels", "labels": { "tier": "gold", "region": "emea" } }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "withdraw", "amountCents": 600 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c7", "command": { "type": "rename", "owner": "Ada King" }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
+      "name": "interleaved",
+      "description": "Writers alternate on every step, so each language extends a stream and a snapshot chain the other started. Covers trace and address metadata, non-ASCII and HTML-sensitive text, map key ordering, rejections, and a closed account.",
+      "snapshotInterval": 2,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Grace Hopper", "openedAt": "2026-03-04T05:06:07Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "trace": { "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "tracestate": "vendor=a" }, "command": { "type": "deposit", "amountCents": 2500, "memo": "Paycheck \u2615 \u2028 \u2029 <tab>\t&" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "address": "198.51.100.4", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "command": { "type": "withdraw", "amountCents": 99999 }, "expect": { "result": "rejected" } },
+        { "by": "go", "op": "execute", "commandId": "c5", "timestamp": "2026-10-12T01:02:03Z", "command": { "type": "withdraw", "amountCents": 600 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "tag", "tags": ["café", "naïve", "漢字"] }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c7", "command": { "type": "setLabels", "labels": { "z": "last", "a": "first", "m": "middle" } }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "command": { "type": "setLabels", "labels": { "b": "second" } }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c9", "command": { "type": "close", "reason": "customer request" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c10", "command": { "type": "deposit", "amountCents": 5 }, "expect": { "result": "rejected" } }
+      ]
+    },
+    {
+      "name": "compaction-handoff",
+      "description": "One language compacts a stream the other wrote, the other keeps writing from the snapshot, compaction stays idempotent and refuses ranges no snapshot covers, and neither language can write a sequence the snapshot covers after its event was compacted.",
+      "snapshotInterval": 3,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Katherine Johnson" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c2", "command": { "type": "batchDeposit", "amounts": [10, 20, 30] }, "expect": { "result": "ok", "events": 3 } },
+        { "by": "rust", "op": "compact", "through": 4, "expect": { "result": "compacted", "deleted": 4 } },
+        { "by": "rust", "op": "compact", "through": 4, "expect": { "result": "compacted" } },
+        { "by": "go", "op": "compact", "through": 5, "expect": { "result": "uncovered" } },
+        { "by": "rust", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 40 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c4", "command": { "type": "deposit", "amountCents": 50 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "compact", "through": 6, "expect": { "result": "compacted", "deleted": 2 } },
+        { "by": "rust", "op": "execute", "commandId": "c5", "command": { "type": "withdraw", "amountCents": 15 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "compact", "through": 7, "expect": { "result": "uncovered" } },
+        { "by": "go", "op": "conflictProbe", "sequence": 7, "expect": { "result": "conflict" } },
+        { "by": "rust", "op": "conflictProbe", "sequence": 2, "expect": { "result": "conflict" } },
+        { "by": "go", "op": "conflictProbe", "sequence": 5, "expect": { "result": "conflict" } }
+      ]
+    },
+    {
+      "name": "upcast-legacy",
+      "description": "Each language appends a legacy account:renamed v1 event ({\"name\": ...}) and the other must upcast it to v2 ({\"owner\": ...}) on load, including into a snapshot.",
+      "snapshotInterval": 3,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Original" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "appendRaw", "commandId": "c2", "event": { "type": "account:renamed", "version": 1, "payload": "{\"name\":\"Legacy From Rust\"}" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 10 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "appendRaw", "commandId": "c4", "event": { "type": "account:renamed", "version": 1, "payload": "{\"name\":\"Legacy From Go\"}" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c5", "command": { "type": "deposit", "amountCents": 20 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "rename", "owner": "Modern" }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
+      "name": "conflict-probe",
+      "description": "Both languages detect writes to an existing sequence written by the other, and accept a write at the next free sequence.",
+      "snapshotInterval": 5,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Mary Jackson" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "conflictProbe", "sequence": 1, "expect": { "result": "conflict" } },
+        { "by": "go", "op": "conflictProbe", "sequence": 1, "expect": { "result": "conflict" } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 75 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "conflictProbe", "sequence": 2, "expect": { "result": "conflict" } },
+        { "by": "rust", "op": "conflictProbe", "sequence": 3, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 5 }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
+      "name": "dedupe-window",
+      "description": "A command ID recorded after the latest snapshot is a duplicate in both languages. Command IDs folded into a snapshot are no longer checked, so the same ID executes again.",
+      "snapshotInterval": 5,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Dorothy Vaughan" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "duplicate" } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "duplicate" } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 50 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "command": { "type": "tag", "tags": ["x"] }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c5", "command": { "type": "setLabels", "labels": { "k": "v" } }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c6", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "deposit", "amountCents": 1 }, "expect": { "result": "duplicate" } }
+      ]
+    },
+    {
+      "name": "batch-crosses-snapshot",
+      "description": "A multi-event command that crosses the snapshot interval snapshots the whole batch, so the snapshot's eventSeq is the batch's last event.",
+      "snapshotInterval": 4,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Hedy Lamarr" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "batchDeposit", "amounts": [1, 2, 3, 4, 5, 6] }, "expect": { "result": "ok", "events": 6 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "batchDeposit", "amounts": [7] }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "command": { "type": "batchDeposit", "amounts": [8, 9, 10] }, "expect": { "result": "ok", "events": 3 } },
+        { "by": "go", "op": "execute", "commandId": "c5", "command": { "type": "batchDeposit", "amounts": [11, 12, 13, 14, 15] }, "expect": { "result": "ok", "events": 5 } }
+      ]
+    },
+    {
+      "name": "snapshots-disabled",
+      "description": "With snapshots disabled, neither language writes a snapshot row and every load replays from sequence 1.",
+      "snapshotInterval": 0,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Radia Perlman" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 300, "memo": "first" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 200, "memo": "second" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c5", "command": { "type": "withdraw", "amountCents": 250 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "tag", "tags": ["no-snapshots"] }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    }
+  ]
+}

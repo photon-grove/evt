@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
+	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -27,6 +30,78 @@ const (
 // identifierPattern guards table names interpolated into DDL/DML. Table names are configuration, not
 // user input, but validating them keeps the interpolation provably injection-free.
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// reservedKeywords are PostgreSQL's reserved keywords (pg_get_keywords() categories R and T), which
+// cannot be used as unquoted table names.
+var reservedKeywords = map[string]struct{}{}
+
+func init() {
+	for _, keyword := range strings.Fields(`
+		all analyse analyze and any array as asc asymmetric authorization binary both case cast check
+		collate collation column concurrently constraint create cross current_catalog current_date
+		current_role current_schema current_time current_timestamp current_user default deferrable desc
+		distinct do else end except false fetch for foreign freeze from full grant group having ilike in
+		initially inner intersect into is isnull join lateral leading left like limit localtime
+		localtimestamp natural not notnull null offset on only or order outer overlaps placing primary
+		references returning right select session_user similar some symmetric system_user table
+		tablesample then to trailing true union unique user using variadic verbose when where window with`) {
+		reservedKeywords[keyword] = struct{}{}
+	}
+}
+
+// maxTableNameLen is the longest table name allowed. PostgreSQL truncates identifiers to 63 bytes,
+// and the longest name derived from a table name, "{events}_entity_type_idx", adds 16.
+const maxTableNameLen = 63 - len("_entity_type_idx")
+
+// entityLockQuery takes the per-entity transaction lock ($1 is the entity ID) that serializes
+// commits and snapshot writes for one entity, so a snapshot cannot raise the floor while a commit
+// below it is in flight. The Rust crate runs this exact statement, so writers in either language
+// exclude each other.
+const entityLockQuery = "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))"
+
+// validIdentifier reports whether a table name is safe to interpolate unquoted.
+func validIdentifier(name string) bool {
+	_, reserved := reservedKeywords[strings.ToLower(name)]
+
+	return len(name) <= maxTableNameLen && identifierPattern.MatchString(name) && !reserved
+}
+
+// sharedRelationName returns a name that two relations created by EnsureSchema would share, or ""
+// when there is none: the tables, "{events}_entity_type_idx", and each table's "{table}_pkey".
+// CREATE TABLE IF NOT EXISTS would otherwise skip a table whose name an index already took.
+// Unquoted identifiers fold to lower case, so names are compared that way.
+func sharedRelationName(eventsTable, snapshotsTable string) string {
+	events, snapshots := strings.ToLower(eventsTable), strings.ToLower(snapshotsTable)
+	relations := []string{events, events + "_pkey", events + "_entity_type_idx", snapshots, snapshots + "_pkey"}
+
+	for i, relation := range relations {
+		if slices.Contains(relations[:i], relation) {
+			return relation
+		}
+	}
+
+	return ""
+}
+
+// lockEntities takes the entity lock for every entity in events, in sorted order so concurrent
+// multi-entity commits cannot deadlock.
+func (repo *Repository) lockEntities(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
+	ids := make([]string, 0, 1)
+	for _, event := range events {
+		if !slices.Contains(ids, string(event.EntityID)) {
+			ids = append(ids, string(event.EntityID))
+		}
+	}
+	slices.Sort(ids)
+
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx, entityLockQuery, id); err != nil {
+			return classifyWriteError(fmt.Errorf("postgres: lock entity %s: %w", id, err))
+		}
+	}
+
+	return nil
+}
 
 // DB is the minimal subset of the pgx API the Repository depends on. Both *pgxpool.Pool and pgx.Tx
 // satisfy it, so callers can pass a pool (the common case) or an ambient transaction. It is the
@@ -87,9 +162,14 @@ func NewRepository(db DB, opts ...Option) *Repository {
 	}
 
 	for _, name := range []string{repo.eventsTable, repo.snapshotsTable} {
-		if !identifierPattern.MatchString(name) {
+		if !validIdentifier(name) {
 			panic(fmt.Sprintf("postgres: invalid table name %q", name))
 		}
+	}
+
+	if shared := sharedRelationName(repo.eventsTable, repo.snapshotsTable); shared != "" {
+		panic(fmt.Sprintf("postgres: tables %q and %q would both use the name %q",
+			repo.eventsTable, repo.snapshotsTable, shared))
 	}
 
 	return repo
@@ -144,8 +224,20 @@ CREATE TABLE IF NOT EXISTS %[2]s (
 // PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
 // same transaction as the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
+	if err := checkContiguous(res.Events); err != nil {
+		return err
+	}
+
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
-		return repo.insertEvents(ctx, tx, res.Events)
+		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		return repo.checkFloor(ctx, tx, res.Events)
 	})
 }
 
@@ -187,10 +279,22 @@ func (repo *Repository) CommitWithSnapshot(
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
 	}
 
+	if err := checkContiguous(res.Events); err != nil {
+		return err
+	}
+
 	eventSequence := res.Events[len(res.Events)-1].Sequence
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
+		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
 		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		if err := repo.checkFloor(ctx, tx, res.Events); err != nil {
 			return err
 		}
 
@@ -296,6 +400,66 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 
 	if err := tx.Commit(ctx); err != nil {
 		return classifyWriteError(fmt.Errorf("postgres: commit: %w", err))
+	}
+
+	return nil
+}
+
+// checkContiguous rejects events whose sequences are not contiguous (each one more than the last)
+// for each entity. The floor check reads the first event and the snapshot records the last, so a
+// commit like [6, 5] after compacting through 5 would recreate sequence 5, and loads reject a
+// stream with a gap such as [1, 3]. Sequences start at 1: DynamoDB keeps the snapshot at sk = 0 and
+// reads events after it.
+func checkContiguous(events []evt.SerializedEvent) error {
+	last := make(map[evt.EntityID]evt.EventSequence, 1)
+
+	for _, event := range events {
+		previous, seen := last[event.EntityID]
+		if !seen && event.Sequence < 1 {
+			return fmt.Errorf("postgres: event %s has sequence %d; sequences start at 1", event.ID, event.Sequence)
+		}
+		// Nothing follows the maximum sequence. Checking it first keeps previous+1 from wrapping.
+		if seen && (previous == math.MaxInt || event.Sequence != previous+1) {
+			return fmt.Errorf("postgres: event %s follows sequence %d; sequences must be contiguous", event.ID, previous)
+		}
+		last[event.EntityID] = event.Sequence
+	}
+
+	return nil
+}
+
+// checkFloor rejects a commit whose first event for an entity is at or below that entity's
+// snapshot event_sequence. Compaction deletes the events a snapshot covers, so the primary key
+// alone would let a writer that loaded before the snapshot recreate a compacted sequence. It runs
+// after the inserts: a concurrent writer can only raise the floor past our first sequence by
+// inserting that sequence, which our uncommitted insert already holds.
+func (repo *Repository) checkFloor(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
+	first := make(map[evt.EntityID]evt.EventSequence)
+	for _, event := range events {
+		if current, ok := first[event.EntityID]; !ok || event.Sequence < current {
+			first[event.EntityID] = event.Sequence
+		}
+	}
+
+	query := fmt.Sprintf(
+		`SELECT event_sequence FROM %s WHERE entity_id = $1 AND event_sequence >= $2`,
+		repo.snapshotsTable,
+	)
+
+	for entityID, sequence := range first {
+		var floor int64
+
+		err := tx.QueryRow(ctx, query, string(entityID), int64(sequence)).Scan(&floor)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("postgres: check snapshot floor: %w", err)
+		}
+
+		return transientConflict(fmt.Sprintf(
+			"postgres: event %d for %s is at or below the snapshot floor %d", sequence, entityID, floor,
+		))
 	}
 
 	return nil

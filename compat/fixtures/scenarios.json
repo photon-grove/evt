@@ -1,0 +1,1922 @@
+{
+  "run": "fixture",
+  "source": "evt-compat",
+  "scenarios": [
+    {
+      "name": "go-writes-rust-reads",
+      "entityId": "compat-fixture-go-writes-rust-reads",
+      "sequence": 9,
+      "snapshotSequence": 3,
+      "state": "{\"owner\":\"Ada King\",\"status\":\"open\",\"balanceCents\":1500,\"deposits\":4,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":[\"vip\",\"early-adopter\"],\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"},\"lastMemo\":\"Coffee \\u0026 \\u003ccake\\u003e\"}",
+      "events": [
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTUwMCwibWVtbyI6IkNvZmZlZSBcdTAwMjYgXHUwMDNjY2FrZVx1MDAzZSJ9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsImVhcmx5LWFkb3B0ZXIiXX0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsicmVnaW9uIjoiZW1lYSIsInRpZXIiOiJnb2xkIn19\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:8\",\"sequence\":8,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-go-writes-rust-reads:9\",\"sequence\":9,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIn0=\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-go-writes-rust-reads\",\"sequence\":3,\"eventSequence\":9,\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTUwMCwiZGVwb3NpdHMiOjQsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIiwidGFncyI6WyJ2aXAiLCJlYXJseS1hZG9wdGVyIl0sImxhYmVscyI6eyJyZWdpb24iOiJlbWVhIiwidGllciI6ImdvbGQifSwibGFzdE1lbW8iOiJDb2ZmZWUgXHUwMDI2IFx1MDAzY2Nha2VcdTAwM2UifQ==\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "9"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada King\",\"status\":\"open\",\"balanceCents\":1500,\"deposits\":4,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":[\"vip\",\"early-adopter\"],\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"},\"lastMemo\":\"Coffee \\u0026 \\u003ccake\\u003e\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "seq": {
+            "N": "3"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":1500,\"memo\":\"Coffee \\u0026 \\u003ccake\\u003e\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":200,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":300,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"vip\",\"early-adopter\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"}}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "7"
+          },
+          "type": {
+            "S": "account:labeled"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":600}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "8"
+          },
+          "type": {
+            "S": "account:withdrawn"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada King\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "9"
+          },
+          "type": {
+            "S": "account:renamed"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTUwMCwibWVtbyI6IkNvZmZlZSBcdTAwMjYgXHUwMDNjY2FrZVx1MDAzZSJ9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:6\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsImVhcmx5LWFkb3B0ZXIiXX0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:7\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsicmVnaW9uIjoiZW1lYSIsInRpZXIiOiJnb2xkIn19\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:8\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:8\",\"sequence\":8,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:9\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:9\",\"sequence\":9,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIn0=\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    },
+    {
+      "name": "rust-writes-go-reads",
+      "entityId": "compat-fixture-rust-writes-go-reads",
+      "sequence": 9,
+      "snapshotSequence": 3,
+      "state": "{\"owner\":\"Ada King\",\"status\":\"open\",\"balanceCents\":1500,\"deposits\":4,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":[\"vip\",\"early-adopter\"],\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"},\"lastMemo\":\"Coffee \\u0026 \\u003ccake\\u003e\"}",
+      "events": [
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTUwMCwibWVtbyI6IkNvZmZlZSBcdTAwMjYgXHUwMDNjY2FrZVx1MDAzZSJ9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsImVhcmx5LWFkb3B0ZXIiXX0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsicmVnaW9uIjoiZW1lYSIsInRpZXIiOiJnb2xkIn19\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:8\",\"sequence\":8,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-rust-writes-go-reads:9\",\"sequence\":9,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIn0=\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-rust-writes-go-reads\",\"sequence\":3,\"eventSequence\":9,\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTUwMCwiZGVwb3NpdHMiOjQsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIiwidGFncyI6WyJ2aXAiLCJlYXJseS1hZG9wdGVyIl0sImxhYmVscyI6eyJyZWdpb24iOiJlbWVhIiwidGllciI6ImdvbGQifSwibGFzdE1lbW8iOiJDb2ZmZWUgXHUwMDI2IFx1MDAzY2Nha2VcdTAwM2UifQ==\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "9"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada King\",\"status\":\"open\",\"balanceCents\":1500,\"deposits\":4,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":[\"vip\",\"early-adopter\"],\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"},\"lastMemo\":\"Coffee \\u0026 \\u003ccake\\u003e\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "seq": {
+            "N": "3"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":1500,\"memo\":\"Coffee \\u0026 \\u003ccake\\u003e\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":200,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":300,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"vip\",\"early-adopter\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"}}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "7"
+          },
+          "type": {
+            "S": "account:labeled"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":600}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "8"
+          },
+          "type": {
+            "S": "account:withdrawn"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada King\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "9"
+          },
+          "type": {
+            "S": "account:renamed"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTUwMCwibWVtbyI6IkNvZmZlZSBcdTAwMjYgXHUwMDNjY2FrZVx1MDAzZSJ9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:6\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsImVhcmx5LWFkb3B0ZXIiXX0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:7\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsicmVnaW9uIjoiZW1lYSIsInRpZXIiOiJnb2xkIn19\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:8\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:8\",\"sequence\":8,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:9\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:9\",\"sequence\":9,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIn0=\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    },
+    {
+      "name": "interleaved",
+      "entityId": "compat-fixture-interleaved",
+      "sequence": 8,
+      "snapshotSequence": 4,
+      "state": "{\"owner\":\"Grace Hopper\",\"status\":\"closed\",\"balanceCents\":2000,\"deposits\":2,\"openedAt\":\"2026-03-04T05:06:07Z\",\"tags\":[\"café\",\"naïve\",\"漢字\"],\"labels\":{\"a\":\"first\",\"b\":\"second\",\"m\":\"middle\",\"z\":\"last\"},\"lastMemo\":\"Paycheck ☕ \\u2028 \\u2029 \\u003ctab\\u003e\\t\\u0026\"}",
+      "events": [
+        "{\"id\":\"compat-fixture-interleaved:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIEhvcHBlciIsIm9wZW5lZEF0IjoiMjAyNi0wMy0wNFQwNTowNjowN1oifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-interleaved:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwMCwibWVtbyI6IlBheWNoZWNrIOKYlSBcdTIwMjggXHUyMDI5IFx1MDAzY3RhYlx1MDAzZVx0XHUwMDI2In0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":{\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=a\"},\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-interleaved:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":\"198.51.100.4\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-interleaved:4\",\"sequence\":4,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T01:02:03Z\"}}",
+        "{\"id\":\"compat-fixture-interleaved:5\",\"sequence\":5,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbImNhZsOpIiwibmHDr3ZlIiwi5ryi5a2XIl19\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-interleaved:6\",\"sequence\":6,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiYSI6ImZpcnN0IiwibSI6Im1pZGRsZSIsInoiOiJsYXN0In19\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-interleaved:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiYiI6InNlY29uZCJ9fQ==\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-interleaved:8\",\"sequence\":8,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOiJjdXN0b21lciByZXF1ZXN0In0=\",\"metadata\":{\"commandId\":\"c9\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-interleaved\",\"sequence\":4,\"eventSequence\":8,\"payload\":\"eyJvd25lciI6IkdyYWNlIEhvcHBlciIsInN0YXR1cyI6ImNsb3NlZCIsImJhbGFuY2VDZW50cyI6MjAwMCwiZGVwb3NpdHMiOjIsIm9wZW5lZEF0IjoiMjAyNi0wMy0wNFQwNTowNjowN1oiLCJ0YWdzIjpbImNhZsOpIiwibmHDr3ZlIiwi5ryi5a2XIl0sImxhYmVscyI6eyJhIjoiZmlyc3QiLCJiIjoic2Vjb25kIiwibSI6Im1pZGRsZSIsInoiOiJsYXN0In0sImxhc3RNZW1vIjoiUGF5Y2hlY2sg4piVIFx1MjAyOCBcdTIwMjkgXHUwMDNjdGFiXHUwMDNlXHRcdTAwMjYifQ==\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "8"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Grace Hopper\",\"status\":\"closed\",\"balanceCents\":2000,\"deposits\":2,\"openedAt\":\"2026-03-04T05:06:07Z\",\"tags\":[\"café\",\"naïve\",\"漢字\"],\"labels\":{\"a\":\"first\",\"b\":\"second\",\"m\":\"middle\",\"z\":\"last\"},\"lastMemo\":\"Paycheck ☕ \\u2028 \\u2029 \\u003ctab\\u003e\\t\\u0026\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "seq": {
+            "N": "4"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Grace Hopper\",\"openedAt\":\"2026-03-04T05:06:07Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":{\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=a\"},\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":2500,\"memo\":\"Paycheck ☕ \\u2028 \\u2029 \\u003ctab\\u003e\\t\\u0026\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":\"198.51.100.4\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T01:02:03Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":600}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:withdrawn"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"café\",\"naïve\",\"漢字\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"labels\":{\"a\":\"first\",\"m\":\"middle\",\"z\":\"last\"}}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:labeled"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"labels\":{\"b\":\"second\"}}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "7"
+          },
+          "type": {
+            "S": "account:labeled"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c9\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"reason\":\"customer request\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "8"
+          },
+          "type": {
+            "S": "account:closed"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIEhvcHBlciIsIm9wZW5lZEF0IjoiMjAyNi0wMy0wNFQwNTowNjowN1oifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwMCwibWVtbyI6IlBheWNoZWNrIOKYlSBcdTIwMjggXHUyMDI5IFx1MDAzY3RhYlx1MDAzZVx0XHUwMDI2In0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":{\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=a\"},\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":\"198.51.100.4\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:4\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:4\",\"sequence\":4,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T01:02:03Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:5\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:5\",\"sequence\":5,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbImNhZsOpIiwibmHDr3ZlIiwi5ryi5a2XIl19\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:6\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:6\",\"sequence\":6,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiYSI6ImZpcnN0IiwibSI6Im1pZGRsZSIsInoiOiJsYXN0In19\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:7\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiYiI6InNlY29uZCJ9fQ==\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:8\",\"detail-type\":\"account:closed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:8\",\"sequence\":8,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOiJjdXN0b21lciByZXF1ZXN0In0=\",\"metadata\":{\"commandId\":\"c9\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    },
+    {
+      "name": "compaction-handoff",
+      "entityId": "compat-fixture-compaction-handoff",
+      "sequence": 7,
+      "snapshotSequence": 2,
+      "state": "{\"owner\":\"Katherine Johnson\",\"status\":\"open\",\"balanceCents\":135,\"deposits\":5,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-compaction-handoff:7\",\"sequence\":7,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-compaction-handoff\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTV9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-compaction-handoff\",\"sequence\":2,\"eventSequence\":6,\"payload\":\"eyJvd25lciI6IkthdGhlcmluZSBKb2huc29uIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTUwLCJkZXBvc2l0cyI6NSwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiIsInRhZ3MiOm51bGwsImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOm51bGx9\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "6"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Katherine Johnson\",\"status\":\"open\",\"balanceCents\":150,\"deposits\":5,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-compaction-handoff"
+          },
+          "seq": {
+            "N": "2"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":15}"
+          },
+          "pk": {
+            "S": "compat-fixture-compaction-handoff"
+          },
+          "sk": {
+            "N": "7"
+          },
+          "type": {
+            "S": "account:withdrawn"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-compaction-handoff:7\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-compaction-handoff:7\",\"sequence\":7,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-compaction-handoff\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTV9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    },
+    {
+      "name": "upcast-legacy",
+      "entityId": "compat-fixture-upcast-legacy",
+      "sequence": 6,
+      "snapshotSequence": 2,
+      "state": "{\"owner\":\"Modern\",\"status\":\"open\",\"balanceCents\":30,\"deposits\":2,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-upcast-legacy:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6Ik9yaWdpbmFsIiwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiJ9\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-upcast-legacy:2\",\"sequence\":2,\"type\":\"account:renamed\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJuYW1lIjoiTGVnYWN5IEZyb20gUnVzdCJ9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-upcast-legacy:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-upcast-legacy:4\",\"sequence\":4,\"type\":\"account:renamed\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJuYW1lIjoiTGVnYWN5IEZyb20gR28ifQ==\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-upcast-legacy:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-upcast-legacy:6\",\"sequence\":6,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6Ik1vZGVybiJ9\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-upcast-legacy\",\"sequence\":2,\"eventSequence\":6,\"payload\":\"eyJvd25lciI6Ik1vZGVybiIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjMwLCJkZXBvc2l0cyI6Miwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiIsInRhZ3MiOm51bGwsImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOm51bGx9\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "6"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Modern\",\"status\":\"open\",\"balanceCents\":30,\"deposits\":2,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-upcast-legacy"
+          },
+          "seq": {
+            "N": "2"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Original\",\"openedAt\":\"0001-01-01T00:00:00Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-upcast-legacy"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"name\":\"Legacy From Rust\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-upcast-legacy"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:renamed"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":10,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-upcast-legacy"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"name\":\"Legacy From Go\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-upcast-legacy"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:renamed"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":20,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-upcast-legacy"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Modern\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-upcast-legacy"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:renamed"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6Ik9yaWdpbmFsIiwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiJ9\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:2\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:2\",\"sequence\":2,\"type\":\"account:renamed\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJuYW1lIjoiTGVnYWN5IEZyb20gUnVzdCJ9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:4\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:4\",\"sequence\":4,\"type\":\"account:renamed\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJuYW1lIjoiTGVnYWN5IEZyb20gR28ifQ==\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:6\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:6\",\"sequence\":6,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6Ik1vZGVybiJ9\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    },
+    {
+      "name": "conflict-probe",
+      "entityId": "compat-fixture-conflict-probe",
+      "sequence": 4,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Mary Jackson\",\"status\":\"open\",\"balanceCents\":81,\"deposits\":3,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-conflict-probe:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6Ik1hcnkgSmFja3NvbiIsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-conflict-probe:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NzUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-conflict-probe:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-conflict-probe:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Mary Jackson\",\"openedAt\":\"0001-01-01T00:00:00Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-conflict-probe"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":75,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-conflict-probe"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":1,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-conflict-probe"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":5,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-conflict-probe"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-conflict-probe:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-conflict-probe:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6Ik1hcnkgSmFja3NvbiIsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-conflict-probe:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-conflict-probe:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NzUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-conflict-probe:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-conflict-probe:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-conflict-probe:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-conflict-probe:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    },
+    {
+      "name": "dedupe-window",
+      "entityId": "compat-fixture-dedupe-window",
+      "sequence": 7,
+      "snapshotSequence": 1,
+      "state": "{\"owner\":\"Dorothy Vaughan\",\"status\":\"open\",\"balanceCents\":350,\"deposits\":4,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":[\"x\"],\"labels\":{\"k\":\"v\"},\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-dedupe-window:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkRvcm90aHkgVmF1Z2hhbiIsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-dedupe-window:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-dedupe-window:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-dedupe-window:4\",\"sequence\":4,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIngiXX0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-dedupe-window:5\",\"sequence\":5,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiayI6InYifX0=\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-dedupe-window:6\",\"sequence\":6,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-dedupe-window:7\",\"sequence\":7,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-dedupe-window\",\"sequence\":1,\"eventSequence\":5,\"payload\":\"eyJvd25lciI6IkRvcm90aHkgVmF1Z2hhbiIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjE1MCwiZGVwb3NpdHMiOjIsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJ0YWdzIjpbIngiXSwibGFiZWxzIjp7ImsiOiJ2In0sImxhc3RNZW1vIjpudWxsfQ==\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "5"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Dorothy Vaughan\",\"status\":\"open\",\"balanceCents\":150,\"deposits\":2,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":[\"x\"],\"labels\":{\"k\":\"v\"},\"lastMemo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "seq": {
+            "N": "1"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Dorothy Vaughan\",\"openedAt\":\"0001-01-01T00:00:00Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":50,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"x\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"labels\":{\"k\":\"v\"}}"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:labeled"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "sk": {
+            "N": "7"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkRvcm90aHkgVmF1Z2hhbiIsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:4\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:4\",\"sequence\":4,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIngiXX0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:5\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:5\",\"sequence\":5,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiayI6InYifX0=\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:6\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:6\",\"sequence\":6,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:7\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:7\",\"sequence\":7,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    },
+    {
+      "name": "batch-crosses-snapshot",
+      "entityId": "compat-fixture-batch-crosses-snapshot",
+      "sequence": 16,
+      "snapshotSequence": 3,
+      "state": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":120,\"deposits\":15,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiJ9\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MiwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MywibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NCwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:6\",\"sequence\":6,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:7\",\"sequence\":7,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NiwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:8\",\"sequence\":8,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NywibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:9\",\"sequence\":9,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6OCwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:10\",\"sequence\":10,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6OSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:11\",\"sequence\":11,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:12\",\"sequence\":12,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTEsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:13\",\"sequence\":13,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTIsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:14\",\"sequence\":14,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTMsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:15\",\"sequence\":15,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTQsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-batch-crosses-snapshot:16\",\"sequence\":16,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-batch-crosses-snapshot\",\"sequence\":3,\"eventSequence\":16,\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTIwLCJkZXBvc2l0cyI6MTUsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJ0YWdzIjpudWxsLCJsYWJlbHMiOm51bGwsImxhc3RNZW1vIjpudWxsfQ==\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "16"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":120,\"deposits\":15,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "seq": {
+            "N": "3"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Hedy Lamarr\",\"openedAt\":\"0001-01-01T00:00:00Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":1,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":2,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":3,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":4,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":5,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":6,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "7"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":7,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "8"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":8,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "9"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":9,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "10"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":10,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "11"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":11,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "12"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":12,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "13"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":13,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "14"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":14,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "15"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":15,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "16"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiJ9\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MiwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MywibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NCwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:6\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:6\",\"sequence\":6,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:7\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:7\",\"sequence\":7,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NiwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:8\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:8\",\"sequence\":8,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NywibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:9\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:9\",\"sequence\":9,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6OCwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:10\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:10\",\"sequence\":10,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6OSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:11\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:11\",\"sequence\":11,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:12\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:12\",\"sequence\":12,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTEsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:13\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:13\",\"sequence\":13,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTIsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:14\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:14\",\"sequence\":14,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTMsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:15\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:15\",\"sequence\":15,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTQsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:16\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:16\",\"sequence\":16,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    },
+    {
+      "name": "snapshots-disabled",
+      "entityId": "compat-fixture-snapshots-disabled",
+      "sequence": 6,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Radia Perlman\",\"status\":\"open\",\"balanceCents\":350,\"deposits\":3,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":[\"no-snapshots\"],\"labels\":null,\"lastMemo\":\"second\"}",
+      "events": [
+        "{\"id\":\"compat-fixture-snapshots-disabled:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IlJhZGlhIFBlcmxtYW4iLCJvcGVuZWRBdCI6IjAwMDEtMDEtMDFUMDA6MDA6MDBaIn0=\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-snapshots-disabled:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjoiZmlyc3QifQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-snapshots-disabled:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjoic2Vjb25kIn0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-snapshots-disabled:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-snapshots-disabled:5\",\"sequence\":5,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+        "{\"id\":\"compat-fixture-snapshots-disabled:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm5vLXNuYXBzaG90cyJdfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Radia Perlman\",\"openedAt\":\"0001-01-01T00:00:00Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-snapshots-disabled"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":300,\"memo\":\"first\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-snapshots-disabled"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":200,\"memo\":\"second\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-snapshots-disabled"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-snapshots-disabled"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":250}"
+          },
+          "pk": {
+            "S": "compat-fixture-snapshots-disabled"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:withdrawn"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"no-snapshots\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-snapshots-disabled"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IlJhZGlhIFBlcmxtYW4iLCJvcGVuZWRBdCI6IjAwMDEtMDEtMDFUMDA6MDA6MDBaIn0=\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjoiZmlyc3QifQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjoic2Vjb25kIn0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:5\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:5\",\"sequence\":5,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:6\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm5vLXNuYXBzaG90cyJdfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}"
+      ]
+    }
+  ]
+}

@@ -19,6 +19,8 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      crate_release_created: ${{ steps.release.outputs['crates/evt--release_created'] }}
+      crate_tag_name: ${{ steps.release.outputs['crates/evt--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
@@ -47,3 +49,44 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publishes photon-evt when release-please tags a crate release (photon-evt-vX.Y.Z).
+  # crates.io only allows trusted publishing (OIDC) for crates that already exist, so the first
+  # release uses the CARGO_REGISTRY_TOKEN secret. Once a trusted publisher is configured on
+  # crates.io for this workflow, delete the secret and later releases authenticate over OIDC.
+  publish-crate:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.crate_release_created == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.crate_tag_name }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: publish
+
+      - name: Check for a bootstrap token
+        id: bootstrap
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "token=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: steps.bootstrap.outputs.token != 'true'
+
+      - name: Publish photon-evt
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+        run: cargo publish -p photon-evt --locked

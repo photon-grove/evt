@@ -13,8 +13,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.classify.outputs.go }}
+      rust: ${{ steps.classify.outputs.rust }}
+      compat: ${{ steps.classify.outputs.compat }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # go: anything outside the Rust crates (Go, docs, website, infra).
+      # rust: the Rust crates and the shared compatibility fixtures.
+      # compat: anything that can change the shared storage format, which runs the
+      # cross-language suite against live backends.
+      - name: Classify changed files
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            printf 'go=true\nrust=true\ncompat=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Capture the list first so a failed diff fails the job instead of skipping everything.
+          files="$(git diff --name-only "$BASE...$HEAD")"
+
+          go=false rust=false compat=false
+          while IFS= read -r file; do
+            case "$file" in
+              .github/*)
+                go=true rust=true compat=true ;;
+              crates/* | Cargo.toml | Cargo.lock | rust-toolchain.toml)
+                rust=true compat=true ;;
+              .moon/* | package.json | pnpm-lock.yaml | pnpm-workspace.yaml)
+                go=true rust=true ;;
+              compat/* | internal/compat/* | scripts/compat-integration.sh)
+                go=true rust=true compat=true ;;
+              serialization.go | metadata.go | compaction.go | types.go | repository.go | transactions.go | \
+                dynamo/* | postgres/* | publishers/* | stream/* | projectors/* | snapshots/* | policy/* | \
+                go.mod | go.sum | infra/*)
+                go=true compat=true ;;
+              *)
+                go=true ;;
+            esac
+          done <<< "$files"
+
+          printf 'go=%s\nrust=%s\ncompat=%s\n' "$go" "$rust" "$compat" | tee -a "$GITHUB_OUTPUT"
+
   quality:
     name: Quality
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
@@ -48,8 +104,48 @@ jobs:
         run: |
           pnpm exec moon run evt:check evt:test website:typecheck website:build react-flow-diagrams:test
 
+  rust:
+    name: Rust
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: quality
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.5
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Rust checks
+        run: pnpm exec moon run evt-rust:check evt-rust:test
+
+      # The dynamodb feature follows the AWS SDK's MSRV, so it is not part of this check.
+      - name: Check the minimum supported Rust version
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" check -p photon-evt --features postgres,conformance --locked
+
   integration:
     name: DynamoDB integration
+    needs: changes
+    if: needs.changes.outputs.go == 'true' || needs.changes.outputs.compat == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
@@ -109,6 +205,7 @@ jobs:
           terraform -chdir=infra/local apply -auto-approve
 
       - name: Run integration tests
+        if: needs.changes.outputs.go == 'true'
         env:
           AWS_ENDPOINT_URL: http://localhost:4566
           AWS_REGION: us-west-2
@@ -116,8 +213,25 @@ jobs:
           AWS_SECRET_ACCESS_KEY: test
         run: pnpm exec moon run evt:integration
 
+      - uses: ./.github/actions/setup-rust
+        if: needs.changes.outputs.compat == 'true'
+        with:
+          cache-key: drivers
+
+      - name: Run Rust and cross-language integration tests
+        if: needs.changes.outputs.compat == 'true'
+        env:
+          CARGO_INCREMENTAL: 0
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_REGION: us-west-2
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: pnpm exec moon run evt-rust:integration
+
   postgres-integration:
     name: PostgreSQL integration
+    needs: changes
+    if: needs.changes.outputs.go == 'true' || needs.changes.outputs.compat == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
@@ -173,24 +287,49 @@ jobs:
           terraform -chdir=infra/local-postgres apply -auto-approve
 
       - name: Run PostgreSQL integration tests
+        if: needs.changes.outputs.go == 'true'
         env:
           DATABASE_URL: postgres://evt:evt@localhost:5432/evt_local?sslmode=disable
         run: pnpm exec moon run evt:integration-postgres
 
+      - uses: ./.github/actions/setup-rust
+        if: needs.changes.outputs.compat == 'true'
+        with:
+          cache-key: drivers
+
+      - name: Run Rust and cross-language PostgreSQL integration tests
+        if: needs.changes.outputs.compat == 'true'
+        env:
+          CARGO_INCREMENTAL: 0
+          DATABASE_URL: postgres://evt:evt@localhost:5432/evt_local?sslmode=disable
+        run: pnpm exec moon run evt-rust:integration-postgres
+
   summary:
     name: Summary
     runs-on: ubuntu-24.04-arm
-    needs: [quality, integration, postgres-integration]
+    needs: [changes, quality, rust, integration, postgres-integration]
     if: always()
     steps:
       - name: Check required jobs
         env:
-          QUALITY: ${{ needs.quality.result }}
-          INTEGRATION: ${{ needs.integration.result }}
-          POSTGRES_INTEGRATION: ${{ needs.postgres-integration.result }}
+          RESULTS: >-
+            changes=${{ needs.changes.result }}
+            quality=${{ needs.quality.result }}
+            rust=${{ needs.rust.result }}
+            integration=${{ needs.integration.result }}
+            postgres-integration=${{ needs.postgres-integration.result }}
         run: |
-          if [ "$QUALITY" != "success" ] || [ "$INTEGRATION" != "success" ] || [ "$POSTGRES_INTEGRATION" != "success" ]; then
-            echo "::error::CI failed: quality=$QUALITY integration=$INTEGRATION postgres-integration=$POSTGRES_INTEGRATION"
+          failed=0
+          for entry in $RESULTS; do
+            case "${entry#*=}" in
+              success) ;;
+              skipped) [ "${entry%%=*}" != changes ] || failed=1 ;;
+              *) failed=1 ;;
+            esac
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::CI failed: $RESULTS"
             exit 1
           fi
-          echo "All required jobs passed."
+          echo "All required jobs passed or were skipped for unchanged paths: $RESULTS"

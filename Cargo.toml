@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/evt", "crates/evt-compat"]
+default-members = ["crates/evt"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/photon-grove/evt"
+homepage = "https://github.com/photon-grove/evt"
+
+[workspace.dependencies]
+photon-evt = { path = "crates/evt" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = { version = "1", default-features = false }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+
+# CI checks use the dev/test profile. Keep debug info small so cold builds and caches stay cheap.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

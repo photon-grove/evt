@@ -3,7 +3,9 @@ package dynamo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,42 +25,141 @@ func (repo *Repository) Commit(
 		return nil
 	}
 
+	if err := checkContiguous(result.Events); err != nil {
+		return err
+	}
+
 	// Generate Put transactions
 	writeItems, _, err := repo.buildEventPutTransactions(result.Events)
 	if err != nil {
 		return err
 	}
 
+	writeItems = append(writeItems, repo.buildFloorChecks(result.Events)...)
+
 	// Commit the transactions to DynamoDB
 	return repo.commitEventsWithTransaction(ctx, writeItems, result.Transaction)
 }
 
-// CommitStream commits a stream of events using batches under the 100-item limit.
+// FloorCondition rejects a commit whose first event is at or below the stored snapshot's
+// eventSeq. Compaction deletes the events a snapshot covers, so attribute_not_exists(sk) alone
+// would let a writer that loaded before the snapshot recreate a compacted sequence.
+const FloorCondition = "attribute_not_exists(eventSeq) OR eventSeq < :first"
+
+// FirstSnapshotCondition guards the first snapshot put in a commit (snapshot sequence 1): no
+// snapshot exists yet.
+const FirstSnapshotCondition = "attribute_not_exists(seq)"
+
+// NextSnapshotCondition guards later snapshot puts in a commit: the stored snapshot is still the one
+// the writer loaded (:seq), and the commit starts above its floor (:first).
+const NextSnapshotCondition = "seq = :seq AND eventSeq < :first"
+
+// checkContiguous rejects events whose sequences are not contiguous (each one more than the last)
+// for each entity. The floor check reads the first event and the snapshot records the last, so a
+// commit like [6, 5] after compacting through 5 would recreate sequence 5, and loads reject a
+// stream with a gap such as [1, 3]. Sequences start at 1: DynamoDB keeps the snapshot at sk = 0 and
+// reads events after it.
+func checkContiguous(events []evt.SerializedEvent) error {
+	last := make(map[evt.EntityID]evt.EventSequence, 1)
+
+	for _, event := range events {
+		previous, seen := last[event.EntityID]
+		if !seen && event.Sequence < 1 {
+			return fmt.Errorf("dynamo: event %s has sequence %d; sequences start at 1", event.ID, event.Sequence)
+		}
+		// Nothing follows the maximum sequence. Checking it first keeps previous+1 from wrapping.
+		if seen && (previous == math.MaxInt || event.Sequence != previous+1) {
+			return fmt.Errorf("dynamo: event %s follows sequence %d; sequences must be contiguous", event.ID, previous)
+		}
+		last[event.EntityID] = event.Sequence
+	}
+
+	return nil
+}
+
+// buildFloorChecks returns one ConditionCheck on each entity's snapshot item (sk = 0) that the
+// commit starts above the snapshot's eventSeq.
+func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.TransactWriteItem {
+	first := make(map[evt.EntityID]evt.EventSequence)
+	order := make([]evt.EntityID, 0, 1)
+
+	for _, event := range events {
+		current, seen := first[event.EntityID]
+		if !seen {
+			order = append(order, event.EntityID)
+		}
+		if !seen || event.Sequence < current {
+			first[event.EntityID] = event.Sequence
+		}
+	}
+
+	checks := make([]types.TransactWriteItem, 0, len(order))
+	for _, entityID := range order {
+		checks = append(checks, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName: &repo.EventsTable,
+			Key: map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: string(entityID)},
+				"sk": &types.AttributeValueMemberN{Value: "0"},
+			},
+			ConditionExpression: aws.String(FloorCondition),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(first[entityID]), 10)},
+			},
+		}})
+	}
+
+	return checks
+}
+
+// CommitStream commits a stream of events using batches under the 100-item limit. Each batch
+// carries one floor check per entity (see FloorCondition), built when the batch is flushed: a
+// transaction cannot touch an entity's snapshot item twice.
 func (repo *Repository) CommitStream(
 	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],
 ) []error {
-	var errors []error
+	var errs []error
 
-	var batch []types.TransactWriteItem
+	var (
+		batch       []types.TransactWriteItem
+		batchEvents []evt.SerializedEvent
+	)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		items := append(batch, repo.buildFloorChecks(batchEvents)...)
+		if err := repo.commitEventsWithTransaction(ctx, items, nil); err != nil {
+			errs = append(errs, err)
+		}
+
+		batch, batchEvents = nil, nil
+	}
 
 	for result := range channel {
 		serializedResult, err := result.Unwrap()
 		if err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
+			continue
+		}
+
+		if err := checkContiguous(serializedResult.Events); err != nil {
+			errs = append(errs, err)
 			continue
 		}
 
 		items, _, err := repo.buildEventPutTransactions(serializedResult.Events)
 		if err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
 			continue
 		}
 
 		// Keep the batches under 100 items total, with transactions included
 		transactItems, err := toDynamoItems(serializedResult.Transaction)
 		if err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
 			continue
 		}
 
@@ -66,37 +167,39 @@ func (repo *Repository) CommitStream(
 		combined := append(transactItems, items...)
 
 		// Guard against a single result that already exceeds the 100-item transaction limit
-		if len(combined) > 100 {
-			errors = append(errors, fmt.Errorf(
+		if size := len(combined) + countEntities(serializedResult.Events); size > 100 {
+			errs = append(errs, fmt.Errorf(
 				"single result produces %d items, exceeding DynamoDB 100-item transaction limit",
-				len(combined),
+				size,
 			))
 			continue
 		}
 
-		// Check to see if the batch would overrun the limit of 100 items
-		if len(batch)+len(combined) > 99 {
-			// Commit the batch
-			if err = repo.commitEventsWithTransaction(ctx, batch, nil); err != nil {
-				errors = append(errors, err)
-			}
-
-			// Reset the batch
-			batch = combined
-		} else {
-			// Add the combined items to the batch
-			batch = append(batch, combined...)
+		// Flush first if adding this result, and its floor checks, would overrun the limit
+		merged := append(append([]evt.SerializedEvent{}, batchEvents...), serializedResult.Events...)
+		if len(batch)+len(combined)+countEntities(merged) > 100 {
+			flush()
 		}
+
+		batch = append(batch, combined...)
+		batchEvents = append(batchEvents, serializedResult.Events...)
 	}
 
 	// Flush the final items from the batch
-	if len(batch) > 0 {
-		if err := repo.commitEventsWithTransaction(ctx, batch, nil); err != nil {
-			errors = append(errors, err)
-		}
+	flush()
+
+	return errs
+}
+
+// countEntities returns the number of distinct entities, which is the number of floor checks a
+// batch of these events needs.
+func countEntities(events []evt.SerializedEvent) int {
+	seen := make(map[evt.EntityID]struct{}, len(events))
+	for _, event := range events {
+		seen[event.EntityID] = struct{}{}
 	}
 
-	return errors
+	return len(seen)
 }
 
 // CommitWithSnapshot commits events and a snapshot in a single transaction.
@@ -108,6 +211,10 @@ func (repo *Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := checkContiguous(result.Events); err != nil {
+		return err
+	}
+
 	// Generate both the regular Put transactions, and a Put for the Snapshot
 	writeItems, err := repo.buildSnapshotPutTransactions(result.Events, entityType, entityID, payload, currentSnapshot)
 	if err != nil {
@@ -174,6 +281,10 @@ func (repo *Repository) buildSnapshotPutTransactions(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) ([]types.TransactWriteItem, error) {
+	if len(serializedEvents) == 0 {
+		return nil, errors.New("commit with snapshot requires at least one event")
+	}
+
 	expectedSnapshot := evt.EventSequence(int(currentSnapshot) - 1)
 
 	// Generate the initial Put transactions that are needed to commit the Events themselves
@@ -201,16 +312,23 @@ func (repo *Repository) buildSnapshotPutTransactions(
 		return nil, fmt.Errorf("error marshalling item to map: %w", err)
 	}
 
-	// Include it within a TransactWriteItem statement that ensures the existing Snapshot
-	// matches the previous Snapshot number (more optimistic locking).
+	// Include it within a TransactWriteItem statement that ensures the existing Snapshot matches
+	// the previous Snapshot number (none for the first) and that the commit starts above its floor.
+	// A separate floor ConditionCheck is not possible here: a transaction cannot touch sk=0 twice.
 	// Snapshots are stored inline in the event-log table at sk=0.
+	// A snapshot sequence below 1 has no valid predecessor, so it takes the second branch and fails
+	// its condition.
 	putItem := types.Put{
 		TableName:           &repo.EventsTable,
 		Item:                item,
-		ConditionExpression: aws.String("attribute_not_exists(seq) OR (seq = :seq)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":seq": &types.AttributeValueMemberN{Value: strconv.Itoa(int(expectedSnapshot))},
-		},
+		ConditionExpression: aws.String(FirstSnapshotCondition),
+	}
+	if expectedSnapshot != 0 {
+		putItem.ConditionExpression = aws.String(NextSnapshotCondition)
+		putItem.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":seq":   &types.AttributeValueMemberN{Value: strconv.Itoa(int(expectedSnapshot))},
+			":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(serializedEvents[0].Sequence), 10)},
+		}
 	}
 
 	transactions = append(transactions, types.TransactWriteItem{Put: &putItem})

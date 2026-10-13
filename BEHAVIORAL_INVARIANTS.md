@@ -1,7 +1,8 @@
 # Go evt Library - Behavioral Invariants
 
 This document captures the behavioral guarantees, serialization formats, error conditions, and key
-invariants of the `evt` library.
+invariants of the `evt` library. The byte-level storage contract shared with the Rust `photon-evt`
+crate is specified in [`docs/spec/storage-format.md`](docs/spec/storage-format.md).
 
 ## Core Types
 
@@ -53,8 +54,9 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
 - Each event is stamped `committedAt + duration`, and DynamoDB TTL expires items individually, so
   retention cannot atomically drop a multi-event stream. It is safe only for terminal, short-lived
   streams (lifetime ≪ duration, no appends after terminal); a stream appended across a span near the
-  duration can lose its older prefix while newer events survive, and `sk > N` reads will not detect
-  the gap. Use compaction (snapshot + `CompactBelow`) for streams that accumulate events over time.
+  duration can lose its older prefix while newer events survive. Store loads detect the gap and fail
+  with a transient conflict on every attempt, because the gap never heals. Rebuild scans do not
+  detect it. Use compaction (snapshot + `CompactBelow`) for streams that accumulate events over time.
 
 ### Inline Snapshots (sk=0)
 
@@ -102,7 +104,7 @@ Snapshots are stored inline in the events table at `sk=0` for each entity:
   "version": 1,
   "entityId": "entity-123",
   "entityType": "User",
-  "payload": "base64-or-json-bytes",
+  "payload": "<base64 of the payload JSON>",
   "metadata": { ... }
 }
 ```
@@ -199,7 +201,10 @@ type TransactionGroup interface {
 ### Transaction Limits
 
 - DynamoDB supports up to 100 items per transaction
-- `CommitStream` batches items to stay under this limit
+- A commit without a snapshot adds one `ConditionCheck` on the entity's `sk = 0` item (the floor
+  check). It counts toward the 100 items and is billed as a write
+- `CommitStream` batches items to stay under this limit, counting one floor `ConditionCheck` per
+  entity, at the lowest sequence the batch commits for it, whatever order results arrive in
 
 ## Snapshot Logic
 
@@ -332,13 +337,20 @@ evt.Metadata{
 ### Commit
 
 - Empty events: no-op, returns nil
+- Rejects events whose sequences are not contiguous for an entity, before writing
 - Builds `TransactWriteItem` with conditional expression `attribute_not_exists(sk)`
+- Adds a `ConditionCheck` on the entity's `sk = 0` item: `attribute_not_exists(eventSeq) OR
+  eventSeq < :first`, so a commit cannot write at or below a snapshot's floor after compaction
+  deleted those keys
 - Includes any transaction groups from projectors
 
 ### CommitWithSnapshot
 
 - Same as Commit, plus snapshot item
-- Snapshot conditional: `attribute_not_exists(seq) OR (seq = :previousSeq)`
+- Snapshot conditional for the first snapshot (sequence 1): `attribute_not_exists(seq)`
+- Snapshot conditional for later snapshots: `seq = :seq AND eventSeq < :first`, where `:seq` is the
+  new sequence minus one. The floor check is folded into the snapshot put because a transaction
+  cannot touch `sk = 0` twice
 
 ### GetEvents
 
@@ -409,7 +421,8 @@ DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimi
 - **Optimistic concurrency on commit** — a commit that reuses an already-committed `(EntityID,
   EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with a conditional
   write (`attribute_not_exists(sk)`); PostgreSQL with the `(entity_id, sequence)` primary key, whose
-  unique violation surfaces as an `evt.ConflictError`. (The in-memory backend is a permissive test
+  unique violation surfaces as an `evt.ConflictError`, classified as transient so
+  `policy.ExecuteWithRetry` retries it. (The in-memory backend is a permissive test
   double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency` is false for it.)
 - **Stable event ordering** — `GetEvents` returns an entity's events in ascending sequence order,
   and `GetLatestEvents(lastSequence)` returns only events with `sequence > lastSequence`.
@@ -418,7 +431,8 @@ DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimi
 - **Snapshot consistency** — a snapshot written by `CommitWithSnapshot` is read back intact by
   `GetSnapshot` (same `EntityType`, `EntityID`, `EventSequence`, and payload). `GetSnapshot` returns
   `nil, nil` when none exists. The snapshot's `EventSequence` is the authoritative floor after
-  compaction (see ADR-0001).
+  compaction (see ADR-0001), and every backend, including the in-memory one, rejects a commit at
+  or below it. The suite checks this whenever `SupportsSnapshots` is on.
 - **Event/view transaction behavior** — events and any projector-produced view writes in a single
   `SerializedResult` are committed atomically. On DynamoDB this is a `TransactWriteItems` call; on
   PostgreSQL it is a single SQL transaction; partial commits must not be observable.
@@ -435,3 +449,26 @@ snapshot exists and never touches the snapshot row, so it preserves the snapshot
 
 See `docs/adr/0002-backend-neutral-storage-contracts.md` for the rationale and the decision to keep
 `result.Result` channels as the streaming shape.
+
+## Cross-Language Compatibility
+
+The Rust crate `photon-evt` (`crates/evt`) implements the same storage format natively. Go and Rust
+services can append to and load the same streams in DynamoDB or PostgreSQL. See
+[ADR 0003](docs/adr/0003-rust-implementation-and-cross-language-compatibility.md).
+
+- **One format, two implementations.** DynamoDB items, PostgreSQL rows, serialized event, snapshot,
+  and metadata JSON, SNS envelopes and message attributes, conditional-write expressions, and the
+  snapshot policy are identical in both languages, byte for byte except for the differences below.
+- **Fixtures enforce the contract.** `go test ./internal/compat -run TestFixtures -update` regenerates
+  `compat/fixtures/` from the Go implementation. `go test ./...` and `cargo test --workspace` both
+  fail when either language drifts from them.
+- **Format changes regenerate fixtures and pass in both languages**, including the live
+  cross-language run (`scripts/compat-integration.sh dynamo|postgres`), and keep older stored data
+  readable through upcasters.
+- **Documented differences**:
+  - A JSON `null` event payload round-trips as `null` in Go and `""` in Rust. Stores never write
+    one.
+  - Floats are not normalized across languages, so cross-language payloads should use integers.
+  - PostgreSQL `metadata` is `jsonb` and must be compared as JSON.
+
+  The duplicate-command window (events after the latest snapshot) is the same in both languages.

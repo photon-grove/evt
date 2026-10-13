@@ -4,7 +4,9 @@ The `evt/postgres` package implements the same backend-neutral `evt.Repository`
 and `evt.Store` contracts as DynamoDB, on a relational store. The aggregate,
 projector, and snapshot code you write does not change between backends — only
 the wiring does. The backend passes `conformance.RunRepositorySuite` with
-`SupportsSnapshots` and `EnforcesOptimisticConcurrency` enabled.
+`SupportsSnapshots` and `EnforcesOptimisticConcurrency` enabled. The Rust
+`photon-evt` crate reads and writes the same tables (see the
+[storage format](spec/storage-format.md)).
 
 ## Wiring
 
@@ -33,7 +35,10 @@ lockstep with the Go types that read and write it:
 
 - `evt_events` — the append-only log, keyed by a `(entity_id, sequence)` primary
   key. The unique key gives optimistic concurrency: a duplicate
-  `(entity_id, sequence)` insert fails and surfaces as an `evt.ConflictError`.
+  `(entity_id, sequence)` insert fails and surfaces as an `evt.ConflictError`,
+  classified as transient so `policy.ExecuteWithRetry` retries it.
+  Because compaction deletes keys, a commit also fails with a conflict when its first
+  sequence is at or below the entity's snapshot `event_sequence`.
   An `entity_type` index backs `StreamFilter` narrowing.
 - `evt_snapshots` — one durable snapshot per entity, keyed by `entity_id`.
 

@@ -7,7 +7,9 @@ the snapshot, compaction, and retention options for growing logs.
 
 > The key patterns, attribute names, and serialized formats below are a stability
 > contract. Treat changes to them as breaking and document them. See
-> [`BEHAVIORAL_INVARIANTS.md`](https://github.com/photon-grove/evt/blob/main/BEHAVIORAL_INVARIANTS.md).
+> [`BEHAVIORAL_INVARIANTS.md`](https://github.com/photon-grove/evt/blob/main/BEHAVIORAL_INVARIANTS.md)
+> and the [storage format](spec/storage-format.md), which the Rust `photon-evt`
+> crate implements too: Go and Rust services can share one table.
 
 ## Wiring
 
@@ -40,7 +42,11 @@ A single table holds events and inline snapshots for every entity.
 
 Event rows are **append-only and protected by conditional writes** — a commit only
 succeeds if the next sequence is unclaimed, which is how concurrent writers on one
-entity stay correctly ordered. The `sk = 0` snapshot row records the entity's
+entity stay correctly ordered. Each commit also checks the `sk = 0` snapshot row: a
+commit that starts at or below the snapshot's `eventSequence` is rejected, so a writer
+that loaded before a compaction cannot recreate the deleted events. That check is one
+more transaction item, billed as a write, so a commit without a snapshot holds at most
+99 events and projector puts. The `sk = 0` snapshot row records the entity's
 serialized state plus the `eventSequence` it covers, and snapshot writes are
 monotonic: a write that would move the covered sequence backwards is a no-op, so a
 slow background writer can never regress the floor.

@@ -76,6 +76,18 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 			testOptimisticConcurrency(t, newRepo())
 		})
 	}
+
+	if opts.SupportsSnapshots {
+		t.Run("RejectsCommitsBelowCompactedFloor", func(t *testing.T) {
+			testCompactedFloor(t, newRepo())
+		})
+	}
+
+	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
+		t.Run("RejectsOutOfOrderEvents", func(t *testing.T) {
+			testOutOfOrderEvents(t, newRepo())
+		})
+	}
 }
 
 // --- contract cases ---
@@ -250,6 +262,100 @@ func testOptimisticConcurrency(t *testing.T, repo evt.Repository) {
 
 	err := repo.Commit(ctx, evt.SerializedResult{Events: duplicate})
 	require.Error(t, err, "expected a conflict committing a duplicate sequence")
+}
+
+func testCompactedFloor(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	compactor, ok := repo.(evt.Compactor)
+	if !ok {
+		t.Skip("repository does not implement evt.Compactor")
+	}
+
+	id := evt.EntityID(ns + "-1")
+	serialized := serialize(t, id, "test", 0,
+		&test.EntityCreated{ID: id, Value: "one"},
+		&test.EntityUpdated{ID: id, Value: "two"},
+	)
+	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"two"}`, id))
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1))
+
+	deleted, err := compactor.CompactBelow(ctx, id, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, deleted)
+
+	// A writer that loaded before the snapshot would commit sequence 2 again. Its key is gone, so
+	// only the snapshot floor rejects it.
+	stale := serialize(t, id, "test", 1, &test.EntityUpdated{ID: id, Value: "stale"})
+	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: stale}), "a commit below the floor must be rejected")
+
+	streamed := make(chan result.Result[evt.SerializedResult], 1)
+	streamed <- result.Ok(evt.SerializedResult{Events: stale})
+	close(streamed)
+	require.NotEmpty(t, repo.CommitStream(ctx, streamed), "a streamed commit below the floor must be rejected")
+
+	events, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Empty(t, events, "the rejected commit writes nothing")
+
+	next := serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "three"})
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: next}))
+}
+
+func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	compactor, ok := repo.(evt.Compactor)
+	if !ok {
+		t.Skip("repository does not implement evt.Compactor")
+	}
+
+	id := evt.EntityID(ns + "-1")
+	serialized := serialize(t, id, "test", 0,
+		&test.EntityCreated{ID: id, Value: "one"},
+		&test.EntityUpdated{ID: id, Value: "two"},
+	)
+	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"two"}`, id))
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1))
+
+	_, err := compactor.CompactBelow(ctx, id, 2)
+	require.NoError(t, err)
+
+	// The floor check reads the first event, so [3, 2] would recreate compacted sequence 2.
+	later := serialize(t, id, "test", 1,
+		&test.EntityUpdated{ID: id, Value: "a"},
+		&test.EntityUpdated{ID: id, Value: "b"},
+	)
+	reversed := evt.SerializedResult{Events: []evt.SerializedEvent{later[1], later[0]}}
+	require.Error(t, repo.CommitWithSnapshot(ctx, reversed, "test", id, payload, 2), "a snapshot commit out of order")
+	require.Error(t, repo.Commit(ctx, reversed), "a commit out of order")
+
+	// Loads reject a stream with a gap, so a commit must not create one. A fresh entity keeps the
+	// floor check out of the way.
+	fresh := evt.EntityID(ns + "-gap")
+	gapped := serialize(t, fresh, "test", 0,
+		&test.EntityCreated{ID: fresh, Value: "one"},
+		&test.EntityUpdated{ID: fresh, Value: "three"},
+	)
+	gapped[1].Sequence = 3
+	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: gapped}), "a commit that skips a sequence")
+
+	// Sequences start at 1: DynamoDB keeps the snapshot at sk = 0.
+	zero := serialize(t, fresh, "test", 0, &test.EntityCreated{ID: fresh, Value: "zero"})
+	zero[0].Sequence = 0
+	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: zero}), "a commit at sequence 0")
+
+	stored, err := repo.GetEvents(ctx, fresh)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the rejected commits write nothing")
+
+	events, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Empty(t, events, "rejected commits write nothing")
 }
 
 // --- helpers ---
