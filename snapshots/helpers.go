@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 )
 
 // createContext returns a new event context with the given entity and sequences.
@@ -31,7 +32,8 @@ func createInitialContext(entity evt.Entity, entityID evt.EntityID) evt.Context 
 // Sequences must continue from the context's current sequence without a gap. A gap means another
 // writer snapshotted and compacted the stream between reading the snapshot and reading the events,
 // or events expired. Applying events across it would build the wrong state, so it returns a
-// conflict, which the caller can retry with a fresh entity.
+// conflict classified as transient: policy.ExecuteWithRetry retries it with a fresh entity, and
+// evt.IsConflictErr still matches it.
 func applyEventsToEntity(serializedEvents []evt.SerializedEvent, eventContext *evt.Context) error {
 	for _, serializedEvent := range serializedEvents {
 		var current evt.EventSequence
@@ -39,10 +41,10 @@ func applyEventsToEntity(serializedEvents []evt.SerializedEvent, eventContext *e
 			current = *eventContext.CurrentSequence
 		}
 		if serializedEvent.Sequence != current+1 {
-			return evt.NewConflictError(fmt.Sprintf(
+			return &policy.ClassifiedError{Class: policy.ClassTransient, Err: evt.NewConflictError(fmt.Sprintf(
 				"stream %s skips from sequence %d to %d: it was compacted during the load, or events expired",
 				eventContext.EntityID, current, serializedEvent.Sequence,
-			))
+			))}
 		}
 
 		event, err := evt.DeserializeEvent(serializedEvent, eventContext.Entity)
