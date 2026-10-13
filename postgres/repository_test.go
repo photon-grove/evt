@@ -63,6 +63,12 @@ func TestNewRepositoryTableNames(t *testing.T) {
 		})
 	})
 
+	t.Run("name over 63 bytes panics", func(t *testing.T) {
+		require.Panics(t, func() {
+			NewRepository(nil, WithEventsTable(strings.Repeat("e", 64)))
+		})
+	})
+
 	t.Run("reserved keyword panics", func(t *testing.T) {
 		require.Panics(t, func() {
 			NewRepository(nil, WithEventsTable("Select"))

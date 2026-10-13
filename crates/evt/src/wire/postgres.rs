@@ -153,14 +153,24 @@ const RESERVED_KEYWORDS: &[&str] = &[
     "with",
 ];
 
-/// Reports whether a table name is safe to use unquoted: it matches `^[A-Za-z_][A-Za-z0-9_]*$`
-/// and is not a reserved keyword.
+/// The longest identifier PostgreSQL keeps. Longer names are silently truncated, so two names that
+/// share their first 63 bytes would name the same table.
+pub const MAX_IDENTIFIER_LEN: usize = 63;
+
+/// Takes the per-entity transaction lock (`$1` is the entity ID) that serializes commits and
+/// snapshot writes for one entity, so a snapshot cannot raise the floor while a commit below it is
+/// in flight. Go and Rust run this exact statement, so their writers exclude each other too.
+pub const ENTITY_LOCK: &str = "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))";
+
+/// Reports whether a table name is safe to use unquoted: it matches `^[A-Za-z_][A-Za-z0-9_]*$`,
+/// is at most [`MAX_IDENTIFIER_LEN`] bytes, and is not a reserved keyword.
 pub fn is_valid_identifier(name: &str) -> bool {
     let mut chars = name.chars();
 
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    name.len() <= MAX_IDENTIFIER_LEN
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !RESERVED_KEYWORDS
             .iter()

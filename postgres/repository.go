@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -47,11 +48,41 @@ func init() {
 	}
 }
 
+// maxIdentifierLen is the longest identifier PostgreSQL keeps. Longer names are silently truncated,
+// so two names that share their first 63 bytes would name the same table.
+const maxIdentifierLen = 63
+
+// entityLockQuery takes the per-entity transaction lock ($1 is the entity ID) that serializes
+// commits and snapshot writes for one entity, so a snapshot cannot raise the floor while a commit
+// below it is in flight. The Rust crate runs this exact statement, so writers in either language
+// exclude each other.
+const entityLockQuery = "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))"
+
 // validIdentifier reports whether a table name is safe to interpolate unquoted.
 func validIdentifier(name string) bool {
 	_, reserved := reservedKeywords[strings.ToLower(name)]
 
-	return identifierPattern.MatchString(name) && !reserved
+	return len(name) <= maxIdentifierLen && identifierPattern.MatchString(name) && !reserved
+}
+
+// lockEntities takes the entity lock for every entity in events, in sorted order so concurrent
+// multi-entity commits cannot deadlock.
+func (repo *Repository) lockEntities(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
+	ids := make([]string, 0, 1)
+	for _, event := range events {
+		if !slices.Contains(ids, string(event.EntityID)) {
+			ids = append(ids, string(event.EntityID))
+		}
+	}
+	slices.Sort(ids)
+
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx, entityLockQuery, id); err != nil {
+			return classifyWriteError(fmt.Errorf("postgres: lock entity %s: %w", id, err))
+		}
+	}
+
+	return nil
 }
 
 // DB is the minimal subset of the pgx API the Repository depends on. Both *pgxpool.Pool and pgx.Tx
@@ -170,11 +201,15 @@ CREATE TABLE IF NOT EXISTS %[2]s (
 // PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
 // same transaction as the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
-	if err := checkAscending(res.Events); err != nil {
+	if err := checkContiguous(res.Events); err != nil {
 		return err
 	}
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
+		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
 		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
 			return err
 		}
@@ -221,13 +256,17 @@ func (repo *Repository) CommitWithSnapshot(
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
 	}
 
-	if err := checkAscending(res.Events); err != nil {
+	if err := checkContiguous(res.Events); err != nil {
 		return err
 	}
 
 	eventSequence := res.Events[len(res.Events)-1].Sequence
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
+		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
 		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
 			return err
 		}
@@ -343,15 +382,16 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return nil
 }
 
-// checkAscending rejects events whose sequences do not strictly ascend for each entity. The floor
-// check reads the lowest sequence and the snapshot records the last, so a commit like [7, 6] would
-// otherwise record a snapshot event_sequence below an event it already folded in.
-func checkAscending(events []evt.SerializedEvent) error {
+// checkContiguous rejects events whose sequences are not contiguous (each one more than the last)
+// for each entity. The floor check reads the first event and the snapshot records the last, so a
+// commit like [6, 5] after compacting through 5 would recreate sequence 5, and loads reject a
+// stream with a gap such as [1, 3].
+func checkContiguous(events []evt.SerializedEvent) error {
 	last := make(map[evt.EntityID]evt.EventSequence, 1)
 
 	for _, event := range events {
-		if previous, seen := last[event.EntityID]; seen && event.Sequence <= previous {
-			return fmt.Errorf("postgres: event %s follows sequence %d; sequences must ascend", event.ID, previous)
+		if previous, seen := last[event.EntityID]; seen && event.Sequence != previous+1 {
+			return fmt.Errorf("postgres: event %s follows sequence %d; sequences must be contiguous", event.ID, previous)
 		}
 		last[event.EntityID] = event.Sequence
 	}

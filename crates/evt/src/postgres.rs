@@ -16,8 +16,8 @@ use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::ids::{EntityId, EntityType, EventSequence};
 use crate::repository::{Commit, Repository};
 use crate::wire::postgres::{
-    DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, EventRow, SnapshotRow, is_valid_identifier,
-    schema_ddl,
+    DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, SnapshotRow,
+    is_valid_identifier, schema_ddl,
 };
 
 /// A SQL statement that an in-band projector adds to a commit. It runs in the same transaction
@@ -237,6 +237,9 @@ impl Repository for PostgresRepository {
 
         let mut client = self.pool.get().await.map_err(Error::backend)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
+        tx.execute(ENTITY_LOCK, &[&commit.entity_id.as_str()])
+            .await
+            .map_err(statement_error)?;
 
         for statement in &commit.operations {
             let params: Vec<&(dyn ToSql + Sync)> = statement
@@ -342,10 +345,16 @@ impl Repository for PostgresRepository {
     }
 
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
-        let client = self.pool.get().await.map_err(Error::backend)?;
+        let mut client = self.pool.get().await.map_err(Error::backend)?;
+        let tx = client.transaction().await.map_err(Error::backend)?;
+        tx.execute(ENTITY_LOCK, &[&snapshot.entity_id.as_str()])
+            .await
+            .map_err(statement_error)?;
+
         let written = self
-            .upsert_snapshot(&client, &SnapshotRow::from_snapshot(snapshot))
+            .upsert_snapshot(&tx, &SnapshotRow::from_snapshot(snapshot))
             .await?;
+        tx.commit().await.map_err(statement_error)?;
 
         Ok(written > 0)
     }
@@ -474,11 +483,15 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_or_shared_table_names() {
+        // PostgreSQL truncates identifiers to 63 bytes.
+        let too_long = "e".repeat(64);
+
         for (events, snapshots) in [
             ("evt_events", "evt_events"),
             ("Evt_Events", "evt_events"),
             ("evt_events; drop", "evt_snapshots"),
             ("Select", "evt_snapshots"),
+            (too_long.as_str(), "evt_snapshots"),
         ] {
             assert!(
                 matches!(

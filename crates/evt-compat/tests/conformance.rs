@@ -6,7 +6,7 @@
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use deadpool_postgres::Pool;
@@ -15,8 +15,10 @@ use photon_evt::conformance::{Add, Ledger, LedgerEvent, Suite, ViewTarget};
 use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository};
 use photon_evt::wire::dynamo::DEFAULT_VIEW_SORT_KEY;
+use photon_evt::wire::postgres::ENTITY_LOCK;
 use photon_evt::{
-    Aggregate, BoxError, EntityId, Error, Metadata, Projector, Repository, RetryPolicy, Store, json,
+    Aggregate, BoxError, Commit, EntityId, Error, EventId, EventSequence, EventType, EventVersion,
+    Metadata, Projector, Repository, RetryPolicy, SerializedEvent, SerializedSnapshot, Store, json,
 };
 
 /// Reads the single-item views `ViewProjector` writes.
@@ -350,6 +352,70 @@ async fn postgres_deferred_projector_violation_is_not_a_conflict() {
         "want a projector error, got {err:?}"
     );
     assert!(repository.events(&id).await.unwrap().is_empty());
+}
+
+/// Commits and snapshot writes for one entity take the same advisory lock, so a snapshot cannot
+/// raise the floor under a commit that already passed its floor check. The other language runs the
+/// same statement, so holding it here must block both kinds of write.
+#[tokio::test]
+async fn postgres_writes_wait_for_the_entity_lock() {
+    let repository = drivers::postgres().await.expect("connect to PostgreSQL");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = EntityId::new(format!("conf-{nanos}-entity-lock"));
+
+    let mut holder = repository
+        .pool()
+        .get()
+        .await
+        .expect("connect to PostgreSQL");
+    let lock = holder.transaction().await.expect("begin");
+    lock.execute(ENTITY_LOCK, &[&id.as_str()])
+        .await
+        .expect("take the lock");
+
+    let snapshot = SerializedSnapshot {
+        entity_type: Ledger::TYPE.into(),
+        entity_id: id.clone(),
+        sequence: EventSequence(1),
+        event_sequence: EventSequence(10),
+        payload: b"{}".to_vec(),
+    };
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: Ledger::TYPE.into(),
+        payload: br#"{"amount":1}"#.to_vec(),
+        metadata: Metadata::new("local"),
+    };
+
+    let put = tokio::spawn({
+        let repository = repository.clone();
+        async move { repository.put_snapshot(&snapshot).await }
+    });
+    let commit = tokio::spawn({
+        let repository = repository.clone();
+        async move { repository.commit(Commit::new(id, vec![event])).await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!put.is_finished(), "put_snapshot waits for the entity lock");
+    assert!(!commit.is_finished(), "commit waits for the entity lock");
+
+    lock.rollback().await.expect("release the lock");
+
+    assert!(put.await.unwrap().expect("the snapshot is written"));
+    // Either order is consistent: the commit lands first, or the floor check rejects it.
+    let committed = commit.await.unwrap();
+    assert!(
+        matches!(committed, Ok(()) | Err(Error::Conflict { .. })),
+        "{committed:?}"
+    );
 }
 
 #[tokio::test]
