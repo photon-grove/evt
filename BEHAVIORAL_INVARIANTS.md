@@ -55,7 +55,8 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
   retention cannot atomically drop a multi-event stream. It is safe only for terminal, short-lived
   streams (lifetime ≪ duration, no appends after terminal); a stream appended across a span near the
   duration can lose its older prefix while newer events survive. Store loads detect the gap and fail
-  with a conflict, but rebuild scans do not. Use compaction (snapshot + `CompactBelow`) for streams that accumulate events over time.
+  with a transient conflict on every attempt, because the gap never heals. Rebuild scans do not
+  detect it. Use compaction (snapshot + `CompactBelow`) for streams that accumulate events over time.
 
 ### Inline Snapshots (sk=0)
 
@@ -200,7 +201,9 @@ type TransactionGroup interface {
 ### Transaction Limits
 
 - DynamoDB supports up to 100 items per transaction
-- `CommitStream` batches items to stay under this limit
+- A commit without a snapshot adds one `ConditionCheck` on the entity's `sk = 0` item (the floor
+  check). It counts toward the 100 items and is billed as a write
+- `CommitStream` batches items to stay under this limit, counting one floor check per entity
 
 ## Snapshot Logic
 

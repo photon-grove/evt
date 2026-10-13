@@ -128,7 +128,9 @@ consumer repos). Backends opt in by implementing the methods; `dynamo` and `mem`
   (`attribute_not_exists(eventSeq) OR eventSeq < :first`), folded into the snapshot put's condition
   when the commit writes a snapshot. PostgreSQL checks the snapshot row after inserting the events,
   in the same transaction. The Go and Rust implementations share these conditions; see
-  `docs/spec/storage-format.md`.
+  `docs/spec/storage-format.md`. On DynamoDB the floor check is one more transaction item per
+  commit without a snapshot (per entity, for `CommitStream`). It is billed as a write and counts
+  toward the 100-item limit.
 
 ## Backward compatibility
 

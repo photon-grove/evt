@@ -144,8 +144,9 @@ trim them safely:
   to `committedAt + duration` for terminal, short-lived, transient streams. TTL
   expires rows individually, so use it only when a stream's lifetime is much
   shorter than the duration and no events are appended after it becomes terminal.
-  Otherwise an older prefix can expire while newer events remain. For accumulating
-  streams, keep a snapshot and compact instead.
+  Otherwise an older prefix can expire while newer events remain, and loading the
+  stream then fails with a conflict. For accumulating streams, keep a snapshot and
+  compact instead.
 
 The raw `dynamo.Delete` is snapshot-unsafe, for local fixtures only, and excluded
 from production builds (`-tags prod`). See

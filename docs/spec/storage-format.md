@@ -142,6 +142,9 @@ item with missing or empty `metadata` is invalid. Readers ignore other attribute
 
 A commit is one `TransactWriteItems` call, at most 100 actions, in this order: projector
 operations, one put per event, then either the snapshot put or a floor check on the snapshot item.
+The floor check counts toward the 100 actions and is billed as a write, so a commit without a
+snapshot costs one more write unit than its events and projector puts, and holds at most 99 of
+them. `CommitStream` adds one check per entity in each batch.
 
 | Write                                  | Condition                                             |
 | -------------------------------------- | ----------------------------------------------------- |
@@ -162,7 +165,9 @@ The floor exists because compaction deletes the events a snapshot covers, which 
 snapshot could recreate a compacted sequence.
 
 Both implementations reject a commit whose sequences are not contiguous for each entity (each one
-more than the last) before writing anything. The floor check reads the first event and the snapshot
+more than the last), or start below 1, before writing anything. Sequence 0 is the DynamoDB snapshot
+slot. Rust also rejects an event whose ID is not `{entityId}:{sequence}`, because DynamoDB does not
+store the ID and rebuilds it from the key on read. The floor check reads the first event and the snapshot
 records the last, so both depend on that order, and loads reject a stream with a gap. Repositories
 do not check that a commit's first sequence follows the stored head: DynamoDB cannot express it in
 one transaction once compaction has deleted the previous event. Stores always continue from the head
@@ -214,9 +219,11 @@ one item per entity to a separate views table, in the same transaction as the ev
 The schema is created by Go's `postgres.Repository.EnsureSchema` or Rust's
 `PostgresRepository::ensure_schema`, which run the same idempotent DDL. Table names default to
 `evt_events` and `evt_snapshots` and can be changed in both implementations. Names are interpolated
-unquoted, so both reject names that are not plain identifiers, are longer than 63 bytes (PostgreSQL
-truncates longer ones), or are PostgreSQL reserved keywords. Rust also rejects event and snapshot
-names that fold to the same table.
+unquoted, so both reject names that are not plain identifiers, are longer than 47 bytes, or are
+PostgreSQL reserved keywords. PostgreSQL truncates identifiers to 63 bytes, and the longest derived
+name, `{events}_entity_type_idx`, adds 16. Both also reject a pair of names where two of the
+relations the schema creates (the tables, the index, and each table's `{table}_pkey`) would share a
+name after case folding, because `CREATE TABLE IF NOT EXISTS` would skip the second one.
 
 ```sql
 CREATE TABLE IF NOT EXISTS evt_events (
@@ -243,9 +250,11 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
 );
 ```
 
-- A commit is one transaction: projector statements, one insert per event, then the snapshot
-  upsert. Projector statements are Rust-only: Go's `postgres.Repository` ignores projector
-  transaction groups. A failed projector statement is a projector error, and so is an integrity
+- A commit is one transaction: the entity lock, one insert per event, the floor check, projector
+  statements, then the snapshot upsert. Projector statements run after the events, so a writer
+  that lost a race fails on the event key (a conflict) before it reaches a view row. Projector statements are Rust-only: Go's `postgres.Repository` ignores projector
+  transaction groups. A projector statement that the database rejects is a projector error (a lost
+  connection is a backend error), and so is an integrity
   violation raised at `COMMIT`, which only a deferred constraint on a projector's table can cause.
 - A unique violation (`23505`) on the event primary key is an optimistic-concurrency conflict.
   In Rust, a serialization failure (`40001`) or deadlock (`40P01`), raised by any statement in
@@ -314,6 +323,10 @@ snapshotted and compacted the stream between the snapshot read and the event rea
 expired. Applying events across the gap would build the wrong state. Rust's `Store::load` reads the
 stream again, up to three times, then returns `Error::Conflict`. Go's `snapshots.Store.LoadEntity`
 returns a conflict error at once, because it has already modified the entity the caller passed in.
+The error is a `policy.ClassifiedError` with class `transient`, so `policy.ExecuteWithRetry`
+retries it with a fresh entity, and `evt.IsConflictErr` still matches it. A gap that does not heal,
+such as a prefix that DynamoDB TTL expired under `WithRetention`, fails every load. Before this
+check, such a stream loaded with the wrong state.
 
 A command whose metadata carries a command ID already recorded by an event **replayed since the
 latest snapshot** is a duplicate and writes nothing. Command IDs folded into a snapshot are no
