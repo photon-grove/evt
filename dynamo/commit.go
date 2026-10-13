@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -66,7 +67,8 @@ func checkContiguous(events []evt.SerializedEvent) error {
 		if !seen && event.Sequence < 1 {
 			return fmt.Errorf("dynamo: event %s has sequence %d; sequences start at 1", event.ID, event.Sequence)
 		}
-		if seen && event.Sequence != previous+1 {
+		// Nothing follows the maximum sequence. Checking it first keeps previous+1 from wrapping.
+		if seen && (previous == math.MaxInt || event.Sequence != previous+1) {
 			return fmt.Errorf("dynamo: event %s follows sequence %d; sequences must be contiguous", event.ID, previous)
 		}
 		last[event.EntityID] = event.Sequence
