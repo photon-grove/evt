@@ -203,7 +203,8 @@ type TransactionGroup interface {
 - DynamoDB supports up to 100 items per transaction
 - A commit without a snapshot adds one `ConditionCheck` on the entity's `sk = 0` item (the floor
   check). It counts toward the 100 items and is billed as a write
-- `CommitStream` batches items to stay under this limit, counting one floor check per entity
+- `CommitStream` batches items to stay under this limit, counting one floor `ConditionCheck` per
+  entity, at the lowest sequence the batch commits for it, whatever order results arrive in
 
 ## Snapshot Logic
 
@@ -429,7 +430,8 @@ DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimi
 - **Snapshot consistency** — a snapshot written by `CommitWithSnapshot` is read back intact by
   `GetSnapshot` (same `EntityType`, `EntityID`, `EventSequence`, and payload). `GetSnapshot` returns
   `nil, nil` when none exists. The snapshot's `EventSequence` is the authoritative floor after
-  compaction (see ADR-0001).
+  compaction (see ADR-0001), and every backend, including the in-memory one, rejects a commit at
+  or below it. The suite checks this whenever `SupportsSnapshots` is on.
 - **Event/view transaction behavior** — events and any projector-produced view writes in a single
   `SerializedResult` are committed atomically. On DynamoDB this is a `TransactWriteItems` call; on
   PostgreSQL it is a single SQL transaction; partial commits must not be observable.

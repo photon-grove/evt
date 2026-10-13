@@ -77,11 +77,13 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		})
 	}
 
-	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
+	if opts.SupportsSnapshots {
 		t.Run("RejectsCommitsBelowCompactedFloor", func(t *testing.T) {
 			testCompactedFloor(t, newRepo())
 		})
+	}
 
+	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
 		t.Run("RejectsOutOfOrderEvents", func(t *testing.T) {
 			testOutOfOrderEvents(t, newRepo())
 		})

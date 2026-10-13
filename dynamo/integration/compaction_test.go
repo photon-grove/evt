@@ -10,6 +10,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/result"
 	"github.com/photon-grove/evt/snapshots"
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
@@ -274,4 +275,39 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_ConcurrentWithAppends()
 	_, err = s.store.LoadEntity(ctx, loaded, id)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), "v9", loaded.Value)
+}
+
+// Test_CommitStream_RejectsBatchBelowFloor sends CommitStream a result above the compacted floor
+// followed by one below it. The batch's floor check must use the lower sequence, so the whole batch
+// is rejected and the compacted sequence is not re-created.
+func (s *DynamoEventsIntegrationSuite) Test_CommitStream_RejectsBatchBelowFloor() {
+	ctx := context.Background()
+
+	id := evt.EntityID(newID())
+	s.SetupEntity(id, 2) // snapshot every 2 events
+	metadata := s.getMetadata(ctx)
+
+	require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.CreateEntity{Value: "v1"}, metadata))
+	for i := 2; i <= 4; i++ {
+		require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.ReplaceEntity{Value: "v" + strconv.Itoa(i)}, metadata))
+	}
+
+	deleted, err := s.repo.CompactBelow(ctx, id, 4)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 4, deleted)
+
+	serialize := func(from evt.EventSequence) evt.SerializedResult {
+		events, err := evt.SerializeEvents([]evt.Event{&test.EntityUpdated{ID: id, Value: "stale"}}, from, id, metadata)
+		require.NoError(s.T(), err)
+
+		return evt.SerializedResult{Events: events}
+	}
+
+	channel := make(chan result.Result[evt.SerializedResult], 2)
+	channel <- result.Ok(serialize(4)) // sequence 5, above the floor
+	channel <- result.Ok(serialize(2)) // sequence 3, compacted
+	close(channel)
+
+	require.Len(s.T(), s.repo.CommitStream(ctx, channel), 1)
+	require.Empty(s.T(), s.sequencesFor(ctx, id))
 }
