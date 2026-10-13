@@ -18,9 +18,18 @@ func (repo *Repository) GetSnapshot(
 	ctx context.Context,
 	entityID evt.EntityID,
 ) (*evt.SerializedSnapshot, error) {
+	return repo.getSnapshot(ctx, entityID, repo.consistentRead)
+}
+
+// getSnapshot reads the inline snapshot with the given read consistency.
+func (repo *Repository) getSnapshot(
+	ctx context.Context,
+	entityID evt.EntityID,
+	consistent bool,
+) (*evt.SerializedSnapshot, error) {
 	input := dynamodb.GetItemInput{
 		TableName:      &repo.EventsTable,
-		ConsistentRead: aws.Bool(repo.consistentRead),
+		ConsistentRead: aws.Bool(consistent),
 		Key: map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: string(entityID)},
 			"sk": &types.AttributeValueMemberN{Value: "0"},

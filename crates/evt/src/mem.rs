@@ -107,8 +107,8 @@ impl Repository for MemRepository {
                 return Err(Error::Conflict {
                     entity_id: commit.entity_id,
                     message: format!(
-                        "snapshot sequence moved: stored {stored}, expected {}",
-                        new.sequence.0 - 1
+                        "snapshot sequence moved: stored {stored}, commit writes {}",
+                        new.sequence
                     ),
                 });
             }

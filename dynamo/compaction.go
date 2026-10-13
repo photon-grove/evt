@@ -36,7 +36,9 @@ func (repo *Repository) CompactBelow(
 		return 0, nil
 	}
 
-	snapshot, err := repo.GetSnapshot(ctx, entityID)
+	// Compaction reads strongly regardless of WithConsistentRead: an eventually consistent read
+	// could miss recent events, and compaction would report success while leaving them behind.
+	snapshot, err := repo.getSnapshot(ctx, entityID, true)
 	if err != nil {
 		return 0, fmt.Errorf("compaction: reading snapshot for %s: %w", entityID, err)
 	}
@@ -76,7 +78,7 @@ func (repo *Repository) eventKeysInRange(
 ) ([]map[string]types.AttributeValue, error) {
 	input := dynamodb.QueryInput{
 		TableName:              &repo.EventsTable,
-		ConsistentRead:         aws.Bool(repo.consistentRead),
+		ConsistentRead:         aws.Bool(true),
 		KeyConditionExpression: aws.String("pk = :pk AND sk BETWEEN :lo AND :hi"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":pk": &types.AttributeValueMemberS{Value: string(entityID)},

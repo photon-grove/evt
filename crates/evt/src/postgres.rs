@@ -21,7 +21,8 @@ use crate::wire::postgres::{
 };
 
 /// A SQL statement that an in-band projector adds to a commit. It runs in the same transaction
-/// as the events, before them.
+/// as the events, after the event inserts and the floor check and before the snapshot upsert, so a
+/// writer that lost a race fails on the event key before it reaches a view row.
 pub struct PgStatement {
     /// The SQL text, with `$1`-style placeholders.
     pub sql: String,

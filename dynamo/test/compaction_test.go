@@ -157,3 +157,27 @@ func (s *RepositorySuite) Test_CompactBelow_RetriesUnprocessedItems() {
 	require.Equal(s.T(), 2, deleted)
 	s.client.AssertExpectations(s.T())
 }
+
+// Compaction reads strongly even when the repository uses eventually consistent reads, because an
+// eventually consistent key query could miss recent events and leave them behind.
+func (s *RepositorySuite) Test_CompactBelow_ReadsStronglyConsistent() {
+	ctx := context.Background()
+	const entityID = "acct-eventual"
+	repo := s.repo.WithConsistentRead(false)
+
+	consistent := func(read *bool) bool { return read != nil && *read }
+
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		return consistent(in.ConsistentRead)
+	}), mock.Anything).Return(snapshotItem(entityID, 2), nil)
+	s.client.On("Query", mock.Anything, mock.MatchedBy(func(in *dynamodb.QueryInput) bool {
+		return consistent(in.ConsistentRead)
+	}), mock.Anything).Return(eventKeyPage(entityID, 1, 2), nil)
+	s.client.On("BatchWriteItem", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.BatchWriteItemOutput{}, nil)
+
+	deleted, err := repo.CompactBelow(ctx, entityID, 2)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 2, deleted)
+	s.client.AssertExpectations(s.T())
+}

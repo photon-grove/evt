@@ -187,6 +187,33 @@ impl DynamoRepository {
         }
     }
 
+    async fn read_snapshot(
+        &self,
+        entity_id: &EntityId,
+        consistent: bool,
+    ) -> Result<Option<SerializedSnapshot>, Error> {
+        let output = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(consistent)
+            .key("pk", s(entity_id.as_str()))
+            .key("sk", n(wire::SNAPSHOT_SORT_KEY))
+            .send()
+            .await
+            .map_err(sdk_error)?;
+
+        match output.item {
+            Some(item) if !item.is_empty() => {
+                Ok(Some(wire::snapshot_from_item(&from_sdk_item(&item))?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Lists the keys of events in `[1, through]`. Always strongly consistent: an eventually
+    /// consistent query could miss recent events, and compaction would report success while
+    /// leaving them behind.
     async fn event_keys_through(
         &self,
         entity_id: &EntityId,
@@ -200,7 +227,7 @@ impl DynamoRepository {
                 .client
                 .query()
                 .table_name(&self.table)
-                .consistent_read(self.consistent_read)
+                .consistent_read(true)
                 .key_condition_expression("pk = :pk AND sk BETWEEN :lo AND :hi")
                 .expression_attribute_values(":pk", s(entity_id.as_str()))
                 .expression_attribute_values(":lo", n(1))
@@ -326,8 +353,7 @@ impl Repository for DynamoRepository {
                 },
                 ttl,
             )?;
-            // A snapshot sequence below 1 has no valid predecessor, so it takes the second branch
-            // and fails its condition.
+            // Commit::validate guarantees the sequence is at least 1.
             let expected = snapshot.sequence.0 - 1;
             items.push(if expected == 0 {
                 put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
@@ -372,23 +398,7 @@ impl Repository for DynamoRepository {
     }
 
     async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
-        let output = self
-            .client
-            .get_item()
-            .table_name(&self.table)
-            .consistent_read(self.consistent_read)
-            .key("pk", s(entity_id.as_str()))
-            .key("sk", n(wire::SNAPSHOT_SORT_KEY))
-            .send()
-            .await
-            .map_err(sdk_error)?;
-
-        match output.item {
-            Some(item) if !item.is_empty() => {
-                Ok(Some(wire::snapshot_from_item(&from_sdk_item(&item))?))
-            }
-            _ => Ok(None),
-        }
+        self.read_snapshot(entity_id, self.consistent_read).await
     }
 
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
@@ -424,8 +434,9 @@ impl Repository for DynamoRepository {
             return Ok(0);
         }
 
+        // Strongly consistent regardless of `with_consistent_read`, like the key query below.
         let covered = self
-            .snapshot(entity_id)
+            .read_snapshot(entity_id, true)
             .await?
             .map(|snapshot| snapshot.event_sequence);
         if covered.is_none_or(|covered| covered < through) {
