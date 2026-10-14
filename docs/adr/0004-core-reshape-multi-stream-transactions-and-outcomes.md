@@ -2,23 +2,23 @@
 
 ## Status
 
-Accepted (2026-10-13). Plan: [evt vNext and the Storyverse Rust
-port](https://github.com/photon-grove/apps/blob/bkonkle/evt-vnext-storyverse-rust-plan/docs/plans/evt-vnext-storyverse-rust/README.md)
-(ids C1–C11). Tracking: [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
+Accepted (2026-10-13). Capabilities C1–C11 of the vNext plan: the core reshape — multi-stream
+transactions, read fences, command outcomes, rejections, fence-aware retry, metadata additions,
+commit-wide projectors, `latest(n)` and reserved namespaces, the feature marker, the rebuild
+fence, and shared conformance. Tracking:
+[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
 
 ## Context
 
 Two consumers of evt have grown capabilities the framework never offered, and each grew them by
 hand:
 
-- **Storyverse v2** (`photon-grove/apps`, `apps/storyverse-api/internal/v2`) built its own command
-  engine on raw evt writes: a hand-rolled counter row (`COUNTER#`) to fence username claims
-  (apps ADR-0033), per-entity dedupe, and no shared conformance story for its memory and DynamoDB
-  stores.
-- **munc-api** (`apps/munc-api`) runs on evt but hand-rolls command reservations
-  (`CommandReservationEntity`, `requestHash`), canonical receipts, ambiguous-write recovery
-  (`resolveCommitmentAfterCancellation`), and a replay guarded by a hand-passed `writersQuiesced`
-  flag (`apps/munc-api/internal/memory/rebuild.go`).
+- **A downstream Rust game service** built its own command engine on raw evt writes:
+  per-aggregate counter rows to sequence every aggregate's writes, per-entity dedupe, and no
+  shared conformance story between its memory and DynamoDB stores.
+- **A downstream Go service on evt** hand-rolls command reservations keyed by an identity digest,
+  canonical receipts, ambiguous-write recovery, and a replay guarded by a hand-passed
+  writers-quiesced flag.
 
 Meanwhile the framework itself only executes one aggregate per commit:
 
@@ -50,7 +50,8 @@ rejections, fence-aware retry, richer metadata, commit-wide projectors, bounded 
 a feature-marker row, and a rebuild fence. Every one of these is **core**: it lands in Go (`evt`
 v0.9.0) and Rust (`photon-evt` 0.2), in the same release window, behind the same storage format.
 
-Per plan decision D1, anything in the commit path or storage contract lands in **both** languages:
+Per plan decision D1 (the commit path and the storage contract are dual-language obligations),
+anything in the commit path or storage contract lands in **both** languages:
 
 - Go generates the core golden fixtures (`go test ./internal/compat -run TestFixtures -update`),
   as it does today.
@@ -67,8 +68,8 @@ shortcut over the general transaction, not a second code path.
 **Current state.** Go commits one entity per `Commit` call; `CommitStream` flushes batches of
 independent single-entity transactions (`dynamo/commit.go`). Rust's `Commit` builder carries one
 entity's events (`crates/evt/src/repository.rs`). A command that must append to two aggregates —
-the username-claim case, where `user#<subject>` and `username#<handle>` change together — cannot
-commit atomically today.
+claiming a unique handle while updating the owning profile, where `user#<subject>` and
+`username#<handle>` change together — cannot commit atomically today.
 
 **Decision.** A caller loads a **typed read set** (a set of aggregate instances with their
 sequences and heads), appends events to any subset of them, and commits once. Every written stream
@@ -106,9 +107,9 @@ let outcome = store
 
 ### C2 — Read fences
 
-**Current state.** Nothing in either implementation fences a read-only aggregate. Storyverse v2
-invented `COUNTER#` rows to make username claims race-safe (apps ADR-0033) — mutable state with no
-backing event, exactly what the core discipline forbids.
+**Current state.** Nothing in either implementation fences a read-only aggregate. A downstream
+service kept per-aggregate counter rows to sequence every aggregate's writes — mutable state with
+no backing event, exactly what the core discipline forbids.
 
 **Decision.** A read-only stream in a transaction is fenced with a `ConditionCheck` on
 `(pk, head + 1)` asserting `attribute_not_exists(sk)`: the check fails if any writer has appended
@@ -132,12 +133,11 @@ caller-stamped fence (see C5).
 **Current state.** The dedupe window is "events replayed since the latest snapshot"
 (`crates/evt/src/store.rs` `Loaded::has_seen`; Go's snapshot-aware load), so a command ID folded
 into a snapshot is no longer checked and the repeat applies twice — documented in
-`crates/evt/README.md` and the spec's known differences. munc-api hand-rolls reservations and
-receipts; v2 hand-rolls per-entity dedupe.
+`crates/evt/README.md` and the spec's known differences. Downstream services hand-roll
+reservations, receipts, and per-entity dedupe instead.
 
 **Decision.** The framework owns durable, global command outcomes. A commit that carries a command
-ID **reserves** a row on a global `command-outcome#<id>` stream in the same transaction as the
-events, then records the outcome:
+ID writes a row on a global `command-outcome#<id>` stream in the same transaction as the events:
 
 - **Identity digest**: pluggable — the caller supplies a digest of the command's identity
   (canonical request bytes). A repeat with the same digest returns the stored outcome; a repeat
@@ -145,37 +145,43 @@ events, then records the outcome:
   ID alone.
 - **Stored response**: the outcome row stores the command's response payload so a retried command
   returns the original answer, not just "accepted".
-- **Status**: `accepted` or `rejected` (C4). A rejected outcome is terminal for that digest.
-- **`prior_outcome`**: a retried commit that finds a reserved-but-unresolved outcome links to it
-  (`prior_outcome`) instead of failing, giving ambiguous-write recovery a durable chain — the
-  general form of munc's `resolveCommitmentAfterCancellation`.
+- **Status**: `accepted` or `rejected` (C4), written **once, in its final state** — digest,
+  response, event IDs, and the rejection when applicable — inside the commit transaction, with a
+  `Put` conditioned on `attribute_not_exists(pk)`. There is no intermediate "reserved" state:
+  DynamoDB's `TransactWriteItems` allows only one action per item, so a reserve-then-resolve pair
+  inside one transaction is not expressible, and a single final-state write needs no resolution
+  step. A rejected outcome is terminal for that digest.
+- **Ambiguous-write recovery**: after an indeterminate commit error (timeout, lost connection —
+  the caller cannot know whether the transaction applied), re-read the outcome row by command ID:
+  present with the **same identity digest** → the commit won; return the stored response. Present
+  with a **different digest** → `IdempotencyKeyReuse`. **Absent** → the commit did not apply;
+  safe to retry.
 - **Outcome-only commits**: a command can record an outcome without appending events, for commands
   whose effect is a decision about state rather than a change to it.
 - **Accepted no-op**: a command that produces zero events is recorded as **accepted with no
-  events**, not an error. This is the framework form of apps ADR-0033's `ACCEPTS_NO_OP`. Go's
-  current "empty commit is a no-op" (`Commit` returns nil on empty events) becomes an observable,
-  durable outcome.
+  events**, not an error. Go's current "empty commit is a no-op" (`Commit` returns nil on empty
+  events) becomes an observable, durable outcome.
 
 This replaces per-entity dedupe: the `SeenCommandIDs`-style window (both languages) is superseded,
 though it remains as a cheap pre-check on load.
 
 **Storage format.** New item shape on the shared table (same `pk`/`sk` pattern as every stream):
 
-| Attribute   | Type | Outcome item (`pk = command-outcome#<id>`)                                  |
-| ----------- | ---- | --------------------------------------------------------------------------- |
-| `pk`        | S    | `command-outcome#<commandId>`                                               |
-| `sk`        | N    | `1` (single row per command; the stream is reserved, then updated in place) |
-| `status`    | S    | `reserved`, `accepted`, or `rejected`                                       |
-| `digest`    | S    | pluggable identity digest                                                   |
-| `response`  | S    | stored response JSON (base64 or raw text — fixed in E1.1)                   |
-| `rejection` | S    | serialized `Rejection` when `status = rejected`                             |
-| `prior`     | S    | prior reserved outcome's pk, when linking                                   |
-| `code`      | S    | rejection code, when rejected                                               |
+| Attribute   | Type | Outcome item (`pk = command-outcome#<id>`)                |
+| ----------- | ---- | --------------------------------------------------------- |
+| `pk`        | S    | `command-outcome#<commandId>`                             |
+| `sk`        | N    | `1` (single row per command)                              |
+| `status`    | S    | `accepted` or `rejected` (written once, final)            |
+| `digest`    | S    | pluggable identity digest                                 |
+| `response`  | S    | stored response JSON (base64 or raw text — fixed in E1.1) |
+| `events`    | S    | event IDs the commit wrote, when any                      |
+| `rejection` | S    | serialized `Rejection` when `status = rejected`           |
+| `code`      | S    | rejection code, when rejected                             |
 
-The row is reserved (written with `attribute_not_exists(sk)`) inside the event commit and resolved
-(status flipped) in the same transaction when possible; the reservation-to-resolution detail is
-specified byte-for-byte in E1.1. The `command-outcome#` namespace is reserved: repository scans
-that walk streams skip it (C8), and it has no snapshot and never compacts.
+The row is written once, in its final state, inside the commit transaction, conditioned on
+`attribute_not_exists(pk)`. A committed transaction therefore never leaves a half-written outcome.
+The row's byte-level shape is specified in E1.1. The `command-outcome#` namespace is reserved:
+repository scans that walk streams skip it (C8), and it has no snapshot and never compacts.
 
 **API shape.**
 
@@ -183,7 +189,7 @@ that walk streams skip it (C8), and it has no snapshot and never compacts.
 // Go
 outcome, err := store.Execute(ctx, account, cmd, metadata.WithCommandID(id))
 // outcome.Accepted() bool, outcome.NoOp() bool, outcome.Response, outcome.Rejection
-// ErrIdempotencyKeyReuse, ErrPriorOutcome matchable with errors.Is
+// ErrIdempotencyKeyReuse and the ambiguous-write recovery error matchable with errors.Is
 ```
 
 ```rust
@@ -192,7 +198,9 @@ enum Outcome<A> {
     Accepted { events: Vec<A::Event>, response: Option<Bytes>, noop: bool },
     Rejected(Rejection),
 }
-// Error::IdempotencyKeyReuse { prior: OutcomeRef }, Error::AmbiguousWrite { prior: OutcomeRef }
+// Error::IdempotencyKeyReuse — a repeat carrying a different identity digest.
+// After an indeterminate commit error, re-read the outcome by command ID:
+// present → return it (same digest) or reject (different digest); absent → safe to retry.
 ```
 
 ### C4 — Rejections
@@ -273,12 +281,12 @@ options. Rust: `Metadata::with_principal_id`, `with_causation_id`, `with_extensi
 ### C7 — Commit-wide projectors
 
 **Current state.** Projectors are per-entity and puts-only: Go's `EventProjector.Project(ctx,
-entity, events)` runs per entity and its `TransactionGroup` merges view puts into the commit
-([`repository.go`](../../repository.go), [`dynamo/view_projector.go`](../../dynamo/view_projector.go));
-Rust's `Projector` trait is likewise per-aggregate (`crates/evt/src/aggregate.rs`), and the
-DynamoDB `ViewProjector` writes exactly one `VIEW` row per entity at
-`pk = {entityType}#{entityId}` (spec "Views"). Errors go through
-`TransactionGroup.HandleError`, which sees only its own group. Cross-entity views — a projection
+entity, events)` runs per entity ([`types.go`](../../types.go)) and its `TransactionGroup` merges
+view puts into the commit ([`dynamo/view_projector.go`](../../dynamo/view_projector.go)); errors go
+through `TransactionGroup.HandleError` ([`transactions.go`](../../transactions.go)), which sees
+only its own group. Rust's `Projector` trait is likewise per-aggregate
+(`crates/evt/src/aggregate.rs`), and the DynamoDB `ViewProjector` writes exactly one `VIEW` row
+per entity at `pk = {entityType}#{entityId}` (spec "Views"). Cross-entity views — a projection
 over every event in a commit — are impossible, and deletes require hand-rolled `DeleteView` calls
 outside the commit.
 
@@ -286,15 +294,22 @@ outside the commit.
 entity. It emits puts **and deletes**, and view rows may live at **any `pk`/`sk`** the projector
 chooses (not just `{entityType}#{entityId}` / `VIEW`), enabling cross-entity read models written
 atomically with the commit. Per-operation error mapping replaces the single
-`HandleError(error, int)`: an operation carries the cancellation reason it maps to, in the shape
-munc's `HandleError` hand-rolls today. `EventProjector`/`Projector` per-entity projectors remain
-supported as the special case "one entity's events"; the commit-wide form is the new general API.
-This also retires the handler-attached `CommandResult.Transaction` pattern (K7).
+`HandleError(error, int)`: an operation carries the cancellation reason it maps to, replacing the
+single per-group callback with per-operation intent. `EventProjector`/`Projector` per-entity
+projectors remain supported as the special case "one entity's events"; the commit-wide form is the
+new general API. This also retires the handler-attached `CommandResult.Transaction` pattern (K7).
 
 **Storage format.** View items keep the existing attribute set (`pk`, `sk`, `entityID`,
 `entityType`, `payload`) but are no longer constrained to `sk = "VIEW"` or the derived pk; the
 spec's Views section is relaxed accordingly, and fixtures gain a multi-pk/sk vector. Delete
-operations are transaction deletes with their own conditions.
+operations are transaction deletes with their own conditions. On PostgreSQL, evt defines no view
+schema — apps own their view tables, and the "do not build" verdict on a Postgres view store
+stands ([ADR 0006](0006-parity-policy-and-feature-cuts.md)). C7 on PostgreSQL therefore means the
+backend executes the projector's operations inside the commit transaction, as the Rust backend
+already does with `PgStatement` ([`crates/evt/src/postgres.rs`](../../crates/evt/src/postgres.rs));
+the Go PostgreSQL backend today ignores `res.Transaction`
+([`postgres/repository.go`](../../postgres/repository.go)), so this is new backend work — a
+view-row execution path, not a port of an existing one.
 
 **API shape.**
 
@@ -337,12 +352,19 @@ shapes). `latest(n)` is a read-pattern addition (a descending query bounded by `
 ### C9 — Feature-marker row
 
 **Current state.** Nothing tells a writer which extensions a store's data uses. A Go tool that
-does not know about a Rust-first extension (D2/D4) would happily write to a table that depends on
+does not know about a Rust-first extension (D2: extensions are Rust-first; D4: the feature marker
+enforces declared extensions) would happily write to a table that depends on
 it, silently violating its invariants (for example, compacting a journal without its manifest).
 
 **Decision.** A store declares the extensions it uses on a `SYSTEM#FEATURES` marker row. Any
-writer that does not support a declared feature **refuses to write** to the table. The marker is
-checked once per repository instance at first write (cheap, cached), not per commit.
+writer that does not support a declared feature **refuses to write** to the table. The marker row
+carries a numeric `version`; a writer validates the declared feature set once, at first write, and
+caches the version it validated. **Every commit then includes a `ConditionCheck` on the marker** —
+the version must still equal the cached one, or `attribute_not_exists(pk)` when no marker row
+existed at validation. A declaration added after the writer validated changes the marker version,
+fails the commit as a conflict, and forces re-validation — at which point an unsupported writer
+reads the row set, sees the feature it does not model, and refuses. The cost is one extra
+transaction item per commit.
 
 **Storage format.**
 
@@ -353,52 +375,61 @@ checked once per repository instance at first write (cheap, cached), not per com
 | `version` | N    | feature format version                                                       |
 
 One row per feature, `pk = SYSTEM#FEATURES`, `sk = <feature>` — declared by the writer that first
-uses the feature. A writer that encounters an undeclared-to-it feature reads the row set and
-refuses. The exact attributes are fixed in E1.1.
+uses the feature; `version` is the feature format version, bumped when the extension's storage
+format changes. A writer that encounters an undeclared-to-it feature reads the row set and
+refuses. The exact attributes and the ConditionCheck shape are fixed in E1.1.
 
 ### C10 — Rebuild fence
 
 **Current state.** Rebuilds are unconstrained: `RebuildProjections`
 ([`rebuild.go`](../../rebuild.go)) runs whenever a job feels like it, and a live writer can commit
-while the rebuild replays, interleaving projector output. munc-api fences rebuilds by hand with a
-`writersQuiesced bool` passed through the call graph
-(`apps/munc-api/internal/memory/rebuild.go`) — a promise, not a fence.
+while the rebuild replays, interleaving projector output. A downstream service fences rebuilds by
+hand with a writers-quiesced flag passed through its call graph — a promise, not a fence.
 
-**Decision.** The framework provides a durable rebuild fence, per plan decision D3:
+**Decision.** The framework provides a durable rebuild fence, per plan decision D3 (rebuilds are
+fenced by the framework, not by app-level flags):
 
-- A `SYSTEM#REBUILD` lock row with an **owner token** and a **generation counter**. A rebuild
-  acquires the lock (conditional write), bumps the generation, and holds the owner token.
-- **Commit-time check**: every commit `ConditionCheck`s the lock row — either it does not exist or
-  the generation matches the value the reader observed at load. A commit that loaded before the
-  rebuild began is rejected as a conflict and retried with a fresh load (C5 semantics).
-- **Reader epoch check**: loads capture the current generation; a rebuild uses it to know which
-  pre-rebuild readers are still in flight, and view readers can reject state built under a stale
-  epoch.
+- **The lock row and the generation counter are separate items.** The lock row (`SYSTEM#REBUILD`,
+  `sk = 0`) carries the **owner token**; the generation counter (`SYSTEM#REBUILD#GENERATION`,
+  `sk = 0`) is a separate item holding a numeric monotonic `value`.
+- **Rebuilds** acquire the lock conditionally (`attribute_not_exists` on the lock row), bump the
+  generation, replay, then release the lock.
+- **Commit-time check**: every commit includes a `ConditionCheck` asserting
+  `attribute_not_exists(pk)` on the lock row — a commit is refused whenever any rebuild holds the
+  lock, regardless of generation. A commit that races a rebuild is rejected as a conflict and
+  retried with a fresh load (C5 semantics).
+- **Reader epoch check**: readers that need consistency read the generation before and after the
+  read and retry if it changed; view readers can reject state built under a stale epoch.
 
 **Storage format.**
 
-| Attribute    | Type | Rebuild-lock item (`pk = SYSTEM#REBUILD`)           |
-| ------------ | ---- | --------------------------------------------------- |
-| `pk`         | S    | `SYSTEM#REBUILD`                                    |
-| `sk`         | S    | `LOCK` (or one row per fence scope — fixed in E1.1) |
-| `owner`      | S    | owner token of the current lock holder              |
-| `generation` | N    | monotonic counter, bumped per rebuild               |
-| `expires`    | N    | lease expiry, epoch seconds                         |
+| Attribute | Type | Rebuild-lock item (`pk = SYSTEM#REBUILD`) |
+| --------- | ---- | ----------------------------------------- |
+| `pk`      | S    | `SYSTEM#REBUILD`                          |
+| `sk`      | N    | `0`                                       |
+| `owner`   | S    | owner token of the current lock holder    |
+| `expires` | N    | lease expiry, epoch seconds               |
 
-The row lives in the reserved `SYSTEM#` namespace (C8), skipped by enumeration and heads. On
-PostgreSQL the same row is a table row checked in the commit transaction.
+| Attribute | Type | Generation item (`pk = SYSTEM#REBUILD#GENERATION`) |
+| --------- | ---- | -------------------------------------------------- |
+| `pk`      | S    | `SYSTEM#REBUILD#GENERATION`                        |
+| `sk`      | N    | `0`                                                |
+| `value`   | N    | monotonic counter, bumped per rebuild              |
+
+The rows live in the reserved `SYSTEM#` namespace (C8), skipped by enumeration and heads. On
+PostgreSQL the same rows are table rows checked in the commit transaction.
 
 ### C11 — Conformance and compat for the new core
 
 **Current state.** Each backend runs its own conformance suite (`conformance.RunRepositorySuite`
 in Go; `photon_evt::conformance::Suite` in Rust), and the cross-language fixtures cover
 serialization and the scenario set in `compat/scenarios.json` (see
-[`compat/README.md`](../../compat/README.md)). Storyverse v2's memory and DynamoDB stores never
-shared a suite — the gap this aims to close permanently.
+[`compat/README.md`](../../compat/README.md)). Bespoke in-app stores never shared a suite — the
+gap this aims to close permanently.
 
 **Decision.** The conformance suites (both languages) grow cases for every capability above:
-multi-stream commits, fences, outcomes (including `IdempotencyKeyReuse`, `prior_outcome`,
-accepted no-op), rejections, fence-aware retry, metadata fields, commit-wide projectors,
+multi-stream commits, fences, outcomes (including `IdempotencyKeyReuse`, ambiguous-write
+recovery, accepted no-op), rejections, fence-aware retry, metadata fields, commit-wide projectors,
 `latest(n)`, the feature marker, and the rebuild fence. Every backend — `mem`, DynamoDB,
 PostgreSQL — passes the same suite in both languages. The shared scenario list in
 `compat/scenarios.json` grows interleaved Go/Rust steps for the new writes, and Go regenerates the
@@ -406,14 +437,15 @@ core golden fixtures as today. The suite, not the ADR, is the executable contrac
 
 ## Motivating consumers
 
-- **Storyverse v2** (`apps/storyverse-api/internal/v2`, apps ADR-0033 username claims): C1+C2
-  replace the `COUNTER#` rows, C3+C4 replace hand-rolled dedupe and verdict handling, C3's
-  accepted-no-op is `ACCEPTS_NO_OP`. The Storyverse Rust port (plan E6) deletes all of it in favor
-  of the framework capabilities.
-- **munc-api** receipts and replay: C3+C4 replace `CommandReservationEntity`/`requestHash` and the
-  canonical receipts (plan E7.1); C3's `prior_outcome` replaces
-  `resolveCommitmentAfterCancellation`; C10 replaces the hand-passed `writersQuiesced`; C7's
-  per-operation error mapping replaces `HandleError` plumbing.
+- **A downstream Rust game service**: needs atomic multi-aggregate commands — claiming a unique
+  handle while updating the owning profile — which C1+C2 provide directly. Its hand-rolled
+  command engine (per-aggregate counter rows, per-entity dedupe, accepted-no-op handling)
+  maps onto C3+C4, and the port to the framework capabilities (plan E6) deletes the engine.
+- **A downstream Go service on evt**: hand-rolled command reservations with identity digests,
+  canonical receipts, ambiguous-write recovery, and a replay guarded by a hand-passed
+  writers-quiesced flag. C3+C4 replace the reservations and receipts; the outcome re-read (C3)
+  replaces the hand-rolled recovery; C10 replaces the manual quiesce flag; C7's per-operation
+  error mapping replaces the per-group error plumbing.
 
 ## Consequences
 
@@ -421,9 +453,14 @@ core golden fixtures as today. The suite, not the ADR, is the executable contrac
   commit path together; the deprecated features (K1–K7, see
   [ADR 0006](0006-parity-policy-and-feature-cuts.md)) are deprecated in the same release and
   deleted in the next minor.
-- **The transaction budget gets tighter.** Fences, floor checks, and outcome reservations all
-  count against the 100-item DynamoDB transaction limit. The commit planner must account for them
-  and split or reject oversized commits deliberately, not accidentally.
+- **The transaction budget gets tighter.** Fences, floor checks, outcome rows, and the
+  feature-marker condition all count against the 100-item DynamoDB transaction limit. The commit
+  planner must account for them and split or reject oversized commits deliberately, not
+  accidentally.
+- **PostgreSQL commits gain a view-write path.** evt defines no PostgreSQL view schema — apps own
+  their view tables — so C7 means the Go PostgreSQL backend starts executing projector operations
+  inside the commit transaction (it ignores `res.Transaction` today), as the Rust backend already
+  does with `PgStatement`.
 - **Every write now has an outcome.** Commands that previously "succeeded silently" (no events)
   become observable, which is the point — but callers that treat empty commits as free no-ops will
   now pay an outcome row write.

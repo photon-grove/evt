@@ -2,9 +2,9 @@
 
 ## Status
 
-Accepted (2026-10-13). Plan: [evt vNext and the Storyverse Rust
-port](https://github.com/photon-grove/apps/blob/bkonkle/evt-vnext-storyverse-rust-plan/docs/plans/evt-vnext-storyverse-rust/README.md)
-(ids X1–X3; plan decisions D2 and D4). Tracking:
+Accepted (2026-10-13). Capabilities X1–X3 of the vNext plan; plan decision D2 (extensions are
+Rust-first) and plan decision D4 (the feature-marker row enforces declared extensions, see
+[ADR 0004](0004-core-reshape-multi-stream-transactions-and-outcomes.md) C9). Tracking:
 [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
 
 ## Context
@@ -24,8 +24,9 @@ the next capabilities on the plan are:
   `NEW_IMAGE` decode, event-type filter helpers matching EventBridge Pipes / ESM filter patterns,
   `KEYS_ONLY` journal wake-up decode, and partial-batch-failure helpers.
 
-Who needs these first? The Storyverse Rust port (plan E6): its engine writes journal scopes and
-its Lambdas consume streams — all in Rust. No Go consumer needs the journal in the port window.
+Who needs these first? The first consumer is a Rust game service (plan E6): its engine writes
+journal scopes and its Lambdas consume streams — all in Rust. No Go consumer needs the journal in
+the port window.
 Plan decision D2 says: **extensions are Rust-first.** This ADR records what that trade costs and
 how the framework defends against it.
 
@@ -37,7 +38,7 @@ first need, **from the spec and Rust-generated fixtures, never by hand-rolling i
 
 Rust-first is justified because:
 
-1. **The first consumer is Rust.** Storyverse (plan E6) is the journal's only near-term user.
+1. **The first consumer is Rust.** The Rust port (plan E6) is the journal's only near-term user.
    Building in Go first would mean writing the spec twice — once in Go code, then translating it
    to Rust — for no consumer in between.
 2. **The extensions are additive, not core.** Per plan decision D1, only the commit path and the
@@ -72,12 +73,14 @@ Rust-first is justified because:
    writes code until it passes the Rust-generated fixtures byte for byte, exactly as Rust does
    today for Go-generated core fixtures.
 2. **The feature-marker row makes unsupported writers refuse.** The `SYSTEM#FEATURES` marker row
-   (plan decision D4, [ADR 0004](0004-core-reshape-multi-stream-transactions-and-outcomes.md) C9)
+   (plan decision D4 — extension features are declared on the table and enforced at commit time;
+   [ADR 0004](0004-core-reshape-multi-stream-transactions-and-outcomes.md) C9)
    is the enforcement backstop: a writer that first uses an extension declares the feature on the
    row, and any writer that does not support a declared feature **refuses to write to the table**.
-   A Go repository that does not know the journal, pointed at a journal-using table, fails loudly
-   instead of corrupting it. The marker is the difference between "Go tooling misbehaves on
-   extension tables" and "Go tooling cannot damage extension tables."
+   Enforcement is per commit, not cached-and-forgotten: every commit carries a condition on the
+   marker version, so a writer cannot write past a declaration it has not validated. A Go
+   repository that does not know the journal, pointed at a journal-using table, fails on its first
+   commit after the declaration exists instead of corrupting the extension tables.
 3. **Missing capabilities are ported into evt, never hand-rolled in apps.** The standing rule of
    the program (plan "Why", item 3): when an event-sourced app needs a capability evt lacks, the
    capability is ported into the framework — Go apps port Rust-first extensions from the spec and
@@ -93,8 +96,9 @@ Rust-first is justified because:
   package), depending on the core and the `dynamodb` feature.
 - **The Go port has a defined entry point.** When a Go consumer appears, the work is: port from
   spec + Rust-generated fixtures, extend `conformance` and the shared scenario list, and flip the
-  Go column in [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md). Until then the
-  matrix records the extension as Rust ✅ / Go ⏸ deferred.
+  Go column in [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md). Until the port
+  lands, the matrix records the extension as Rust ⏳ / Go —; once it ships, it moves to
+  Rust ✅ / Go ⏸ deferred.
 - **Fixtures gain a second generator.** `internal/compat` (Go) keeps generating core fixtures;
   the Rust side gains a generator for extension fixtures. Both live in `compat/fixtures/` and the
   `compat/README.md` table is updated to say which side writes which file.

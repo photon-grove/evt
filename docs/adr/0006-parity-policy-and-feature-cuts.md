@@ -2,9 +2,8 @@
 
 ## Status
 
-Accepted (2026-10-13). Plan: [evt vNext and the Storyverse Rust
-port](https://github.com/photon-grove/apps/blob/bkonkle/evt-vnext-storyverse-rust-plan/docs/plans/evt-vnext-storyverse-rust/README.md)
-(plan decision D6, port/defer/cut tables P1–P10, F1–F5, K1–K7). Tracking:
+Accepted (2026-10-13). Plan decision D6, defined below (port/defer/cut thresholds); rows
+P1–P10, F1–F5, K1–K7. Tracking:
 [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
 
 ## Context
@@ -12,10 +11,10 @@ port](https://github.com/photon-grove/apps/blob/bkonkle/evt-vnext-storyverse-rus
 The Rust `photon-evt` crate implements the event-log core — log, snapshots, upcasting, compaction,
 entity heads, in-band projectors, the stream envelope ([ADR 0003](0003-rust-implementation-and-cross-language-compatibility.md))
 — but Go's `evt` has years of accumulated tooling the Rust crate lacks: view repositories, rebuild
-runtime, publisher and projector fan-out, test utilities. The vNext program ports Storyverse to
-Rust and migrates munc-api onto evt core outcomes, so every gap is a porting decision: which Go
-features does Rust need in the port window, which can wait, and which should stop existing
-anywhere?
+runtime, publisher and projector fan-out, test utilities. The vNext program moves a downstream
+service to Rust and migrates a Go service onto evt core outcomes, so every gap is a porting
+decision: which Go features does Rust need in the port window, which can wait, and which should
+stop existing anywhere?
 
 Deciding per feature ad hoc produces half-finished ports. Plan decision D6 fixes the policy, and
 the [feature matrix](../parity/feature-matrix.md) is where the decisions live.
@@ -24,14 +23,14 @@ the [feature matrix](../parity/feature-matrix.md) is where the decisions live.
 
 ### Thresholds (D6)
 
-Estimate the probability the feature is needed in the port window (≈ next quarter: the Storyverse
-port and the munc migration), then:
+Estimate the probability the feature is needed in the port window (≈ next quarter: the Rust port
+and the outcomes migration), then:
 
-| Probability                        | Verdict   | Meaning                                                                                                                                                                  |
-| ---------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| ≥ 50%, or required by an invariant | **Port**  | Build in Rust now, in the parity window (photon-evt 0.2/0.3).                                                                                                            |
-| 20–50%                             | **Defer** | Stays Go-only; specified in the matrix; ported on first consumer, from the spec and fixtures ([ADR 0005](0005-rust-first-extensions-journal-and-lambda.md) rules apply). |
-| < 20%                              | **Cut**   | Deprecated in Go in the core-reshape release (Go v0.9.0), deleted in the next minor. Never ported.                                                                       |
+| Probability                        | Verdict   | Meaning                                                                                                                                                                          |
+| ---------------------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ≥ 50%, or required by an invariant | **Port**  | Build in Rust now, in the parity window (photon-evt 0.2/0.3).                                                                                                                    |
+| 20–50%                             | **Defer** | Stays single-language; specified in the matrix; ported on first consumer, from the spec and fixtures ([ADR 0005](0005-rust-first-extensions-journal-and-lambda.md) rules apply). |
+| < 20%                              | **Cut**   | Deprecated in Go in the core-reshape release (Go v0.9.0), deleted in the next minor. Never ported.                                                                               |
 
 The invariant escape hatch matters: the wipe-and-replay guarantee (see
 [ADR 0001](0001-event-compaction-and-snapshot-truncation.md)) and the new core reshape capabilities
@@ -46,8 +45,8 @@ state; the reasoning lives here.
 
 | ID  | Feature                                                                                                                                                        | Near-term need | Verdict                   | Why                                                                                                                                               |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P1  | `ViewRepository`: get, put (TTL), delete, list by pk, list by entity type (GSI), paged with base64url cursor                                                   | 95%            | **Port**                  | Storyverse and munc both read views through it; rebuild (P4) depends on it.                                                                       |
-| P2  | `ViewCodec<T>` (merges `viewstore` Codec/Single + the `GetJSONView` family)                                                                                    | 85%            | **Port**                  | Typed view reads are how both apps consume P1.                                                                                                    |
+| P1  | `ViewRepository`: get, put (TTL), delete, list by pk, list by entity type (GSI), paged with base64url cursor                                                   | 95%            | **Port**                  | Both downstream services read views through it; rebuild (P4) depends on it.                                                                       |
+| P2  | `ViewCodec<T>` (merges `viewstore` Codec/Single + the `GetJSONView` family)                                                                                    | 85%            | **Port**                  | Typed view reads are how both consumers use P1.                                                                                                   |
 | P3  | Event-log enumeration: `stream_all_events` / `stream_entities` + filter (`futures_core::Stream`)                                                               | 90%            | **Port**                  | Rebuild, doctoring, and differential testing all replay the log.                                                                                  |
 | P4  | Full rebuild: commit-wide projector replay, batch view writes, honours the C10 rebuild fence                                                                   | 95%            | **Port**                  | Wipe-and-replay is the load-bearing invariant.                                                                                                    |
 | P5  | Catch-up snapshot on read-only loads                                                                                                                           | 55%            | **Port**                  | Keeps cold streams from replaying unboundedly during the port window.                                                                             |
@@ -63,9 +62,9 @@ state; the reasoning lives here.
 | F5  | SNS/SQS projector runtime + in-memory idempotency guard                                                                                                        | 25%            | **Defer**                 | C3 outcomes replace the idempotency guard; the runtime itself ports when a Rust app fans out.                                                     |
 | K1  | `CommitStream`                                                                                                                                                 | 15%            | **Cut**                   | Bypasses outcomes, the journal, and projections — the one code path that must not exist after the reshape. Seeding uses batched commands instead. |
 | K2  | Snapshot freshness observer / replay estimate / budget                                                                                                         | 15%            | **Cut**                   | Replaced by P9 `tracing` fields on load.                                                                                                          |
-| K3  | `StreamEntitiesByQuery` + workers + `HeadSource`; `RebuildProjectionsByQuery`                                                                                  | 10%            | **Cut**                   | Served the hosted Homunculus only, removed in apps #2931.                                                                                         |
+| K3  | `StreamEntitiesByQuery` + workers + `HeadSource`; `RebuildProjectionsByQuery`                                                                                  | 10%            | **Cut**                   | Served one hosted multi-tenant deployment only, since removed.                                                                                    |
 | K4  | `HeadStore` (heads table) + incremental/delta rebuild                                                                                                          | 10%            | **Cut**                   | The heads-table rebuild path never earned its complexity; `entity_heads` scans suffice.                                                           |
-| K5  | `publishers` + `BudgetController` + `stream.SNSPublisher`/FIFO                                                                                                 | 10%            | **Cut**                   | Cut after Storyverse v1 is deleted. The envelope encode/decode stays (it is the cross-language wire format).                                      |
+| K5  | `publishers` + `BudgetController` + `stream.SNSPublisher`/FIFO                                                                                                 | 10%            | **Cut**                   | Cut after the legacy Go consumer is deleted. The envelope encode/decode stays (it is the cross-language wire format).                             |
 | K6  | `policy` hooks / attempt callbacks / pluggable classifier                                                                                                      | 15%            | **Cut**                   | C5 fence-aware retry plus `tracing` replace the hooks.                                                                                            |
 | K7  | `BaseEntity`, factories, `ByCommandID`, `dynamo.Delete`, `dynamo/mock`, `result/`, `do.go`, `ExpressionStreamer`, handler-attached `CommandResult.Transaction` | < 10%          | **Cut**                   | Legacy ergonomics and escape hatches the reshape obsoletes; the core rule is "evolve evt, never hand-roll in the app."                            |
 | —   | `evt-doctor`                                                                                                                                                   | —              | **Keep, Go-only**         | Diagnostic CLI stays Go-only; it must learn the new rows (outcomes, `SYSTEM#FEATURES`, `SYSTEM#REBUILD`).                                         |
@@ -107,7 +106,7 @@ suite, and its rows move from ⏳ to ✅ only when the shared suite passes.
 - The Rust parity work (plan E4) is bounded by the table above: ten ports, five defers, seven
   cuts — not "port everything."
 - Cuts shrink Go's surface at the same moment the reshape grows it, keeping the framework
-  reviewable. Consumers migrating to v0.9.0 read the matrix's ✂️ rows as the migration list.
+  reviewable. Consumers migrating to v0.9.0 read the matrix's ✅ → ✂️ v0.9 rows as the migration list.
 - Defers are tracked, not forgotten: a deferred row names its consumer trigger, and the first
   consumer ports it under the ADR-0005 rules (spec + fixtures, never hand-rolled).
 - The matrix becomes the first file every evt PR checks, and the first file a new adopter reads to
