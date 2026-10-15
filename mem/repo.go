@@ -3,8 +3,10 @@ package mem
 // WARNING: Not intended for use in Production
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
@@ -201,9 +203,8 @@ func (repo Repository) GetRecentEvents(
 
 	id := string(entityID)
 
-	latest := make([]evt.SerializedEvent, 0, min(limit, len(repo.events[id])))
-	for i := len(repo.events[id]) - 1; i >= 0 && len(latest) < limit; i-- {
-		event := repo.events[id][i]
+	latest := make([]evt.SerializedEvent, 0, len(repo.events[id]))
+	for _, event := range repo.events[id] {
 		if event.Sequence == 0 {
 			// Defensive: inline snapshots are not events.
 			continue
@@ -212,7 +213,12 @@ func (repo Repository) GetRecentEvents(
 		latest = append(latest, event)
 	}
 
-	return latest, nil
+	// Commits need not arrive in sequence order. Sort a copy so reads never reorder storage.
+	slices.SortFunc(latest, func(a, b evt.SerializedEvent) int {
+		return cmp.Compare(b.Sequence, a.Sequence)
+	})
+
+	return latest[:min(limit, len(latest))], nil
 }
 
 // GetSnapshot gets a Snapshot
