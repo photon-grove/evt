@@ -7,8 +7,10 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -16,6 +18,17 @@ import (
 type Repository struct {
 	events    map[string][]evt.SerializedEvent
 	snapshots map[string]evt.SerializedSnapshot
+
+	// features holds the durable feature manifest. Shared through a pointer, like the maps
+	// above, so copies of the handle (and clones of it) see one manifest.
+	features *memFeatures
+}
+
+// memFeatures is the in-memory form of the feature-marker row: the manifest plus the lock that
+// keeps a declaration and a commit's retention check from interleaving.
+type memFeatures struct {
+	mu       sync.Mutex
+	manifest *evt.FeatureManifest
 }
 
 // NewRepository creates a new instance of the Repository
@@ -23,6 +36,7 @@ func NewRepository() evt.Repository {
 	return &Repository{
 		make(map[string][]evt.SerializedEvent),
 		make(map[string]evt.SerializedSnapshot),
+		&memFeatures{},
 	}
 }
 
@@ -47,6 +61,13 @@ func (repo Repository) Commit(
 	}
 
 	if err := evt.PreflightCommit(normalized); err != nil {
+		return err
+	}
+
+	// Fences are refused outright for entity types durably declared with retention, exactly as
+	// the durable backends refuse them: TTL deletes reopen fenced slots without leaving a
+	// successor snapshot, so the two checks cannot protect them.
+	if err := repo.refuseRetention(normalized.Fences); err != nil {
 		return err
 	}
 
@@ -100,25 +121,64 @@ func (repo Repository) checkSnapshots(snapshots []evt.SerializedSnapshot) error 
 // head, or any snapshot covering it, means another writer advanced the stream. This is the
 // in-memory form of the slot check plus the snapshot companion (ADR 0004, C2).
 func (repo Repository) checkFences(fences []evt.ReadFence) error {
-	for i, fence := range fences {
+	for _, fence := range fences {
 		for _, event := range repo.events[string(fence.EntityID)] {
 			if event.Sequence > fence.Head {
-				return &evt.FenceConflictError{
-					Fence: fence,
-					Index: i,
-				}
+				return policy.FenceConflict(fence)
 			}
 		}
 
 		if snapshot, ok := repo.snapshots[string(fence.EntityID)]; ok && snapshot.EventSequence > fence.Head {
-			return &evt.FenceConflictError{
-				Fence: fence,
-				Index: i,
-			}
+			return policy.FenceConflict(fence)
 		}
 	}
 
 	return nil
+}
+
+// Manifest reads the stored feature manifest, or nil when nothing is declared. The returned
+// manifest is a copy; declaring is the only way to change it.
+func (repo Repository) Manifest(_ context.Context) (*evt.FeatureManifest, error) {
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	if repo.features.manifest == nil {
+		return nil, nil
+	}
+
+	manifest := *repo.features.manifest
+
+	return &manifest, nil
+}
+
+// Declare applies a change to the stored manifest in one read-modify-write and bumps its
+// version, like the durable backends' declarations. Declaring does not grant support: the
+// resulting manifest may declare features this build does not model.
+func (repo Repository) Declare(_ context.Context, change func(*evt.FeatureManifest)) error {
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	manifest := repo.features.manifest
+	if manifest == nil {
+		manifest = &evt.FeatureManifest{}
+	}
+	change(manifest)
+	manifest.Version++
+	repo.features.manifest = manifest
+
+	return nil
+}
+
+// refuseRetention refuses fences whose entity type is in the stored manifest's retention set.
+func (repo Repository) refuseRetention(fences []evt.ReadFence) error {
+	if len(fences) == 0 {
+		return nil
+	}
+
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	return evt.CheckFenceRetention(fences, repo.features.manifest)
 }
 
 // CommitStream streams Events to memory

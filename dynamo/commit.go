@@ -13,6 +13,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/internal/eventjson"
+	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -262,8 +263,8 @@ func (repo *Repository) buildSnapshotPut(
 		Item:                item,
 		ConditionExpression: aws.String(FirstSnapshotCondition),
 	}
-	// A snapshot sequence below 1 has no valid predecessor, so it takes the first branch and
-	// fails its condition.
+	// A snapshot sequence below 1 has no valid predecessor: the second branch applies with a
+	// negative :seq, and NextSnapshotCondition fails.
 	if expected := snapshot.Sequence - 1; expected != 0 {
 		put.ConditionExpression = aws.String(NextSnapshotCondition)
 		put.ExpressionAttributeValues = map[string]types.AttributeValue{
@@ -555,7 +556,7 @@ func (repo *Repository) commitStreamItems(
 
 	// The preflight covers every item the transaction carries, with the projector operations
 	// sized exactly from the items this backend will write.
-	sizes, serr := evt.TransactionItemSizes(result)
+	sizes, serr := evt.TransactionItemSizesWithTTL(result, repo.ttlFor)
 	if serr != nil {
 		return serr
 	}
@@ -636,7 +637,7 @@ func (repo *Repository) classifyCommitFailure(
 	// and the projector operations in the combined transaction.
 	streamIndex := i - len(transactItems) - 1
 	if fence, failed := layout.fenceIndexes[streamIndex]; failed {
-		return &evt.FenceConflictError{Fence: fence, Index: i}
+		return policy.FenceConflict(fence)
 	}
 
 	// A failed condition on a written stream's own items is an ordinary conflict.

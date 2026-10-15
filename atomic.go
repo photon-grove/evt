@@ -23,18 +23,17 @@ type ReadFence struct {
 	CallerStamped bool
 }
 
-// FenceConflictError identifies the read-only stream and transaction item that failed. Another
-// writer moved the stream past the fenced head. A conflict on an engine-filled fence is
-// retryable (the engine can reload and re-decide); a conflict on a caller-stamped fence is a
-// stale-fence rejection the caller must handle, because the engine cannot know the caller's
-// decision is still valid.
+// FenceConflictError identifies the read-only stream whose fence failed. Another writer moved
+// the stream past the fenced head. A conflict on an engine-filled fence is retryable (the engine
+// can reload and re-decide, and backends classify it transient like an event-put conflict); a
+// conflict on a caller-stamped fence is a stale-fence rejection the caller must handle, because
+// the engine cannot know the caller's decision is still valid.
 type FenceConflictError struct {
 	Fence ReadFence
-	Index int
 }
 
 func (e *FenceConflictError) Error() string {
-	return fmt.Sprintf("read fence conflict on %s at head %d (item %d)", e.Fence.EntityID, e.Fence.Head, e.Index)
+	return fmt.Sprintf("read fence conflict on %s at head %d", e.Fence.EntityID, e.Fence.Head)
 }
 
 // Unwrap keeps a fence failure matchable as optimistic concurrency without losing provenance.
@@ -169,10 +168,10 @@ func CheckFenceRetention(fences []ReadFence, manifest *FeatureManifest) error {
 	return nil
 }
 
-// CommitMetadata returns a copy stamped once for the entire engine commit. The default commit ID
-// is the command ID when present; a caller-supplied commit ID is preserved; otherwise a
-// cryptographically random ULID is generated. Callers must stamp one metadata value and use it
-// for every stream of a commit.
+// CommitMetadata returns a copy stamped once for the entire engine commit. The commit ID is the
+// command ID when present — overriding any caller-supplied commit ID; otherwise a caller-supplied
+// commit ID is preserved; otherwise a cryptographically random ULID is generated. Callers must
+// stamp one metadata value and use it for every stream of a commit.
 func CommitMetadata(metadata Metadata) Metadata {
 	if metadata.CommandID != nil && *metadata.CommandID != "" {
 		metadata.CommitID = string(*metadata.CommandID)
@@ -210,6 +209,25 @@ func CommitMetadata(metadata Metadata) Metadata {
 // that carry operations must additionally supply their item sizes through
 // SizedTransactionGroup, because an opaque group cannot safely bypass commit preflight.
 func TransactionItemSizes(result SerializedResult) ([]int, error) {
+	return TransactionItemSizesWithTTL(result, nil)
+}
+
+// TransactionItemSizesWithTTL is TransactionItemSizes with the ttl attribute the items of
+// retained entity types carry, so a backend with retention policies estimates the same bytes its
+// items encode. A ttlFor that returns 0 sizes items as the retention-free TransactionItemSizes
+// does.
+func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType) int64) ([]int, error) {
+	ttlSize := func(entityType EntityType) int {
+		if ttlFor == nil {
+			return 0
+		}
+		if ttl := ttlFor(entityType); ttl != 0 {
+			return len("ttl") + len(strconv.FormatInt(ttl, 10))
+		}
+
+		return 0
+	}
+
 	keySize := func(id EntityID, sequence EventSequence) int {
 		return len("pk") + len("sk") + len(id) + len(strconv.Itoa(int(sequence)))
 	}
@@ -227,14 +245,16 @@ func TransactionItemSizes(result SerializedResult) ([]int, error) {
 		}
 		sizes = append(sizes, keySize(event.EntityID, event.Sequence)+
 			len("type")+len(event.Type)+len("version")+len(strconv.Itoa(int(event.Version)))+
-			len("entityType")+len(event.EntityType)+len("payload")+len(event.Payload)+len("metadata")+len(encoded))
+			len("entityType")+len(event.EntityType)+len("payload")+len(event.Payload)+len("metadata")+len(encoded)+
+			ttlSize(event.EntityType))
 		written[event.EntityID] = true
 	}
 	for _, snapshot := range result.Snapshots {
 		sizes = append(sizes, keySize(snapshot.EntityID, 0)+
 			len("seq")+len(strconv.Itoa(int(snapshot.Sequence)))+
 			len("eventSeq")+len(strconv.Itoa(int(snapshot.EventSequence)))+
-			len("entityType")+len(snapshot.EntityType)+len("payload")+len(snapshot.Payload))
+			len("entityType")+len(snapshot.EntityType)+len("payload")+len(snapshot.Payload)+
+			ttlSize(snapshot.EntityType))
 		delete(written, snapshot.EntityID)
 	}
 	// A written stream without a snapshot contributes a floor check on its snapshot item.
