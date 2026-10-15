@@ -11,6 +11,6 @@ terraform = "~1.14"
 auto-install = true
 
 [plugins.tools]
-"actionlint" = "https://raw.githubusercontent.com/Phault/proto-toml-plugins/main/actionlint/plugin.toml"
+"actionlint" = "source:./.github/proto-plugins/actionlint.toml"
 "golangci-lint" = "https://raw.githubusercontent.com/b4nst/proto-plugins/refs/heads/main/toml/golangci-lint.toml"
 "terraform" = "source:./.github/proto-plugins/terraform.toml"
