@@ -196,7 +196,10 @@ All durable Go repositories enforce the [feature marker](docs/spec/storage-forma
 by default, with no supported extensions. Unsupported declarations refuse commits and standalone
 snapshot writes and compaction atomically; history-dependent declarations also fence compaction
 across handles.
-`WithFeatureMarker` customizes the supported set, not whether enforcement runs.
+`repo.WithFeatureMarker(repo.FeatureMarker(supported))` customizes the supported set, not whether
+enforcement runs. Create markers from the repository so reads and transactional checks share its
+client and events table; attaching a marker from another client or table is a typed configuration
+error.
 
 The raw `dynamo.Delete` is snapshot-unsafe, for local fixtures only, and excluded
 from production builds (`-tags prod`). See

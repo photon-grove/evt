@@ -66,6 +66,10 @@ func (repo *Repository) CompactBelow(
 	entityID evt.EntityID,
 	throughSequence evt.EventSequence,
 ) (int, error) {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return 0, err
+	}
+
 	if err := evt.CheckReservedEntityID(entityID); err != nil {
 		return 0, err
 	}

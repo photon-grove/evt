@@ -87,8 +87,7 @@ func Test_MaintenanceHoldsFeatureLock(t *testing.T) {
 			require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "account", id, []byte(`{}`), 1))
 			db := &pausedManifestDB{DB: newPool(ctx, t), paused: make(chan struct{}), resume: make(chan struct{})}
 			// Mixed-case handles address the same unquoted table and must share the lowercase lock.
-			writer := postgres.NewRepository(db, postgres.WithEventsTable(strings.ToUpper(name)), postgres.WithSnapshotsTable(strings.ToUpper(name+"_snapshots"))).
-				WithFeatureMarker(postgres.NewFeatureMarker(db, strings.ToUpper(name), nil))
+			writer := postgres.NewRepository(db, postgres.WithEventsTable(strings.ToUpper(name)), postgres.WithSnapshotsTable(strings.ToUpper(name+"_snapshots")))
 			done := make(chan error, 1)
 			go func() {
 				if operation == "compaction" {

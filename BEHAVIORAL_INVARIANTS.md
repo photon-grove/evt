@@ -426,15 +426,25 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
   `CommitWithSnapshot`, `CommitStream`, out-of-band snapshot writes (`dynamo.PutSnapshot`), and
   `CompactBelow` (which writes no new rows but is refused all the same).
 - Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
-  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition.
+  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition, including the deprecated
+  `HeadStore` map and visitor APIs. `ReservedNamespacePrefixes()` returns a copy; callers cannot
+  change the authoritative namespace checks.
 - Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
-  become silently invisible after upgrading. `evt-doctor` reports pre-existing streams in reserved
-  namespaces — on DynamoDB by scanning the table (exempting engine-written rows: the feature
+  disappear from enumeration after upgrading. Explicit event and snapshot reads by ID still
+  return legacy reserved-prefix streams so migration tooling can read them. `evt-doctor` reports
+  pre-existing streams in reserved namespaces — on DynamoDB by scanning the table (exempting engine-written rows: the feature
   marker, the rebuild fence, and command outcomes), on PostgreSQL with the two spec queries against
   the configured events and snapshots tables — and the upgrade note requires renaming (migrating)
   such streams before enabling the v0.9 features.
 
 ### Feature Marker (ADR-0004 C9)
+
+- Create markers with `repo.FeatureMarker(supported)`, binding reads and transactional checks to
+  that repository's client and events table. `WithFeatureMarker` panics with
+  `*evt.FeatureMarkerClientMismatchError` for a different client handle (even with the same table
+  name), or `*evt.FeatureMarkerTableMismatchError` for another table. Writes return the typed
+  mismatch error if the binding no longer matches; snapshot writes and compaction enforce the
+  same rule.
 
 - A store declares the extensions it uses on the reserved `SYSTEM#FEATURES` marker row (storage
   spec, Feature Marker): `version` (bumped by exactly one per declaration transaction), `features`

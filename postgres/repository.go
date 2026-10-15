@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -169,14 +170,35 @@ func WithSnapshotsTable(name string) Option {
 //
 // The default marker supports no extensions. Passing nil restores that default; it never
 // disables enforcement.
+// Create markers with repo.FeatureMarker. A marker bound to another events table or client
+// panics with *evt.FeatureMarkerTableMismatchError or *evt.FeatureMarkerClientMismatchError.
 func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
 	r := *repo
 	r.features = marker
 	if r.features == nil {
-		r.features = NewFeatureMarker(r.db, r.eventsTable, nil)
+		r.features = r.FeatureMarker(nil)
+	}
+	if err := r.checkFeatureMarkerTable(); err != nil {
+		panic(err)
 	}
 
 	return &r
+}
+
+func (repo *Repository) checkFeatureMarkerTable() error {
+	if repo.features.eventsTable != repo.eventsTable {
+		return &evt.FeatureMarkerTableMismatchError{
+			EventsTable: repo.eventsTable, MarkerEventsTable: repo.features.eventsTable,
+		}
+	}
+
+	// Interface equality is safe only for comparable client handles (normally pointers).
+	// Fail closed for other handles rather than compare their configuration or contents.
+	if (repo.db != nil && !reflect.ValueOf(repo.db).Comparable()) || repo.db != repo.features.db {
+		return &evt.FeatureMarkerClientMismatchError{}
+	}
+
+	return nil
 }
 
 // NewRepository constructs a Repository over the given pgx handle (typically a *pgxpool.Pool). It
@@ -221,7 +243,7 @@ func NewRepository(db DB, opts ...Option) *Repository {
 
 	repo.eventsTable = strings.ToLower(repo.eventsTable)
 	repo.snapshotsTable = strings.ToLower(repo.snapshotsTable)
-	repo.features = NewFeatureMarker(db, repo.eventsTable, nil)
+	repo.features = repo.FeatureMarker(nil)
 
 	return repo
 }
@@ -300,6 +322,10 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
 // PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
 // same transaction as the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if err := evt.CheckReservedEntityIDs(res.Events); err != nil {
 		return err
 	}
@@ -362,6 +388,10 @@ func (repo *Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if len(res.Events) == 0 {
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
 	}

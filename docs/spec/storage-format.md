@@ -866,8 +866,10 @@ marker, the rebuild fence) and `command-outcome#` (outcomes). Matching is a case
 prefix on `pk`.
 
 - Enumeration, entity heads, and rebuild scans **skip** every partition whose `pk` begins with a
-  reserved prefix. Reserved rows are never ordinary aggregates: they have no snapshots and never
-  compact.
+  reserved prefix. Engine-managed rows are not ordinary aggregates and never compact.
+- Explicit reads by entity ID (`GetEvents`, `GetLatestEvents`, `GetRecentEvents` / `latest(n)`,
+  and `GetSnapshot`) do **not** filter reserved prefixes. Legacy streams and their snapshots remain
+  readable for migration; only enumeration, heads, and rebuild scans hide them.
 - **Every entity-addressed write path refuses** an entity ID that begins with a reserved prefix,
   before any request, with a typed `ReservedEntityId` error: commits (multi-stream included —
   one reserved stream fails the whole commit), out-of-band snapshot writes (`PutSnapshot`),
@@ -912,6 +914,13 @@ early. Initial buffer allocation is bounded by a page or the available events, n
 arbitrarily large `n`. PostgreSQL's `LIMIT n` returns the same at-most-`n` window in one statement.
 
 ## Feature Marker
+
+A feature marker is created from its repository and bound to both its client handle and events
+table at construction. Marker reads and transactional checks must use that same client and table;
+matching table names alone do not identify a physical log. Attaching a marker for another client
+or table is a typed configuration error; subsequent writes (including snapshots and compaction)
+must fail with a typed mismatch error if the repository no longer matches the binding. Rust
+repositories own marker access directly rather than accepting a separately constructed marker.
 
 A store declares the extensions it uses on a single `SYSTEM#FEATURES` marker row (v0.9, C9). Any
 writer that does not support a declared feature **refuses to write** to the table.

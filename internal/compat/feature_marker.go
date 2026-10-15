@@ -233,8 +233,8 @@ func GenerateFeatureMarkerFixtures(ctx context.Context) (FeatureMarkerFixtures, 
 	var fixtures FeatureMarkerFixtures
 	fake := NewFakeDynamo()
 	pg := &featurePG{}
-	dm := dynamo.NewFeatureMarker(fake, fakeTable, nil)
-	pm := postgres.NewFeatureMarker(pg, "evt_events", nil)
+	dm := dynamo.NewRepository(fake, fakeTable).FeatureMarker(nil)
+	pm := postgres.NewRepository(pg).FeatureMarker(nil)
 	inputs := []FeatureDeclarationVector{
 		{Name: "empty", Input: FeatureDeclarationInput{Features: map[string]evt.FeatureFormat{}, HistoryDependent: []evt.EntityType{}, Retention: []evt.EntityType{}}},
 		{Name: "sorted-deduplicated", Input: FeatureDeclarationInput{
@@ -333,7 +333,7 @@ func featureCommitVector(ctx context.Context, name string, declarations []Featur
 	vector := FeatureCommitVector{Name: name}
 	capture := &featureCaptureDynamo{FakeDynamo: NewFakeDynamo()}
 	supported := evt.SupportedFeatures{evt.FeatureJournal: 1, evt.FeatureJournalCompaction: 2}
-	marker := dynamo.NewFeatureMarker(capture, fakeTable, supported)
+	marker := dynamo.NewRepository(capture, fakeTable).FeatureMarker(supported)
 	if !strings.HasPrefix(name, "absent") {
 		// Reproduce the named declaration's version as well as its contents.
 		for _, declaration := range declarations[:2] {
