@@ -20,7 +20,7 @@ import (
 
 // defaultDSN points at the local infra/local-postgres database with its local-only credentials. The
 // integration tests honor DATABASE_URL when set so CI and other environments can override it.
-const defaultDSN = "postgres://evt:evt@localhost:5432/evt_local?sslmode=disable"
+const defaultDSN = "postgres://evt:evt@localhost:5432/evt_local?sslmode=disable" //nolint:gosec // local emulator placeholder credentials, not a secret
 
 var (
 	schemaOnce sync.Once

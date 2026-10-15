@@ -75,7 +75,9 @@ func TestExecuteWithRetryRetriesALoadGap(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, 1, retries, "the gap is retried once")
-	require.Equal(t, "six", entity.(*test.Entity).Value)
+	loaded, ok := entity.(*test.Entity)
+	require.True(t, ok)
+	require.Equal(t, "six", loaded.Value)
 }
 
 // compactDuringLoad snapshots and compacts the stream between the load's snapshot read and its
@@ -110,9 +112,12 @@ func TestFloorRejectsACommitFromALoadBehindACompaction(t *testing.T) {
 	}
 	execute("one", "two", "three")
 
+	compactor, ok := repo.(evt.Compactor)
+	require.True(t, ok)
+
 	racing := &compactDuringLoad{Repository: repo, advance: func() {
 		execute("four", "five", "six")
-		_, err := repo.(evt.Compactor).CompactBelow(ctx, id, 6)
+		_, err := compactor.CompactBelow(ctx, id, 6)
 		require.NoError(t, err)
 	}}
 

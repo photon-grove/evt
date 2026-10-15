@@ -203,6 +203,7 @@ and DynamoDB schema guarantees.
 pnpm install
 go test ./...
 moon run evt:test
+moon run evt:lint
 ```
 
 The Rust toolchain is pinned in `rust-toolchain.toml`, and `rustup` installs it on first use:

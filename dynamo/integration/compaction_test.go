@@ -133,8 +133,8 @@ func (s *DynamoEventsIntegrationSuite) Test_StreamFromSnapshots_HeadSourceRebuil
 
 	// Populate the heads registry from the (now compacted) log. The head folds in the snapshot floor,
 	// so the compacted entity is still registered at sequence 7 even though events 1..6 are gone.
-	heads := dynamo.NewHeadStore(s.client, headsTable)
-	_, err = heads.Backfill(ctx, s.repo, s.entityType)
+	heads := dynamo.NewHeadStore(s.client, headsTable) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	_, err = heads.Backfill(ctx, s.repo, s.entityType) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.NoError(s.T(), err)
 
 	// Rebuild enumerating entity IDs from the registry (constant memory) rather than a full-log scan.
@@ -308,6 +308,6 @@ func (s *DynamoEventsIntegrationSuite) Test_CommitStream_RejectsBatchBelowFloor(
 	channel <- result.Ok(serialize(2)) // sequence 3, compacted
 	close(channel)
 
-	require.Len(s.T(), s.repo.CommitStream(ctx, channel), 1)
+	require.Len(s.T(), s.repo.CommitStream(ctx, channel), 1) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Empty(s.T(), s.sequencesFor(ctx, id))
 }

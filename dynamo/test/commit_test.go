@@ -157,7 +157,11 @@ func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
 
 	var input *dynamodb.TransactWriteItemsInput
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) { input = args.Get(1).(*dynamodb.TransactWriteItemsInput) }).
+		Run(func(args mock.Arguments) {
+			var ok bool
+			input, ok = args.Get(1).(*dynamodb.TransactWriteItemsInput)
+			require.True(s.T(), ok)
+		}).
 		Return(new(dynamodb.TransactWriteItemsOutput), nil)
 
 	err := s.repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serializedEvents}, "test", "test-id", []byte{}, 3)
@@ -236,8 +240,13 @@ func (s *RepositorySuite) Test_CommitStream_OneFloorCheckPerStream() {
 
 	floors := make(map[string]string)
 	for _, check := range checks {
-		pk := check.Key["pk"].(*types.AttributeValueMemberS).Value
-		floors[pk] = check.ExpressionAttributeValues[":first"].(*types.AttributeValueMemberN).Value
+		pk, ok := check.Key["pk"].(*types.AttributeValueMemberS)
+		require.True(s.T(), ok)
+
+		first, ok := check.ExpressionAttributeValues[":first"].(*types.AttributeValueMemberN)
+		require.True(s.T(), ok)
+
+		floors[pk.Value] = first.Value
 	}
 
 	require.Len(s.T(), checks, 2)
