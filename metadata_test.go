@@ -542,6 +542,47 @@ func Test_Metadata_Equal(t *testing.T) {
 	}))
 }
 
+func Test_Metadata_EqualRoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		metadata Metadata
+	}{
+		{"unset", Metadata{}},
+		{"empty extensions", Metadata{Extensions: map[string]string{}}},
+		{"default causation", Metadata{CommandID: ptr(CommandID("c-1"))}},
+		{"explicit causation", Metadata{
+			CommandID:   ptr(CommandID("c-1")),
+			PrincipalID: ptr(PrincipalID("user:42")),
+			CausationID: ptr(CommandID("c-0")),
+			Extensions:  map[string]string{"source": "cli", "empty": ""},
+		}},
+		{"causation without command", Metadata{CausationID: ptr(CommandID("c-0"))}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.metadata)
+			require.NoError(t, err)
+
+			var decoded Metadata
+			require.NoError(t, json.Unmarshal(data, &decoded))
+			require.True(t, tc.metadata.Equal(decoded))
+			require.True(t, decoded.Equal(tc.metadata))
+		})
+	}
+
+	defaulted := Metadata{CommandID: ptr(CommandID("c-1"))}
+	explicit := defaulted
+	explicit.CausationID = ptr(CommandID("c-1"))
+	require.True(t, defaulted.Equal(explicit))
+	require.True(t, explicit.Equal(defaulted))
+
+	explicit.CausationID = ptr(CommandID("c-0"))
+	require.False(t, defaulted.Equal(explicit))
+	require.False(t, explicit.Equal(defaulted))
+	require.False(t, Metadata{}.Equal(Metadata{CausationID: ptr(CommandID("c-0"))}))
+}
+
 func Test_Metadata_V09Options(t *testing.T) {
 	ctx := context.Background()
 	region := "us-east-1"

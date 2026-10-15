@@ -1553,8 +1553,10 @@ scenarios below. Go generates the core golden fixtures for them
 and the live interleaved runs (`scripts/compat-integration.sh dynamo|postgres`) execute the same
 steps on real backends. **E2.8** (Go conformance suite + fixtures) and **E3.8** (Rust conformance
 suite + the live runs) must implement every scenario in this list; the names are the shared keys
-in `compat/scenarios.json`. In all of them both writers run with outcomes enabled and a command ID
-on every step. Some scenarios need new ops in the harness (`declareFeature`, `acquireRebuildLock`,
+in `compat/scenarios.json`. The `metadata-extensions` case is implemented for C6 (E2.1/E3.1)
+in the current single-stream harness; it does not yet enable outcomes. Once C3 lands, both writers
+run these scenarios with outcomes enabled and a command ID on every step. Some scenarios need
+new ops in the harness (`declareFeature`, `acquireRebuildLock`,
 `releaseRebuildLock`, `forceReleaseRebuildLock`, `resolveOutcome`, `readLatest`, `rebuildViews`, a
 multi-stream execute, and `injectCommitFault`, which makes a commit apply but the caller observe an
 indeterminate error, so `outcomes-ambiguous` exercises the real ambiguous path rather than only

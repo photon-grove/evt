@@ -55,17 +55,20 @@ type Scenario struct {
 
 // Step is one operation against the scenario's stream.
 type Step struct {
-	By        string            `json:"by"`
-	Op        string            `json:"op"`
-	CommandID string            `json:"commandId,omitempty"`
-	Command   *Command          `json:"command,omitempty"`
-	Event     *RawEvent         `json:"event,omitempty"`
-	Through   int64             `json:"through,omitempty"`
-	Sequence  int64             `json:"sequence,omitempty"`
-	Trace     map[string]string `json:"trace,omitempty"`
-	Address   string            `json:"address,omitempty"`
-	Timestamp string            `json:"timestamp,omitempty"`
-	Expect    Outcome           `json:"expect"`
+	By          string            `json:"by"`
+	Op          string            `json:"op"`
+	CommandID   string            `json:"commandId,omitempty"`
+	PrincipalID string            `json:"principalId,omitempty"`
+	CausationID string            `json:"causationId,omitempty"`
+	Extensions  map[string]string `json:"extensions,omitempty"`
+	Command     *Command          `json:"command,omitempty"`
+	Event       *RawEvent         `json:"event,omitempty"`
+	Through     int64             `json:"through,omitempty"`
+	Sequence    int64             `json:"sequence,omitempty"`
+	Trace       map[string]string `json:"trace,omitempty"`
+	Address     string            `json:"address,omitempty"`
+	Timestamp   string            `json:"timestamp,omitempty"`
+	Expect      Outcome           `json:"expect"`
 }
 
 // RawEvent is an event appended directly to the log, bypassing the aggregate (legacy versions).
@@ -124,6 +127,16 @@ func StepMetadata(step Step) evt.Metadata {
 		id := evt.CommandID(step.CommandID)
 		metadata.CommandID = &id
 	}
+	if step.PrincipalID != "" {
+		id := evt.PrincipalID(step.PrincipalID)
+		metadata.PrincipalID = &id
+	}
+	if step.CausationID != "" {
+		id := evt.CommandID(step.CausationID)
+		metadata.CausationID = &id
+	}
+	metadata.Extensions = step.Extensions
+
 	if step.Trace != nil {
 		carrier := make(propagation.MapCarrier, len(step.Trace))
 		for key, value := range step.Trace {

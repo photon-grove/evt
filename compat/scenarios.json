@@ -1,6 +1,17 @@
 {
   "scenarios": [
     {
+      "name": "metadata-extensions",
+      "description": "Both writers persist C6 principal, explicit and defaulted causation, and extensions; both readers verify every field against the golden fixtures.",
+      "snapshotInterval": 0,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "principalId": "user:42", "causationId": "upstream-go", "extensions": { "source": "cli", "empty": "" }, "command": { "type": "open", "owner": "Alex" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "principalId": "user:43", "causationId": "upstream-rust", "extensions": { "tenant": "example", "source": "api" }, "command": { "type": "deposit", "amountCents": 10 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "principalId": "user:42", "command": { "type": "deposit", "amountCents": 20 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "principalId": "user:43", "command": { "type": "deposit", "amountCents": 30 }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
       "name": "go-writes-rust-reads",
       "description": "Go writes the whole stream, including two snapshots; Rust must load and verify it.",
       "snapshotInterval": 3,

@@ -77,6 +77,12 @@ pub struct Step {
     #[serde(default)]
     pub command_id: Option<String>,
     #[serde(default)]
+    pub principal_id: Option<String>,
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    #[serde(default)]
+    pub extensions: BTreeMap<String, String>,
+    #[serde(default)]
     pub command: Option<AccountCommand>,
     #[serde(default)]
     pub event: Option<RawEvent>,
@@ -112,6 +118,17 @@ impl Step {
             .clone()
             .filter(|id| !id.is_empty())
             .map(Into::into);
+        metadata.principal_id = self
+            .principal_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .map(Into::into);
+        metadata.causation_id = self
+            .causation_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .map(Into::into);
+        metadata.extensions = self.extensions.clone();
         metadata.trace = self.trace.clone();
         metadata.region = REGION.to_owned();
 

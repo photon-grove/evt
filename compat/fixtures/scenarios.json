@@ -3,6 +3,120 @@
   "source": "evt-compat",
   "scenarios": [
     {
+      "name": "metadata-extensions",
+      "entityId": "compat-fixture-metadata-extensions",
+      "sequence": 4,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Alex\",\"status\":\"open\",\"balanceCents\":60,\"deposits\":3,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-metadata-extensions:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFsZXgiLCJvcGVuZWRBdCI6IjAwMDEtMDEtMDFUMDA6MDA6MDBaIn0=\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"upstream-go\",\"extensions\":{\"empty\":\"\",\"source\":\"cli\"}}}",
+        "{\"id\":\"compat-fixture-metadata-extensions:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:43\",\"causationId\":\"upstream-rust\",\"extensions\":{\"source\":\"api\",\"tenant\":\"example\"}}}",
+        "{\"id\":\"compat-fixture-metadata-extensions:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"c3\",\"extensions\":{}}}",
+        "{\"id\":\"compat-fixture-metadata-extensions:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:43\",\"causationId\":\"c4\",\"extensions\":{}}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"upstream-go\",\"extensions\":{\"empty\":\"\",\"source\":\"cli\"}}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Alex\",\"openedAt\":\"0001-01-01T00:00:00Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-metadata-extensions"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:43\",\"causationId\":\"upstream-rust\",\"extensions\":{\"source\":\"api\",\"tenant\":\"example\"}}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":10,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-metadata-extensions"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"c3\",\"extensions\":{}}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":20,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-metadata-extensions"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:43\",\"causationId\":\"c4\",\"extensions\":{}}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":30,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-metadata-extensions"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-metadata-extensions:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-metadata-extensions:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFsZXgiLCJvcGVuZWRBdCI6IjAwMDEtMDEtMDFUMDA6MDA6MDBaIn0=\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"upstream-go\",\"extensions\":{\"empty\":\"\",\"source\":\"cli\"}}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-metadata-extensions:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-metadata-extensions:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:43\",\"causationId\":\"upstream-rust\",\"extensions\":{\"source\":\"api\",\"tenant\":\"example\"}}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-metadata-extensions:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-metadata-extensions:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"c3\",\"extensions\":{}}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-metadata-extensions:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-metadata-extensions:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:43\",\"causationId\":\"c4\",\"extensions\":{}}}}"
+      ]
+    },
+    {
       "name": "go-writes-rust-reads",
       "entityId": "compat-fixture-go-writes-rust-reads",
       "sequence": 9,

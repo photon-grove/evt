@@ -102,16 +102,33 @@ stored, changing either requires an upcaster so old rows stay readable.
 
 `evt.Metadata` travels with every command and is stamped onto every event it
 produces. It carries an optional `CommandID`, OpenTelemetry `Trace`, `Origin`
-(source + endpoint), client `Address`, `Region`, and `Timestamp`. Build it with
-options rather than by hand:
+(source + endpoint), client `Address`, `Region`, and `Timestamp`, plus `PrincipalID`
+(the caller's identity), `CausationID` (the command that caused this one), and
+`Extensions` (application-specific string keys and values). Build it with options
+rather than by hand:
 
 ```go
 md := evt.NewMetadata(ctx, region,
     evt.WithCommandID("idempotency-key-123"),
+    evt.WithPrincipalID("user:42"),
+    evt.WithCausationID("upstream-command-456"),
+    evt.WithExtension("requestSource", "cli"),
     evt.WithTrace(ctx),
     evt.WithOrigin(evt.Origin{Source: "api", Endpoint: "POST /deposits"}),
 )
 ```
+
+`WithCausationID` overrides the default for commands triggered by another command.
+When unset, the encoded `causationId` defaults to `CommandID`; with neither set,
+it is `null`. `PrincipalID` is optional and encodes as `null` when unset.
+`WithPrincipalID("")` and `WithCausationID("")` clear their fields. `Extensions`
+always encodes as an object (`{}` when nil or empty); call `WithExtension` once
+per key. Decoding preserves stored values without filling in defaults.
+
+Use `md.Equal(other)` to compare metadata: it compares effective causation IDs
+and treats nil and empty extension maps as equal, so encoded round trips remain
+equal. `Metadata` contains a map and cannot be compared with `==`. See the
+[storage format](spec/storage-format.md#metadata) for the full encoding contract.
 
 ## Repository
 

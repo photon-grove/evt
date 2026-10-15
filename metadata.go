@@ -158,8 +158,8 @@ func NewMetadata(_ context.Context, region *string, opts ...MetadataOption) Meta
 	return m
 }
 
-// Equal reports whether two metadata values carry the same data. A nil and an empty Extensions
-// map compare equal, since both encode as {}.
+// Equal reports whether two metadata values carry the same effective data. An unset CausationID
+// defaults to CommandID, and nil and empty Extensions maps compare equal, matching their encoding.
 func (m Metadata) Equal(other Metadata) bool {
 	return equalPtr(m.CommandID, other.CommandID) &&
 		carrierEqual(m.Trace, other.Trace) &&
@@ -168,11 +168,19 @@ func (m Metadata) Equal(other Metadata) bool {
 		m.Region == other.Region &&
 		m.Timestamp == other.Timestamp &&
 		equalPtr(m.PrincipalID, other.PrincipalID) &&
-		equalPtr(m.CausationID, other.CausationID) &&
+		equalPtr(m.effectiveCausationID(), other.effectiveCausationID()) &&
 		extensionsEqual(m.Extensions, other.Extensions)
 }
 
-// carrierEqual compares two optional trace carriers, treating nil and empty as equal.
+func (m Metadata) effectiveCausationID() *CommandID {
+	if m.CausationID != nil {
+		return m.CausationID
+	}
+
+	return m.CommandID
+}
+
+// carrierEqual compares two optional trace carriers by content, with nil only equal to nil.
 func carrierEqual(a, b *propagation.MapCarrier) bool {
 	if a == nil || b == nil {
 		return a == b
@@ -213,10 +221,7 @@ func (m Metadata) MarshalJSON() ([]byte, error) {
 	type metadataWire Metadata
 
 	wire := metadataWire(m)
-	if wire.CausationID == nil && wire.CommandID != nil {
-		causation := *wire.CommandID
-		wire.CausationID = &causation
-	}
+	wire.CausationID = m.effectiveCausationID()
 
 	if wire.Extensions == nil {
 		wire.Extensions = map[string]string{}

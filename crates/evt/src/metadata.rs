@@ -18,8 +18,8 @@ use crate::json::null_default;
 /// Encoding applies the storage format's defaults: `causationId` is written as the explicitly set
 /// causation, otherwise the `commandId`, otherwise `null`, and `extensions` is always an object
 /// (`{}` when unset or empty). Decoding stays faithful to the stored bytes and does not apply the
-/// defaults.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+/// defaults. Equality compares effective causation IDs, so metadata equals its encoded round trip.
+#[derive(Clone, Debug, Default, Eq, Deserialize)]
 #[non_exhaustive]
 pub struct Metadata {
     /// The command that produced the event. Used to reject duplicate commands on replay.
@@ -157,11 +157,29 @@ impl Metadata {
         self
     }
 
+    fn effective_causation_id(&self) -> Option<&CommandId> {
+        self.causation_id.as_ref().or(self.command_id.as_ref())
+    }
+
     /// Adds one application-specific extension.
     #[must_use]
     pub fn with_extension(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extensions.insert(key.into(), value.into());
         self
+    }
+}
+
+impl PartialEq for Metadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.command_id == other.command_id
+            && self.trace == other.trace
+            && self.origin == other.origin
+            && self.address == other.address
+            && self.region == other.region
+            && self.timestamp == other.timestamp
+            && self.principal_id == other.principal_id
+            && self.effective_causation_id() == other.effective_causation_id()
+            && self.extensions == other.extensions
     }
 }
 
@@ -184,7 +202,7 @@ struct MetadataWire<'a> {
     #[serde(rename = "principalId")]
     principal_id: &'a Option<PrincipalId>,
     #[serde(rename = "causationId")]
-    causation_id: &'a Option<CommandId>,
+    causation_id: Option<&'a CommandId>,
     #[serde(rename = "extensions")]
     extensions: &'a BTreeMap<String, String>,
 }
@@ -193,11 +211,6 @@ impl Serialize for Metadata {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // causationId is written with its effective value: the explicitly set causation, otherwise
         // the commandId, otherwise null — matching Go's Metadata.MarshalJSON.
-        let causation = self
-            .causation_id
-            .clone()
-            .or_else(|| self.command_id.clone());
-
         MetadataWire {
             command_id: &self.command_id,
             trace: &self.trace,
@@ -206,7 +219,7 @@ impl Serialize for Metadata {
             region: &self.region,
             timestamp: &self.timestamp,
             principal_id: &self.principal_id,
-            causation_id: &causation,
+            causation_id: self.effective_causation_id(),
             extensions: &self.extensions,
         }
         .serialize(serializer)
@@ -338,6 +351,40 @@ mod tests {
 
         let neither = to_json_string(&Metadata::default());
         assert!(neither.contains(r#""causationId":null"#), "{neither}");
+    }
+
+    #[test]
+    fn equality_uses_effective_causation_and_survives_round_trip() {
+        let cases = [
+            Metadata::default(),
+            Metadata::default().with_command_id("c-1"),
+            Metadata::default()
+                .with_command_id("c-1")
+                .with_principal_id("user:42")
+                .with_causation_id("c-0")
+                .with_extension("source", "cli")
+                .with_extension("empty", ""),
+            Metadata::default().with_causation_id("c-0"),
+        ];
+
+        for original in cases {
+            let decoded: Metadata = serde_json::from_str(&to_json_string(&original)).unwrap();
+            assert_eq!(original, decoded);
+            assert_eq!(decoded, original);
+        }
+
+        let defaulted = Metadata::default().with_command_id("c-1");
+        let explicit = defaulted.clone().with_causation_id("c-1");
+        assert_eq!(defaulted, explicit);
+        assert_eq!(explicit, defaulted);
+        assert_ne!(defaulted, explicit.with_causation_id("c-0"));
+        assert_ne!(
+            Metadata::default(),
+            Metadata::default().with_causation_id("c-0")
+        );
+
+        let legacy: Metadata = serde_json::from_str(r#"{"extensions":null}"#).unwrap();
+        assert_eq!(legacy, Metadata::default());
     }
 
     #[test]
