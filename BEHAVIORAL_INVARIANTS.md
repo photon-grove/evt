@@ -419,7 +419,9 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
   `CommitWithSnapshot`, `CommitStream`, out-of-band snapshot writes (`dynamo.PutSnapshot`), and
   `CompactBelow` (which writes no new rows but is refused all the same).
 - Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
-  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition.
+  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition, including the deprecated
+  `HeadStore` map and visitor APIs. `ReservedNamespacePrefixes()` returns a copy; callers cannot
+  change the authoritative namespace checks.
 - Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
   disappear from enumeration after upgrading. Explicit event and snapshot reads by ID still
   return legacy reserved-prefix streams so migration tooling can read them. `evt-doctor` reports
@@ -430,9 +432,12 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 
 ### Feature Marker (ADR-0004 C9)
 
-- Markers are bound to their events table at construction. `WithFeatureMarker` panics with
-  `*evt.FeatureMarkerTableMismatchError` for another table. Writes return that typed error if the
-  repository's events table later changes; snapshot writes and compaction enforce the same rule.
+- Create markers with `repo.FeatureMarker(supported)`, binding reads and transactional checks to
+  that repository's client and events table. `WithFeatureMarker` panics with
+  `*evt.FeatureMarkerClientMismatchError` for a different client handle (even with the same table
+  name), or `*evt.FeatureMarkerTableMismatchError` for another table. Writes return the typed
+  mismatch error if the binding no longer matches; snapshot writes and compaction enforce the
+  same rule.
 
 - A store declares the extensions it uses on the reserved `SYSTEM#FEATURES` marker row (storage
   spec, Feature Marker): `version` (bumped by exactly one per declaration transaction), `features`

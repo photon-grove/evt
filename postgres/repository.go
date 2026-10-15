@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -169,12 +170,13 @@ func WithSnapshotsTable(name string) Option {
 //
 // The default marker supports no extensions. Passing nil restores that default; it never
 // disables enforcement.
-// A marker bound to another events table panics with *evt.FeatureMarkerTableMismatchError.
+// Create markers with repo.FeatureMarker. A marker bound to another events table or client
+// panics with *evt.FeatureMarkerTableMismatchError or *evt.FeatureMarkerClientMismatchError.
 func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
 	r := *repo
 	r.features = marker
 	if r.features == nil {
-		r.features = NewFeatureMarker(r.db, r.eventsTable, nil)
+		r.features = r.FeatureMarker(nil)
 	}
 	if err := r.checkFeatureMarkerTable(); err != nil {
 		panic(err)
@@ -188,6 +190,12 @@ func (repo *Repository) checkFeatureMarkerTable() error {
 		return &evt.FeatureMarkerTableMismatchError{
 			EventsTable: repo.eventsTable, MarkerEventsTable: repo.features.eventsTable,
 		}
+	}
+
+	// Interface equality is safe only for comparable client handles (normally pointers).
+	// Fail closed for other handles rather than compare their configuration or contents.
+	if (repo.db != nil && !reflect.ValueOf(repo.db).Comparable()) || repo.db != repo.features.db {
+		return &evt.FeatureMarkerClientMismatchError{}
 	}
 
 	return nil
@@ -235,7 +243,7 @@ func NewRepository(db DB, opts ...Option) *Repository {
 
 	repo.eventsTable = strings.ToLower(repo.eventsTable)
 	repo.snapshotsTable = strings.ToLower(repo.snapshotsTable)
-	repo.features = NewFeatureMarker(db, repo.eventsTable, nil)
+	repo.features = repo.FeatureMarker(nil)
 
 	return repo
 }

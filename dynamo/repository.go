@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
@@ -44,7 +45,7 @@ func NewRepository(client Client, eventsTable string) *Repository {
 	})
 
 	return &Repository{EventsTable: eventsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true,
-		features: NewFeatureMarker(client, eventsTable, nil)}
+		features: newFeatureMarker(client, eventsTable, nil)}
 }
 
 // WithLogger returns a shallow copy of the repository with the logger updated.
@@ -122,12 +123,13 @@ func (repo *Repository) WithClock(now func() time.Time) *Repository {
 //
 // Without this option the mandatory marker check supports no extensions. A nil marker resets
 // that default; it never disables enforcement.
-// A marker bound to another events table panics with *evt.FeatureMarkerTableMismatchError.
+// Create markers with repo.FeatureMarker. A marker bound to another events table or client
+// panics with *evt.FeatureMarkerTableMismatchError or *evt.FeatureMarkerClientMismatchError.
 func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
 	r := *repo
 	r.features = marker
 	if r.features == nil {
-		r.features = NewFeatureMarker(r.client, r.EventsTable, nil)
+		r.features = r.FeatureMarker(nil)
 	}
 	if err := r.checkFeatureMarkerTable(); err != nil {
 		panic(err)
@@ -141,6 +143,12 @@ func (repo *Repository) checkFeatureMarkerTable() error {
 		return &evt.FeatureMarkerTableMismatchError{
 			EventsTable: repo.EventsTable, MarkerEventsTable: repo.features.eventsTable,
 		}
+	}
+
+	// Interface equality is safe only for comparable client handles (normally pointers).
+	// Fail closed for other handles rather than compare their configuration or contents.
+	if (repo.client != nil && !reflect.ValueOf(repo.client).Comparable()) || repo.client != repo.features.client {
+		return &evt.FeatureMarkerClientMismatchError{}
 	}
 
 	return nil

@@ -107,7 +107,7 @@ func (s *FeatureMarkerSuite) commit(repo *dynamo.Repository, entityID string) er
 func (s *FeatureMarkerSuite) Test_Commit_IncludesMarkerCheck() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewFeatureMarker(client, "test-events", nil))
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
 	// First commit: no marker row exists; validate against attribute_not_exists(pk).
 	expectManifest(client, nil)
@@ -138,7 +138,7 @@ func (s *FeatureMarkerSuite) Test_Commit_IncludesMarkerCheck() {
 func (s *FeatureMarkerSuite) Test_Commit_ConditionsOnCachedVersion() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewFeatureMarker(client, "test-events", nil))
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
 	expectManifest(client, markerItem(3, "{}", "", ""))
 
@@ -160,7 +160,7 @@ func (s *FeatureMarkerSuite) Test_Commit_ConditionsOnCachedVersion() {
 func (s *FeatureMarkerSuite) Test_Commit_RefusesUnsupportedFeature() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewFeatureMarker(client, "test-events", nil))
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
 	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
 
@@ -175,7 +175,7 @@ func (s *FeatureMarkerSuite) Test_Commit_RefusesUnsupportedFeature() {
 func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_RevalidatesAndRefuses() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewFeatureMarker(client, "test-events", nil))
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
 	// First commit validates an empty table and succeeds.
 	expectManifest(client, nil)
@@ -200,7 +200,7 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_RevalidatesAndRefuses() {
 func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewFeatureMarker(client, "test-events", evt.SupportedFeatures{"journal": 1}))
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(evt.SupportedFeatures{"journal": 1}))
 
 	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
 
@@ -231,7 +231,7 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient
 // against attribute_not_exists(pk); an update bumps by exactly one against version = :observed.
 func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 	client := dynamo_mock.NewClient()
-	marker := dynamo.NewFeatureMarker(client, "test-events", evt.SupportedFeatures{"journal": 1})
+	marker := dynamo.NewRepository(client, "test-events").FeatureMarker(evt.SupportedFeatures{"journal": 1})
 
 	// Create.
 	expectManifest(client, nil)
@@ -285,7 +285,7 @@ func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 func (s *FeatureMarkerSuite) Test_Declare_SameInstanceRevalidatesUnsupportedFeature() {
 	ctx := context.Background()
 	client := dynamo_mock.NewClient()
-	marker := dynamo.NewFeatureMarker(client, "test-events", nil)
+	marker := dynamo.NewRepository(client, "test-events").FeatureMarker(nil)
 	repo := dynamo.NewRepository(client, "test-events").WithFeatureMarker(marker)
 
 	expectManifest(client, nil)
@@ -330,7 +330,7 @@ func (s *FeatureMarkerSuite) Test_Declare_SameInstanceRevalidatesUnsupportedFeat
 func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewFeatureMarker(client, "test-events", nil))
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
 	// The snapshot read learns the entity's type.
 	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
@@ -359,7 +359,7 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
 func (s *FeatureMarkerSuite) Test_CompactBelow_ProceedsWithoutMarker() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewFeatureMarker(client, "test-events", nil))
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
 	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
 		return in.Key["pk"].(*types.AttributeValueMemberS).Value == "acct-1"

@@ -307,6 +307,10 @@ func (h *HeadStore) StreamEntityHeadsFunc(
 				continue
 			}
 
+			if evt.IsReservedEntityID(evt.EntityID(pkAttr.Value)) {
+				continue
+			}
+
 			seq, ok := numAttr(item, "headSeq")
 			if !ok {
 				continue

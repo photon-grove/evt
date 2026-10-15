@@ -20,22 +20,17 @@ const (
 	CommandOutcomeNamespacePrefix = "command-outcome#"
 )
 
-// ReservedNamespacePrefixes lists every reserved partition prefix.
-var ReservedNamespacePrefixes = []string{
-	SystemNamespacePrefix,
-	CommandOutcomeNamespacePrefix,
+// ReservedNamespacePrefixes returns a fresh list of every reserved partition prefix.
+// Mutating it cannot change the engine's namespace checks.
+func ReservedNamespacePrefixes() []string {
+	return []string{SystemNamespacePrefix, CommandOutcomeNamespacePrefix}
 }
 
 // IsReservedEntityID reports whether an entity ID falls in a reserved namespace. Matching is a
 // case-sensitive byte prefix, exactly as the storage spec pins it.
 func IsReservedEntityID(id EntityID) bool {
-	for _, prefix := range ReservedNamespacePrefixes {
-		if strings.HasPrefix(string(id), prefix) {
-			return true
-		}
-	}
-
-	return false
+	return strings.HasPrefix(string(id), SystemNamespacePrefix) ||
+		strings.HasPrefix(string(id), CommandOutcomeNamespacePrefix)
 }
 
 // ReservedEntityIdError is returned when a write path is handed an entity ID that falls in a

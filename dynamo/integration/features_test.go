@@ -60,7 +60,7 @@ func newIsolatedEventLog(ctx context.Context, t *testing.T) (*dynamo.Repository,
 	repo := dynamo.NewRepository(client, name)
 	isolatedClient = client
 
-	return repo, dynamo.NewFeatureMarker(client, name, nil)
+	return repo, repo.FeatureMarker(nil)
 }
 
 // isolatedClient holds the client of the most recently created isolated event log, so follow-up
@@ -129,8 +129,7 @@ func Test_FeatureMarker_DeclareAndVersionBump(t *testing.T) {
 	require.Equal(t, []evt.EntityType{"session"}, stored.Retention)
 
 	// The marker validates the declared set against the supported pairs.
-	supported := dynamo.NewFeatureMarker(repoClient(), repo.EventsTable,
-		evt.SupportedFeatures{"journal": 1, "journal-compaction": 1})
+	supported := repo.FeatureMarker(evt.SupportedFeatures{"journal": 1, "journal-compaction": 1})
 	require.NoError(t, supported.Validate(ctx))
 
 	// Removing an entity type from a set is a declaration in the same protocol.
@@ -159,7 +158,7 @@ func Test_FeatureMarker_CommitRefusesUnsupportedFeature(t *testing.T) {
 
 	// A Rust service declares the journal extension; this writer supports no extensions. The
 	// declaration runs through its own marker instance, the way an independent writer would.
-	otherWriter := dynamo.NewFeatureMarker(repoClient(), repo.EventsTable, nil)
+	otherWriter := repo.FeatureMarker(nil)
 	_, err := otherWriter.Declare(ctx, func(m *evt.FeatureManifest) {
 		m.Features["journal"] = 1
 	})
@@ -186,7 +185,7 @@ func Test_FeatureMarker_ChangedManifestRetries(t *testing.T) {
 	ctx := context.Background()
 	repo, marker := newIsolatedEventLog(ctx, t)
 	enforcing := repo.WithFeatureMarker(
-		dynamo.NewFeatureMarker(repoClient(), repo.EventsTable, evt.SupportedFeatures{"journal": 1}))
+		repo.FeatureMarker(evt.SupportedFeatures{"journal": 1}))
 
 	id := evt.EntityID("acct-1")
 	commitOne(ctx, t, enforcing, id, 1)

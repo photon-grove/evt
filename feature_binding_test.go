@@ -10,6 +10,43 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type bindingClient struct{ dynamo.Client }
+
+type bindingDB struct{ postgres.DB }
+
+func TestFeatureMarkerClientBinding(t *testing.T) {
+	for _, backend := range []string{"dynamo", "postgres"} {
+		t.Run(backend, func(t *testing.T) {
+			var attachWrong func()
+			if backend == "dynamo" {
+				client := &bindingClient{}
+				r := dynamo.NewRepository(client, "events")
+				marker := r.FeatureMarker(nil)
+				require.NotNil(t, r.WithFeatureMarker(marker))
+				require.NotNil(t, dynamo.NewRepository(client, "events").WithFeatureMarker(marker))
+				other := dynamo.NewRepository(&bindingClient{}, "events")
+				attachWrong = func() { other.WithFeatureMarker(marker) }
+			} else {
+				db := &bindingDB{}
+				r := postgres.NewRepository(db)
+				marker := r.FeatureMarker(nil)
+				require.NotNil(t, r.WithFeatureMarker(marker))
+				require.NotNil(t, postgres.NewRepository(db).WithFeatureMarker(marker))
+				other := postgres.NewRepository(&bindingDB{})
+				attachWrong = func() { other.WithFeatureMarker(marker) }
+			}
+
+			// Equal table names do not imply equal physical stores. Reject before any I/O.
+			defer func() {
+				mismatch, ok := recover().(*evt.FeatureMarkerClientMismatchError)
+				require.True(t, ok, "attachment must reject a marker from another client")
+				require.NotNil(t, mismatch)
+			}()
+			attachWrong()
+		})
+	}
+}
+
 func TestFeatureMarkerTableBinding(t *testing.T) {
 	for _, backend := range []string{"dynamo", "postgres"} {
 		t.Run(backend, func(t *testing.T) {
@@ -21,12 +58,14 @@ func TestFeatureMarkerTableBinding(t *testing.T) {
 			var attachWrong func()
 			if backend == "dynamo" {
 				r := dynamo.NewRepository(nil, "events")
-				attachWrong = func() { r.WithFeatureMarker(dynamo.NewFeatureMarker(nil, "events", nil)) }
+				attachWrong = func() { r.WithFeatureMarker(dynamo.NewRepository(nil, "events").FeatureMarker(nil)) }
 				r.EventsTable = "other_events"
 				repo = r
 			} else {
 				r := postgres.NewRepository(nil, postgres.WithEventsTable("events"))
-				attachWrong = func() { r.WithFeatureMarker(postgres.NewFeatureMarker(nil, "events", nil)) }
+				attachWrong = func() {
+					r.WithFeatureMarker(postgres.NewRepository(nil, postgres.WithEventsTable("events")).FeatureMarker(nil))
+				}
 				postgres.WithEventsTable("other_events")(r)
 				repo = r
 			}

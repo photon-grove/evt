@@ -915,9 +915,12 @@ arbitrarily large `n`. PostgreSQL's `LIMIT n` returns the same at-most-`n` windo
 
 ## Feature Marker
 
-A feature marker is bound to its events table at construction. Attaching a marker for another
-log is a configuration error; subsequent writes (including snapshots and compaction) must fail
-with a typed table-mismatch error if the repository's events table no longer matches the binding.
+A feature marker is created from its repository and bound to both its client handle and events
+table at construction. Marker reads and transactional checks must use that same client and table;
+matching table names alone do not identify a physical log. Attaching a marker for another client
+or table is a typed configuration error; subsequent writes (including snapshots and compaction)
+must fail with a typed mismatch error if the repository no longer matches the binding. Rust
+repositories own marker access directly rather than accepting a separately constructed marker.
 
 A store declares the extensions it uses on a single `SYSTEM#FEATURES` marker row (v0.9, C9). Any
 writer that does not support a declared feature **refuses to write** to the table.

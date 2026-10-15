@@ -44,7 +44,7 @@ func newIsolatedEventLog(ctx context.Context, t *testing.T) (*postgres.Repositor
 		}
 	})
 
-	return repo, postgres.NewFeatureMarker(newPool(ctx, t), name, nil), name
+	return repo, repo.FeatureMarker(nil), name
 }
 
 // Test_FeatureMarker exercises the feature-marker protocol end to end.
@@ -95,13 +95,13 @@ func Test_FeatureMarker(t *testing.T) {
 	})
 
 	t.Run("CommitRefusesUnsupportedFeature", func(t *testing.T) {
-		repo, marker, eventsName := newIsolatedEventLog(ctx, t)
+		repo, marker, _ := newIsolatedEventLog(ctx, t)
 
 		ns := fmt.Sprintf("feat-%d", time.Now().UnixNano())
 		entityType := evt.EntityType(ns)
 		id := evt.EntityID(ns + "-a")
 
-		enforcing := repo.WithFeatureMarker(postgres.NewFeatureMarker(newPool(ctx, t), eventsName, nil))
+		enforcing := repo.WithFeatureMarker(repo.FeatureMarker(nil))
 
 		// The first commit validates the empty table and succeeds.
 		require.NoError(t, enforcing.Commit(ctx, evt.SerializedResult{
@@ -127,14 +127,13 @@ func Test_FeatureMarker(t *testing.T) {
 	})
 
 	t.Run("ChangedManifestRetries", func(t *testing.T) {
-		repo, marker, eventsName := newIsolatedEventLog(ctx, t)
+		repo, marker, _ := newIsolatedEventLog(ctx, t)
 
 		ns := fmt.Sprintf("bump-%d", time.Now().UnixNano())
 		entityType := evt.EntityType(ns)
 		id := evt.EntityID(ns + "-a")
 
-		enforcing := repo.WithFeatureMarker(postgres.NewFeatureMarker(newPool(ctx, t), eventsName,
-			evt.SupportedFeatures{"journal": 1}))
+		enforcing := repo.WithFeatureMarker(repo.FeatureMarker(evt.SupportedFeatures{"journal": 1}))
 
 		require.NoError(t, enforcing.Commit(ctx, evt.SerializedResult{
 			Events: serializeAs(t, id, entityType, 0, &test.EntityCreated{ID: id, Value: "one"}),

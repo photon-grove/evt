@@ -49,10 +49,14 @@ type FeatureMarker struct {
 	cachedVersion int64 // the validated version; meaningful only when validated
 }
 
-// NewFeatureMarker constructs a FeatureMarker over the events table. The supported set declares
-// the (feature, formatVersion) pairs this writer models; a nil or empty set supports no
-// extensions, so a table that declares any feature refuses this writer.
-func NewFeatureMarker(client Client, eventsTable string, supported evt.SupportedFeatures) *FeatureMarker {
+// FeatureMarker constructs a marker using this repository's client and events table.
+// The supported set declares the (feature, formatVersion) pairs this writer models;
+// a nil or empty set supports no extensions.
+func (repo *Repository) FeatureMarker(supported evt.SupportedFeatures) *FeatureMarker {
+	return newFeatureMarker(repo.client, repo.EventsTable, supported)
+}
+
+func newFeatureMarker(client Client, eventsTable string, supported evt.SupportedFeatures) *FeatureMarker {
 	return &FeatureMarker{
 		client:      client,
 		eventsTable: eventsTable,
