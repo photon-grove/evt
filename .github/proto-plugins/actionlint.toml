@@ -16,8 +16,8 @@ checksum-url = "https://github.com/rhysd/actionlint/releases/download/v{version}
 unpack = true
 
 [install.arch]
-arm64 = "arm64"
-x64 = "amd64"
+aarch64 = "arm64"
+x86_64 = "amd64"
 
 [resolve]
 git-url = "https://github.com/rhysd/actionlint"
