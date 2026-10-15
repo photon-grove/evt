@@ -134,8 +134,11 @@ conflict. PostgreSQL fences cannot rely on row locks: the slot at `head + 1` doe
 and `SELECT … FOR KEY SHARE` locks only rows that were actually returned, so it cannot protect an
 absent key. Instead, every fenced stream takes the same per-entity transaction-scoped advisory
 lock the writer path already takes (`pg_advisory_xact_lock(1702261760, hashtext($1))` with the
-entity ID), then asserts `max(sequence) = head` over the stream's events — and the snapshot's
-`eventSeq <= head` — inside the commit transaction. A concurrent writer blocks on the advisory
+entity ID), then asserts `max(sequence) <= head` over the stream's events — and the snapshot's
+`eventSeq <= head` — inside the commit transaction. _Errata (E1.1):_ the events predicate is an
+upper bound, not equality, matching the storage spec — a fully compacted stream whose snapshot
+sits at the fenced head has `max(sequence) < head` and is unchanged, not moved, so equality would
+wrongly reject it. A concurrent writer blocks on the advisory
 lock rather than slipping `head + 1` past a fenced read. The in-memory backends check
 sequentially. Fences are declared per read; a fence the caller fills from outside the engine is a
 caller-stamped fence (see C5).
@@ -185,20 +188,21 @@ though it remains as a cheap pre-check on load.
 
 **Storage format.** New item shape on the shared table (same `pk`/`sk` pattern as every stream):
 
-| Attribute   | Type | Outcome item (`pk = command-outcome#<id>`)                |
-| ----------- | ---- | --------------------------------------------------------- |
-| `pk`        | S    | `command-outcome#<commandId>`                             |
-| `sk`        | N    | `1` (single row per command)                              |
-| `status`    | S    | `accepted` or `rejected` (written once, final)            |
-| `digest`    | S    | pluggable identity digest                                 |
-| `response`  | S    | stored response JSON (base64 or raw text — fixed in E1.1) |
-| `events`    | S    | event IDs the commit wrote, when any                      |
-| `rejection` | S    | serialized `Rejection` when `status = rejected`           |
-| `code`      | S    | rejection code, when rejected                             |
+| Attribute   | Type | Outcome item (`pk = command-outcome#<id>`)                                                                                                |
+| ----------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `pk`        | S    | `command-outcome#<commandId>`                                                                                                             |
+| `sk`        | N    | `1` (single row per command)                                                                                                              |
+| `status`    | S    | `accepted` or `rejected` (written once, final)                                                                                            |
+| `digest`    | S    | pluggable identity digest                                                                                                                 |
+| `response`  | S    | the response bytes, standard padded base64 (Errata (E1.1): the storage spec pins base64, so arbitrary bytes round-trip in both languages) |
+| `events`    | S    | event IDs the commit wrote, when any                                                                                                      |
+| `rejection` | S    | serialized `Rejection` when `status = rejected`                                                                                           |
+| `code`      | S    | rejection code, when rejected                                                                                                             |
 
 The row is written once, in its final state, inside the commit transaction, conditioned on
 `attribute_not_exists(pk)`. A committed transaction therefore never leaves a half-written outcome.
-The row's byte-level shape is specified in E1.1. The `command-outcome#` namespace is reserved:
+The row's byte-level shape is pinned in the storage spec (E1.1). The `command-outcome#` namespace
+is reserved:
 repository scans that walk streams skip it (C8), and it has no snapshot and never compacts.
 
 **API shape.**
@@ -245,7 +249,7 @@ this reason; Go's `NoOp` becomes accepted-without-events (C3). Rejections are st
 retried command replays the original rejection verbatim.
 
 **Storage format.** The `rejection` attribute on the outcome row (above), with a fixed JSON shape
-specified in E1.1. No other format change.
+pinned in the storage spec (E1.1). No other format change.
 
 **API shape.**
 
@@ -402,18 +406,18 @@ commit.
 
 **Storage format.**
 
-| Attribute  | Type | Feature-marker item (`pk = SYSTEM#FEATURES`)                                               |
-| ---------- | ---- | ------------------------------------------------------------------------------------------ |
-| `pk`       | S    | `SYSTEM#FEATURES`                                                                          |
-| `sk`       | N    | `0` (the events table's `sk` is numeric — the feature set is an attribute, not a sort key) |
-| `version`  | N    | bumped on every declaration or change                                                      |
-| `features` | S    | serialized feature set (the declared feature identifiers)                                  |
+| Attribute  | Type | Feature-marker item (`pk = SYSTEM#FEATURES`)                                                                                                               |
+| ---------- | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pk`       | S    | `SYSTEM#FEATURES`                                                                                                                                          |
+| `sk`       | N    | `0` (the events table's `sk` is numeric — the feature set is an attribute, not a sort key)                                                                 |
+| `version`  | N    | `1` when the row is created; each declaration transaction then adds one (Errata (E1.1): the storage spec pins the initial value and the unit of increment) |
+| `features` | S    | JSON object mapping declared feature name → its stored-format version, keys sorted (Errata (E1.1): per-feature format versions, matching the storage spec) |
 
 One manifest row, `pk = SYSTEM#FEATURES`, `sk = 0` — declared by the writer that first uses a
 feature, updated (with a `version` bump) by every later declaration; `version` is bumped again
 when an extension's storage format changes. A writer that encounters an undeclared-to-it feature
-reads the feature set and refuses. The exact attributes and the ConditionCheck shape are fixed in
-E1.1.
+reads the feature set and refuses. The exact attributes, the per-feature format versions, and the
+ConditionCheck shape are pinned in the storage spec (E1.1).
 
 ### C10 — Rebuild fence
 

@@ -79,13 +79,18 @@ The JSON form of one stored event. It is the `detail` of a stream envelope.
     "origin": null,
     "address": null,
     "region": "us-west-2",
-    "timestamp": "2026-10-12T00:00:00Z"
+    "timestamp": "2026-10-12T00:00:00Z",
+    "principalId": null,
+    "causationId": null,
+    "extensions": {}
   }
 }
 ```
 
 Keys, in order: `id`, `sequence`, `type`, `version`, `entityId`, `entityType`, `payload` (base64),
-`metadata` (an object).
+`metadata` (an object carrying every key from [Metadata](#metadata) — the example shows the
+defaults a command with none of the optional metadata produces: `principalId` and `causationId`
+`null`, `extensions` `{}`).
 
 ## Metadata
 
@@ -504,6 +509,13 @@ included — the engine gets `(command-outcome#<id>, sk = 1)`:
 - present with a **different digest** → `IdempotencyKeyReuse`;
 - absent → prepare and commit normally.
 
+Every outcome read — the pre-check above, the race resolution after a failed outcome put, and the
+ambiguous-write recovery below — is strongly consistent: on DynamoDB, `GetItem` with
+`ConsistentRead = true`, regardless of the repository's read-consistency setting. An eventually
+consistent read can return absent after the transaction applied, and the absent branch would then
+re-execute a command that already committed. PostgreSQL's reads are transactionally consistent, so
+the rule needs no flag there.
+
 A commit whose outcome put fails its condition is resolved by the same rule on the next attempt,
 never by re-preparing the command as a generic conflict ([Writes](#writes)): the losing writer's
 next attempt reads the winner's row and returns whichever branch applies.
@@ -587,7 +599,7 @@ outcomes keep the older behavior.
 
 After an indeterminate commit error (a timeout, a lost connection — the caller cannot know
 whether the transaction applied), re-read the outcome row by command ID (get
-`(command-outcome#<id>, sk = 1)`):
+`(command-outcome#<id>, sk = 1)`, strongly consistent as above):
 
 - present with the **same identity digest** → the commit won; return the stored outcome,
   including the stored response and events.
@@ -623,8 +635,9 @@ language; codes are free-form strings beyond the engine-provided ones.
 
 A `stale-fence` rejection is durable even though the condition it records is transient: exactly
 one outcome per command ID is the contract, so the old ID stays terminal and its rejection replays
-verbatim. The remedy is a new command ID, not a retry of the old one — see
-[Fence-Aware Retry](#fence-aware-retry).
+verbatim. It is persisted by the outcome-only transaction pinned in
+[Fence-Aware Retry](#fence-aware-retry), which deliberately omits the failed fences. The remedy is
+a new command ID, not a retry of the old one.
 
 ## Fence-Aware Retry
 
@@ -641,6 +654,37 @@ command: the caller re-reads the fenced streams, re-decides, and submits a **new
 old ID replays its stored `stale-fence` rejection verbatim, like any rejected outcome. This
 replaces blind whole-command retry as the default path for transactional commands; the policy
 packages remain for backend-level transient classification.
+
+The rejection is persisted by an **outcome-only transaction** that carries none of the failed
+commit's other items: no fences (they are stale by definition), no event puts, no snapshot or
+floor items, no projector operations. Like every attempt, it begins with the outcome pre-check
+read. On DynamoDB its item list is exactly:
+
+```text
+1. ConditionCheck (SYSTEM#FEATURES, sk = 0)   the feature-marker check, as in every commit
+2. ConditionCheck (SYSTEM#REBUILD, sk = 0)    the rebuild-lock check, as in every commit
+3. Put (command-outcome#<id>, sk = 1)         the rejected outcome, attribute_not_exists(pk)
+```
+
+On PostgreSQL the same shape is the feature-marker `SELECT`, the rebuild-lock assertion, and the
+outcome `INSERT`, inside one transaction. If the outcome put loses its condition, the standard
+resolution applies: the next read of the row returns the winner's outcome (same digest) or
+`IdempotencyKeyReuse` (different digest) ([Command Outcomes](#command-outcomes)). A persisted
+`stale-fence` row — command `account:rename` on `acct-1`, payload `{"name":"Grace"}`, principal
+`user:42`, whose caller-stamped fence on `referral#r-3` at head 2 went stale before the commit:
+
+```json
+{
+  "pk": "command-outcome#cmd-0005",
+  "sk": 1,
+  "status": "rejected",
+  "digest": "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b",
+  "rejection": "{\"code\":\"stale-fence\",\"message\":\"a caller-stamped fence went stale\",\"details\":null}",
+  "code": "stale-fence"
+}
+```
+
+The command never wrote; the engine persisted the rejection instead of retrying it.
 
 The same rule covers the outcome put itself: an attempt whose outcome put lost a race is never
 re-prepared as a generic conflict. The next attempt's outcome pre-check resolves it — the
@@ -688,6 +732,12 @@ prefix on `pk`.
   key condition excludes the snapshot item, so the result is the `n` highest event sequences,
   descending.
 - PostgreSQL: `SELECT … FROM evt_events WHERE entity_id = $1 ORDER BY sequence DESC LIMIT $2`.
+
+`n < 1` is a programmer error returned before any request, in both languages — nothing is read.
+The result is at most `n` events: on DynamoDB the first request sets `Limit = n`, and when a
+response returns fewer than `n` items and carries `LastEvaluatedKey` (large items can close a page
+early), the reader keeps paging until it has collected `n` items or the stream runs out;
+PostgreSQL's `LIMIT n` returns the same at-most-`n` window in one statement.
 
 ## Feature Marker
 
@@ -743,10 +793,12 @@ at re-validation an unsupported writer reads the feature set, sees a `(name, for
 it does not support, and refuses. The check costs one transaction item per commit
 ([Writes](#writes)).
 
-The declaration itself is a conditional write: creating the row asserts `attribute_not_exists(pk)`;
-updating it asserts `version = :observed`, writes the merged feature map with sorted keys, and sets
-`version = :observed + 1`. (One row per feature with distinct sort keys could not do this: adding
-a feature would neither change an already-validated row nor fail a condition against another key.)
+The declaration itself is a conditional write. Creating the row asserts `attribute_not_exists(pk)`
+and writes **`version = 1`**; updating it asserts `version = :observed`, writes the merged feature
+map with sorted keys, and sets `version = :observed + 1` — each declaration transaction adds
+exactly one to `version`, no matter how many features it adds or bumps. (One row per feature with
+distinct sort keys could not do this: adding a feature would neither change an already-validated
+row nor fail a condition against another key.)
 
 ## Rebuild Fence
 
@@ -779,14 +831,24 @@ items:
 {
   "pk": "SYSTEM#REBUILD#GENERATION",
   "sk": 0,
-  "value": 4
+  "value": 5
 }
 ```
+
+The lock row above and this generation are one active-rebuild state: the lock exists, so the
+generation is odd.
 
 The protocol. Acquire, takeover, release, and force-release are each **one `TransactWriteItems`**
 that writes both items in a single transaction, so a crash can never leave the lock and the
 generation disagreeing: the generation is **odd if and only if the lock row exists** — odd while
 a rebuild holds the lock, even when quiesced.
+
+Every attribute name an expression touches is audited against DynamoDB's reserved-word list, which
+is case-insensitive: `VALUE` and `OWNER` are reserved, so the expressions below reach them only
+through the `#value` and `#owner` aliases, each shown with its `ExpressionAttributeNames` map. The
+other attribute names in this spec's expressions — `pk`, `sk`, `seq`, `eventSeq`, `version`, and
+`leaseExpiresAt` — are not reserved and appear literally, here and in the write-condition table in
+[Writes](#writes).
 
 - **Acquire** (a fresh lock — no lock row exists):
 
@@ -794,8 +856,9 @@ a rebuild holds the lock, even when quiesced.
   Put    (SYSTEM#REBUILD, sk = 0)  owner = :newOwner, leaseExpiresAt = :now + :lease
          ConditionExpression: attribute_not_exists(pk)
   Update (SYSTEM#REBUILD#GENERATION, sk = 0)
-         SET value = if_not_exists(value, :zero) + :one
-         ConditionExpression: attribute_not_exists(value) OR value = :seenEven
+         SET #value = if_not_exists(#value, :zero) + :one
+         ConditionExpression: attribute_not_exists(#value) OR #value = :seenEven
+         ExpressionAttributeNames: {"#value": "value"}
   ```
 
   The generation condition asserts the quiesced value the caller observed: absent-or-`0` before
@@ -806,10 +869,12 @@ a rebuild holds the lock, even when quiesced.
 
   ```text
   Put    (SYSTEM#REBUILD, sk = 0)  owner = :newOwner, leaseExpiresAt = :now + :lease
-         ConditionExpression: leaseExpiresAt < :now AND owner = :observedOwner
+         ConditionExpression: leaseExpiresAt < :now AND #owner = :observedOwner
+         ExpressionAttributeNames: {"#owner": "owner"}
   Update (SYSTEM#REBUILD#GENERATION, sk = 0)
-         SET value = value + :two
-         ConditionExpression: value = :seenOdd
+         SET #value = #value + :two
+         ConditionExpression: #value = :seenOdd
+         ExpressionAttributeNames: {"#value": "value"}
   ```
 
   `:observedOwner` is the owner the caller observed when it decided to take over the expired
@@ -821,26 +886,30 @@ a rebuild holds the lock, even when quiesced.
   conditions and retries from a fresh read.
 
 - **Renew**: while it runs, the rebuild renews `leaseExpiresAt` with a conditional update
-  asserting `owner = :owner`.
+  asserting `#owner = :owner`, with `ExpressionAttributeNames` `{"#owner": "owner"}`.
 
 - **Release** — one transaction:
 
   ```text
   Delete (SYSTEM#REBUILD, sk = 0)
-         ConditionExpression: owner = :me
+         ConditionExpression: #owner = :me
+         ExpressionAttributeNames: {"#owner": "owner"}
   Update (SYSTEM#REBUILD#GENERATION, sk = 0)
-         SET value = value + :one
-         ConditionExpression: value = :seenOdd
+         SET #value = #value + :one
+         ConditionExpression: #value = :seenOdd
+         ExpressionAttributeNames: {"#value": "value"}
   ```
 
 - **Force-release** — one transaction, the same shape with the operator-named owner:
 
   ```text
   Delete (SYSTEM#REBUILD, sk = 0)
-         ConditionExpression: owner = :requestedOwner
+         ConditionExpression: #owner = :requestedOwner
+         ExpressionAttributeNames: {"#owner": "owner"}
   Update (SYSTEM#REBUILD#GENERATION, sk = 0)
-         SET value = value + :one
-         ConditionExpression: value = :seenOdd
+         SET #value = #value + :one
+         ConditionExpression: #value = :seenOdd
+         ExpressionAttributeNames: {"#value": "value"}
   ```
 
 - **Commit-time check**: every v0.9 commit includes a `ConditionCheck` asserting
@@ -858,7 +927,11 @@ scans, and neither row has a snapshot or a `ttl`.
 read and treats an **odd or changed** value as "rebuild in progress or completed — retry": the
 generation increments when a rebuild acquires the lock, changes again when a takeover replaces an
 expired lease, and increments once more when it releases after replay completes, so state built
-under a stale epoch can be rejected and re-read.
+under a stale epoch can be rejected and re-read. On DynamoDB both generation reads set
+`ConsistentRead = true`, regardless of the repository's read-consistency setting: two eventually
+consistent reads can return the same stale even value while a rebuild holds the lock, and the
+reader would accept state produced mid-rebuild. PostgreSQL's reads are transactionally consistent,
+so the rule needs no flag there.
 
 ## PostgreSQL
 
@@ -1035,10 +1108,12 @@ name.)
   two statements as the DynamoDB transaction: the conditional lock insert, update, or delete
   (fresh acquire asserts absence; takeover asserts `owner = :observedOwner AND lease_expires_at
 < :now`; release and force-release assert the owner) and the conditional generation bump
-  (`attribute_not_exists(value) OR value = :seenEven` to acquire, `value = value + :two` against
-  `value = :seenOdd` to take over, `value = value + :one` against `value = :seenOdd` to release
-  or force-release), keeping the invariant that the generation is odd if and only if the lock row
-  exists — a takeover moves odd to odd (changed), so readers pinned to the old epoch re-read.
+  (`attribute_not_exists(#value) OR #value = :seenEven` to acquire, `SET #value = #value + :two`
+  against `#value = :seenOdd` to take over, `SET #value = #value + :one` against
+  `#value = :seenOdd` to release or force-release, aliased as in
+  [Rebuild Fence](#rebuild-fence)), keeping the invariant that the generation is odd if and only
+  if the lock row exists — a takeover moves odd to odd (changed), so readers pinned to the old
+  epoch re-read.
 
 - **Feature marker**: declarations take
   `pg_advisory_xact_lock(1702261761, hashtext('{events}:features'))` — exclusive — around the
