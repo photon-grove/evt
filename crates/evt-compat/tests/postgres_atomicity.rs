@@ -236,6 +236,21 @@ async fn marker_cache_is_invalidated_by_updates_and_log_reconfiguration() {
     let (other, events, snapshots) = repository().await;
     unsupported(&other).await; // also version 1, but a different log
     let moved = repo.with_tables(&events, &snapshots).unwrap();
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("account:opened"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: "account".into(),
+        payload: b"{}".to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    assert!(matches!(
+        moved.commit(Commit::new(id.clone(), vec![event])).await,
+        Err(Error::UnsupportedFeature { .. })
+    ));
+    assert!(other.events(&id).await.unwrap().is_empty());
     assert!(matches!(
         moved.put_snapshot(&snapshot(&id)).await,
         Err(Error::UnsupportedFeature { .. })

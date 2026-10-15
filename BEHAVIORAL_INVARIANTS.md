@@ -440,6 +440,8 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 - Markers are bound to their events table at construction. `WithFeatureMarker` panics with
   `*evt.FeatureMarkerTableMismatchError` for another table. Writes return that typed error if the
   repository's events table later changes; snapshot writes and compaction enforce the same rule.
+  Rust markers are repository-owned rather than attachable: DynamoDB's table is immutable, and
+  PostgreSQL `with_tables` rebinds the marker together with the events table and clears validation.
 
 - A store declares the extensions it uses on the reserved `SYSTEM#FEATURES` marker row (storage
   spec, Feature Marker): `version` (bumped by exactly one per declaration transaction), `features`
