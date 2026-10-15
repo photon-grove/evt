@@ -30,13 +30,16 @@ var (
 // future SQL backend must satisfy.
 //
 // Deprecated: Cut in ADR-0006 (K7): raw server-side expressions leak backend types past the
-// backend-neutral contract. Use StreamAllEvents / StreamEntities with evt.StreamFilter instead.
-// It will be removed in the next minor release.
+// backend-neutral contract. There is no like-for-like in-library replacement:
+// StreamAllEvents / StreamEntities with evt.StreamFilter filter by entity type only, so move
+// richer predicates client-side or page your own Scan with a FilterExpression. It will be
+// removed in the next minor release.
 type ExpressionStreamer interface {
 	// StreamAllEventsByExpression scans all Events in the table, optionally filtered by a raw
 	// DynamoDB expression. A nil expression streams every event.
 	//
-	// Deprecated: Cut in ADR-0006 (K7). Use StreamAllEvents with evt.StreamFilter instead. It
+	// Deprecated: Cut in ADR-0006 (K7). No like-for-like replacement: StreamAllEvents with
+	// evt.StreamFilter filters by entity type only — apply richer predicates client-side. It
 	// will be removed in the next minor release.
 	StreamAllEventsByExpression(
 		ctx context.Context,
@@ -46,7 +49,8 @@ type ExpressionStreamer interface {
 	// StreamEntitiesByExpression streams reconstituted Entities, optionally filtered by a raw
 	// DynamoDB expression. A nil expression streams every entity.
 	//
-	// Deprecated: Cut in ADR-0006 (K7). Use StreamEntities with evt.StreamFilter instead. It
+	// Deprecated: Cut in ADR-0006 (K7). No like-for-like replacement: StreamEntities with
+	// evt.StreamFilter filters by entity type only — apply richer predicates client-side. It
 	// will be removed in the next minor release.
 	StreamEntitiesByExpression(
 		ctx context.Context,
@@ -97,7 +101,8 @@ func (repo *Repository) StreamAllEvents(
 // parallel across segments and pages from different segments interleave on the channel in no
 // particular order.
 //
-// Deprecated: Cut in ADR-0006 (K7). Use StreamAllEvents with evt.StreamFilter instead. It
+// Deprecated: Cut in ADR-0006 (K7). No like-for-like replacement: StreamAllEvents with
+// evt.StreamFilter filters by entity type only — apply richer predicates client-side. It
 // will be removed in the next minor release.
 func (repo *Repository) StreamAllEventsByExpression(
 	ctx context.Context,
@@ -150,7 +155,8 @@ func (repo *Repository) StreamEntities(
 // for rebuild/diagnostic flows (see evt.RebuildProjections), not hot read paths. For large tables,
 // pair it with WithScanSegments to parallelize the read.
 //
-// Deprecated: Cut in ADR-0006 (K7). Use StreamEntities with evt.StreamFilter instead. It
+// Deprecated: Cut in ADR-0006 (K7). No like-for-like replacement: StreamEntities with
+// evt.StreamFilter filters by entity type only — apply richer predicates client-side. It
 // will be removed in the next minor release.
 func (repo *Repository) StreamEntitiesByExpression(
 	ctx context.Context,

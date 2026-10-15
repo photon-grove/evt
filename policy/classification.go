@@ -19,8 +19,10 @@ const (
 
 // Classifier maps an error into a retry/failure class.
 //
-// Deprecated: Cut in ADR-0006 (K6): the pluggable classifier hook is cut; the built-in Classify
-// mapping stays (B16). It will be removed in the next minor release.
+// Planned for removal with the core reshape (ADR-0006, K6): custom retry decisions have no
+// replacement until C5 lands. It carries no Deprecated notice yet because Execute and
+// ExecuteWithRetry still accept Config.Classify, so the notice would flag the only supported
+// way to mark backend errors transient.
 type Classifier func(error) Class
 
 // Classify maps errors already wrapped with ClassifiedError into their stored

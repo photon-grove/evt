@@ -37,8 +37,10 @@ type Config struct {
 	Jitter      func(time.Duration) time.Duration
 	Sleep       func(context.Context, time.Duration) error
 	IsRetryable func(error) bool
-	// Deprecated: Cut in ADR-0006 (K6): the pluggable classifier hook is cut; the built-in
-	// Classify mapping stays (B16). It will be removed in the next minor release.
+	// Planned for removal with the core reshape (ADR-0006, K6): custom retry decisions have no
+	// replacement until C5 lands. It carries no Deprecated notice yet because the built-in
+	// Classify mapping only recognizes errors wrapped with ClassifiedError, so a custom
+	// classifier is the only supported way to mark raw backend errors transient.
 	Classify Classifier
 }
 

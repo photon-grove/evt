@@ -14,8 +14,11 @@ import (
 // This path rejects SeedEntity because it cannot safely rebuild compacted streams. Use
 // evt.RebuildProjections for snapshot-seeded replay.
 //
-// Deprecated: Cut in ADR-0006 (K3): use evt.RebuildProjections (snapshot-seeded, B11) instead.
-// It will be removed in the next minor release.
+// Deprecated: Cut in ADR-0006 (K3): removed without a bounded-memory in-library replacement.
+// evt.RebuildProjections is the supported rebuild entry point, but its StreamEntities source
+// buffers every matched event; for large tables, page your own DynamoDB Query/Scan with
+// LastEvaluatedKey and drive evt.RebuildProjectionsFromStream yourself. It will be removed in
+// the next minor release.
 func (repo *Repository) RebuildProjectionsByQuery(
 	ctx context.Context,
 	opts StreamByQueryOptions,

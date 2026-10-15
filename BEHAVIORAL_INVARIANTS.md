@@ -303,6 +303,11 @@ type EventUpcaster interface {
 
 ### ByCommandID Sort
 
+*Deprecated in v0.9.0 ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md), K7):*
+`evt.ByCommandID` is cut and removed in the next minor release. It has no in-library
+replacement — write your own comparator when you need deterministic batch ordering. The
+pre-v0.9 behavior:
+
 - Sorts `[]SerializedEvent` by `Metadata.CommandID` if both events have one
 - Falls back to sorting by `ID` (EventID) if either is missing CommandID
 - Used for deterministic event ordering in batch operations

@@ -41,9 +41,11 @@ default (a single sequential scan) for small tables.
 
 *Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K3):*
 `StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` are
-cut — use `StreamEntities` plus `evt.RebuildProjectionsFromStream` instead, or
-`evt.RebuildProjections` with `WithScanSegments`. The section below documents the deprecated
-path for pre-v0.9 readers.
+cut — **removed without a bounded-memory in-library replacement**. `StreamEntities` (the source
+behind `evt.RebuildProjections` and `evt.RebuildProjectionsFromStream`) buffers every matched
+event, so for large tables page your own DynamoDB Query/Scan with `LastEvaluatedKey` (one
+partition query per entity keeps memory bounded) and feed `evt.RebuildProjectionsFromStream`
+yourself. The section below documents the deprecated path for pre-v0.9 readers.
 
 Because `StreamEntities` must regroup an unordered scan, it holds the matched
 events in memory until the scan finishes. For large event logs, use the dynamo
