@@ -218,8 +218,17 @@ func (m *FeatureMarker) readManifest(ctx context.Context, db DB) (*evt.FeatureMa
 // commits compare the stored version against the cache, and any difference (a row that changed, or
 // one that appeared after the writer validated an empty table) fails the check.
 func (m *FeatureMarker) checkInTx(ctx context.Context, tx pgx.Tx) error {
+	_, err := m.checkManifestTx(ctx, tx)
+
+	return err
+}
+
+// checkManifestTx runs the commit-time feature-marker check inside the writer's transaction and
+// returns the manifest it validated against, so callers can consult durable declarations (the
+// retention set, for instance) that this instance did not configure.
+func (m *FeatureMarker) checkManifestTx(ctx context.Context, tx pgx.Tx) (*evt.FeatureManifest, error) {
 	if err := m.lockShared(ctx, tx); err != nil {
-		return err
+		return nil, err
 	}
 
 	m.mu.Lock()
@@ -227,32 +236,32 @@ func (m *FeatureMarker) checkInTx(ctx context.Context, tx pgx.Tx) error {
 
 	manifest, err := m.readManifestTx(ctx, tx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if !m.validated {
 		if manifest != nil {
 			if err := manifest.Validate(m.supported); err != nil {
-				return err
+				return nil, err
 			}
 
 			m.cacheVersionLocked(manifest.Version, true)
 
-			return nil
+			return manifest, nil
 		}
 
 		m.cacheVersionLocked(0, false)
 
-		return nil
+		return nil, nil
 	}
 
 	switch {
 	case manifest == nil && m.hasMarker:
 		m.invalidateLocked()
 
-		return transientFeatureChanged("the marker row was removed")
+		return nil, transientFeatureChanged("the marker row was removed")
 	case manifest == nil:
-		return nil
+		return nil, nil
 	case !m.hasMarker || manifest.Version != m.cachedVersion:
 		// The manifest changed under the writer: re-validate now — an unsupported pair refuses the
 		// writer outright — and classify the mismatch as transient so the commit is retried against
@@ -261,16 +270,16 @@ func (m *FeatureMarker) checkInTx(ctx context.Context, tx pgx.Tx) error {
 		m.invalidateLocked()
 
 		if err := manifest.Validate(m.supported); err != nil {
-			return err
+			return nil, err
 		}
 
 		m.cacheVersionLocked(manifest.Version, true)
 
-		return transientFeatureChanged(fmt.Sprintf(
+		return manifest, transientFeatureChanged(fmt.Sprintf(
 			"validated version %d, store now declares %d", cachedVersion, manifest.Version))
 	}
 
-	return nil
+	return manifest, nil
 }
 
 // lockShared fences declarations until the calling transaction commits or rolls back.
