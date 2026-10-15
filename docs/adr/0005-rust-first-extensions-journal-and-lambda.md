@@ -13,19 +13,18 @@ Rust-first) and plan decision D4 (the feature-marker row enforces declared exten
 languages, because the commit path and the storage contract cannot tolerate drift. Beyond the core,
 the next capabilities on the plan are:
 
-- **X1 — the journal**: scope allocations persisted in event metadata (so rebuild is
-  order-independent), scope counters plus journal rows written in the commit, `high_watermark` /
-  `page` reads with gap detection, a configurable row-size guard with a pre-check, and
-  storage-contention retry. A scoped, paginated side-log for large in-commit payloads that must
-  survive compaction.
+- **X1 — the journal**: per-scope ordered, replayable delivery rows written in the commit — scope
+  allocations persisted in event metadata (so rebuild is order-independent), scope counters,
+  `high_watermark` / `page` reads with gap detection, a configurable row-size guard with a
+  pre-check, and storage-contention retry.
 - **X2 — journal compaction**: canonical chunks, a manifest, a lease with force release, an audit
   trail, range delete, and a `410 Gone` handoff descriptor so readers discover a moved page.
 - **X3 — `photon-evt-lambda`**: a crate for the Lambda side of an evt deployment — DynamoDB Streams
   `NEW_IMAGE` decode, event-type filter helpers matching EventBridge Pipes / ESM filter patterns,
   `KEYS_ONLY` journal wake-up decode, and partial-batch-failure helpers.
 
-Who needs these first? The first consumer is a Rust game service (plan E6): its engine writes
-journal scopes and its Lambdas consume streams — all in Rust. No Go consumer needs the journal in
+Who needs these first? The first known consumer (plan E6) is a Rust service: the writers and
+consumers of the new rows are all in Rust. No Go consumer needs the journal in
 the port window.
 Plan decision D2 says: **extensions are Rust-first.** This ADR records what that trade costs and
 how the framework defends against it.
@@ -76,9 +75,10 @@ Rust-first is justified because:
    (plan decision D4 — extension features are declared on the table and enforced at commit time;
    [ADR 0004](0004-core-reshape-multi-stream-transactions-and-outcomes.md) C9)
    is the enforcement backstop: a writer that first uses an extension declares the feature on the
-   row, and any writer that does not support a declared feature **refuses to write to the table**.
+   marker row — every declaration bumps the marker's `version` in the same conditional write — and
+   any writer that does not support a declared feature **refuses to write to the table**.
    Enforcement is per commit, not cached-and-forgotten: every commit carries a condition on the
-   marker version, so a writer cannot write past a declaration it has not validated. A Go
+   marker `version`, so a writer cannot write past a declaration it has not validated. A Go
    repository that does not know the journal, pointed at a journal-using table, fails on its first
    commit after the declaration exists instead of corrupting the extension tables.
 3. **Missing capabilities are ported into evt, never hand-rolled in apps.** The standing rule of

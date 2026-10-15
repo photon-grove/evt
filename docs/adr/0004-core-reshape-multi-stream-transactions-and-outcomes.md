@@ -128,8 +128,13 @@ stream whose repository has compaction disabled (E1.1 pins the exact rule). Each
 counts toward the 100-item limit, like the existing floor check
 ([`dynamo/commit.go`](../../dynamo/commit.go), `buildFloorChecks`). A `ConditionalCheckFailed` on a
 fence is a conflict (another writer moved the stream), classified and retried like an event-put
-conflict. PostgreSQL expresses the same check as a `SELECT … FOR KEY SHARE`-strength existence
-assert on the row at `head + 1` inside the commit transaction; the in-memory backends check
+conflict. PostgreSQL fences cannot rely on row locks: the slot at `head + 1` does not exist at fence time,
+and `SELECT … FOR KEY SHARE` locks only rows that were actually returned, so it cannot protect an
+absent key. Instead, every fenced stream takes the same per-entity transaction-scoped advisory
+lock the writer path already takes (`pg_advisory_xact_lock(1702261760, hashtext($1))` with the
+entity ID), then asserts `max(sequence) = head` over the stream's events — and the snapshot's
+`eventSeq <= head` — inside the commit transaction. A concurrent writer blocks on the advisory
+lock rather than slipping `head + 1` past a fenced read. The in-memory backends check
 sequentially. Fences are declared per read; a fence the caller fills from outside the engine is a
 caller-stamped fence (see C5).
 
@@ -141,13 +146,19 @@ into a snapshot is no longer checked and the repeat applies twice — documented
 `crates/evt/README.md` and the spec's known differences. Downstream services hand-roll
 reservations, receipts, and per-entity dedupe instead.
 
-**Decision.** The framework owns durable, global command outcomes. A commit that carries a command
-ID writes a row on a global `command-outcome#<id>` stream in the same transaction as the events:
+**Decision.** The framework owns durable, global command outcomes. A commit on a store with
+outcomes enabled writes a row on a global `command-outcome#<id>` stream in the same transaction as
+the events:
 
-- **Identity digest**: pluggable — the caller supplies a digest of the command's identity
-  (canonical request bytes). A repeat with the same digest returns the stored outcome; a repeat
-  with a different digest is an `IdempotencyKeyReuse` rejection. The default digest is the command
-  ID alone.
+- **Command ID required**: a store with outcomes enabled requires a command ID on every command.
+  A missing ID is a programmer error returned before the commit — no outcome row, no events.
+  Stores built without outcomes keep today's behaviour.
+- **Identity digest**: pluggable — the caller may supply a digest function over the command's
+  identity. A repeat with the same digest returns the stored outcome; a repeat with a different
+  digest is an `IdempotencyKeyReuse` rejection. The default digest is SHA-256 over a canonical
+  encoding of (command type, target stream IDs, canonical command payload JSON, principal), so two
+  different requests that reuse one command ID carry different digests and the
+  `IdempotencyKeyReuse` branch is reachable without a custom digester.
 - **Stored response**: the outcome row stores the command's response payload so a retried command
   returns the original answer, not just "accepted".
 - **Status**: `accepted` or `rejected` (C4), written **once, in its final state** — digest,
@@ -221,10 +232,15 @@ command cannot know why the first attempt failed.
 Rejection { code, message, details }
 ```
 
-Domain error enums map onto rejection codes (Rust: `From<DomainError> for Rejection`; Go: a
-`Rejectioner` interface or a code registry). Go's existing `NotFound`/`BadCommand`/`BadEvent`
-become rejection codes; Go's `NoOp` becomes accepted-without-events (C3). Rejections are stored by
-C3, so a retried command replays the original rejection verbatim.
+Only **domain rejections** — the aggregate's own refusal: not-found, invalid, conflict-by-rule —
+become durable rejected outcomes. Internal failures — event encoding errors, bad events
+(`BadEventError`), storage errors — are returned as errors and **write no outcome**: after the
+underlying bug or deployment mismatch is fixed, a retry starts clean instead of replaying a
+durable rejection forever. Domain error enums map onto rejection codes (Rust:
+`From<DomainError> for Rejection`; Go: a `Rejectioner` interface or a code registry). Go's
+existing `NotFound`/`BadCommand` become rejection codes; `BadEvent` stays an error for exactly
+this reason; Go's `NoOp` becomes accepted-without-events (C3). Rejections are stored by C3, so a
+retried command replays the original rejection verbatim.
 
 **Storage format.** The `rejection` attribute on the outcome row (above), with a fixed JSON shape
 specified in E1.1. No other format change.
@@ -347,8 +363,15 @@ outcome stream would pollute enumerations, heads, and rebuilds.
 - `latest(n)`: a bounded, newest-first read of an entity's last `n` events (descending), for
   "recent activity" reads that must not replay a long stream.
 - **Reserved namespaces**: the `SYSTEM#` partition namespace (C9, C10) and the
-  `command-outcome#` namespace (C3) are skipped by enumeration, heads, and rebuild scans by
-  default. Streams in a reserved namespace are engine-managed; they are never ordinary aggregates.
+  `command-outcome#` namespace (C3) are reserved for engine-managed rows; enumeration, heads, and
+  rebuild scans skip them, and they are never ordinary aggregates.
+  - **Commit-time refusal**: a writer refuses an entity ID that starts with a reserved prefix
+    (`SYSTEM#`, `command-outcome#`) at commit time, before any write.
+  - **Upgrade check**: entity IDs were never restricted before, so a pre-existing stream such as
+    `SYSTEM#account` would become silently invisible to enumeration, heads, and rebuild after
+    upgrading. `evt-doctor` gains a check that reports pre-existing streams whose IDs fall in a
+    reserved namespace, and the upgrade note requires renaming (migrating) such streams before
+    enabling the v0.9 features. Real stored data is never silently skipped.
 
 **Storage format.** The namespaces themselves are the format change (C3, C9, C10 define the row
 shapes). `latest(n)` is a read-pattern addition (a descending query bounded by `n` on DynamoDB, an
@@ -361,28 +384,34 @@ does not know about a Rust-first extension (D2: extensions are Rust-first; D4: t
 enforces declared extensions) would happily write to a table that depends on
 it, silently violating its invariants (for example, compacting a journal without its manifest).
 
-**Decision.** A store declares the extensions it uses on a `SYSTEM#FEATURES` marker row. Any
-writer that does not support a declared feature **refuses to write** to the table. The marker row
-carries a numeric `version`; a writer validates the declared feature set once, at first write, and
-caches the version it validated. **Every commit then includes a `ConditionCheck` on the marker** —
-the version must still equal the cached one, or `attribute_not_exists(pk)` when no marker row
-existed at validation. A declaration added after the writer validated changes the marker version,
-fails the commit as a conflict, and forces re-validation — at which point an unsupported writer
-reads the row set, sees the feature it does not model, and refuses. The cost is one extra
-transaction item per commit.
+**Decision.** A store declares the extensions it uses on a single `SYSTEM#FEATURES` marker row.
+Any writer that does not support a declared feature **refuses to write** to the table. The marker
+row carries the feature set and a numeric `version`; a writer validates the declared feature set
+once, at first write, and caches the version it validated. **Every commit then includes a
+`ConditionCheck` on the marker** — the version must still equal the cached one, or
+`attribute_not_exists(pk)` when no marker row existed at validation. Declaring a feature — or
+changing one — **increments the `version` in the same conditional write that updates the feature
+set**, so every writer whose commits condition on the old version fails and re-validates; a writer
+that validated before the declaration cannot keep committing. (One row per feature with distinct
+sort keys could not do this: adding a feature would neither change an already-validated row nor
+fail a condition against another key.) At re-validation an unsupported writer reads the feature
+set, sees the feature it does not model, and refuses. The cost is one extra transaction item per
+commit.
 
 **Storage format.**
 
-| Attribute | Type | Feature-marker item (`pk = SYSTEM#FEATURES`)                                 |
-| --------- | ---- | ---------------------------------------------------------------------------- |
-| `pk`      | S    | `SYSTEM#FEATURES`                                                            |
-| `sk`      | S    | the feature identifier, one row per declared feature (for example `journal`) |
-| `version` | N    | feature format version                                                       |
+| Attribute  | Type | Feature-marker item (`pk = SYSTEM#FEATURES`)                                               |
+| ---------- | ---- | ------------------------------------------------------------------------------------------ |
+| `pk`       | S    | `SYSTEM#FEATURES`                                                                          |
+| `sk`       | N    | `0` (the events table's `sk` is numeric — the feature set is an attribute, not a sort key) |
+| `version`  | N    | bumped on every declaration or change                                                      |
+| `features` | S    | serialized feature set (the declared feature identifiers)                                  |
 
-One row per feature, `pk = SYSTEM#FEATURES`, `sk = <feature>` — declared by the writer that first
-uses the feature; `version` is the feature format version, bumped when the extension's storage
-format changes. A writer that encounters an undeclared-to-it feature reads the row set and
-refuses. The exact attributes and the ConditionCheck shape are fixed in E1.1.
+One manifest row, `pk = SYSTEM#FEATURES`, `sk = 0` — declared by the writer that first uses a
+feature, updated (with a `version` bump) by every later declaration; `version` is bumped again
+when an extension's storage format changes. A writer that encounters an undeclared-to-it feature
+reads the feature set and refuses. The exact attributes and the ConditionCheck shape are fixed in
+E1.1.
 
 ### C10 — Rebuild fence
 
@@ -395,25 +424,36 @@ hand with a writers-quiesced flag passed through its call graph — a promise, n
 fenced by the framework, not by app-level flags):
 
 - **The lock row and the generation counter are separate items.** The lock row (`SYSTEM#REBUILD`,
-  `sk = 0`) carries the **owner token**; the generation counter (`SYSTEM#REBUILD#GENERATION`,
-  `sk = 0`) is a separate item holding a numeric monotonic `value`.
+  `sk = 0`) carries the **owner token** and a lease expiry (`leaseExpiresAt`); the generation
+  counter (`SYSTEM#REBUILD#GENERATION`, `sk = 0`) is a separate item holding a numeric monotonic
+  `value`.
 - **Rebuilds** acquire the lock conditionally (`attribute_not_exists` on the lock row), bump the
   generation, replay, then release the lock.
+- **Lease and recovery**: the rebuild renews the lease (`leaseExpiresAt`) while it runs. A failed
+  rebuild's lock is recoverable: another rebuild may **take over** only with a conditional write
+  that asserts the observed `owner` and an expired `leaseExpiresAt`; an operator **force-release**
+  path also exists and bumps the generation. Until then, commits are still refused while any lock
+  row exists — an expired lock blocks writes until taken over or force-released. That is the
+  deliberate tradeoff: commits stay safe while any lock row exists, at the cost of waiting out a
+  crashed rebuild until takeover or force-release.
 - **Commit-time check**: every commit includes a `ConditionCheck` asserting
   `attribute_not_exists(pk)` on the lock row — a commit is refused whenever any rebuild holds the
   lock, regardless of generation. A commit that races a rebuild is rejected as a conflict and
   retried with a fresh load (C5 semantics).
-- **Reader epoch check**: readers that need consistency read the generation before and after the
-  read and retry if it changed; view readers can reject state built under a stale epoch.
+- **Reader epoch check**: the generation increments when a rebuild **acquires** the lock and
+  **again when it releases** after replay completes, so the value is odd while a rebuild is in
+  progress and even when quiesced. Readers that need consistency read the generation before and
+  after the read and treat an **odd or changed** value as "rebuild in progress or completed —
+  retry"; view readers can reject state built under a stale epoch.
 
 **Storage format.**
 
-| Attribute | Type | Rebuild-lock item (`pk = SYSTEM#REBUILD`) |
-| --------- | ---- | ----------------------------------------- |
-| `pk`      | S    | `SYSTEM#REBUILD`                          |
-| `sk`      | N    | `0`                                       |
-| `owner`   | S    | owner token of the current lock holder    |
-| `expires` | N    | lease expiry, epoch seconds               |
+| Attribute        | Type | Rebuild-lock item (`pk = SYSTEM#REBUILD`) |
+| ---------------- | ---- | ----------------------------------------- |
+| `pk`             | S    | `SYSTEM#REBUILD`                          |
+| `sk`             | N    | `0`                                       |
+| `owner`          | S    | owner token of the current lock holder    |
+| `leaseExpiresAt` | N    | lease expiry, epoch seconds               |
 
 | Attribute | Type | Generation item (`pk = SYSTEM#REBUILD#GENERATION`) |
 | --------- | ---- | -------------------------------------------------- |
@@ -459,9 +499,12 @@ core golden fixtures as today. The suite, not the ADR, is the executable contrac
   [ADR 0006](0006-parity-policy-and-feature-cuts.md)) are deprecated in the same release and
   deleted in the next minor.
 - **The transaction budget gets tighter.** Fences, floor checks, outcome rows, and the
-  feature-marker condition all count against the 100-item DynamoDB transaction limit. The commit
-  planner must account for them and split or reject oversized commits deliberately, not
-  accidentally.
+  feature-marker condition all count against the 100-item DynamoDB transaction limit — the item
+  budget is: events + fences + snapshot checks + the outcome row + the feature-marker and
+  rebuild-lock checks + projector operations. An atomic multi-stream commit that needs more than
+  100 items fails with a typed `CommitTooLarge` error **before any write**; it is **never split** —
+  splitting would break C1's atomicity guarantee, because an error after an earlier chunk commits
+  would leave only part of the aggregate set updated.
 - **PostgreSQL commits gain a view-write path.** evt defines no PostgreSQL view schema — apps own
   their view tables — so C7 means the Go PostgreSQL backend starts executing projector operations
   inside the commit transaction (it ignores `res.Transaction` today), as the Rust backend already
@@ -470,7 +513,9 @@ core golden fixtures as today. The suite, not the ADR, is the executable contrac
   become observable, which is the point — but callers that treat empty commits as free no-ops will
   now pay an outcome row write.
 - **Reserved namespaces are permanent.** `SYSTEM#` and `command-outcome#` partitions must never
-  collide with entity IDs. Entity IDs beginning with these prefixes are rejected at commit.
+  collide with entity IDs. Entity IDs beginning with these prefixes are rejected at commit, and
+  pre-existing streams in a reserved namespace must be renamed (migrated) before enabling the
+  v0.9 features — `evt-doctor` reports them (C8), so no stored data is silently skipped.
 - **Spec and fixtures first.** No code lands before `docs/spec/storage-format.md` carries the
   byte-level shapes (plan E1.1); both implementations then pass the regenerated fixtures and the
   shared conformance suite.
