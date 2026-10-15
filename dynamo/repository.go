@@ -147,7 +147,7 @@ func (repo *Repository) checkFeatureMarkerTable() error {
 
 	// Interface equality is safe only for comparable client handles (normally pointers).
 	// Fail closed for other handles rather than compare their configuration or contents.
-	if (repo.client != nil && !reflect.ValueOf(repo.client).Comparable()) || repo.client != repo.features.client {
+	if !comparableHandle(repo.client) || !comparableHandle(repo.features.client) || repo.client != repo.features.client {
 		return &evt.FeatureMarkerClientMismatchError{}
 	}
 
@@ -184,4 +184,10 @@ func (repo *Repository) loggerOrDefault() *slog.Logger {
 	}
 
 	return repo.logger
+}
+
+// comparableHandle reports whether a client handle can be compared with == without panicking; nil is
+// comparable. Non-comparable handles (for example structs holding slices) fail the binding closed.
+func comparableHandle(client Client) bool {
+	return client == nil || reflect.ValueOf(client).Comparable()
 }

@@ -15,6 +15,24 @@ type bindingClient struct{ dynamo.Client }
 
 type bindingDB struct{ postgres.DB }
 
+// valueClient is a non-comparable client value: == on it would panic at runtime.
+type valueClient struct {
+	dynamo.Client
+	tags []string
+}
+
+func TestFeatureMarkerRejectsNonComparableMarkerClient(t *testing.T) {
+	marker := dynamo.NewRepository(valueClient{tags: []string{"a"}}, "events").FeatureMarker(nil)
+	repo := dynamo.NewRepository(&bindingClient{}, "events")
+
+	defer func() {
+		mismatch, ok := recover().(*evt.FeatureMarkerClientMismatchError)
+		require.True(t, ok, "a non-comparable marker client must fail closed, not panic in ==")
+		require.NotNil(t, mismatch)
+	}()
+	repo.WithFeatureMarker(marker)
+}
+
 func TestFeatureMarkerClientBinding(t *testing.T) {
 	for _, backend := range []string{"dynamo", "postgres"} {
 		t.Run(backend, func(t *testing.T) {
