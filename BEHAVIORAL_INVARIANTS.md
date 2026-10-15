@@ -443,8 +443,8 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
   same conditional write that updates the feature set, so every writer cached at the old version
   fails, re-validates, and retries (typed via `evt.ErrFeatureManifestChanged`, classified
   transient); a re-validation that finds an unsupported pair refuses outright.
-- Enforcement is unconditional. Default repositories support no extensions;
-  `WithFeatureMarker` customizes the supported set, never disables the check. PostgreSQL holds
+- Enforcement is unconditional in Go and Rust. Default repositories support no extensions;
+  Go's `WithFeatureMarker` customizes the supported set, never disables the check. PostgreSQL holds
   the shared feature advisory lock across validation and writes in the same transaction.
   Unquoted table names are lowercase-canonicalized, including the feature-lock key.
 - Declaration invalidates cached writer validation; declaring a feature does not imply support.
@@ -498,9 +498,11 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 - Deletes events with `sequence` in `[1, throughSequence]`
 - Refuses with `evt.ErrCompactionUncovered` unless a snapshot covers the range
   (`snapshot.EventSequence >= throughSequence`)
-- Never deletes the `sk = 0` snapshot; `throughSequence < 1` is a no-op; idempotent
-- DynamoDB: key-only range query + `BatchWriteItem` deletes (25/batch) with bounded
-  `UnprocessedItems` retries
+- Never deletes the `sk = 0` snapshot; `throughSequence < 1` is a no-op for ordinary entity IDs;
+  reserved IDs are refused even for a no-op range. Compaction is idempotent.
+- DynamoDB: key-only range query + `TransactWriteItems` batches (up to 99 deletes and one
+  marker check); marker changes trigger bounded re-reading and re-validation before retrying.
+  PostgreSQL holds the shared feature lock across validation and deletion in one transaction.
 
 ### Delete (build-tagged `//go:build !prod`)
 

@@ -105,8 +105,9 @@ impl PostgresRepository {
         check_table_names(events_table, snapshots_table)
             .map_err(|message| Error::InvalidConfig(format!("postgres: {message}")))?;
 
-        self.events_table = events_table.to_owned();
-        self.snapshots_table = snapshots_table.to_owned();
+        self.events_table = events_table.to_ascii_lowercase();
+        self.snapshots_table = snapshots_table.to_ascii_lowercase();
+        *self.validated_marker() = None;
 
         Ok(self)
     }
@@ -534,6 +535,13 @@ impl Repository for PostgresRepository {
             .await
             .map_err(statement_error)?;
 
+        let lock_key = features_lock_key(&self.events_table);
+        tx.execute(FEATURES_LOCK_SHARED, &[&lock_key])
+            .await
+            .map_err(statement_error)?;
+        let manifest = self.read_manifest_in(&tx).await?;
+        self.check_manifest(manifest.as_ref())?;
+
         let written = self
             .upsert_snapshot(&tx, &SnapshotRow::from_snapshot(snapshot))
             .await?;
@@ -547,14 +555,32 @@ impl Repository for PostgresRepository {
         entity_id: &EntityId,
         through: EventSequence,
     ) -> Result<usize, Error> {
+        features::check_not_reserved(entity_id)?;
+
         if through < EventSequence(1) {
             return Ok(0);
         }
 
-        features::check_not_reserved(entity_id)?;
+        let mut client = self.pool.get().await.map_err(pool_error)?;
+        let tx = client.transaction().await.map_err(Error::backend)?;
+        let lock_key = features_lock_key(&self.events_table);
+        tx.execute(FEATURES_LOCK_SHARED, &[&lock_key])
+            .await
+            .map_err(statement_error)?;
+        let manifest = self.read_manifest_in(&tx).await?;
+        if let Some(manifest) = &manifest {
+            manifest.validate_supported()?;
+        }
 
-        let snapshot = self.snapshot(entity_id).await?;
-        let covered = snapshot.as_ref().map(|snapshot| snapshot.event_sequence);
+        let sql = format!(
+            "SELECT entity_type, event_sequence FROM {} WHERE entity_id = $1",
+            self.snapshots_table
+        );
+        let snapshot = tx
+            .query_opt(&sql, &[&entity_id.as_str()])
+            .await
+            .map_err(Error::backend)?;
+        let covered = snapshot.as_ref().map(|row| EventSequence(row.get(1)));
         if covered.is_none_or(|covered| covered < through) {
             return Err(Error::CompactionUncovered {
                 entity_id: entity_id.clone(),
@@ -563,31 +589,26 @@ impl Repository for PostgresRepository {
             });
         }
 
-        // The manifest is durable, shared state: a process that never registered the projector
-        // refuses all the same. The check runs before anything is deleted.
-        let manifest = self.read_manifest().await?;
-        if let Some(manifest) = &manifest {
-            manifest.validate_supported()?;
-
-            if let Some(entity_type) = snapshot.as_ref().map(|snapshot| &snapshot.entity_type)
-                && manifest.is_history_dependent(entity_type)
-            {
+        // Keep the shared lock through the delete and COMMIT: a completed declaration must
+        // never be followed by deletion authorized against the previous manifest.
+        if let (Some(manifest), Some(snapshot)) = (&manifest, &snapshot) {
+            let entity_type = EntityType::new(snapshot.get::<_, String>(0));
+            if manifest.is_history_dependent(&entity_type) {
                 return Err(Error::HistoryDependentProjection {
-                    entity_type: entity_type.clone(),
+                    entity_type,
                     entity_id: entity_id.clone(),
                 });
             }
         }
-
-        let client = self.pool.get().await.map_err(pool_error)?;
         let sql = format!(
             "DELETE FROM {} WHERE entity_id = $1 AND sequence >= 1 AND sequence <= $2",
             self.events_table
         );
-        let deleted = client
+        let deleted = tx
             .execute(&sql, &[&entity_id.as_str(), &through.0])
             .await
             .map_err(Error::backend)?;
+        tx.commit().await.map_err(Error::backend)?;
 
         Ok(deleted as usize)
     }

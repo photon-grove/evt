@@ -20,7 +20,10 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
 - `latest(n)` reads a stream's last `n` events newest-first. The `SYSTEM#` and `command-outcome#`
   namespaces are reserved for engine rows: writes to them are refused, entity heads skip them,
   and a `SYSTEM#FEATURES` marker row declares the extensions a table uses — a writer that does
-  not support a declared feature refuses to write.
+  not support a declared feature refuses to write, including maintenance snapshots. Declaration
+  invalidates the writer's cache; it never grants feature support. Durable history-dependent
+  declarations fence compaction under the same marker check (DynamoDB) or transaction lock
+  (PostgreSQL).
 
 ## Example
 
@@ -162,7 +165,11 @@ The table needs a string partition key `pk` and a number sort key `sk`, the same
 ## PostgreSQL
 
 Enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
-`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`.
+`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`. Engine relations use the
+reserved `__evt_` infix; schema setup migrates the old `{events}_entity_type_idx` index to
+`{events}__evt_entity_type_idx`. Configured unquoted names are lowercase-canonicalized, with a
+34-byte events-table limit and a 58-byte snapshots-table limit. Both names must avoid `__evt_`
+and any collision among the tables and derived relations.
 
 ```rust,ignore
 use photon_evt::postgres::PostgresRepository;

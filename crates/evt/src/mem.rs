@@ -231,6 +231,9 @@ impl Repository for MemRepository {
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
         features::check_not_reserved(&snapshot.entity_id)?;
 
+        let manifest = self.manifest_lock();
+        self.check_manifest(manifest.as_ref())?;
+
         let mut streams = self.lock();
         let stream = streams.entry(snapshot.entity_id.clone()).or_default();
 
@@ -252,11 +255,10 @@ impl Repository for MemRepository {
         entity_id: &EntityId,
         through: EventSequence,
     ) -> Result<usize, Error> {
+        features::check_not_reserved(entity_id)?;
         if through < EventSequence(1) {
             return Ok(0);
         }
-
-        features::check_not_reserved(entity_id)?;
 
         let manifest = self.manifest_lock();
         if let Some(manifest) = manifest.as_ref() {
@@ -333,7 +335,9 @@ impl FeatureMarker for MemRepository {
         next.version = stored.as_ref().map_or(1, |manifest| manifest.version + 1);
         *stored = Some(next);
 
-        // Every writer compares versions on its next commit, so no cache needs invalidating.
+        // Declaring is not validation: the resulting manifest may be unsupported by this writer.
+        *self.validated() = None;
+
         Ok(())
     }
 }

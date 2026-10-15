@@ -1015,11 +1015,13 @@ async fn reserved_namespaces<R: Repository>(repo: &R) -> CaseResult {
             |err| matches!(err, Error::ReservedEntityId { .. }),
         )?;
 
-        expect_err(
-            repo.compact_below(id, EventSequence(1)).await,
-            &format!("compact_below at {id}"),
-            |err| matches!(err, Error::ReservedEntityId { .. }),
-        )?;
+        for through in [-1, 0, 1] {
+            expect_err(
+                repo.compact_below(id, EventSequence(through)).await,
+                &format!("compact_below({through}) at {id}"),
+                |err| matches!(err, Error::ReservedEntityId { .. }),
+            )?;
+        }
     }
 
     let heads = repo.entity_heads(None).await?;
@@ -1407,7 +1409,7 @@ where
         clear_manifest(repo, other).await,
     );
     record(
-        "a declaration bumps the version and the cached writer refuses, then revalidates",
+        "a declaration refuses commits and snapshots from both writers, then revalidates",
         declaration_bumps_and_refuses(repo, other).await,
     );
     record(
@@ -1496,31 +1498,50 @@ where
         "the declaration"
     );
 
-    // The cached version no longer matches, and the declared pair is unsupported: the writer
-    // refuses, and the refused commit writes nothing.
-    expect_err(
-        stream.commit(repo, stream.events(6..=6), None).await,
-        "committing to a table that declares journal",
-        |err| {
-            matches!(
-                err,
-                Error::UnsupportedFeature {
-                    feature,
-                    version: 1
-                } if feature == "journal"
-            )
-        },
-    )?;
+    // Declaring never counts as validation, either on the declaring handle or one whose
+    // cached validation predates the declaration. Maintenance snapshots obey the same refusal.
+    let before_snapshot = repo.snapshot(&stream.id).await?;
+    for writer in [other, repo] {
+        let unsupported = |err: &Error| matches!(err, Error::UnsupportedFeature { feature, version: 1 } if feature == "journal");
+        expect_err(
+            stream.commit(writer, stream.events(6..=6), None).await,
+            "committing to a table that declares journal",
+            unsupported,
+        )?;
+        expect_err(
+            writer.put_snapshot(&stream.snapshot(2, 5, "{}")).await,
+            "writing a snapshot to a table that declares journal",
+            unsupported,
+        )?;
+    }
     ensure_eq!(
         repo.events(&stream.id).await?,
         stream.events(1..=5),
-        "the refused commit wrote nothing"
+        "the refused commits wrote nothing"
     );
+    ensure_eq!(
+        repo.snapshot(&stream.id).await?,
+        before_snapshot,
+        "the refused snapshots did not advance the floor"
+    );
+
+    // A declaration touching only a durable set must not bless existing unsupported features.
+    let retained = stream.entity_type.as_str().to_owned();
+    repo.update_manifest(|manifest| {
+        manifest.retention.insert(retained.clone());
+    })
+    .await?;
+    expect_err(
+        stream.commit(repo, stream.events(6..=6), None).await,
+        "committing after a durable-set-only declaration on an unsupported log",
+        |err| matches!(err, Error::UnsupportedFeature { .. }),
+    )?;
 
     // Removing the feature revalidates the writer, which then commits again.
     other
         .update_manifest(|manifest| {
             manifest.features.remove("journal");
+            manifest.retention.remove(&retained);
         })
         .await?;
     stream.commit(repo, stream.events(6..=6), None).await?;

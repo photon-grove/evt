@@ -10,14 +10,11 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::config::AsyncSleep;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::{
-    self as sdk, ConditionCheck, DeleteRequest, Put, TransactWriteItem, WriteRequest,
-};
+use aws_sdk_dynamodb::types::{self as sdk, ConditionCheck, Delete, Put, TransactWriteItem};
 
 use crate::aggregate::{Aggregate, Projector};
 use crate::error::{BoxError, Error};
@@ -43,10 +40,7 @@ const MAX_MARKER_REVALIDATIONS: usize = 8;
 /// changed the row first.
 const MAX_DECLARATION_RETRIES: usize = 8;
 
-const BATCH_DELETE_SIZE: usize = 25;
-const MAX_UNPROCESSED_RETRIES: u32 = 8;
-const UNPROCESSED_BASE_DELAY: Duration = Duration::from_millis(50);
-const UNPROCESSED_MAX_DELAY: Duration = Duration::from_secs(2);
+const COMPACTION_BATCH_SIZE: usize = MAX_TRANSACTION_ITEMS - 1;
 
 /// A DynamoDB-backed [`Repository`]. Clones share the client.
 #[derive(Debug)]
@@ -459,66 +453,94 @@ impl DynamoRepository {
         }
     }
 
-    /// Waits before retrying unprocessed items, using the SDK's sleep implementation so the crate
-    /// stays runtime-agnostic. Without one configured, it retries immediately.
-    async fn back_off(&self, attempt: u32) {
-        if let Some(sleep) = self.client.config().sleep_impl() {
-            let delay = UNPROCESSED_BASE_DELAY.saturating_mul(2u32.saturating_pow(attempt));
-            sleep.sleep(delay.min(UNPROCESSED_MAX_DELAY)).await;
+    /// Compaction never uses the writer cache: history dependence is durable shared state.
+    /// Pin the exact observed version (or absence) into every delete transaction.
+    async fn compaction_check(
+        &self,
+        snapshot: &SerializedSnapshot,
+    ) -> Result<TransactWriteItem, Error> {
+        let manifest = self.read_manifest().await?;
+        let observed = features::validate_marker(manifest.as_ref())?;
+        if manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.is_history_dependent(&snapshot.entity_type))
+        {
+            return Err(Error::HistoryDependentProjection {
+                entity_type: snapshot.entity_type.clone(),
+                entity_id: snapshot.entity_id.clone(),
+            });
         }
+
+        let check = ConditionCheck::builder()
+            .table_name(&self.table)
+            .key("pk", s(features::FEATURES_ID))
+            .key("sk", n(features::FEATURES_SORT_KEY));
+        // Unlike commit's compatibility check, compaction pins presence as well as version.
+        let check = match observed {
+            ValidatedMarker::Version(version) => check
+                .condition_expression("version = :observed")
+                .expression_attribute_values(":observed", n(version)),
+            ValidatedMarker::Absent => check.condition_expression("attribute_not_exists(pk)"),
+        };
+
+        Ok(TransactWriteItem::builder()
+            .condition_check(check.build().map_err(Error::backend)?)
+            .build())
     }
 
-    async fn delete_keys(
+    async fn delete_compaction_keys(
         &self,
         keys: Vec<HashMap<String, sdk::AttributeValue>>,
+        snapshot: &SerializedSnapshot,
+        mut check: TransactWriteItem,
     ) -> Result<usize, Error> {
         let mut deleted = 0;
 
-        for chunk in keys.chunks(BATCH_DELETE_SIZE) {
-            let mut pending = chunk
+        for chunk in keys.chunks(COMPACTION_BATCH_SIZE) {
+            let deletes = chunk
                 .iter()
                 .map(|key| {
-                    let request = DeleteRequest::builder()
-                        .set_key(Some(key.clone()))
-                        .build()
-                        .map_err(Error::backend)?;
-                    Ok(WriteRequest::builder().delete_request(request).build())
+                    Ok(TransactWriteItem::builder()
+                        .delete(
+                            Delete::builder()
+                                .table_name(&self.table)
+                                .set_key(Some(key.clone()))
+                                .build()
+                                .map_err(Error::backend)?,
+                        )
+                        .build())
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
 
-            let total = pending.len();
-
             for attempt in 0.. {
-                let output = self
+                let mut items = vec![check.clone()];
+                items.extend(deletes.iter().cloned());
+                match self
                     .client
-                    .batch_write_item()
-                    .request_items(&self.table, pending.clone())
+                    .transact_write_items()
+                    .set_transact_items(Some(items))
                     .send()
                     .await
-                    .map_err(sdk_error)?;
+                {
+                    Ok(_) => break,
+                    Err(err) => {
+                        if cancellation_reasons(&err).first().copied().flatten()
+                            != Some("ConditionalCheckFailed")
+                        {
+                            return Err(sdk_error(err));
+                        }
 
-                pending = output
-                    .unprocessed_items
-                    .and_then(|mut unprocessed| unprocessed.remove(&self.table))
-                    .unwrap_or_default();
-
-                if pending.is_empty() {
-                    break;
+                        // Re-read before retrying the unchanged batch, refusing a declaration
+                        // that completed after validation but before the delete.
+                        check = self.compaction_check(snapshot).await?;
+                        if attempt >= MAX_MARKER_REVALIDATIONS {
+                            return Err(Error::Transient("compaction marker kept changing".into()));
+                        }
+                    }
                 }
-                if attempt >= MAX_UNPROCESSED_RETRIES {
-                    return Err(Error::Transient(
-                        format!(
-                            "compaction: {} items still unprocessed after {MAX_UNPROCESSED_RETRIES} retries",
-                            pending.len()
-                        )
-                        .into(),
-                    ));
-                }
-
-                self.back_off(attempt).await;
             }
 
-            deleted += total;
+            deleted += chunk.len();
         }
 
         Ok(deleted)
@@ -655,24 +677,43 @@ impl Repository for DynamoRepository {
 
         let item = wire::snapshot_item(snapshot, self.ttl_for(&snapshot.entity_type))?;
 
-        let result = self
-            .client
-            .put_item()
-            .table_name(&self.table)
-            .set_item(Some(to_sdk_item(&item)))
-            .condition_expression(wire::PUT_SNAPSHOT_CONDITION)
-            .expression_attribute_values(":new", n(snapshot.event_sequence.0))
-            .send()
-            .await;
+        let snapshot_put = put(
+            &self.table,
+            item,
+            Some(wire::PUT_SNAPSHOT_CONDITION),
+            &[(":new", n(snapshot.event_sequence.0))],
+        )?;
 
-        match result {
-            Ok(_) => Ok(true),
-            Err(SdkError::ServiceError(err))
-                if matches!(err.err(), PutItemError::ConditionalCheckFailedException(_)) =>
+        let mut revalidations = 0;
+        loop {
+            let cached = self.ensure_manifest_validated().await?;
+            let items = vec![self.marker_check(cached)?, snapshot_put.clone()];
+            match self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
             {
-                Ok(false)
+                Ok(_) => return Ok(true),
+                Err(err) => {
+                    let codes = cancellation_reasons(&err);
+                    // A failed marker takes precedence over a stale snapshot condition.
+                    if codes.first().copied().flatten() == Some("ConditionalCheckFailed") {
+                        self.invalidate_manifest();
+                        if revalidations >= MAX_MARKER_REVALIDATIONS {
+                            return Err(sdk_error(err));
+                        }
+                        revalidations += 1;
+                        continue;
+                    }
+                    if codes.get(1).copied().flatten() == Some("ConditionalCheckFailed") {
+                        return Ok(false);
+                    }
+
+                    return Err(sdk_error(err));
+                }
             }
-            Err(err) => Err(sdk_error(err)),
         }
     }
 
@@ -681,11 +722,11 @@ impl Repository for DynamoRepository {
         entity_id: &EntityId,
         through: EventSequence,
     ) -> Result<usize, Error> {
+        features::check_not_reserved(entity_id)?;
+
         if through < EventSequence(1) {
             return Ok(0);
         }
-
-        features::check_not_reserved(entity_id)?;
 
         // Strongly consistent regardless of `with_consistent_read`, like the key query below.
         let snapshot = self.read_snapshot(entity_id, true).await?;
@@ -698,28 +739,16 @@ impl Repository for DynamoRepository {
             });
         }
 
-        // The manifest is durable, shared state: a process that never registered the projector
-        // refuses all the same. The check runs before anything is deleted.
-        let manifest = self.read_manifest().await?;
-        if let Some(manifest) = &manifest {
-            manifest.validate_supported()?;
-
-            if let Some(entity_type) = snapshot.as_ref().map(|snapshot| &snapshot.entity_type)
-                && manifest.is_history_dependent(entity_type)
-            {
-                return Err(Error::HistoryDependentProjection {
-                    entity_type: entity_type.clone(),
-                    entity_id: entity_id.clone(),
-                });
-            }
-        }
+        // Coverage above guarantees there is a durable snapshot.
+        let snapshot = snapshot.expect("covered snapshot");
+        let check = self.compaction_check(&snapshot).await?;
 
         let keys = self.event_keys_through(entity_id, through).await?;
         if keys.is_empty() {
             return Ok(0);
         }
 
-        self.delete_keys(keys).await
+        self.delete_compaction_keys(keys, &snapshot, check).await
     }
 
     async fn entity_heads(
@@ -728,6 +757,12 @@ impl Repository for DynamoRepository {
     ) -> Result<BTreeMap<EntityId, EventSequence>, Error> {
         let mut heads = BTreeMap::new();
         let mut start = None;
+        // Reserved partitions are engine-managed rows, never ordinary aggregates (v0.9, C8).
+        let mut filter =
+            "NOT begins_with(pk, :system) AND NOT begins_with(pk, :outcome)".to_owned();
+        if entity_type.is_some() {
+            filter.push_str(" AND entityType = :et");
+        }
 
         loop {
             let mut scan = self
@@ -736,17 +771,13 @@ impl Repository for DynamoRepository {
                 .table_name(&self.table)
                 .consistent_read(self.consistent_read)
                 .projection_expression("pk, sk, eventSeq")
-                // The reserved SYSTEM# and command-outcome# partitions are engine-managed rows,
-                // never ordinary aggregates (v0.9, C8).
-                .filter_expression("NOT begins_with(pk, :system) AND NOT begins_with(pk, :outcome)")
+                .filter_expression(&filter)
                 .expression_attribute_values(":system", s(SYSTEM_PREFIX))
                 .expression_attribute_values(":outcome", s(COMMAND_OUTCOME_PREFIX))
                 .set_exclusive_start_key(start);
 
             if let Some(entity_type) = entity_type {
-                scan = scan
-                    .filter_expression("entityType = :et")
-                    .expression_attribute_values(":et", s(entity_type.as_str()));
+                scan = scan.expression_attribute_values(":et", s(entity_type.as_str()));
             }
 
             let page = scan.send().await.map_err(sdk_error)?;
@@ -1206,6 +1237,114 @@ mod tests {
             .clone();
         assert_eq!(absent.condition_expression(), "attribute_not_exists(pk)");
         assert!(absent.expression_attribute_values().is_none());
+    }
+
+    #[test]
+    fn transaction_items_match_shared_feature_marker_vectors() {
+        use serde_json::{Value, json};
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compat/fixtures/feature-marker.json");
+        let fixture: Value = serde_json::from_slice(
+            &std::fs::read(&path)
+                .unwrap_or_else(|err| panic!("read shared fixture {}: {err}", path.display())),
+        )
+        .unwrap();
+        for case in fixture["commits"].as_array().unwrap() {
+            let input = &case["input"];
+            let event = &input["event"];
+            let text = |key: &str| event[key].as_str().unwrap();
+            let event = SerializedEvent {
+                id: text("id").into(),
+                sequence: EventSequence(event["sequence"].as_i64().unwrap()),
+                event_type: text("type").into(),
+                version: crate::EventVersion(event["version"].as_i64().unwrap()),
+                entity_id: text("entityId").into(),
+                entity_type: text("entityType").into(),
+                payload: text("payload").as_bytes().to_vec(),
+                metadata: serde_json::from_str(text("metadataJson")).unwrap(),
+            };
+            let view = wire::view_item(
+                &event.entity_type,
+                &event.entity_id,
+                input["viewState"].as_str().unwrap().as_bytes(),
+            )
+            .unwrap();
+            let mut commit =
+                Commit::new(event.entity_id.clone(), vec![event]).with_operations([put(
+                    input["viewsTable"].as_str().unwrap(),
+                    view,
+                    None,
+                    &[],
+                )
+                .unwrap()]);
+            if !input["snapshot"].is_null() {
+                let snapshot = &input["snapshot"];
+                commit = commit.with_snapshot(crate::NewSnapshot::new(
+                    snapshot["entityType"].as_str().unwrap(),
+                    EventSequence(snapshot["sequence"].as_i64().unwrap()),
+                    snapshot["payload"].as_str().unwrap().as_bytes(),
+                ));
+            }
+            let declaration = input["markerDeclaration"].as_str().unwrap();
+            let observed = if declaration.is_empty() {
+                ValidatedMarker::Absent
+            } else {
+                let declared = fixture["declarations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|case| case["name"] == declaration)
+                    .unwrap();
+                let version = declared["output"]["dynamoItem"]["version"]["N"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                ValidatedMarker::Version(version)
+            };
+            let mut repository = offline_repository();
+            repository.table = input["eventsTable"].as_str().unwrap().into();
+            let actual = repository
+                .transaction_items(&commit, Some(observed))
+                .unwrap()
+                .iter()
+                .map(|action| {
+                    let (mut value, condition, values, names) = if let Some(put) = action.put() {
+                        assert!(put.return_values_on_condition_check_failure().is_none());
+                        (
+                            json!({"operation": "Put", "tableName": put.table_name(),
+                            "item": from_sdk_item(put.item())}),
+                            put.condition_expression(),
+                            put.expression_attribute_values(),
+                            put.expression_attribute_names(),
+                        )
+                    } else {
+                        let check = action.condition_check().expect("only puts and checks");
+                        assert!(check.return_values_on_condition_check_failure().is_none());
+                        (
+                            json!({"operation": "ConditionCheck", "tableName": check.table_name(),
+                            "key": from_sdk_item(check.key())}),
+                            Some(check.condition_expression()),
+                            check.expression_attribute_values(),
+                            check.expression_attribute_names(),
+                        )
+                    };
+                    if let Some(condition) = condition {
+                        value["conditionExpression"] = json!(condition);
+                    }
+                    if let Some(values) = values {
+                        value["expressionAttributeValues"] = json!(from_sdk_item(values));
+                    }
+                    if let Some(names) = names {
+                        value["expressionAttributeNames"] = json!(names);
+                    }
+                    assert!(action.delete().is_none() && action.update().is_none());
+                    value
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(json!(actual), case["output"], "{}", case["name"]);
+        }
     }
 
     #[test]

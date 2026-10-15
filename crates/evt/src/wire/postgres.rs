@@ -50,7 +50,17 @@ CREATE TABLE IF NOT EXISTS {events_table} (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (entity_id, sequence)
 );
-CREATE INDEX IF NOT EXISTS {events_table}_entity_type_idx ON {events_table} (entity_type);
+CREATE INDEX IF NOT EXISTS {events_table}__evt_entity_type_idx ON {events_table} (entity_type);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_index
+        WHERE indexrelid = to_regclass('{events_table}_entity_type_idx')
+          AND indrelid = '{events_table}'::regclass
+    ) THEN
+        DROP INDEX {events_table}_entity_type_idx;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS {snapshots_table} (
     entity_id      text   PRIMARY KEY,
@@ -180,7 +190,7 @@ const RESERVED_KEYWORDS: &[&str] = &[
 ];
 
 /// The longest snapshot table name allowed. PostgreSQL truncates identifiers to 63 bytes, and the
-/// longest name derived from a snapshot table, `{snapshots_table}_pkey`, adds 6.
+/// longest name derived from a snapshot table, `{snapshots_table}_pkey`, adds 5.
 pub const MAX_SNAPSHOTS_TABLE_NAME_LEN: usize = 63 - "_pkey".len();
 
 /// Takes the per-entity transaction lock (`$1` is the entity ID) that serializes commits and
@@ -202,7 +212,7 @@ pub const FEATURES_LOCK_EXCLUSIVE: &str = "SELECT pg_advisory_xact_lock(17022617
 /// The advisory-lock key of an events table's feature marker, derived from the configured events
 /// table name so two event logs in one database never block each other's engine rows.
 pub fn features_lock_key(events_table: &str) -> String {
-    format!("{events_table}:features")
+    format!("{}:features", events_table.to_ascii_lowercase())
 }
 
 /// Reports whether a table name is safe to use unquoted: it matches `^[A-Za-z_][A-Za-z0-9_]*$`,

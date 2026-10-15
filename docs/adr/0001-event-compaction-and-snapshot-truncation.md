@@ -131,6 +131,13 @@ consumer repos). Backends opt in by implementing the methods; `dynamo` and `mem`
   `docs/spec/storage-format.md`. On DynamoDB the floor check is one more transaction item per
   commit without a snapshot (per entity, for `CommitStream`). It is billed as a write and counts
   toward the 100-item limit.
+- **Amendment (v0.9, C9): history-dependent projectors forbid compaction.** An aggregate snapshot
+  does not preserve the commit history such a projector needs. Compaction therefore checks the
+  durable feature manifest and refuses entity types in `historyDependent`. PostgreSQL holds the
+  shared feature advisory lock across that validation and all deletes in one transaction.
+  DynamoDB replaces the original batch deletes with transactions of at most 99 deletes plus a
+  check on the observed marker version (or absence), re-reading and re-validating on changes.
+  A completed declaration fences an in-flight compactor; a pre-delete manifest read alone does not.
 
 ## Backward compatibility
 
