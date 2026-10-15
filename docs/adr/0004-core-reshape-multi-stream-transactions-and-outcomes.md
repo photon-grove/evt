@@ -123,8 +123,10 @@ load re-derives the head as the larger of the highest event sequence and the sna
 `head + 1` makes the fence redundant and it is omitted.
 
 **Storage format.** The fence is two `ConditionCheck` transaction items — the slot
-`(pk, sk = head+1)` and the snapshot item `(pk, sk = 0)`; the snapshot check may be omitted for a
-stream whose repository has compaction disabled (E1.1 pins the exact rule). Each bills as a write and
+`(pk, sk = head+1)` and the snapshot item `(pk, sk = 0)`. The snapshot companion is always
+included: any store instance can snapshot the stream and `CompactBelow` compacts whatever a
+durable snapshot covers, so no interval configuration durably disables compaction (E1.1 pins the
+exact rule). Each bills as a write and
 counts toward the 100-item limit, like the existing floor check
 ([`dynamo/commit.go`](../../dynamo/commit.go), `buildFloorChecks`). A `ConditionalCheckFailed` on a
 fence is a conflict (another writer moved the stream), classified and retried like an event-put
