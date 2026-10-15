@@ -62,6 +62,10 @@ func (repo *Repository) PutSnapshot(
 	snapshotSequence evt.EventSequence,
 	eventSequence evt.EventSequence,
 ) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if err := evt.CheckReservedEntityID(entityID); err != nil {
 		return err
 	}

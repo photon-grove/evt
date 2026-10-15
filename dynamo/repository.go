@@ -122,14 +122,28 @@ func (repo *Repository) WithClock(now func() time.Time) *Repository {
 //
 // Without this option the mandatory marker check supports no extensions. A nil marker resets
 // that default; it never disables enforcement.
+// A marker bound to another events table panics with *evt.FeatureMarkerTableMismatchError.
 func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
 	r := *repo
 	r.features = marker
 	if r.features == nil {
 		r.features = NewFeatureMarker(r.client, r.EventsTable, nil)
 	}
+	if err := r.checkFeatureMarkerTable(); err != nil {
+		panic(err)
+	}
 
 	return &r
+}
+
+func (repo *Repository) checkFeatureMarkerTable() error {
+	if repo.features.eventsTable != repo.EventsTable {
+		return &evt.FeatureMarkerTableMismatchError{
+			EventsTable: repo.EventsTable, MarkerEventsTable: repo.features.eventsTable,
+		}
+	}
+
+	return nil
 }
 
 // ttlFor returns the Unix-epoch expiry for an event or snapshot of the given entity type, or 0 when

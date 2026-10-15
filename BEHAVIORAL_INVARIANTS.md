@@ -428,13 +428,18 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 - Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
   scans (`StreamEntitiesFromSnapshots`) skip every reserved partition.
 - Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
-  become silently invisible after upgrading. `evt-doctor` reports pre-existing streams in reserved
-  namespaces — on DynamoDB by scanning the table (exempting engine-written rows: the feature
+  disappear from enumeration after upgrading. Explicit event and snapshot reads by ID still
+  return legacy reserved-prefix streams so migration tooling can read them. `evt-doctor` reports
+  pre-existing streams in reserved namespaces — on DynamoDB by scanning the table (exempting engine-written rows: the feature
   marker, the rebuild fence, and command outcomes), on PostgreSQL with the two spec queries against
   the configured events and snapshots tables — and the upgrade note requires renaming (migrating)
   such streams before enabling the v0.9 features.
 
 ### Feature Marker (ADR-0004 C9)
+
+- Markers are bound to their events table at construction. `WithFeatureMarker` panics with
+  `*evt.FeatureMarkerTableMismatchError` for another table. Writes return that typed error if the
+  repository's events table later changes; snapshot writes and compaction enforce the same rule.
 
 - A store declares the extensions it uses on the reserved `SYSTEM#FEATURES` marker row (storage
   spec, Feature Marker): `version` (bumped by exactly one per declaration transaction), `features`

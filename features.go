@@ -105,6 +105,18 @@ func (e *UnsupportedFeatureError) Error() string {
 	)
 }
 
+// FeatureMarkerTableMismatchError reports a marker bound to a different event log.
+// Marker bindings are immutable; construct a new marker when changing event tables.
+type FeatureMarkerTableMismatchError struct {
+	EventsTable       string
+	MarkerEventsTable string
+}
+
+// Error returns the error message string.
+func (e *FeatureMarkerTableMismatchError) Error() string {
+	return fmt.Sprintf("feature marker belongs to events table %q, not %q", e.MarkerEventsTable, e.EventsTable)
+}
+
 // HistoryDependentProjectionError is returned when compaction is refused for an entity type whose
 // commit-wide projectors are history-dependent (declared in the feature manifest's
 // historyDependent set). The refusal holds in every process that opens the log, whether or not it
