@@ -361,6 +361,15 @@ func (repo *Repository) CommitStream(
 	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],
 ) []error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		// Drain the channel so producers never block on a refused stream.
+		for range channel { //nolint:revive // Drain without reading so producers never block.
+			continue
+		}
+
+		return []error{err}
+	}
+
 	var errs []error
 
 	for r := range channel {
