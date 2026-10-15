@@ -345,7 +345,15 @@ backend executes the projector's operations inside the commit transaction, as th
 already does with `PgStatement` ([`crates/evt/src/postgres.rs`](../../crates/evt/src/postgres.rs));
 the Go PostgreSQL backend today ignores `res.Transaction`
 ([`postgres/repository.go`](../../postgres/repository.go)), so this is new backend work — a
-view-row execution path, not a port of an existing one.
+view-row execution path, not a port of an existing one. _Errata (E1.1):_ the spec pins the
+**current-state contract**: a commit-wide projector's rows are a deterministic function of the
+commit's events plus the post-commit aggregate states, and every commit-wide projector implements
+a snapshot-seed entry point that produces the rows for an aggregate's snapshot state. Rebuild
+over a compacted prefix seeds rows from the snapshot via that entry point, then replays the
+remaining commits grouped by `commitId`. Projections that need the full history (for example
+feeds) must declare it: repositories refuse `CompactBelow` for entity types with a
+history-dependent projector registered (typed error), and a rebuild that finds such a stream
+compacted fails with `CompactionUncovered`.
 
 **API shape.**
 
@@ -453,8 +461,11 @@ fenced by the framework, not by app-level flags):
   crashed rebuild until takeover or force-release.
 - **Commit-time check**: every commit includes a `ConditionCheck` asserting
   `attribute_not_exists(pk)` on the lock row — a commit is refused whenever any rebuild holds the
-  lock, regardless of generation. A commit that races a rebuild is rejected as a conflict and
-  retried with a fresh load (C5 semantics).
+  lock, regardless of generation. _Errata (E1.1):_ a commit that races a rebuild fails its check
+  with `RebuildInProgress`, a control-row classification like the feature-marker check: it is
+  **never** routed through the fence path — it does not produce a stale-fence rejection and is
+  **not** retried with a fresh load under C5 — but is retried after the lock is taken over or
+  force-released. The storage spec pins this in "Writes" and "Fence-aware retry".
 - **Reader epoch check**: the generation increments when a rebuild **acquires** the lock and
   **again when it releases** after replay completes, so the value is odd while a rebuild is in
   progress and even when quiesced. Readers that need consistency read the generation before and

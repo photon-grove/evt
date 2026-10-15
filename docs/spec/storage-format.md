@@ -237,6 +237,21 @@ A commit whose budget exceeds 100 fails with a typed `CommitTooLarge` error **be
 It is never split: splitting would break atomicity, because an error after an earlier chunk
 commits would leave only part of the aggregate set updated.
 
+The item count is not the only limit. `TransactWriteItems` also caps the whole request at
+4,000,000 bytes in aggregate and every item at 400 KB, so a commit of individually valid items —
+twenty 250 KB event items, say — would still be rejected by DynamoDB while PostgreSQL could
+commit the same data. The preflight therefore covers bytes as well as items, and it runs in both
+languages regardless of backend, so `CommitTooLarge` fires identically everywhere. The estimator
+mirrors DynamoDB's item-size rules: an item's size is the sum over its attributes of the
+attribute name's UTF-8 byte length plus the value's encoded byte length (strings as UTF-8,
+numbers as their decimal text, binary as raw bytes), and the request's size is the sum of its
+items' sizes. The preflight compares the estimates against 95% of the backend limits —
+**3,800,000 bytes** in aggregate and **380,000 bytes** for any single item, a 5% safety margin
+for key-encoding and rounding differences. It covers every item the transaction carries: the
+event puts, the snapshot and floor items, the projector operations, the fenced checks, the
+outcome row, and the two control checks. A commit over either byte budget fails with the same
+typed `CommitTooLarge` error before any write, and is never split.
+
 | Write                                  | Condition                                             |
 | -------------------------------------- | ----------------------------------------------------- |
 | event put                              | `attribute_not_exists(sk)`                            |
@@ -378,16 +393,36 @@ transaction as the events that produced it.
 **Commit boundaries (v0.9, C6, C7).** The only durable record of which events belong to one
 commit is the events' metadata: every event of a commit carries the same `commitId`
 ([Metadata](#metadata)), including the events a multi-stream commit writes to different streams.
-A wipe-and-rebuild replays the log through the commit-wide projectors regrouped by `commitId`:
-each group's events — ordered by stream ID bytewise, then by sequence, the same pinned order as
-the commit's transaction — form one `CommitView`, and the projector runs once per group, exactly
-as it did at commit time.
 
-The projector purity contract makes that reconstruction faithful: a commit-wide projector's
-output may depend only on the events of that commit plus the post-commit aggregate states, never
-on cross-commit ordering or on anything the projector would see differently when the same commit
-is replayed later. A projector that broke the contract would produce rows at commit time that
-the rebuild cannot reproduce.
+**Current-state rows (v0.9, C7).** A commit-wide projector produces **current-state rows**: every
+row it puts is a deterministic function of that commit's events plus the post-commit aggregate
+states — the state of each written stream after the commit — never of earlier commits' rows or
+event history. A row encodes what the projection says _now_, not what happened once, so the same
+rows can be produced again without replaying the events that preceded the commit. This is what
+makes a rebuild faithful even over a compacted log: compaction deletes event rows, so any
+projector whose output depended on a deleted commit's payloads could not be reproduced after a
+wipe-and-rebuild.
+
+**Snapshot-seed entry point (v0.9, C7).** Every commit-wide projector therefore implements a
+second entry point alongside the per-commit one: seeded with an aggregate's snapshot state, it
+produces the rows that stand in for every commit the snapshot covers — the same rows those
+commits' projector runs produced, evaluated at the snapshot's state. A wipe-and-rebuild runs per
+stream: it seeds the projector's rows from the stream's snapshot (nothing, when the stream has
+none), then replays the commits after the snapshot's `eventSequence`, grouped by `commitId` —
+each group's events, ordered by stream ID bytewise then by sequence (the same pinned order as the
+commit's transaction), form one `CommitView`, and the projector runs once per group, exactly as
+it did at commit time. Compaction does not change this algorithm: the seed stands in for
+whatever prefix compaction deleted.
+
+**History-dependent projectors (v0.9, C7).** A projector whose rows cannot be derived from a
+snapshot state plus the commits after it — one that needs the full event history, such as an
+append-only feed — must **declare that at registration**. Two refusals enforce the declaration,
+both before any write:
+
+- `CompactBelow` refuses an entity type with a history-dependent projector registered, with a
+  typed error: compacting that entity's streams would destroy the history the projector needs.
+- A wipe-and-rebuild that finds such a stream already compacted fails with `CompactionUncovered`
+  ([Compaction](#compaction)): the snapshot seed cannot stand in for the deleted commits.
 
 Pre-v0.9 events, whose metadata has no `commitId`, replay as single-event commits — one
 `CommitView` per event, in stream and sequence order — which reproduces the per-entity projector
@@ -428,6 +463,16 @@ whatever a durable snapshot covers. So an interval-0 stream can still be compact
 reader's head, and the companion closes the ABA regardless. When a fenced stream is **written in
 the same commit**, both checks are omitted: the event put at `head + 1` and that stream's floor
 or snapshot condition supersede them.
+
+**Retention conflicts with fences (v0.9, C2).** Fences are refused outright for entity types
+configured with retention (a positive `ttl`), with a typed `RetentionConflict` error returned
+before any write — in both languages, regardless of backend. Retention deletes event items by
+TTL — possibly the item at `head + 1`, possibly an event and its TTL-bearing snapshot together —
+without a newer snapshot ever covering them, and the deletion reopens the fenced slot: both
+checks can pass while the stream has in fact moved. The snapshot companion closes the compaction
+ABA but not this one, because TTL deletion leaves no successor snapshot behind. A
+retention-enabled stream is therefore an append-only log with an expiring tail, not a fenced
+input; a caller that needs a fenced read uses a stream without retention.
 
 A `ConditionalCheckFailed` on either check is an optimistic-concurrency conflict — another writer
 moved the stream — classified and retried like an event-put conflict. Whether the engine may
@@ -979,6 +1024,32 @@ other attribute names in this spec's expressions — `pk`, `sk`, `seq`, `eventSe
   ([Writes](#writes)), retryable after the lock is taken over or force-released — never as a
   fence conflict.
 
+**Rebuild view writes (v0.9, C10).** While it replays, the rebuild worker writes its view rows in
+`TransactWriteItems` batches of at most 99 view operations — the 100th item of every batch is a
+`ConditionCheck` on the lock row:
+
+```text
+ConditionExpression: #owner = :me AND leaseExpiresAt > :now
+ExpressionAttributeNames: {"#owner": "owner"}
+```
+
+The condition asserts transactionally, with every batch's writes, that the worker still holds an
+unexpired lease. A worker that pauses past its lease and loses the lock to a takeover cannot
+resume wiping or replaying views: its next batch fails the check and the worker aborts
+immediately, so the new owner's release is never racing a stale worker's projection writes.
+(Changing the generation protects readers; only this per-batch condition protects the views from
+the _old_ worker.) On PostgreSQL the equivalent is per transaction: every rebuild write
+transaction asserts the lock row's owner and lease before its view statements —
+
+```sql
+SELECT 1 FROM evt_events_rebuild_lock
+WHERE id = 0 AND owner = $1 AND lease_expires_at > $2;  -- must return a row, else abort
+```
+
+(`evt_events_rebuild_lock` stands for the configured derived name.) A failed check aborts the
+rebuild worker in both languages; nothing is ever written by a worker that no longer holds the
+lock.
+
 The rows live in the reserved `SYSTEM#` namespace, skipped by enumeration, heads, and rebuild
 scans, and neither row has a snapshot or a `ttl`.
 
@@ -1181,7 +1252,11 @@ name.)
   `#value = :seenOdd` to release or force-release, aliased as in
   [Rebuild Fence](#rebuild-fence)), keeping the invariant that the generation is odd if and only
   if the lock row exists — a takeover moves odd to odd (changed), so readers pinned to the old
-  epoch re-read.
+  epoch re-read. While it replays, the rebuild's view writes are transactions that each assert
+  the lock row's owner and lease (`owner = :me AND lease_expires_at > :now`) before their
+  statements, so a worker that lost the lock to a takeover aborts instead of writing — the
+  transactional equivalent of the DynamoDB per-batch `ConditionCheck`
+  ([Rebuild Fence](#rebuild-fence)).
 
 - **Feature marker**: declarations take
   `pg_advisory_xact_lock(1702261761, hashtext('{events}:features'))` — exclusive — around the
@@ -1333,23 +1408,23 @@ indeterminate error, so `outcomes-ambiguous` exercises the real ambiguous path r
 the re-read branches); [`compat/README.md`](../../compat/README.md) grows the op table when they
 land.
 
-| Scenario               | Covers | What it pins                                                                                                                                                                                                                                                                                                            |
-| ---------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `outcomes-idempotency` | C3     | A retry with the same identity digest returns the stored outcome and writes nothing; a retry with a different digest is `IdempotencyKeyReuse` in both languages.                                                                                                                                                        |
-| `outcomes-noop`        | C3     | A zero-event command and an outcome-only commit are stored as accepted with no `events` attribute.                                                                                                                                                                                                                      |
-| `outcomes-rejection`   | C3, C4 | A domain rejection is persisted once in final state; the retried command replays it verbatim, cross-language.                                                                                                                                                                                                           |
-| `outcomes-ambiguous`   | C3     | After an indeterminate commit error — injected with `injectCommitFault` so the commit really applied — the re-read by command ID returns the stored outcome (same digest), `IdempotencyKeyReuse` (different digest), or absence (safe retry).                                                                           |
-| `commit-too-large`     | C1     | A commit whose item budget exceeds 100 fails with `CommitTooLarge` before any write, in both languages; nothing is stored and the commit is never split.                                                                                                                                                                |
-| `multi-stream-commit`  | C1     | One commit appends to two streams atomically; the other language interleaves and must see both streams or neither. Per-stream floor checks apply.                                                                                                                                                                       |
-| `read-fences`          | C2     | A fenced read fails when the other language appends past the head; the compaction ABA (append, snapshot, compact past the head) still fails the fence; the snapshot companion is present on every fenced read, including one whose aggregate has snapshots disabled; a fenced-and-written stream emits no fence checks. |
-| `fence-aware-retry`    | C2, C5 | An engine-filled fence conflict re-prepares and succeeds; a caller-stamped fence produces the persisted `stale-fence` rejection, whose only remedy is a new command ID — the old ID replays the rejection.                                                                                                              |
-| `metadata-extensions`  | C6     | `principalId`, `causationId`, and `extensions` round-trip in both directions, including the defaults: `causationId` written as the command ID when unset, `extensions` written as `{}`.                                                                                                                                 |
-| `commit-grouping`      | C6, C7 | A multi-stream commit's events carry one `commitId` across all its streams; after a wipe-and-rebuild, the commit-wide projector ran once per `commitId` group, with each commit's events in the pinned (stream ID, sequence) order; pre-v0.9 events without `commitId` replayed as single-event commits.                |
-| `commit-wide-views`    | C7     | A commit-wide projector writes rows at a `pk` outside `{entityType}#{entityId}` and deletes a row; the other language reads the rows after the commit.                                                                                                                                                                  |
-| `latest-n`             | C8     | With more than `n` events on a stream, both languages read the last `n` events newest-first, excluding the snapshot item.                                                                                                                                                                                               |
-| `feature-marker`       | C9     | A declaration bumps `version`; the other language's cached version fails its condition and revalidates; a bump of a feature's format version fails the older writer the same way; a writer that does not support a declared `(name, formatVersion)` pair refuses to commit.                                             |
-| `rebuild-fence`        | C10    | While one language holds `SYSTEM#REBUILD`, the other's commit conflicts; release (and force-release) bumps the generation; takeover of an expired lease bumps it by two while it stays odd; the reader epoch check sees odd/changed generations.                                                                        |
-| `reserved-namespaces`  | C8     | A commit whose entity ID begins with `SYSTEM#` or `command-outcome#` is refused before any write; enumeration and heads skip the engine rows the other language wrote.                                                                                                                                                  |
+| Scenario               | Covers | What it pins                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `outcomes-idempotency` | C3     | A retry with the same identity digest returns the stored outcome and writes nothing; a retry with a different digest is `IdempotencyKeyReuse` in both languages.                                                                                                                                                                                                                                                                       |
+| `outcomes-noop`        | C3     | A zero-event command and an outcome-only commit are stored as accepted with no `events` attribute.                                                                                                                                                                                                                                                                                                                                     |
+| `outcomes-rejection`   | C3, C4 | A domain rejection is persisted once in final state; the retried command replays it verbatim, cross-language.                                                                                                                                                                                                                                                                                                                          |
+| `outcomes-ambiguous`   | C3     | After an indeterminate commit error — injected with `injectCommitFault` so the commit really applied — the re-read by command ID returns the stored outcome (same digest), `IdempotencyKeyReuse` (different digest), or absence (safe retry).                                                                                                                                                                                          |
+| `commit-too-large`     | C1     | A commit whose item budget exceeds 100, or whose estimated request exceeds the byte budgets (3,800,000 bytes in aggregate, 380,000 bytes for any single item), fails with `CommitTooLarge` before any write, in both languages and on both backends; nothing is stored and the commit is never split.                                                                                                                                  |
+| `multi-stream-commit`  | C1     | One commit appends to two streams atomically; the other language interleaves and must see both streams or neither. Per-stream floor checks apply.                                                                                                                                                                                                                                                                                      |
+| `read-fences`          | C2     | A fenced read fails when the other language appends past the head; the compaction ABA (append, snapshot, compact past the head) still fails the fence; the snapshot companion is present on every fenced read, including one whose aggregate has snapshots disabled; a fenced-and-written stream emits no fence checks; a fence on a retention-enabled stream is refused with `RetentionConflict`.                                     |
+| `fence-aware-retry`    | C2, C5 | An engine-filled fence conflict re-prepares and succeeds; a caller-stamped fence produces the persisted `stale-fence` rejection, whose only remedy is a new command ID — the old ID replays the rejection.                                                                                                                                                                                                                             |
+| `metadata-extensions`  | C6     | `principalId`, `causationId`, and `extensions` round-trip in both directions, including the defaults: `causationId` written as the command ID when unset, `extensions` written as `{}`.                                                                                                                                                                                                                                                |
+| `commit-grouping`      | C6, C7 | A multi-stream commit's events carry one `commitId` across all its streams; after a wipe-and-rebuild, the commit-wide projector ran once per `commitId` group, with each commit's events in the pinned (stream ID, sequence) order; a rebuild over a compacted prefix seeded rows from the snapshot via the seed entry point, then replayed the commits after it; pre-v0.9 events without `commitId` replayed as single-event commits. |
+| `commit-wide-views`    | C7     | A commit-wide projector writes rows at a `pk` outside `{entityType}#{entityId}` and deletes a row; the other language reads the rows after the commit.                                                                                                                                                                                                                                                                                 |
+| `latest-n`             | C8     | With more than `n` events on a stream, both languages read the last `n` events newest-first, excluding the snapshot item.                                                                                                                                                                                                                                                                                                              |
+| `feature-marker`       | C9     | A declaration bumps `version`; the other language's cached version fails its condition and revalidates; a bump of a feature's format version fails the older writer the same way; a writer that does not support a declared `(name, formatVersion)` pair refuses to commit.                                                                                                                                                            |
+| `rebuild-fence`        | C10    | While one language holds `SYSTEM#REBUILD`, the other's commit conflicts; release (and force-release) bumps the generation; takeover of an expired lease bumps it by two while it stays odd; the reader epoch check sees odd/changed generations; a replay batch or transaction whose lock-row condition fails aborts the worker without writing.                                                                                       |
+| `reserved-namespaces`  | C8     | A commit whose entity ID begins with `SYSTEM#` or `command-outcome#` is refused before any write; enumeration and heads skip the engine rows the other language wrote.                                                                                                                                                                                                                                                                 |
 
 ## Changing the Format
 
