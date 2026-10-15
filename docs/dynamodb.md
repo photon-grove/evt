@@ -37,8 +37,7 @@ A single table holds events and inline snapshots for every entity.
 - `sk = 0` — the inline **snapshot** row for that entity
 - plus `type`, `version`, `entityType`, `payload`, and `metadata` attributes
 - optional `ttl` (`N`) when a [retention](#retention) policy applies
-- **DynamoDB Streams** with `NEW_IMAGE` when using async [projectors or
-  publishers](streams.md)
+- **DynamoDB Streams** with `NEW_IMAGE` when using async [projectors](streams.md)
 
 Event rows are **append-only and protected by conditional writes** — a commit only
 succeeds if the next sequence is unclaimed, which is how concurrent writers on one
@@ -79,7 +78,10 @@ The raw `dynamo.Delete` helper is snapshot-unsafe, intended for local/staging
 fixtures only, and excluded from production builds behind a `//go:build !prod`
 tag. It is deprecated in v0.9.0
 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7) and will be removed in the next
-minor release. Prefer `CompactBelow` for any principled truncation. Background and rationale
+minor release with no in-library replacement: for fixture teardown or reset, delete the items
+with the AWS SDK or recreate the table. (`CompactBelow` is for snapshot-verified truncation, not
+fixture cleanup — it only deletes a snapshot-covered prefix and never deletes the snapshot row.)
+Prefer `CompactBelow` for principled truncation in any environment. Background and rationale
 live in [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
 
 ### Retention
@@ -113,6 +115,11 @@ for the common "one row per entity" pattern. See
 [Projections and rebuilds](projections.md).
 
 ## Entity-heads table
+
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K4):* the heads
+table and `dynamo.HeadStore` are cut — derive entity heads from the log with
+`Repository.StreamEntityHeads` (a scan-and-fold over the event log) instead. The paragraph below
+describes the pre-v0.9 table for readers still on it.
 
 To support [incremental rebuilds](projections.md), the repository can track one
 small row per entity (`pk` = entity ID) recording its current head sequence. This

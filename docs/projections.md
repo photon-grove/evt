@@ -82,6 +82,11 @@ below.
 
 ### Incremental rebuilds with an entity-heads table
 
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K4):* the heads
+table and `dynamo.HeadStore` are cut — derive heads from the log with `StreamEntityHeads`
+instead, and rebuild changed entities against a per-entity checkpoint you maintain yourself.
+This section documents the pre-v0.9 setup for readers still on it.
+
 A full rebuild reprocesses every entity even when only a handful changed since the
 last run, and (per the note above) enumeration reads capacity comparable to the
 whole log. To rebuild only what changed, keep a small **heads table**: one row per
@@ -114,10 +119,6 @@ flowchart TB
 
   ht -.->|"read, not the log"| read
 ```
-
-*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K4):* the heads
-table and `dynamo.HeadStore` are cut — derive heads from the log with
-`StreamEntityHeads` instead. The flow below shows the pre-v0.9 setup.
 
 `dynamo.HeadStore` plays both projector and reader roles. Putting the pieces
 together:
@@ -184,6 +185,10 @@ head accounts for a compacted stream's snapshot floor, so it stays correct after
 `CompactBelow`.
 
 #### Constant-memory enumeration
+
+*Deprecated in v0.9.0 (K3/K4):* the `HeadSource` option, `StreamEntitiesByQuery`, and
+`RebuildProjectionsByQuery` below are cut — the scan-and-dedup enumeration through
+`StreamEntities`/`StreamEntitiesFromSnapshotsWithOptions` is the supported path.
 
 `StreamEntityHeads` returns a `map[EntityID]EventSequence` — convenient, but the
 map grows with the number of entities, so a rebuild's memory ceiling scales with

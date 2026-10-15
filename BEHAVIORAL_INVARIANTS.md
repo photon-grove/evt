@@ -203,7 +203,8 @@ type TransactionGroup interface {
 - DynamoDB supports up to 100 items per transaction
 - A commit without a snapshot adds one `ConditionCheck` on the entity's `sk = 0` item (the floor
   check). It counts toward the 100 items and is billed as a write
-- `CommitStream` batches items to stay under this limit, counting one floor `ConditionCheck` per
+- `CommitStream` (deprecated in v0.9.0, K1) batches items to stay under this limit, counting one
+  floor `ConditionCheck` per
   entity, at the lowest sequence the batch commits for it, whatever order results arrive in
 
 ## Snapshot Logic
@@ -374,8 +375,11 @@ evt.Metadata{
   `EntityType` narrows to that type. The core contract carries no DynamoDB types.
 - DynamoDB compiles the filter into a Scan `FilterExpression`; the in-memory repository applies it
   client-side. Skips items with the inline-snapshot marker (`sk = 0`). Uses scan pagination.
-- Callers needing a raw DynamoDB filter beyond entity type type-assert the repository to
-  `dynamo.ExpressionStreamer` and call `StreamAllEventsByExpression`.
+- Callers needing a raw DynamoDB filter beyond entity type historically type-asserted the
+  repository to `dynamo.ExpressionStreamer` and called `StreamAllEventsByExpression`. That
+  extension is deprecated in v0.9.0 (K7) and removed in the next minor — new code narrows with
+  `evt.StreamFilter` (entity type) and filters the rest client-side, or scans directly with the
+  AWS SDK.
 
 ### StreamEntities
 
@@ -384,6 +388,7 @@ evt.Metadata{
 - Skips `sequence = 0` events (snapshot markers)
 - Errors during `applyEvent` are yielded to channel, then continues
 - DynamoDB raw-expression variant: `dynamo.ExpressionStreamer.StreamEntitiesByExpression`
+  (deprecated in v0.9.0, K7 — use `evt.StreamFilter`)
 
 ### StreamEntitiesFromSnapshots (optional: `evt.SnapshotStreamer`)
 
@@ -437,8 +442,10 @@ DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimi
   `SerializedResult` are committed atomically. On DynamoDB this is a `TransactWriteItems` call; on
   PostgreSQL it is a single SQL transaction; partial commits must not be observable.
 - **Backend-neutral filtering** — `StreamAllEvents`/`StreamEntities` honor `evt.StreamFilter`
-  (entity-type narrowing today). Richer, vendor-specific server-side filtering is offered through a
-  backend extension interface (e.g. `dynamo.ExpressionStreamer`), never through the core contract.
+  (entity-type narrowing today). The legacy backend extension interface
+  (`dynamo.ExpressionStreamer`) offered richer vendor-specific server-side filtering but is
+  deprecated in v0.9.0 (K7) and removed in the next minor; richer filtering must not enter the
+  core contract.
 
 The PostgreSQL backend stores the log as an append-only `evt_events` table keyed by `(entity_id,
 sequence)` and durable snapshots in a sibling `evt_snapshots` table keyed by `entity_id`. That

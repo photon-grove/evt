@@ -19,10 +19,12 @@ Every consumer follows the same reliability contract: process records
 independently, return **partial-batch failures** so only affected records retry,
 and stay **idempotent** because the same event can be delivered more than once.
 
-> A projector can also read the DynamoDB Stream **directly** via
-> `projectors.NewLambdaHandler`, skipping the topic. That's a supported
-> alternative for the occasional consumer that warrants it — but prefer the
-> SNS/SQS handlers below unless you have a specific reason.
+*SNS fan-out via `evt/publishers` is deprecated in v0.9.0*
+([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K5). The shipped, supported paths for
+new consumers are reading the DynamoDB Stream **directly** with
+`projectors.NewLambdaHandler` (no topic hop), or consuming the stream with your own handler and
+publishing onward yourself — see [Publishers](#publishers) for the full migration notes. The
+consumer-side guidance below (projectors, idempotency, retry classification) is unaffected.
 
 ## Projectors
 
@@ -47,13 +49,13 @@ func main() {
 ```
 
 `NewSQSHandler` decodes each SQS message — the CloudWatchEvent envelope the
-publisher emitted — into a `StreamRecord` with `StreamRecordFromEnvelope`, runs
-the batch through the runtime, and returns an `events.SQSEventResponse` so Lambda
-redelivers only the failed messages. For a latency-sensitive consumer wired as a
-**direct** SNS→Lambda subscription, use `NewSNSHandler` instead; SNS has no
-partial-batch protocol, so a failure retries the whole invocation — give that
-subscription a redrive policy. (`NewLambdaHandler` is the direct-from-stream
-variant noted above.)
+(deprecated) publisher emitted, or that your own handler emitted — into a
+`StreamRecord` with `StreamRecordFromEnvelope`, runs the batch through the runtime, and returns
+an `events.SQSEventResponse` so Lambda redelivers only the failed messages. For a
+latency-sensitive consumer wired as a **direct** SNS→Lambda subscription, use `NewSNSHandler`
+instead; SNS has no partial-batch protocol, so a failure retries the whole invocation — give
+that subscription a redrive policy. (`NewLambdaHandler` reads the DynamoDB Stream directly —
+the shipped path now that the publisher is deprecated.)
 
 The runtime adds:
 
@@ -74,8 +76,21 @@ The runtime adds:
 ## Publishers
 
 *Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K5):*
-`evt/publishers`, `BudgetController`, and the SNS/FIFO publisher are cut; command outcomes and
-the stream envelope (which stays as the cross-language wire format) replace them.
+`evt/publishers`, `BudgetController`, and the SNS/FIFO publisher are removed in the next minor
+release **without an in-library replacement**. Command outcomes are planned but are not a
+shipped replacement, and the envelope is only the wire format — it neither consumes the stream
+nor publishes to SNS. What to do today:
+
+- **Projector-style consumers** — switch to the direct-from-stream handler
+  (`projectors.NewLambdaHandler`), which is shipped and skips the SNS hop entirely.
+- **Anything else** — consume the DynamoDB Stream with your own handler (a stream-targeted
+  Lambda or a worker) and publish onward yourself. To keep the existing envelope shape for
+  downstream subscribers, emit the documented CloudWatchEvent-style envelope — the format stays
+  as the cross-language wire format (Rust encodes it with `photon_evt::wire::envelope::encode`;
+  Go decodes it with `projectors.StreamRecordFromEnvelope`).
+- **Ingress/retry budgets** — implement backpressure around your own handler; nothing ships.
+
+The rest of this section describes the pre-v0.9 runtime for readers still on it.
 
 `evt/publishers` is the single DynamoDB-Stream consumer: it reads committed
 events and republishes them to the SNS topic the consumers above subscribe to.
@@ -114,8 +129,7 @@ deployment.
 ## Reliability checklist
 
 - **Drop malformed rows deliberately and measure them.** A record that can't be
-  decoded should be counted and skipped, not retried forever — the publisher
-  reports `DroppedMalformedCount` for this.
+  decoded should be counted and skipped, not retried forever.
 - **Return batch item failures, not whole-batch errors,** for retryable problems,
   so successful records in the same batch aren't reprocessed.
 - **Keep handlers idempotent.** At-least-once delivery means every projector and

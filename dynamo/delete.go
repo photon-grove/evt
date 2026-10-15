@@ -20,9 +20,11 @@ import (
 //
 // WARNING: Use only in local and staging environments.
 //
-// Deprecated: Cut in ADR-0006 (K7): point-deleting events is snapshot-unsafe. Use
-// evt.Compactor.CompactBelow, which only deletes events a durable snapshot already covers. It
-// will be removed in the next minor release.
+// Deprecated: Cut in ADR-0006 (K7): point-deleting events is snapshot-unsafe. It will be removed
+// in the next minor release with no in-library replacement. For fixture teardown or reset, delete
+// the items with the AWS SDK or recreate the table. (evt.Compactor.CompactBelow is not a
+// replacement here: it only deletes the prefix a durable snapshot already covers and never
+// deletes the snapshot row, so it cannot clear an unsnapshotted test stream.)
 func (repo *Repository) Delete(
 	ctx context.Context,
 	serializedEvents []evt.SerializedEvent,

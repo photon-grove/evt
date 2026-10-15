@@ -22,9 +22,7 @@ your application needs.
   per-entity sequence ordering. Stable command IDs prevent retries from duplicating
   facts.
 - **Long logs can be rebuilt efficiently.** Inline snapshots, versioned upcasters,
-  and snapshot-verified compaction limit replay work without rewriting history. An
-  optional entity-heads table tracks each entity's latest sequence so rebuilds can
-  target changed entities.
+  and snapshot-verified compaction limit replay work without rewriting history.
 - **DynamoDB Streams support.** A publisher fans committed events out over SNS to
   idempotent projectors with retry classification.
 - **A Rust crate shares the log.** [`photon-evt`](crates/evt) reads and writes the
@@ -129,15 +127,18 @@ replacement, so adopting the replacement today builds warning-free:
 - `StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` (K3) —
   `StreamEntities` plus `evt.RebuildProjectionsFromStream`
 - `HeadStore` (heads table) and incremental/delta rebuild (K4) — scan-derived `StreamEntityHeads`
-- `evt/publishers`, `BudgetController`, and `stream.SNSPublisher`/FIFO (K5) — command outcomes and
-  the stream envelope (which stays: it is the cross-language wire format)
+- `evt/publishers`, `BudgetController`, and `stream.SNSPublisher`/FIFO (K5) — removed without an
+  in-library replacement: read the DynamoDB Stream directly (`projectors.NewLambdaHandler`) or
+  publish with your own handler; the envelope format stays (it is the cross-language wire format).
+  Command outcomes are planned, not shipped
 - `policy.Config.Classify` / `policy.Classifier` (K6) — leave `Classify` unset; the built-in
   `policy.Classify` mapping applies
 - the `WithFactory` helpers (including `snapshots.Store`'s), `ByCommandID`, `dynamo.Delete`,
   `dynamo/mock`, the `do.go` DI providers, `dynamo.ExpressionStreamer` (and the concrete
   `*dynamo.Repository` `...ByExpression` methods), and handler-attached
-  `CommandResult.Transaction` (K7) — direct store calls, `CompactBelow`, `StreamFilter`,
-  projector-produced transaction groups, and (planned) commit-wide projectors
+  `CommandResult.Transaction` (K7) — direct store calls, `StreamFilter`, projector-produced
+  transaction groups, and (planned) commit-wide projectors; for `dynamo.Delete`, delete fixture
+  items with the AWS SDK or recreate the test table
 
 Three more D6-cut surfaces have **no warning-free migration path yet**, so they carry no
 `Deprecated:` notice in v0.9.0. They are planned for removal once the core reshape (C1–C11)
