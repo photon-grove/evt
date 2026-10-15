@@ -76,6 +76,39 @@ pub enum Error {
         limit: usize,
     },
 
+    /// Shared DynamoDB-compatible transaction budget exceeded.
+    #[error("commit exceeds transaction budget: {actions} actions, {bytes} bytes, largest item {largest_item}")]
+    CommitTooLarge {
+        /// Number of actions.
+        actions: usize,
+        /// Total encoded item bytes.
+        bytes: usize,
+        /// Largest encoded item.
+        largest_item: usize,
+    },
+
+    /// A read-only input moved. The index is the pinned transaction action index.
+    #[error("read fence failed for {entity_id} at action {index} ({provenance:?})")]
+    FenceConflict {
+        /// Fenced stream.
+        entity_id: EntityId,
+        /// Failing action's zero-based index.
+        index: usize,
+        /// Origin of the fenced head.
+        provenance: crate::repository::FenceProvenance,
+    },
+
+    /// TTL retention cannot protect a read fence.
+    #[error("read fences refused for retention-enabled entity type {entity_type}")]
+    RetentionConflict {
+        /// Durable retention-enabled type.
+        entity_type: EntityType,
+    },
+
+    /// A durable rebuild lock blocks writes, including when its lease expired.
+    #[error("a projection rebuild is in progress")]
+    RebuildInProgress,
+
     /// Encoding a payload, metadata, or snapshot failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -165,7 +198,7 @@ impl Error {
     /// Reports whether reloading and running the command again may succeed: a conflict or a
     /// transient backend failure.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Conflict { .. } | Self::Transient(_))
+        matches!(self, Self::Conflict { .. } | Self::Transient(_) | Self::FenceConflict { provenance: crate::repository::FenceProvenance::Engine, .. })
     }
 }
 

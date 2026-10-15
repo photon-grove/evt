@@ -449,7 +449,7 @@ func (s *RepositorySuite) Test_CommitWithSnapshot_Error() {
 		Return((*dynamodb.TransactWriteItemsOutput)(nil), expectedError)
 
 	result := evt.SerializedResult{Events: serializedEvents}
-	err := s.repo.CommitWithSnapshot(ctx, result, "test", "test-id", []byte("{}"), 0)
+	err := s.repo.CommitWithSnapshot(ctx, result, "test", "test-id", []byte("{}"), 1)
 
 	require.Error(s.T(), err)
 	require.Contains(s.T(), err.Error(), "snapshot commit failed")

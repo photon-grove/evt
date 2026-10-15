@@ -56,7 +56,7 @@ pub use ids::{
 };
 pub use mem::MemRepository;
 pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};
-pub use repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
+pub use repository::{Commit, FenceProvenance, ReadFence, TransactionCommit, NewSnapshot, Repository, snapshot_events_due};
 pub use retry::RetryPolicy;
 pub use store::{DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, serialize_events};
 pub use upcast::{JsonUpcaster, Upcaster};

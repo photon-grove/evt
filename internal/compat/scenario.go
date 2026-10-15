@@ -69,6 +69,8 @@ type Step struct {
 	Address     string            `json:"address,omitempty"`
 	Timestamp   string            `json:"timestamp,omitempty"`
 	Expect      Outcome           `json:"expect"`
+	Streams     []TransactionStream `json:"streams,omitempty"`
+	Fences      []TransactionFence  `json:"fences,omitempty"`
 }
 
 // RawEvent is an event appended directly to the log, bypassing the aggregate (legacy versions).
@@ -135,6 +137,7 @@ func StepMetadata(step Step) evt.Metadata {
 		id := evt.CommandID(step.CausationID)
 		metadata.CausationID = &id
 	}
+	metadata.CommitID = "compat-" + step.By + "-" + step.CommandID
 	metadata.Extensions = step.Extensions
 
 	if step.Trace != nil {
@@ -165,6 +168,8 @@ type Runner struct {
 // Execute runs one step and classifies its outcome. Unexpected errors are returned as errors.
 func (r Runner) Execute(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
 	switch step.Op {
+	case "transaction":
+		return r.transaction(ctx, entityID, step)
 	case "execute":
 		return r.execute(ctx, entityID, step)
 	case "appendRaw":

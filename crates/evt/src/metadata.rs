@@ -58,6 +58,10 @@ pub struct Metadata {
     /// empty map serializes as `{}`.
     #[serde(default, deserialize_with = "extensions")]
     pub extensions: BTreeMap<String, String>,
+
+    /// Engine-assigned commit identity, shared by every stream in one transaction.
+    #[serde(rename = "commitId", default, deserialize_with = "null_default")]
+    pub commit_id: String,
 }
 
 /// The system (`source`) and entry point (`endpoint`) that initiated a command.
@@ -180,6 +184,7 @@ impl PartialEq for Metadata {
             && self.principal_id == other.principal_id
             && self.effective_causation_id() == other.effective_causation_id()
             && self.extensions == other.extensions
+            && self.commit_id == other.commit_id
     }
 }
 
@@ -205,6 +210,8 @@ struct MetadataWire<'a> {
     causation_id: Option<&'a CommandId>,
     #[serde(rename = "extensions")]
     extensions: &'a BTreeMap<String, String>,
+    #[serde(rename = "commitId")]
+    commit_id: &'a str,
 }
 
 impl Serialize for Metadata {
@@ -221,6 +228,7 @@ impl Serialize for Metadata {
             principal_id: &self.principal_id,
             causation_id: self.effective_causation_id(),
             extensions: &self.extensions,
+            commit_id: &self.commit_id,
         }
         .serialize(serializer)
     }

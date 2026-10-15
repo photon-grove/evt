@@ -29,6 +29,12 @@ type Metadata struct {
 	// encode unset or empty extensions as {}. A stored object decodes to a non-nil map, while a
 	// pre-v0.9 row without the key decodes to nil. Equal treats the two as the same.
 	Extensions map[string]string `json:"extensions"`
+
+	// CommitID identifies the commit that wrote the event. The engine sets it once per commit, so
+	// every event of a commit — across every stream a multi-stream commit touches — carries the
+	// same value (ADR 0004, C1). The default is the command ID when present, otherwise a generated
+	// ULID. Pre-v0.9 rows without the key decode to the empty string.
+	CommitID string `json:"commitId"`
 }
 
 // A PrincipalID identifies the caller that issued a command, for audit and per-principal checks.
@@ -168,7 +174,8 @@ func (m Metadata) Equal(other Metadata) bool {
 		m.Timestamp == other.Timestamp &&
 		equalPtr(m.PrincipalID, other.PrincipalID) &&
 		equalPtr(m.effectiveCausationID(), other.effectiveCausationID()) &&
-		extensionsEqual(m.Extensions, other.Extensions)
+		extensionsEqual(m.Extensions, other.Extensions) &&
+		m.CommitID == other.CommitID
 }
 
 func (m Metadata) effectiveCausationID() *CommandID {

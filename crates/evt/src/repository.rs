@@ -158,6 +158,195 @@ impl<Op> Commit<Op> {
     }
 }
 
+/// Where a fenced head came from. Caller decisions must not be automatically re-prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FenceProvenance {
+    /// Loaded by the transaction engine.
+    Engine,
+    /// Supplied by an external caller.
+    Caller,
+}
+
+/// A stream whose observed head must not advance before the transaction commits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadFence {
+    /// Stream ID.
+    pub entity_id: EntityId,
+    /// Aggregate type (used for durable retention checks).
+    pub entity_type: EntityType,
+    /// Observed head, including the snapshot floor.
+    pub head: EventSequence,
+    /// Origin of the observation.
+    pub provenance: FenceProvenance,
+}
+
+impl ReadFence {
+    /// Constructs a fence.
+    pub fn new(entity_id: impl Into<EntityId>, entity_type: impl Into<EntityType>, head: EventSequence, provenance: FenceProvenance) -> Self {
+        Self { entity_id: entity_id.into(), entity_type: entity_type.into(), head, provenance }
+    }
+}
+
+/// One atomic transaction. Stream-local operations flatten in declaration order; events and
+/// floors normalize by stream ID. Empty stream commits retain the legacy no-op semantics.
+#[derive(Debug)]
+pub struct TransactionCommit<Op> {
+    /// Stream appends, in projector declaration order.
+    pub streams: Vec<Commit<Op>>,
+    /// Read set, including any streams also written.
+    pub fences: Vec<ReadFence>,
+    /// Additional transaction operations, after stream-local operations.
+    pub operations: Vec<Op>,
+}
+
+impl<Op> TransactionCommit<Op> {
+    /// Creates an envelope from stream commits.
+    pub fn new(streams: Vec<Commit<Op>>) -> Self {
+        Self { streams, fences: Vec::new(), operations: Vec::new() }
+    }
+
+    /// Adds read fences.
+    #[must_use]
+    pub fn with_fences(mut self, fences: impl IntoIterator<Item = ReadFence>) -> Self {
+        self.fences.extend(fences);
+        self
+    }
+
+    /// Adds projector operations.
+    #[must_use]
+    pub fn with_operations(mut self, operations: impl IntoIterator<Item = Op>) -> Self {
+        self.operations.extend(operations);
+        self
+    }
+
+    /// Validates every stream and normalizes the pinned event/fence ordering.
+    pub(crate) fn normalize(&mut self) -> Result<(), Error> {
+        let mut ids = std::collections::BTreeSet::new();
+        for stream in &self.streams {
+            stream.validate()?;
+            crate::features::check_not_reserved(&stream.entity_id)?;
+            if !ids.insert(stream.entity_id.clone()) {
+                return Err(Error::InvalidCommit(format!("duplicate stream {}", stream.entity_id)));
+            }
+        }
+        let mut fences = std::collections::BTreeSet::new();
+        for fence in &self.fences {
+            crate::features::check_not_reserved(&fence.entity_id)?;
+            if fence.head.0 < 0 || fence.head.checked_next().is_none() || !fences.insert(fence.entity_id.clone()) {
+                return Err(Error::InvalidCommit(format!("invalid or duplicate fence {}", fence.entity_id)));
+            }
+            if let Some(stream) = self.streams.iter().find(|s| s.entity_id == fence.entity_id)
+                && let Some(first) = stream.events.first()
+                && (first.entity_type != fence.entity_type || Some(first.sequence) != fence.head.checked_next())
+            {
+                return Err(Error::InvalidCommit(format!("written fence does not match {}", fence.entity_id)));
+            }
+        }
+        // Preserve declaration/emission order before sorting the write set.
+        let mut operations = Vec::new();
+        for stream in &mut self.streams {
+            if !stream.events.is_empty() {
+                operations.append(&mut stream.operations);
+            }
+        }
+        operations.append(&mut self.operations);
+        self.operations = operations;
+        self.streams.retain(|stream| !stream.events.is_empty());
+        self.streams.sort_by(|a, b| a.entity_id.as_str().as_bytes().cmp(b.entity_id.as_str().as_bytes()));
+        self.fences.sort_by(|a, b| a.entity_id.as_str().as_bytes().cmp(b.entity_id.as_str().as_bytes()));
+        Ok(())
+    }
+
+    pub(crate) fn read_only_fences(&self) -> impl Iterator<Item = &ReadFence> {
+        self.fences.iter().filter(|f| !self.streams.iter().any(|s| s.entity_id == f.entity_id))
+    }
+
+    pub(crate) fn check_retention(&self, manifest: Option<&crate::FeatureManifest>) -> Result<(), Error> {
+        for fence in &self.fences {
+            if manifest.is_some_and(|m| m.retention.contains(&fence.entity_type)) {
+                return Err(Error::RetentionConflict { entity_type: fence.entity_type.clone() });
+            }
+        }
+        Ok(())
+    }
+
+    /// Assigns the engine identity once, before size estimation or any backend attempt.
+    pub(crate) fn stamp(&mut self) {
+        let id = self.streams.iter().flat_map(|s| &s.events)
+            .find_map(|e| e.metadata.command_id.as_ref().map(ToString::to_string))
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        for event in self.streams.iter_mut().flat_map(|s| &mut s.events) {
+            event.metadata.commit_id.clone_from(&id);
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.streams.is_empty() && self.fences.is_empty() && self.operations.is_empty()
+    }
+
+    /// Exact backend-neutral event/snapshot/check representation, matching Dynamo item sizes.
+    pub(crate) fn sizes(&self, ttl: impl Fn(&EntityType) -> Option<i64>) -> Result<Vec<usize>, Error> {
+        use crate::wire::dynamo::{self as wire, AttributeValue as V};
+        let key = |id: &str, seq: i64| wire::Item::from([
+            ("pk".into(), V::S(id.into())), ("sk".into(), V::N(seq.to_string()))
+        ]);
+        let mut sizes = vec![item_size(&key(crate::features::FEATURES_ID, 0)), item_size(&key("SYSTEM#REBUILD", 0))];
+        for stream in &self.streams {
+            for event in &stream.events {
+                sizes.push(item_size(&wire::event_item(event, ttl(&event.entity_type))?));
+            }
+        }
+        for stream in &self.streams {
+            if let Some(snapshot) = &stream.snapshot {
+                sizes.push(item_size(&wire::snapshot_item(&SerializedSnapshot {
+                    entity_type: snapshot.entity_type.clone(), entity_id: stream.entity_id.clone(),
+                    sequence: snapshot.sequence, event_sequence: stream.events.last().expect("normalized stream").sequence,
+                    payload: snapshot.payload.clone(),
+                }, ttl(&snapshot.entity_type))?));
+            } else {
+                sizes.push(item_size(&key(stream.entity_id.as_str(), 0)));
+            }
+        }
+        for fence in self.read_only_fences() {
+            sizes.push(item_size(&key(fence.entity_id.as_str(), fence.head.next().0)));
+            sizes.push(item_size(&key(fence.entity_id.as_str(), 0)));
+        }
+        Ok(sizes)
+    }
+}
+
+pub(crate) fn check_budget(sizes: impl IntoIterator<Item = usize>) -> Result<(), Error> {
+    let mut actions = 0usize;
+    let mut bytes = 0usize;
+    let mut largest_item = 0usize;
+    for size in sizes {
+        actions += 1;
+        bytes = bytes.saturating_add(size);
+        largest_item = largest_item.max(size);
+    }
+    if actions > 100 || bytes > 3_800_000 || largest_item > 380_000 {
+        return Err(Error::CommitTooLarge { actions, bytes, largest_item });
+    }
+    Ok(())
+}
+
+/// DynamoDB item size, including attribute names and recursively encoded values.
+pub(crate) fn item_size(item: &crate::wire::dynamo::Item) -> usize {
+    use crate::wire::dynamo::AttributeValue as V;
+    fn value_size(value: &V) -> usize {
+        match value {
+            V::S(s) | V::N(s) => s.len(),
+            V::B(b) => b.len(),
+            V::Bool(_) | V::Null(_) => 1,
+            V::M(m) => 3 + item_size(m) + m.len(),
+            V::L(l) => 3 + l.iter().map(|v| 1 + value_size(v)).sum::<usize>(),
+            V::Ss(s) | V::Ns(s) => s.iter().map(String::len).sum(),
+            V::Bs(b) => b.iter().map(Vec::len).sum(),
+        }
+    }
+    item.iter().map(|(name, value)| name.len() + value_size(value)).sum()
+}
+
 /// An append-only event log with one optional snapshot per entity.
 ///
 /// Implementations must:
@@ -189,6 +378,15 @@ pub trait Repository: Send + Sync {
         &self,
         commit: Commit<Self::Operation>,
     ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Atomically appends all streams and validates read-only fences. Third-party repositories
+    /// may opt in independently; the default never silently degrades to sequential commits.
+    fn commit_transaction(
+        &self,
+        _commit: TransactionCommit<Self::Operation>,
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Err(Error::InvalidConfig("repository does not support transactions".into())) }
+    }
 
     /// Returns every stored event for the entity, ascending.
     fn events(
@@ -252,6 +450,10 @@ macro_rules! forward_repository {
 
             fn commit(&self, commit: Commit<Self::Operation>) -> impl Future<Output = Result<(), Error>> + Send {
                 (**self).commit(commit)
+            }
+
+            fn commit_transaction(&self, commit: TransactionCommit<Self::Operation>) -> impl Future<Output = Result<(), Error>> + Send {
+                (**self).commit_transaction(commit)
             }
 
             fn events(

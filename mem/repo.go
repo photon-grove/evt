@@ -35,19 +35,34 @@ var (
 
 // Commit Events to memory. It does not reject reused sequences, but like the durable backends it
 // rejects a commit at or below the entity's snapshot, which compaction may have deleted below.
+// A multi-stream commit validates every stream, snapshot, and read fence before writing
+// anything, so a failure leaves every stream unchanged.
 func (repo Repository) Commit(
 	_ context.Context,
 	result evt.SerializedResult,
 ) error {
-	if err := evt.CheckReservedEntityIDs(result.Events); err != nil {
+	normalized, err := evt.NormalizeCommit(result)
+	if err != nil {
 		return err
 	}
 
-	if err := repo.checkFloor(result.Events); err != nil {
+	if err := evt.PreflightCommit(normalized); err != nil {
 		return err
 	}
 
-	for _, event := range result.Events {
+	if err := repo.checkFloor(normalized.Events); err != nil {
+		return err
+	}
+
+	if err := repo.checkSnapshots(normalized.Snapshots); err != nil {
+		return err
+	}
+
+	if err := repo.checkFences(normalized.Fences); err != nil {
+		return err
+	}
+
+	for _, event := range normalized.Events {
 		id := string(event.EntityID)
 
 		if repo.events[id] == nil {
@@ -58,7 +73,50 @@ func (repo Repository) Commit(
 		repo.events[id] = append(repo.events[id], event)
 	}
 
-	return repo.applyTransactions(result.Transaction)
+	for _, snapshot := range normalized.Snapshots {
+		repo.snapshots[string(snapshot.EntityID)] = snapshot
+	}
+
+	return repo.applyTransactions(normalized.Transaction)
+}
+
+// checkSnapshots rejects a snapshot whose sequence does not follow the stored one, or whose
+// event sequence is not above the events it summarizes.
+func (repo Repository) checkSnapshots(snapshots []evt.SerializedSnapshot) error {
+	for _, snapshot := range snapshots {
+		stored, ok := repo.snapshots[string(snapshot.EntityID)]
+		if ok && stored.Sequence+1 != snapshot.Sequence {
+			return evt.NewConflictError(fmt.Sprintf(
+				"mem: snapshot sequence moved: stored %d, commit writes %d",
+				stored.Sequence, snapshot.Sequence,
+			))
+		}
+	}
+
+	return nil
+}
+
+// checkFences rejects a fence whose stream has moved past the fenced head: any event above the
+// head, or any snapshot covering it, means another writer advanced the stream. This is the
+// in-memory form of the slot check plus the snapshot companion (ADR 0004, C2).
+func (repo Repository) checkFences(fences []evt.ReadFence) error {
+	for _, fence := range fences {
+		for _, event := range repo.events[string(fence.EntityID)] {
+			if event.Sequence > fence.Head {
+				return evt.NewConflictError(fmt.Sprintf(
+					"mem: read fence on %s failed: head moved past %d", fence.EntityID, fence.Head,
+				))
+			}
+		}
+
+		if snapshot, ok := repo.snapshots[string(fence.EntityID)]; ok && snapshot.EventSequence > fence.Head {
+			return evt.NewConflictError(fmt.Sprintf(
+				"mem: read fence on %s failed: snapshot covers past head %d", fence.EntityID, fence.Head,
+			))
+		}
+	}
+
+	return nil
 }
 
 // CommitStream streams Events to memory
@@ -66,7 +124,7 @@ func (repo Repository) Commit(
 // Deprecated: Cut in ADR-0006 (K1). Commit batched commands through the normal commit path
 // instead. It will be removed in the next minor release.
 func (repo Repository) CommitStream(
-	_ context.Context,
+	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],
 ) []error {
 	var errors []error
@@ -78,28 +136,7 @@ func (repo Repository) CommitStream(
 			continue
 		}
 
-		if err := evt.CheckReservedEntityIDs(serializedResult.Events); err != nil {
-			errors = append(errors, err)
-			continue
-		}
-
-		if err := repo.checkFloor(serializedResult.Events); err != nil {
-			errors = append(errors, err)
-			continue
-		}
-
-		for _, event := range serializedResult.Events {
-			id := string(event.EntityID)
-
-			if repo.events[id] == nil {
-				var empty []evt.SerializedEvent
-				repo.events[id] = empty
-			}
-
-			repo.events[id] = append(repo.events[id], event)
-		}
-
-		if err := repo.applyTransactions(serializedResult.Transaction); err != nil {
+		if err := repo.Commit(ctx, serializedResult); err != nil {
 			errors = append(errors, err)
 		}
 	}
@@ -122,7 +159,8 @@ func (repo Repository) checkFloor(events []evt.SerializedEvent) error {
 	return nil
 }
 
-// CommitWithSnapshot commits Events with a Snapshot
+// CommitWithSnapshot commits Events with a Snapshot. It routes through the multi-stream commit
+// path, writing the snapshot in the same logical commit as its events.
 func (repo Repository) CommitWithSnapshot(
 	ctx context.Context,
 	result evt.SerializedResult,
@@ -131,29 +169,23 @@ func (repo Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if len(result.Events) == 0 {
+		return fmt.Errorf("mem: commit with snapshot requires at least one event")
+	}
+
 	if err := evt.CheckReservedEntityID(entityID); err != nil {
 		return err
 	}
 
-	if err := repo.Commit(ctx, result); err != nil {
-		return err
-	}
-
-	currentSequence := result.Events[len(result.Events)-1].Sequence
-
-	id := string(entityID)
-
-	snapshot := evt.SerializedSnapshot{
+	result.Snapshots = append(result.Snapshots, evt.SerializedSnapshot{
 		EntityType:    entityType,
 		EntityID:      entityID,
 		Sequence:      currentSnapshot,
-		EventSequence: currentSequence,
+		EventSequence: result.Events[len(result.Events)-1].Sequence,
 		Payload:       payload,
-	}
+	})
 
-	repo.snapshots[id] = snapshot
-
-	return nil
+	return repo.Commit(ctx, result)
 }
 
 // GetEvents gets all Events

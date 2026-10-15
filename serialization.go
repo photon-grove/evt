@@ -30,10 +30,15 @@ func (e *SerializedEvent) UnmarshalJSON(data []byte) error {
 	return UnmarshalEvent(data, e)
 }
 
-// SerializedResult is similar to CommandResult but uses SerializedEvents instead.
+// SerializedResult is similar to CommandResult but uses SerializedEvents instead. A multi-stream
+// commit (ADR 0004, C1) appends to any number of streams in one result: Events carries every
+// written stream's events, Snapshots the per-stream snapshot puts, and Fences the read fences
+// for read-only streams (C2). The zero value keeps the single-stream shape.
 type SerializedResult struct {
-	Events      []SerializedEvent `json:"events"`
-	Transaction Transaction       `json:"transactions"`
+	Events      []SerializedEvent    `json:"events"`
+	Snapshots   []SerializedSnapshot `json:"snapshots,omitempty"`
+	Fences      []ReadFence          `json:"fences,omitempty"`
+	Transaction Transaction          `json:"transactions"`
 }
 
 // SerializedSnapshot represents a snapshot of current Entity state that is ready
