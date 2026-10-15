@@ -569,7 +569,21 @@ async fn postgres_schema_setup_is_concurrent_safe() {
 
 #[tokio::test]
 async fn postgres_conforms() {
-    let repository = drivers::postgres().await.expect("connect to PostgreSQL");
+    // C9 cases mutate table-global state, including unsupported declarations. Keep them
+    // separate from parallel tests that exercise normal commits on the default event log.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let events = format!("cf_{nanos:x}");
+    let snapshots = format!("{events}s");
+    let repository = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    repository
+        .ensure_schema()
+        .await
+        .expect("create the event log");
     let views = PostgresViews::new(repository.pool().clone())
         .await
         .expect("create the view table");
@@ -585,14 +599,29 @@ async fn postgres_conforms() {
         .await;
 
     // A second handle over the same pool is a second writer with its own marker cache.
-    let second = PostgresRepository::new(repository.pool().clone());
+    let second = PostgresRepository::new(repository.pool().clone())
+        .with_tables(&events, &snapshots)
+        .unwrap();
     feature_marker_cases(&repository, &second).await;
-    postgres_features_text_matches_the_manifest(&repository).await;
+    postgres_features_text_matches_the_manifest(&repository, &events).await;
+    repository
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features"
+        ))
+        .await
+        .expect("drop the isolated event log");
 }
 
 /// Reads the features row back through raw SQL and asserts the stored JSON text is exactly the
 /// manifest's encoding, matching the DynamoDB attribute byte for byte.
-async fn postgres_features_text_matches_the_manifest(repository: &PostgresRepository) {
+async fn postgres_features_text_matches_the_manifest(
+    repository: &PostgresRepository,
+    events_table: &str,
+) {
     use photon_evt::wire::postgres::features_table;
 
     let manifest = repository
@@ -609,7 +638,7 @@ async fn postgres_features_text_matches_the_manifest(repository: &PostgresReposi
         .query_opt(
             &format!(
                 "SELECT features, history_dependent, retention FROM {} WHERE id = 0",
-                features_table("evt_events")
+                features_table(events_table)
             ),
             &[],
         )
