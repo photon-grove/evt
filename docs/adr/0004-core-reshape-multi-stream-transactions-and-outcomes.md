@@ -123,8 +123,10 @@ load re-derives the head as the larger of the highest event sequence and the sna
 `head + 1` makes the fence redundant and it is omitted.
 
 **Storage format.** The fence is two `ConditionCheck` transaction items — the slot
-`(pk, sk = head+1)` and the snapshot item `(pk, sk = 0)`; the snapshot check may be omitted for a
-stream whose repository has compaction disabled (E1.1 pins the exact rule). Each bills as a write and
+`(pk, sk = head+1)` and the snapshot item `(pk, sk = 0)`. The snapshot companion is always
+included: any store instance can snapshot the stream and `CompactBelow` compacts whatever a
+durable snapshot covers, so no interval configuration durably disables compaction (E1.1 pins the
+exact rule). Each bills as a write and
 counts toward the 100-item limit, like the existing floor check
 ([`dynamo/commit.go`](../../dynamo/commit.go), `buildFloorChecks`). A `ConditionalCheckFailed` on a
 fence is a conflict (another writer moved the stream), classified and retried like an event-put
@@ -132,8 +134,11 @@ conflict. PostgreSQL fences cannot rely on row locks: the slot at `head + 1` doe
 and `SELECT … FOR KEY SHARE` locks only rows that were actually returned, so it cannot protect an
 absent key. Instead, every fenced stream takes the same per-entity transaction-scoped advisory
 lock the writer path already takes (`pg_advisory_xact_lock(1702261760, hashtext($1))` with the
-entity ID), then asserts `max(sequence) = head` over the stream's events — and the snapshot's
-`eventSeq <= head` — inside the commit transaction. A concurrent writer blocks on the advisory
+entity ID), then asserts `max(sequence) <= head` over the stream's events — and the snapshot's
+`eventSeq <= head` — inside the commit transaction. _Errata (E1.1):_ the events predicate is an
+upper bound, not equality, matching the storage spec — a fully compacted stream whose snapshot
+sits at the fenced head has `max(sequence) < head` and is unchanged, not moved, so equality would
+wrongly reject it. A concurrent writer blocks on the advisory
 lock rather than slipping `head + 1` past a fenced read. The in-memory backends check
 sequentially. Fences are declared per read; a fence the caller fills from outside the engine is a
 caller-stamped fence (see C5).
@@ -183,20 +188,21 @@ though it remains as a cheap pre-check on load.
 
 **Storage format.** New item shape on the shared table (same `pk`/`sk` pattern as every stream):
 
-| Attribute   | Type | Outcome item (`pk = command-outcome#<id>`)                |
-| ----------- | ---- | --------------------------------------------------------- |
-| `pk`        | S    | `command-outcome#<commandId>`                             |
-| `sk`        | N    | `1` (single row per command)                              |
-| `status`    | S    | `accepted` or `rejected` (written once, final)            |
-| `digest`    | S    | pluggable identity digest                                 |
-| `response`  | S    | stored response JSON (base64 or raw text — fixed in E1.1) |
-| `events`    | S    | event IDs the commit wrote, when any                      |
-| `rejection` | S    | serialized `Rejection` when `status = rejected`           |
-| `code`      | S    | rejection code, when rejected                             |
+| Attribute   | Type | Outcome item (`pk = command-outcome#<id>`)                                                                                                |
+| ----------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `pk`        | S    | `command-outcome#<commandId>`                                                                                                             |
+| `sk`        | N    | `1` (single row per command)                                                                                                              |
+| `status`    | S    | `accepted` or `rejected` (written once, final)                                                                                            |
+| `digest`    | S    | pluggable identity digest                                                                                                                 |
+| `response`  | S    | the response bytes, standard padded base64 (Errata (E1.1): the storage spec pins base64, so arbitrary bytes round-trip in both languages) |
+| `events`    | S    | event IDs the commit wrote, when any                                                                                                      |
+| `rejection` | S    | serialized `Rejection` when `status = rejected`                                                                                           |
+| `code`      | S    | rejection code, when rejected                                                                                                             |
 
 The row is written once, in its final state, inside the commit transaction, conditioned on
 `attribute_not_exists(pk)`. A committed transaction therefore never leaves a half-written outcome.
-The row's byte-level shape is specified in E1.1. The `command-outcome#` namespace is reserved:
+The row's byte-level shape is pinned in the storage spec (E1.1). The `command-outcome#` namespace
+is reserved:
 repository scans that walk streams skip it (C8), and it has no snapshot and never compacts.
 
 **API shape.**
@@ -243,7 +249,7 @@ this reason; Go's `NoOp` becomes accepted-without-events (C3). Rejections are st
 retried command replays the original rejection verbatim.
 
 **Storage format.** The `rejection` attribute on the outcome row (above), with a fixed JSON shape
-specified in E1.1. No other format change.
+pinned in the storage spec (E1.1). No other format change.
 
 **API shape.**
 
@@ -275,7 +281,11 @@ persisted via C3 when retries are exhausted. This replaces blind `ExecuteWithRet
 remain for backend-level transient classification.
 
 **Storage format.** None beyond C3 (a stale rejection is an outcome row). Fence provenance
-(engine-filled vs caller-stamped) is in-memory commit metadata, not stored.
+(engine-filled vs caller-stamped) is in-memory commit metadata, not stored. _Errata (E1.1):_ the
+classification keys off the **transaction item that failed**, not the commit's contents: a failed
+event put, floor check, or snapshot condition is an ordinary conflict that re-prepares even when
+the commit also carried caller-stamped fences, and only a failed caller-stamped fence produces
+the stale-fence rejection. The storage spec pins this in "Fence-aware retry".
 
 ### C6 — Metadata: `principalId`, `causationId`, `extensions`
 
@@ -293,7 +303,11 @@ remain for backend-level transient classification.
 **Storage format.** The metadata JSON gains three keys, always written (absent = `null` /
 empty map), appended after the existing keys so stored events remain readable without upcasters —
 decoding is lenient in both languages, and the existing fixture vectors still decode. New fixtures
-cover the added keys. Rust's `photon_evt::metadata` mirrors the field order.
+cover the added keys. Rust's `photon_evt::metadata` mirrors the field order. _Errata (E1.1):_ the
+metadata JSON gains a fourth key, `commitId` (a string the engine writes, not the caller): every
+event of one commit carries the same value — identical across all streams of a multi-stream
+commit — defaulting to the command ID when outcomes are enabled, else a generated ULID. It is the
+only durable commit boundary, and a wipe-and-rebuild regroups on it (see C7).
 
 **API shape.** Go: `Metadata.PrincipalID *PrincipalID`, `Metadata.CausationID *CommandID`,
 `Metadata.Extensions map[string]string` plus `WithPrincipalID`/`WithCausationID`/`WithExtension`
@@ -323,14 +337,31 @@ new general API. This also retires the handler-attached `CommandResult.Transacti
 **Storage format.** View items keep the existing attribute set (`pk`, `sk`, `entityID`,
 `entityType`, `payload`) but are no longer constrained to `sk = "VIEW"` or the derived pk; the
 spec's Views section is relaxed accordingly, and fixtures gain a multi-pk/sk vector. Delete
-operations are transaction deletes with their own conditions. On PostgreSQL, evt defines no view
+operations are transaction deletes with their own conditions. _Errata (E1.1):_ because the log
+stores only per-stream events, the spec pins how a wipe-and-rebuild reproduces the grouping: it
+regroups events by `commitId` (C6) and runs the commit-wide projector once per commit, with that
+commit's events in the pinned (stream ID, sequence) order; the projector's output may depend only
+on the events of that commit plus the post-commit aggregate states, never on cross-commit
+ordering; pre-v0.9 events without `commitId` replay as single-event commits. On PostgreSQL, evt defines no view
 schema — apps own their view tables, and the "do not build" verdict on a Postgres view store
 stands ([ADR 0006](0006-parity-policy-and-feature-cuts.md)). C7 on PostgreSQL therefore means the
 backend executes the projector's operations inside the commit transaction, as the Rust backend
 already does with `PgStatement` ([`crates/evt/src/postgres.rs`](../../crates/evt/src/postgres.rs));
 the Go PostgreSQL backend today ignores `res.Transaction`
 ([`postgres/repository.go`](../../postgres/repository.go)), so this is new backend work — a
-view-row execution path, not a port of an existing one.
+view-row execution path, not a port of an existing one. _Errata (E1.1):_ the spec pins the
+**current-state contract**: a commit-wide projector's rows are a deterministic function of the
+commit's events plus the post-commit aggregate states, and every commit-wide projector implements
+a second, **state entry point** called with a lookup by stream ID over the final state of every
+aggregate in scope. Rebuild splits by projector kind: **current-state** projectors (the default)
+never replay history — the rebuild loads every aggregate's final state (snapshot + tail), calls
+the state entry point once over all of them, and writes the complete returned row set, so
+cross-entity rows derive from complete, consistent state and compaction is irrelevant to them;
+**history-dependent** projectors replay every commit grouped by `commitId`, and compaction is
+forbidden for their entity types — durably, via the feature manifest's `historyDependent` set
+(C9), which `CompactBelow` checks with a consistent read and refuses with a typed error in every
+process. Projections that need the full history (for example feeds) must declare it; a rebuild
+that finds such a stream already compacted fails with `CompactionUncovered`.
 
 **API shape.**
 
@@ -400,18 +431,26 @@ commit.
 
 **Storage format.**
 
-| Attribute  | Type | Feature-marker item (`pk = SYSTEM#FEATURES`)                                               |
-| ---------- | ---- | ------------------------------------------------------------------------------------------ |
-| `pk`       | S    | `SYSTEM#FEATURES`                                                                          |
-| `sk`       | N    | `0` (the events table's `sk` is numeric — the feature set is an attribute, not a sort key) |
-| `version`  | N    | bumped on every declaration or change                                                      |
-| `features` | S    | serialized feature set (the declared feature identifiers)                                  |
+| Attribute  | Type | Feature-marker item (`pk = SYSTEM#FEATURES`)                                                                                                               |
+| ---------- | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pk`       | S    | `SYSTEM#FEATURES`                                                                                                                                          |
+| `sk`       | N    | `0` (the events table's `sk` is numeric — the feature set is an attribute, not a sort key)                                                                 |
+| `version`  | N    | `1` when the row is created; each declaration transaction then adds one (Errata (E1.1): the storage spec pins the initial value and the unit of increment) |
+| `features` | S    | JSON object mapping declared feature name → its stored-format version, keys sorted (Errata (E1.1): per-feature format versions, matching the storage spec) |
 
 One manifest row, `pk = SYSTEM#FEATURES`, `sk = 0` — declared by the writer that first uses a
 feature, updated (with a `version` bump) by every later declaration; `version` is bumped again
 when an extension's storage format changes. A writer that encounters an undeclared-to-it feature
-reads the feature set and refuses. The exact attributes and the ConditionCheck shape are fixed in
-E1.1.
+reads the feature set and refuses. The exact attributes, the per-feature format versions, and the
+ConditionCheck shape are pinned in the storage spec (E1.1). _Errata (E1.1):_ the manifest is
+also the durable home of two policy declarations the original decision left to registration:
+the `historyDependent` set (entity types whose commit-wide projectors need the full commit
+stream, so compaction is forbidden for them — `CompactBelow` reads the set with a consistent read
+and refuses with a typed error in every process that opens the log) and the `retention` set
+(entity types with TTL retention, for which read fences are refused). Both are sorted JSON arrays
+of entity types stored on the same row, and changing either bumps `version` — and re-fails every
+cached writer — exactly as a feature change does. The sets are durable, shared state, so the
+refusals hold across independently configured instances; in-memory-only declarations could not.
 
 ### C10 — Rebuild fence
 
@@ -435,11 +474,22 @@ fenced by the framework, not by app-level flags):
   path also exists and bumps the generation. Until then, commits are still refused while any lock
   row exists — an expired lock blocks writes until taken over or force-released. That is the
   deliberate tradeoff: commits stay safe while any lock row exists, at the cost of waiting out a
-  crashed rebuild until takeover or force-release.
+  crashed rebuild until takeover or force-release. _Errata (E1.1):_ force-release is reshaped to
+  protect readers from a partially rebuilt projection: it deletes the lock (commits resume
+  immediately) but bumps the generation by **two**, leaving it **odd**, and records a
+  `forceReleased` flag on the generation item. Readers keep treating odd as unavailable — every
+  view read stays fenced — until a later rebuild acquires from the flagged odd generation,
+  replays, and completes a release, whose even generation and cleared flag end the fence. The
+  operator tradeoff: force-release trades read availability for write availability, because the
+  force-released rebuild may have committed only some of its wipe and replay batches and no
+  replacement worker remains to finish them.
 - **Commit-time check**: every commit includes a `ConditionCheck` asserting
   `attribute_not_exists(pk)` on the lock row — a commit is refused whenever any rebuild holds the
-  lock, regardless of generation. A commit that races a rebuild is rejected as a conflict and
-  retried with a fresh load (C5 semantics).
+  lock, regardless of generation. _Errata (E1.1):_ a commit that races a rebuild fails its check
+  with `RebuildInProgress`, a control-row classification like the feature-marker check: it is
+  **never** routed through the fence path — it does not produce a stale-fence rejection and is
+  **not** retried with a fresh load under C5 — but is retried after the lock is taken over or
+  force-released. The storage spec pins this in "Writes" and "Fence-aware retry".
 - **Reader epoch check**: the generation increments when a rebuild **acquires** the lock and
   **again when it releases** after replay completes, so the value is odd while a rebuild is in
   progress and even when quiesced. Readers that need consistency read the generation before and

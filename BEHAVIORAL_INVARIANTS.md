@@ -62,14 +62,14 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
 
 Snapshots are stored inline in the events table at `sk=0` for each entity:
 
-| Field      | DynamoDB Type | JSON Key     | Description                              |
-| ---------- | ------------- | ------------ | ---------------------------------------- |
-| pk         | S             | `pk`         | Partition key = EntityID                 |
-| sk         | N             | `sk`         | Sort key = 0 (reserved for snapshots)    |
-| seq        | N             | `seq`        | Snapshot sequence (starts at 1)          |
-| eventSeq   | N             | `eventSeq`   | Last event sequence included in snapshot |
-| entityType | S             | `entityType` | EntityType                               |
-| payload    | S             | `payload`    | JSON-encoded entity state                |
+| Field      | DynamoDB Type | JSON Key     | Description                                  |
+| ---------- | ------------- | ------------ | -------------------------------------------- |
+| pk         | S             | `pk`         | Partition key = EntityID                     |
+| sk         | N             | `sk`         | Sort key = 0 (reserved for snapshots)        |
+| seq        | N             | `seq`        | Snapshot sequence (starts at 1)              |
+| eventSeq   | N             | `eventSeq`   | Last event sequence included in snapshot     |
+| entityType | S             | `entityType` | EntityType                                   |
+| payload    | S             | `payload`    | JSON-encoded entity state                    |
 | ttl        | N             | `ttl`        | Optional TTL expiry (Unix s), mirrors policy |
 
 **Key Invariants:**
@@ -91,6 +91,12 @@ Snapshots are stored inline in the events table at `sk=0` for each entity:
 | entityID   | S             | `entityID`   | EntityID                     |
 | entityType | S             | `entityType` | EntityType (for GSI queries) |
 | payload    | S             | `payload`    | JSON-encoded view data       |
+
+In v0.9 (C7), commit-wide projectors may put or delete rows at any `pk`/`sk` — not only the
+derived `{entityType}#{entityId}` / `VIEW` — with per-operation error mapping and shared
+key-length validation (`pk` ≤ 2,048 and `sk` ≤ 1,024 UTF-8 bytes, enforced before any write on
+both backends). The row shape and rules are specified in the
+[storage format](docs/spec/storage-format.md#views).
 
 ## Serialization Formats
 
@@ -130,6 +136,14 @@ Snapshots are stored inline in the events table at `sk=0` for each entity:
 - `address`: Client IP address (from context)
 - `region`: AWS region
 - `timestamp`: RFC3339 format, UTC timezone
+
+In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C6),
+metadata gains `principalId` (string or null), `causationId` (string or null; defaults to
+`commandId` when unset), `extensions` (string-keyed map, `{}` when empty), and `commitId`
+(string; engine-written, identical across every event of a commit, defaulting to the command ID
+when outcomes are enabled, else a generated ULID) — appended after the
+existing keys. The byte-level shape — including defaults for old readers — is specified in the
+[storage format](docs/spec/storage-format.md#metadata).
 
 ## Error Types and Messages
 
@@ -207,6 +221,11 @@ type TransactionGroup interface {
   floor `ConditionCheck` per
   entity, at the lowest sequence the batch commits for it, whatever order results arrive in
 
+The v0.9 core reshape adds further transaction items — read-fence checks, the command-outcome row,
+and the feature-marker and rebuild-lock checks — with a pinned item ordering and budget formula in
+the [storage format](docs/spec/storage-format.md#writes). An over-budget commit fails with a typed
+error before any write and is never split.
+
 ## Snapshot Logic
 
 ### Snapshot Timing
@@ -247,6 +266,11 @@ its coordination with consumer wipe-and-replay guarantees.
 - **Refuses unless covered:** reads the inline snapshot and requires
   `snapshot.EventSequence >= throughSequence`. With no snapshot, or an uncovered range, it deletes
   nothing and returns `evt.ErrCompactionUncovered` (wrapped; matchable with `errors.Is`).
+- In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7,
+  C9) it also reads the feature manifest's durable `historyDependent` set (consistent read) and
+  refuses with a typed error when the entity's type is declared history-dependent — in every
+  process that opens the log, not only those that registered the projector. The byte-level rules
+  are specified in the [storage format](docs/spec/storage-format.md#feature-marker).
 - Never deletes the `sk = 0` snapshot row. `throughSequence < 1` is a no-op. Idempotent.
 
 ### Compaction invariants
@@ -303,7 +327,7 @@ type EventUpcaster interface {
 
 ### ByCommandID Sort
 
-*Deprecated in v0.9.0 ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md), K7):*
+_Deprecated in v0.9.0 ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md), K7):_
 `evt.ByCommandID` is cut and removed in the next minor release. It has no in-library
 replacement — write your own comparator when you need deterministic batch ordering. The
 pre-v0.9 behavior:
@@ -346,7 +370,7 @@ evt.Metadata{
 - Rejects events whose sequences are not contiguous for an entity, before writing
 - Builds `TransactWriteItem` with conditional expression `attribute_not_exists(sk)`
 - Adds a `ConditionCheck` on the entity's `sk = 0` item: `attribute_not_exists(eventSeq) OR
-  eventSeq < :first`, so a commit cannot write at or below a snapshot's floor after compaction
+eventSeq < :first`, so a commit cannot write at or below a snapshot's floor after compaction
   deleted those keys
 - Includes any transaction groups from projectors
 
@@ -429,7 +453,7 @@ DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimi
 - **Per-entity sequence uniqueness** — for a given entity, each `EventSequence` is written at most
   once. Sequences start at 1 and increase by 1 per committed event.
 - **Optimistic concurrency on commit** — a commit that reuses an already-committed `(EntityID,
-  EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with a conditional
+EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with a conditional
   write (`attribute_not_exists(sk)`); PostgreSQL with the `(entity_id, sequence)` primary key, whose
   unique violation surfaces as an `evt.ConflictError`, classified as transient so
   `policy.ExecuteWithRetry` retries it. (The in-memory backend is a permissive test
@@ -484,3 +508,6 @@ services can append to and load the same streams in DynamoDB or PostgreSQL. See
   - PostgreSQL `metadata` is `jsonb` and must be compared as JSON.
 
   The duplicate-command window (events after the latest snapshot) is the same in both languages.
+  In v0.9 it is superseded by command outcomes, but on an upgraded log the window is the only
+  guard for pre-v0.9 command IDs, which have no outcome rows — a pre-v0.9 duplicate beyond the
+  latest snapshot is not detected (a documented upgrade limitation; no backfill).
