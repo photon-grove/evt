@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -50,6 +51,19 @@ type ScenarioExpectation struct {
 	Snapshot         *string          `json:"snapshot"`
 	DynamoItems      []map[string]any `json:"dynamoItems"`
 	SNSMessages      []string         `json:"snsMessages"`
+
+	// Sibling records a second stream a scenario touches outside its primary partition
+	// (transactional sibling streams, fenced read-only streams). Nil when there is none.
+	Sibling *SiblingExpectation `json:"sibling,omitempty"`
+}
+
+// SiblingExpectation is the stored state of a scenario's sibling stream.
+type SiblingExpectation struct {
+	EntityID    evt.EntityID     `json:"entityId"`
+	Sequence    int64            `json:"sequence"`
+	Events      []string         `json:"events"`
+	Snapshot    *string          `json:"snapshot"`
+	DynamoItems []map[string]any `json:"dynamoItems"`
 }
 
 // ForRun rewrites the expectation's entity IDs from the fixture run to another run.
@@ -293,8 +307,14 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 
 	entity := NewAccount(entityID)
 	eventContext, err := runner.Store.LoadEntity(ctx, entity, entityID)
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "skips from sequence") {
 		return expectation, err
+	}
+
+	// A compacted sibling stream (the read-fences scenario) has no coherent aggregate view; its
+	// stored rows are still compared by the Rust side.
+	if err != nil {
+		return expectation, nil
 	}
 
 	state, err := json.Marshal(entity)
@@ -307,6 +327,36 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 	expectation.SnapshotSequence = int64(*eventContext.CurrentSnapshot)
 
 	return expectation, nil
+}
+
+// ObserveSibling records the stored state of a scenario's sibling stream (transactional sibling
+// streams, fenced read-only streams).
+func ObserveSibling(ctx context.Context, runner Runner, entityID evt.EntityID) (*SiblingExpectation, error) {
+	events, err := runner.Repo.GetEvents(ctx, entityID)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshot, err := runner.Repo.GetSnapshot(ctx, entityID)
+	if err != nil {
+		return nil, err
+	}
+
+	encoded, err := encodeEvents(events)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshotJSON, err := encodeSnapshot(snapshot)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SiblingExpectation{
+		EntityID: entityID,
+		Events:   encoded,
+		Snapshot: snapshotJSON,
+	}, nil
 }
 
 // encodeEvents renders stored events in their canonical JSON form. It never returns nil, so an empty
@@ -380,6 +430,15 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 			}
 			expectation.SNSMessages = append(expectation.SNSMessages, message)
 		}
+
+		sibling, serr := ObserveSibling(ctx, runner, entityID+"-watched")
+		if serr != nil {
+			return fixtures, fmt.Errorf("%s: %w", scenario.Name, serr)
+		}
+		for _, item := range fake.Items(string(entityID) + "-watched") {
+			sibling.DynamoItems = append(sibling.DynamoItems, DynamoItemJSON(item))
+		}
+		expectation.Sibling = sibling
 
 		fixtures.Scenarios = append(fixtures.Scenarios, expectation)
 	}

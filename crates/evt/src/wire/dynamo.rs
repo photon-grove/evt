@@ -55,6 +55,16 @@ pub const FIRST_SNAPSHOT_CONDITION: &str = "attribute_not_exists(seq)";
 /// [`FLOOR_CONDITION`] because a transaction cannot touch the snapshot item twice.
 pub const NEXT_SNAPSHOT_CONDITION: &str = "seq = :seq AND eventSeq < :first";
 
+/// Condition for a fenced read-only stream's slot check: `(pk, sk = head + 1)` must be free, so
+/// no writer has appended past the head the reader saw (ADR 0004, C2).
+pub const FENCE_SLOT_CONDITION: &str = "attribute_not_exists(sk)";
+
+/// Condition for a fenced read-only stream's snapshot companion on `(pk, sk = 0)`: the stored
+/// snapshot must not cover past the fenced head (`:head`), which closes the compaction ABA. It
+/// passes on a stream with no snapshot item. Always included — any store instance can snapshot
+/// the stream and compaction deletes whatever a durable snapshot covers.
+pub const FENCE_COMPANION_CONDITION: &str = "attribute_not_exists(sk) OR eventSeq <= :head";
+
 /// Condition for out-of-band snapshot puts: never lower the stored `eventSeq` (`:new`).
 pub const PUT_SNAPSHOT_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq <= :new";
 

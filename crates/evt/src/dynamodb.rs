@@ -25,7 +25,7 @@ use crate::features::{
 };
 use crate::ids::{EntityId, EntityType, EventSequence};
 use crate::json;
-use crate::repository::{Commit, Repository};
+use crate::repository::{Commit, Repository, TransactionCommit};
 use crate::wire::dynamo::{self as wire, AttributeValue, Item};
 
 /// DynamoDB's limit on actions per transaction.
@@ -295,6 +295,76 @@ impl DynamoRepository {
         }
 
         Ok(items)
+    }
+
+    /// Builds a multi-stream commit's transaction items in the pinned order: the feature-marker
+    /// check, the projector operations, then per written stream in bytewise stream-ID order its
+    /// event puts followed by its snapshot put or floor check, then per fenced read-only stream
+    /// its slot check and snapshot companion. The layout records each item's index so a failed
+    /// commit is classified by the item that failed.
+    fn transaction_stream_items(
+        &self,
+        commit: &TransactionCommit<TransactWriteItem>,
+        validated: ValidatedMarker,
+    ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
+        let mut items = Vec::new();
+        let mut layout = TransactionLayout::default();
+
+        items.push(self.marker_check(validated)?);
+        items.extend(commit.operations.iter().cloned());
+        layout.operations = items.len() - 1;
+
+        for stream in &commit.streams {
+            let Some(first) = stream.events.first().map(|event| n(event.sequence.0)) else {
+                continue;
+            };
+
+            for event in &stream.events {
+                let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
+                items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
+            }
+
+            if let Some(snapshot) = &stream.snapshot {
+                let ttl = self.ttl_for(&snapshot.entity_type);
+                let item = wire::snapshot_item(
+                    &SerializedSnapshot {
+                        entity_type: snapshot.entity_type.clone(),
+                        entity_id: stream.entity_id.clone(),
+                        sequence: snapshot.sequence,
+                        event_sequence: stream
+                            .events
+                            .last()
+                            .expect("normalized stream has events")
+                            .sequence,
+                        payload: snapshot.payload.clone(),
+                    },
+                    ttl,
+                )?;
+                // Commit::validate guarantees the sequence is at least 1.
+                let expected = snapshot.sequence.0 - 1;
+                items.push(if expected == 0 {
+                    put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
+                } else {
+                    put(
+                        &self.table,
+                        item,
+                        Some(wire::NEXT_SNAPSHOT_CONDITION),
+                        &[(":seq", n(expected)), (":first", first)],
+                    )?
+                });
+            } else {
+                items.push(floor_check(&self.table, &stream.entity_id, first)?);
+            }
+        }
+
+        for fence in &commit.fences {
+            items.extend(fence_checks(&self.table, fence)?);
+            let base = items.len() - 2;
+            layout.fences.push((base, fence.clone()));
+            layout.fences.push((base + 1, fence.clone()));
+        }
+
+        Ok((items, layout))
     }
 
     /// Returns every item in an entity's partition, including the snapshot at `sk = 0`, in sort
@@ -605,6 +675,98 @@ impl Repository for DynamoRepository {
         }
     }
 
+    async fn commit_transaction(
+        &self,
+        commit: TransactionCommit<TransactWriteItem>,
+    ) -> Result<(), Error> {
+        let mut commit = commit;
+        commit.normalize()?;
+
+        if commit.is_empty() {
+            return Ok(());
+        }
+
+        // Fences are refused for entity types durably declared with retention: TTL deletes reopen
+        // fenced slots without leaving a successor snapshot. The refusal consults the manifest,
+        // not this instance's configuration.
+        if !commit.fences.is_empty() {
+            let manifest = self.read_manifest().await?;
+            commit.check_retention(manifest.as_ref())?;
+        }
+
+        let mut revalidations = 0;
+
+        loop {
+            let cached = self.ensure_manifest_validated().await?;
+            let (items, layout) = self.transaction_stream_items(&commit, cached)?;
+
+            let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
+            for operation in &commit.operations {
+                sizes.push(sdk_item_size(operation));
+            }
+            crate::repository::check_budget(sizes)?;
+
+            match self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    let codes = cancellation_reasons(&err);
+
+                    let failed_check = failed_items(&codes, "ConditionalCheckFailed").next();
+                    let fence_conflict = failed_check.and_then(|index| layout.fence_at(index).cloned());
+
+                    if failed_check == Some(0) {
+                        // The feature set changed under this writer: re-validate it, then
+                        // retry. Re-validating refuses a feature this writer does not support.
+                        if revalidations >= MAX_MARKER_REVALIDATIONS {
+                            return Err(Error::Backend(Box::new(err)));
+                        }
+                        revalidations += 1;
+                        self.invalidate_manifest();
+
+                        continue;
+                    }
+
+                    let fallback_entity = || {
+                        commit
+                            .streams
+                            .first()
+                            .map_or_else(|| EntityId::new("unknown"), |stream| stream.entity_id.clone())
+                    };
+
+                    if let Some(fence) = fence_conflict {
+                        return Err(Error::FenceConflict {
+                            entity_id: fence.entity_id,
+                            index: failed_check.unwrap_or_default(),
+                            provenance: fence.provenance,
+                        });
+                    }
+
+                    if let Some(index) = failed_check {
+                        if index > 0 && index <= layout.operations {
+                            // Projector conditions are not retried by reloading.
+                            return Err(Error::Projector(Box::new(err)));
+                        }
+
+                        return Err(Error::Conflict {
+                            entity_id: fallback_entity(),
+                            message:
+                                "conditional check failed: the sequence or snapshot changed since it was read"
+                                    .to_owned(),
+                        });
+                    }
+
+                    return Err(classify_transaction_error(&fallback_entity(), layout.operations, err));
+                }
+            }
+        }
+    }
+
     async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
         self.query_events(entity_id, EventSequence::ZERO).await
     }
@@ -862,6 +1024,68 @@ fn put(
     Ok(TransactWriteItem::builder()
         .put(put.build().map_err(Error::backend)?)
         .build())
+}
+
+/// Where each kind of item sits in a multi-stream transaction, for failure classification.
+#[derive(Default)]
+struct TransactionLayout {
+    /// Number of projector operations, which start at index 1 after the marker check.
+    operations: usize,
+    /// Fences by their slot-check and companion-check item indexes.
+    fences: Vec<(usize, crate::repository::ReadFence)>,
+}
+
+impl TransactionLayout {
+    fn fence_at(&self, index: usize) -> Option<&crate::repository::ReadFence> {
+        self.fences
+            .iter()
+            .find(|(item_index, _)| *item_index == index)
+            .map(|(_, fence)| fence)
+    }
+}
+
+/// Builds a fenced read-only stream's two ConditionChecks: the slot check on
+/// `(pk, sk = head + 1)` and the snapshot companion on `(pk, sk = 0)`, which is always included.
+fn fence_checks(
+    table: &str,
+    fence: &crate::repository::ReadFence,
+) -> Result<[TransactWriteItem; 2], Error> {
+    let slot = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(fence.entity_id.as_str()))
+        .key("sk", n(fence.head.next().0))
+        .condition_expression(wire::FENCE_SLOT_CONDITION)
+        .build()
+        .map_err(Error::backend)?;
+
+    let companion = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(fence.entity_id.as_str()))
+        .key("sk", n(wire::SNAPSHOT_SORT_KEY))
+        .condition_expression(wire::FENCE_COMPANION_CONDITION)
+        .expression_attribute_values(":head", n(fence.head.0))
+        .build()
+        .map_err(Error::backend)?;
+
+    Ok([
+        TransactWriteItem::builder()
+            .condition_check(slot)
+            .build(),
+        TransactWriteItem::builder()
+            .condition_check(companion)
+            .build(),
+    ])
+}
+
+/// A projector operation's DynamoDB-encoded item size: the sum over its Put item's attributes of
+/// the attribute name's byte length plus the value's encoded byte length. Non-put operations
+/// carry no bytes.
+fn sdk_item_size(operation: &TransactWriteItem) -> usize {
+    let Some(put) = &operation.put else {
+        return 0;
+    };
+
+    crate::repository::item_size(&from_sdk_item(&put.item))
 }
 
 /// Checks that a commit starting at `first` is above the entity's snapshot floor.

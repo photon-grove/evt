@@ -235,11 +235,14 @@ impl<Op> TransactionCommit<Op> {
             if fence.head.0 < 0 || fence.head.checked_next().is_none() || !fences.insert(fence.entity_id.clone()) {
                 return Err(Error::InvalidCommit(format!("invalid or duplicate fence {}", fence.entity_id)));
             }
-            if let Some(stream) = self.streams.iter().find(|s| s.entity_id == fence.entity_id)
-                && let Some(first) = stream.events.first()
-                && (first.entity_type != fence.entity_type || Some(first.sequence) != fence.head.checked_next())
-            {
-                return Err(Error::InvalidCommit(format!("written fence does not match {}", fence.entity_id)));
+        }
+        // Snapshots belong to written streams: a snapshot must cover its commit's last event.
+        for stream in &self.streams {
+            if stream.snapshot.is_some() && stream.events.is_empty() {
+                return Err(Error::InvalidCommit(format!(
+                    "snapshot for {} must cover this commit's last event",
+                    stream.entity_id
+                )));
             }
         }
         // Preserve declaration/emission order before sorting the write set.
@@ -254,6 +257,8 @@ impl<Op> TransactionCommit<Op> {
         self.streams.retain(|stream| !stream.events.is_empty());
         self.streams.sort_by(|a, b| a.entity_id.as_str().as_bytes().cmp(b.entity_id.as_str().as_bytes()));
         self.fences.sort_by(|a, b| a.entity_id.as_str().as_bytes().cmp(b.entity_id.as_str().as_bytes()));
+        // A written stream's event put at head + 1 supersedes its fence.
+        self.fences.retain(|fence| !self.streams.iter().any(|stream| stream.entity_id == fence.entity_id));
         Ok(())
     }
 
@@ -263,7 +268,7 @@ impl<Op> TransactionCommit<Op> {
 
     pub(crate) fn check_retention(&self, manifest: Option<&crate::FeatureManifest>) -> Result<(), Error> {
         for fence in &self.fences {
-            if manifest.is_some_and(|m| m.retention.contains(&fence.entity_type)) {
+            if manifest.is_some_and(|m| m.retention.contains(fence.entity_type.as_str())) {
                 return Err(Error::RetentionConflict { entity_type: fence.entity_type.clone() });
             }
         }
@@ -341,7 +346,7 @@ pub(crate) fn item_size(item: &crate::wire::dynamo::Item) -> usize {
             V::M(m) => 3 + item_size(m) + m.len(),
             V::L(l) => 3 + l.iter().map(|v| 1 + value_size(v)).sum::<usize>(),
             V::Ss(s) | V::Ns(s) => s.iter().map(String::len).sum(),
-            V::Bs(b) => b.iter().map(Vec::len).sum(),
+            V::Bs(b) => b.iter().map(|v| v.len()).sum(),
         }
     }
     item.iter().map(|(name, value)| name.len() + value_size(value)).sum()

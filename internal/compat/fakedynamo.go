@@ -130,6 +130,9 @@ func conditionHolds(
 
 	case "attribute_not_exists(eventSeq) OR eventSeq <= :new":
 		return compareIfExists(existing, "eventSeq", values, ":new", func(have, limit int64) bool { return have <= limit })
+
+	case "attribute_not_exists(sk) OR eventSeq <= :head":
+		return compareIfExists(existing, "eventSeq", values, ":head", func(have, head int64) bool { return have <= head })
 	}
 
 	return false, fmt.Errorf("fake dynamo: unsupported condition %q", condition)

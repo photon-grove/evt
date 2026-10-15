@@ -12,7 +12,7 @@ use crate::event::{DomainEvent, SerializedEvent};
 use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
-use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
+use crate::repository::{Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit, snapshot_events_due};
 use crate::retry::RetryPolicy;
 use crate::upcast::upcast_event;
 
@@ -259,8 +259,10 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             return Ok((loaded, Vec::new()));
         }
 
+        // The engine stamps the commit ID once per commit; every event of this commit carries it.
+        let stamped = stamp_commit_id(metadata);
         let serialized =
-            serialize_events::<A>(&loaded.entity_id, loaded.sequence, &events, metadata)?;
+            serialize_events::<A>(&loaded.entity_id, loaded.sequence, &events, &stamped)?;
         let snapshot_due =
             snapshot_events_due(loaded.sequence, events.len(), self.snapshot_interval) > 0;
         let projected_events = (!self.projectors.is_empty()).then(|| events.clone());
@@ -473,4 +475,223 @@ mod tests {
 
         assert!(matches!(result, Err(Error::InvalidCommit(_))), "{result:?}");
     }
+}
+
+/// One multi-stream transaction (ADR 0004, C1/C2). A caller loads aggregates with
+/// [`Store::load`], hands them to [`read`](Transaction::read), appends decided events to any
+/// subset with [`append`](Transaction::append), adds caller-stamped fences with
+/// [`fence`](Transaction::fence), and commits once with [`commit`](Transaction::commit). A stream
+/// that was read but never appended to contributes an engine-filled [read fence](ReadFence), so
+/// the commit fails when another writer moved the stream past the head the reader saw.
+///
+/// The single-aggregate shortcut stays: [`Store::execute`] remains a load, handle, and commit of
+/// one entity, over the same repository commit path.
+///
+/// A transaction is single-use: any error consumes it, and a new one must be built.
+pub struct Transaction<'a, A: Aggregate, R: Repository> {
+    store: &'a Store<A, R>,
+    streams: Vec<Loaded<A>>,
+    appended: Vec<Vec<A::Event>>,
+    fences: Vec<ReadFence>,
+    used: bool,
+}
+
+impl<A: Aggregate, R: Repository> Store<A, R> {
+    /// Begins a multi-stream transaction on this store's repository. The aggregate type is the
+    /// store's; streams of other aggregate types can only be fenced (a caller-stamped
+    /// [`ReadFence`] with the head they were read at).
+    pub fn transaction(&self) -> Transaction<'_, A, R> {
+        Transaction {
+            store: self,
+            streams: Vec::new(),
+            appended: Vec::new(),
+            fences: Vec::new(),
+            used: false,
+        }
+    }
+}
+
+impl<A, R> Transaction<'_, A, R>
+where
+    A: Aggregate,
+    R: Repository,
+{
+    /// Hands a loaded aggregate to the transaction's read set, consuming it. Appending events
+    /// with [`append`](Transaction::append) applies them to this copy, so the snapshot the
+    /// commit captures reflects them; a read that is never appended to is fenced at the head it
+    /// was loaded at.
+    pub fn read(&mut self, loaded: Loaded<A>) -> Result<&mut Self, Error> {
+        if self.used {
+            return Err(Error::InvalidCommit(
+                "the transaction is already consumed".to_owned(),
+            ));
+        }
+        if self.streams.iter().any(|existing| existing.entity_id == loaded.entity_id) {
+            return Err(Error::InvalidCommit(format!(
+                "duplicate read of {}",
+                loaded.entity_id
+            )));
+        }
+
+        self.appended.push(Vec::new());
+        self.streams.push(loaded);
+
+        Ok(self)
+    }
+
+    /// Appends decided events to a stream that was read. The events are applied to the
+    /// transaction's copy of the aggregate, so the snapshot it captures reflects them.
+    pub fn append(
+        &mut self,
+        entity_id: &EntityId,
+        events: Vec<A::Event>,
+    ) -> Result<&mut Self, Error> {
+        if self.used {
+            return Err(Error::InvalidCommit(
+                "the transaction is already consumed".to_owned(),
+            ));
+        }
+
+        let index = self
+            .streams
+            .iter()
+            .position(|loaded| loaded.entity_id == *entity_id)
+            .ok_or_else(|| {
+                Error::InvalidCommit(format!(
+                    "stream {entity_id} was not read by this transaction"
+                ))
+            })?;
+
+        // The builder is typed to A, so every appended event belongs to its streams by
+        // construction; serialize_events stamps A's entity type.
+        self.appended[index].extend(events);
+
+        Ok(self)
+    }
+
+    /// Adds a caller-stamped read fence for a stream this engine did not load — typically a
+    /// stream of another aggregate type. A fence for a stream that was read is dropped at
+    /// commit: the engine's own fence provenance supersedes it.
+    pub fn fence(&mut self, mut fence: ReadFence) -> Result<&mut Self, Error> {
+        if self.used {
+            return Err(Error::InvalidCommit(
+                "the transaction is already consumed".to_owned(),
+            ));
+        }
+        if self
+            .streams
+            .iter()
+            .any(|loaded| loaded.entity_id == fence.entity_id)
+        {
+            return Ok(self);
+        }
+
+        fence.provenance = FenceProvenance::Caller;
+        self.fences.push(fence);
+
+        Ok(self)
+    }
+
+    /// Stamps the commit ID once, prepares every written stream's events, projector operations,
+    /// and snapshot, fences every unwritten read, and persists exactly one atomic repository
+    /// commit. On failure nothing is written.
+    pub async fn commit(mut self, metadata: &Metadata) -> Result<Vec<SerializedEvent>, Error> {
+        if self.used {
+            return Err(Error::InvalidCommit(
+                "the transaction is already consumed".to_owned(),
+            ));
+        }
+        self.used = true;
+
+        let metadata = stamp_commit_id(metadata);
+
+        let mut streams = Vec::new();
+        let mut operations = Vec::new();
+        let mut committed = Vec::new();
+
+        let streams_taken = std::mem::take(&mut self.streams);
+        let appended_taken = std::mem::take(&mut self.appended);
+
+        for (mut loaded, events) in streams_taken.into_iter().zip(appended_taken) {
+            if let Some(command_id) = &metadata.command_id
+                && loaded.has_seen(command_id)
+            {
+                return Err(Error::DuplicateCommand(command_id.clone()));
+            }
+
+            if events.is_empty() {
+                // An unwritten read is fenced at the head it saw: the larger of its highest event
+                // sequence and its snapshot's event sequence.
+                self.fences.push(ReadFence {
+                    entity_id: loaded.entity_id.clone(),
+                    entity_type: EntityType::new(A::TYPE),
+                    head: loaded.sequence.max(loaded.snapshot_sequence),
+                    provenance: FenceProvenance::Engine,
+                });
+
+                continue;
+            }
+
+            let serialized =
+                serialize_events::<A>(&loaded.entity_id, loaded.sequence, &events, &metadata)?;
+
+            for event in &events {
+                loaded.aggregate.apply(event.clone());
+            }
+
+            for projector in &self.store.projectors {
+                let ops = projector
+                    .project(&loaded.entity_id, &loaded.aggregate, &events)
+                    .map_err(Error::Projector)?;
+                operations.extend(ops);
+            }
+
+            let snapshot = if snapshot_events_due(
+                loaded.sequence,
+                events.len(),
+                self.store.snapshot_interval,
+            ) > 0 {
+                Some(NewSnapshot {
+                    entity_type: EntityType::new(A::TYPE),
+                    sequence: loaded.snapshot_sequence.next(),
+                    payload: json::to_vec(&loaded.aggregate)?,
+                })
+            } else {
+                None
+            };
+
+            committed.extend(serialized.iter().cloned());
+            streams.push(Commit {
+                entity_id: loaded.entity_id,
+                events: serialized,
+                snapshot,
+                operations: Vec::new(),
+            });
+        }
+
+        let mut commit = TransactionCommit::new(streams);
+        commit.fences = self.fences;
+        commit.operations = operations;
+
+        self.store.repository.commit_transaction(commit).await?;
+
+        Ok(committed)
+    }
+}
+
+/// Stamps the engine's commit identity: the command ID when present, a caller-supplied commit ID
+/// otherwise, else a generated ULID.
+pub(crate) fn stamp_commit_id(metadata: &Metadata) -> Metadata {
+    let mut metadata = metadata.clone();
+    if let Some(command_id) = &metadata.command_id {
+        metadata.commit_id = command_id.to_string();
+
+        return metadata;
+    }
+
+    if metadata.commit_id.is_empty() {
+        metadata.commit_id = ulid::Ulid::new().to_string();
+    }
+
+    metadata
 }
