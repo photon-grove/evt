@@ -151,11 +151,6 @@ always written:
   default is the command ID when the store records outcomes (outcomes require a command ID),
   otherwise a generated ULID, unique per commit.
 
-> **Interim (until C7 lands):** neither implementation writes `commitId` yet — commit grouping
-> ([Views](#views)) ships with C7. Events written before C7 carry no `commitId` key, decode with
-> an empty one, and replay as single-event commits per the rule below. The examples above show
-> the target v0.9 format.
-
 A metadata object without the four keys (an event written before v0.9) decodes with `principalId`
 and `causationId` `null`, `extensions` empty, and `commitId` empty; such events replay as
 single-event commits ([Views](#views)).

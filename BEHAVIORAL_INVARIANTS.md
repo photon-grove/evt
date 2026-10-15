@@ -231,6 +231,32 @@ and the feature-marker and rebuild-lock checks — with a pinned item ordering a
 the [storage format](docs/spec/storage-format.md#writes). An over-budget commit fails with a typed
 error before any write and is never split.
 
+### Multi-Stream Commits (v0.9, C1)
+
+- One `Repository.Commit` may append to several streams at once (`SerializedResult.Events` and
+  `.Snapshots` for more than one entity ID), plus projector operations, in a single transaction:
+  all streams land or none does
+- The engine pins the write order bytewise by stream ID regardless of declaration order; each
+  stream keeps its own ascending sequences and its own snapshot-put-or-floor-check suffix
+- Every event of the commit carries one `commitId` (see Metadata Structure)
+- The shared budget counts the whole commit — every stream's events, snapshot/floor items, fence
+  checks, projector operations, and the control checks — and a commit over any limit fails with
+  `CommitTooLargeError` before any write, identically on every backend and in both languages
+
+### Read Fences (v0.9, C2)
+
+- A read-only stream observed during a transaction is fenced with a `ConditionCheck` on
+  `(pk, sk = head + 1)` plus a mandatory snapshot companion on `(pk, sk = 0)`, so a compaction
+  that deletes the checked slot (the append → snapshot → compact ABA) still fails a stale fence
+- A fence conflict fails the whole commit and surfaces as `*FenceConflictError` naming the fenced
+  stream; it unwraps to a conflict, so an engine-filled fence is retryable after a reload while a
+  caller-stamped one is a stale-fence rejection
+- Fences for entity types in the feature manifest's durable `retention` set are refused with
+  `*RetentionConflictError` — the refusal consults the manifest, so it binds writers that
+  configured no retention themselves
+- A written stream's event put at `head + 1` supersedes its own fence; no fence check is emitted
+  for it
+
 ## Snapshot Logic
 
 ### Snapshot Timing

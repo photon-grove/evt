@@ -167,6 +167,16 @@ Two v0.9.0 changes are source-breaking without a deprecation window:
   sequence, regardless of insertion order, excluding snapshot rows. Bound the storage query
   itself — do not call `GetEvents` and slice a full replay.
 
+Multi-stream transactions and read fences (C1/C2) land in v0.9.0 without a new interface method:
+`Repository.Commit` already accepts a `SerializedResult`, so a commit may append to several
+streams and snapshots at once and the engine pins their order bytewise by stream ID. A
+`SerializedResult.Fences` entry pins a read-only stream to the head it was observed at — the
+commit fails with `*evt.FenceConflictError` when another writer (or a compaction) moves it —
+and fences for entity types durably declared with retention are refused. Every commit, single
+or multi-stream, is checked against the shared 100-item / 3.8 MB / 380 KB budget and fails with
+`*evt.CommitTooLargeError` before any write, on every backend. The exact contract is specified
+in the [storage format](docs/spec/storage-format.md#writes).
+
 For example, a SQL backend with a separate events table can implement the method below.
 Here `queryEvents` is the backend's existing query-and-decode helper; it executes the supplied
 SQL and decodes event rows, not a full-stream replay:
