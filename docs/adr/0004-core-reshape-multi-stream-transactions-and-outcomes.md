@@ -113,14 +113,19 @@ no backing event, exactly what the core discipline forbids.
 
 **Decision.** A read-only stream in a transaction is fenced with a `ConditionCheck` on
 `(pk, head + 1)` asserting `attribute_not_exists(sk)`: the check fails if any writer has appended
-past the head the reader saw. This works with `sk = 0` snapshots and with compaction: compaction
-never deletes at or above the head, and a fresh load always re-derives the head as the larger of
-the highest event sequence and the snapshot's `eventSeq`, so `head + 1` is always a free slot on
-the reader's view. A fenced stream can also be written in the same commit; then the event put at
+past the head the reader saw. The slot check alone is not enough once compaction exists: another
+writer could append `head + 1`, snapshot it and compact it away, leaving the slot empty again (an
+ABA). So the fence pairs the slot check with a second `ConditionCheck` on the stream's `sk = 0`
+snapshot item asserting `attribute_not_exists(sk) OR eventSeq <= :head`; compaction only deletes
+events covered by a snapshot, so any compaction past the reader's head shows up there. A fresh
+load re-derives the head as the larger of the highest event sequence and the snapshot's
+`eventSeq`, so `head + 1` is a free slot on the reader's view. A fenced stream can also be written in the same commit; then the event put at
 `head + 1` makes the fence redundant and it is omitted.
 
-**Storage format.** The fence is a `ConditionCheck` transaction item on `(pk, sk = head+1)`. It
-bills as a write and counts toward the 100-item limit, like the existing floor check
+**Storage format.** The fence is two `ConditionCheck` transaction items — the slot
+`(pk, sk = head+1)` and the snapshot item `(pk, sk = 0)`; the snapshot check may be omitted for a
+stream whose repository has compaction disabled (E1.1 pins the exact rule). Each bills as a write and
+counts toward the 100-item limit, like the existing floor check
 ([`dynamo/commit.go`](../../dynamo/commit.go), `buildFloorChecks`). A `ConditionalCheckFailed` on a
 fence is a conflict (another writer moved the stream), classified and retried like an event-put
 conflict. PostgreSQL expresses the same check as a `SELECT … FOR KEY SHARE`-strength existence
