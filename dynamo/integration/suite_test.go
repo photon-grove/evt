@@ -78,11 +78,16 @@ func (s *DynamoEventsIntegrationSuite) SetupEntity(entityID evt.EntityID, snapsh
 }
 
 func (s *DynamoEventsIntegrationSuite) getMetadata(ctx context.Context) evt.Metadata {
-	return evt.NewMetadata(
+	metadata := evt.NewMetadata(
 		ctx,
 		&s.awsRegion,
 		evt.WithOrigin(evt.Origin{Source: "testing", Endpoint: "Testing"}),
 	)
+
+	// Decoded events carry an empty, non-nil extensions map.
+	metadata.Extensions = map[string]string{}
+
+	return metadata
 }
 
 func resolveLocalEndpoint() string {

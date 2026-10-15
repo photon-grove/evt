@@ -102,6 +102,11 @@ both backends). The row shape and rules are specified in the
 
 ### SerializedEvent
 
+`SerializedEvent` owns its JSON encoding. `json.Marshal` / `json.Unmarshal` and
+`evt.MarshalEvent` / `evt.UnmarshalEvent` use the same wire codec: encoding applies effective
+causation and empty-extension defaults, while decoding preserves stored values. `Metadata` itself
+has no JSON methods; embedding it in application DTOs must preserve sibling fields.
+
 ```json
 {
   "id": "entity-123:5",

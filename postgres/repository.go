@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -14,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -599,7 +599,7 @@ func (repo *Repository) insertEvents(ctx context.Context, db DB, events []evt.Se
 	)
 
 	for _, event := range events {
-		metadata, err := json.Marshal(event.Metadata)
+		metadata, err := eventjson.MarshalMetadata(event.Metadata)
 		if err != nil {
 			return fmt.Errorf("postgres: marshal metadata: %w", err)
 		}

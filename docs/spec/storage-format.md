@@ -94,6 +94,11 @@ defaults a command with none of the optional metadata produces: `principalId` an
 `null`, `extensions` `{}`; the event's `commandId` is `null`, so its engine-generated `commitId`
 is a ULID).
 
+Go's `evt.SerializedEvent` owns this JSON encoding: `encoding/json` uses the same canonical
+codec as the public `evt.MarshalEvent` / `evt.UnmarshalEvent` helpers. Encode-time metadata
+defaults apply to the event envelope, not to standalone `evt.Metadata`, which has no JSON methods
+and can be embedded in application DTOs without hiding sibling fields.
+
 ## Metadata
 
 Every key is always written; absent values are `null` (or `""` for `region` and `timestamp`).
@@ -145,6 +150,11 @@ always written:
   recover the commit's grouping ([Views](#views)). It is set by the engine, not the caller: the
   default is the command ID when the store records outcomes (outcomes require a command ID),
   otherwise a generated ULID, unique per commit.
+
+> **Interim (until C7 lands):** neither implementation writes `commitId` yet — commit grouping
+> ([Views](#views)) ships with C7. Events written before C7 carry no `commitId` key, decode with
+> an empty one, and replay as single-event commits per the rule below. The examples above show
+> the target v0.9 format.
 
 A metadata object without the four keys (an event written before v0.9) decodes with `principalId`
 and `causationId` `null`, `extensions` empty, and `commitId` empty; such events replay as
@@ -1559,8 +1569,10 @@ scenarios below. Go generates the core golden fixtures for them
 and the live interleaved runs (`scripts/compat-integration.sh dynamo|postgres`) execute the same
 steps on real backends. **E2.8** (Go conformance suite + fixtures) and **E3.8** (Rust conformance
 suite + the live runs) must implement every scenario in this list; the names are the shared keys
-in `compat/scenarios.json`. In all of them both writers run with outcomes enabled and a command ID
-on every step. Some scenarios need new ops in the harness (`declareFeature`, `acquireRebuildLock`,
+in `compat/scenarios.json`. The `metadata-extensions` case is implemented for C6 (E2.1/E3.1)
+in the current single-stream harness; it does not yet enable outcomes. Once C3 lands, both writers
+run these scenarios with outcomes enabled and a command ID on every step. Some scenarios need
+new ops in the harness (`declareFeature`, `acquireRebuildLock`,
 `releaseRebuildLock`, `forceReleaseRebuildLock`, `resolveOutcome`, `readLatest`, `rebuildViews`, a
 multi-stream execute, and `injectCommitFault`, which makes a commit apply but the caller observe an
 indeterminate error, so `outcomes-ambiguous` exercises the real ambiguous path rather than only

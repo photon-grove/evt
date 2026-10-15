@@ -45,6 +45,10 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		testCommitAndGetEvents(t, newRepo())
 	})
 
+	t.Run("MetadataRoundTrip", func(t *testing.T) {
+		testMetadataRoundTrip(t, newRepo())
+	})
+
 	t.Run("GetEventsIsolatesEntities", func(t *testing.T) {
 		testGetEventsIsolatesEntities(t, newRepo())
 	})
@@ -117,6 +121,42 @@ func testCommitAndGetEvents(t *testing.T, repo evt.Repository) {
 	requireAscendingSequences(t, events)
 	require.Equal(t, evt.EventSequence(1), events[0].Sequence)
 	require.Equal(t, evt.EventSequence(2), events[1].Sequence)
+}
+
+func testMetadataRoundTrip(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	id := evt.EntityID(newNamespace() + "-1")
+
+	serialized := serialize(t, id, "test", 0,
+		&test.EntityCreated{ID: id, Value: "one"},
+		&test.EntityUpdated{ID: id, Value: "two"},
+	)
+	for i := range serialized {
+		commandID := evt.CommandID(fmt.Sprintf("command-%d", i+1))
+		principalID := evt.PrincipalID(fmt.Sprintf("principal-%d", i+1))
+		causationID := evt.CommandID(fmt.Sprintf("cause-%d", i+1))
+		serialized[i].Metadata = evt.Metadata{
+			CommandID:   &commandID,
+			PrincipalID: &principalID,
+			CausationID: &causationID,
+			Timestamp:   "2026-01-02T03:04:05Z",
+			Extensions:  map[string]string{"source": fmt.Sprintf("source-%d", i+1), "empty": ""},
+		}
+	}
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialized}))
+
+	events, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	for i, event := range events {
+		want := serialized[i].Metadata
+		require.Equal(t, want.CommandID, event.Metadata.CommandID)
+		require.Equal(t, want.PrincipalID, event.Metadata.PrincipalID)
+		require.Equal(t, want.CausationID, event.Metadata.CausationID)
+		require.Equal(t, want.Extensions, event.Metadata.Extensions)
+	}
 }
 
 func testGetEventsIsolatesEntities(t *testing.T, repo evt.Repository) {

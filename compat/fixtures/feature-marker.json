@@ -164,7 +164,7 @@
           "entityId": "compat-feature-account",
           "entityType": "account",
           "payload": "{\"owner\":\"Ada\"}",
-          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":null}"
         },
         "viewState": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
         "snapshot": null
@@ -217,7 +217,7 @@
               "S": "account"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"owner\":\"Ada\"}"
@@ -271,7 +271,7 @@
           "entityId": "compat-feature-account",
           "entityType": "account",
           "payload": "{\"owner\":\"Ada\"}",
-          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":null}"
         },
         "viewState": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
         "snapshot": {
@@ -330,7 +330,7 @@
               "S": "account"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"owner\":\"Ada\"}"
@@ -391,7 +391,7 @@
           "entityId": "compat-feature-account",
           "entityType": "account",
           "payload": "{\"owner\":\"Ada\"}",
-          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":null}"
         },
         "viewState": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
         "snapshot": null
@@ -439,7 +439,7 @@
               "S": "account"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"owner\":\"Ada\"}"

@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 )
 
 // FromSerializedEvent converts a decoded domain event into a StreamRecord. It is
@@ -28,7 +29,7 @@ func FromSerializedEvent(event evt.SerializedEvent) StreamRecord {
 	// Metadata is a plain struct, so marshaling cannot realistically fail; if it
 	// ever did, an absent Metadata is harmless (ToSerializedEvent treats it as
 	// empty), so leave the field nil rather than failing the whole record.
-	if raw, err := json.Marshal(event.Metadata); err == nil {
+	if raw, err := eventjson.MarshalMetadata(event.Metadata); err == nil {
 		record.Metadata = raw
 	}
 
@@ -49,7 +50,7 @@ func StreamRecordFromEnvelope(body []byte) (StreamRecord, error) {
 	}
 
 	var event evt.SerializedEvent
-	if err := json.Unmarshal(envelope.Detail, &event); err != nil {
+	if err := eventjson.UnmarshalEvent(envelope.Detail, &event); err != nil {
 		return StreamRecord{}, fmt.Errorf("unmarshalling serialized event from envelope: %w", err)
 	}
 

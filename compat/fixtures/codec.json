@@ -10,15 +10,15 @@
         "entityId": "acct-1",
         "entityType": "account",
         "payload": "{\"owner\":\"Ada\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}",
-        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
       },
-      "serializedEventJson": "{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "serializedEventJson": "{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
         },
         "payload": {
           "S": "{\"owner\":\"Ada\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
@@ -36,7 +36,7 @@
           "N": "1"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}}",
       "snsAttributes": {
         "entityType": "account",
         "eventType": "account:opened"
@@ -52,15 +52,15 @@
         "entityId": "acct-1",
         "entityType": "account",
         "payload": "{\"amountCents\":2500,\"memo\":\"rent\"}",
-        "metadataJson": "{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        "metadataJson": "{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"cmd-0001\",\"extensions\":{\"requestSource\":\"cli\"}}"
       },
-      "serializedEventJson": "{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwMCwibWVtbyI6InJlbnQifQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "serializedEventJson": "{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwMCwibWVtbyI6InJlbnQifQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"cmd-0001\",\"extensions\":{\"requestSource\":\"cli\"}}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "S": "{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"cmd-0001\",\"extensions\":{\"requestSource\":\"cli\"}}"
         },
         "payload": {
           "S": "{\"amountCents\":2500,\"memo\":\"rent\"}"
@@ -78,7 +78,7 @@
           "N": "1"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwMCwibWVtbyI6InJlbnQifQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwMCwibWVtbyI6InJlbnQifQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":{\"baggage\":\"tenant=example\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"},\"origin\":{\"source\":\"billing-api\",\"endpoint\":\"POST /accounts\"},\"address\":\"203.0.113.7\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"cmd-0001\",\"extensions\":{\"requestSource\":\"cli\"}}}}",
       "snsAttributes": {
         "commandId": "cmd-0001",
         "correlationId": "cmd-0001",
@@ -88,7 +88,7 @@
       }
     },
     {
-      "name": "escaping",
+      "name": "explicit-causation",
       "input": {
         "id": "acct-1:3",
         "sequence": 3,
@@ -96,19 +96,19 @@
         "version": 1,
         "entityId": "acct-1",
         "entityType": "account",
-        "payload": "{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 ☕ \\\"q\\\" \\\\ \\t\"}",
-        "metadataJson": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        "payload": "{\"amountCents\":100}",
+        "metadataJson": "{\"commandId\":\"cmd-0002\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"attempt\":\"2\",\"requestSource\":\"cli\",\"tenant\":\"example\"}}"
       },
-      "serializedEventJson": "{\"id\":\"acct-1:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "serializedEventJson": "{\"id\":\"acct-1:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwfQ==\",\"metadata\":{\"commandId\":\"cmd-0002\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"attempt\":\"2\",\"requestSource\":\"cli\",\"tenant\":\"example\"}}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "S": "{\"commandId\":\"cmd-0002\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"attempt\":\"2\",\"requestSource\":\"cli\",\"tenant\":\"example\"}}"
         },
         "payload": {
-          "S": "{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 ☕ \\\"q\\\" \\\\ \\t\"}"
+          "S": "{\"amountCents\":100}"
         },
         "pk": {
           "S": "acct-1"
@@ -123,7 +123,51 @@
           "N": "1"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwfQ==\",\"metadata\":{\"commandId\":\"cmd-0002\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"attempt\":\"2\",\"requestSource\":\"cli\",\"tenant\":\"example\"}}}}",
+      "snsAttributes": {
+        "commandId": "cmd-0002",
+        "correlationId": "cmd-0002",
+        "entityType": "account",
+        "eventType": "account:deposited"
+      }
+    },
+    {
+      "name": "escaping",
+      "input": {
+        "id": "acct-1:4",
+        "sequence": 4,
+        "type": "account:deposited",
+        "version": 1,
+        "entityId": "acct-1",
+        "entityType": "account",
+        "payload": "{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 ☕ \\\"q\\\" \\\\ \\t\"}",
+        "metadataJson": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"}}"
+      },
+      "serializedEventJson": "{\"id\":\"acct-1:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"}}}",
+      "dynamoItem": {
+        "entityType": {
+          "S": "account"
+        },
+        "metadata": {
+          "S": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"}}"
+        },
+        "payload": {
+          "S": "{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 ☕ \\\"q\\\" \\\\ \\t\"}"
+        },
+        "pk": {
+          "S": "acct-1"
+        },
+        "sk": {
+          "N": "4"
+        },
+        "type": {
+          "S": "account:deposited"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"}}}}",
       "snsAttributes": {
         "commandId": "cmd <&> \u2028 \u2029",
         "correlationId": "cmd <&> \u2028 \u2029",
@@ -141,15 +185,15 @@
         "entityId": "acct-2",
         "entityType": "account",
         "payload": "{}",
-        "metadataJson": "{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+        "metadataJson": "{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":\"\",\"extensions\":{}}"
       },
-      "serializedEventJson": "{\"id\":\"acct-2:1\",\"sequence\":1,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}",
+      "serializedEventJson": "{\"id\":\"acct-2:1\",\"sequence\":1,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":\"\",\"extensions\":{}}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+          "S": "{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":\"\",\"extensions\":{}}"
         },
         "payload": {
           "S": "{}"
@@ -167,7 +211,7 @@
           "N": "1"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"acct-2:1\",\"detail-type\":\"account:closed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-2:1\",\"sequence\":1,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-2:1\",\"detail-type\":\"account:closed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-2:1\",\"sequence\":1,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":\"\",\"trace\":{},\"origin\":{\"source\":\"\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":\"\",\"extensions\":{}}}}",
       "snsAttributes": {
         "entityType": "account",
         "eventType": "account:closed"
@@ -183,15 +227,15 @@
         "entityId": "acct-2",
         "entityType": "account",
         "payload": "{\"reason\":null}",
-        "metadataJson": "{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        "metadataJson": "{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
       },
-      "serializedEventJson": "{\"id\":\"acct-2:2\",\"sequence\":2,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOm51bGx9\",\"metadata\":{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "serializedEventJson": "{\"id\":\"acct-2:2\",\"sequence\":2,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOm51bGx9\",\"metadata\":{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "S": "{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
         },
         "payload": {
           "S": "{\"reason\":null}"
@@ -209,7 +253,7 @@
           "N": "1"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"acct-2:2\",\"detail-type\":\"account:closed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-2:2\",\"sequence\":2,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOm51bGx9\",\"metadata\":{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-2:2\",\"detail-type\":\"account:closed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-2:2\",\"sequence\":2,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOm51bGx9\",\"metadata\":{\"commandId\":null,\"trace\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"},\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}}",
       "snsAttributes": {
         "correlationId": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
         "entityType": "account",
@@ -227,15 +271,15 @@
         "entityId": "acct-3",
         "entityType": "account",
         "payload": "{\"owner\":\"Grace\"}",
-        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
       },
-      "serializedEventJson": "{\"id\":\"acct-3:9007199254740993\",\"sequence\":9007199254740993,\"type\":\"account:renamed\",\"version\":12,\"entityId\":\"acct-3\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "serializedEventJson": "{\"id\":\"acct-3:9007199254740993\",\"sequence\":9007199254740993,\"type\":\"account:renamed\",\"version\":12,\"entityId\":\"acct-3\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
         },
         "payload": {
           "S": "{\"owner\":\"Grace\"}"
@@ -253,7 +297,7 @@
           "N": "12"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"acct-3:9007199254740993\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-3:9007199254740993\",\"sequence\":9007199254740993,\"type\":\"account:renamed\",\"version\":12,\"entityId\":\"acct-3\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-3:9007199254740993\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-3:9007199254740993\",\"sequence\":9007199254740993,\"type\":\"account:renamed\",\"version\":12,\"entityId\":\"acct-3\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIn0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}}",
       "snsAttributes": {
         "entityType": "account",
         "eventType": "account:renamed"
@@ -269,15 +313,15 @@
         "entityId": "konto-ø-漢-1",
         "entityType": "account",
         "payload": "{\"tags\":[\"vip\",\"ü\"]}",
-        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
       },
-      "serializedEventJson": "{\"id\":\"konto-ø-漢-1:1\",\"sequence\":1,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"konto-ø-漢-1\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsIsO8Il19\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "serializedEventJson": "{\"id\":\"konto-ø-漢-1:1\",\"sequence\":1,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"konto-ø-漢-1\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsIsO8Il19\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
         },
         "payload": {
           "S": "{\"tags\":[\"vip\",\"ü\"]}"
@@ -295,7 +339,7 @@
           "N": "1"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"konto-ø-漢-1:1\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"konto-ø-漢-1:1\",\"sequence\":1,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"konto-ø-漢-1\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsIsO8Il19\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"konto-ø-漢-1:1\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"konto-ø-漢-1:1\",\"sequence\":1,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"konto-ø-漢-1\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCIsIsO8Il19\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}}",
       "snsAttributes": {
         "entityType": "account",
         "eventType": "account:tagged"
@@ -311,15 +355,15 @@
         "entityId": "acct-4",
         "entityType": "account",
         "payload": "{ \"labels\" : { \"b\": \"2\", \"a\": \"1\" } }\n",
-        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+        "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
       },
-      "serializedEventJson": "{\"id\":\"acct-4:1\",\"sequence\":1,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"acct-4\",\"entityType\":\"account\",\"payload\":\"eyAibGFiZWxzIiA6IHsgImIiOiAiMiIsICJhIjogIjEiIH0gfQo=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
+      "serializedEventJson": "{\"id\":\"acct-4:1\",\"sequence\":1,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"acct-4\",\"entityType\":\"account\",\"payload\":\"eyAibGFiZWxzIiA6IHsgImIiOiAiMiIsICJhIjogIjEiIH0gfQo=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+          "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
         },
         "payload": {
           "S": "{ \"labels\" : { \"b\": \"2\", \"a\": \"1\" } }\n"
@@ -337,7 +381,7 @@
           "N": "1"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"acct-4:1\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-4:1\",\"sequence\":1,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"acct-4\",\"entityType\":\"account\",\"payload\":\"eyAibGFiZWxzIiA6IHsgImIiOiAiMiIsICJhIjogIjEiIH0gfQo=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-4:1\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-4:1\",\"sequence\":1,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"acct-4\",\"entityType\":\"account\",\"payload\":\"eyAibGFiZWxzIiA6IHsgImIiOiAiMiIsICJhIjogIjEiIH0gfQo=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}}",
       "snsAttributes": {
         "entityType": "account",
         "eventType": "account:labeled"
@@ -412,59 +456,84 @@
     {
       "name": "empty-object",
       "input": "{}",
-      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
     },
     {
       "name": "nulls",
       "input": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":null,\"timestamp\":null}",
-      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
     },
     {
       "name": "unknown-fields-ignored",
       "input": "{\"commandId\":\"c-1\",\"unknown\":true,\"origin\":{\"source\":\"s\",\"extra\":1}}",
-      "canonical": "{\"commandId\":\"c-1\",\"trace\":null,\"origin\":{\"source\":\"s\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+      "canonical": "{\"commandId\":\"c-1\",\"trace\":null,\"origin\":{\"source\":\"s\",\"endpoint\":\"\"},\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":\"c-1\",\"extensions\":{}}"
     },
     {
       "name": "trace-keys-sorted",
       "input": "{\"trace\":{\"b\":\"2\",\"a\":\"1\",\"c\":\"3\"},\"region\":\"eu-west-1\"}",
-      "canonical": "{\"commandId\":null,\"trace\":{\"a\":\"1\",\"b\":\"2\",\"c\":\"3\"},\"origin\":null,\"address\":null,\"region\":\"eu-west-1\",\"timestamp\":\"\"}"
+      "canonical": "{\"commandId\":null,\"trace\":{\"a\":\"1\",\"b\":\"2\",\"c\":\"3\"},\"origin\":null,\"address\":null,\"region\":\"eu-west-1\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
     },
     {
       "name": "empty-address-kept",
       "input": "{\"address\":\"\",\"origin\":{\"source\":null,\"endpoint\":\"e\"}}",
-      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"\",\"endpoint\":\"e\"},\"address\":\"\",\"region\":\"\",\"timestamp\":\"\"}"
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"\",\"endpoint\":\"e\"},\"address\":\"\",\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
     },
     {
       "name": "whitespace-and-escapes",
       "input": "{ \"region\" : \"us\\u002dwest\\u002d2\", \"timestamp\":\"t\" }",
-      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"t\"}"
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"t\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
     },
     {
       "name": "null-trace-value",
       "input": "{\"trace\":{\"traceparent\":null,\"tracestate\":\"a\"}}",
-      "canonical": "{\"commandId\":null,\"trace\":{\"traceparent\":\"\",\"tracestate\":\"a\"},\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}"
+      "canonical": "{\"commandId\":null,\"trace\":{\"traceparent\":\"\",\"tracestate\":\"a\"},\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
+    },
+    {
+      "name": "v09-principal-causation-extensions",
+      "input": "{\"commandId\":\"c-1\",\"principalId\":\"user:7\",\"causationId\":\"c-0\",\"extensions\":{\"b\":\"2\",\"a\":\"1\"},\"region\":\"r\"}",
+      "canonical": "{\"commandId\":\"c-1\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"r\",\"timestamp\":\"\",\"principalId\":\"user:7\",\"causationId\":\"c-0\",\"extensions\":{\"a\":\"1\",\"b\":\"2\"}}"
+    },
+    {
+      "name": "legacy-without-new-keys",
+      "input": "{\"commandId\":\"c-1\",\"region\":\"r\",\"timestamp\":\"t\"}",
+      "canonical": "{\"commandId\":\"c-1\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"r\",\"timestamp\":\"t\",\"principalId\":null,\"causationId\":\"c-1\",\"extensions\":{}}"
+    },
+    {
+      "name": "extensions-null-value",
+      "input": "{\"extensions\":{\"a\":null,\"b\":\"x\"}}",
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{\"a\":\"\",\"b\":\"x\"}}"
+    },
+    {
+      "name": "extensions-empty-object",
+      "input": "{\"extensions\":{}}",
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
+    },
+    {
+      "name": "extensions-null-map",
+      "input": "{\"extensions\":null}",
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
     }
   ],
   "eventDecode": [
     {
       "name": "null-payload-and-metadata",
       "input": "{\"id\":\"a:1\",\"sequence\":1,\"type\":\"t\",\"version\":1,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":null,\"metadata\":null}",
-      "canonical": "{\"id\":\"a:1\",\"sequence\":1,\"type\":\"t\",\"version\":1,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":null,\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}"
+      "canonical": "{\"id\":\"a:1\",\"sequence\":1,\"type\":\"t\",\"version\":1,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":null,\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}"
     },
     {
       "name": "missing-fields",
       "input": "{\"id\":\"a:2\",\"sequence\":2,\"payload\":\"e30=\",\"metadata\":{\"region\":\"r\"},\"extra\":\"ignored\"}",
-      "canonical": "{\"id\":\"a:2\",\"sequence\":2,\"type\":\"\",\"version\":0,\"entityId\":\"\",\"entityType\":\"\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"r\",\"timestamp\":\"\"}}"
+      "canonical": "{\"id\":\"a:2\",\"sequence\":2,\"type\":\"\",\"version\":0,\"entityId\":\"\",\"entityType\":\"\",\"payload\":\"e30=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"r\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}"
     },
     {
       "name": "empty-payload",
       "input": "{\"id\":\"a:3\",\"sequence\":3,\"type\":\"t\",\"version\":2,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":\"\",\"metadata\":{}}",
-      "canonical": "{\"id\":\"a:3\",\"sequence\":3,\"type\":\"t\",\"version\":2,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":\"\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}"
+      "canonical": "{\"id\":\"a:3\",\"sequence\":3,\"type\":\"t\",\"version\":2,\"entityId\":\"a\",\"entityType\":\"x\",\"payload\":\"\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}"
     },
     {
       "name": "null-identifiers",
       "input": "{\"id\":null,\"sequence\":null,\"type\":null,\"version\":null,\"entityId\":null,\"entityType\":null,\"payload\":\"\",\"metadata\":{}}",
-      "canonical": "{\"id\":\"\",\"sequence\":0,\"type\":\"\",\"version\":0,\"entityId\":\"\",\"entityType\":\"\",\"payload\":\"\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\"}}"
+      "canonical": "{\"id\":\"\",\"sequence\":0,\"type\":\"\",\"version\":0,\"entityId\":\"\",\"entityType\":\"\",\"payload\":\"\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}"
     }
   ],
   "snapshotPolicy": [
@@ -3021,8 +3090,8 @@
         "name": "retained",
         "retentionNanos": 86400500000000,
         "events": [
-          "{\"id\":\"ttl-retained:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-retained\",\"entityType\":\"scratch\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
-          "{\"id\":\"ttl-retained:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-retained\",\"entityType\":\"scratch\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+          "{\"id\":\"ttl-retained:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-retained\",\"entityType\":\"scratch\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}",
+          "{\"id\":\"ttl-retained:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-retained\",\"entityType\":\"scratch\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}"
         ],
         "snapshot": "{\"entityType\":\"scratch\",\"entityID\":\"ttl-retained\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
         "dynamoItems": [
@@ -3054,7 +3123,7 @@
               "S": "scratch"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"owner\":\"Ada\"}"
@@ -3080,7 +3149,7 @@
               "S": "scratch"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"amountCents\":5}"
@@ -3107,8 +3176,8 @@
         "name": "zero-retention",
         "retentionNanos": 0,
         "events": [
-          "{\"id\":\"ttl-zero-retention:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-zero-retention\",\"entityType\":\"disabled\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
-          "{\"id\":\"ttl-zero-retention:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-zero-retention\",\"entityType\":\"disabled\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+          "{\"id\":\"ttl-zero-retention:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-zero-retention\",\"entityType\":\"disabled\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}",
+          "{\"id\":\"ttl-zero-retention:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-zero-retention\",\"entityType\":\"disabled\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}"
         ],
         "snapshot": "{\"entityType\":\"disabled\",\"entityID\":\"ttl-zero-retention\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
         "dynamoItems": [
@@ -3137,7 +3206,7 @@
               "S": "disabled"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"owner\":\"Ada\"}"
@@ -3160,7 +3229,7 @@
               "S": "disabled"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"amountCents\":5}"
@@ -3184,8 +3253,8 @@
         "name": "no-policy",
         "retentionNanos": 0,
         "events": [
-          "{\"id\":\"ttl-no-policy:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-no-policy\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}",
-          "{\"id\":\"ttl-no-policy:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-no-policy\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}}"
+          "{\"id\":\"ttl-no-policy:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"ttl-no-policy\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}",
+          "{\"id\":\"ttl-no-policy:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"ttl-no-policy\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NX0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}}"
         ],
         "snapshot": "{\"entityType\":\"account\",\"entityID\":\"ttl-no-policy\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
         "dynamoItems": [
@@ -3214,7 +3283,7 @@
               "S": "account"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"owner\":\"Ada\"}"
@@ -3237,7 +3306,7 @@
               "S": "account"
             },
             "metadata": {
-              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\"}"
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
             },
             "payload": {
               "S": "{\"amountCents\":5}"

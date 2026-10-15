@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/stretchr/testify/require"
 )
 
@@ -87,13 +88,11 @@ func Test_HasConditionalCheckFailure_NilError(t *testing.T) {
 func Test_MarshalJSON_Success(t *testing.T) {
 	// Create test DynamoDB AttributeValue map
 	metadata := evt.Metadata{
-		Region: "us-east-1",
-		Origin: &evt.Origin{
-			Source:   "test",
-			Endpoint: "test-endpoint",
-		},
+		Region:     "us-east-1",
+		Origin:     &evt.Origin{Source: "test", Endpoint: "test-endpoint"},
+		Extensions: map[string]string{},
 	}
-	metadataJSON, err := json.Marshal(metadata)
+	metadataJSON, err := eventjson.MarshalMetadata(metadata)
 	require.NoError(t, err)
 
 	item := map[string]events.DynamoDBAttributeValue{

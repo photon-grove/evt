@@ -46,7 +46,9 @@ pub mod postgres;
 pub use aggregate::{Aggregate, Projector};
 pub use error::{BoxError, Error, ExecuteError, ReplayPhase};
 pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
-pub use ids::{CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
+pub use ids::{
+    CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion, PrincipalId,
+};
 pub use mem::MemRepository;
 pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};
 pub use repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
