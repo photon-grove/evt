@@ -281,7 +281,11 @@ persisted via C3 when retries are exhausted. This replaces blind `ExecuteWithRet
 remain for backend-level transient classification.
 
 **Storage format.** None beyond C3 (a stale rejection is an outcome row). Fence provenance
-(engine-filled vs caller-stamped) is in-memory commit metadata, not stored.
+(engine-filled vs caller-stamped) is in-memory commit metadata, not stored. _Errata (E1.1):_ the
+classification keys off the **transaction item that failed**, not the commit's contents: a failed
+event put, floor check, or snapshot condition is an ordinary conflict that re-prepares even when
+the commit also carried caller-stamped fences, and only a failed caller-stamped fence produces
+the stale-fence rejection. The storage spec pins this in "Fence-aware retry".
 
 ### C6 — Metadata: `principalId`, `causationId`, `extensions`
 
@@ -348,12 +352,16 @@ the Go PostgreSQL backend today ignores `res.Transaction`
 view-row execution path, not a port of an existing one. _Errata (E1.1):_ the spec pins the
 **current-state contract**: a commit-wide projector's rows are a deterministic function of the
 commit's events plus the post-commit aggregate states, and every commit-wide projector implements
-a snapshot-seed entry point that produces the rows for an aggregate's snapshot state. Rebuild
-over a compacted prefix seeds rows from the snapshot via that entry point, then replays the
-remaining commits grouped by `commitId`. Projections that need the full history (for example
-feeds) must declare it: repositories refuse `CompactBelow` for entity types with a
-history-dependent projector registered (typed error), and a rebuild that finds such a stream
-compacted fails with `CompactionUncovered`.
+a second, **state entry point** called with a lookup by stream ID over the final state of every
+aggregate in scope. Rebuild splits by projector kind: **current-state** projectors (the default)
+never replay history — the rebuild loads every aggregate's final state (snapshot + tail), calls
+the state entry point once over all of them, and writes the complete returned row set, so
+cross-entity rows derive from complete, consistent state and compaction is irrelevant to them;
+**history-dependent** projectors replay every commit grouped by `commitId`, and compaction is
+forbidden for their entity types — durably, via the feature manifest's `historyDependent` set
+(C9), which `CompactBelow` checks with a consistent read and refuses with a typed error in every
+process. Projections that need the full history (for example feeds) must declare it; a rebuild
+that finds such a stream already compacted fails with `CompactionUncovered`.
 
 **API shape.**
 
@@ -434,7 +442,15 @@ One manifest row, `pk = SYSTEM#FEATURES`, `sk = 0` — declared by the writer th
 feature, updated (with a `version` bump) by every later declaration; `version` is bumped again
 when an extension's storage format changes. A writer that encounters an undeclared-to-it feature
 reads the feature set and refuses. The exact attributes, the per-feature format versions, and the
-ConditionCheck shape are pinned in the storage spec (E1.1).
+ConditionCheck shape are pinned in the storage spec (E1.1). _Errata (E1.1):_ the manifest is
+also the durable home of two policy declarations the original decision left to registration:
+the `historyDependent` set (entity types whose commit-wide projectors need the full commit
+stream, so compaction is forbidden for them — `CompactBelow` reads the set with a consistent read
+and refuses with a typed error in every process that opens the log) and the `retention` set
+(entity types with TTL retention, for which read fences are refused). Both are sorted JSON arrays
+of entity types stored on the same row, and changing either bumps `version` — and re-fails every
+cached writer — exactly as a feature change does. The sets are durable, shared state, so the
+refusals hold across independently configured instances; in-memory-only declarations could not.
 
 ### C10 — Rebuild fence
 
@@ -458,7 +474,15 @@ fenced by the framework, not by app-level flags):
   path also exists and bumps the generation. Until then, commits are still refused while any lock
   row exists — an expired lock blocks writes until taken over or force-released. That is the
   deliberate tradeoff: commits stay safe while any lock row exists, at the cost of waiting out a
-  crashed rebuild until takeover or force-release.
+  crashed rebuild until takeover or force-release. _Errata (E1.1):_ force-release is reshaped to
+  protect readers from a partially rebuilt projection: it deletes the lock (commits resume
+  immediately) but bumps the generation by **two**, leaving it **odd**, and records a
+  `forceReleased` flag on the generation item. Readers keep treating odd as unavailable — every
+  view read stays fenced — until a later rebuild acquires from the flagged odd generation,
+  replays, and completes a release, whose even generation and cleared flag end the fence. The
+  operator tradeoff: force-release trades read availability for write availability, because the
+  force-released rebuild may have committed only some of its wipe and replay batches and no
+  replacement worker remains to finish them.
 - **Commit-time check**: every commit includes a `ConditionCheck` asserting
   `attribute_not_exists(pk)` on the lock row — a commit is refused whenever any rebuild holds the
   lock, regardless of generation. _Errata (E1.1):_ a commit that races a rebuild fails its check
