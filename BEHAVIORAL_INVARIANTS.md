@@ -516,8 +516,16 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 - Refuses with `evt.ErrCompactionUncovered` unless a snapshot covers the range
   (`snapshot.EventSequence >= throughSequence`)
 - Never deletes the `sk = 0` snapshot; `throughSequence < 1` is a no-op; idempotent
-- DynamoDB: key-only range query + `BatchWriteItem` deletes (25/batch) with bounded
-  `UnprocessedItems` retries
+- Refuses unsupported feature declarations and history-dependent entity types from the durable
+  feature marker, including declarations made by other repository handles
+- DynamoDB: strongly consistent key-only range query + `TransactWriteItems` batches of at most
+  99 deletes and one marker check; marker changes trigger revalidation before retrying
+- Fencing is per batch, not a whole-operation lease: a history-dependent declaration racing
+  multi-batch compaction can leave a partially compacted stream; committed deletes are not rolled
+  back. A history-dependent rebuild reports `CompactionUncovered`. Declare history dependence
+  before writing data of that entity type
+- PostgreSQL holds the shared feature advisory lock through validation and all deletes in one
+  transaction
 
 ### Delete (build-tagged `//go:build !prod`)
 

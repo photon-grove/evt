@@ -156,9 +156,36 @@ replaces the contracts that require them:
   (the built-in `policy.Classify` only recognizes `ClassifiedError`, so a custom classifier
   is the only supported way to mark raw backend errors transient)
 
-One v0.9.0 change is source-breaking without a deprecation window: `evt.Metadata` is no longer
-comparable with `==` — the new `Extensions` map (C6) makes the struct non-comparable. Use the new
-`evt.Metadata.Equal` method instead; it treats a nil and an empty `Extensions` map as equal.
+Two v0.9.0 changes are source-breaking without a deprecation window:
+
+- `evt.Metadata` is no longer comparable with `==` — the new `Extensions` map (C6) makes the
+  struct non-comparable. Use `evt.Metadata.Equal` instead; it treats nil and empty maps as equal.
+- `evt.Repository` now requires `GetRecentEvents(ctx context.Context, entityID evt.EntityID,
+  limit int) ([]evt.SerializedEvent, error)` (C8). Add it to custom backends and mocks. Return
+  a typed `evt.InvalidLimitError` for `limit < 1` before any I/O; return at most `limit` events
+  newest-first, excluding snapshot rows. Bound the storage query itself — do not call
+  `GetEvents` and slice a full replay.
+
+For example, a SQL backend with a separate events table can implement the method below.
+Here `queryEvents` is the backend's existing query-and-decode helper; it executes the supplied
+SQL and decodes event rows, not a full-stream replay:
+
+```go
+func (r *Repository) GetRecentEvents(
+    ctx context.Context, entityID evt.EntityID, limit int,
+) ([]evt.SerializedEvent, error) {
+    if limit < 1 {
+        return nil, &evt.InvalidLimitError{Limit: limit}
+    }
+
+    return r.queryEvents(ctx,
+        `SELECT * FROM events WHERE entity_id = $1 AND sequence > 0
+         ORDER BY sequence DESC LIMIT $2`, string(entityID), int64(limit))
+}
+```
+
+Use your backend's event-column list and decoder in place of `SELECT *`; snapshots must remain
+outside this result. Mocks must implement the same signature and bounded-read contract.
 
 ## Rust
 
@@ -194,8 +221,11 @@ trim them safely:
 
 All durable Go repositories enforce the [feature marker](docs/spec/storage-format.md#feature-marker)
 by default, with no supported extensions. Unsupported declarations refuse commits and standalone
-snapshot writes and compaction atomically; history-dependent declarations also fence compaction
-across handles.
+snapshot writes atomically. Compaction checks declarations across handles: PostgreSQL holds one
+transaction lock; DynamoDB fences each delete batch, with no whole-operation lease or rollback of
+already committed batches. A racing history-dependent declaration can therefore leave a partially
+compacted stream; its history-dependent rebuild reports `CompactionUncovered`. Declare history
+dependence before writing data of that entity type.
 `repo.WithFeatureMarker(repo.FeatureMarker(supported))` customizes the supported set, not whether
 enforcement runs. Create markers from the repository so reads and transactional checks share its
 client and events table; attaching a marker from another client or table is a typed configuration
