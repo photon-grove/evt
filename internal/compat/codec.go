@@ -249,7 +249,8 @@ func eventVector(ctx context.Context, c namedEvent) (EventVector, error) {
 
 	fake := NewFakeDynamo()
 	repo := dynamo.NewRepository(fake, fakeTable)
-	if err := repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{c.event}}); err != nil {
+	err = repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{c.event}})
+	if err != nil {
 		return EventVector{}, err
 	}
 
@@ -336,7 +337,12 @@ func viewVector(ctx context.Context) (ViewVector, error) {
 		return ViewVector{}, err
 	}
 
-	items := group.(dynamo.TransactionGroup).ToWriteItems()
+	transaction, ok := group.(dynamo.TransactionGroup)
+	if !ok {
+		return ViewVector{}, fmt.Errorf("want a dynamo.TransactionGroup, got %T", group)
+	}
+
+	items := transaction.ToWriteItems()
 	if len(items) != 1 || items[0].Put == nil {
 		return ViewVector{}, fmt.Errorf("want one put, got %d items", len(items))
 	}
@@ -390,12 +396,9 @@ func ttlVector(ctx context.Context) (TTLVector, error) {
 		}
 
 		stream := TTLStream{Name: c.name, RetentionNanos: int64(c.retention)}
-		for _, event := range events {
-			encoded, err := eventjson.MarshalEvent(event)
-			if err != nil {
-				return vector, err
-			}
-			stream.Events = append(stream.Events, string(encoded))
+		stream.Events, err = encodeEvents(events)
+		if err != nil {
+			return vector, err
 		}
 		encoded, err := json.Marshal(snapshot)
 		if err != nil {

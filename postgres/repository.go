@@ -562,7 +562,7 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 
 	// Roll back on any early return — an error from fn or a panic unwinding through it. This is a
 	// no-op once Commit has succeeded, so the happy path is unaffected.
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // after Commit this is ErrTxClosed; on failure fn's error is the one to report
 
 	if err := fn(tx); err != nil {
 		return err
