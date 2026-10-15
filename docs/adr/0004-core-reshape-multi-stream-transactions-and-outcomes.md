@@ -299,7 +299,11 @@ remain for backend-level transient classification.
 **Storage format.** The metadata JSON gains three keys, always written (absent = `null` /
 empty map), appended after the existing keys so stored events remain readable without upcasters —
 decoding is lenient in both languages, and the existing fixture vectors still decode. New fixtures
-cover the added keys. Rust's `photon_evt::metadata` mirrors the field order.
+cover the added keys. Rust's `photon_evt::metadata` mirrors the field order. _Errata (E1.1):_ the
+metadata JSON gains a fourth key, `commitId` (a string the engine writes, not the caller): every
+event of one commit carries the same value — identical across all streams of a multi-stream
+commit — defaulting to the command ID when outcomes are enabled, else a generated ULID. It is the
+only durable commit boundary, and a wipe-and-rebuild regroups on it (see C7).
 
 **API shape.** Go: `Metadata.PrincipalID *PrincipalID`, `Metadata.CausationID *CommandID`,
 `Metadata.Extensions map[string]string` plus `WithPrincipalID`/`WithCausationID`/`WithExtension`
@@ -329,7 +333,12 @@ new general API. This also retires the handler-attached `CommandResult.Transacti
 **Storage format.** View items keep the existing attribute set (`pk`, `sk`, `entityID`,
 `entityType`, `payload`) but are no longer constrained to `sk = "VIEW"` or the derived pk; the
 spec's Views section is relaxed accordingly, and fixtures gain a multi-pk/sk vector. Delete
-operations are transaction deletes with their own conditions. On PostgreSQL, evt defines no view
+operations are transaction deletes with their own conditions. _Errata (E1.1):_ because the log
+stores only per-stream events, the spec pins how a wipe-and-rebuild reproduces the grouping: it
+regroups events by `commitId` (C6) and runs the commit-wide projector once per commit, with that
+commit's events in the pinned (stream ID, sequence) order; the projector's output may depend only
+on the events of that commit plus the post-commit aggregate states, never on cross-commit
+ordering; pre-v0.9 events without `commitId` replay as single-event commits. On PostgreSQL, evt defines no view
 schema — apps own their view tables, and the "do not build" verdict on a Postgres view store
 stands ([ADR 0006](0006-parity-policy-and-feature-cuts.md)). C7 on PostgreSQL therefore means the
 backend executes the projector's operations inside the commit transaction, as the Rust backend

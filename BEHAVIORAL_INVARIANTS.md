@@ -137,7 +137,9 @@ rules are specified in the [storage format](docs/spec/storage-format.md#views).
 
 In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C6),
 metadata gains `principalId` (string or null), `causationId` (string or null; defaults to
-`commandId` when unset), and `extensions` (string-keyed map, `{}` when empty), appended after the
+`commandId` when unset), `extensions` (string-keyed map, `{}` when empty), and `commitId`
+(string; engine-written, identical across every event of a commit, defaulting to the command ID
+when outcomes are enabled, else a generated ULID) — appended after the
 existing keys. The byte-level shape — including defaults for old readers — is specified in the
 [storage format](docs/spec/storage-format.md#metadata).
 
@@ -487,3 +489,6 @@ services can append to and load the same streams in DynamoDB or PostgreSQL. See
   - PostgreSQL `metadata` is `jsonb` and must be compared as JSON.
 
   The duplicate-command window (events after the latest snapshot) is the same in both languages.
+  In v0.9 it is superseded by command outcomes, but on an upgraded log the window is the only
+  guard for pre-v0.9 command IDs, which have no outcome rows — a pre-v0.9 duplicate beyond the
+  latest snapshot is not detected (a documented upgrade limitation; no backfill).
