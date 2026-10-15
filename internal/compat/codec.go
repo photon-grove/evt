@@ -144,7 +144,7 @@ var metadataDecodeInputs = []struct{ name, input string }{
 	{"null-trace-value", `{"trace":{"traceparent":null,"tracestate":"a"}}`},
 	// The v0.9 keys (C6). A pre-v0.9 object without them decodes leniently and re-encodes with the
 	// defaults; causationId re-encodes as the commandId when it was not stored.
-	{"v06-principal-causation-extensions", `{"commandId":"c-1","principalId":"user:7","causationId":"c-0","extensions":{"b":"2","a":"1"},"region":"r"}`},
+	{"v09-principal-causation-extensions", `{"commandId":"c-1","principalId":"user:7","causationId":"c-0","extensions":{"b":"2","a":"1"},"region":"r"}`},
 	{"legacy-without-new-keys", `{"commandId":"c-1","region":"r","timestamp":"t"}`},
 	{"extensions-null-value", `{"extensions":{"a":null,"b":"x"}}`},
 	{"extensions-empty-object", `{"extensions":{}}`},

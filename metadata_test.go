@@ -471,6 +471,77 @@ func Test_Metadata_ExtensionsAlwaysWritten(t *testing.T) {
 	}
 }
 
+func Test_Metadata_Equal(t *testing.T) {
+	base := Metadata{
+		CommandID:   ptr(CommandID("c-1")),
+		Region:      "us-east-1",
+		Timestamp:   "2026-01-02T03:04:05Z",
+		PrincipalID: ptr(PrincipalID("user:42")),
+		CausationID: ptr(CommandID("c-0")),
+		Extensions:  map[string]string{"source": "cli"},
+	}
+
+	require.True(t, base.Equal(Metadata{
+		CommandID:   ptr(CommandID("c-1")),
+		Region:      "us-east-1",
+		Timestamp:   "2026-01-02T03:04:05Z",
+		PrincipalID: ptr(PrincipalID("user:42")),
+		CausationID: ptr(CommandID("c-0")),
+		Extensions:  map[string]string{"source": "cli"},
+	}))
+
+	// A nil and an empty Extensions map compare equal, since both encode as {}.
+	require.True(t, Metadata{}.Equal(Metadata{Extensions: map[string]string{}}))
+
+	// Every field participates in the comparison.
+	other := base
+	other.Region = "eu-west-1"
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.Timestamp = "2026-01-02T03:04:06Z"
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.CommandID = ptr(CommandID("c-2"))
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.CommandID = nil
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.PrincipalID = nil
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.CausationID = ptr(CommandID("c-9"))
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.Extensions = map[string]string{"source": "api"}
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.Extensions = nil
+	require.False(t, base.Equal(other))
+
+	// Trace carriers compare by content, nil only equals nil.
+	withTrace := base
+	withTrace.Trace = &propagation.MapCarrier{"traceparent": "00-4b-01"}
+	require.False(t, base.Equal(withTrace))
+
+	require.True(t, withTrace.Equal(Metadata{
+		CommandID:   ptr(CommandID("c-1")),
+		Trace:       &propagation.MapCarrier{"traceparent": "00-4b-01"},
+		Region:      "us-east-1",
+		Timestamp:   "2026-01-02T03:04:05Z",
+		PrincipalID: ptr(PrincipalID("user:42")),
+		CausationID: ptr(CommandID("c-0")),
+		Extensions:  map[string]string{"source": "cli"},
+	}))
+}
+
 func Test_Metadata_V09Options(t *testing.T) {
 	ctx := context.Background()
 	region := "us-east-1"

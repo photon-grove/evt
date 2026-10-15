@@ -489,7 +489,7 @@
       "canonical": "{\"commandId\":null,\"trace\":{\"traceparent\":\"\",\"tracestate\":\"a\"},\"origin\":null,\"address\":null,\"region\":\"\",\"timestamp\":\"\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
     },
     {
-      "name": "v06-principal-causation-extensions",
+      "name": "v09-principal-causation-extensions",
       "input": "{\"commandId\":\"c-1\",\"principalId\":\"user:7\",\"causationId\":\"c-0\",\"extensions\":{\"b\":\"2\",\"a\":\"1\"},\"region\":\"r\"}",
       "canonical": "{\"commandId\":\"c-1\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"r\",\"timestamp\":\"\",\"principalId\":\"user:7\",\"causationId\":\"c-0\",\"extensions\":{\"a\":\"1\",\"b\":\"2\"}}"
     },

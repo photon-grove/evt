@@ -21,10 +21,15 @@ type Metadata struct {
 
 	// v0.9 metadata (ADR 0004, C6), appended after the existing keys so stored events written
 	// before v0.9 still decode: missing keys decode to their empty values and unknown keys are
-	// ignored.
-	PrincipalID *PrincipalID      `json:"principalId"`
-	CausationID *CommandID        `json:"causationId"`
-	Extensions  map[string]string `json:"extensions"`
+	// ignored. Because of the appended keys (and the Extensions map), Metadata is no longer
+	// comparable with ==; use Equal instead.
+	PrincipalID *PrincipalID `json:"principalId"`
+	CausationID *CommandID   `json:"causationId"`
+
+	// Extensions carries application-specific metadata. It always encodes, as {} when unset or
+	// empty: a stored object decodes to a non-nil map, while a pre-v0.9 row without the key
+	// decodes to nil. The two encode identically and Equal treats them as the same.
+	Extensions map[string]string `json:"extensions"`
 }
 
 // A PrincipalID identifies the caller that issued a command, for audit and per-principal checks.
@@ -90,7 +95,7 @@ func WithAddress(address string) MetadataOption {
 }
 
 // WithPrincipalID adds the caller's identity to metadata. An empty principal is left unset.
-func WithPrincipalID(principal string) MetadataOption {
+func WithPrincipalID(principal PrincipalID) MetadataOption {
 	return func(m Metadata) Metadata {
 		if principal == "" {
 			m.PrincipalID = nil
@@ -98,7 +103,7 @@ func WithPrincipalID(principal string) MetadataOption {
 			return m
 		}
 
-		id := PrincipalID(principal)
+		id := principal
 		m.PrincipalID = &id
 
 		return m
@@ -151,6 +156,53 @@ func NewMetadata(_ context.Context, region *string, opts ...MetadataOption) Meta
 	}
 
 	return m
+}
+
+// Equal reports whether two metadata values carry the same data. A nil and an empty Extensions
+// map compare equal, since both encode as {}.
+func (m Metadata) Equal(other Metadata) bool {
+	return equalPtr(m.CommandID, other.CommandID) &&
+		carrierEqual(m.Trace, other.Trace) &&
+		equalPtr(m.Origin, other.Origin) &&
+		equalPtr(m.Address, other.Address) &&
+		m.Region == other.Region &&
+		m.Timestamp == other.Timestamp &&
+		equalPtr(m.PrincipalID, other.PrincipalID) &&
+		equalPtr(m.CausationID, other.CausationID) &&
+		extensionsEqual(m.Extensions, other.Extensions)
+}
+
+// carrierEqual compares two optional trace carriers, treating nil and empty as equal.
+func carrierEqual(a, b *propagation.MapCarrier) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	return extensionsEqual(*a, *b)
+}
+
+// equalPtr compares two optional values by their pointees, with nil only equal to nil.
+func equalPtr[T comparable](a, b *T) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	return *a == *b
+}
+
+// extensionsEqual compares two extension maps, treating nil and empty as equal.
+func extensionsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for key, value := range a {
+		if other, ok := b[key]; !ok || other != value {
+			return false
+		}
+	}
+
+	return true
 }
 
 // MarshalJSON encodes metadata with the storage format's rules: every key is always written, and
