@@ -711,7 +711,17 @@ impl Repository for DynamoRepository {
                         return Ok(false);
                     }
 
-                    return Err(sdk_error(err));
+                    // Per-item throttling and write conflicts arrive inside the cancellation
+                    // reasons, not as the outer error code, so classify them here to keep
+                    // them retryable.
+                    return Err(match classify_cancellation(0, &codes) {
+                        Some(Cancellation::Throttled) => Error::Transient(Box::new(err)),
+                        Some(Cancellation::TransactionConflict) => Error::Conflict {
+                            entity_id: snapshot.entity_id.clone(),
+                            message: "transaction conflict: another writer was committing at the same time".into(),
+                        },
+                        _ => sdk_error(err),
+                    });
                 }
             }
         }
