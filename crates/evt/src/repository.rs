@@ -177,7 +177,8 @@ impl<Op> Commit<Op> {
 /// - refuse an entity ID in a reserved namespace (`SYSTEM#`, `command-outcome#`) on every
 ///   entity-addressed write path (commit, `put_snapshot`, `compact_below`) with
 ///   [`Error::ReservedEntityId`], before any request, and skip those partitions in `entity_heads`
-///   (v0.9, C8).
+///   (v0.9, C8). Explicit event and snapshot reads by ID retain legacy reserved-prefix streams
+///   so migration tooling can read them.
 pub trait Repository: Send + Sync {
     /// Backend-specific operations that in-band projectors can add to a commit. Backends without
     /// projector support use [`std::convert::Infallible`].

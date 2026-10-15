@@ -73,6 +73,7 @@ impl Clone for DynamoRepository {
 
 impl DynamoRepository {
     /// Creates a repository over the given event-log table. Reads are strongly consistent.
+    /// The table binding is immutable: event writes and feature-marker checks always use it.
     pub fn new(client: Client, table: impl Into<String>) -> Self {
         Self {
             client,

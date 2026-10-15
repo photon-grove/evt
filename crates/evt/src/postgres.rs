@@ -99,7 +99,8 @@ impl PostgresRepository {
     }
 
     /// Uses other table names, so several logical event logs can share a database. Names must be
-    /// plain SQL identifiers.
+    /// plain SQL identifiers. This rebinds both events and the repository-owned feature marker,
+    /// discarding cached validation from the old log.
     #[must_use = "with_tables returns the reconfigured repository"]
     pub fn with_tables(mut self, events_table: &str, snapshots_table: &str) -> Result<Self, Error> {
         check_table_names(events_table, snapshots_table)

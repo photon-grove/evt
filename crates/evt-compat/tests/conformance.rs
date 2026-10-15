@@ -159,6 +159,7 @@ async fn dynamo_conforms() {
     feature_marker_cases(&repository, &second).await;
     dynamo_marker_row_matches_the_wire_format(&repository).await;
     projector_condition_failure_is_not_a_conflict(&repository).await;
+    dynamo_legacy_reserved_reads(&repository).await;
 }
 
 /// Reads the marker row back through the raw client and asserts it is byte-for-byte the item the
@@ -604,6 +605,7 @@ async fn postgres_conforms() {
         .unwrap();
     feature_marker_cases(&repository, &second).await;
     postgres_features_text_matches_the_manifest(&repository, &events).await;
+    postgres_legacy_reserved_reads(&repository, &events, &snapshots).await;
     repository
         .pool()
         .get()
@@ -614,6 +616,147 @@ async fn postgres_conforms() {
         ))
         .await
         .expect("drop the isolated event log");
+}
+
+fn legacy_stream(id: EntityId) -> (Vec<SerializedEvent>, SerializedSnapshot) {
+    let events = (1..=2)
+        .map(|sequence| SerializedEvent {
+            id: EventId::for_event(&id, EventSequence(sequence)),
+            sequence: EventSequence(sequence),
+            event_type: EventType::new("ledger:added"),
+            version: EventVersion(1),
+            entity_id: id.clone(),
+            entity_type: Ledger::TYPE.into(),
+            payload: br#"{"amount":1}"#.to_vec(),
+            metadata: Metadata::new("local"),
+        })
+        .collect();
+    let snapshot = SerializedSnapshot {
+        entity_type: Ledger::TYPE.into(),
+        entity_id: id,
+        sequence: EventSequence(1),
+        event_sequence: EventSequence(1),
+        payload: br#"{"total":1,"entries":1}"#.to_vec(),
+    };
+    (events, snapshot)
+}
+
+async fn legacy_reserved_reads<R: Repository>(
+    repository: &R,
+    events: &[SerializedEvent],
+    snapshot: &SerializedSnapshot,
+) {
+    let id = &snapshot.entity_id;
+    assert_eq!(repository.events(id).await.unwrap(), events);
+    assert_eq!(
+        repository.events_after(id, EventSequence(1)).await.unwrap(),
+        events[1..]
+    );
+    assert_eq!(
+        repository.latest(id, 2).await.unwrap(),
+        events.iter().rev().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        repository.snapshot(id).await.unwrap().as_ref(),
+        Some(snapshot)
+    );
+    for filter in [None, Some(&snapshot.entity_type)] {
+        assert!(
+            !repository
+                .entity_heads(filter)
+                .await
+                .unwrap()
+                .contains_key(id)
+        );
+    }
+}
+
+async fn dynamo_legacy_reserved_reads(repository: &DynamoRepository) {
+    use photon_evt::dynamodb::to_sdk_item;
+    use photon_evt::wire::dynamo::{event_item, snapshot_item};
+
+    for prefix in ["SYSTEM#", "command-outcome#"] {
+        let (events, snapshot) = legacy_stream(EntityId::new(format!("{prefix}legacy-account")));
+        // Legacy rows predate write-time namespace refusal; seed through the raw backend.
+        let mut items = events
+            .iter()
+            .map(|event| event_item(event, None).unwrap())
+            .collect::<Vec<_>>();
+        items.push(snapshot_item(&snapshot, None).unwrap());
+        for item in items {
+            repository
+                .client()
+                .put_item()
+                .table_name(repository.table())
+                .set_item(Some(to_sdk_item(&item)))
+                .send()
+                .await
+                .unwrap();
+        }
+        legacy_reserved_reads(repository, &events, &snapshot).await;
+        for sequence in 0..=2 {
+            repository
+                .client()
+                .delete_item()
+                .table_name(repository.table())
+                .key("pk", AttributeValue::S(snapshot.entity_id.to_string()))
+                .key("sk", AttributeValue::N(sequence.to_string()))
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+}
+
+async fn postgres_legacy_reserved_reads(
+    repository: &PostgresRepository,
+    events_table: &str,
+    snapshots_table: &str,
+) {
+    use photon_evt::wire::postgres::EventRow;
+
+    let client = repository.pool().get().await.unwrap();
+    for prefix in ["SYSTEM#", "command-outcome#"] {
+        let (events, snapshot) = legacy_stream(EntityId::new(format!("{prefix}legacy-account")));
+        for event in &events {
+            let row = EventRow::from_event(event).unwrap();
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO {events_table}
+                (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)"
+                    ),
+                    &[
+                        &row.entity_id,
+                        &row.sequence,
+                        &row.event_id,
+                        &row.event_type,
+                        &row.version,
+                        &row.entity_type,
+                        &row.payload,
+                        &row.metadata,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {snapshots_table}
+            (entity_id, entity_type, sequence, event_sequence, payload) VALUES ($1, $2, 1, 1, $3)"
+                ),
+                &[
+                    &snapshot.entity_id.as_str(),
+                    &snapshot.entity_type.as_str(),
+                    &snapshot.payload,
+                ],
+            )
+            .await
+            .unwrap();
+        legacy_reserved_reads(repository, &events, &snapshot).await;
+    }
 }
 
 /// Reads the features row back through raw SQL and asserts the stored JSON text is exactly the
