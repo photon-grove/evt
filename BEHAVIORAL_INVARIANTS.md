@@ -46,13 +46,6 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
 - `pk` + `sk` combination must be unique (enforced by conditional write)
 - `sk` (sequence) starts at 1 and increments monotonically per entity
 - `sk` = 0 is reserved for inline snapshots (filtered out by event queries)
-- In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C8,
-  C9) the `SYSTEM#` and `command-outcome#` partition prefixes are reserved for engine rows (the
-  feature marker, the rebuild fence, command outcomes): every entity-addressed write path refuses
-  an entity ID beginning with one (`ReservedEntityId`), entity heads and rebuild scans skip them,
-  and a `SYSTEM#FEATURES` marker row carries the declared feature set every commit conditions on.
-  The byte-level rules are specified in the
-  [storage format](docs/spec/storage-format.md#reserved-namespaces).
 - `ttl` is written **only** for entity types covered by a `Repository` retention policy
   (`WithRetention`); every other row omits the attribute entirely (`json:"ttl,omitempty"`) and is
   never auto-expired. It is a no-op unless the table has DynamoDB TTL enabled on the `ttl` attribute.
@@ -445,6 +438,7 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   name), or `*evt.FeatureMarkerTableMismatchError` for another table. Writes return the typed
   mismatch error if the binding no longer matches; snapshot writes and compaction enforce the
   same rule.
+
   Rust markers are repository-owned rather than attachable: DynamoDB's table is immutable, and
   PostgreSQL `with_tables` rebinds the marker together with the events table and clears validation.
 
@@ -462,8 +456,8 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   same conditional write that updates the feature set, so every writer cached at the old version
   fails, re-validates, and retries (typed via `evt.ErrFeatureManifestChanged`, classified
   transient); a re-validation that finds an unsupported pair refuses outright.
-- Enforcement is unconditional in Go and Rust. Default repositories support no extensions;
-  Go's `WithFeatureMarker` customizes the supported set, never disables the check. PostgreSQL holds
+- Enforcement is unconditional. Default repositories support no extensions;
+  `WithFeatureMarker` customizes the supported set, never disables the check. PostgreSQL holds
   the shared feature advisory lock across validation and writes in the same transaction.
   Unquoted table names are lowercase-canonicalized, including the feature-lock key.
 - Validation and construction of a commit's marker condition use one locked cache snapshot;
@@ -524,8 +518,7 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 - Deletes events with `sequence` in `[1, throughSequence]`
 - Refuses with `evt.ErrCompactionUncovered` unless a snapshot covers the range
   (`snapshot.EventSequence >= throughSequence`)
-- Never deletes the `sk = 0` snapshot; `throughSequence < 1` is a no-op for ordinary entity IDs;
-  reserved IDs are refused even for a no-op range. Compaction is idempotent.
+- Never deletes the `sk = 0` snapshot; `throughSequence < 1` is a no-op; idempotent
 - Refuses unsupported feature declarations and history-dependent entity types from the durable
   feature marker, including declarations made by other repository handles
 - DynamoDB: strongly consistent key-only range query + `TransactWriteItems` batches of at most
