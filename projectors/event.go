@@ -1,9 +1,8 @@
 package projectors
 
 import (
-	"encoding/json"
-
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 )
 
 // ToSerializedEvent converts a DynamoDB stream record shape into an evt
@@ -12,7 +11,7 @@ import (
 func ToSerializedEvent(rec StreamRecord) evt.SerializedEvent {
 	var meta evt.Metadata
 	if len(rec.Metadata) > 0 {
-		if err := json.Unmarshal(rec.Metadata, &meta); err != nil {
+		if err := eventjson.UnmarshalMetadata(rec.Metadata, &meta); err != nil {
 			meta = evt.Metadata{}
 		}
 	}

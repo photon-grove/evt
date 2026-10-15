@@ -51,7 +51,9 @@ pub use features::{
     COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker, SUPPORTED_FEATURES,
     SYSTEM_PREFIX, ValidatedMarker,
 };
-pub use ids::{CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
+pub use ids::{
+    CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion, PrincipalId,
+};
 pub use mem::MemRepository;
 pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};
 pub use repository::{Commit, NewSnapshot, Repository, snapshot_events_due};

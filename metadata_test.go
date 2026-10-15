@@ -384,3 +384,159 @@ func Test_Metadata_ConcurrentCreation(t *testing.T) {
 		}
 	}
 }
+
+func Test_Metadata_Equal(t *testing.T) {
+	base := Metadata{
+		CommandID:   ptr(CommandID("c-1")),
+		Region:      "us-east-1",
+		Timestamp:   "2026-01-02T03:04:05Z",
+		PrincipalID: ptr(PrincipalID("user:42")),
+		CausationID: ptr(CommandID("c-0")),
+		Extensions:  map[string]string{"source": "cli"},
+	}
+
+	require.True(t, base.Equal(Metadata{
+		CommandID:   ptr(CommandID("c-1")),
+		Region:      "us-east-1",
+		Timestamp:   "2026-01-02T03:04:05Z",
+		PrincipalID: ptr(PrincipalID("user:42")),
+		CausationID: ptr(CommandID("c-0")),
+		Extensions:  map[string]string{"source": "cli"},
+	}))
+
+	// A nil and an empty Extensions map compare equal, since both encode as {}.
+	require.True(t, Metadata{}.Equal(Metadata{Extensions: map[string]string{}}))
+
+	// Every field participates in the comparison.
+	other := base
+	other.Region = "eu-west-1"
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.Timestamp = "2026-01-02T03:04:06Z"
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.CommandID = ptr(CommandID("c-2"))
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.CommandID = nil
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.PrincipalID = nil
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.CausationID = ptr(CommandID("c-9"))
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.Extensions = map[string]string{"source": "api"}
+	require.False(t, base.Equal(other))
+
+	other = base
+	other.Extensions = nil
+	require.False(t, base.Equal(other))
+
+	// Trace carriers compare by content, nil only equals nil.
+	withTrace := base
+	withTrace.Trace = &propagation.MapCarrier{"traceparent": "00-4b-01"}
+	require.False(t, base.Equal(withTrace))
+
+	require.True(t, withTrace.Equal(Metadata{
+		CommandID:   ptr(CommandID("c-1")),
+		Trace:       &propagation.MapCarrier{"traceparent": "00-4b-01"},
+		Region:      "us-east-1",
+		Timestamp:   "2026-01-02T03:04:05Z",
+		PrincipalID: ptr(PrincipalID("user:42")),
+		CausationID: ptr(CommandID("c-0")),
+		Extensions:  map[string]string{"source": "cli"},
+	}))
+}
+
+func Test_Metadata_V09Options(t *testing.T) {
+	ctx := context.Background()
+	region := "us-east-1"
+
+	metadata := NewMetadata(ctx, &region,
+		WithPrincipalID("user:42"),
+		WithCausationID("cmd-0000"),
+		WithExtension("requestSource", "cli"),
+	)
+
+	require.NotNil(t, metadata.PrincipalID)
+	require.Equal(t, PrincipalID("user:42"), *metadata.PrincipalID)
+	require.NotNil(t, metadata.CausationID)
+	require.Equal(t, CommandID("cmd-0000"), *metadata.CausationID)
+	require.Equal(t, map[string]string{"requestSource": "cli"}, metadata.Extensions)
+
+	// Empty values are left unset, like WithAddress.
+	cleared := NewMetadata(ctx, &region,
+		WithPrincipalID("user:42"), WithPrincipalID(""),
+		WithCausationID("cmd-0000"), WithCausationID(""),
+	)
+
+	require.Nil(t, cleared.PrincipalID)
+	require.Nil(t, cleared.CausationID)
+}
+
+func Test_Metadata_V09KeysDecodeLeniently(t *testing.T) {
+	// A metadata object written before v0.9 has none of the new keys.
+	var metadata Metadata
+	require.NoError(t, json.Unmarshal([]byte(`{"commandId":"c-1","region":"r"}`), &metadata))
+
+	require.Nil(t, metadata.PrincipalID)
+	require.Nil(t, metadata.CausationID)
+	require.Empty(t, metadata.Extensions)
+
+	// Stored v0.9 keys decode faithfully, including an empty-string extension value.
+	metadata = Metadata{}
+	require.NoError(t, json.Unmarshal(
+		[]byte(`{"principalId":"user:42","causationId":"c-0","extensions":{"a":"","b":"x"}}`),
+		&metadata))
+
+	require.NotNil(t, metadata.PrincipalID)
+	require.Equal(t, PrincipalID("user:42"), *metadata.PrincipalID)
+	require.Equal(t, CommandID("c-0"), *metadata.CausationID)
+	require.Equal(t, map[string]string{"a": "", "b": "x"}, metadata.Extensions)
+}
+
+func Test_Metadata_EmbeddedJSON(t *testing.T) {
+	type valueDTO struct {
+		Metadata
+		Value string `json:"value"`
+	}
+	type pointerDTO struct {
+		*Metadata
+		Value string `json:"value"`
+	}
+
+	metadata := Metadata{
+		CommandID:   ptr(CommandID("cmd-1")),
+		PrincipalID: ptr(PrincipalID("user:42")),
+	}
+
+	for _, dto := range []any{
+		valueDTO{Metadata: metadata, Value: "retained"},
+		pointerDTO{Metadata: &metadata, Value: "retained"},
+	} {
+		data, err := json.Marshal(dto)
+		require.NoError(t, err)
+
+		var decoded valueDTO
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		require.Equal(t, "retained", decoded.Value)
+		require.Equal(t, metadata, decoded.Metadata)
+	}
+
+	// A nil embedded pointer must not gain a promoted marshaler that panics.
+	data, err := json.Marshal(pointerDTO{Value: "retained"})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"value":"retained"}`, string(data))
+}
+
+func ptr[T any](value T) *T {
+	return &value
+}

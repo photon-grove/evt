@@ -161,16 +161,28 @@ intent rather than strings: `evt.IsNotFoundErr(err)`, `evt.IsConflictErr(err)`,
 ## 3. Make retries safe with metadata
 
 [`evt.Metadata`](concepts.md#metadata) rides along with every command and carries
-an optional command ID, trace context, and origin. The command ID is the
+an optional command ID, trace context, origin, caller identity (`PrincipalID`),
+causation (`CausationID`), and application-specific `Extensions`. The command ID is the
 practical key to **idempotent retries**: set it from a request ID, job ID, or
 message ID, and a duplicate attempt fails as a
 [`DuplicateCommandError`](concepts.md#command) instead of recording the fact
 twice.
 
 ```go
-md := evt.NewMetadata(ctx, nil, evt.WithCommandID("idempotency-key-123"))
+md := evt.NewMetadata(ctx, nil,
+    evt.WithCommandID("idempotency-key-123"),
+    evt.WithPrincipalID("user:42"),
+    evt.WithExtension("requestSource", "cli"),
+)
 err := store.Execute(ctx, account, "acct-1", &Deposit{AccountID: "acct-1", Amount: 25}, md)
 ```
+
+This example leaves `CausationID` unset, so the stored `causationId` defaults to
+`"idempotency-key-123"`. For a command triggered by another command, add
+`evt.WithCausationID("upstream-command-456")` to override it. With neither a
+command ID nor a causation ID, `causationId` encodes as `null`. An unset principal
+also encodes as `null`; nil or empty extensions encode as `{}`. Use
+`evt.WithExtension(key, value)` for each application-specific string entry.
 
 Use `evt.WithTrace(ctx)` to propagate an OpenTelemetry context and
 `evt.WithAddress(addr)` when the caller has parsed a client address worth

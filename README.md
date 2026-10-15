@@ -156,6 +156,10 @@ replaces the contracts that require them:
   (the built-in `policy.Classify` only recognizes `ClassifiedError`, so a custom classifier
   is the only supported way to mark raw backend errors transient)
 
+One v0.9.0 change is source-breaking without a deprecation window: `evt.Metadata` is no longer
+comparable with `==` — the new `Extensions` map (C6) makes the struct non-comparable. Use the new
+`evt.Metadata.Equal` method instead; it treats a nil and an empty `Extensions` map as equal.
+
 ## Rust
 
 The [`photon-evt`](crates/evt) crate is a native Rust implementation of the same

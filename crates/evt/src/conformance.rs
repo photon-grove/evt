@@ -190,6 +190,7 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
         };
 
         record("commit and read in order", commit_and_read(repo).await);
+        record("metadata round trip", metadata_round_trip(repo).await);
         record("isolate entities", isolate_entities(repo).await);
         record(
             "reject events for another entity or of mixed types",
@@ -430,6 +431,50 @@ async fn commit_and_read<R: Repository>(repo: &R) -> CaseResult {
             repo.events_after(&stream.id, EventSequence(after)).await?,
             want,
             format!("events_after({after})")
+        );
+    }
+
+    Ok(())
+}
+
+async fn metadata_round_trip<R: Repository>(repo: &R) -> CaseResult {
+    let stream = Stream::new(&namespace(), "1", "ledger");
+    let mut events = stream.events(1..=2);
+    for (i, event) in events.iter_mut().enumerate() {
+        event.metadata = event
+            .metadata
+            .clone()
+            .with_command_id(format!("command-{}", i + 1))
+            .with_principal_id(format!("principal-{}", i + 1))
+            .with_causation_id(format!("cause-{}", i + 1))
+            .with_extension("source", format!("source-{}", i + 1))
+            .with_extension("empty", "");
+    }
+
+    stream.commit(repo, events.clone(), None).await?;
+
+    let stored = repo.events(&stream.id).await?;
+    ensure_eq!(stored.len(), 2, "metadata event count");
+    for (got, want) in stored.iter().zip(&events) {
+        ensure_eq!(
+            got.metadata.command_id,
+            want.metadata.command_id,
+            "command ID survives commit and read"
+        );
+        ensure_eq!(
+            got.metadata.principal_id,
+            want.metadata.principal_id,
+            "principal ID survives commit and read"
+        );
+        ensure_eq!(
+            got.metadata.causation_id,
+            want.metadata.causation_id,
+            "explicit causation ID survives commit and read"
+        );
+        ensure_eq!(
+            got.metadata.extensions,
+            want.metadata.extensions,
+            "extensions, including an empty value, survive commit and read"
         );
     }
 

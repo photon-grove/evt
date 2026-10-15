@@ -6,7 +6,9 @@ import (
 )
 
 // SerializedEvent is a common event format that is ready to be committed to an Event Store and
-// streamed to downstream event listeners.
+// streamed to downstream event listeners. It owns its JSON encoding: encoding/json and
+// MarshalEvent use the canonical storage format, including encode-time metadata defaults.
+// Metadata itself has no JSON methods, so embedding it in application DTOs preserves sibling fields.
 type SerializedEvent struct {
 	ID         EventID       `json:"id"` // Composed of the EntityID and EventSequence
 	Sequence   EventSequence `json:"sequence"`
@@ -16,6 +18,16 @@ type SerializedEvent struct {
 	EntityType EntityType    `json:"entityType"`
 	Payload    []byte        `json:"payload"`
 	Metadata   Metadata      `json:"metadata"`
+}
+
+// MarshalJSON encodes the event using the shared storage and stream format.
+func (e SerializedEvent) MarshalJSON() ([]byte, error) {
+	return MarshalEvent(e)
+}
+
+// UnmarshalJSON decodes the event without applying encode-time metadata defaults.
+func (e *SerializedEvent) UnmarshalJSON(data []byte) error {
+	return UnmarshalEvent(data, e)
 }
 
 // SerializedResult is similar to CommandResult but uses SerializedEvents instead.
