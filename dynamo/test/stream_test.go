@@ -40,7 +40,7 @@ func (m *MockEntity) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) 
 }
 func (m *MockEntity) EventUpcasters() []evt.EventUpcaster { return nil }
 func (m *MockEntity) Projectors() []evt.EventProjector    { return nil }
-func (m *MockEntity) Base() evt.BaseEntity                { return m.BaseEntity }
+func (m *MockEntity) Base() evt.BaseEntity                { return m.BaseEntity } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 // Test StreamEntities Success
 func (s *RepositorySuite) Test_StreamEntities_Success() {
@@ -59,7 +59,7 @@ func (s *RepositorySuite) Test_StreamEntities_Success() {
 	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(output, nil)
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
-		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	}
 
 	entityStream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc)
@@ -130,7 +130,7 @@ func (s *RepositorySuite) Test_StreamEntities_GroupsAndOrdersInterleavedScan() {
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		applied[event.EntityID] = append(applied[event.EntityID], int(event.Sequence))
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
@@ -172,7 +172,7 @@ func (s *RepositorySuite) Test_StreamEntities_ParallelSegments() {
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
@@ -227,14 +227,14 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_EnumeratesAndQueries() {
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		applied[event.EntityID] = append(applied[event.EntityID], int(event.Sequence))
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
 	}
 
 	ids := make([]evt.EntityID, 0, 2)
-	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, applyFunc) {
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		entity, err := entityResult.Unwrap()
 		require.NoError(s.T(), err)
 		ids = append(ids, entity.GetID())
@@ -260,19 +260,19 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_Skip() {
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
 	}
 
-	opts := dynamo.StreamByQueryOptions{
+	opts := dynamo.StreamByQueryOptions{ //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		Workers: 1,
 		Skip:    func(id evt.EntityID) bool { return id == "b" },
 	}
 
 	ids := make([]evt.EntityID, 0, 1)
-	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) {
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		entity, err := entityResult.Unwrap()
 		require.NoError(s.T(), err)
 		ids = append(ids, entity.GetID())
@@ -298,16 +298,16 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_EntityTypeFilter() {
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
 	}
 
-	opts := dynamo.StreamByQueryOptions{Workers: 1, EntityType: evt.EntityType("TestEntity")}
+	opts := dynamo.StreamByQueryOptions{Workers: 1, EntityType: evt.EntityType("TestEntity")} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	count := 0
-	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) {
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		_, err := entityResult.Unwrap()
 		require.NoError(s.T(), err)
 		count++
@@ -332,14 +332,14 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_ParallelWorkers() {
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
 	}
 
 	ids := make([]evt.EntityID, 0, 4)
-	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 4}, applyFunc) {
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 4}, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		entity, err := entityResult.Unwrap()
 		require.NoError(s.T(), err)
 		ids = append(ids, entity.GetID())
@@ -357,12 +357,12 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_EnumerationError() {
 		Return((*dynamodb.ScanOutput)(nil), errors.New("scan boom")).Once()
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
-		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	}
 
 	var gotErr error
 	okCount := 0
-	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 2}, applyFunc) {
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 2}, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		if _, err := entityResult.Unwrap(); err != nil {
 			gotErr = err
 		} else {
@@ -387,7 +387,7 @@ func (s *RepositorySuite) Test_StreamEntities_ScanErrorAborts() {
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
@@ -472,14 +472,14 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_HeadSourceEnumeration() {
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		applied[event.EntityID] = append(applied[event.EntityID], int(event.Sequence))
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
 	}
 
 	ids := make([]evt.EntityID, 0, 2)
-	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}, applyFunc) {
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		entity, err := entityResult.Unwrap()
 		require.NoError(s.T(), err)
 		ids = append(ids, entity.GetID())
@@ -510,13 +510,13 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_HeadSourceSkipAndType() {
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
 	}
 
-	opts := dynamo.StreamByQueryOptions{
+	opts := dynamo.StreamByQueryOptions{ //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		Workers:    1,
 		EntityType: evt.EntityType("TestEntity"),
 		HeadSource: heads,
@@ -524,7 +524,7 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_HeadSourceSkipAndType() {
 	}
 
 	ids := make([]evt.EntityID, 0, 1)
-	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) {
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, opts, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		entity, err := entityResult.Unwrap()
 		require.NoError(s.T(), err)
 		ids = append(ids, entity.GetID())
@@ -544,11 +544,11 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_HeadSourceEnumerationError(
 	heads := &fakeHeadVisitor{err: errors.New("registry boom")}
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
-		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	}
 
 	var gotErr error
-	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 2, HeadSource: heads}, applyFunc) {
+	for entityResult := range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 2, HeadSource: heads}, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		if _, err := entityResult.Unwrap(); err != nil {
 			gotErr = err
 		}
@@ -575,11 +575,11 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_CancelMidStream() {
 	}
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
-		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	}
 
 	consumed := 0
-	for range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}, applyFunc) {
+	for range s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}, applyFunc) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		consumed++
 		if consumed == 1 {
 			cancel() // abandon the stream while entities are still being enumerated

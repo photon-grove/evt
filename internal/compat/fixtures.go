@@ -225,11 +225,11 @@ func SNSMessage(ctx context.Context, item map[string]types.AttributeValue) (stri
 	}
 
 	capture := &captureSNS{}
-	publisher, err := stream.NewSNSPublisher(
+	publisher, err := stream.NewSNSPublisher( //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		capture,
 		"arn:aws:sns:us-west-2:000000000000:evt-compat",
 		OriginSource,
-		stream.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		stream.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	)
 	if err != nil {
 		return "", nil, err

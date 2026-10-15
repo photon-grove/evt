@@ -7,7 +7,7 @@ import (
 	"fmt"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // This Repository lives in-memory for testing or local development
@@ -56,6 +56,9 @@ func (repo Repository) Commit(
 }
 
 // CommitStream streams Events to memory
+//
+// Deprecated: Cut in ADR-0006 (K1). Commit batched commands through the normal commit path
+// instead. It will be removed in the next minor release.
 func (repo Repository) CommitStream(
 	_ context.Context,
 	channel <-chan result.Result[evt.SerializedResult],

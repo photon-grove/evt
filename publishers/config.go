@@ -12,6 +12,8 @@ const (
 )
 
 // Config holds runtime settings for a DynamoDB stream event publisher Lambda.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 type Config struct {
 	EventsTopicARN       string
 	EventsFIFOTopicARN   string // optional companion FIFO topic for realtime fanout
@@ -22,6 +24,8 @@ type Config struct {
 
 // LoadConfigFromEnv loads publisher settings from environment variables.
 // defaultSource is used when EVENT_SOURCE is not set.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 func LoadConfigFromEnv(defaultSource string) (*Config, error) {
 	eventsTopicARN := os.Getenv("EVENTS_TOPIC_ARN")
 	if eventsTopicARN == "" {

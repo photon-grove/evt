@@ -39,6 +39,14 @@ default (a single sequential scan) for small tables.
 
 ### Bounded-memory rebuilds for large tables
 
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K3):*
+`StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` are
+cut — **removed without a bounded-memory in-library replacement**. `StreamEntities` (the source
+behind `evt.RebuildProjections` and `evt.RebuildProjectionsFromStream`) buffers every matched
+event, so for large tables page your own DynamoDB Query/Scan with `LastEvaluatedKey` (one
+partition query per entity keeps memory bounded) and feed `evt.RebuildProjectionsFromStream`
+yourself. The section below documents the deprecated path for pre-v0.9 readers.
+
 Because `StreamEntities` must regroup an unordered scan, it holds the matched
 events in memory until the scan finishes. For large event logs, use the dynamo
 repository's `StreamEntitiesByQuery`, which first enumerates the distinct entity
@@ -75,6 +83,11 @@ back it with a heads registry — see [Constant-memory enumeration](#constant-me
 below.
 
 ### Incremental rebuilds with an entity-heads table
+
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K4):* the heads
+table and `dynamo.HeadStore` are cut — derive heads from the log with `StreamEntityHeads`
+instead, and rebuild changed entities against a per-entity checkpoint you maintain yourself.
+This section documents the pre-v0.9 setup for readers still on it.
 
 A full rebuild reprocesses every entity even when only a handful changed since the
 last run, and (per the note above) enumeration reads capacity comparable to the
@@ -175,6 +188,10 @@ head accounts for a compacted stream's snapshot floor, so it stays correct after
 
 #### Constant-memory enumeration
 
+*Deprecated in v0.9.0 (K3/K4):* the `HeadSource` option, `StreamEntitiesByQuery`, and
+`RebuildProjectionsByQuery` below are cut — the scan-and-dedup enumeration through
+`StreamEntities`/`StreamEntitiesFromSnapshotsWithOptions` is the supported path.
+
 `StreamEntityHeads` returns a `map[EntityID]EventSequence` — convenient, but the
 map grows with the number of entities, so a rebuild's memory ceiling scales with
 the table. For a genuinely constant-memory pass, `HeadStore` also implements the
@@ -271,7 +288,11 @@ a dedup set, so its memory ceiling grows with the entity count. For the same
 `StreamByQueryOptions.HeadSource`, the DynamoDB repository exposes
 `StreamEntitiesFromSnapshotsWithOptions` with a matching
 `StreamFromSnapshotsOptions.HeadSource` (any `EntityHeadVisitor`, e.g. a
-`HeadStore`):
+`HeadStore`).
+
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K3):*
+`HeadSource` is cut along with the heads registry — the scan-and-dedup enumeration above is the
+supported path. The rest of this section describes the pre-v0.9 setup.
 
 ```go
 stream := repo.StreamEntitiesFromSnapshotsWithOptions(ctx, dynamo.StreamFromSnapshotsOptions{

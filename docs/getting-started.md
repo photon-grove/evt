@@ -12,13 +12,19 @@ go get github.com/photon-grove/evt
 
 The core `evt` and `mem` packages have no cloud dependencies, so unit tests stay
 fast and offline. The AWS SDK is pulled in only through the `dynamo`, `stream`,
-`projectors`, and `publishers` subpackages, where you actually need it.
+and `projectors` subpackages (plus the deprecated `publishers` package until it is removed),
+where you actually need it.
 
 ## 1. Define an aggregate
 
 An aggregate implements [`evt.Entity`](concepts.md#entity). It does three jobs:
 **handle** commands into new events, **apply** events to its own state, and
 **deserialize** historical events back into current Go types.
+
+> **Planned for removal in the next minor release** ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):
+> `evt.BaseEntity` and `evt.NewEntity` go away then — define your own identity and lifecycle
+> fields instead. No `Deprecated:` notice is carried in v0.9.0 because `Entity.Base` still
+> requires the type; the notice lands once the core reshape (C1–C11) replaces the contract.
 
 ```go
 const entityType evt.EntityType = "bank_account"
@@ -206,4 +212,5 @@ straight to a view.
 - [DynamoDB integration](dynamodb.md) — table shapes, snapshots, and compaction.
 - [PostgreSQL integration](postgres.md) — the relational schema and local setup.
 - [Projections and rebuilds](projections.md) — building and rebuilding read models.
-- [Streams, projectors, and publishers](streams.md) — async fanout on Lambda.
+- [Streams and projectors](streams.md) — async fan-out on Lambda (SNS fan-out is deprecated in
+  v0.9.0).

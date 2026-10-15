@@ -9,6 +9,9 @@ import (
 const defaultReplayEstimatePerEventMS = 8.0
 
 // FreshnessSample captures replay debt metrics for a loaded entity.
+//
+// Deprecated: Cut in ADR-0006 (K2): there is no Go replacement; wrap Load with your own
+// metrics. It will be removed in the next minor release.
 type FreshnessSample struct {
 	EntityType           string
 	EntityID             string
@@ -22,15 +25,24 @@ type FreshnessSample struct {
 }
 
 // FreshnessObserver receives snapshot freshness samples from LoadEntity.
+//
+// Deprecated: Cut in ADR-0006 (K2): there is no Go replacement; wrap Load with your own
+// metrics. It will be removed in the next minor release.
 type FreshnessObserver func(context.Context, FreshnessSample)
 
 // WithFreshnessObserver registers an observer used to emit freshness metrics.
+//
+// Deprecated: Cut in ADR-0006 (K2): there is no Go replacement; wrap Load with your own
+// metrics. It will be removed in the next minor release.
 func (store *Store) WithFreshnessObserver(observer FreshnessObserver) *Store {
 	store.freshnessObserver = observer
 	return store
 }
 
 // WithReplayEstimatePerEventMS configures replay-duration estimation.
+//
+// Deprecated: Cut in ADR-0006 (K2): there is no Go replacement; wrap Load with your own
+// metrics. It will be removed in the next minor release.
 func (store *Store) WithReplayEstimatePerEventMS(ms float64) *Store {
 	if ms > 0 {
 		store.replayEstimatePerEventMS = ms
@@ -39,6 +51,9 @@ func (store *Store) WithReplayEstimatePerEventMS(ms float64) *Store {
 }
 
 // WithReplayBudgetEvents configures the events-since-snapshot budget. Values <= 0 disable budget checks.
+//
+// Deprecated: Cut in ADR-0006 (K2): there is no Go replacement; wrap Load with your own
+// metrics. It will be removed in the next minor release.
 func (store *Store) WithReplayBudgetEvents(maxEvents int) *Store {
 	store.replayBudgetEvents = maxEvents
 	return store

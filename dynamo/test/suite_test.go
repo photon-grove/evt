@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/photon-grove/evt/dynamo"
-	"github.com/photon-grove/evt/dynamo/mock"
+	"github.com/photon-grove/evt/dynamo/mock" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/stretchr/testify/suite"
 )
 

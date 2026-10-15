@@ -41,23 +41,13 @@ export const capabilities: ContentCard[] = [
     doc: 'projections',
   },
   {
-    title: 'Incremental rebuilds',
-    body: 'Track entity heads in a small table to rebuild only what changed with constant-memory enumeration.',
-    doc: 'projections',
-  },
-  {
     title: 'Snapshots and upcasters',
     body: 'Keep replay fast while allowing old event payloads to evolve through explicit versioned upcasters.',
     doc: 'concepts',
   },
   {
     title: 'Fan-out projectors',
-    body: 'Projectors subscribe to the SNS fan-out (SNS→SQS) with idempotency, retry classification, and partial-batch failure responses.',
-    doc: 'streams',
-  },
-  {
-    title: 'Event publishers',
-    body: 'Fan out event-log INSERT records to SNS, including optional FIFO companion topics for ordered real-time workflows.',
+    body: 'Projectors read the DynamoDB Stream directly (or through SNS→SQS) with idempotency, retry classification, and partial-batch failure responses.',
     doc: 'streams',
   },
 ]
@@ -77,7 +67,7 @@ export const packages = [
   {name: 'evt/snapshots', body: 'Store with snapshot loading and configurable write thresholds.'},
   {name: 'evt/stream', body: 'Stream handler and publisher helpers for event fanout.'},
   {name: 'evt/projectors', body: 'Projector runtime for the SNS fan-out (or direct stream) with idempotency and retry classification.'},
-  {name: 'evt/publishers', body: 'DynamoDB Streams publisher that fans events out to SNS, with ingress and retry budgets.'},
+  {name: 'evt/publishers', body: 'DynamoDB Streams publisher that fans events out to SNS, with ingress and retry budgets (deprecated in v0.9.0).'},
   {name: 'evt/policy', body: 'Backend-neutral retry helpers for commit paths (+ policy/dynamodb).'},
   {name: 'evt/viewstore', body: 'Typed JSON helper around evt.ViewRepository.'},
   {name: 'evt/test', body: 'Shared test aggregate, commands, events, and helpers for adopters.'},

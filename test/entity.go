@@ -27,7 +27,7 @@ type Entity struct {
 // NewEntity returns an Entity instance for the given id
 func NewEntity(id evt.EntityID) *Entity {
 	return &Entity{
-		BaseEntity: evt.NewEntity(id),
+		BaseEntity: evt.NewEntity(id), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	}
 }
 
@@ -42,7 +42,7 @@ func (entity *Entity) GetID() evt.EntityID {
 }
 
 // Base returns the base entity fields
-func (entity *Entity) Base() evt.BaseEntity {
+func (entity *Entity) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	return entity.BaseEntity
 }
 

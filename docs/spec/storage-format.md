@@ -1268,9 +1268,12 @@ name.)
 
 ## Stream Envelope
 
-Go's `stream.SNSPublisher` wraps each committed event in an EventBridge-style envelope and publishes
-it to SNS. The Rust crate encodes the same bytes (`photon_evt::wire::envelope::encode`) and decodes
-both SNS messages and raw-delivery SQS bodies (`decode`).
+The stream envelope is the cross-language wire format. Go's `stream.SNSPublisher` (deprecated in
+v0.9.0, K5) wraps each committed event in an EventBridge-style envelope and publishes it to SNS;
+a post-removal publisher emits the same envelope itself. Go decodes the envelope with
+`projectors.StreamRecordFromEnvelope`; Rust encodes the same bytes
+(`photon_evt::wire::envelope::encode`) and decodes both SNS messages and raw-delivery SQS bodies
+(`decode`).
 
 ```json
 {"version":"","id":"acct-1:1","detail-type":"account:opened","source":"evt-compat","account":"","time":"0001-01-01T00:00:00Z","region":"","resources":null,"detail":{...serialized event...}}

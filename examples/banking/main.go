@@ -20,14 +20,14 @@ type Account struct {
 }
 
 func NewAccount(id evt.EntityID) *Account {
-	return &Account{BaseEntity: evt.NewEntity(id)}
+	return &Account{BaseEntity: evt.NewEntity(id)} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 }
 
 func (a *Account) Type() evt.EntityType { return entityType }
 
 func (a *Account) GetID() evt.EntityID { return a.ID }
 
-func (a *Account) Base() evt.BaseEntity { return a.BaseEntity }
+func (a *Account) Base() evt.BaseEntity { return a.BaseEntity } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 func (a *Account) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
 	switch cmd := command.(type) {

@@ -6,6 +6,11 @@ import (
 )
 
 // Attempt contains retry telemetry fields emitted by Execute.
+//
+// Planned for removal in the next minor release (ADR-0006, K6): attempt callbacks are replaced
+// by fence-aware retry plus structured telemetry. It carries no Deprecated notice yet because
+// Execute/ExecuteWithRetry still take a Hooks argument, so the notice would break builds with
+// no warning-free path; it lands once the core reshape (C5) replaces the signature.
 type Attempt struct {
 	Attempt int
 	Delay   time.Duration
@@ -14,6 +19,11 @@ type Attempt struct {
 }
 
 // Hooks emits retry lifecycle callbacks for telemetry.
+//
+// Planned for removal in the next minor release (ADR-0006, K6): retry lifecycle hooks are
+// replaced by fence-aware retry plus structured telemetry. It carries no Deprecated notice yet
+// because Execute/ExecuteWithRetry still take a Hooks argument, so the notice would break
+// builds with no warning-free path; it lands once the core reshape (C5) replaces the signature.
 type Hooks struct {
 	OnRetry  func(Attempt)
 	OnGiveUp func(Attempt)
@@ -27,7 +37,11 @@ type Config struct {
 	Jitter      func(time.Duration) time.Duration
 	Sleep       func(context.Context, time.Duration) error
 	IsRetryable func(error) bool
-	Classify    Classifier
+	// Planned for removal with the core reshape (ADR-0006, K6): custom retry decisions have no
+	// replacement until C5 lands. It carries no Deprecated notice yet because the built-in
+	// Classify mapping only recognizes errors wrapped with ClassifiedError, so a custom
+	// classifier is the only supported way to mark raw backend errors transient.
+	Classify Classifier
 }
 
 // Execute runs op with bounded retries using the configured policy.

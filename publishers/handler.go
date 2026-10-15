@@ -10,13 +10,17 @@ import (
 )
 
 // StreamPublisher publishes DynamoDB stream records to a downstream stream.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 type StreamPublisher interface {
-	Publish(ctx context.Context, records []events.DynamoDBEventRecord) (*stream.PublishResult, error)
+	Publish(ctx context.Context, records []events.DynamoDBEventRecord) (*stream.PublishResult, error) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 }
 
 // HandleDynamoDBEvent publishes INSERT records from DynamoDB Streams to a
 // downstream stream and returns partial batch failures for throttled or failed
 // records.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 func HandleDynamoDBEvent(
 	ctx context.Context,
 	event events.DynamoDBEvent,
