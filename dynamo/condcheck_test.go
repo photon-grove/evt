@@ -32,7 +32,7 @@ func Test_handleConditionalCheckFailure_NoConditionalCheck(t *testing.T) {
 
 	// Regular error without conditional check failure
 	originalErr := errors.New("some error")
-	result := repo.handleConditionalCheckFailure(ctx, nil, nil, originalErr)
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 0, originalErr)
 	require.Equal(t, originalErr, result)
 }
 
@@ -43,13 +43,14 @@ func Test_handleConditionalCheckFailure_RaceCondition(t *testing.T) {
 	// Conditional check failure outside transaction items range
 	conditionalErr := &types.TransactionCanceledException{
 		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory feature-marker check
 			{Code: aws.String("ConditionalCheckFailed")},
 		},
 	}
 
-	// Empty transactItems means the failure is for events (index 0 >= 0)
+	// After the marker, empty transactItems means the failure is for events
 	// but we have no transaction groups, so it's a race condition
-	result := repo.handleConditionalCheckFailure(ctx, nil, nil, conditionalErr)
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 1, conditionalErr)
 	require.ErrorIs(t, result, ErrSnapshotRaceCondition)
 
 	var classified *policy.ClassifiedError
@@ -67,7 +68,7 @@ func Test_handleConditionalCheckFailure_ClassifiesTransientTransactionConflict(t
 		},
 	}
 
-	result := repo.handleConditionalCheckFailure(ctx, nil, nil, transactionErr)
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 0, transactionErr)
 	require.ErrorIs(t, result, transactionErr)
 
 	var classified *policy.ClassifiedError
@@ -92,11 +93,12 @@ func Test_handleConditionalCheckFailure_TransactionGroupHandlesError(t *testing.
 
 	conditionalErr := &types.TransactionCanceledException{
 		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory feature-marker check
 			{Code: aws.String("ConditionalCheckFailed")},
 		},
 	}
 
-	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 1, conditionalErr)
 	require.Equal(t, expectedErr, result)
 }
 
@@ -119,9 +121,10 @@ func Test_handleConditionalCheckFailure_MultipleGroups(t *testing.T) {
 		{Put: &types.Put{}},
 	}
 
-	// Failure at index 3 (which is in group2)
+	// Failure at group-item index 3 (wire index 4 after the marker) is in group2.
 	conditionalErr := &types.TransactionCanceledException{
 		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory feature-marker check
 			{Code: aws.String("None")},
 			{Code: aws.String("None")},
 			{Code: aws.String("None")},
@@ -129,7 +132,7 @@ func Test_handleConditionalCheckFailure_MultipleGroups(t *testing.T) {
 		},
 	}
 
-	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 1, conditionalErr)
 	require.Equal(t, expectedErr, result)
 }
 
@@ -147,16 +150,17 @@ func Test_handleConditionalCheckFailure_FailureBeyondTransactionGroups(t *testin
 		{Put: &types.Put{}},
 	}
 
-	// Failure at index 2 which is beyond the transaction group (length 1)
+	// Failure at group-item index 2 (wire index 3) is beyond the transaction group (length 1).
 	conditionalErr := &types.TransactionCanceledException{
 		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory feature-marker check
 			{Code: aws.String("None")},
 			{Code: aws.String("None")},
 			{Code: aws.String("ConditionalCheckFailed")},
 		},
 	}
 
-	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 1, conditionalErr)
 	require.ErrorIs(t, result, conditionalErr)
 
 	var classified *policy.ClassifiedError
@@ -199,17 +203,17 @@ func Test_handleConditionalCheckFailure_IndexCalculation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			reasons := make([]types.CancellationReason, tc.failureIndex+1)
+			reasons := make([]types.CancellationReason, tc.failureIndex+2)
 			for i := range reasons {
 				reasons[i] = types.CancellationReason{Code: aws.String("None")}
 			}
-			reasons[tc.failureIndex] = types.CancellationReason{Code: aws.String("ConditionalCheckFailed")}
+			reasons[tc.failureIndex+1] = types.CancellationReason{Code: aws.String("ConditionalCheckFailed")}
 
 			conditionalErr := &types.TransactionCanceledException{
 				CancellationReasons: reasons,
 			}
 
-			result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
+			result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 1, conditionalErr)
 			require.Equal(t, tc.expectedErr, result)
 		})
 	}

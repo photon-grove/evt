@@ -204,6 +204,34 @@ func TestHeadStore_StreamEntityHeadsFunc_VisitsEachRowAcrossPages(t *testing.T) 
 	require.Equal(t, 1, db.maxLive, "the visitor path must never materialize more than one page of rows")
 }
 
+func TestHeadStore_SkipsReservedIDs(t *testing.T) {
+	ctx := context.Background()
+	for _, entityType := range []evt.EntityType{"", "widget"} {
+		t.Run(string(entityType), func(t *testing.T) {
+			db := newPagingHeadsDB([]map[string]types.AttributeValue{
+				headRow("SYSTEM#legacy", "widget", 8),
+				headRow("widget-1", "widget", 5),
+				headRow("command-outcome#cmd", "widget", 9),
+				headRow("widget-2", "widget", 2),
+			})
+			store := NewHeadStore(db, "heads")
+			want := map[evt.EntityID]evt.EventSequence{"widget-1": 5, "widget-2": 2}
+
+			visited := map[evt.EntityID]evt.EventSequence{}
+			err := store.StreamEntityHeadsFunc(ctx, entityType, func(id evt.EntityID, seq evt.EventSequence) error {
+				visited[id] = seq
+				return nil
+			})
+			require.NoError(t, err)
+			require.Equal(t, want, visited)
+
+			heads, err := store.StreamEntityHeads(ctx, entityType)
+			require.NoError(t, err)
+			require.Equal(t, want, heads)
+		})
+	}
+}
+
 func TestHeadStore_StreamEntityHeadsFunc_StopsOnVisitError(t *testing.T) {
 	ctx := context.Background()
 	db := newPagingHeadsDB([]map[string]types.AttributeValue{

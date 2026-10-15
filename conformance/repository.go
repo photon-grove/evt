@@ -8,6 +8,7 @@ package conformance
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -55,6 +56,14 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 
 	t.Run("GetLatestEvents", func(t *testing.T) {
 		testGetLatestEvents(t, newRepo())
+	})
+
+	t.Run("GetRecentEvents", func(t *testing.T) {
+		testGetRecentEvents(t, newRepo())
+	})
+
+	t.Run("RejectsReservedEntityIds", func(t *testing.T) {
+		testRejectsReservedEntityIds(t, newRepo())
 	})
 
 	t.Run("StreamAllEventsHonorsFilter", func(t *testing.T) {
@@ -188,6 +197,126 @@ func testGetLatestEvents(t *testing.T, repo evt.Repository) {
 	require.Len(t, latest, 2)
 	for _, e := range latest {
 		require.Greater(t, e.Sequence, evt.EventSequence(1))
+	}
+}
+
+func testGetRecentEvents(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	id := evt.EntityID(ns + "-1")
+	commitEvents(t, repo, id, "test", 0,
+		&test.EntityCreated{ID: id, Value: "one"},
+		&test.EntityUpdated{ID: id, Value: "two"},
+		&test.EntityUpdated{ID: id, Value: "three"},
+		&test.EntityUpdated{ID: id, Value: "four"},
+	)
+
+	// A bounded newest-first window: the last two events, descending.
+	recent, err := repo.GetRecentEvents(ctx, id, 2)
+	require.NoError(t, err)
+	require.Len(t, recent, 2)
+	require.Greater(t, recent[0].Sequence, recent[1].Sequence, "newest-first")
+	require.Equal(t, evt.EventSequence(4), recent[0].Sequence)
+	require.Equal(t, evt.EventSequence(3), recent[1].Sequence)
+
+	// A limit above the stream's length returns every event, still newest-first.
+	all, err := repo.GetRecentEvents(ctx, id, 10)
+	require.NoError(t, err)
+	require.Len(t, all, 4)
+	require.Greater(t, all[0].Sequence, all[len(all)-1].Sequence)
+
+	// Even an oversized window only allocates for actual events, not the requested count.
+	oversized, err := repo.GetRecentEvents(ctx, id, math.MaxInt)
+	require.NoError(t, err)
+	require.Equal(t, all, oversized)
+
+	// A limit below 1 is a programmer error returned before any request.
+	_, err = repo.GetRecentEvents(ctx, id, 0)
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+	var invalid *evt.InvalidArgumentError
+	require.ErrorAs(t, err, &invalid)
+	_, err = repo.GetRecentEvents(ctx, id, -1)
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+	// An unknown stream returns no events.
+	missing, err := repo.GetRecentEvents(ctx, evt.EntityID(ns+"-missing"), 3)
+	require.NoError(t, err)
+	require.Empty(t, missing)
+
+	// The newest-first window never includes the snapshot item.
+	serialized := serialize(t, id, "test", 4, &test.EntityUpdated{ID: id, Value: "five"})
+	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"five"}`, id))
+	require.NoError(t, repo.CommitWithSnapshot(
+		ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1))
+
+	afterSnapshot, err := repo.GetRecentEvents(ctx, id, 1)
+	require.NoError(t, err)
+	require.Len(t, afterSnapshot, 1)
+	require.Equal(t, evt.EventSequence(5), afterSnapshot[0].Sequence)
+}
+
+// testRejectsReservedEntityIds asserts every entity-addressed write path refuses an entity ID in
+// a reserved namespace, before any request: commits (multi-stream included), out-of-band snapshot
+// writes, and compaction.
+func testRejectsReservedEntityIds(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	reserved := []evt.EntityID{
+		evt.EntityID(evt.SystemNamespacePrefix + ns + "-1"),
+		evt.EntityID(evt.CommandOutcomeNamespacePrefix + ns + "-1"),
+	}
+
+	for _, id := range reserved {
+		serialized := serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})
+
+		err := repo.Commit(ctx, evt.SerializedResult{Events: serialized})
+		require.Error(t, err, "a commit into %q must be refused", id)
+		require.True(t, evt.IsReservedEntityIdErr(err), "expected a ReservedEntityIdError, got %v", err)
+
+		// One reserved stream fails a multi-stream commit whole.
+		plain := evt.EntityID(ns + "-plain")
+		mixed := serialize(t, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "ok"})
+		mixed = append(mixed, serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "reserved"})...)
+
+		err = repo.Commit(ctx, evt.SerializedResult{Events: mixed})
+		require.Error(t, err, "a multi-stream commit with one reserved stream must be refused")
+		require.True(t, evt.IsReservedEntityIdErr(err))
+
+		// The refusal happens before any write: the plain stream stays empty.
+		stored, err := repo.GetEvents(ctx, plain)
+		require.NoError(t, err)
+		require.Empty(t, stored, "the refused commit writes nothing")
+
+		// Snapshot writes refuse all the same.
+		err = repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialize(t, id, "test", 0,
+			&test.EntityCreated{ID: id, Value: "one"})}, "test", id, []byte(`{"id":"x"}`), 1)
+		require.Error(t, err)
+		require.True(t, evt.IsReservedEntityIdErr(err))
+
+		// Out-of-band snapshot writes refuse all the same, on backends that offer them.
+		if snapshotter, ok := repo.(interface {
+			PutSnapshot(
+				context.Context, evt.EntityType, evt.EntityID, []byte, evt.EventSequence, evt.EventSequence,
+			) error
+		}); ok {
+			err = snapshotter.PutSnapshot(ctx, "test", id, []byte(`{"id":"x"}`), 1, 1)
+			require.Error(t, err, "an out-of-band snapshot of %q must be refused", id)
+			require.True(t, evt.IsReservedEntityIdErr(err), "expected a ReservedEntityIdError, got %v", err)
+		}
+
+		// Compaction writes no new rows but is refused all the same.
+		compactor, ok := repo.(evt.Compactor)
+		if !ok {
+			continue
+		}
+
+		_, err = compactor.CompactBelow(ctx, id, 1)
+		require.Error(t, err)
+		require.True(t, evt.IsReservedEntityIdErr(err))
 	}
 }
 

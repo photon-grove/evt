@@ -272,7 +272,8 @@ its coordination with consumer wipe-and-replay guarantees.
   `snapshot.EventSequence >= throughSequence`. With no snapshot, or an uncovered range, it deletes
   nothing and returns `evt.ErrCompactionUncovered` (wrapped; matchable with `errors.Is`).
 - In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7,
-  C9) it also reads the feature manifest's durable `historyDependent` set (consistent read) and
+  C9) it also validates all declared feature/version pairs against the writer's supported set,
+  refusing unsupported features before deletion. It reads the durable `historyDependent` set and
   refuses with a typed error when the entity's type is declared history-dependent — in every
   process that opens the log, not only those that registered the projector. The byte-level rules
   are specified in the [storage format](docs/spec/storage-format.md#feature-marker).
@@ -397,6 +398,84 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 
 - Same as GetEvents but with `sk > :lastSequence` condition
 
+### GetRecentEvents
+
+- Bounded, newest-first read of an entity's last `limit` events (storage spec, latest(n); ADR-0004
+  C8) — for "recent activity" reads that must not replay a long stream. No item shape changes.
+  Invalid limits return `*evt.InvalidArgumentError`, matchable with `errors.Is(err, evt.ErrInvalidArgument)`, before I/O.
+- DynamoDB: descending queries (`ScanIndexForward = false`, `Limit = min(n, 100)`) whose `sk > 0` key
+  condition excludes the snapshot item; when a page closes early (large items), the reader keeps
+  paging until it has collected `n` items or the stream runs out. PostgreSQL: `ORDER BY sequence
+  DESC LIMIT n`. The in-memory backend walks its stream backwards.
+- A `limit` below 1 is a programmer error returned before any request, in every backend.
+  Initial buffer capacity is bounded by a page or the available events, even for the largest limit.
+
+### Reserved Namespaces (ADR-0004 C8)
+
+- The partition prefixes `SYSTEM#` and `command-outcome#` are reserved for engine-managed rows
+  (matching is a case-sensitive byte prefix on the entity ID).
+- Every entity-addressed write path refuses a reserved entity ID before any request, with a typed
+  `evt.ReservedEntityIdError`: `Commit` (one reserved stream fails a multi-stream commit whole),
+  `CommitWithSnapshot`, `CommitStream`, out-of-band snapshot writes (`dynamo.PutSnapshot`), and
+  `CompactBelow` (which writes no new rows but is refused all the same).
+- Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
+  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition, including the deprecated
+  `HeadStore` map and visitor APIs. `ReservedNamespacePrefixes()` returns a copy; callers cannot
+  change the authoritative namespace checks.
+- Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
+  disappear from enumeration after upgrading. Explicit event and snapshot reads by ID still
+  return legacy reserved-prefix streams so migration tooling can read them. `evt-doctor` reports
+  pre-existing streams in reserved namespaces — on DynamoDB by scanning the table (exempting engine-written rows: the feature
+  marker, the rebuild fence, and command outcomes), on PostgreSQL with the two spec queries against
+  the configured events and snapshots tables — and the upgrade note requires renaming (migrating)
+  such streams before enabling the v0.9 features.
+
+### Feature Marker (ADR-0004 C9)
+
+- Create markers with `repo.FeatureMarker(supported)`, binding reads and transactional checks to
+  that repository's client and events table. `WithFeatureMarker` panics with
+  `*evt.FeatureMarkerClientMismatchError` for a different client handle (even with the same table
+  name), or `*evt.FeatureMarkerTableMismatchError` for another table. Writes return the typed
+  mismatch error if the binding no longer matches; snapshot writes and compaction enforce the
+  same rule.
+
+- A store declares the extensions it uses on the reserved `SYSTEM#FEATURES` marker row (storage
+  spec, Feature Marker): `version` (bumped by exactly one per declaration transaction), `features`
+  (JSON object, feature name → stored-format version, keys sorted), and two sorted, deduplicated JSON-array sets,
+  `historyDependent` and `retention`, each omitted when empty. On PostgreSQL the row lives in the
+  derived `{events}__evt_features` table and holds the same JSON text.
+- Any writer that does not support a declared `(name, formatVersion)` pair refuses to write, with a
+  typed `evt.UnsupportedFeatureError`.
+- Every DynamoDB commit, including each `CommitStream` batch, carries a mandatory `ConditionCheck` on the marker
+  (`attribute_not_exists(pk) OR version = :v`; a store that never declared features validates
+  against `attribute_not_exists(pk)`), ordered first in the transaction. A writer validates the
+  feature set once, at first write, and caches the version; a declaration bumps the version in the
+  same conditional write that updates the feature set, so every writer cached at the old version
+  fails, re-validates, and retries (typed via `evt.ErrFeatureManifestChanged`, classified
+  transient); a re-validation that finds an unsupported pair refuses outright.
+- Enforcement is unconditional. Default repositories support no extensions;
+  `WithFeatureMarker` customizes the supported set, never disables the check. PostgreSQL holds
+  the shared feature advisory lock across validation and writes in the same transaction.
+  Unquoted table names are lowercase-canonicalized, including the feature-lock key.
+- Validation and construction of a commit's marker condition use one locked cache snapshot;
+  concurrent declaration cannot leave a commit with an unvalidated condition.
+- PostgreSQL probes feature-table existence with `to_regclass` before reading a legacy log whose
+  marker table is absent, so successful writes never continue inside an aborted transaction.
+  Schema setup is serialized across Go and Rust by a shared advisory lock.
+- Declaration invalidates cached writer validation; declaring a feature does not imply support.
+  `PutSnapshot` obeys the same refusal atomically: a DynamoDB marker check and snapshot put in
+  one transaction, or PostgreSQL validation under the shared feature lock in the write transaction.
+- `CompactBelow` validates every declared feature/version pair against the writer's supported set
+  and returns `evt.UnsupportedFeatureError` before deletion when any pair is unsupported. It also
+  reads `historyDependent` (strongly consistent on DynamoDB, regardless of
+  `WithConsistentRead`) and refuses an entity type in the set with a typed
+  `evt.HistoryDependentProjectionError` before deleting anything — in every process that opens the
+  log, whether or not it registered the projector. A table with no marker row declares nothing and
+  compaction proceeds. PostgreSQL retains the shared feature lock through all deletes; DynamoDB
+  uses transactional batches of at most 99 deletes plus a check on the observed marker version
+  (or absence). A changed marker is re-read and re-validated before retrying a delete batch.
+  A completed history-dependent declaration therefore fences in-flight compaction.
+
 ### GetSnapshot
 
 - Returns `nil, nil` if not found
@@ -437,8 +516,16 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 - Refuses with `evt.ErrCompactionUncovered` unless a snapshot covers the range
   (`snapshot.EventSequence >= throughSequence`)
 - Never deletes the `sk = 0` snapshot; `throughSequence < 1` is a no-op; idempotent
-- DynamoDB: key-only range query + `BatchWriteItem` deletes (25/batch) with bounded
-  `UnprocessedItems` retries
+- Refuses unsupported feature declarations and history-dependent entity types from the durable
+  feature marker, including declarations made by other repository handles
+- DynamoDB: strongly consistent key-only range query + `TransactWriteItems` batches of at most
+  99 deletes and one marker check; marker changes trigger revalidation before retrying
+- Fencing is per batch, not a whole-operation lease: a history-dependent declaration racing
+  multi-batch compaction can leave a partially compacted stream; committed deletes are not rolled
+  back. A history-dependent rebuild reports `CompactionUncovered`. Declare history dependence
+  before writing data of that entity type
+- PostgreSQL holds the shared feature advisory lock through validation and all deletes in one
+  transaction
 
 ### Delete (build-tagged `//go:build !prod`)
 
@@ -465,6 +552,10 @@ EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this wi
   double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency` is false for it.)
 - **Stable event ordering** — `GetEvents` returns an entity's events in ascending sequence order,
   and `GetLatestEvents(lastSequence)` returns only events with `sequence > lastSequence`.
+  `GetRecentEvents(limit)` returns at most `limit` events in descending sequence order.
+- **Reserved namespaces** — every entity-addressed write path refuses a reserved entity ID
+  (`SYSTEM#`, `command-outcome#`) with a typed `evt.ReservedEntityIdError` before any request, and
+  enumeration, heads, and rebuild scans skip every reserved partition (ADR-0004 C8).
 - **Read isolation by entity** — `GetEvents`/`GetLatestEvents`/`GetSnapshot` return only the
   requested entity's data; an unknown entity yields an empty result (no error).
 - **Snapshot consistency** — a snapshot written by `CommitWithSnapshot` is read back intact by

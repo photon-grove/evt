@@ -34,6 +34,9 @@ func (m *MockRepository) GetEvents(_ context.Context, _ evt.EntityID) ([]evt.Ser
 	return m.events, nil
 }
 
+func (m *MockRepository) GetRecentEvents(_ context.Context, _ evt.EntityID, _ int) ([]evt.SerializedEvent, error) {
+	return nil, nil
+}
 func (m *MockRepository) GetLatestEvents(_ context.Context, _ evt.EntityID, _ evt.EventSequence) ([]evt.SerializedEvent, error) {
 	if m.getLatestEventsError != nil {
 		return nil, m.getLatestEventsError

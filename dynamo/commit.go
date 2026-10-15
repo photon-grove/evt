@@ -21,8 +21,16 @@ func (repo *Repository) Commit(
 	ctx context.Context,
 	result evt.SerializedResult,
 ) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if len(result.Events) == 0 {
 		return nil
+	}
+
+	if err := evt.CheckReservedEntityIDs(result.Events); err != nil {
+		return err
 	}
 
 	if err := checkContiguous(result.Events); err != nil {
@@ -121,12 +129,24 @@ func (repo *Repository) CommitStream(
 	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],
 ) []error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		// Drain the channel so producers never block on a refused stream.
+		for range channel { //nolint:revive // Drain without reading so producers never block.
+			continue
+		}
+
+		return []error{err}
+	}
+
 	var errs []error
 
 	var (
 		batch       []types.TransactWriteItem
 		batchEvents []evt.SerializedEvent
 	)
+
+	// Every batch reserves one item for the mandatory feature-marker check.
+	const markerItems = 1
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -144,6 +164,11 @@ func (repo *Repository) CommitStream(
 	for result := range channel {
 		serializedResult, err := result.Unwrap()
 		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		if err = evt.CheckReservedEntityIDs(serializedResult.Events); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -170,7 +195,7 @@ func (repo *Repository) CommitStream(
 		combined := append(transactItems, items...)
 
 		// Guard against a single result that already exceeds the 100-item transaction limit
-		if size := len(combined) + countEntities(serializedResult.Events); size > 100 {
+		if size := len(combined) + countEntities(serializedResult.Events) + markerItems; size > 100 {
 			errs = append(errs, fmt.Errorf(
 				"single result produces %d items, exceeding DynamoDB 100-item transaction limit",
 				size,
@@ -180,7 +205,7 @@ func (repo *Repository) CommitStream(
 
 		// Flush first if adding this result, and its floor checks, would overrun the limit
 		merged := append(append([]evt.SerializedEvent{}, batchEvents...), serializedResult.Events...)
-		if len(batch)+len(combined)+countEntities(merged) > 100 {
+		if len(batch)+len(combined)+countEntities(merged)+markerItems > 100 {
 			flush()
 		}
 
@@ -214,6 +239,18 @@ func (repo *Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return err
+	}
+
+	if err := evt.CheckReservedEntityIDs(result.Events); err != nil {
+		return err
+	}
+
 	if err := checkContiguous(result.Events); err != nil {
 		return err
 	}
@@ -350,8 +387,20 @@ func (repo *Repository) commitEventsWithTransaction(
 		return err
 	}
 
+	// Every v0.9 commit carries the feature-marker ConditionCheck, ordered before every other
+	// item so the transaction layout stays pinned across implementations (storage spec, Writes).
+	check, cerr := repo.features.checkItem(ctx)
+	if cerr != nil {
+		return cerr
+	}
+
+	control := []types.TransactWriteItem{check}
+
 	// Combine the two, with included transaction items first
-	combined := append(transactItems, writeItems...)
+	combined := make([]types.TransactWriteItem, 0, len(control)+len(transactItems)+len(writeItems))
+	combined = append(combined, control...)
+	combined = append(combined, transactItems...)
+	combined = append(combined, writeItems...)
 
 	count := len(combined)
 	if count > 100 {
@@ -363,8 +412,25 @@ func (repo *Repository) commitEventsWithTransaction(
 	input := dynamodb.TransactWriteItemsInput{TransactItems: combined}
 	_, err = repo.client.TransactWriteItems(ctx, &input)
 	if err != nil {
-		return repo.handleConditionalCheckFailure(ctx, transaction, transactItems, err)
+		return repo.classifyCommitFailure(ctx, transaction, transactItems, len(control), err)
 	}
 
 	return nil
+}
+
+// classifyCommitFailure routes a failed commit by the transaction item that failed. Control items
+// (the feature-marker check) are prepended to the transaction, so their failure is classified
+// separately and the remaining indices shift by their count.
+func (repo *Repository) classifyCommitFailure(
+	ctx context.Context,
+	transaction evt.Transaction,
+	transactItems []types.TransactWriteItem,
+	controlCount int,
+	err error,
+) error {
+	if ok, i := HasConditionalCheckFailure(err); ok && i < controlCount {
+		return repo.features.handleCheckFailure(ctx, err)
+	}
+
+	return repo.handleConditionalCheckFailure(ctx, transaction, transactItems, controlCount, err)
 }

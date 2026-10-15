@@ -43,12 +43,31 @@ Event rows are **append-only and protected by conditional writes** — a commit 
 succeeds if the next sequence is unclaimed, which is how concurrent writers on one
 entity stay correctly ordered. Each commit also checks the `sk = 0` snapshot row: a
 commit that starts at or below the snapshot's `eventSequence` is rejected, so a writer
-that loaded before a compaction cannot recreate the deleted events. That check is one
-more transaction item, billed as a write, so a commit without a snapshot holds at most
-99 events and projector puts. The `sk = 0` snapshot row records the entity's
-serialized state plus the `eventSequence` it covers, and snapshot writes are
-monotonic: a write that would move the covered sequence backwards is a no-op, so a
-slow background writer can never regress the floor.
+that loaded before a compaction cannot recreate the deleted events. The current Go C9
+implementation also includes a mandatory feature-marker check. Of the 100 transaction
+items, a single-stream commit without a snapshot reserves two (floor + marker), leaving
+**98 event/projector operations**. A commit with a snapshot also leaves **98**: the
+snapshot put replaces the floor check, and the marker check remains. These checks are
+billed as writes.
+
+The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C2/C3/C10) is:
+
+```text
+items = Σ(events per written stream + 1 snapshot/floor)
+      + 2 × read-only fenced streams
+      + optional outcome put
+      + feature-marker check + rebuild-lock check
+      + projector operations
+```
+
+A basic single-stream commit with no read fences or outcome then leaves **97**
+event/projector operations. The rebuild-lock check (C10) is a target, **not implemented
+by this Go C9 change**; do not count it as a current transaction item.
+
+The `sk = 0` snapshot row records the entity's serialized state plus the
+`eventSequence` it covers, and snapshot writes are monotonic: a write that would move
+the covered sequence backwards is a no-op, so a slow background writer can never
+regress the floor.
 
 ### Snapshots
 
@@ -73,6 +92,16 @@ row itself. An uncovered request returns `evt.ErrCompactionUncovered` and delete
 nothing. After a stream is compacted you **must** rebuild it through the
 snapshot-aware path (`RebuildConfig.SeedEntity` / `evt.SnapshotStreamer`), never a
 full replay from sequence 1 — the early events are gone.
+
+Feature-marker checks also refuse unsupported features and history-dependent entity types
+across repository handles. DynamoDB fences **each delete batch** (at most 99 events plus
+one marker check), not the entire compaction: there is no whole-operation lease. A declaration
+racing an in-progress multi-batch compaction can stop later batches but cannot roll back an
+already committed prefix, leaving the stream partially compacted. A history-dependent rebuild
+then reports `CompactionUncovered`, rather than silently replaying incomplete history. Declare
+history dependence **before writing data of that entity type**. PostgreSQL instead holds its
+shared feature advisory lock through validation and all deletes in one transaction. See
+[Feature Marker](spec/storage-format.md#feature-marker).
 
 The raw `dynamo.Delete` helper is snapshot-unsafe, intended for local/staging
 fixtures only, and excluded from production builds behind a `//go:build !prod`

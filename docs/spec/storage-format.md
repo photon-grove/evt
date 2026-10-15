@@ -223,9 +223,14 @@ store carries both, and a store that never declares features still validates the
 `attribute_not_exists(pk)`. A store built without the v0.9 capabilities writes exactly the actions
 the older paragraphs describe. The order is pinned so fixtures byte-match across implementations.
 
-The floor check counts toward the 100 actions and is billed as a write, so a commit without a
-snapshot costs one more write unit than its events and projector puts, and holds at most 99 of
-them. `CommitStream` adds one check per entity in each batch.
+**Pre-v0.9 capacity:** the floor check counts toward the 100 actions and is billed as a write,
+so a commit without a snapshot costs one more write unit than its events and projector puts,
+and holds at most 99 of them. `CommitStream` adds one check per entity in each batch. This is
+not the v0.9 capacity: the current Go C9 implementation reserves a marker check as well,
+leaving 98 event/projector operations for a single-stream commit, with or without a snapshot
+(the snapshot put replaces the floor check). The full v0.9 target below adds the C10 rebuild
+check and leaves 97 for a basic single-stream commit with no read fences or outcome. C10 is
+not implemented by the Go C9 change.
 
 **Multi-stream commits (v0.9, C1).** A commit may append to any number of streams. Each written
 stream keeps its existing protections — `attribute_not_exists(sk)` on every event put and the
@@ -866,8 +871,10 @@ marker, the rebuild fence) and `command-outcome#` (outcomes). Matching is a case
 prefix on `pk`.
 
 - Enumeration, entity heads, and rebuild scans **skip** every partition whose `pk` begins with a
-  reserved prefix. Reserved rows are never ordinary aggregates: they have no snapshots and never
-  compact.
+  reserved prefix. Engine-managed rows are not ordinary aggregates and never compact.
+- Explicit reads by entity ID (`GetEvents`, `GetLatestEvents`, `GetRecentEvents` / `latest(n)`,
+  and `GetSnapshot`) do **not** filter reserved prefixes. Legacy streams and their snapshots remain
+  readable for migration; only enumeration, heads, and rebuild scans hide them.
 - **Every entity-addressed write path refuses** an entity ID that begins with a reserved prefix,
   before any request, with a typed `ReservedEntityId` error: commits (multi-stream included —
   one reserved stream fails the whole commit), out-of-band snapshot writes (`PutSnapshot`),
@@ -900,18 +907,25 @@ prefix on `pk`.
 `latest(n)` is a bounded, newest-first read of a stream's last `n` events (descending), for
 "recent activity" reads that must not replay a long stream. No item shape changes.
 
-- DynamoDB: query `pk = :id AND sk > :zero`, `ScanIndexForward = false`, `Limit = n`. The `sk > 0`
+- DynamoDB: query `pk = :id AND sk > :zero`, `ScanIndexForward = false`, `Limit = min(n, 100)`. The `sk > 0`
   key condition excludes the snapshot item, so the result is the `n` highest event sequences,
   descending.
 - PostgreSQL: `SELECT … FROM evt_events WHERE entity_id = $1 ORDER BY sequence DESC LIMIT $2`.
 
 `n < 1` is a programmer error returned before any request, in both languages — nothing is read.
-The result is at most `n` events: on DynamoDB the first request sets `Limit = n`, and when a
-response returns fewer than `n` items and carries `LastEvaluatedKey` (large items can close a page
-early), the reader keeps paging until it has collected `n` items or the stream runs out;
-PostgreSQL's `LIMIT n` returns the same at-most-`n` window in one statement.
+The result is at most `n` events: DynamoDB uses bounded pages and follows `LastEvaluatedKey`
+until it has collected `n` items or the stream runs out, including when large items close a page
+early. Initial buffer allocation is bounded by a page or the available events, not by an
+arbitrarily large `n`. PostgreSQL's `LIMIT n` returns the same at-most-`n` window in one statement.
 
 ## Feature Marker
+
+A feature marker is created from its repository and bound to both its client handle and events
+table at construction. Marker reads and transactional checks must use that same client and table;
+matching table names alone do not identify a physical log. Attaching a marker for another client
+or table is a typed configuration error; subsequent writes (including snapshots and compaction)
+must fail with a typed mismatch error if the repository no longer matches the binding. Rust
+repositories own marker access directly rather than accepting a separately constructed marker.
 
 A store declares the extensions it uses on a single `SYSTEM#FEATURES` marker row (v0.9, C9). Any
 writer that does not support a declared feature **refuses to write** to the table.
@@ -942,7 +956,7 @@ are `journal` and `journal-compaction` (the Rust-first extensions, ADR 0005), bo
 version 1. The `historyDependent` set declares the entity types whose commit-wide projectors are
 history-dependent ([Views](#views)) — compaction is forbidden for them; the `retention` set
 declares the entity types configured with retention (a positive `ttl`) — fences are refused for
-them ([Read Fences](#read-fences)). Both sets are JSON arrays of entity-type names, sorted,
+them ([Read Fences](#read-fences)). Both sets are JSON arrays of entity-type names, sorted and deduplicated,
 encoded with the shared JSON rules, stored as strings; an absent attribute is an empty set. Both
 declarations are **durable, shared state**, not per-process registration: every writer and
 maintenance tool that opens the log observes the same sets, which is what makes the compaction
@@ -978,7 +992,15 @@ write, and caches the version it validated: a table with no marker validates aga
 feature set**, so every writer whose commits condition on the old version fails and re-validates;
 at re-validation an unsupported writer reads the feature set, sees a `(name, formatVersion)` pair
 it does not support, and refuses. The check costs one transaction item per commit
-([Writes](#writes)).
+([Writes](#writes)). Standalone snapshot writes follow the same refusal protocol atomically:
+DynamoDB includes the marker check and snapshot put in one transaction; PostgreSQL validates
+under the shared feature advisory lock held through the snapshot-write transaction. Declaration
+invalidates cached validation: declaring a feature is not proof that the declaring writer supports it.
+Validation and per-commit condition construction use one locked cache snapshot, so concurrent
+declarations cannot leave a commit with an unvalidated condition. PostgreSQL checks for a missing
+feature relation with `to_regclass` before selecting it: a pre-marker log declares nothing, and
+its transaction remains usable. Schema setup in both languages serializes DDL under
+`pg_advisory_xact_lock(1702261762, hashtext(events_table))` to avoid catalog races on startup.
 
 The declaration itself is a conditional write. Creating the row asserts `attribute_not_exists(pk)`
 and writes **`version = 1`**; updating it asserts `version = :observed`, writes the merged feature
@@ -990,11 +1012,23 @@ row nor fail a condition against another key.)
 **Durable refusals read the manifest, not local configuration.** Both set-backed refusals consult
 the row itself, so they hold for every process that opens the log:
 
-- `CompactBelow` reads `historyDependent` — on DynamoDB with `ConsistentRead = true`, regardless
+- `CompactBelow` first validates every declared feature/version pair against the writer's
+  supported set, refusing an unsupported pair with `UnsupportedFeature` before deleting anything.
+  It also reads `historyDependent` — on DynamoDB with `ConsistentRead = true`, regardless
   of the repository's read-consistency setting, so the check cannot miss a just-written set — and
   refuses an entity whose type appears in the set with a typed `HistoryDependentProjection` error
   before deleting anything ([Views](#views)). A maintenance tool that never registered the
-  projector refuses all the same. On a table with no marker row there is nothing declared and
+  projector refuses all the same. PostgreSQL holds the shared feature advisory lock across
+  validation and all deletes in one transaction. DynamoDB deletes in transactions of at most
+  99 events plus a check on the observed marker (`version = :observed`, or
+  `attribute_not_exists(pk)` when absent); a failed check re-reads and re-validates before retrying.
+  This is **per-batch fencing**, not a lease over the entire DynamoDB compaction. A
+  history-dependent declaration racing an in-progress multi-batch compaction can stop later
+  batches but cannot roll back the already committed prefix, leaving a partially compacted
+  stream. A history-dependent rebuild then reports `CompactionUncovered`, rather than silently
+  replaying incomplete history. History dependence must therefore be declared **before writing
+  data of that entity type**. PostgreSQL retains its single-transaction guarantee under the
+  shared feature advisory lock. On a table with no marker row there is nothing declared and
   compaction proceeds, as it always has; a pre-v0.9 writer that knows nothing of the manifest
   cannot be stopped, and the guarantee binds v0.9 writers as everywhere else in this section.
 - A fenced read refuses an entity type in `retention` with a typed `RetentionConflict` error
@@ -1218,7 +1252,10 @@ infix also renames the pre-v0.9 entity-type index, whose old `{events}_entity_ty
 was collision-prone the same way; a schema upgraded from a pre-v0.9 release recreates the index
 under the new name. Both implementations validate a derived name by the same rules as a
 configured one. Names are interpolated unquoted, so both reject names that are not plain
-identifiers or are PostgreSQL reserved keywords. The configured events table name must be at
+identifiers or are PostgreSQL reserved keywords. Validated unquoted names are canonicalized to
+lowercase before deriving engine advisory-lock keys, so differently cased handles share locks.
+The snapshots table name is at most **58 bytes**, leaving room for its `_pkey` index.
+The configured events table name must be at
 most **34 bytes** — both implementations return a validation error at construction otherwise —
 so every derived name fits PostgreSQL's 63-byte identifier limit without truncation. The longest
 derived relation name, `{events}__evt_rebuild_generation_pkey`, adds 29 bytes to the base name

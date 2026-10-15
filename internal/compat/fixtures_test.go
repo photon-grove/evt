@@ -29,6 +29,13 @@ func TestFixturesScenarios(t *testing.T) {
 	assertFixture(t, ScenarioFixtureFile, fixtures)
 }
 
+func TestFixturesFeatureMarker(t *testing.T) {
+	fixtures, err := GenerateFeatureMarkerFixtures(context.Background())
+	require.NoError(t, err)
+
+	assertFixture(t, FeatureMarkerFixtureFile, fixtures)
+}
+
 func assertFixture(t *testing.T, name string, value any) {
 	t.Helper()
 

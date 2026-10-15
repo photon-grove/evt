@@ -87,6 +87,9 @@ func (r *fakeRepo) CommitWithSnapshot(_ context.Context, _ evt.SerializedResult,
 func (r *fakeRepo) GetEvents(_ context.Context, _ evt.EntityID) ([]evt.SerializedEvent, error) {
 	return nil, nil
 }
+func (r *fakeRepo) GetRecentEvents(_ context.Context, _ evt.EntityID, _ int) ([]evt.SerializedEvent, error) {
+	return nil, nil
+}
 func (r *fakeRepo) GetLatestEvents(_ context.Context, _ evt.EntityID, _ evt.EventSequence) ([]evt.SerializedEvent, error) {
 	return nil, nil
 }

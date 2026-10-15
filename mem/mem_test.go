@@ -26,6 +26,46 @@ func Test_NewStore(t *testing.T) {
 	require.NotNil(t, store)
 }
 
+func Test_Repository_GetRecentEvents_OutOfOrder(t *testing.T) {
+	ctx := context.Background()
+	repo := NewRepository()
+
+	for _, sequence := range []evt.EventSequence{3, 1, 4, 2} {
+		require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{
+			{EntityID: "account-1", Sequence: sequence},
+		}}))
+	}
+
+	for _, tc := range []struct {
+		limit int
+		want  []evt.EventSequence
+	}{
+		{1, []evt.EventSequence{4}},
+		{2, []evt.EventSequence{4, 3}},
+		{5, []evt.EventSequence{4, 3, 2, 1}},
+	} {
+		events, err := repo.GetRecentEvents(ctx, "account-1", tc.limit)
+		require.NoError(t, err)
+
+		sequences := make([]evt.EventSequence, len(events))
+		for i, event := range events {
+			sequences[i] = event.Sequence
+		}
+		require.Equal(t, tc.want, sequences)
+
+		events[0].Sequence = 99
+	}
+
+	events, err := repo.GetEvents(ctx, "account-1")
+	require.NoError(t, err)
+	require.Equal(t, []evt.SerializedEvent{
+		{EntityID: "account-1", Sequence: 3},
+		{EntityID: "account-1", Sequence: 1},
+		{EntityID: "account-1", Sequence: 4},
+		{EntityID: "account-1", Sequence: 2},
+	}, events, "recent reads must not sort or mutate the stored slice")
+}
+
 func Test_Repository_StreamAllEvents(t *testing.T) {
 	repo := &Repository{
 		events:    make(map[string][]evt.SerializedEvent),

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -31,6 +32,11 @@ const (
 // user input, but validating them keeps the interpolation provably injection-free.
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// reservedInfix derives the engine-row relation names from the configured events table name
+// ({events}__evt_features today). A configured table name may not contain it, so one log's events
+// or snapshots table can never equal another log's derived relation.
+const reservedInfix = "__evt_"
+
 // reservedKeywords are PostgreSQL's reserved keywords (pg_get_keywords() categories R and T), which
 // cannot be used as unquoted table names.
 var reservedKeywords = map[string]struct{}{}
@@ -49,9 +55,11 @@ func init() {
 	}
 }
 
-// maxTableNameLen is the longest table name allowed. PostgreSQL truncates identifiers to 63 bytes,
-// and the longest name derived from a table name, "{events}_entity_type_idx", adds 16.
-const maxTableNameLen = 63 - len("_entity_type_idx")
+// Keep every derived relation within PostgreSQL's 63-byte identifier limit.
+const (
+	maxEventsTableNameLen    = 63 - len("__evt_rebuild_generation_pkey")
+	maxSnapshotsTableNameLen = 63 - len("_pkey")
+)
 
 // entityLockQuery takes the per-entity transaction lock ($1 is the entity ID) that serializes
 // commits and snapshot writes for one entity, so a snapshot cannot raise the floor while a commit
@@ -63,16 +71,21 @@ const entityLockQuery = "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))"
 func validIdentifier(name string) bool {
 	_, reserved := reservedKeywords[strings.ToLower(name)]
 
-	return len(name) <= maxTableNameLen && identifierPattern.MatchString(name) && !reserved
+	return len(name) <= 63 && identifierPattern.MatchString(name) && !reserved
 }
 
 // sharedRelationName returns a name that two relations created by EnsureSchema would share, or ""
-// when there is none: the tables, "{events}_entity_type_idx", and each table's "{table}_pkey".
+// when there is none: the tables, the reserved entity-type index, and each table's primary key.
 // CREATE TABLE IF NOT EXISTS would otherwise skip a table whose name an index already took.
 // Unquoted identifiers fold to lower case, so names are compared that way.
 func sharedRelationName(eventsTable, snapshotsTable string) string {
 	events, snapshots := strings.ToLower(eventsTable), strings.ToLower(snapshotsTable)
-	relations := []string{events, events + "_pkey", events + "_entity_type_idx", snapshots, snapshots + "_pkey"}
+	relations := make([]string, 0, 13)
+	relations = append(relations, events, events+"_pkey", events+"__evt_entity_type_idx", snapshots, snapshots+"_pkey")
+	for _, suffix := range []string{"command_outcomes", "features", "rebuild_lock", "rebuild_generation"} {
+		name := events + reservedInfix + suffix
+		relations = append(relations, name, name+"_pkey")
+	}
 
 	for i, relation := range relations {
 		if slices.Contains(relations[:i], relation) {
@@ -118,6 +131,7 @@ type Repository struct {
 	db             DB
 	eventsTable    string
 	snapshotsTable string
+	features       *FeatureMarker // mandatory feature validation (C9)
 }
 
 // Compile-time checks that the Repository satisfies the core contract and every optional capability
@@ -147,6 +161,46 @@ func WithSnapshotsTable(name string) Option {
 	}
 }
 
+// WithFeatureMarker returns a shallow copy of the repository whose commits enforce the store's
+// feature manifest (ADR-0004 C9): the first commit validates the {events}__evt_features manifest
+// against the supported feature set and caches its version, and every commit then re-checks the
+// version inside its own transaction under the shared advisory lock, so a manifest declared by
+// another writer (say, a Rust service using an extension this writer does not model) fails the
+// check and re-validates; an unsupported pair refuses the writer outright.
+//
+// The default marker supports no extensions. Passing nil restores that default; it never
+// disables enforcement.
+// Create markers with repo.FeatureMarker. A marker bound to another events table or client
+// panics with *evt.FeatureMarkerTableMismatchError or *evt.FeatureMarkerClientMismatchError.
+func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
+	r := *repo
+	r.features = marker
+	if r.features == nil {
+		r.features = r.FeatureMarker(nil)
+	}
+	if err := r.checkFeatureMarkerTable(); err != nil {
+		panic(err)
+	}
+
+	return &r
+}
+
+func (repo *Repository) checkFeatureMarkerTable() error {
+	if repo.features.eventsTable != repo.eventsTable {
+		return &evt.FeatureMarkerTableMismatchError{
+			EventsTable: repo.eventsTable, MarkerEventsTable: repo.features.eventsTable,
+		}
+	}
+
+	// Interface equality is safe only for comparable client handles (normally pointers).
+	// Fail closed for other handles rather than compare their configuration or contents.
+	if !comparableHandle(repo.db) || !comparableHandle(repo.features.db) || repo.db != repo.features.db {
+		return &evt.FeatureMarkerClientMismatchError{}
+	}
+
+	return nil
+}
+
 // NewRepository constructs a Repository over the given pgx handle (typically a *pgxpool.Pool). It
 // panics if a configured table name is not a valid SQL identifier, since that is a programming
 // error in wiring rather than a runtime condition.
@@ -161,9 +215,24 @@ func NewRepository(db DB, opts ...Option) *Repository {
 		opt(repo)
 	}
 
+	for _, table := range []struct {
+		name   string
+		maxLen int
+	}{
+		{repo.eventsTable, maxEventsTableNameLen},
+		{repo.snapshotsTable, maxSnapshotsTableNameLen},
+	} {
+		if !validIdentifier(table.name) || len(table.name) > table.maxLen {
+			panic(fmt.Sprintf("postgres: invalid table name %q", table.name))
+		}
+	}
+
+	// The reserved infix derives the engine-row table names (the feature marker today, command
+	// outcomes and the rebuild fence as their capabilities land). A configured name containing it
+	// could collide with another log's derived relation, so it is rejected outright.
 	for _, name := range []string{repo.eventsTable, repo.snapshotsTable} {
-		if !validIdentifier(name) {
-			panic(fmt.Sprintf("postgres: invalid table name %q", name))
+		if strings.Contains(strings.ToLower(name), reservedInfix) {
+			panic(fmt.Sprintf("postgres: table name %q contains the reserved infix %q", name, reservedInfix))
 		}
 	}
 
@@ -171,6 +240,10 @@ func NewRepository(db DB, opts ...Option) *Repository {
 		panic(fmt.Sprintf("postgres: tables %q and %q would both use the name %q",
 			repo.eventsTable, repo.snapshotsTable, shared))
 	}
+
+	repo.eventsTable = strings.ToLower(repo.eventsTable)
+	repo.snapshotsTable = strings.ToLower(repo.snapshotsTable)
+	repo.features = repo.FeatureMarker(nil)
 
 	return repo
 }
@@ -180,11 +253,18 @@ func NewRepository(db DB, opts ...Option) *Repository {
 // Repository owns this DDL because the relational schema must stay in lockstep with the Go types
 // that marshal into and out of it.
 func (repo *Repository) EnsureSchema(ctx context.Context) error {
-	if _, err := repo.db.Exec(ctx, repo.schemaDDL()); err != nil {
-		return fmt.Errorf("postgres: ensure schema: %w", err)
-	}
+	return repo.inTx(ctx, func(tx pgx.Tx) error {
+		// IF NOT EXISTS alone can still race in PostgreSQL's catalogs. Serialize DDL
+		// across processes (including Rust) before checking or creating any relation.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(1702261762, hashtext($1))", repo.eventsTable); err != nil {
+			return fmt.Errorf("postgres: lock schema: %w", err)
+		}
+		if _, err := tx.Exec(ctx, repo.schemaDDL()); err != nil {
+			return fmt.Errorf("postgres: ensure schema: %w", err)
+		}
 
-	return nil
+		return nil
+	})
 }
 
 // schemaDDL returns the idempotent DDL for the configured tables.
@@ -202,7 +282,17 @@ CREATE TABLE IF NOT EXISTS %[1]s (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (entity_id, sequence)
 );
-CREATE INDEX IF NOT EXISTS %[1]s_entity_type_idx ON %[1]s (entity_type);
+CREATE INDEX IF NOT EXISTS %[1]s__evt_entity_type_idx ON %[1]s (entity_type);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_index
+        WHERE indexrelid = to_regclass('%[1]s_entity_type_idx')
+          AND indrelid = '%[1]s'::regclass
+    ) THEN
+        DROP INDEX %[1]s_entity_type_idx;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS %[2]s (
     entity_id      text   PRIMARY KEY,
@@ -211,6 +301,14 @@ CREATE TABLE IF NOT EXISTS %[2]s (
     event_sequence bigint NOT NULL,
     payload        bytea  NOT NULL,
     updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
+    id                integer PRIMARY KEY,
+    version           bigint NOT NULL,
+    features          text   NOT NULL,
+    history_dependent text   NOT NULL DEFAULT '[]',
+    retention         text   NOT NULL DEFAULT '[]'
 );
 `, repo.eventsTable, repo.snapshotsTable)
 }
@@ -224,12 +322,24 @@ CREATE TABLE IF NOT EXISTS %[2]s (
 // PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
 // same transaction as the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
+	if err := evt.CheckReservedEntityIDs(res.Events); err != nil {
+		return err
+	}
+
 	if err := checkContiguous(res.Events); err != nil {
 		return err
 	}
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
 		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		if err := repo.checkFeatures(ctx, tx); err != nil {
 			return err
 		}
 
@@ -251,6 +361,15 @@ func (repo *Repository) CommitStream(
 	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],
 ) []error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		// Drain the channel so producers never block on a refused stream.
+		for range channel { //nolint:revive // Drain without reading so producers never block.
+			continue
+		}
+
+		return []error{err}
+	}
+
 	var errs []error
 
 	for r := range channel {
@@ -278,8 +397,20 @@ func (repo *Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if len(res.Events) == 0 {
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
+	}
+
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return err
+	}
+
+	if err := evt.CheckReservedEntityIDs(res.Events); err != nil {
+		return err
 	}
 
 	if err := checkContiguous(res.Events); err != nil {
@@ -290,6 +421,10 @@ func (repo *Repository) CommitWithSnapshot(
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
 		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		if err := repo.checkFeatures(ctx, tx); err != nil {
 			return err
 		}
 
@@ -349,6 +484,31 @@ func (repo *Repository) GetLatestEvents(
 	return scanEvents(rows)
 }
 
+// GetRecentEvents returns at most limit events for an entity, newest-first (descending sequence).
+// A limit below 1 is a programmer error returned before any request. PostgreSQL's LIMIT returns
+// the same at-most-limit window in one statement.
+func (repo *Repository) GetRecentEvents(
+	ctx context.Context,
+	entityID evt.EntityID,
+	limit int,
+) ([]evt.SerializedEvent, error) {
+	if limit < 1 {
+		return nil, &evt.InvalidArgumentError{Argument: "limit", Message: fmt.Sprintf("must be at least 1, got %d", limit)}
+	}
+
+	query := fmt.Sprintf(
+		`SELECT %s FROM %s WHERE entity_id = $1 ORDER BY sequence DESC LIMIT $2`,
+		eventColumns, repo.eventsTable,
+	)
+
+	rows, err := repo.db.Query(ctx, query, string(entityID), int64(limit))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: get recent events: %w", err)
+	}
+
+	return scanEvents(rows)
+}
+
 // GetSnapshot returns the entity's durable snapshot, or nil when none exists.
 func (repo *Repository) GetSnapshot(
 	ctx context.Context,
@@ -384,6 +544,13 @@ func (repo *Repository) GetSnapshot(
 	snapshot.EventSequence = evt.EventSequence(eventSequence)
 
 	return &snapshot, nil
+}
+
+// checkFeatures runs the mandatory commit-time feature-marker check.
+// It runs after the per-entity locks, before the inserts, matching the control-checks-first order
+// the DynamoDB transaction pins.
+func (repo *Repository) checkFeatures(ctx context.Context, tx pgx.Tx) error {
+	return repo.features.checkInTx(ctx, tx)
 }
 
 // inTx runs fn inside a transaction, committing on success and rolling back on error or panic.
@@ -533,4 +700,10 @@ func (repo *Repository) upsertSnapshot(ctx context.Context, db DB, snapshot evt.
 	}
 
 	return nil
+}
+
+// comparableHandle reports whether a DB handle can be compared with == without panicking; nil is
+// comparable. Non-comparable handles (for example structs holding slices) fail the binding closed.
+func comparableHandle(db DB) bool {
+	return db == nil || reflect.ValueOf(db).Comparable()
 }

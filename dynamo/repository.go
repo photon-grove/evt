@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
@@ -21,6 +22,7 @@ type Repository struct {
 	retention      Retention
 	now            func() time.Time // clock for TTL expiry; nil means time.Now
 	logger         *slog.Logger
+	features       *FeatureMarker // mandatory feature validation (C9)
 }
 
 // Retention maps entity types to TTL durations for events and inline snapshots. Other rows have no
@@ -42,7 +44,8 @@ func NewRepository(client Client, eventsTable string) *Repository {
 		opts.TagKey = tagKey
 	})
 
-	return &Repository{EventsTable: eventsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true}
+	return &Repository{EventsTable: eventsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true,
+		features: newFeatureMarker(client, eventsTable, nil)}
 }
 
 // WithLogger returns a shallow copy of the repository with the logger updated.
@@ -111,6 +114,46 @@ func (repo *Repository) WithClock(now func() time.Time) *Repository {
 	return &r
 }
 
+// WithFeatureMarker returns a shallow copy of the repository whose commits enforce the store's
+// feature manifest (ADR-0004 C9): the first commit validates the SYSTEM#FEATURES manifest against
+// the supported feature set and caches its version, and every commit then carries the mandatory
+// ConditionCheck on the marker, so a manifest declared by another writer (say, a Rust service
+// using an extension this writer does not model) fails the check and re-validates; an unsupported
+// pair refuses the writer outright.
+//
+// Without this option the mandatory marker check supports no extensions. A nil marker resets
+// that default; it never disables enforcement.
+// Create markers with repo.FeatureMarker. A marker bound to another events table or client
+// panics with *evt.FeatureMarkerTableMismatchError or *evt.FeatureMarkerClientMismatchError.
+func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
+	r := *repo
+	r.features = marker
+	if r.features == nil {
+		r.features = r.FeatureMarker(nil)
+	}
+	if err := r.checkFeatureMarkerTable(); err != nil {
+		panic(err)
+	}
+
+	return &r
+}
+
+func (repo *Repository) checkFeatureMarkerTable() error {
+	if repo.features.eventsTable != repo.EventsTable {
+		return &evt.FeatureMarkerTableMismatchError{
+			EventsTable: repo.EventsTable, MarkerEventsTable: repo.features.eventsTable,
+		}
+	}
+
+	// Interface equality is safe only for comparable client handles (normally pointers).
+	// Fail closed for other handles rather than compare their configuration or contents.
+	if !comparableHandle(repo.client) || !comparableHandle(repo.features.client) || repo.client != repo.features.client {
+		return &evt.FeatureMarkerClientMismatchError{}
+	}
+
+	return nil
+}
+
 // ttlFor returns the Unix-epoch expiry for an event or snapshot of the given entity type, or 0 when
 // the type has no retention policy. A 0 result is dropped by the `ttl,omitempty` tag, so un-policed
 // rows carry no ttl attribute and DynamoDB never expires them.
@@ -141,4 +184,10 @@ func (repo *Repository) loggerOrDefault() *slog.Logger {
 	}
 
 	return repo.logger
+}
+
+// comparableHandle reports whether a client handle can be compared with == without panicking; nil is
+// comparable. Non-comparable handles (for example structs holding slices) fail the binding closed.
+func comparableHandle(client Client) bool {
+	return client == nil || reflect.ValueOf(client).Comparable()
 }

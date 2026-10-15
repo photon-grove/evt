@@ -4,9 +4,12 @@ import (
 	"context"
 	"strconv"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/dynamo"
+	dynamo_mock "github.com/photon-grove/evt/dynamo/mock" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -38,29 +41,44 @@ func eventKeyPage(entityID string, sequences ...int) *dynamodb.QueryOutput {
 	return &dynamodb.QueryOutput{Items: items}
 }
 
+// expectSnapshot scopes a GetItem expectation to the entity's sk=0 snapshot read.
+func (s *RepositorySuite) expectSnapshot(entityID string, out *dynamodb.GetItemOutput) {
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && pk.Value == entityID
+	}), mock.Anything).Return(out, nil)
+}
+
+// expectNoMarker scopes a GetItem expectation to the feature-marker key and returns its absence:
+// a table with no marker row declares nothing.
+func (s *RepositorySuite) expectNoMarker() {
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && pk.Value == "SYSTEM#FEATURES"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
+}
+
 func (s *RepositorySuite) Test_CompactBelow_Success() {
 	ctx := context.Background()
 	const entityID = "acct-1"
 
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(snapshotItem(entityID, 5), nil)
+	s.expectSnapshot(entityID, snapshotItem(entityID, 5))
+	s.expectNoMarker()
 
 	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
 		Return(eventKeyPage(entityID, 1, 2, 3, 4, 5), nil)
 
-	// Capture the batch and assert it deletes exactly the five keys.
-	s.client.On("BatchWriteItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.BatchWriteItemInput) bool {
-		reqs := in.RequestItems[s.repo.EventsTable]
-		if len(reqs) != 5 {
-			return false
-		}
-		for _, r := range reqs {
-			if r.DeleteRequest == nil {
-				return false
-			}
+	// Pin marker absence and delete exactly the event keys, never sk=0.
+	s.client.On("TransactWriteItems", mock.Anything, mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
+		require.Len(s.T(), in.TransactItems, 6)
+		require.Equal(s.T(), absentMarkerCheck(s.repo.EventsTable), in.TransactItems[0])
+		for i, item := range in.TransactItems[1:] {
+			require.NotNil(s.T(), item.Delete)
+			require.Equal(s.T(), s.repo.EventsTable, *item.Delete.TableName)
+			require.Equal(s.T(), eventKeyPage(entityID, i+1).Items[0], item.Delete.Key)
 		}
 		return true
-	}), mock.Anything).Return(&dynamodb.BatchWriteItemOutput{}, nil)
+	}), mock.Anything).Return(&dynamodb.TransactWriteItemsOutput{}, nil)
 
 	// *dynamo.Repository satisfies the evt.Compactor capability interface.
 	var _ evt.Compactor = s.repo
@@ -71,11 +89,53 @@ func (s *RepositorySuite) Test_CompactBelow_Success() {
 	s.client.AssertExpectations(s.T())
 }
 
+func (s *RepositorySuite) Test_CompactBelow_Batches99DeletesPlusMarker() {
+	const entityID = "acct-batches"
+	s.expectSnapshot(entityID, snapshotItem(entityID, 100))
+	sequences := make([]int, 100)
+	for i := range sequences {
+		sequences[i] = i + 1
+	}
+	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
+		Return(eventKeyPage(entityID, sequences...), nil).Once()
+
+	deletedKeys := make([]int, 0, 100)
+	batchSizes := []int{}
+	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.TransactWriteItemsOutput{}, nil).Times(2).
+		Run(func(args mock.Arguments) {
+			in, ok := args.Get(1).(*dynamodb.TransactWriteItemsInput)
+			require.True(s.T(), ok)
+			require.LessOrEqual(s.T(), len(in.TransactItems), 100)
+			require.Equal(s.T(), absentMarkerCheck(s.repo.EventsTable), in.TransactItems[0])
+			batchSizes = append(batchSizes, len(in.TransactItems)-1)
+			for _, item := range in.TransactItems[1:] {
+				require.NotNil(s.T(), item.Delete)
+				require.Equal(s.T(), s.repo.EventsTable, *item.Delete.TableName)
+				pk, ok := item.Delete.Key["pk"].(*types.AttributeValueMemberS)
+				require.True(s.T(), ok)
+				sk, ok := item.Delete.Key["sk"].(*types.AttributeValueMemberN)
+				require.True(s.T(), ok)
+				require.Equal(s.T(), entityID, pk.Value)
+				sequence, err := strconv.Atoi(sk.Value)
+				require.NoError(s.T(), err)
+				deletedKeys = append(deletedKeys, sequence)
+			}
+		})
+
+	deleted, err := s.repo.CompactBelow(context.Background(), entityID, 100)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 100, deleted)
+	require.Equal(s.T(), []int{99, 1}, batchSizes)
+	require.Equal(s.T(), sequences, deletedKeys, "every event is deleted exactly once and sk=0 is retained")
+	s.client.AssertExpectations(s.T())
+}
+
 func (s *RepositorySuite) Test_CompactBelow_RefusesWithoutSnapshot() {
 	ctx := context.Background()
 
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.GetItemOutput{Item: nil}, nil)
+	s.expectSnapshot("acct-nosnap", &dynamodb.GetItemOutput{Item: nil})
+	s.expectNoMarker()
 
 	deleted, err := s.repo.CompactBelow(ctx, "acct-nosnap", 5)
 	require.ErrorIs(s.T(), err, evt.ErrCompactionUncovered)
@@ -83,7 +143,7 @@ func (s *RepositorySuite) Test_CompactBelow_RefusesWithoutSnapshot() {
 
 	// No deletes should have been attempted.
 	s.client.AssertNotCalled(s.T(), "Query", mock.Anything, mock.Anything, mock.Anything)
-	s.client.AssertNotCalled(s.T(), "BatchWriteItem", mock.Anything, mock.Anything, mock.Anything)
+	s.client.AssertNotCalled(s.T(), "TransactWriteItems", mock.Anything, mock.Anything, mock.Anything)
 }
 
 func (s *RepositorySuite) Test_CompactBelow_RefusesWhenUncovered() {
@@ -91,13 +151,13 @@ func (s *RepositorySuite) Test_CompactBelow_RefusesWhenUncovered() {
 	const entityID = "acct-uncovered"
 
 	// Snapshot only covers through event 3, but compaction requested through 5.
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(snapshotItem(entityID, 3), nil)
+	s.expectSnapshot(entityID, snapshotItem(entityID, 3))
+	s.expectNoMarker()
 
 	deleted, err := s.repo.CompactBelow(ctx, entityID, 5)
 	require.ErrorIs(s.T(), err, evt.ErrCompactionUncovered)
 	require.Equal(s.T(), 0, deleted)
-	s.client.AssertNotCalled(s.T(), "BatchWriteItem", mock.Anything, mock.Anything, mock.Anything)
+	s.client.AssertNotCalled(s.T(), "TransactWriteItems", mock.Anything, mock.Anything, mock.Anything)
 }
 
 func (s *RepositorySuite) Test_CompactBelow_ZeroIsNoOp() {
@@ -115,47 +175,64 @@ func (s *RepositorySuite) Test_CompactBelow_NothingToDelete() {
 	ctx := context.Background()
 	const entityID = "acct-empty"
 
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(snapshotItem(entityID, 5), nil)
+	s.expectSnapshot(entityID, snapshotItem(entityID, 5))
+	s.expectNoMarker()
 	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
 		Return(eventKeyPage(entityID), nil)
 
 	deleted, err := s.repo.CompactBelow(ctx, entityID, 5)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 0, deleted)
-	s.client.AssertNotCalled(s.T(), "BatchWriteItem", mock.Anything, mock.Anything, mock.Anything)
+	s.client.AssertNotCalled(s.T(), "TransactWriteItems", mock.Anything, mock.Anything, mock.Anything)
 }
 
-func (s *RepositorySuite) Test_CompactBelow_RetriesUnprocessedItems() {
+func (s *RepositorySuite) Test_CompactBelow_RetriesMarkerChange() {
 	ctx := context.Background()
 	const entityID = "acct-retry"
 
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(snapshotItem(entityID, 2), nil)
-	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
-		Return(eventKeyPage(entityID, 1, 2), nil)
+	// Script each marker read on a fresh client rather than using the suite default.
+	client := dynamo_mock.NewClient()
+	repo := dynamo.NewRepository(client, "test-events")
+	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && pk.Value == entityID
+	}), mock.Anything).Return(snapshotItem(entityID, 2), nil).Once()
+	expectManifest(client, nil)
+	client.On("Query", mock.Anything, mock.Anything, mock.Anything).
+		Return(eventKeyPage(entityID, 1, 2), nil).Once()
 
-	unprocessed := &dynamodb.BatchWriteItemOutput{
-		UnprocessedItems: map[string][]types.WriteRequest{
-			s.repo.EventsTable: {
-				{DeleteRequest: &types.DeleteRequest{Key: map[string]types.AttributeValue{
-					"pk": &types.AttributeValueMemberS{Value: entityID},
-					"sk": &types.AttributeValueMemberN{Value: "2"},
-				}}},
-			},
-		},
-	}
+	client.On("TransactWriteItems", mock.Anything, mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
+		if len(in.TransactItems) != 3 || aws.ToString(in.TransactItems[0].ConditionCheck.ConditionExpression) != "attribute_not_exists(pk)" {
+			return false
+		}
+		require.Equal(s.T(), absentMarkerCheck(repo.EventsTable), in.TransactItems[0])
+		for i, item := range in.TransactItems[1:] {
+			require.Equal(s.T(), eventKeyPage(entityID, i+1).Items[0], item.Delete.Key)
+		}
+		return true
+	}), mock.Anything).Return((*dynamodb.TransactWriteItemsOutput)(nil), &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{{Code: aws.String("ConditionalCheckFailed")}},
+	}).Once()
+	// An unrelated declaration wins the race: pin its new version and retry the whole
+	// unchanged delete batch, counting the events only once.
+	expectManifest(client, markerItem(2, "{}", `["audit-feed"]`, ""))
+	client.On("TransactWriteItems", mock.Anything, mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
+		if len(in.TransactItems) != 3 || aws.ToString(in.TransactItems[0].ConditionCheck.ConditionExpression) != "version = :observed" {
+			return false
+		}
+		check := in.TransactItems[0].ConditionCheck
+		require.Equal(s.T(), "version = :observed", aws.ToString(check.ConditionExpression))
+		require.Equal(s.T(), &types.AttributeValueMemberN{Value: "2"}, check.ExpressionAttributeValues[":observed"])
+		for i, item := range in.TransactItems[1:] {
+			require.Equal(s.T(), eventKeyPage(entityID, i+1).Items[0], item.Delete.Key)
+		}
+		return true
+	}), mock.Anything).Return(&dynamodb.TransactWriteItemsOutput{}, nil).Once()
 
-	// First call leaves one item unprocessed; the retry clears it.
-	s.client.On("BatchWriteItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(unprocessed, nil).Once()
-	s.client.On("BatchWriteItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.BatchWriteItemOutput{}, nil).Once()
-
-	deleted, err := s.repo.CompactBelow(ctx, entityID, 2)
+	deleted, err := repo.CompactBelow(ctx, entityID, 2)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 2, deleted)
-	s.client.AssertExpectations(s.T())
+	client.AssertExpectations(s.T())
 }
 
 // Compaction reads strongly even when the repository uses eventually consistent reads, because an
@@ -168,13 +245,15 @@ func (s *RepositorySuite) Test_CompactBelow_ReadsStronglyConsistent() {
 	consistent := func(read *bool) bool { return read != nil && *read }
 
 	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		return consistent(in.ConsistentRead)
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && consistent(in.ConsistentRead) && pk.Value == entityID
 	}), mock.Anything).Return(snapshotItem(entityID, 2), nil)
+	s.expectNoMarker()
 	s.client.On("Query", mock.Anything, mock.MatchedBy(func(in *dynamodb.QueryInput) bool {
 		return consistent(in.ConsistentRead)
 	}), mock.Anything).Return(eventKeyPage(entityID, 1, 2), nil)
-	s.client.On("BatchWriteItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.BatchWriteItemOutput{}, nil)
+	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.TransactWriteItemsOutput{}, nil)
 
 	deleted, err := repo.CompactBelow(ctx, entityID, 2)
 	require.NoError(s.T(), err)

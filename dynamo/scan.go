@@ -93,7 +93,8 @@ func (repo *Repository) scanSegment(
 	}
 }
 
-// decodeScanPage turns a page of raw Scan items into SerializedEvents, skipping inline snapshots.
+// decodeScanPage turns a page of raw Scan items into SerializedEvents, skipping inline snapshots
+// and any item in a reserved namespace (engine rows are never ordinary events).
 func (repo *Repository) decodeScanPage(items []map[string]types.AttributeValue) ([]evt.SerializedEvent, error) {
 	serializedEvents := make([]evt.SerializedEvent, 0, len(items))
 
@@ -105,6 +106,11 @@ func (repo *Repository) decodeScanPage(items []map[string]types.AttributeValue) 
 
 		if event.SK == 0 {
 			// Skip inline snapshots stored at sk=0
+			continue
+		}
+
+		if evt.IsReservedEntityID(event.PK) {
+			// Reserved namespaces hold engine-managed rows, never ordinary aggregates.
 			continue
 		}
 

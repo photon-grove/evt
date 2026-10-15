@@ -3,8 +3,10 @@ package mem
 // WARNING: Not intended for use in Production
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
@@ -37,6 +39,10 @@ func (repo Repository) Commit(
 	_ context.Context,
 	result evt.SerializedResult,
 ) error {
+	if err := evt.CheckReservedEntityIDs(result.Events); err != nil {
+		return err
+	}
+
 	if err := repo.checkFloor(result.Events); err != nil {
 		return err
 	}
@@ -68,6 +74,11 @@ func (repo Repository) CommitStream(
 	for result := range channel {
 		serializedResult, err := result.Unwrap()
 		if err != nil {
+			errors = append(errors, err)
+			continue
+		}
+
+		if err := evt.CheckReservedEntityIDs(serializedResult.Events); err != nil {
 			errors = append(errors, err)
 			continue
 		}
@@ -120,6 +131,10 @@ func (repo Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return err
+	}
+
 	if err := repo.Commit(ctx, result); err != nil {
 		return err
 	}
@@ -175,6 +190,37 @@ func (repo Repository) GetLatestEvents(
 	return latest, nil
 }
 
+// GetRecentEvents returns at most limit Events newest-first (descending sequence). A limit below
+// 1 is a programmer error returned before any read.
+func (repo Repository) GetRecentEvents(
+	_ context.Context,
+	entityID evt.EntityID,
+	limit int,
+) ([]evt.SerializedEvent, error) {
+	if limit < 1 {
+		return nil, &evt.InvalidArgumentError{Argument: "limit", Message: fmt.Sprintf("must be at least 1, got %d", limit)}
+	}
+
+	id := string(entityID)
+
+	latest := make([]evt.SerializedEvent, 0, len(repo.events[id]))
+	for _, event := range repo.events[id] {
+		if event.Sequence == 0 {
+			// Defensive: inline snapshots are not events.
+			continue
+		}
+
+		latest = append(latest, event)
+	}
+
+	// Commits need not arrive in sequence order. Sort a copy so reads never reorder storage.
+	slices.SortFunc(latest, func(a, b evt.SerializedEvent) int {
+		return cmp.Compare(b.Sequence, a.Sequence)
+	})
+
+	return latest[:min(limit, len(latest))], nil
+}
+
 // GetSnapshot gets a Snapshot
 func (repo Repository) GetSnapshot(
 	_ context.Context,
@@ -201,6 +247,11 @@ func (repo Repository) StreamAllEvents(
 		defer close(channel)
 
 		for id, events := range repo.events {
+			if evt.IsReservedEntityID(evt.EntityID(id)) {
+				// Reserved namespaces hold engine-managed rows, never ordinary aggregates.
+				continue
+			}
+
 			if !filter.Matches(memPartitionType(events, repo.snapshots[id])) {
 				continue
 			}
@@ -245,6 +296,11 @@ func (repo Repository) StreamEntityHeadsFunc(
 	visit func(evt.EntityID, evt.EventSequence) error,
 ) error {
 	for id, events := range repo.events {
+		if evt.IsReservedEntityID(evt.EntityID(id)) {
+			// Reserved namespaces hold engine-managed rows, never ordinary aggregates.
+			continue
+		}
+
 		snapshot := repo.snapshots[id]
 		if entityType != "" && !memEventsMatchType(events, snapshot, entityType) {
 			continue
@@ -271,6 +327,9 @@ func (repo Repository) StreamEntityHeadsFunc(
 		if _, hasEvents := repo.events[id]; hasEvents {
 			continue
 		}
+		if evt.IsReservedEntityID(evt.EntityID(id)) {
+			continue
+		}
 		if entityType != "" && snapshot.EntityType != entityType {
 			continue
 		}
@@ -290,6 +349,10 @@ func (repo Repository) CompactBelow(
 	entityID evt.EntityID,
 	throughSequence evt.EventSequence,
 ) (int, error) {
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return 0, err
+	}
+
 	if throughSequence < 1 {
 		return 0, nil
 	}
@@ -340,6 +403,11 @@ func (repo Repository) StreamEntitiesFromSnapshots(
 		defer close(channel)
 
 		for id, serialized := range repo.events {
+			if evt.IsReservedEntityID(evt.EntityID(id)) {
+				// Reserved namespaces hold engine-managed rows, never ordinary aggregates.
+				continue
+			}
+
 			if entityType != "" && !memEventsMatchType(serialized, repo.snapshots[id], entityType) {
 				continue
 			}
@@ -448,6 +516,11 @@ func (repo Repository) StreamEntities(
 		entityEvents := 0
 
 		for id, serialized := range repo.events {
+			if evt.IsReservedEntityID(evt.EntityID(id)) {
+				// Reserved namespaces hold engine-managed rows, never ordinary aggregates.
+				continue
+			}
+
 			if !filter.Matches(memPartitionType(serialized, repo.snapshots[id])) {
 				continue
 			}

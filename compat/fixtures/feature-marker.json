@@ -1,0 +1,495 @@
+{
+  "declarations": [
+    {
+      "name": "empty",
+      "input": {
+        "features": {},
+        "historyDependent": [],
+        "retention": []
+      },
+      "output": {
+        "featuresJson": "{}",
+        "historyDependentJson": "[]",
+        "retentionJson": "[]",
+        "dynamoItem": {
+          "features": {
+            "S": "{}"
+          },
+          "pk": {
+            "S": "SYSTEM#FEATURES"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        "postgresRow": {
+          "id": 0,
+          "version": 1,
+          "features": "{}",
+          "history_dependent": "[]",
+          "retention": "[]"
+        },
+        "postgresWrite": {
+          "sql": "INSERT INTO evt_events__evt_features (id, version, features, history_dependent, retention)\n\t\t\t\t VALUES (0, 1, $1, $2, $3)",
+          "args": [
+            "{}",
+            "[]",
+            "[]"
+          ]
+        }
+      }
+    },
+    {
+      "name": "sorted-deduplicated",
+      "input": {
+        "features": {
+          "journal": 1,
+          "journal-compaction": 2
+        },
+        "historyDependent": [
+          "order",
+          "account",
+          "order",
+          "account"
+        ],
+        "retention": [
+          "session",
+          "account",
+          "session"
+        ]
+      },
+      "output": {
+        "featuresJson": "{\"journal\":1,\"journal-compaction\":2}",
+        "historyDependentJson": "[\"account\",\"order\"]",
+        "retentionJson": "[\"account\",\"session\"]",
+        "dynamoItem": {
+          "features": {
+            "S": "{\"journal\":1,\"journal-compaction\":2}"
+          },
+          "historyDependent": {
+            "S": "[\"account\",\"order\"]"
+          },
+          "pk": {
+            "S": "SYSTEM#FEATURES"
+          },
+          "retention": {
+            "S": "[\"account\",\"session\"]"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        "postgresRow": {
+          "id": 0,
+          "version": 2,
+          "features": "{\"journal\":1,\"journal-compaction\":2}",
+          "history_dependent": "[\"account\",\"order\"]",
+          "retention": "[\"account\",\"session\"]"
+        },
+        "postgresWrite": {
+          "sql": "UPDATE evt_events__evt_features SET version = $1, features = $2, history_dependent = $3, retention = $4\n\t\t\t\t WHERE id = 0 AND version = $5",
+          "args": [
+            2,
+            "{\"journal\":1,\"journal-compaction\":2}",
+            "[\"account\",\"order\"]",
+            "[\"account\",\"session\"]",
+            1
+          ]
+        }
+      }
+    },
+    {
+      "name": "clear-sets",
+      "input": {
+        "features": {},
+        "historyDependent": [],
+        "retention": []
+      },
+      "output": {
+        "featuresJson": "{}",
+        "historyDependentJson": "[]",
+        "retentionJson": "[]",
+        "dynamoItem": {
+          "features": {
+            "S": "{}"
+          },
+          "pk": {
+            "S": "SYSTEM#FEATURES"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "version": {
+            "N": "3"
+          }
+        },
+        "postgresRow": {
+          "id": 0,
+          "version": 3,
+          "features": "{}",
+          "history_dependent": "[]",
+          "retention": "[]"
+        },
+        "postgresWrite": {
+          "sql": "UPDATE evt_events__evt_features SET version = $1, features = $2, history_dependent = $3, retention = $4\n\t\t\t\t WHERE id = 0 AND version = $5",
+          "args": [
+            3,
+            "{}",
+            "[]",
+            "[]",
+            2
+          ]
+        }
+      }
+    }
+  ],
+  "commits": [
+    {
+      "name": "declared-with-view",
+      "input": {
+        "markerDeclaration": "sorted-deduplicated",
+        "eventsTable": "evt-compat",
+        "viewsTable": "views",
+        "event": {
+          "id": "compat-feature-account:1",
+          "sequence": 1,
+          "type": "account:opened",
+          "version": 1,
+          "entityId": "compat-feature-account",
+          "entityType": "account",
+          "payload": "{\"owner\":\"Ada\"}",
+          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":null}"
+        },
+        "viewState": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+        "snapshot": null
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "2"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "views",
+          "item": {
+            "entityID": {
+              "S": "compat-feature-account"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+            },
+            "pk": {
+              "S": "account#compat-feature-account"
+            },
+            "sk": {
+              "S": "VIEW"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+          "expressionAttributeValues": {
+            ":first": {
+              "N": "1"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "declared-with-view-and-snapshot",
+      "input": {
+        "markerDeclaration": "sorted-deduplicated",
+        "eventsTable": "evt-compat",
+        "viewsTable": "views",
+        "event": {
+          "id": "compat-feature-account:1",
+          "sequence": 1,
+          "type": "account:opened",
+          "version": 1,
+          "entityId": "compat-feature-account",
+          "entityType": "account",
+          "payload": "{\"owner\":\"Ada\"}",
+          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":null}"
+        },
+        "viewState": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+        "snapshot": {
+          "entityType": "account",
+          "entityId": "compat-feature-account",
+          "sequence": 1,
+          "eventSequence": 1,
+          "payload": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+        }
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "2"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "views",
+          "item": {
+            "entityID": {
+              "S": "compat-feature-account"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+            },
+            "pk": {
+              "S": "account#compat-feature-account"
+            },
+            "sk": {
+              "S": "VIEW"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "1"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+            },
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(seq)"
+        }
+      ]
+    },
+    {
+      "name": "absent-with-view",
+      "input": {
+        "markerDeclaration": "",
+        "eventsTable": "evt-compat",
+        "viewsTable": "views",
+        "event": {
+          "id": "compat-feature-account:1",
+          "sequence": 1,
+          "type": "account:opened",
+          "version": 1,
+          "entityId": "compat-feature-account",
+          "entityType": "account",
+          "payload": "{\"owner\":\"Ada\"}",
+          "metadataJson": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":null}"
+        },
+        "viewState": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+        "snapshot": null
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "views",
+          "item": {
+            "entityID": {
+              "S": "compat-feature-account"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+            },
+            "pk": {
+              "S": "account#compat-feature-account"
+            },
+            "sk": {
+              "S": "VIEW"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{}}"
+            },
+            "payload": {
+              "S": "{\"owner\":\"Ada\"}"
+            },
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+          "expressionAttributeValues": {
+            ":first": {
+              "N": "1"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "postgresSchemas": [
+    {
+      "eventsTable": "orders",
+      "snapshotsTable": "orders_entity_type_idx",
+      "ddl": "\nCREATE TABLE IF NOT EXISTS orders (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS orders__evt_entity_type_idx ON orders (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('orders_entity_type_idx')\n          AND indrelid = 'orders'::regclass\n    ) THEN\n        DROP INDEX orders_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS orders_entity_type_idx (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n"
+    },
+    {
+      "eventsTable": "evt_events",
+      "snapshotsTable": "evt_snapshots",
+      "ddl": "\nCREATE TABLE IF NOT EXISTS evt_events (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS evt_events__evt_entity_type_idx ON evt_events (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('evt_events_entity_type_idx')\n          AND indrelid = 'evt_events'::regclass\n    ) THEN\n        DROP INDEX evt_events_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS evt_snapshots (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n"
+    }
+  ]
+}
