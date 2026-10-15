@@ -92,6 +92,10 @@ Snapshots are stored inline in the events table at `sk=0` for each entity:
 | entityType | S             | `entityType` | EntityType (for GSI queries) |
 | payload    | S             | `payload`    | JSON-encoded view data       |
 
+In v0.9 (C7), commit-wide projectors may put or delete rows at any `pk`/`sk` — not only the
+derived `{entityType}#{entityId}` / `VIEW` — with per-operation error mapping. The row shape and
+rules are specified in the [storage format](docs/spec/storage-format.md#views).
+
 ## Serialization Formats
 
 ### SerializedEvent
@@ -130,6 +134,12 @@ Snapshots are stored inline in the events table at `sk=0` for each entity:
 - `address`: Client IP address (from context)
 - `region`: AWS region
 - `timestamp`: RFC3339 format, UTC timezone
+
+In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C6),
+metadata gains `principalId` (string or null), `causationId` (string or null; defaults to
+`commandId` when unset), and `extensions` (string-keyed map, `{}` when empty), appended after the
+existing keys. The byte-level shape — including defaults for old readers — is specified in the
+[storage format](docs/spec/storage-format.md#metadata).
 
 ## Error Types and Messages
 
@@ -205,6 +215,11 @@ type TransactionGroup interface {
   check). It counts toward the 100 items and is billed as a write
 - `CommitStream` batches items to stay under this limit, counting one floor `ConditionCheck` per
   entity, at the lowest sequence the batch commits for it, whatever order results arrive in
+
+The v0.9 core reshape adds further transaction items — read-fence checks, the command-outcome row,
+and the feature-marker and rebuild-lock checks — with a pinned item ordering and budget formula in
+the [storage format](docs/spec/storage-format.md#writes). An over-budget commit fails with a typed
+error before any write and is never split.
 
 ## Snapshot Logic
 

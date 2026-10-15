@@ -10,6 +10,14 @@ document and the fixtures disagree, the fixtures are what the code enforces. Fix
 See [`compat/README.md`](../../compat/README.md) and
 [ADR 0003](../adr/0003-rust-implementation-and-cross-language-compatibility.md).
 
+The sections [Read Fences](#read-fences), [Command Outcomes](#command-outcomes),
+[Fence-Aware Retry](#fence-aware-retry), [Reserved Namespaces](#reserved-namespaces),
+[Feature Marker](#feature-marker), and [Rebuild Fence](#rebuild-fence) specify the v0.9 core
+reshape ([ADR 0004](../adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md),
+capabilities C1–C10). They are normative for both implementations and land with Go evt v0.9.0 and
+`photon-evt` 0.2; until then the shipped behavior is the one described in the older sections. No
+code lands before this document carries the byte-level shapes.
+
 ## Identifiers
 
 | Name                    | Type   | Notes                                                                                  |
@@ -91,18 +99,38 @@ Every key is always written; absent values are `null` (or `""` for `region` and 
   "origin": { "source": "billing-api", "endpoint": "POST /accounts" },
   "address": "203.0.113.7",
   "region": "us-west-2",
-  "timestamp": "2026-10-12T00:00:00Z"
+  "timestamp": "2026-10-12T00:00:00Z",
+  "principalId": "user:42",
+  "causationId": "cmd-0001",
+  "extensions": { "requestSource": "cli" }
 }
 ```
 
-| Key         | Type           | Notes                                                                   |
-| ----------- | -------------- | ----------------------------------------------------------------------- |
-| `commandId` | string or null | The command that produced the event. Used to reject duplicate commands. |
-| `trace`     | object or null | W3C trace-context carrier. Keys sorted.                                 |
-| `origin`    | object or null | `{"source": ..., "endpoint": ...}`, both strings.                       |
-| `address`   | string or null | Optional caller address. An empty address is written as `null`.         |
-| `region`    | string         | The region the command ran in.                                          |
-| `timestamp` | string         | RFC 3339 UTC with second precision: `2026-01-02T03:04:05Z`.             |
+| Key           | Type            | Notes                                                                                    |
+| ------------- | --------------- | ---------------------------------------------------------------------------------------- |
+| `commandId`   | string or null  | The command that produced the event. Used to reject duplicate commands.                  |
+| `trace`       | object or null  | W3C trace-context carrier. Keys sorted.                                                  |
+| `origin`      | object or null  | `{"source": ..., "endpoint": ...}`, both strings.                                        |
+| `address`     | string or null  | Optional caller address. An empty address is written as `null`.                          |
+| `region`      | string          | The region the command ran in.                                                           |
+| `timestamp`   | string          | RFC 3339 UTC with second precision: `2026-01-02T03:04:05Z`.                              |
+| `principalId` | string or null  | Who issued the command (the caller's identity), for audit and per-principal checks.      |
+| `causationId` | string or null  | The command that caused this command. Defaults to `commandId` when unset (see below).    |
+| `extensions`  | object          | String-keyed application-specific metadata. Keys sorted. `{}` when unset or empty.       |
+
+The last three keys are new in v0.9 (ADR 0004, C6) and are appended after the existing keys, so
+stored events remain readable without upcasters — decoding is lenient in both languages. They are
+always written:
+
+- `principalId` is the caller's identity as a string, `null` when the command carries no principal.
+- `causationId` is written with its effective value: the explicitly set causation, otherwise the
+  `commandId`, otherwise `null`. Two events written by the same command therefore carry the same
+  `causationId` even when neither set it explicitly.
+- `extensions` is always an object, `{}` when the command carries no extensions. Values are strings;
+  keys are sorted by their encoded string, like every map.
+
+A metadata object without the three keys (an event written before v0.9) decodes with `principalId`
+and `causationId` `null` and `extensions` empty.
 
 ## Serialized Snapshot
 
@@ -144,11 +172,50 @@ rounded down after adding. View items never carry it. An event item with missing
 
 ### Writes
 
-A commit is one `TransactWriteItems` call, at most 100 actions, in this order: projector
-operations, one put per event, then either the snapshot put or a floor check on the snapshot item.
+A commit is one `TransactWriteItems` call, at most 100 actions. The actions appear in this order:
+
+1. The feature-marker check (`SYSTEM#FEATURES`), when the store enforces declared features
+   ([Feature Marker](#feature-marker)).
+2. The rebuild-lock check (`SYSTEM#REBUILD`), when the store enforces the rebuild fence
+   ([Rebuild Fence](#rebuild-fence)).
+3. Projector operations, in projector declaration order; within one projector, in emission order.
+4. One put per event. Streams are grouped by entity ID in ascending byte order, and each stream's
+   events are in ascending sequence.
+5. Per written stream, in the same order: either the snapshot put or the floor check on the
+   stream's snapshot item.
+6. The fence checks for each read-only fenced stream in the read set, in ascending entity-ID
+   order: the slot check, then the snapshot companion ([Read Fences](#read-fences)). A stream that
+   is both fenced and written contributes no fence checks.
+7. The outcome row put, when the store records command outcomes
+   ([Command Outcomes](#command-outcomes)).
+
+Steps 1, 2, 6, and 7 apply only when the corresponding capability is enabled for the store; a
+store built without them writes exactly the actions the older paragraphs describe. The order is
+pinned so fixtures byte-match across implementations.
+
 The floor check counts toward the 100 actions and is billed as a write, so a commit without a
 snapshot costs one more write unit than its events and projector puts, and holds at most 99 of
 them. `CommitStream` adds one check per entity in each batch.
+
+**Multi-stream commits (v0.9, C1).** A commit may append to any number of streams. Each written
+stream keeps its existing protections — `attribute_not_exists(sk)` on every event put and the
+snapshot floor — per stream, and the sequence-contiguity rule applies per written stream. Nothing
+else about the item shapes changes.
+
+The item budget is the same for the single-aggregate shortcut and a multi-stream commit:
+
+```text
+items = Σ over written streams (events_s + 1)     event puts + snapshot put or floor check
+      + fenced read-only streams × (1 or 2)       slot check, + snapshot companion unless omitted
+      + 1                                         outcome put, when outcomes are enabled
+      + 1                                         feature-marker check, when enforcement is enabled
+      + 1                                         rebuild-lock check, when the fence is enabled
+      + projector puts and deletes
+```
+
+A commit whose budget exceeds 100 fails with a typed `CommitTooLarge` error **before any write**.
+It is never split: splitting would break atomicity, because an error after an earlier chunk
+commits would leave only part of the aggregate set updated.
 
 | Write                                  | Condition                                             |
 | -------------------------------------- | ----------------------------------------------------- |
@@ -157,6 +224,11 @@ them. `CommitStream` adds one check per entity in each batch.
 | first snapshot put (`:seq` would be 0) | `attribute_not_exists(seq)`                           |
 | later snapshot put in a commit         | `seq = :seq AND eventSeq < :first`                    |
 | snapshot put outside a commit          | `attribute_not_exists(eventSeq) OR eventSeq <= :new`  |
+| fenced slot check (v0.9, C2)           | `attribute_not_exists(sk)` on `(pk, sk = head + 1)`   |
+| fenced snapshot companion (v0.9, C2)   | `attribute_not_exists(sk) OR eventSeq <= :head`       |
+| outcome row put (v0.9, C3)             | `attribute_not_exists(pk)`                            |
+| feature-marker check (v0.9, C9)        | `attribute_not_exists(pk) OR version = :v`            |
+| rebuild-lock check (v0.9, C10)         | `attribute_not_exists(pk)`                            |
 
 `:first` is the commit's first event sequence, `:seq` is the new snapshot sequence minus one, and
 `:new` is the new `eventSeq`. The first snapshot must have sequence 1, and every later one the stored sequence plus
@@ -167,6 +239,13 @@ transaction cannot touch one item twice.
 The floor exists because compaction deletes the events a snapshot covers, which removes the keys
 `attribute_not_exists(sk)` relies on. Without it, a writer that loaded the stream before the covering
 snapshot could recreate a compacted sequence.
+
+A `ConditionalCheckFailed` on a fence check, the outcome put, the feature-marker check, or the
+rebuild-lock check is classified like the existing conflicts: a fence failure means another writer
+moved the stream ([Read Fences](#read-fences)); a feature-marker or rebuild-lock failure means the
+store's state changed under the writer ([Feature Marker](#feature-marker),
+[Rebuild Fence](#rebuild-fence)). All are retried with a fresh load, per
+[Fence-Aware Retry](#fence-aware-retry).
 
 Both implementations reject a commit whose sequences are not contiguous for each entity (each one
 more than the last), or start below 1, before writing anything. Sequence 0 is the DynamoDB snapshot
@@ -203,7 +282,8 @@ could write its events twice. Reload the entity to find out.
 - Snapshot: get item `(pk, sk = 0)`.
 - Entity heads (rebuilds and diagnostics only): scan `pk`, `sk`, and `eventSeq`, optionally
   filtered by `entityType`. An entity's head is the larger of its highest `sk` and its snapshot's
-  `eventSeq`.
+  `eventSeq`. Enumeration, heads, and rebuild scans skip the reserved namespaces
+  ([Reserved Namespaces](#reserved-namespaces)).
 
 ### Views
 
@@ -217,6 +297,413 @@ one item per entity to a separate views table, in the same transaction as the ev
 | `entityID`   | S    | entity ID                 |
 | `entityType` | S    | entity type               |
 | `payload`    | S    | aggregate state JSON      |
+
+**Commit-wide view rows (v0.9, C7).** A commit-wide projector is a pure function over every event
+in the commit, and its rows are no longer constrained to the derived `pk` or `sk = "VIEW"`: a
+projector may put — or delete — rows at **any `pk`/`sk` it chooses**, including partitions that do
+not name an entity, which is what makes cross-entity read models atomic with the commit. The
+attribute set is unchanged:
+
+| Attribute    | Type | Notes                                         |
+| ------------ | ---- | ---------------------------------------------- |
+| `pk`         | S    | chosen by the projector                        |
+| `sk`         | S    | chosen by the projector                        |
+| `entityID`   | S    | projector-supplied; readers never interpret it |
+| `entityType` | S    | projector-supplied; readers never interpret it |
+| `payload`    | S    | view state JSON                                |
+
+`entityID` and `entityType` are always written. For a row that belongs to no single entity — a
+projection over the whole commit — the projector repeats the commit's primary stream's type and
+ID, or any stable label it chooses; both are informational. Puts are unconditional. A delete
+operation is a transaction `Delete`; it carries no condition unless the projector supplies one,
+and deleting an absent row succeeds. Each projector operation carries the cancellation reason it
+maps to, replacing the single per-group `HandleError(error, int)` callback. The per-entity
+`VIEW` row above remains the special case "one entity's events"; the commit-wide form is the
+general API. View items never carry `ttl`.
+
+```json
+{
+  "pk": "username-claims",
+  "sk": "handle#ada",
+  "entityID": "acct-1",
+  "entityType": "account",
+  "payload": "{\"status\":\"claimed\",\"accountId\":\"acct-1\"}"
+}
+```
+
+A commit-wide row at a `pk` outside any `{entityType}#{entityId}` pattern, written in the same
+transaction as the events that produced it.
+
+## Read Fences
+
+A read-only stream in a transaction is fenced with two `ConditionCheck` items (v0.9, C2). The
+fence fails the commit when any writer has moved the stream past the head the reader saw:
+
+1. **Slot check** on `(pk, sk = head + 1)`:
+
+   ```text
+   ConditionExpression: attribute_not_exists(sk)
+   ```
+
+   The slot at `head + 1` is free on the reader's view: the head is the larger of the stream's
+   highest event sequence and its snapshot's `eventSeq`, so any writer that appends past the head
+   takes the slot and fails the check.
+
+2. **Snapshot companion** on `(pk, sk = 0)`:
+
+   ```text
+   ConditionExpression: attribute_not_exists(sk) OR eventSeq <= :head
+   ```
+
+   `:head` is the fenced head. The companion closes the compaction ABA: another writer could
+   append `head + 1`, snapshot it, and compact it away, leaving the slot empty again — the slot
+   check alone would then pass. Compaction only deletes events covered by a snapshot, so any
+   compaction past the reader's head raises the snapshot's `eventSeq` above `:head` and fails the
+   companion. On a stream with no snapshot item, `attribute_not_exists(sk)` is true and the
+   companion passes.
+
+The companion is **omitted** when the fenced stream's aggregate has a snapshot interval of 0
+(snapshots disabled): compaction requires a covering snapshot, so such a stream can never be
+compacted and the ABA is impossible. Every other fenced stream carries both checks. When a
+fenced stream is **written in the same commit**, both checks are omitted: the event put at
+`head + 1` and that stream's floor or snapshot condition supersede them.
+
+A `ConditionalCheckFailed` on either check is an optimistic-concurrency conflict — another writer
+moved the stream — classified and retried like an event-put conflict. Whether the engine may
+re-prepare the command depends on fence provenance; see [Fence-Aware Retry](#fence-aware-retry).
+
+Worked example. A transaction loads `claim#ada` at head 3 and fences it (snapshot interval
+greater than 0, so both checks apply). The two items are:
+
+```json
+{
+  "ConditionCheck": {
+    "Key": { "pk": "claim#ada", "sk": 4 },
+    "ConditionExpression": "attribute_not_exists(sk)"
+  }
+}
+```
+
+```json
+{
+  "ConditionCheck": {
+    "Key": { "pk": "claim#ada", "sk": 0 },
+    "ConditionExpression": "attribute_not_exists(sk) OR eventSeq <= :head",
+    "ExpressionAttributeValues": { ":head": 3 }
+  }
+}
+```
+
+Fences are declared per read; a fence the caller fills from outside the engine is a
+**caller-stamped fence**, and [Fence-Aware Retry](#fence-aware-retry) treats it differently from
+an engine-filled one. Fence provenance is in-memory commit metadata, never stored.
+
+## Command Outcomes
+
+A store with outcomes enabled (v0.9, C3) records every command on a global, reserved
+`command-outcome#<commandId>` stream — one row per command, written inside the commit transaction
+alongside the events. The row is written **once, in its final state**, with a `Put` conditioned on
+`attribute_not_exists(pk)`: a committed transaction never leaves a half-written outcome, and
+there is no reserved-then-resolved intermediate state.
+
+| Attribute  | Type | Outcome item (`pk = command-outcome#<id>`, `sk = 1`)               |
+| ----------- | ---- | ------------------------------------------------------------------- |
+| `pk`        | S    | `command-outcome#<commandId>`                                       |
+| `sk`        | N    | `1`                                                                 |
+| `status`    | S    | `accepted` or `rejected`, final at write time                       |
+| `digest`    | S    | identity digest (below)                                             |
+| `response`  | S    | standard padded base64 of the response bytes; absent when none      |
+| `events`    | S    | JSON array of event IDs the commit wrote; absent when none          |
+| `rejection` | S    | serialized rejection (below); present only when `status = rejected` |
+| `code`      | S    | the rejection code; present only when `status = rejected`           |
+
+The row has no snapshot, no `ttl`, and never compacts. `response` is base64 rather than raw text
+so a response of arbitrary bytes round-trips exactly in both languages; the decoded bytes are the
+stored response returned to a retried command. `events` is a JSON array of event IDs
+(`{entityId}:{sequence}` strings) encoded with the shared JSON rules.
+
+An **accepted** outcome with events and a stored response:
+
+```json
+{
+  "pk": "command-outcome#cmd-0001",
+  "sk": 1,
+  "status": "accepted",
+  "digest": "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6",
+  "response": "eyJhY2NvdW50SWQiOiJhY2N0LTEiLCJiYWxhbmNlQ2VudHMiOjB9",
+  "events": "[\"acct-1:1\"]"
+}
+```
+
+An **accepted no-op** — a command that produced zero events, or an outcome-only commit — is the
+same row without `events` (and without `response` when the command returned none). It is a
+durable, observable outcome, not an error. An **outcome-only commit** writes only the outcome row
+plus its checks: no event puts, no snapshot or floor items.
+
+A **rejected** outcome:
+
+```json
+{
+  "pk": "command-outcome#cmd-0002",
+  "sk": 1,
+  "status": "rejected",
+  "digest": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+  "rejection": "{\"code\":\"username-taken\",\"message\":\"handle ada is taken\",\"details\":{\"handle\":\"ada\"}}",
+  "code": "username-taken"
+}
+```
+
+### Identity digest
+
+The default digest is SHA-256 over the **canonical bytes** of the command's identity. A repeat
+with the same digest returns the stored outcome; a repeat with a different digest is
+`IdempotencyKeyReuse`. The canonical bytes are:
+
+```text
+"evt-cmd-digest-v1" || 0x00
+|| lp(command type)
+|| lp(stream count) || lp(stream ID) …        target stream IDs, sorted by byte order, deduplicated
+|| lp(canonical payload JSON)
+|| lp(principal)
+
+lp(x)  = uint32 little-endian byte length of x, followed by x
+```
+
+- `command type` is the command's type string.
+- The target stream IDs are the streams the commit **writes events to**, deduplicated and sorted
+  by byte order. Fenced (read-only) streams are not part of the digest; a fenced conflict is
+  caught by the fence checks themselves. An outcome-only commit contributes an empty list.
+- `canonical payload JSON` is the command payload encoded by the shared JSON rules (the same
+  encoder as every JSON document in this format).
+- `principal` is the command metadata's `principalId` as a string, `""` when unset.
+- The `evt-cmd-digest-v1` tag pins the encoding; a future change to the input bumps the tag, and
+  old command IDs then digest differently, which surfaces as `IdempotencyKeyReuse` rather than a
+  silently matched outcome.
+
+A custom digester stores its own opaque string in `digest`; ambiguous-write recovery compares
+digests for equality only.
+
+Worked example. Command type `account:open`, target stream `acct-1`, payload
+`{"owner":"Ada"}`, principal `user:42`:
+
+```text
+evt-cmd-digest-v1 00
+0c000000 6163636f756e743a6f70656e                    "account:open"
+01000000 06000000 616363742d31                       1 stream: "acct-1"
+0f000000 7b226f776e6572223a22416461227d              '{"owner":"Ada"}'
+07000000 757365723a3432                              "user:42"
+```
+
+78 bytes; SHA-256 is
+`08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6` — the `digest` in the accepted
+example above.
+
+A multi-stream example: command type `claim-username`, target streams `claim#ada` and
+`profile#u-1` (sorted byte order), payload `{"handle":"ada"}`, no principal:
+
+```text
+evt-cmd-digest-v1 00
+0e000000 636c61696d2d757365726e616d65                "claim-username"
+02000000 09000000 636c61696d23616461                 "claim#ada"
+         0b000000 70726f66696c6523752d31             "profile#u-1"
+10000000 7b2268616e646c65223a22616461227d            '{"handle":"ada"}'
+00000000                                             ""
+```
+
+SHA-256 is `21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79` — the `digest` in
+the rejected example above.
+
+A store with outcomes enabled **requires a command ID** on every command; a missing ID is a
+programmer error returned before the commit — no outcome row, no events. Stores built without
+outcomes keep the older behavior.
+
+### Ambiguous-write recovery
+
+After an indeterminate commit error (a timeout, a lost connection — the caller cannot know
+whether the transaction applied), re-read the outcome row by command ID (get
+`(command-outcome#<id>, sk = 1)`):
+
+- present with the **same identity digest** → the commit won; return the stored outcome,
+  including the stored response and events.
+- present with a **different digest** → `IdempotencyKeyReuse`.
+- absent → the commit did not apply; safe to retry.
+
+`IdempotencyKeyReuse` is returned as an error and is **not stored**: the existing outcome row
+belongs to the first command that claimed the ID, and nothing overwrites it.
+
+### Rejections
+
+A domain rejection — the aggregate's own refusal: not-found, invalid, conflict-by-rule — is a
+durable rejected outcome (v0.9, C4):
+
+```text
+Rejection { code, message, details }
+```
+
+The `rejection` attribute is the JSON encoding of this struct, keys in order `code`, `message`,
+`details`. `code` and `message` are strings; `details` is a JSON object of application details,
+or `null` when the rejection carries none. A rejected outcome is terminal for that digest: a
+retried command replays the original rejection verbatim from the stored row.
+
+Only domain rejections are durable. Internal failures — event encoding errors, bad events,
+storage errors — are returned as errors and **write no outcome**, so a retry after the underlying
+bug is fixed starts clean. Engine-provided rejection codes are `not-found` and `bad-command`
+(Go's former `NotFoundError`/`BadCommandError`), and the engine's own stale-fence rejection
+([Fence-Aware Retry](#fence-aware-retry)). Domain error enums map onto rejection codes in each
+language; codes are free-form strings beyond the engine-provided ones.
+
+## Fence-Aware Retry
+
+On conflict, a transactional command is re-prepared — the command re-runs against a fresh load —
+**only when every fence in the failed commit was engine-filled**: the engine loaded the fenced
+streams itself, so it can reload them and re-decide (v0.9, C5). If any fence was caller-stamped
+(a head the caller supplied), the engine cannot know the caller's decision is still valid, so it
+does not retry: it returns a **stale-fence rejection**, persisted through
+[Command Outcomes](#command-outcomes) when retries are exhausted, with the reserved code
+`stale-fence`. This replaces blind whole-command retry as the default path for transactional
+commands; the policy packages remain for backend-level transient classification.
+
+Fence provenance (engine-filled vs caller-stamped) is in-memory commit metadata, not stored.
+
+## Reserved Namespaces
+
+Two partition prefixes are reserved for engine-managed rows (v0.9, C8): `SYSTEM#` (the feature
+marker, the rebuild fence) and `command-outcome#` (outcomes). Matching is a case-sensitive byte
+prefix on `pk`.
+
+- Enumeration, entity heads, and rebuild scans **skip** every partition whose `pk` begins with a
+  reserved prefix. Reserved rows are never ordinary aggregates: they have no snapshots and never
+  compact.
+- A writer **refuses** an entity ID that begins with a reserved prefix at commit time, before any
+  write, with a typed error.
+- Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account`
+  would become silently invisible to enumeration, heads, and rebuild after upgrading. `evt-doctor`
+  reports pre-existing streams whose IDs fall in a reserved namespace, and the upgrade note
+  requires renaming (migrating) such streams before enabling the v0.9 features. Real stored data
+  is never silently skipped.
+
+### latest(n)
+
+`latest(n)` is a bounded, newest-first read of a stream's last `n` events (descending), for
+"recent activity" reads that must not replay a long stream. No item shape changes.
+
+- DynamoDB: query `pk = :id AND sk > :zero`, `ScanIndexForward = false`, `Limit = n`. The `sk > 0`
+  key condition excludes the snapshot item, so the result is the `n` highest event sequences,
+  descending.
+- PostgreSQL: `SELECT … FROM evt_events WHERE entity_id = $1 ORDER BY sequence DESC LIMIT $2`.
+
+## Feature Marker
+
+A store declares the extensions it uses on a single `SYSTEM#FEATURES` marker row (v0.9, C9). Any
+writer that does not support a declared feature **refuses to write** to the table.
+
+| Attribute | Type | Feature-marker item (`pk = SYSTEM#FEATURES`, `sk = 0`)                        |
+| --------- | ---- | ------------------------------------------------------------------------------ |
+| `pk`      | S    | `SYSTEM#FEATURES`                                                              |
+| `sk`      | N    | `0`                                                                            |
+| `version` | N    | bumped on every declaration or change                                          |
+| `features` | S    | JSON array of declared feature identifiers, sorted by byte order, deduplicated |
+
+```json
+{
+  "pk": "SYSTEM#FEATURES",
+  "sk": 0,
+  "version": 2,
+  "features": "[\"journal\",\"journal-compaction\"]"
+}
+```
+
+Feature identifiers are strings. The identifiers this spec defines are `journal` and
+`journal-compaction` (the Rust-first extensions, ADR 0005); a writer that encounters an
+identifier it does not model reads the feature set and refuses. The row is declared by the writer
+that first uses a feature, and updated — with a `version` bump — by every later declaration;
+`version` is bumped again when an extension's stored format changes.
+
+Every commit on a store with feature enforcement enabled includes one `ConditionCheck` on
+`(SYSTEM#FEATURES, sk = 0)`:
+
+```text
+ConditionExpression: attribute_not_exists(pk) OR version = :v
+```
+
+`:v` is the version the writer validated. A writer validates the feature set once, at first
+write, and caches the version it validated: a table with no marker validates against
+`attribute_not_exists(pk)` (cached as "no marker"), and a marker at version `v` validates against
+`version = :v`. A declaration bumps `version` **in the same conditional write that updates the
+feature set**, so every writer whose commits condition on the old version fails and re-validates;
+at re-validation an unsupported writer reads the feature set, sees the feature it does not model,
+and refuses. The check costs one transaction item per commit ([Writes](#writes)).
+
+The declaration itself is a conditional write: creating the row asserts `attribute_not_exists(pk)`;
+updating it asserts `version = :observed`, writes the merged, sorted feature set, and sets
+`version = :observed + 1`. (One row per feature with distinct sort keys could not do this: adding
+a feature would neither change an already-validated row nor fail a condition against another key.)
+
+## Rebuild Fence
+
+Rebuilds are fenced durably (v0.9, C10). The lock row and the generation counter are separate
+items:
+
+| Attribute        | Type | Rebuild-lock item (`pk = SYSTEM#REBUILD`, `sk = 0`) |
+| ----------------- | ---- | ---------------------------------------------------- |
+| `pk`              | S    | `SYSTEM#REBUILD`                                     |
+| `sk`              | N    | `0`                                                  |
+| `owner`           | S    | owner token of the current lock holder               |
+| `leaseExpiresAt`  | N    | lease expiry, epoch seconds                          |
+
+| Attribute | Type | Generation item (`pk = SYSTEM#REBUILD#GENERATION`, `sk = 0`) |
+| --------- | ---- | ------------------------------------------------------------- |
+| `pk`      | S    | `SYSTEM#REBUILD#GENERATION`                                   |
+| `sk`      | N    | `0`                                                           |
+| `value`   | N    | monotonic counter, bumped per rebuild                          |
+
+```json
+{
+  "pk": "SYSTEM#REBUILD",
+  "sk": 0,
+  "owner": "rebuild-4b1f0a2e",
+  "leaseExpiresAt": 1760000000
+}
+```
+
+```json
+{
+  "pk": "SYSTEM#REBUILD#GENERATION",
+  "sk": 0,
+  "value": 4
+}
+```
+
+The protocol:
+
+- **Acquire**: a rebuild puts the lock row conditioned on `attribute_not_exists(pk)` with a fresh
+  owner token and a lease expiry, then bumps the generation. The generation is absent-or-`0`
+  before the first rebuild, and every bump is a conditional update asserting the observed value
+  (`attribute_not_exists(value) OR value = :observed` for the first bump, `value = :observed`
+  after). The generation is **odd while a rebuild is in progress** and **even when quiesced**.
+- **Renew**: while it runs, the rebuild renews `leaseExpiresAt` with a conditional update
+  asserting `owner = :owner`.
+- **Release**: after replay completes, the rebuild deletes the lock row with a conditional delete
+  asserting `owner = :owner`, then bumps the generation again.
+- **Takeover**: a rebuild may take over a failed rebuild's lock only with a conditional write
+  asserting the observed `owner` **and** an expired `leaseExpiresAt` (`attribute_exists(pk) AND
+  owner = :observed AND leaseExpiresAt <= :now`).
+- **Force-release**: an operator path deletes the lock row conditionally on the owner it names and
+  bumps the generation.
+- **Commit-time check**: every commit on a store with the fence enabled includes a
+  `ConditionCheck` asserting `attribute_not_exists(pk)` on the lock row — a commit is refused
+  whenever any rebuild holds the lock, **including an expired one**: until the lock is taken over
+  or force-released, it blocks writes. That is deliberate: commits stay safe while any lock row
+  exists, at the cost of waiting out a crashed rebuild. A commit that races a rebuild is rejected
+  as a conflict and retried with a fresh load ([Fence-Aware Retry](#fence-aware-retry)).
+
+The rows live in the reserved `SYSTEM#` namespace, skipped by enumeration, heads, and rebuild
+scans, and neither row has a snapshot or a `ttl`.
+
+**Reader epoch check.** A reader that needs consistency reads the generation before and after its
+read and treats an **odd or changed** value as "rebuild in progress or completed — retry": the
+generation increments when a rebuild acquires the lock and again when it releases after replay
+completes, so state built under a stale epoch can be rejected and re-read.
 
 ## PostgreSQL
 
@@ -252,6 +739,36 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
     payload        bytea  NOT NULL,
     updated_at     timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS evt_command_outcomes (
+    command_id text        PRIMARY KEY,
+    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),
+    digest     text        NOT NULL,
+    response   bytea,
+    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    rejection  jsonb,
+    code       text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)
+           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))
+);
+
+CREATE TABLE IF NOT EXISTS evt_features (
+    id       integer PRIMARY KEY,
+    version  bigint NOT NULL,
+    features text   NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evt_rebuild_lock (
+    id               integer PRIMARY KEY,
+    owner            text        NOT NULL,
+    lease_expires_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evt_rebuild_generation (
+    id    integer PRIMARY KEY,
+    value bigint NOT NULL
+);
 ```
 
 - A commit is one transaction: the entity lock, one insert per event, the floor check, projector
@@ -278,6 +795,63 @@ CREATE TABLE IF NOT EXISTS evt_snapshots (
 - `metadata` is `jsonb`, which normalizes whitespace and key order. Compare it as JSON, not bytes.
   `payload` is `bytea` and keeps its exact bytes.
 - Entity heads take `MAX` over event sequences and snapshot event sequences per entity.
+
+**v0.9 rows.** The DynamoDB items of [Command Outcomes](#command-outcomes),
+[Feature Marker](#feature-marker), and [Rebuild Fence](#rebuild-fence) are PostgreSQL rows:
+
+- `evt_command_outcomes` holds one row per command (`command_id` is the command ID without the
+  `command-outcome#` prefix). `digest` and `code` are text as on DynamoDB; `response` is `bytea`,
+  the same raw bytes whose base64 the DynamoDB item stores; `events` is a `jsonb` array of event
+  IDs and `rejection` a `jsonb` object with keys `code`, `message`, `details` — compare both as
+  JSON, not bytes. The `CHECK` constraints mirror the once-in-final-state rule. The outcome insert
+  is a plain `INSERT` into the commit transaction; a unique violation (`23505`) on
+  `evt_command_outcomes` means another writer recorded the outcome first — the commit is
+  ambiguous, and the caller recovers by re-reading the row by command ID
+  ([Ambiguous-write recovery](#ambiguous-write-recovery)). The outcome insert runs last, after the
+  snapshot upserts.
+- `evt_features` holds exactly one row, `id = 0`; `features` is the canonical JSON array text,
+  byte-identical to the DynamoDB `features` attribute. The commit-time check is a `SELECT` of
+  `version` in the commit transaction: a row whose `version` differs from the cached one, or a
+  row that appeared after the writer validated an empty table, is a conflict. Declarations and
+  commit-time checks take the advisory lock below, so a declaration cannot slip between a
+  writer's check and its commit.
+- `evt_rebuild_lock` (`id = 0`) and `evt_rebuild_generation` (`id = 0`) mirror the lock and
+  generation items; `lease_expires_at` is `timestamptz` rather than epoch seconds.
+
+**Advisory locks.** The per-entity commit lock stays `pg_advisory_xact_lock(1702261760,
+hashtext($1))`. Engine rows use class key `1702261761`: objid `0` is the feature marker and objid
+`1` the rebuild fence.
+
+- A multi-stream commit takes the per-entity lock for **every stream in its read set** — written
+  and fenced — in ascending byte order of entity ID, then runs the fence assertions below, then
+  the inserts. A concurrent writer blocks on the lock instead of slipping `head + 1` past a
+  fenced read.
+- **Fence assertions** (v0.9, C2) run inside the commit transaction after the locks:
+
+  ```sql
+  SELECT COALESCE(MAX(sequence), 0) FROM evt_events WHERE entity_id = $1;   -- must be <= :head
+  SELECT event_sequence FROM evt_snapshots WHERE entity_id = $1;            -- must be <= :head
+  ```
+
+  Both assertions are upper bounds, not equality: compaction can shrink the visible event range
+  below the reader's head (a snapshot whose `event_sequence` equals the head may have covered
+  every event), and that is not movement past the head. A stream moved past the head always
+  violates one conjunct — an appended event raises `MAX(sequence)` above `:head`, and a snapshot
+  past the head raises `event_sequence` above it; an event appended and then compacted away is
+  covered by such a snapshot. PostgreSQL cannot fence the absent slot at `head + 1` with row
+  locks (`SELECT … FOR KEY SHARE` locks only rows that were actually returned), so the advisory
+  lock plus these assertions are the fence.
+- **Rebuild fence** (v0.9, C10): rebuilds hold `pg_advisory_lock(1702261761, 1)` — session-level,
+  exclusive — for the duration, and commits take `pg_advisory_xact_lock_shared(1702261761, 1)` at
+  commit start. Shared locks do not serialize commits against each other; the exclusive lock
+  blocks them all while a rebuild runs, and the rebuild cannot acquire while commits are in
+  flight. The `evt_rebuild_lock` row carries the durable state — owner, lease, takeover and
+  force-release — exactly as the DynamoDB item does; a commit that fails the shared lock is a
+  conflict retried with a fresh load. The generation bumps use the same conditional-update rules
+  as the DynamoDB item (`value = :observed`, `id = 0`).
+- **Feature marker**: declarations take `pg_advisory_xact_lock(1702261761, 0)` around the
+  read-modify-write of `evt_features`; commit-time checks take the same lock, which is why the
+  check-then-commit race above cannot happen.
 
 ## Stream Envelope
 
@@ -347,6 +921,10 @@ A command whose metadata carries a command ID already recorded by an event **rep
 latest snapshot** is a duplicate and writes nothing. Command IDs folded into a snapshot are no
 longer checked, so the dedupe window is the events after the snapshot.
 
+In v0.9 this window is superseded by [Command Outcomes](#command-outcomes): the durable
+`command-outcome#` row checks every command ID globally, including IDs folded into snapshots. The
+window remains as a cheap pre-check on load.
+
 ## Upcasting
 
 Upcasters migrate stored events from older payload versions when they are read. They run in
@@ -383,9 +961,40 @@ These differences are deliberate and covered by tests. Keep them documented here
 - **Floats.** Not normalized across languages, as described under [JSON Encoding](#json-encoding).
 - **Duplicate-command window.** Both languages only see command IDs in events after the latest
   snapshot. This is shared behavior, listed here because it surprises readers. The `dedupe-window`
-  scenario covers it.
+  scenario covers it. Superseded in v0.9 by command outcomes
+  ([Command Outcomes](#command-outcomes)); the window remains as a load-time pre-check.
 - **PostgreSQL metadata.** Stored as `jsonb`, so its bytes differ from the encoded JSON. Compare it
   as JSON.
+
+## Compat Scenarios to Add
+
+The v0.9 core reshape (C1–C10) extends `compat/scenarios.json` with the interleaved Go/Rust
+scenarios below. Go generates the core golden fixtures for them
+(`go test ./internal/compat -run TestFixtures -update`), Rust must reproduce them byte for byte,
+and the live interleaved runs (`scripts/compat-integration.sh dynamo|postgres`) execute the same
+steps on real backends. **E2.8** (Go conformance suite + fixtures) and **E3.8** (Rust conformance
+suite + the live runs) must implement every scenario in this list; the names are the shared keys
+in `compat/scenarios.json`. In all of them both writers run with outcomes enabled and a command ID
+on every step. Some scenarios need new ops in the harness (`declareFeature`, `acquireRebuildLock`,
+`releaseRebuildLock`, `forceReleaseRebuildLock`, `resolveOutcome`, `readLatest`, and a
+multi-stream execute); [`compat/README.md`](../../compat/README.md) grows the op table when they
+land.
+
+| Scenario                    | Covers | What it pins                                                                                             |
+| --------------------------- | ------ | -------------------------------------------------------------------------------------------------------- |
+| `outcomes-idempotency`      | C3     | A retry with the same identity digest returns the stored outcome and writes nothing; a retry with a different digest is `IdempotencyKeyReuse` in both languages. |
+| `outcomes-noop`             | C3     | A zero-event command and an outcome-only commit are stored as accepted with no `events` attribute.       |
+| `outcomes-rejection`        | C3, C4 | A domain rejection is persisted once in final state; the retried command replays it verbatim, cross-language. |
+| `outcomes-ambiguous`        | C3     | After an indeterminate commit error, the re-read by command ID returns the stored outcome (same digest), `IdempotencyKeyReuse` (different digest), or absence (safe retry). |
+| `multi-stream-commit`       | C1     | One commit appends to two streams atomically; the other language interleaves and must see both streams or neither. Per-stream floor checks apply. |
+| `read-fences`               | C2     | A fenced read fails when the other language appends past the head; the compaction ABA (append, snapshot, compact past the head) still fails the fence; a fenced-and-written stream emits no fence checks. |
+| `fence-aware-retry`         | C2, C5 | An engine-filled fence conflict re-prepares and succeeds; a caller-stamped fence produces the persisted `stale-fence` rejection. |
+| `metadata-extensions`       | C6     | `principalId`, `causationId`, and `extensions` round-trip in both directions, including the defaults: `causationId` written as the command ID when unset, `extensions` written as `{}`. |
+| `commit-wide-views`         | C7     | A commit-wide projector writes rows at a `pk` outside `{entityType}#{entityId}` and deletes a row; the other language reads the rows after the commit. |
+| `latest-n`                  | C8     | With more than `n` events on a stream, both languages read the last `n` events newest-first, excluding the snapshot item. |
+| `feature-marker`            | C9     | A declaration bumps `version`; the other language's cached version fails its condition and revalidates; a writer that does not model a declared feature refuses to commit. |
+| `rebuild-fence`             | C10    | While one language holds `SYSTEM#REBUILD`, the other's commit conflicts; release (and force-release) bumps the generation; the reader epoch check sees odd/changed generations. |
+| `reserved-namespaces`       | C8     | A commit whose entity ID begins with `SYSTEM#` or `command-outcome#` is refused before any write; enumeration and heads skip the engine rows the other language wrote. |
 
 ## Changing the Format
 
