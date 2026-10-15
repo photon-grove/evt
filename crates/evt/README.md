@@ -22,8 +22,10 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
   and a `SYSTEM#FEATURES` marker row declares the extensions a table uses — a writer that does
   not support a declared feature refuses to write, including maintenance snapshots. Declaration
   invalidates the writer's cache; it never grants feature support. Durable history-dependent
-  declarations fence compaction under the same marker check (DynamoDB) or transaction lock
-  (PostgreSQL).
+  declarations fence each compaction batch under a marker check (DynamoDB) or all deletes under
+  one transaction lock (PostgreSQL). DynamoDB has no whole-operation lease: a declaration racing
+  multi-batch compaction can leave a partially compacted stream, whose history-dependent rebuild
+  reports `CompactionUncovered`. Declare history dependence before writing data of that type.
 
 ## Example
 

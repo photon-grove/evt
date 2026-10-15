@@ -223,9 +223,14 @@ store carries both, and a store that never declares features still validates the
 `attribute_not_exists(pk)`. A store built without the v0.9 capabilities writes exactly the actions
 the older paragraphs describe. The order is pinned so fixtures byte-match across implementations.
 
-The floor check counts toward the 100 actions and is billed as a write, so a commit without a
-snapshot costs one more write unit than its events and projector puts, and holds at most 99 of
-them. `CommitStream` adds one check per entity in each batch.
+**Pre-v0.9 capacity:** the floor check counts toward the 100 actions and is billed as a write,
+so a commit without a snapshot costs one more write unit than its events and projector puts,
+and holds at most 99 of them. `CommitStream` adds one check per entity in each batch. This is
+not the v0.9 capacity: the current Go C9 implementation reserves a marker check as well,
+leaving 98 event/projector operations for a single-stream commit, with or without a snapshot
+(the snapshot put replaces the floor check). The full v0.9 target below adds the C10 rebuild
+check and leaves 97 for a basic single-stream commit with no read fences or outcome. C10 is
+not implemented by the Go C9 change.
 
 **Multi-stream commits (v0.9, C1).** A commit may append to any number of streams. Each written
 stream keeps its existing protections — `attribute_not_exists(sk)` on every event put and the
@@ -1017,8 +1022,13 @@ the row itself, so they hold for every process that opens the log:
   validation and all deletes in one transaction. DynamoDB deletes in transactions of at most
   99 events plus a check on the observed marker (`version = :observed`, or
   `attribute_not_exists(pk)` when absent); a failed check re-reads and re-validates before retrying.
-  Thus a completed history-dependent declaration fences an in-flight compactor, not merely future
-  compactor starts. On a table with no marker row there is nothing declared and
+  This is **per-batch fencing**, not a lease over the entire DynamoDB compaction. A
+  history-dependent declaration racing an in-progress multi-batch compaction can stop later
+  batches but cannot roll back the already committed prefix, leaving a partially compacted
+  stream. A history-dependent rebuild then reports `CompactionUncovered`, rather than silently
+  replaying incomplete history. History dependence must therefore be declared **before writing
+  data of that entity type**. PostgreSQL retains its single-transaction guarantee under the
+  shared feature advisory lock. On a table with no marker row there is nothing declared and
   compaction proceeds, as it always has; a pre-v0.9 writer that knows nothing of the manifest
   cannot be stopped, and the guarantee binds v0.9 writers as everywhere else in this section.
 - A fenced read refuses an entity type in `retention` with a typed `RetentionConflict` error

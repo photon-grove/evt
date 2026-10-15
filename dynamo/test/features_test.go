@@ -64,12 +64,16 @@ func serializedEvent(entityID string) evt.SerializedEvent {
 }
 
 // expectCommit wires a successful TransactWriteItems call and captures the transaction input.
-func expectCommit(client *dynamo_mock.Client, captured *dynamodb.TransactWriteItemsInput) {
+func expectCommit(t *testing.T, client *dynamo_mock.Client, captured *dynamodb.TransactWriteItemsInput) {
+	t.Helper()
+
 	client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
 		Return(new(dynamodb.TransactWriteItemsOutput), nil).
 		Once().
 		Run(func(args mock.Arguments) {
-			*captured = *args.Get(1).(*dynamodb.TransactWriteItemsInput)
+			input, ok := args.Get(1).(*dynamodb.TransactWriteItemsInput)
+			require.True(t, ok, "expected TransactWriteItems input")
+			*captured = *input
 		})
 }
 
@@ -92,7 +96,8 @@ func expectManifest(client *dynamo_mock.Client, item map[string]types.AttributeV
 	}
 
 	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		return in.Key["pk"].(*types.AttributeValueMemberS).Value == "SYSTEM#FEATURES"
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && pk.Value == "SYSTEM#FEATURES"
 	}), mock.Anything).Return(out, nil).Once()
 }
 
@@ -113,19 +118,19 @@ func (s *FeatureMarkerSuite) Test_Commit_IncludesMarkerCheck() {
 	expectManifest(client, nil)
 
 	var first dynamodb.TransactWriteItemsInput
-	expectCommit(client, &first)
+	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
 
 	require.NotEmpty(s.T(), first.TransactItems)
 	check := first.TransactItems[0].ConditionCheck
 	require.NotNil(s.T(), check)
-	require.Equal(s.T(), "SYSTEM#FEATURES", check.Key["pk"].(*types.AttributeValueMemberS).Value)
-	require.Equal(s.T(), "0", check.Key["sk"].(*types.AttributeValueMemberN).Value)
+	require.Equal(s.T(), &types.AttributeValueMemberS{Value: "SYSTEM#FEATURES"}, check.Key["pk"])
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "0"}, check.Key["sk"])
 	require.Equal(s.T(), "attribute_not_exists(pk)", aws.ToString(check.ConditionExpression))
 
 	// Second commit: the validation is cached; the same check is included without a re-read.
 	var second dynamodb.TransactWriteItemsInput
-	expectCommit(client, &second)
+	expectCommit(s.T(), client, &second)
 	require.NoError(s.T(), s.commit(repo, "acct-2"))
 
 	require.NotNil(s.T(), second.TransactItems[0].ConditionCheck)
@@ -143,12 +148,12 @@ func (s *FeatureMarkerSuite) Test_Commit_ConditionsOnCachedVersion() {
 	expectManifest(client, markerItem(3, "{}", "", ""))
 
 	var first dynamodb.TransactWriteItemsInput
-	expectCommit(client, &first)
+	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
 
 	check := first.TransactItems[0].ConditionCheck
 	require.Equal(s.T(), "attribute_not_exists(pk) OR version = :v", aws.ToString(check.ConditionExpression))
-	require.Equal(s.T(), "3", check.ExpressionAttributeValues[":v"].(*types.AttributeValueMemberN).Value)
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "3"}, check.ExpressionAttributeValues[":v"])
 
 	// Compaction reads the manifest with a consistent read of its own; no features configured, so
 	// it only consumes the validation read above.
@@ -181,7 +186,7 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_RevalidatesAndRefuses() {
 	expectManifest(client, nil)
 
 	var first dynamodb.TransactWriteItemsInput
-	expectCommit(client, &first)
+	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
 
 	// A declaration lands between the commits. The next commit's cached "no marker" condition
@@ -205,7 +210,7 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient
 	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
 
 	var first dynamodb.TransactWriteItemsInput
-	expectCommit(client, &first)
+	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
 
 	// The manifest bumps to version 2 under the writer; the cached condition fails.
@@ -219,11 +224,11 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient
 
 	// The retry reuses the freshly cached version without another read.
 	var retried dynamodb.TransactWriteItemsInput
-	expectCommit(client, &retried)
+	expectCommit(s.T(), client, &retried)
 	require.NoError(s.T(), s.commit(repo, "acct-2"))
 
 	check := retried.TransactItems[0].ConditionCheck
-	require.Equal(s.T(), "2", check.ExpressionAttributeValues[":v"].(*types.AttributeValueMemberN).Value)
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "2"}, check.ExpressionAttributeValues[":v"])
 	client.AssertExpectations(s.T())
 }
 
@@ -241,7 +246,9 @@ func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 		Return(new(dynamodb.PutItemOutput), nil).
 		Once().
 		Run(func(args mock.Arguments) {
-			createdPtr = args.Get(1).(*dynamodb.PutItemInput)
+			var ok bool
+			createdPtr, ok = args.Get(1).(*dynamodb.PutItemInput)
+			require.True(s.T(), ok, "expected PutItem input")
 		})
 
 	manifest, err := marker.Declare(context.Background(), func(m *evt.FeatureManifest) {
@@ -250,8 +257,8 @@ func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), int64(1), manifest.Version)
 	require.Equal(s.T(), "attribute_not_exists(pk)", aws.ToString(createdPtr.ConditionExpression))
-	require.Equal(s.T(), "1", createdPtr.Item["version"].(*types.AttributeValueMemberN).Value)
-	require.Equal(s.T(), `{"journal":1}`, createdPtr.Item["features"].(*types.AttributeValueMemberS).Value)
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "1"}, createdPtr.Item["version"])
+	require.Equal(s.T(), &types.AttributeValueMemberS{Value: `{"journal":1}`}, createdPtr.Item["features"])
 
 	// Update: one declaration adds exactly one to the version and writes the merged sets.
 	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
@@ -261,7 +268,9 @@ func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 		Return(new(dynamodb.PutItemOutput), nil).
 		Once().
 		Run(func(args mock.Arguments) {
-			updatedPtr = args.Get(1).(*dynamodb.PutItemInput)
+			var ok bool
+			updatedPtr, ok = args.Get(1).(*dynamodb.PutItemInput)
+			require.True(s.T(), ok, "expected PutItem input")
 		})
 
 	manifest, err = marker.Declare(context.Background(), func(m *evt.FeatureManifest) {
@@ -271,10 +280,10 @@ func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), int64(2), manifest.Version)
 	require.Equal(s.T(), "version = :observed", aws.ToString(updatedPtr.ConditionExpression))
-	require.Equal(s.T(), "1", updatedPtr.ExpressionAttributeValues[":observed"].(*types.AttributeValueMemberN).Value)
-	require.Equal(s.T(), "2", updatedPtr.Item["version"].(*types.AttributeValueMemberN).Value)
-	require.Equal(s.T(), `{"journal":1,"journal-compaction":1}`, updatedPtr.Item["features"].(*types.AttributeValueMemberS).Value)
-	require.Equal(s.T(), `["audit-feed"]`, updatedPtr.Item["historyDependent"].(*types.AttributeValueMemberS).Value)
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "1"}, updatedPtr.ExpressionAttributeValues[":observed"])
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "2"}, updatedPtr.Item["version"])
+	require.Equal(s.T(), &types.AttributeValueMemberS{Value: `{"journal":1,"journal-compaction":1}`}, updatedPtr.Item["features"])
+	require.Equal(s.T(), &types.AttributeValueMemberS{Value: `["audit-feed"]`}, updatedPtr.Item["historyDependent"])
 	require.NotContains(s.T(), updatedPtr.Item, "retention", "an empty set is omitted")
 
 	client.AssertExpectations(s.T())
@@ -290,7 +299,7 @@ func (s *FeatureMarkerSuite) Test_Declare_SameInstanceRevalidatesUnsupportedFeat
 
 	expectManifest(client, nil)
 	var first dynamodb.TransactWriteItemsInput
-	expectCommit(client, &first)
+	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
 
 	expectManifest(client, nil)
@@ -334,7 +343,8 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
 
 	// The snapshot read learns the entity's type.
 	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		return in.Key["pk"].(*types.AttributeValueMemberS).Value == "acct-1"
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && pk.Value == "acct-1"
 	}), mock.Anything).Return(&dynamodb.GetItemOutput{Item: map[string]types.AttributeValue{
 		"pk":         &types.AttributeValueMemberS{Value: "acct-1"},
 		"sk":         &types.AttributeValueMemberN{Value: "0"},
@@ -362,7 +372,8 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_ProceedsWithoutMarker() {
 		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
 	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		return in.Key["pk"].(*types.AttributeValueMemberS).Value == "acct-1"
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && pk.Value == "acct-1"
 	}), mock.Anything).Return(&dynamodb.GetItemOutput{Item: map[string]types.AttributeValue{
 		"pk":         &types.AttributeValueMemberS{Value: "acct-1"},
 		"sk":         &types.AttributeValueMemberN{Value: "0"},

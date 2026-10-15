@@ -88,7 +88,7 @@ func (s *NamespacesSuite) Test_GetRecentEvents_NewestFirst() {
 	require.Equal(s.T(), "pk = :pk AND sk > :sk", aws.ToString(input.KeyConditionExpression))
 	require.True(s.T(), aws.ToBool(input.ScanIndexForward) == false)
 	require.Equal(s.T(), int32(2), aws.ToInt32(input.Limit))
-	require.Equal(s.T(), "0", input.ExpressionAttributeValues[":sk"].(*types.AttributeValueMemberN).Value)
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "0"}, input.ExpressionAttributeValues[":sk"])
 }
 
 // Test_GetRecentEvents_PagesUntilLimit asserts the reader keeps paging when a page closes early

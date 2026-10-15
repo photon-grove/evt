@@ -48,7 +48,8 @@ func Test_SkipsReservedNamespaces(t *testing.T) {
 // Test_WritePathsRefuseReservedEntityIds asserts the in-memory write paths refuse reserved entity
 // IDs like the durable backends do.
 func Test_WritePathsRefuseReservedEntityIds(t *testing.T) {
-	repo := NewRepository().(*Repository)
+	repo, ok := NewRepository().(*Repository)
+	require.True(t, ok)
 
 	for _, id := range []evt.EntityID{"SYSTEM#acct-1", "command-outcome#cmd-1"} {
 		err := repo.Commit(context.Background(), evt.SerializedResult{Events: []evt.SerializedEvent{

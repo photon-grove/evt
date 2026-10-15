@@ -44,7 +44,8 @@ func eventKeyPage(entityID string, sequences ...int) *dynamodb.QueryOutput {
 // expectSnapshot scopes a GetItem expectation to the entity's sk=0 snapshot read.
 func (s *RepositorySuite) expectSnapshot(entityID string, out *dynamodb.GetItemOutput) {
 	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		return in.Key["pk"].(*types.AttributeValueMemberS).Value == entityID
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && pk.Value == entityID
 	}), mock.Anything).Return(out, nil)
 }
 
@@ -52,7 +53,8 @@ func (s *RepositorySuite) expectSnapshot(entityID string, out *dynamodb.GetItemO
 // a table with no marker row declares nothing.
 func (s *RepositorySuite) expectNoMarker() {
 	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		return in.Key["pk"].(*types.AttributeValueMemberS).Value == "SYSTEM#FEATURES"
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && pk.Value == "SYSTEM#FEATURES"
 	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
 }
 
@@ -243,8 +245,8 @@ func (s *RepositorySuite) Test_CompactBelow_ReadsStronglyConsistent() {
 	consistent := func(read *bool) bool { return read != nil && *read }
 
 	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		return consistent(in.ConsistentRead) &&
-			in.Key["pk"].(*types.AttributeValueMemberS).Value == entityID
+		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
+		return ok && consistent(in.ConsistentRead) && pk.Value == entityID
 	}), mock.Anything).Return(snapshotItem(entityID, 2), nil)
 	s.expectNoMarker()
 	s.client.On("Query", mock.Anything, mock.MatchedBy(func(in *dynamodb.QueryInput) bool {
