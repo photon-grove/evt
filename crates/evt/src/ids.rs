@@ -127,6 +127,12 @@ string_id!(
     CommandId
 );
 
+string_id!(
+    /// Identifies the caller that issued a command, for audit and per-principal checks. Stored in
+    /// event metadata.
+    PrincipalId
+);
+
 impl EventId {
     /// Builds the stable event ID for an entity and sequence: `{entityId}:{sequence}`.
     pub fn for_event(entity_id: &EntityId, sequence: EventSequence) -> Self {

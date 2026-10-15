@@ -87,11 +87,9 @@ func Test_HasConditionalCheckFailure_NilError(t *testing.T) {
 func Test_MarshalJSON_Success(t *testing.T) {
 	// Create test DynamoDB AttributeValue map
 	metadata := evt.Metadata{
-		Region: "us-east-1",
-		Origin: &evt.Origin{
-			Source:   "test",
-			Endpoint: "test-endpoint",
-		},
+		Region:     "us-east-1",
+		Origin:     &evt.Origin{Source: "test", Endpoint: "test-endpoint"},
+		Extensions: map[string]string{},
 	}
 	metadataJSON, err := json.Marshal(metadata)
 	require.NoError(t, err)

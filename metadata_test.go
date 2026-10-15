@@ -384,3 +384,140 @@ func Test_Metadata_ConcurrentCreation(t *testing.T) {
 		}
 	}
 }
+
+func Test_Metadata_V09FieldsEncode(t *testing.T) {
+	// The storage format's metadata example (docs/spec/storage-format.md#metadata), minus the
+	// engine-written commitId: causationId is unset and defaults to the commandId, extensions is
+	// set, principalId is the caller's identity.
+	metadata := NewMetadata(context.Background(), ptr("us-west-2"),
+		WithCommandID("cmd-0001"),
+		WithOrigin(Origin{Source: "billing-api", Endpoint: "POST /accounts"}),
+		WithAddress("203.0.113.7"),
+		WithPrincipalID("user:42"),
+		WithExtension("requestSource", "cli"),
+	)
+	metadata.Timestamp = "2026-10-12T00:00:00Z"
+	metadata.Trace = &propagation.MapCarrier{
+		"baggage":     "tenant=example",
+		"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"tracestate":  "vendor=value",
+	}
+
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+
+	require.JSONEq(t, `{
+		"commandId": "cmd-0001",
+		"trace": {"baggage": "tenant=example", "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "tracestate": "vendor=value"},
+		"origin": {"source": "billing-api", "endpoint": "POST /accounts"},
+		"address": "203.0.113.7",
+		"region": "us-west-2",
+		"timestamp": "2026-10-12T00:00:00Z",
+		"principalId": "user:42",
+		"causationId": "cmd-0001",
+		"extensions": {"requestSource": "cli"}
+	}`, string(data))
+}
+
+func Test_Metadata_CausationIDDefaults(t *testing.T) {
+	testCases := []struct {
+		name     string
+		metadata Metadata
+		expected any
+	}{
+		{"unset falls back to the command ID", Metadata{CommandID: ptr(CommandID("cmd-0001"))}, "cmd-0001"},
+		{"explicit causation wins", Metadata{CommandID: ptr(CommandID("cmd-0002")), CausationID: ptr(CommandID("cmd-0001"))}, "cmd-0001"},
+		{"neither set", Metadata{}, nil},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.metadata)
+			require.NoError(t, err)
+
+			var raw struct {
+				CausationID *string `json:"causationId"`
+			}
+			require.NoError(t, json.Unmarshal(data, &raw))
+
+			if tc.expected == nil {
+				require.Nil(t, raw.CausationID)
+
+				return
+			}
+			require.NotNil(t, raw.CausationID)
+			require.Equal(t, tc.expected, *raw.CausationID)
+		})
+	}
+}
+
+func Test_Metadata_ExtensionsAlwaysWritten(t *testing.T) {
+	testCases := []struct {
+		name     string
+		metadata Metadata
+		expected string
+	}{
+		{"unset", Metadata{}, `"extensions":{}`},
+		{"empty", Metadata{Extensions: map[string]string{}}, `"extensions":{}`},
+		{"keys sorted by encoded string", Metadata{Extensions: map[string]string{"b": "2", "a": "1", "c": "3"}}, `"extensions":{"a":"1","b":"2","c":"3"}`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.metadata)
+			require.NoError(t, err)
+			require.Contains(t, string(data), tc.expected)
+		})
+	}
+}
+
+func Test_Metadata_V09Options(t *testing.T) {
+	ctx := context.Background()
+	region := "us-east-1"
+
+	metadata := NewMetadata(ctx, &region,
+		WithPrincipalID("user:42"),
+		WithCausationID("cmd-0000"),
+		WithExtension("requestSource", "cli"),
+	)
+
+	require.NotNil(t, metadata.PrincipalID)
+	require.Equal(t, PrincipalID("user:42"), *metadata.PrincipalID)
+	require.NotNil(t, metadata.CausationID)
+	require.Equal(t, CommandID("cmd-0000"), *metadata.CausationID)
+	require.Equal(t, map[string]string{"requestSource": "cli"}, metadata.Extensions)
+
+	// Empty values are left unset, like WithAddress.
+	cleared := NewMetadata(ctx, &region,
+		WithPrincipalID("user:42"), WithPrincipalID(""),
+		WithCausationID("cmd-0000"), WithCausationID(""),
+	)
+
+	require.Nil(t, cleared.PrincipalID)
+	require.Nil(t, cleared.CausationID)
+}
+
+func Test_Metadata_V09KeysDecodeLeniently(t *testing.T) {
+	// A metadata object written before v0.9 has none of the new keys.
+	var metadata Metadata
+	require.NoError(t, json.Unmarshal([]byte(`{"commandId":"c-1","region":"r"}`), &metadata))
+
+	require.Nil(t, metadata.PrincipalID)
+	require.Nil(t, metadata.CausationID)
+	require.Empty(t, metadata.Extensions)
+
+	// Stored v0.9 keys decode faithfully, including an empty-string extension value.
+	metadata = Metadata{}
+	require.NoError(t, json.Unmarshal(
+		[]byte(`{"principalId":"user:42","causationId":"c-0","extensions":{"a":"","b":"x"}}`),
+		&metadata))
+
+	require.NotNil(t, metadata.PrincipalID)
+	require.Equal(t, PrincipalID("user:42"), *metadata.PrincipalID)
+	require.Equal(t, CommandID("c-0"), *metadata.CausationID)
+	require.Equal(t, map[string]string{"a": "", "b": "x"}, metadata.Extensions)
+}
+
+func ptr[T any](value T) *T {
+	return &value
+}

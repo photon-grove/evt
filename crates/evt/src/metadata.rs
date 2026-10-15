@@ -3,17 +3,23 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
-use crate::ids::CommandId;
+use crate::ids::{CommandId, PrincipalId};
 use crate::json::null_default;
 
 /// Metadata stored with each event. It mirrors the Go `evt.Metadata` struct field for field, and
-/// every field is always written (absent values are written as `null` or `""`).
+/// every field is always written (absent values are written as `null`, `""`, or `{}`).
 ///
-/// Readers are lenient the way Go is: missing fields and `null` decode to their empty values and
-/// unknown fields are ignored.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The v0.9 keys (ADR 0004, C6) are appended after the existing ones, so stored events written
+/// before v0.9 still decode: missing fields and `null` decode to their empty values and unknown
+/// fields are ignored.
+///
+/// Encoding applies the storage format's defaults: `causationId` is written as the explicitly set
+/// causation, otherwise the `commandId`, otherwise `null`, and `extensions` is always an object
+/// (`{}` when unset or empty). Decoding stays faithful to the stored bytes and does not apply the
+/// defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[non_exhaustive]
 pub struct Metadata {
     /// The command that produced the event. Used to reject duplicate commands on replay.
@@ -39,6 +45,19 @@ pub struct Metadata {
     /// When the command ran, as RFC 3339 UTC with second precision (`2026-01-02T03:04:05Z`).
     #[serde(default, deserialize_with = "null_default")]
     pub timestamp: String,
+
+    /// Who issued the command (the caller's identity), for audit and per-principal checks.
+    #[serde(rename = "principalId", default)]
+    pub principal_id: Option<PrincipalId>,
+
+    /// The command that caused this command. Encoding writes the `commandId` when unset.
+    #[serde(rename = "causationId", default)]
+    pub causation_id: Option<CommandId>,
+
+    /// String-keyed application-specific metadata. Keys serialize in sorted order; an unset or
+    /// empty map serializes as `{}`.
+    #[serde(default, deserialize_with = "extensions")]
+    pub extensions: BTreeMap<String, String>,
 }
 
 /// The system (`source`) and entry point (`endpoint`) that initiated a command.
@@ -119,6 +138,79 @@ impl Metadata {
         self.timestamp = timestamp.into();
         self
     }
+
+    /// Sets the caller's identity. An empty principal clears it, matching Go's
+    /// `evt.WithPrincipalID`.
+    #[must_use]
+    pub fn with_principal_id(mut self, principal: impl Into<PrincipalId>) -> Self {
+        let principal = principal.into();
+        self.principal_id = (!principal.is_empty()).then_some(principal);
+        self
+    }
+
+    /// Sets the command that caused this command. An empty causation clears it, matching Go's
+    /// `evt.WithCausationID`.
+    #[must_use]
+    pub fn with_causation_id(mut self, causation: impl Into<CommandId>) -> Self {
+        let causation = causation.into();
+        self.causation_id = (!causation.is_empty()).then_some(causation);
+        self
+    }
+
+    /// Adds one application-specific extension.
+    #[must_use]
+    pub fn with_extension(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extensions.insert(key.into(), value.into());
+        self
+    }
+}
+
+/// The encoding shape of [`Metadata`]: the fields in the storage format's key order, with the
+/// effective `causationId` already applied.
+#[derive(Serialize)]
+struct MetadataWire<'a> {
+    #[serde(rename = "commandId")]
+    command_id: &'a Option<CommandId>,
+    #[serde(rename = "trace")]
+    trace: &'a Option<BTreeMap<String, String>>,
+    #[serde(rename = "origin")]
+    origin: &'a Option<Origin>,
+    #[serde(rename = "address")]
+    address: &'a Option<String>,
+    #[serde(rename = "region")]
+    region: &'a str,
+    #[serde(rename = "timestamp")]
+    timestamp: &'a str,
+    #[serde(rename = "principalId")]
+    principal_id: &'a Option<PrincipalId>,
+    #[serde(rename = "causationId")]
+    causation_id: &'a Option<CommandId>,
+    #[serde(rename = "extensions")]
+    extensions: &'a BTreeMap<String, String>,
+}
+
+impl Serialize for Metadata {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // causationId is written with its effective value: the explicitly set causation, otherwise
+        // the commandId, otherwise null — matching Go's Metadata.MarshalJSON.
+        let causation = self
+            .causation_id
+            .clone()
+            .or_else(|| self.command_id.clone());
+
+        MetadataWire {
+            command_id: &self.command_id,
+            trace: &self.trace,
+            origin: &self.origin,
+            address: &self.address,
+            region: &self.region,
+            timestamp: &self.timestamp,
+            principal_id: &self.principal_id,
+            causation_id: &causation,
+            extensions: &self.extensions,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// Decodes the trace carrier, reading `null` values as `""` the way Go's `encoding/json` does for a
@@ -134,6 +226,20 @@ fn trace_carrier<'de, D: serde::Deserializer<'de>>(
             .map(|(key, value)| (key, value.unwrap_or_default()))
             .collect()
     }))
+}
+
+/// Decodes the extensions map the way Go decodes a `map[string]string`: a `null` map is empty, and
+/// `null` values decode to `""`.
+fn extensions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    let map = Option::<BTreeMap<String, Option<String>>>::deserialize(deserializer)?;
+
+    Ok(map
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| (key, value.unwrap_or_default()))
+        .collect())
 }
 
 /// Formats the current time as RFC 3339 UTC with second precision, matching Go's
@@ -206,5 +312,87 @@ mod tests {
             .with_address("");
 
         assert_eq!(metadata.address, None);
+    }
+
+    #[test]
+    fn causation_defaults_to_the_command_id_at_encode() {
+        let defaulted = to_json_string(&Metadata::default().with_command_id("cmd-0001"));
+        assert!(
+            defaulted.contains(r#""causationId":"cmd-0001""#),
+            "{defaulted}"
+        );
+
+        let explicit = to_json_string(
+            &Metadata::default()
+                .with_command_id("cmd-0002")
+                .with_causation_id("cmd-0001"),
+        );
+        assert!(
+            explicit.contains(r#""causationId":"cmd-0001""#),
+            "{explicit}"
+        );
+        assert!(
+            !explicit.contains(r#""causationId":"cmd-0002""#),
+            "{explicit}"
+        );
+
+        let neither = to_json_string(&Metadata::default());
+        assert!(neither.contains(r#""causationId":null"#), "{neither}");
+    }
+
+    #[test]
+    fn extensions_always_encode_as_an_object_with_sorted_keys() {
+        let unset = to_json_string(&Metadata::default());
+        assert!(unset.contains(r#""extensions":{}"#), "{unset}");
+
+        let sorted = to_json_string(
+            &Metadata::default()
+                .with_extension("tenant", "example")
+                .with_extension("attempt", "2")
+                .with_extension("requestSource", "cli"),
+        );
+        assert!(
+            sorted.contains(
+                r#""extensions":{"attempt":"2","requestSource":"cli","tenant":"example"}"#
+            ),
+            "{sorted}"
+        );
+    }
+
+    #[test]
+    fn v09_keys_decode_leniently_from_legacy_metadata() {
+        let metadata: Metadata =
+            serde_json::from_str(r#"{"commandId":"c-1","region":"r"}"#).unwrap();
+
+        assert_eq!(metadata.principal_id, None);
+        assert_eq!(metadata.causation_id, None);
+        assert!(metadata.extensions.is_empty());
+
+        // Encoding applies the defaults even to a decoded legacy event.
+        let encoded = to_json_string(&metadata);
+        assert!(encoded.contains(r#""principalId":null"#), "{encoded}");
+        assert!(encoded.contains(r#""causationId":"c-1""#), "{encoded}");
+        assert!(encoded.contains(r#""extensions":{}"#), "{encoded}");
+    }
+
+    #[test]
+    fn extensions_decode_nulls_like_go() {
+        let metadata: Metadata =
+            serde_json::from_str(r#"{"extensions":{"a":null,"b":"x"}}"#).unwrap();
+        assert_eq!(
+            metadata.extensions,
+            BTreeMap::from([
+                ("a".to_owned(), "".to_owned()),
+                ("b".to_owned(), "x".to_owned())
+            ])
+        );
+
+        let metadata: Metadata = serde_json::from_str(r#"{"extensions":null}"#).unwrap();
+        assert!(metadata.extensions.is_empty());
+    }
+
+    /// Encodes metadata with the Go-identical JSON encoder, for assertions on stored bytes.
+    fn to_json_string(metadata: &Metadata) -> String {
+        crate::json::to_string(metadata).unwrap()
     }
 }

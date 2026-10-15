@@ -2,6 +2,7 @@ package evt
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -17,7 +18,17 @@ type Metadata struct {
 	Address   *string                 `json:"address"`
 	Region    string                  `json:"region"`
 	Timestamp string                  `json:"timestamp"`
+
+	// v0.9 metadata (ADR 0004, C6), appended after the existing keys so stored events written
+	// before v0.9 still decode: missing keys decode to their empty values and unknown keys are
+	// ignored.
+	PrincipalID *PrincipalID      `json:"principalId"`
+	CausationID *CommandID        `json:"causationId"`
+	Extensions  map[string]string `json:"extensions"`
 }
+
+// A PrincipalID identifies the caller that issued a command, for audit and per-principal checks.
+type PrincipalID string
 
 // A Source is the system that initiated the request
 type Source string
@@ -78,6 +89,51 @@ func WithAddress(address string) MetadataOption {
 	}
 }
 
+// WithPrincipalID adds the caller's identity to metadata. An empty principal is left unset.
+func WithPrincipalID(principal string) MetadataOption {
+	return func(m Metadata) Metadata {
+		if principal == "" {
+			m.PrincipalID = nil
+
+			return m
+		}
+
+		id := PrincipalID(principal)
+		m.PrincipalID = &id
+
+		return m
+	}
+}
+
+// WithCausationID adds the command that caused this command to metadata. When unset, the stored
+// causationId defaults to the commandId at encode time. An empty causation is left unset.
+func WithCausationID(causation CommandID) MetadataOption {
+	return func(m Metadata) Metadata {
+		if causation == "" {
+			m.CausationID = nil
+
+			return m
+		}
+
+		m.CausationID = &causation
+
+		return m
+	}
+}
+
+// WithExtension adds one application-specific extension to metadata.
+func WithExtension(key, value string) MetadataOption {
+	return func(m Metadata) Metadata {
+		if m.Extensions == nil {
+			m.Extensions = map[string]string{}
+		}
+
+		m.Extensions[key] = value
+
+		return m
+	}
+}
+
 // NewMetadata initializes a Metadata k-v store
 func NewMetadata(_ context.Context, region *string, opts ...MetadataOption) Metadata {
 	m := Metadata{}
@@ -95,4 +151,24 @@ func NewMetadata(_ context.Context, region *string, opts ...MetadataOption) Meta
 	}
 
 	return m
+}
+
+// MarshalJSON encodes metadata with the storage format's rules: every key is always written, and
+// the v0.9 keys carry their effective values — causationId is the explicitly set causation,
+// otherwise the commandId, otherwise null, and extensions is an object, {} when unset or empty.
+// Decoding stays faithful to the stored bytes and does not apply the defaults.
+func (m Metadata) MarshalJSON() ([]byte, error) {
+	type metadataWire Metadata
+
+	wire := metadataWire(m)
+	if wire.CausationID == nil && wire.CommandID != nil {
+		causation := *wire.CommandID
+		wire.CausationID = &causation
+	}
+
+	if wire.Extensions == nil {
+		wire.Extensions = map[string]string{}
+	}
+
+	return json.Marshal(wire)
 }

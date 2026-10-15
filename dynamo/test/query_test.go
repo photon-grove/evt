@@ -36,7 +36,7 @@ func (s *RepositorySuite) Test_GetEvents_Success() {
 			Type:       "test-event",
 			Version:    1,
 			Payload:    []byte{},
-			Metadata:   evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}},
+			Metadata:   evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}, Extensions: map[string]string{}},
 		},
 	}
 
@@ -89,7 +89,7 @@ func (s *RepositorySuite) Test_GetLatestEvents_Success() {
 			Type:       "test-event",
 			Version:    1,
 			Payload:    []byte{},
-			Metadata:   evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}},
+			Metadata:   evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}, Extensions: map[string]string{}},
 		},
 	}
 
