@@ -96,9 +96,16 @@ func (s *RepositorySuite) Test_GetSnapshot_Error() {
 func (s *RepositorySuite) Test_PutSnapshot_UsesMonotonicCondition() {
 	ctx := context.Background()
 
-	s.client.On("PutItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.PutItemInput) bool {
-		return in.ConditionExpression != nil && *in.ConditionExpression == "attribute_not_exists(eventSeq) OR eventSeq <= :new"
-	}), mock.Anything).Return(&dynamodb.PutItemOutput{}, nil)
+	s.client.On("TransactWriteItems", mock.Anything, mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
+		require.Len(s.T(), in.TransactItems, 2)
+		require.Equal(s.T(), absentMarkerCheck(s.repo.EventsTable), in.TransactItems[0])
+		put := in.TransactItems[1].Put
+		require.NotNil(s.T(), put)
+		require.Equal(s.T(), "attribute_not_exists(eventSeq) OR eventSeq <= :new", aws.ToString(put.ConditionExpression))
+		require.Equal(s.T(), &types.AttributeValueMemberN{Value: "6"}, put.ExpressionAttributeValues[":new"])
+		require.Equal(s.T(), &types.AttributeValueMemberN{Value: "0"}, put.Item["sk"])
+		return true
+	}), mock.Anything).Return(&dynamodb.TransactWriteItemsOutput{}, nil)
 
 	err := s.repo.PutSnapshot(ctx, "test", "id-1", []byte("{}"), 1, 6)
 	require.NoError(s.T(), err)
@@ -109,8 +116,13 @@ func (s *RepositorySuite) Test_PutSnapshot_UsesMonotonicCondition() {
 func (s *RepositorySuite) Test_PutSnapshot_NoOpOnRegression() {
 	ctx := context.Background()
 
-	s.client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
-		Return((*dynamodb.PutItemOutput)(nil), &types.ConditionalCheckFailedException{})
+	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
+		Return((*dynamodb.TransactWriteItemsOutput)(nil), &types.TransactionCanceledException{
+			CancellationReasons: []types.CancellationReason{
+				{Code: aws.String("None")},
+				{Code: aws.String("ConditionalCheckFailed")},
+			},
+		})
 
 	// A regression attempt must not surface as an error — the existing newer snapshot already covers it.
 	err := s.repo.PutSnapshot(ctx, "test", "id-1", []byte("{}"), 2, 3)
@@ -122,8 +134,8 @@ func (s *RepositorySuite) Test_PutSnapshot_NoOpOnRegression() {
 func (s *RepositorySuite) Test_PutSnapshot_PropagatesError() {
 	ctx := context.Background()
 
-	s.client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
-		Return((*dynamodb.PutItemOutput)(nil), errors.New("put failed"))
+	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
+		Return((*dynamodb.TransactWriteItemsOutput)(nil), errors.New("put failed"))
 
 	err := s.repo.PutSnapshot(ctx, "test", "id-1", []byte("{}"), 1, 6)
 	require.Error(s.T(), err)

@@ -280,6 +280,51 @@ func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 	client.AssertExpectations(s.T())
 }
 
+// A successful Declare must invalidate this instance's cached validation, even when it
+// declares a feature the writer cannot use. Later set-only declarations preserve durable features.
+func (s *FeatureMarkerSuite) Test_Declare_SameInstanceRevalidatesUnsupportedFeature() {
+	ctx := context.Background()
+	client := dynamo_mock.NewClient()
+	marker := dynamo.NewFeatureMarker(client, "test-events", nil)
+	repo := dynamo.NewRepository(client, "test-events").WithFeatureMarker(marker)
+
+	expectManifest(client, nil)
+	var first dynamodb.TransactWriteItemsInput
+	expectCommit(client, &first)
+	require.NoError(s.T(), s.commit(repo, "acct-1"))
+
+	expectManifest(client, nil)
+	client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.PutItemOutput{}, nil).Once()
+	_, err := marker.Declare(ctx, func(m *evt.FeatureManifest) { m.Features["journal"] = 1 })
+	require.NoError(s.T(), err)
+
+	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
+	err = s.commit(repo, "acct-2")
+	require.True(s.T(), evt.IsUnsupportedFeatureErr(err), "expected unsupported feature refusal, got %v", err)
+	client.AssertNumberOfCalls(s.T(), "TransactWriteItems", 1)
+
+	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
+	client.On("PutItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.PutItemInput) bool {
+		features, featuresOK := in.Item["features"].(*types.AttributeValueMemberS)
+		history, historyOK := in.Item["historyDependent"].(*types.AttributeValueMemberS)
+		return featuresOK && historyOK && aws.ToString(in.ConditionExpression) == "version = :observed" &&
+			features.Value == `{"journal":1}` && history.Value == `["audit-feed"]`
+	}), mock.Anything).Return(&dynamodb.PutItemOutput{}, nil).Once()
+	manifest, err := marker.Declare(ctx, func(m *evt.FeatureManifest) {
+		m.HistoryDependent = []evt.EntityType{"audit-feed"}
+	})
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(2), manifest.Version)
+	require.Equal(s.T(), map[string]evt.FeatureFormat{"journal": 1}, manifest.Features)
+
+	expectManifest(client, markerItem(2, `{"journal":1}`, `["audit-feed"]`, ""))
+	err = s.commit(repo, "acct-3")
+	require.True(s.T(), evt.IsUnsupportedFeatureErr(err), "set-only declaration must not erase unsupported durable features: %v", err)
+	client.AssertNumberOfCalls(s.T(), "TransactWriteItems", 1)
+	client.AssertExpectations(s.T())
+}
+
 // Test_CompactBelow_RefusesHistoryDependentType asserts compaction refuses an entity type declared
 // history-dependent in the durable manifest, before deleting anything.
 func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
@@ -306,7 +351,7 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
 	require.Error(s.T(), err)
 	require.True(s.T(), evt.IsHistoryDependentProjectionErr(err), "expected HistoryDependentProjectionError, got %v", err)
 	require.Equal(s.T(), 0, deleted)
-	client.AssertNotCalled(s.T(), "BatchWriteItem", mock.Anything, mock.Anything, mock.Anything)
+	client.AssertNotCalled(s.T(), "TransactWriteItems", mock.Anything, mock.Anything, mock.Anything)
 }
 
 // Test_CompactBelow_ProceedsWithoutMarker asserts compaction proceeds when no manifest declares
@@ -338,8 +383,8 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_ProceedsWithoutMarker() {
 			},
 		}}, nil).Once()
 
-	client.On("BatchWriteItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.BatchWriteItemOutput{}, nil).Once()
+	client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.TransactWriteItemsOutput{}, nil).Once()
 
 	deleted, err := repo.CompactBelow(context.Background(), "acct-1", 1)
 	require.NoError(s.T(), err)

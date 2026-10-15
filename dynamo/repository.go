@@ -21,7 +21,7 @@ type Repository struct {
 	retention      Retention
 	now            func() time.Time // clock for TTL expiry; nil means time.Now
 	logger         *slog.Logger
-	features       *FeatureMarker // nil when the store does not enforce the feature manifest (C9)
+	features       *FeatureMarker // mandatory feature validation (C9)
 }
 
 // Retention maps entity types to TTL durations for events and inline snapshots. Other rows have no
@@ -43,7 +43,8 @@ func NewRepository(client Client, eventsTable string) *Repository {
 		opts.TagKey = tagKey
 	})
 
-	return &Repository{EventsTable: eventsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true}
+	return &Repository{EventsTable: eventsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true,
+		features: NewFeatureMarker(client, eventsTable, nil)}
 }
 
 // WithLogger returns a shallow copy of the repository with the logger updated.
@@ -119,10 +120,15 @@ func (repo *Repository) WithClock(now func() time.Time) *Repository {
 // using an extension this writer does not model) fails the check and re-validates; an unsupported
 // pair refuses the writer outright.
 //
-// Without this option commits are unchanged: no marker item is written and no manifest is read.
+// Without this option the mandatory marker check supports no extensions. A nil marker resets
+// that default; it never disables enforcement.
 func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
 	r := *repo
 	r.features = marker
+	if r.features == nil {
+		r.features = NewFeatureMarker(r.client, r.EventsTable, nil)
+	}
+
 	return &r
 }
 

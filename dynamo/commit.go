@@ -132,12 +132,8 @@ func (repo *Repository) CommitStream(
 		batchEvents []evt.SerializedEvent
 	)
 
-	// Every commit carries the feature-marker check when the store enforces the manifest, so each
-	// batch costs one more transaction item.
-	markerItems := 0
-	if repo.features != nil {
-		markerItems = 1
-	}
+	// Every batch reserves one item for the mandatory feature-marker check.
+	const markerItems = 1
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -376,19 +372,16 @@ func (repo *Repository) commitEventsWithTransaction(
 
 	// Every v0.9 commit carries the feature-marker ConditionCheck, ordered before every other
 	// item so the transaction layout stays pinned across implementations (storage spec, Writes).
-	control := make([]types.TransactWriteItem, 0, 1)
-	if repo.features != nil {
-		if verr := repo.features.Validate(ctx); verr != nil {
-			return verr
-		}
-
-		check, cerr := repo.features.checkItem()
-		if cerr != nil {
-			return cerr
-		}
-
-		control = append(control, check)
+	if verr := repo.features.Validate(ctx); verr != nil {
+		return verr
 	}
+
+	check, cerr := repo.features.checkItem()
+	if cerr != nil {
+		return cerr
+	}
+
+	control := []types.TransactWriteItem{check}
 
 	// Combine the two, with included transaction items first
 	combined := make([]types.TransactWriteItem, 0, len(control)+len(transactItems)+len(writeItems))

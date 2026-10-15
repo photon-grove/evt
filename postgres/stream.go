@@ -16,11 +16,11 @@ func (repo *Repository) streamEventsByEntity(
 	filter evt.StreamFilter,
 	onBatch func([]evt.SerializedEvent) error,
 ) error {
-	query := fmt.Sprintf(`SELECT %s FROM %s`, eventColumns, repo.eventsTable)
+	query := fmt.Sprintf(`SELECT %s FROM %s WHERE `+reservedExclusion, eventColumns, repo.eventsTable)
 
 	var args []any
 	if filter.EntityType != "" {
-		query += ` WHERE entity_type = $1`
+		query += ` AND entity_type = $1`
 		args = append(args, string(filter.EntityType))
 	}
 

@@ -396,6 +396,7 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 
 - Bounded, newest-first read of an entity's last `limit` events (storage spec, latest(n); ADR-0004
   C8) — for "recent activity" reads that must not replay a long stream. No item shape changes.
+  Invalid limits return `*evt.InvalidArgumentError`, matchable with `errors.Is(err, evt.ErrInvalidArgument)`, before I/O.
 - DynamoDB: one descending query (`ScanIndexForward = false`, `Limit = n`) whose `sk > 0` key
   condition excludes the snapshot item; when a page closes early (large items), the reader keeps
   paging until it has collected `n` items or the stream runs out. PostgreSQL: `ORDER BY sequence
@@ -423,28 +424,33 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 
 - A store declares the extensions it uses on the reserved `SYSTEM#FEATURES` marker row (storage
   spec, Feature Marker): `version` (bumped by exactly one per declaration transaction), `features`
-  (JSON object, feature name → stored-format version, keys sorted), and two sorted JSON-array sets,
+  (JSON object, feature name → stored-format version, keys sorted), and two sorted, deduplicated JSON-array sets,
   `historyDependent` and `retention`, each omitted when empty. On PostgreSQL the row lives in the
   derived `{events}__evt_features` table and holds the same JSON text.
 - Any writer that does not support a declared `(name, formatVersion)` pair refuses to write, with a
   typed `evt.UnsupportedFeatureError`.
-- Every commit on a store that enforces the manifest carries a `ConditionCheck` on the marker
+- Every DynamoDB commit, including each `CommitStream` batch, carries a mandatory `ConditionCheck` on the marker
   (`attribute_not_exists(pk) OR version = :v`; a store that never declared features validates
   against `attribute_not_exists(pk)`), ordered first in the transaction. A writer validates the
   feature set once, at first write, and caches the version; a declaration bumps the version in the
   same conditional write that updates the feature set, so every writer cached at the old version
   fails, re-validates, and retries (typed via `evt.ErrFeatureManifestChanged`, classified
   transient); a re-validation that finds an unsupported pair refuses outright.
-- Enforcement is opt-in per repository instance until the v0.9 store wiring lands: a repository
-  built without a feature marker writes exactly the pre-v0.9 transaction shape. Enable it with
-  `dynamo.Repository.WithFeatureMarker` / `postgres.Repository.WithFeatureMarker` around a
-  `dynamo.NewFeatureMarker` / `postgres.NewFeatureMarker` constructed with the (feature,
-  formatVersion) pairs the writer models.
+- Enforcement is unconditional. Default repositories support no extensions;
+  `WithFeatureMarker` customizes the supported set, never disables the check. PostgreSQL holds
+  the shared feature advisory lock across validation and writes in the same transaction.
+  Unquoted table names are lowercase-canonicalized, including the feature-lock key.
+- Declaration invalidates cached writer validation; declaring a feature does not imply support.
+  `PutSnapshot` obeys the same refusal atomically: a DynamoDB marker check and snapshot put in
+  one transaction, or PostgreSQL validation under the shared feature lock in the write transaction.
 - `CompactBelow` reads `historyDependent` (strongly consistent on DynamoDB, regardless of
   `WithConsistentRead`) and refuses an entity type in the set with a typed
   `evt.HistoryDependentProjectionError` before deleting anything — in every process that opens the
   log, whether or not it registered the projector. A table with no marker row declares nothing and
-  compaction proceeds as it always has.
+  compaction proceeds. PostgreSQL retains the shared feature lock through all deletes; DynamoDB
+  uses transactional batches of at most 99 deletes plus a check on the observed marker version
+  (or absence). A changed marker is re-read and re-validated before retrying a delete batch.
+  A completed history-dependent declaration therefore fences in-flight compaction.
 
 ### GetSnapshot
 

@@ -188,9 +188,11 @@ func testGetRecentEvents(t *testing.T, repo evt.Repository) {
 
 	// A limit below 1 is a programmer error returned before any request.
 	_, err = repo.GetRecentEvents(ctx, id, 0)
-	require.Error(t, err)
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+	var invalid *evt.InvalidArgumentError
+	require.ErrorAs(t, err, &invalid)
 	_, err = repo.GetRecentEvents(ctx, id, -1)
-	require.Error(t, err)
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
 
 	// An unknown stream returns no events.
 	missing, err := repo.GetRecentEvents(ctx, evt.EntityID(ns+"-missing"), 3)

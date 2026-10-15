@@ -184,7 +184,7 @@ func (m *FeatureMarker) Declare(
 
 		_, err = m.client.PutItem(ctx, input)
 		if err == nil {
-			m.cacheVersion(current.Version, true)
+			m.invalidate()
 
 			return current, nil
 		}

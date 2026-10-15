@@ -188,6 +188,11 @@ trim them safely:
   stream then fails with a conflict. For accumulating streams, keep a snapshot and
   compact instead.
 
+All durable Go repositories enforce the [feature marker](docs/spec/storage-format.md#feature-marker)
+by default, with no supported extensions. Unsupported declarations refuse commits and standalone
+snapshot writes atomically; history-dependent declarations fence compaction across handles.
+`WithFeatureMarker` customizes the supported set, not whether enforcement runs.
+
 The raw `dynamo.Delete` is snapshot-unsafe, for local fixtures only, and excluded
 from production builds (`-tags prod`). See
 [`BEHAVIORAL_INVARIANTS.md`](BEHAVIORAL_INVARIANTS.md) for the exact serialization

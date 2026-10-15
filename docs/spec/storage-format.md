@@ -932,7 +932,7 @@ are `journal` and `journal-compaction` (the Rust-first extensions, ADR 0005), bo
 version 1. The `historyDependent` set declares the entity types whose commit-wide projectors are
 history-dependent ([Views](#views)) — compaction is forbidden for them; the `retention` set
 declares the entity types configured with retention (a positive `ttl`) — fences are refused for
-them ([Read Fences](#read-fences)). Both sets are JSON arrays of entity-type names, sorted,
+them ([Read Fences](#read-fences)). Both sets are JSON arrays of entity-type names, sorted and deduplicated,
 encoded with the shared JSON rules, stored as strings; an absent attribute is an empty set. Both
 declarations are **durable, shared state**, not per-process registration: every writer and
 maintenance tool that opens the log observes the same sets, which is what makes the compaction
@@ -968,7 +968,10 @@ write, and caches the version it validated: a table with no marker validates aga
 feature set**, so every writer whose commits condition on the old version fails and re-validates;
 at re-validation an unsupported writer reads the feature set, sees a `(name, formatVersion)` pair
 it does not support, and refuses. The check costs one transaction item per commit
-([Writes](#writes)).
+([Writes](#writes)). Standalone snapshot writes follow the same refusal protocol atomically:
+DynamoDB includes the marker check and snapshot put in one transaction; PostgreSQL validates
+under the shared feature advisory lock held through the snapshot-write transaction. Declaration
+invalidates cached validation: declaring a feature is not proof that the declaring writer supports it.
 
 The declaration itself is a conditional write. Creating the row asserts `attribute_not_exists(pk)`
 and writes **`version = 1`**; updating it asserts `version = :observed`, writes the merged feature
@@ -984,7 +987,12 @@ the row itself, so they hold for every process that opens the log:
   of the repository's read-consistency setting, so the check cannot miss a just-written set — and
   refuses an entity whose type appears in the set with a typed `HistoryDependentProjection` error
   before deleting anything ([Views](#views)). A maintenance tool that never registered the
-  projector refuses all the same. On a table with no marker row there is nothing declared and
+  projector refuses all the same. PostgreSQL holds the shared feature advisory lock across
+  validation and all deletes in one transaction. DynamoDB deletes in transactions of at most
+  99 events plus a check on the observed marker (`version = :observed`, or
+  `attribute_not_exists(pk)` when absent); a failed check re-reads and re-validates before retrying.
+  Thus a completed history-dependent declaration fences an in-flight compactor, not merely future
+  compactor starts. On a table with no marker row there is nothing declared and
   compaction proceeds, as it always has; a pre-v0.9 writer that knows nothing of the manifest
   cannot be stopped, and the guarantee binds v0.9 writers as everywhere else in this section.
 - A fenced read refuses an entity type in `retention` with a typed `RetentionConflict` error
@@ -1208,7 +1216,10 @@ infix also renames the pre-v0.9 entity-type index, whose old `{events}_entity_ty
 was collision-prone the same way; a schema upgraded from a pre-v0.9 release recreates the index
 under the new name. Both implementations validate a derived name by the same rules as a
 configured one. Names are interpolated unquoted, so both reject names that are not plain
-identifiers or are PostgreSQL reserved keywords. The configured events table name must be at
+identifiers or are PostgreSQL reserved keywords. Validated unquoted names are canonicalized to
+lowercase before deriving engine advisory-lock keys, so differently cased handles share locks.
+The snapshots table name is at most **58 bytes**, leaving room for its `_pkey` index.
+The configured events table name must be at
 most **34 bytes** — both implementations return a validation error at construction otherwise —
 so every derived name fits PostgreSQL's 63-byte identifier limit without truncation. The longest
 derived relation name, `{events}__evt_rebuild_generation_pkey`, adds 29 bytes to the base name

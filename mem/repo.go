@@ -196,7 +196,7 @@ func (repo Repository) GetRecentEvents(
 	limit int,
 ) ([]evt.SerializedEvent, error) {
 	if limit < 1 {
-		return nil, fmt.Errorf("mem: limit must be at least 1, got %d", limit)
+		return nil, &evt.InvalidArgumentError{Argument: "limit", Message: fmt.Sprintf("must be at least 1, got %d", limit)}
 	}
 
 	id := string(entityID)

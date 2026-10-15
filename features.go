@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -174,11 +175,12 @@ func (m FeatureManifest) RetentionJSON() (string, error) {
 	return entityTypeSetJSON(m.Retention)
 }
 
-// entityTypeSetJSON sorts a copy of the set and encodes it as a JSON array of strings.
+// entityTypeSetJSON sorts and deduplicates a copy of the set before encoding it.
 func entityTypeSetJSON(set []EntityType) (string, error) {
 	sorted := make([]EntityType, len(set))
 	copy(sorted, set)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
 
 	data, err := json.Marshal(sorted)
 	if err != nil {

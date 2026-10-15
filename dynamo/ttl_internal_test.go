@@ -115,13 +115,18 @@ func Test_PutSnapshot_StampsTTLForPolicyType(t *testing.T) {
 	fixed := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
 	client := dynamock.NewClient()
 
-	var captured *dynamodb.PutItemInput
-	client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.PutItemOutput{}, nil).
+	client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.GetItemOutput{}, nil).Once()
+
+	var captured *types.Put
+	client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.TransactWriteItemsOutput{}, nil).
 		Run(func(args mock.Arguments) {
-			input, ok := args.Get(1).(*dynamodb.PutItemInput)
+			input, ok := args.Get(1).(*dynamodb.TransactWriteItemsInput)
 			require.True(t, ok)
-			captured = input
+			require.Len(t, input.TransactItems, 2)
+			require.NotNil(t, input.TransactItems[0].ConditionCheck)
+			captured = input.TransactItems[1].Put
 		})
 
 	repo := NewRepository(client, "events").
@@ -139,13 +144,18 @@ func Test_PutSnapshot_StampsTTLForPolicyType(t *testing.T) {
 func Test_PutSnapshot_NoTTLForUnpolicedType(t *testing.T) {
 	client := dynamock.NewClient()
 
-	var captured *dynamodb.PutItemInput
-	client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.PutItemOutput{}, nil).
+	client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.GetItemOutput{}, nil).Once()
+
+	var captured *types.Put
+	client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.TransactWriteItemsOutput{}, nil).
 		Run(func(args mock.Arguments) {
-			input, ok := args.Get(1).(*dynamodb.PutItemInput)
+			input, ok := args.Get(1).(*dynamodb.TransactWriteItemsInput)
 			require.True(t, ok)
-			captured = input
+			require.Len(t, input.TransactItems, 2)
+			require.NotNil(t, input.TransactItems[0].ConditionCheck)
+			captured = input.TransactItems[1].Put
 		})
 
 	repo := NewRepository(client, "events").

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/photon-grove/evt"
 )
 
@@ -11,12 +12,12 @@ import (
 // store's durable feature manifest. The refusal holds in every process that opens the log, whether
 // or not it registered the projector or configured a feature marker. A log with no marker row
 // declares nothing and compaction proceeds as it always has.
-func (repo *Repository) checkHistoryDependent(ctx context.Context, entityType evt.EntityType) error {
-	if entityType == "" {
-		return nil
+func (repo *Repository) checkHistoryDependent(ctx context.Context, tx pgx.Tx, entityType evt.EntityType) error {
+	if err := repo.features.lockShared(ctx, tx); err != nil {
+		return err
 	}
 
-	manifest, err := NewFeatureMarker(repo.db, repo.eventsTable, nil).Manifest(ctx)
+	manifest, err := repo.features.readManifestTx(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -61,13 +62,6 @@ func (repo *Repository) CompactBelow(
 		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
 	}
 
-	// A durable refusal: the manifest's historyDependent set forbids compaction for the entity's
-	// type in every process that opens the log, whether or not it registered the projector.
-	err = repo.checkHistoryDependent(ctx, snapshot.EntityType)
-	if err != nil {
-		return 0, err
-	}
-
 	if snapshot.EventSequence < throughSequence {
 		return 0, fmt.Errorf(
 			"%w: entity %s snapshot covers through event %d but compaction was requested through %d",
@@ -80,10 +74,26 @@ func (repo *Repository) CompactBelow(
 		repo.eventsTable,
 	)
 
-	tag, err := repo.db.Exec(ctx, query, string(entityID), int64(throughSequence))
+	deleted := 0
+	err = repo.inTx(ctx, func(tx pgx.Tx) error {
+		// Hold the shared feature lock across validation and every delete: a completed
+		// history-dependent declaration must fence any later deletion.
+		if checkErr := repo.checkHistoryDependent(ctx, tx, snapshot.EntityType); checkErr != nil {
+			return checkErr
+		}
+
+		tag, deleteErr := tx.Exec(ctx, query, string(entityID), int64(throughSequence))
+		if deleteErr != nil {
+			return fmt.Errorf("postgres: compact below: %w", deleteErr)
+		}
+
+		deleted = int(tag.RowsAffected())
+
+		return nil
+	})
 	if err != nil {
-		return 0, fmt.Errorf("postgres: compact below: %w", err)
+		return 0, err
 	}
 
-	return int(tag.RowsAffected()), nil
+	return deleted, nil
 }

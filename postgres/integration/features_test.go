@@ -35,10 +35,12 @@ func newIsolatedEventLog(ctx context.Context, t *testing.T) (*postgres.Repositor
 	require.NoError(t, repo.EnsureSchema(ctx))
 
 	t.Cleanup(func() {
-		pool := newPool(ctx, t)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool := newPool(cleanupCtx, t)
 		for _, table := range []string{name, name + "_snapshots", name + "__evt_features"} {
 			// Best-effort teardown of a test-only log.
-			_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS "+table) //nolint:errcheck // best-effort teardown
+			_, _ = pool.Exec(cleanupCtx, "DROP TABLE IF EXISTS "+table) //nolint:errcheck // best-effort teardown
 		}
 	})
 
@@ -242,16 +244,16 @@ func Test_Namespaces(t *testing.T) {
 		// directly the way an engine row (or a pre-v0.9 stream) would appear.
 		_, err := newPool(ctx, t).Exec(ctx, fmt.Sprintf(
 			`INSERT INTO %s (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
-			 VALUES ($1, 1, $1 || ':1', 'outcome', 1, 'engine', '{}'::bytea, '{}'::jsonb)
+			 VALUES ($1, 1, $1 || ':1', 'outcome', 1, $2, '{}'::bytea, '{}'::jsonb)
 			 ON CONFLICT (entity_id, sequence) DO NOTHING`,
-			eventsName), evt.CommandOutcomeNamespacePrefix+"cmd-"+ns)
+			eventsName), evt.CommandOutcomeNamespacePrefix+"cmd-"+ns, string(entityType))
 		require.NoError(t, err)
 
 		_, err = newPool(ctx, t).Exec(ctx, fmt.Sprintf(
 			`INSERT INTO %s (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
-			 VALUES ($1, 1, $1 || ':1', 'legacy', 1, 'legacy', '{}'::bytea, '{}'::jsonb)
+			 VALUES ($1, 1, $1 || ':1', 'legacy', 1, $2, '{}'::bytea, '{}'::jsonb)
 			 ON CONFLICT (entity_id, sequence) DO NOTHING`,
-			eventsName), evt.SystemNamespacePrefix+"legacy-"+ns)
+			eventsName), evt.SystemNamespacePrefix+"legacy-"+ns, string(entityType))
 		require.NoError(t, err)
 
 		events, err := repo.GetEvents(ctx, id)
@@ -264,11 +266,26 @@ func Test_Namespaces(t *testing.T) {
 		require.NotContains(t, heads, evt.EntityID(evt.CommandOutcomeNamespacePrefix+"cmd-"+ns))
 		require.Contains(t, heads, id)
 
-		count := 0
-		for range repo.StreamAllEvents(ctx, evt.StreamFilter{EntityType: entityType}) {
-			count++
+		for _, filter := range []evt.StreamFilter{{}, {EntityType: entityType}} {
+			count := 0
+			for r := range repo.StreamAllEvents(ctx, filter) {
+				batch, err := r.Unwrap()
+				require.NoError(t, err)
+				require.Len(t, batch, 1)
+				require.Equal(t, id, batch[0].EntityID)
+				count++
+			}
+			require.Equal(t, 1, count, "reserved rows never surface in enumeration")
+
+			count = 0
+			for r := range repo.StreamEntities(ctx, filter, applyTestEvent) {
+				entity, err := r.Unwrap()
+				require.NoError(t, err)
+				require.Equal(t, id, entity.GetID())
+				count++
+			}
+			require.Equal(t, 1, count)
 		}
-		require.Equal(t, 1, count, "reserved rows never surface in enumeration")
 	})
 
 	t.Run("GetRecentEventsNewestFirst", func(t *testing.T) {

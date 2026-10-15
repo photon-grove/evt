@@ -9,6 +9,7 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 | ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. The v0.9 scenarios (C1–C10) that E2.8/E3.8 must add are listed in the [storage format](../docs/spec/storage-format.md#compat-scenarios-to-add). |
 | `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
+| `fixtures/feature-marker.json` | Go generator | C9 canonical manifest JSON, complete DynamoDB marker items, PostgreSQL declaration rows, ordered commit requests, and schema-upgrade DDL. |
 | `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items, SNS messages, sequences, and loaded state.                                                                                             |
 
 Both sides implement the same account domain: `internal/compat/account.go` and

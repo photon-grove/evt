@@ -65,7 +65,7 @@ func (s *RepositorySuite) Test_Commit_Ok() {
 		},
 	}
 
-	input := dynamodb.TransactWriteItemsInput{TransactItems: expected}
+	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{absentMarkerCheck(s.repo.EventsTable)}, expected...)}
 
 	// Return an empty output object, because the result isn't used
 	output := new(dynamodb.TransactWriteItemsOutput)
@@ -131,7 +131,7 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 		},
 	}
 
-	input := dynamodb.TransactWriteItemsInput{TransactItems: expected}
+	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{absentMarkerCheck(s.repo.EventsTable)}, expected...)}
 
 	// Return an empty output object, because the result isn't used
 	output := new(dynamodb.TransactWriteItemsOutput)
@@ -222,7 +222,11 @@ func (s *RepositorySuite) Test_CommitStream_OneFloorCheckPerStream() {
 	capture := mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
 		for _, item := range in.TransactItems {
 			if item.ConditionCheck != nil {
-				checks = append(checks, item.ConditionCheck)
+				pk, ok := item.ConditionCheck.Key["pk"].(*types.AttributeValueMemberS)
+				require.True(s.T(), ok)
+				if pk.Value != "SYSTEM#FEATURES" {
+					checks = append(checks, item.ConditionCheck)
+				}
 			}
 		}
 
@@ -400,6 +404,7 @@ func (s *RepositorySuite) Test_Commit_ConditionalCheckFailure() {
 
 	conditionalCheckErr := &types.TransactionCanceledException{
 		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory marker check
 			{Code: aws.String("ConditionalCheckFailed")},
 		},
 	}

@@ -54,9 +54,11 @@ func init() {
 	}
 }
 
-// maxTableNameLen is the longest table name allowed. PostgreSQL truncates identifiers to 63 bytes,
-// and the longest name derived from a table name, "{events}_entity_type_idx", adds 16.
-const maxTableNameLen = 63 - len("_entity_type_idx")
+// Keep every derived relation within PostgreSQL's 63-byte identifier limit.
+const (
+	maxEventsTableNameLen    = 63 - len("__evt_rebuild_generation_pkey")
+	maxSnapshotsTableNameLen = 63 - len("_pkey")
+)
 
 // entityLockQuery takes the per-entity transaction lock ($1 is the entity ID) that serializes
 // commits and snapshot writes for one entity, so a snapshot cannot raise the floor while a commit
@@ -68,16 +70,21 @@ const entityLockQuery = "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))"
 func validIdentifier(name string) bool {
 	_, reserved := reservedKeywords[strings.ToLower(name)]
 
-	return len(name) <= maxTableNameLen && identifierPattern.MatchString(name) && !reserved
+	return len(name) <= 63 && identifierPattern.MatchString(name) && !reserved
 }
 
 // sharedRelationName returns a name that two relations created by EnsureSchema would share, or ""
-// when there is none: the tables, "{events}_entity_type_idx", and each table's "{table}_pkey".
+// when there is none: the tables, the reserved entity-type index, and each table's primary key.
 // CREATE TABLE IF NOT EXISTS would otherwise skip a table whose name an index already took.
 // Unquoted identifiers fold to lower case, so names are compared that way.
 func sharedRelationName(eventsTable, snapshotsTable string) string {
 	events, snapshots := strings.ToLower(eventsTable), strings.ToLower(snapshotsTable)
-	relations := []string{events, events + "_pkey", events + "_entity_type_idx", snapshots, snapshots + "_pkey"}
+	relations := make([]string, 0, 13)
+	relations = append(relations, events, events+"_pkey", events+"__evt_entity_type_idx", snapshots, snapshots+"_pkey")
+	for _, suffix := range []string{"command_outcomes", "features", "rebuild_lock", "rebuild_generation"} {
+		name := events + reservedInfix + suffix
+		relations = append(relations, name, name+"_pkey")
+	}
 
 	for i, relation := range relations {
 		if slices.Contains(relations[:i], relation) {
@@ -123,7 +130,7 @@ type Repository struct {
 	db             DB
 	eventsTable    string
 	snapshotsTable string
-	features       *FeatureMarker // nil when the store does not enforce the feature manifest (C9)
+	features       *FeatureMarker // mandatory feature validation (C9)
 }
 
 // Compile-time checks that the Repository satisfies the core contract and every optional capability
@@ -160,10 +167,14 @@ func WithSnapshotsTable(name string) Option {
 // another writer (say, a Rust service using an extension this writer does not model) fails the
 // check and re-validates; an unsupported pair refuses the writer outright.
 //
-// Without this option commits are unchanged: no manifest is read.
+// The default marker supports no extensions. Passing nil restores that default; it never
+// disables enforcement.
 func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
 	r := *repo
 	r.features = marker
+	if r.features == nil {
+		r.features = NewFeatureMarker(r.db, r.eventsTable, nil)
+	}
 
 	return &r
 }
@@ -182,9 +193,15 @@ func NewRepository(db DB, opts ...Option) *Repository {
 		opt(repo)
 	}
 
-	for _, name := range []string{repo.eventsTable, repo.snapshotsTable} {
-		if !validIdentifier(name) {
-			panic(fmt.Sprintf("postgres: invalid table name %q", name))
+	for _, table := range []struct {
+		name   string
+		maxLen int
+	}{
+		{repo.eventsTable, maxEventsTableNameLen},
+		{repo.snapshotsTable, maxSnapshotsTableNameLen},
+	} {
+		if !validIdentifier(table.name) || len(table.name) > table.maxLen {
+			panic(fmt.Sprintf("postgres: invalid table name %q", table.name))
 		}
 	}
 
@@ -201,6 +218,10 @@ func NewRepository(db DB, opts ...Option) *Repository {
 		panic(fmt.Sprintf("postgres: tables %q and %q would both use the name %q",
 			repo.eventsTable, repo.snapshotsTable, shared))
 	}
+
+	repo.eventsTable = strings.ToLower(repo.eventsTable)
+	repo.snapshotsTable = strings.ToLower(repo.snapshotsTable)
+	repo.features = NewFeatureMarker(db, repo.eventsTable, nil)
 
 	return repo
 }
@@ -232,7 +253,17 @@ CREATE TABLE IF NOT EXISTS %[1]s (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (entity_id, sequence)
 );
-CREATE INDEX IF NOT EXISTS %[1]s_entity_type_idx ON %[1]s (entity_type);
+CREATE INDEX IF NOT EXISTS %[1]s__evt_entity_type_idx ON %[1]s (entity_type);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_index
+        WHERE indexrelid = to_regclass('%[1]s_entity_type_idx')
+          AND indrelid = '%[1]s'::regclass
+    ) THEN
+        DROP INDEX %[1]s_entity_type_idx;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS %[2]s (
     entity_id      text   PRIMARY KEY,
@@ -416,7 +447,7 @@ func (repo *Repository) GetRecentEvents(
 	limit int,
 ) ([]evt.SerializedEvent, error) {
 	if limit < 1 {
-		return nil, fmt.Errorf("postgres: limit must be at least 1, got %d", limit)
+		return nil, &evt.InvalidArgumentError{Argument: "limit", Message: fmt.Sprintf("must be at least 1, got %d", limit)}
 	}
 
 	query := fmt.Sprintf(
@@ -469,14 +500,10 @@ func (repo *Repository) GetSnapshot(
 	return &snapshot, nil
 }
 
-// checkFeatures runs the commit-time feature-marker check when the store enforces the manifest.
+// checkFeatures runs the mandatory commit-time feature-marker check.
 // It runs after the per-entity locks, before the inserts, matching the control-checks-first order
 // the DynamoDB transaction pins.
 func (repo *Repository) checkFeatures(ctx context.Context, tx pgx.Tx) error {
-	if repo.features == nil {
-		return nil
-	}
-
 	return repo.features.checkInTx(ctx, tx)
 }
 

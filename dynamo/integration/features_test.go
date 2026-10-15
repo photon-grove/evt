@@ -47,7 +47,9 @@ func newIsolatedEventLog(ctx context.Context, t *testing.T) (*dynamo.Repository,
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		_, _ = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(name)}) //nolint:errcheck // best-effort teardown of a test-only table
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = client.DeleteTable(cleanupCtx, &dynamodb.DeleteTableInput{TableName: aws.String(name)}) //nolint:errcheck // best-effort teardown of a test-only table
 	})
 
 	require.Eventually(t, func() bool {

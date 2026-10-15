@@ -4,9 +4,43 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
+
+// PutSnapshot advances a durable snapshot without regressing its floor. The shared feature lock
+// is held in the write transaction so an unsupported declaration cannot race the maintenance write.
+func (repo *Repository) PutSnapshot(
+	ctx context.Context,
+	entityType evt.EntityType,
+	entityID evt.EntityID,
+	payload []byte,
+	snapshotSequence evt.EventSequence,
+	eventSequence evt.EventSequence,
+) error {
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return err
+	}
+
+	return repo.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, entityLockQuery, string(entityID)); err != nil {
+			return classifyWriteError(fmt.Errorf("postgres: lock snapshot: %w", err))
+		}
+
+		if err := repo.checkFeatures(ctx, tx); err != nil {
+			return err
+		}
+
+		return repo.upsertSnapshot(ctx, tx, evt.SerializedSnapshot{
+			EntityType:    entityType,
+			EntityID:      entityID,
+			Payload:       payload,
+			Sequence:      snapshotSequence,
+			EventSequence: eventSequence,
+		})
+	})
+}
 
 // StreamEntitiesFromSnapshots streams completed entities, seeding each from its durable snapshot and
 // applying only the events recorded after that snapshot. Streams with no snapshot fall back to full

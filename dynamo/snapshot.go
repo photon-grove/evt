@@ -2,7 +2,6 @@ package dynamo
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 
@@ -44,7 +43,7 @@ func (repo *Repository) getSnapshot(
 	return snapshot, nil
 }
 
-// PutSnapshot writes a snapshot directly using PutItem (no transaction).
+// PutSnapshot writes a snapshot and the mandatory feature-marker check in one transaction.
 // Snapshots are stored inline in the event-log table at sk=0.
 // This is intended for use by projectors and background processes that need to
 // write snapshots outside of the transactional command handler flow.
@@ -84,7 +83,7 @@ func (repo *Repository) PutSnapshot(
 		return fmt.Errorf("error marshalling snapshot to map: %w", err)
 	}
 
-	input := &dynamodb.PutItemInput{
+	put := &types.Put{
 		TableName: &repo.EventsTable,
 		Item:      item,
 		// Monotonic floor: allow the write only when no snapshot exists yet or the stored snapshot's
@@ -96,12 +95,27 @@ func (repo *Repository) PutSnapshot(
 		},
 	}
 
-	_, err = repo.client.PutItem(ctx, input)
+	if err = repo.features.Validate(ctx); err != nil {
+		return err
+	}
+
+	check, err := repo.features.checkItem()
 	if err != nil {
-		// A newer-or-equal snapshot already exists; the write would regress the floor, so skip it.
-		var condFailed *types.ConditionalCheckFailedException
-		if errors.As(err, &condFailed) {
-			return nil
+		return err
+	}
+
+	_, err = repo.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{check, {Put: put}},
+	})
+	if err != nil {
+		if failed, index := HasConditionalCheckFailure(err); failed {
+			if index == 0 {
+				return repo.features.handleCheckFailure(ctx, err)
+			}
+			if index == 1 {
+				// A newer snapshot already covers this regressing maintenance write.
+				return nil
+			}
 		}
 
 		return fmt.Errorf("failed to put snapshot: %w", err)

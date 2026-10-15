@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/jackc/pgx/v5"
@@ -51,7 +52,7 @@ type FeatureMarker struct {
 func NewFeatureMarker(db DB, eventsTable string, supported evt.SupportedFeatures) *FeatureMarker {
 	return &FeatureMarker{
 		db:          db,
-		eventsTable: eventsTable,
+		eventsTable: strings.ToLower(eventsTable),
 		supported:   supported,
 	}
 }
@@ -193,7 +194,7 @@ func (m *FeatureMarker) Declare(
 		return evt.FeatureManifest{}, classifyWriteError(fmt.Errorf("features: declare commit: %w", err))
 	}
 
-	m.cacheVersion(current.Version, true)
+	m.invalidate()
 
 	return current, nil
 }
@@ -238,9 +239,8 @@ func (m *FeatureMarker) readManifestTx(ctx context.Context, tx pgx.Tx) (*evt.Fea
 // commits compare the stored version against the cache, and any difference (a row that changed, or
 // one that appeared after the writer validated an empty table) fails the check.
 func (m *FeatureMarker) checkInTx(ctx context.Context, tx pgx.Tx) error {
-	sharedLock := fmt.Sprintf(`SELECT pg_advisory_xact_lock_shared(%d, hashtext($1))`, engineRowLockClass)
-	if _, err := tx.Exec(ctx, sharedLock, m.eventsTable+":features"); err != nil {
-		return fmt.Errorf("features: lock commit check: %w", err)
+	if err := m.lockShared(ctx, tx); err != nil {
+		return err
 	}
 
 	m.mu.Lock()
@@ -289,6 +289,16 @@ func (m *FeatureMarker) checkInTx(ctx context.Context, tx pgx.Tx) error {
 
 		return transientFeatureChanged(fmt.Sprintf(
 			"validated version %d, store now declares %d", cachedVersion, manifest.Version))
+	}
+
+	return nil
+}
+
+// lockShared fences declarations until the calling transaction commits or rolls back.
+func (m *FeatureMarker) lockShared(ctx context.Context, tx pgx.Tx) error {
+	query := fmt.Sprintf("SELECT pg_advisory_xact_lock_shared(%d, hashtext($1))", engineRowLockClass)
+	if _, err := tx.Exec(ctx, query, m.eventsTable+":features"); err != nil {
+		return fmt.Errorf("features: lock check: %w", err)
 	}
 
 	return nil

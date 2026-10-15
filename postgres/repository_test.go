@@ -65,16 +65,28 @@ func TestNewRepositoryTableNames(t *testing.T) {
 		})
 	})
 
-	t.Run("name over 47 bytes panics", func(t *testing.T) {
-		require.Panics(t, func() {
-			NewRepository(nil, WithEventsTable(strings.Repeat("e", 48)))
+	t.Run("derived relations fit at table name boundaries", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			NewRepository(nil, WithEventsTable(strings.Repeat("e", 34)), WithSnapshotsTable(strings.Repeat("s", 58)))
 		})
+		require.Panics(t, func() {
+			NewRepository(nil, WithEventsTable(strings.Repeat("e", 35)))
+		})
+		require.Panics(t, func() {
+			NewRepository(nil, WithSnapshotsTable(strings.Repeat("s", 59)))
+		})
+	})
+
+	t.Run("legacy entity type index suffix is available to snapshots", func(t *testing.T) {
+		repo := NewRepository(nil, WithEventsTable("events"), WithSnapshotsTable("events_entity_type_idx"))
+		require.Contains(t, repo.schemaDDL(), "events__evt_entity_type_idx")
+		require.Equal(t, "events_entity_type_idx", repo.snapshotsTable)
 	})
 
 	t.Run("names that collide with each other or a derived index panic", func(t *testing.T) {
 		for _, names := range [][2]string{
 			{"evt_events", "Evt_Events"},
-			{"events", "events_entity_type_idx"},
+			{"events", "events__evt_entity_type_idx"},
 			{"events_pkey", "events"},
 		} {
 			require.Panics(t, func() {
