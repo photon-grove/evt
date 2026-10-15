@@ -15,6 +15,12 @@ type bindingClient struct{ dynamo.Client }
 
 type bindingDB struct{ postgres.DB }
 
+// valueDB is a non-comparable DB value: == on it would panic at runtime.
+type valueDB struct {
+	postgres.DB
+	tags []string
+}
+
 // valueClient is a non-comparable client value: == on it would panic at runtime.
 type valueClient struct {
 	dynamo.Client
@@ -28,6 +34,18 @@ func TestFeatureMarkerRejectsNonComparableMarkerClient(t *testing.T) {
 	defer func() {
 		mismatch, ok := recover().(*evt.FeatureMarkerClientMismatchError)
 		require.True(t, ok, "a non-comparable marker client must fail closed, not panic in ==")
+		require.NotNil(t, mismatch)
+	}()
+	repo.WithFeatureMarker(marker)
+}
+
+func TestFeatureMarkerRejectsNonComparableMarkerDB(t *testing.T) {
+	marker := postgres.NewRepository(valueDB{tags: []string{"a"}}).FeatureMarker(nil)
+	repo := postgres.NewRepository(&bindingDB{})
+
+	defer func() {
+		mismatch, ok := recover().(*evt.FeatureMarkerClientMismatchError)
+		require.True(t, ok, "a non-comparable marker DB must fail closed, not panic in ==")
 		require.NotNil(t, mismatch)
 	}()
 	repo.WithFeatureMarker(marker)
