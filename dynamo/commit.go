@@ -21,6 +21,10 @@ func (repo *Repository) Commit(
 	ctx context.Context,
 	result evt.SerializedResult,
 ) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if len(result.Events) == 0 {
 		return nil
 	}
@@ -226,6 +230,10 @@ func (repo *Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if err := evt.CheckReservedEntityID(entityID); err != nil {
 		return err
 	}

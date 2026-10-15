@@ -169,14 +169,28 @@ func WithSnapshotsTable(name string) Option {
 //
 // The default marker supports no extensions. Passing nil restores that default; it never
 // disables enforcement.
+// A marker bound to another events table panics with *evt.FeatureMarkerTableMismatchError.
 func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
 	r := *repo
 	r.features = marker
 	if r.features == nil {
 		r.features = NewFeatureMarker(r.db, r.eventsTable, nil)
 	}
+	if err := r.checkFeatureMarkerTable(); err != nil {
+		panic(err)
+	}
 
 	return &r
+}
+
+func (repo *Repository) checkFeatureMarkerTable() error {
+	if repo.features.eventsTable != repo.eventsTable {
+		return &evt.FeatureMarkerTableMismatchError{
+			EventsTable: repo.eventsTable, MarkerEventsTable: repo.features.eventsTable,
+		}
+	}
+
+	return nil
 }
 
 // NewRepository constructs a Repository over the given pgx handle (typically a *pgxpool.Pool). It
@@ -300,6 +314,10 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
 // PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
 // same transaction as the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if err := evt.CheckReservedEntityIDs(res.Events); err != nil {
 		return err
 	}
@@ -362,6 +380,10 @@ func (repo *Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	if len(res.Events) == 0 {
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
 	}

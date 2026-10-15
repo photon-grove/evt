@@ -196,7 +196,7 @@ func (repo *Repository) queryEvents(
 }
 
 // decodeQueryPage turns a page of raw Query items into SerializedEvents, skipping the sk=0
-// snapshot and any item in a reserved namespace.
+// snapshot. Explicit point reads retain legacy reserved-prefix streams for migration.
 func (repo *Repository) decodeQueryPage(items []map[string]types.AttributeValue) ([]evt.SerializedEvent, error) {
 	serializedEvents := make([]evt.SerializedEvent, 0, len(items))
 
@@ -207,11 +207,6 @@ func (repo *Repository) decodeQueryPage(items []map[string]types.AttributeValue)
 		}
 
 		if event.SK == 0 {
-			continue
-		}
-
-		if evt.IsReservedEntityID(event.PK) {
-			// Reserved namespaces hold engine-managed rows, never ordinary events.
 			continue
 		}
 
