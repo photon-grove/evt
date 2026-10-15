@@ -10,6 +10,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/internal/eventjson"
 )
 
 type namedEvent struct {
@@ -45,6 +46,8 @@ func codecEvent(id evt.EntityID, sequence evt.EventSequence, eventType evt.Event
 func codecEvents() []namedEvent {
 	base := evt.Metadata{Region: Region, Timestamp: DefaultTimestamp}
 
+	// full carries the storage format's metadata example: the causationId is unset and defaults to
+	// the commandId at encode time.
 	full := evt.Metadata{
 		CommandID: ptr(evt.CommandID("cmd-0001")),
 		Trace: &propagation.MapCarrier{
@@ -52,18 +55,33 @@ func codecEvents() []namedEvent {
 			"tracestate":  "vendor=value",
 			"baggage":     "tenant=example",
 		},
-		Origin:    &evt.Origin{Source: "billing-api", Endpoint: "POST /accounts"},
-		Address:   ptr("203.0.113.7"),
-		Region:    Region,
-		Timestamp: DefaultTimestamp,
+		Origin:      &evt.Origin{Source: "billing-api", Endpoint: "POST /accounts"},
+		Address:     ptr("203.0.113.7"),
+		Region:      Region,
+		Timestamp:   DefaultTimestamp,
+		PrincipalID: ptr(evt.PrincipalID("user:42")),
+		Extensions:  map[string]string{"requestSource": "cli"},
+	}
+
+	// explicitCausation keeps its own causationId instead of defaulting to the commandId, and pins
+	// the extension-key sort order.
+	explicitCausation := evt.Metadata{
+		CommandID:   ptr(evt.CommandID("cmd-0002")),
+		CausationID: ptr(evt.CommandID("cmd-0001")),
+		Region:      Region,
+		Timestamp:   DefaultTimestamp,
+		Extensions:  map[string]string{"requestSource": "cli", "tenant": "example", "attempt": "2"},
 	}
 
 	escaping := evt.Metadata{
-		CommandID: ptr(evt.CommandID("cmd <&> \u2028 \u2029")),
-		Origin:    &evt.Origin{Source: "<script>alert('x')</script>", Endpoint: "tab\tnew\nline \"quote\" \\ \u0001 \u007f"},
-		Address:   ptr("é ü 漢字 🚀"),
-		Region:    Region,
-		Timestamp: DefaultTimestamp,
+		CommandID:   ptr(evt.CommandID("cmd <&> \u2028 \u2029")),
+		Origin:      &evt.Origin{Source: "<script>alert('x')</script>", Endpoint: "tab\tnew\nline \"quote\" \\ \u0001 \u007f"},
+		Address:     ptr("é ü 漢字 🚀"),
+		Region:      Region,
+		Timestamp:   DefaultTimestamp,
+		PrincipalID: ptr(evt.PrincipalID("user<&> \u2028")),
+		CausationID: ptr(evt.CommandID("cmd\t\"quoted\"")),
+		Extensions:  map[string]string{"<k>&ey": "v<&> \u2028", "é": "漢字"},
 	}
 
 	empty := evt.Metadata{
@@ -83,7 +101,9 @@ func codecEvents() []namedEvent {
 			`{"owner":"Ada","openedAt":"2026-01-02T03:04:05.123Z"}`, base)},
 		{"full-metadata", codecEvent("acct-1", 2, DepositedEvent, 1,
 			`{"amountCents":2500,"memo":"rent"}`, full)},
-		{"escaping", codecEvent("acct-1", 3, DepositedEvent, 1,
+		{"explicit-causation", codecEvent("acct-1", 3, DepositedEvent, 1,
+			`{"amountCents":100}`, explicitCausation)},
+		{"escaping", codecEvent("acct-1", 4, DepositedEvent, 1,
 			"{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 \u2615 \\\"q\\\" \\\\ \\t\"}", escaping)},
 		{"empty-values", codecEvent("acct-2", 1, ClosedEvent, 1, `{}`, empty)},
 		{"trace-without-command", codecEvent("acct-2", 2, ClosedEvent, 1, `{"reason":null}`, traceOnly)},
@@ -123,6 +143,13 @@ var metadataDecodeInputs = []struct{ name, input string }{
 	{"empty-address-kept", `{"address":"","origin":{"source":null,"endpoint":"e"}}`},
 	{"whitespace-and-escapes", "{ \"region\" : \"us\\u002dwest\\u002d2\", \"timestamp\":\"t\" }"},
 	{"null-trace-value", `{"trace":{"traceparent":null,"tracestate":"a"}}`},
+	// The v0.9 keys (C6). A pre-v0.9 object without them decodes leniently and re-encodes with the
+	// defaults; causationId re-encodes as the commandId when it was not stored.
+	{"v09-principal-causation-extensions", `{"commandId":"c-1","principalId":"user:7","causationId":"c-0","extensions":{"b":"2","a":"1"},"region":"r"}`},
+	{"legacy-without-new-keys", `{"commandId":"c-1","region":"r","timestamp":"t"}`},
+	{"extensions-null-value", `{"extensions":{"a":null,"b":"x"}}`},
+	{"extensions-empty-object", `{"extensions":{}}`},
+	{"extensions-null-map", `{"extensions":null}`},
 }
 
 var eventDecodeInputs = []struct{ name, input string }{
@@ -155,10 +182,10 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 
 	for _, c := range metadataDecodeInputs {
 		var metadata evt.Metadata
-		if err := json.Unmarshal([]byte(c.input), &metadata); err != nil {
+		if err := eventjson.UnmarshalMetadata([]byte(c.input), &metadata); err != nil {
 			return fixtures, fmt.Errorf("metadata %s: %w", c.name, err)
 		}
-		canonical, err := json.Marshal(metadata)
+		canonical, err := eventjson.MarshalMetadata(metadata)
 		if err != nil {
 			return fixtures, err
 		}
@@ -167,10 +194,10 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 
 	for _, c := range eventDecodeInputs {
 		var event evt.SerializedEvent
-		if err := json.Unmarshal([]byte(c.input), &event); err != nil {
+		if err := eventjson.UnmarshalEvent([]byte(c.input), &event); err != nil {
 			return fixtures, fmt.Errorf("event decode %s: %w", c.name, err)
 		}
-		canonical, err := json.Marshal(event)
+		canonical, err := eventjson.MarshalEvent(event)
 		if err != nil {
 			return fixtures, err
 		}
@@ -210,12 +237,12 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 }
 
 func eventVector(ctx context.Context, c namedEvent) (EventVector, error) {
-	serialized, err := json.Marshal(c.event)
+	serialized, err := eventjson.MarshalEvent(c.event)
 	if err != nil {
 		return EventVector{}, err
 	}
 
-	metadata, err := json.Marshal(c.event.Metadata)
+	metadata, err := eventjson.MarshalMetadata(c.event.Metadata)
 	if err != nil {
 		return EventVector{}, err
 	}
@@ -364,7 +391,7 @@ func ttlVector(ctx context.Context) (TTLVector, error) {
 
 		stream := TTLStream{Name: c.name, RetentionNanos: int64(c.retention)}
 		for _, event := range events {
-			encoded, err := json.Marshal(event)
+			encoded, err := eventjson.MarshalEvent(event)
 			if err != nil {
 				return vector, err
 			}

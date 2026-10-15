@@ -2,13 +2,13 @@ package dynamo
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -109,7 +109,7 @@ func (repo *Repository) decodeScanPage(items []map[string]types.AttributeValue) 
 		}
 
 		var metadata evt.Metadata
-		if err := json.Unmarshal([]byte(event.Metadata), &metadata); err != nil {
+		if err := eventjson.UnmarshalMetadata([]byte(event.Metadata), &metadata); err != nil {
 			return nil, err
 		}
 

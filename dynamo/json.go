@@ -1,7 +1,6 @@
 package dynamo
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 )
 
 // InvalidEventError indicates an irrecoverable validation/parsing error in a stream event.
@@ -54,7 +54,7 @@ func MarshalJSON(item map[string]lambdaevents.DynamoDBAttributeValue) (evt.Seria
 	}
 
 	var metadata evt.Metadata
-	if err = json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+	if err = eventjson.UnmarshalMetadata([]byte(metadataJSON), &metadata); err != nil {
 		return event, nil, &InvalidEventError{
 			Field:  "metadata",
 			Reason: "invalid_json",
@@ -73,7 +73,7 @@ func MarshalJSON(item map[string]lambdaevents.DynamoDBAttributeValue) (evt.Seria
 		Metadata:   metadata,
 	}
 
-	eventJSON, err := json.Marshal(event)
+	eventJSON, err := eventjson.MarshalEvent(event)
 	if err != nil {
 		return event, nil, fmt.Errorf("error marshaling event to JSON: %s", err.Error())
 	}
