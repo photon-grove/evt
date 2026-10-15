@@ -3,7 +3,6 @@ package dynamo
 import (
 	"context"
 	"fmt"
-	"math"
 	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -109,8 +108,10 @@ func (repo *Repository) GetMaxSequence(
 	return evt.EventSequence(sk), nil
 }
 
+const recentEventsPageSize = 100
+
 // GetRecentEvents returns at most limit events for an entity, newest-first (descending sequence).
-// The query reads the highest event sequences with ScanIndexForward=false and Limit=limit; the
+// The query reads the highest event sequences with ScanIndexForward=false and bounded pages; the
 // `sk > 0` key condition excludes the sk=0 snapshot item. When a response returns fewer than limit
 // items and carries a pagination key (large items can close a page early), the reader keeps paging
 // until it has collected limit items or the stream runs out. A limit below 1 is a programmer error
@@ -132,12 +133,11 @@ func (repo *Repository) GetRecentEvents(
 			":pk": &types.AttributeValueMemberS{Value: string(entityID)},
 			":sk": &types.AttributeValueMemberN{Value: "0"}, // Exclude sk=0 snapshots
 		},
-		ScanIndexForward: aws.Bool(false), // Descending order
-		// A limit above int32 is clamped; callers pass small recent-activity windows.
-		Limit: aws.Int32(int32(min(limit, math.MaxInt32))), //nolint:gosec // clamped to MaxInt32 just above
+		ScanIndexForward: aws.Bool(false),                                    // Descending order
+		Limit:            aws.Int32(int32(min(limit, recentEventsPageSize))), //nolint:gosec // bounded by the page size
 	}
 
-	recent := make([]evt.SerializedEvent, 0, limit)
+	recent := make([]evt.SerializedEvent, 0, min(limit, recentEventsPageSize))
 
 	p := dynamodb.NewQueryPaginator(repo.client, &input)
 

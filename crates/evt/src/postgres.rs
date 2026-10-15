@@ -99,11 +99,19 @@ impl PostgresRepository {
 
     /// Creates the event and snapshot tables if they do not exist.
     pub async fn ensure_schema(&self) -> Result<(), Error> {
-        let client = self.pool.get().await.map_err(pool_error)?;
-        client
-            .batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
+        let mut client = self.pool.get().await.map_err(pool_error)?;
+        let tx = client.transaction().await.map_err(Error::backend)?;
+        // IF NOT EXISTS can still race in PostgreSQL's catalogs. Go takes this same lock.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(1702261762, hashtext($1))",
+            &[&self.events_table.to_lowercase()],
+        )
+        .await
+        .map_err(Error::backend)?;
+        tx.batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
             .await
-            .map_err(Error::backend)
+            .map_err(Error::backend)?;
+        tx.commit().await.map_err(Error::backend)
     }
 
     /// Returns the raw event rows for an entity, ascending. Intended for diagnostics and

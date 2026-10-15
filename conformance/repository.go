@@ -8,6 +8,7 @@ package conformance
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -225,6 +226,11 @@ func testGetRecentEvents(t *testing.T, repo evt.Repository) {
 	require.NoError(t, err)
 	require.Len(t, all, 4)
 	require.Greater(t, all[0].Sequence, all[len(all)-1].Sequence)
+
+	// Even an oversized window only allocates for actual events, not the requested count.
+	oversized, err := repo.GetRecentEvents(ctx, id, math.MaxInt)
+	require.NoError(t, err)
+	require.Equal(t, all, oversized)
 
 	// A limit below 1 is a programmer error returned before any request.
 	_, err = repo.GetRecentEvents(ctx, id, 0)

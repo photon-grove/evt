@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/policy"
@@ -22,10 +21,6 @@ const featuresInfix = "__evt_features"
 // configured events table name, so two logs never block each other's engine rows: declarations
 // take the exclusive lock for their read-modify-write, commit-time checks take the shared lock.
 const engineRowLockClass = 1702261761
-
-// undefinedTable is the PostgreSQL SQLSTATE for "relation does not exist". A log upgraded from a
-// release without the feature marker has no features table yet; it declares nothing.
-const undefinedTable = "42P01"
 
 // FeatureMarker reads, declares, and validates the feature manifest a store keeps in the
 // {events}__evt_features table (ADR-0004 C9). The manifest is durable, shared state: any writer
@@ -66,41 +61,7 @@ func (m *FeatureMarker) TableName() string {
 // the row is absent or the table itself does not exist yet (a log upgraded from a release without
 // the marker).
 func (m *FeatureMarker) Manifest(ctx context.Context) (*evt.FeatureManifest, error) {
-	query := fmt.Sprintf(
-		`SELECT version, features, history_dependent, retention FROM %s WHERE id = 0`,
-		m.TableName(),
-	)
-
-	var (
-		version          int64
-		features         string
-		historyDependent string
-		retention        string
-	)
-
-	err := m.db.QueryRow(ctx, query).Scan(&version, &features, &historyDependent, &retention)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) || isUndefinedTable(err) {
-			return nil, nil
-		}
-
-		return nil, fmt.Errorf("features: reading manifest: %w", err)
-	}
-
-	manifest, err := evt.ParseFeatureManifest(features, historyDependent, retention)
-	if err != nil {
-		return nil, fmt.Errorf("features: decoding manifest: %w", err)
-	}
-
-	manifest.Version = version
-
-	return &manifest, nil
-}
-
-// isUndefinedTable reports whether the error is PostgreSQL's "relation does not exist".
-func isUndefinedTable(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == undefinedTable
+	return m.readManifest(ctx, m.db)
 }
 
 // Declare applies update to the current manifest in a read-modify-write that bumps the version by
@@ -202,6 +163,20 @@ func (m *FeatureMarker) Declare(
 // readManifestTx reads the feature-marker row inside the given transaction, returning nil when the
 // log declares nothing.
 func (m *FeatureMarker) readManifestTx(ctx context.Context, tx pgx.Tx) (*evt.FeatureManifest, error) {
+	return m.readManifest(ctx, tx)
+}
+
+func (m *FeatureMarker) readManifest(ctx context.Context, db DB) (*evt.FeatureManifest, error) {
+	// A failing SELECT would abort an open transaction even if we swallowed 42P01.
+	// Probe without an error so pre-marker logs can still commit before EnsureSchema runs.
+	var exists bool
+	if err := db.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, m.TableName()).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("features: checking manifest table: %w", err)
+	}
+	if !exists {
+		return nil, nil
+	}
+
 	query := fmt.Sprintf(
 		`SELECT version, features, history_dependent, retention FROM %s WHERE id = 0`,
 		m.TableName(),
@@ -214,9 +189,9 @@ func (m *FeatureMarker) readManifestTx(ctx context.Context, tx pgx.Tx) (*evt.Fea
 		retention        string
 	)
 
-	err := tx.QueryRow(ctx, query).Scan(&version, &features, &historyDependent, &retention)
+	err := db.QueryRow(ctx, query).Scan(&version, &features, &historyDependent, &retention)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) || isUndefinedTable(err) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 
@@ -244,48 +219,48 @@ func (m *FeatureMarker) checkInTx(ctx context.Context, tx pgx.Tx) error {
 	}
 
 	m.mu.Lock()
-	validated, hasMarker, cachedVersion := m.validated, m.hasMarker, m.cachedVersion
-	m.mu.Unlock()
+	defer m.mu.Unlock()
 
 	manifest, err := m.readManifestTx(ctx, tx)
 	if err != nil {
 		return err
 	}
 
-	if !validated {
+	if !m.validated {
 		if manifest != nil {
 			if err := manifest.Validate(m.supported); err != nil {
 				return err
 			}
 
-			m.cacheVersion(manifest.Version, true)
+			m.cacheVersionLocked(manifest.Version, true)
 
 			return nil
 		}
 
-		m.cacheVersion(0, false)
+		m.cacheVersionLocked(0, false)
 
 		return nil
 	}
 
 	switch {
-	case manifest == nil && hasMarker:
-		m.invalidate()
+	case manifest == nil && m.hasMarker:
+		m.invalidateLocked()
 
 		return transientFeatureChanged("the marker row was removed")
 	case manifest == nil:
 		return nil
-	case !hasMarker || manifest.Version != cachedVersion:
+	case !m.hasMarker || manifest.Version != m.cachedVersion:
 		// The manifest changed under the writer: re-validate now — an unsupported pair refuses the
 		// writer outright — and classify the mismatch as transient so the commit is retried against
 		// the freshly cached version.
-		m.invalidate()
+		cachedVersion := m.cachedVersion
+		m.invalidateLocked()
 
 		if err := manifest.Validate(m.supported); err != nil {
 			return err
 		}
 
-		m.cacheVersion(manifest.Version, true)
+		m.cacheVersionLocked(manifest.Version, true)
 
 		return transientFeatureChanged(fmt.Sprintf(
 			"validated version %d, store now declares %d", cachedVersion, manifest.Version))
@@ -304,11 +279,8 @@ func (m *FeatureMarker) lockShared(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
-// cacheVersion stores the validated version.
-func (m *FeatureMarker) cacheVersion(version int64, hasMarker bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+// cacheVersionLocked stores the validated version while mu is held.
+func (m *FeatureMarker) cacheVersionLocked(version int64, hasMarker bool) {
 	m.validated = true
 	m.hasMarker = hasMarker
 	m.cachedVersion = version
@@ -319,6 +291,10 @@ func (m *FeatureMarker) invalidate() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.invalidateLocked()
+}
+
+func (m *FeatureMarker) invalidateLocked() {
 	m.validated = false
 	m.hasMarker = false
 	m.cachedVersion = 0

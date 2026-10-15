@@ -475,6 +475,43 @@ async fn postgres_lost_race_is_a_conflict_with_a_plain_insert_projector() {
 }
 
 #[tokio::test]
+async fn postgres_schema_setup_is_concurrent_safe() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let events = format!("ddl_{nanos:x}");
+    let snapshots = format!("{events}s");
+    let repository = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let repository = repository.clone();
+        tasks.push(tokio::spawn(
+            async move { repository.ensure_schema().await },
+        ));
+    }
+    let mut results = Vec::new();
+    for task in tasks {
+        results.push(task.await.unwrap());
+    }
+    repository
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS {events}, {snapshots}, {events}__evt_features"
+        ))
+        .await
+        .unwrap();
+    for result in results {
+        result.expect("concurrent schema creation succeeds");
+    }
+}
+
+#[tokio::test]
 async fn postgres_conforms() {
     let repository = drivers::postgres().await.expect("connect to PostgreSQL");
     let views = PostgresViews::new(repository.pool().clone())

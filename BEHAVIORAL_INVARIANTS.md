@@ -272,7 +272,8 @@ its coordination with consumer wipe-and-replay guarantees.
   `snapshot.EventSequence >= throughSequence`. With no snapshot, or an uncovered range, it deletes
   nothing and returns `evt.ErrCompactionUncovered` (wrapped; matchable with `errors.Is`).
 - In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7,
-  C9) it also reads the feature manifest's durable `historyDependent` set (consistent read) and
+  C9) it also validates all declared feature/version pairs against the writer's supported set,
+  refusing unsupported features before deletion. It reads the durable `historyDependent` set and
   refuses with a typed error when the entity's type is declared history-dependent — in every
   process that opens the log, not only those that registered the projector. The byte-level rules
   are specified in the [storage format](docs/spec/storage-format.md#feature-marker).
@@ -402,11 +403,12 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 - Bounded, newest-first read of an entity's last `limit` events (storage spec, latest(n); ADR-0004
   C8) — for "recent activity" reads that must not replay a long stream. No item shape changes.
   Invalid limits return `*evt.InvalidArgumentError`, matchable with `errors.Is(err, evt.ErrInvalidArgument)`, before I/O.
-- DynamoDB: one descending query (`ScanIndexForward = false`, `Limit = n`) whose `sk > 0` key
+- DynamoDB: descending queries (`ScanIndexForward = false`, `Limit = min(n, 100)`) whose `sk > 0` key
   condition excludes the snapshot item; when a page closes early (large items), the reader keeps
   paging until it has collected `n` items or the stream runs out. PostgreSQL: `ORDER BY sequence
   DESC LIMIT n`. The in-memory backend walks its stream backwards.
 - A `limit` below 1 is a programmer error returned before any request, in every backend.
+  Initial buffer capacity is bounded by a page or the available events, even for the largest limit.
 
 ### Reserved Namespaces (ADR-0004 C8)
 
@@ -445,10 +447,17 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
   `WithFeatureMarker` customizes the supported set, never disables the check. PostgreSQL holds
   the shared feature advisory lock across validation and writes in the same transaction.
   Unquoted table names are lowercase-canonicalized, including the feature-lock key.
+- Validation and construction of a commit's marker condition use one locked cache snapshot;
+  concurrent declaration cannot leave a commit with an unvalidated condition.
+- PostgreSQL probes feature-table existence with `to_regclass` before reading a legacy log whose
+  marker table is absent, so successful writes never continue inside an aborted transaction.
+  Schema setup is serialized across Go and Rust by a shared advisory lock.
 - Declaration invalidates cached writer validation; declaring a feature does not imply support.
   `PutSnapshot` obeys the same refusal atomically: a DynamoDB marker check and snapshot put in
   one transaction, or PostgreSQL validation under the shared feature lock in the write transaction.
-- `CompactBelow` reads `historyDependent` (strongly consistent on DynamoDB, regardless of
+- `CompactBelow` validates every declared feature/version pair against the writer's supported set
+  and returns `evt.UnsupportedFeatureError` before deletion when any pair is unsupported. It also
+  reads `historyDependent` (strongly consistent on DynamoDB, regardless of
   `WithConsistentRead`) and refuses an entity type in the set with a typed
   `evt.HistoryDependentProjectionError` before deleting anything — in every process that opens the
   log, whether or not it registered the projector. A table with no marker row declares nothing and

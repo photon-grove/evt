@@ -194,7 +194,8 @@ trim them safely:
 
 All durable Go repositories enforce the [feature marker](docs/spec/storage-format.md#feature-marker)
 by default, with no supported extensions. Unsupported declarations refuse commits and standalone
-snapshot writes atomically; history-dependent declarations fence compaction across handles.
+snapshot writes and compaction atomically; history-dependent declarations also fence compaction
+across handles.
 `WithFeatureMarker` customizes the supported set, not whether enforcement runs.
 
 The raw `dynamo.Delete` is snapshot-unsafe, for local fixtures only, and excluded

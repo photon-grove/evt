@@ -900,16 +900,16 @@ prefix on `pk`.
 `latest(n)` is a bounded, newest-first read of a stream's last `n` events (descending), for
 "recent activity" reads that must not replay a long stream. No item shape changes.
 
-- DynamoDB: query `pk = :id AND sk > :zero`, `ScanIndexForward = false`, `Limit = n`. The `sk > 0`
+- DynamoDB: query `pk = :id AND sk > :zero`, `ScanIndexForward = false`, `Limit = min(n, 100)`. The `sk > 0`
   key condition excludes the snapshot item, so the result is the `n` highest event sequences,
   descending.
 - PostgreSQL: `SELECT … FROM evt_events WHERE entity_id = $1 ORDER BY sequence DESC LIMIT $2`.
 
 `n < 1` is a programmer error returned before any request, in both languages — nothing is read.
-The result is at most `n` events: on DynamoDB the first request sets `Limit = n`, and when a
-response returns fewer than `n` items and carries `LastEvaluatedKey` (large items can close a page
-early), the reader keeps paging until it has collected `n` items or the stream runs out;
-PostgreSQL's `LIMIT n` returns the same at-most-`n` window in one statement.
+The result is at most `n` events: DynamoDB uses bounded pages and follows `LastEvaluatedKey`
+until it has collected `n` items or the stream runs out, including when large items close a page
+early. Initial buffer allocation is bounded by a page or the available events, not by an
+arbitrarily large `n`. PostgreSQL's `LIMIT n` returns the same at-most-`n` window in one statement.
 
 ## Feature Marker
 
@@ -982,6 +982,11 @@ it does not support, and refuses. The check costs one transaction item per commi
 DynamoDB includes the marker check and snapshot put in one transaction; PostgreSQL validates
 under the shared feature advisory lock held through the snapshot-write transaction. Declaration
 invalidates cached validation: declaring a feature is not proof that the declaring writer supports it.
+Validation and per-commit condition construction use one locked cache snapshot, so concurrent
+declarations cannot leave a commit with an unvalidated condition. PostgreSQL checks for a missing
+feature relation with `to_regclass` before selecting it: a pre-marker log declares nothing, and
+its transaction remains usable. Schema setup in both languages serializes DDL under
+`pg_advisory_xact_lock(1702261762, hashtext(events_table))` to avoid catalog races on startup.
 
 The declaration itself is a conditional write. Creating the row asserts `attribute_not_exists(pk)`
 and writes **`version = 1`**; updating it asserts `version = :observed`, writes the merged feature
@@ -993,7 +998,9 @@ row nor fail a condition against another key.)
 **Durable refusals read the manifest, not local configuration.** Both set-backed refusals consult
 the row itself, so they hold for every process that opens the log:
 
-- `CompactBelow` reads `historyDependent` — on DynamoDB with `ConsistentRead = true`, regardless
+- `CompactBelow` first validates every declared feature/version pair against the writer's
+  supported set, refusing an unsupported pair with `UnsupportedFeature` before deleting anything.
+  It also reads `historyDependent` — on DynamoDB with `ConsistentRead = true`, regardless
   of the repository's read-consistency setting, so the check cannot miss a just-written set — and
   refuses an entity whose type appears in the set with a typed `HistoryDependentProjection` error
   before deleting anything ([Views](#views)). A maintenance tool that never registered the
