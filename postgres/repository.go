@@ -231,11 +231,18 @@ func NewRepository(db DB, opts ...Option) *Repository {
 // Repository owns this DDL because the relational schema must stay in lockstep with the Go types
 // that marshal into and out of it.
 func (repo *Repository) EnsureSchema(ctx context.Context) error {
-	if _, err := repo.db.Exec(ctx, repo.schemaDDL()); err != nil {
-		return fmt.Errorf("postgres: ensure schema: %w", err)
-	}
+	return repo.inTx(ctx, func(tx pgx.Tx) error {
+		// IF NOT EXISTS alone can still race in PostgreSQL's catalogs. Serialize DDL
+		// across processes (including Rust) before checking or creating any relation.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(1702261762, hashtext($1))", repo.eventsTable); err != nil {
+			return fmt.Errorf("postgres: lock schema: %w", err)
+		}
+		if _, err := tx.Exec(ctx, repo.schemaDDL()); err != nil {
+			return fmt.Errorf("postgres: ensure schema: %w", err)
+		}
 
-	return nil
+		return nil
+	})
 }
 
 // schemaDDL returns the idempotent DDL for the configured tables.

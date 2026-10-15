@@ -119,11 +119,19 @@ impl PostgresRepository {
 
     /// Creates the event and snapshot tables if they do not exist.
     pub async fn ensure_schema(&self) -> Result<(), Error> {
-        let client = self.pool.get().await.map_err(pool_error)?;
-        client
-            .batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
+        let mut client = self.pool.get().await.map_err(pool_error)?;
+        let tx = client.transaction().await.map_err(Error::backend)?;
+        // IF NOT EXISTS can still race in PostgreSQL's catalogs. Go takes this same lock.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(1702261762, hashtext($1))",
+            &[&self.events_table.to_lowercase()],
+        )
+        .await
+        .map_err(Error::backend)?;
+        tx.batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
             .await
-            .map_err(Error::backend)
+            .map_err(Error::backend)?;
+        tx.commit().await.map_err(Error::backend)
     }
 
     fn validated_marker(&self) -> std::sync::MutexGuard<'_, CachedMarker> {
@@ -144,9 +152,21 @@ impl PostgresRepository {
         &self,
         client: &impl GenericClient,
     ) -> Result<Option<FeatureManifest>, Error> {
+        let table = features_table(&self.events_table);
+        // Older logs have only events and snapshots. Catching 42P01 after SELECT would still
+        // abort an enclosing commit transaction, so probe without referencing the relation.
+        // Callers retain their shared advisory lock through this probe and the eventual write.
+        let exists: bool = client
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+            .await
+            .map_err(Error::backend)?
+            .get(0);
+        if !exists {
+            return Ok(None);
+        }
+
         let sql = format!(
-            "SELECT version, features, history_dependent, retention FROM {} WHERE id = 0",
-            features_table(&self.events_table)
+            "SELECT version, features, history_dependent, retention FROM {table} WHERE id = 0"
         );
         let row = client.query_opt(&sql, &[]).await.map_err(Error::backend)?;
 
@@ -500,7 +520,13 @@ impl Repository for PostgresRepository {
         );
 
         let rows = client
-            .query(&sql, &[&entity_id.as_str(), &(count as i64)])
+            .query(
+                &sql,
+                &[
+                    &entity_id.as_str(),
+                    &i64::try_from(count).unwrap_or(i64::MAX),
+                ],
+            )
             .await
             .map_err(Error::backend)?;
 

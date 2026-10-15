@@ -11,7 +11,7 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// compactionCheck reads the durable history-dependent set strongly and pins that exact marker
+// compactionCheck validates the durable feature manifest strongly and pins that exact marker
 // version (or its absence). Every delete batch carries this check, fencing declarations that
 // complete after validation but before deletion.
 func (repo *Repository) compactionCheck(ctx context.Context, entityType evt.EntityType) (types.TransactWriteItem, error) {
@@ -29,6 +29,10 @@ func (repo *Repository) compactionCheck(ctx context.Context, entityType evt.Enti
 		ConditionExpression: aws.String("attribute_not_exists(pk)"),
 	}
 	if manifest != nil {
+		if err := manifest.Validate(repo.features.supported); err != nil {
+			return types.TransactWriteItem{}, err
+		}
+
 		for _, declared := range manifest.HistoryDependent {
 			if declared == entityType {
 				return types.TransactWriteItem{}, evt.NewHistoryDependentProjectionError(entityType)

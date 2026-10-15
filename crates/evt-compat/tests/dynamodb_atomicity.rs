@@ -338,6 +338,19 @@ async fn maintenance_writes_are_fenced_by_the_durable_manifest() {
 
     // Cross the 99-delete boundary, preserve sk=0, and count only extant event keys on repeat.
     seed(&repository, "account-batches", 105).await;
+    // A huge count must neither preallocate usize::MAX nor overflow the SDK's i32 limit,
+    // and must keep paging past the bounded 100-event query size.
+    let latest = repository
+        .latest(&"account-batches".into(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest
+            .iter()
+            .map(|event| event.sequence.0)
+            .collect::<Vec<_>>(),
+        (1..=105).rev().collect::<Vec<_>>()
+    );
     assert_eq!(
         repository
             .compact_below(&"account-batches".into(), EventSequence(105))
@@ -407,6 +420,55 @@ async fn maintenance_writes_are_fenced_by_the_durable_manifest() {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+    repository
+        .update_manifest(|manifest| manifest.features.clear())
+        .await
+        .unwrap();
+
+    // A declaration on the very same handle invalidates its cache while a commit is in
+    // flight. The commit must retain its validated snapshot, fail the version check, and
+    // revalidate rather than treating an invalidated cache as a validated absent marker.
+    {
+        let gate = TransactionGate::new("\"Put\"");
+        let writer = Arc::new(gate.repository(&repository).await);
+        let task = tokio::spawn({
+            let writer = Arc::clone(&writer);
+            async move {
+                let event = SerializedEvent {
+                    id: "commit-race:1".into(),
+                    entity_id: "commit-race".into(),
+                    entity_type: "account".into(),
+                    sequence: EventSequence(1),
+                    event_type: "account:opened".into(),
+                    version: photon_evt::EventVersion(1),
+                    payload: b"{}".to_vec(),
+                    ..Default::default()
+                };
+                writer
+                    .commit(photon_evt::Commit::new("commit-race", vec![event]))
+                    .await
+            }
+        });
+        gate.wait();
+        writer
+            .update_manifest(|manifest| {
+                manifest.features.insert("unsupported".into(), 1);
+            })
+            .await
+            .unwrap();
+        gate.release.send(()).unwrap();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(Error::UnsupportedFeature { .. })
+        ));
+        assert!(
+            repository
+                .events(&"commit-race".into())
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
     repository

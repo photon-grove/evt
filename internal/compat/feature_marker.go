@@ -161,8 +161,8 @@ func (db *featurePG) Begin(context.Context) (pgx.Tx, error) {
 	return &featurePGTx{db: db}, nil
 }
 
-func (tx *featurePGTx) QueryRow(context.Context, string, ...any) pgx.Row {
-	return featurePGScan{tx.db.row}
+func (tx *featurePGTx) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	return featurePGScan{row: tx.db.row, existsOnly: strings.HasPrefix(sql, "SELECT to_regclass(")}
 }
 
 func (tx *featurePGTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -196,9 +196,17 @@ func (tx *featurePGTx) Commit(context.Context) error {
 
 func (tx *featurePGTx) Rollback(context.Context) error { return nil }
 
-type featurePGScan struct{ row *FeatureMarkerRow }
+type featurePGScan struct {
+	row        *FeatureMarkerRow
+	existsOnly bool
+}
 
 func (s featurePGScan) Scan(dest ...any) error {
+	if s.existsOnly {
+		*featureArgument[*bool](dest[0]) = true
+
+		return nil
+	}
 	if s.row == nil {
 		return pgx.ErrNoRows
 	}
@@ -291,6 +299,26 @@ type featureSchemaCapture struct {
 	postgres.DB
 	ddl string
 }
+
+func (c *featureSchemaCapture) Begin(context.Context) (pgx.Tx, error) {
+	return &featureSchemaTx{capture: c}, nil
+}
+
+type featureSchemaTx struct {
+	pgx.Tx
+	capture *featureSchemaCapture
+}
+
+func (tx *featureSchemaTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.HasPrefix(sql, "SELECT pg_advisory_xact_lock(") {
+		return pgconn.NewCommandTag("SELECT 1"), nil
+	}
+
+	return tx.capture.Exec(ctx, sql, args...)
+}
+
+func (tx *featureSchemaTx) Commit(context.Context) error   { return nil }
+func (tx *featureSchemaTx) Rollback(context.Context) error { return nil }
 
 func (c *featureSchemaCapture) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if c.ddl != "" || len(args) != 0 {

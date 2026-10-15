@@ -42,6 +42,9 @@ const MAX_DECLARATION_RETRIES: usize = 8;
 
 const COMPACTION_BATCH_SIZE: usize = MAX_TRANSACTION_ITEMS - 1;
 
+/// Bound allocation and SDK limits independently of the caller's `usize` count.
+const LATEST_PAGE_SIZE: usize = 100;
+
 /// A DynamoDB-backed [`Repository`]. Clones share the client.
 #[derive(Debug)]
 pub struct DynamoRepository {
@@ -132,21 +135,20 @@ impl DynamoRepository {
 
     /// Returns the marker version this handle validated, reading and validating the manifest at
     /// first write. The read is strongly consistent regardless of `with_consistent_read`, so a
-    /// declaration another writer just wrote cannot be missed.
-    async fn ensure_manifest_validated(&self) -> Result<CachedMarker, Error> {
+    /// declaration another writer just wrote cannot be missed. The returned non-optional snapshot
+    /// is used for the entire transaction check, even if a concurrent declaration invalidates the
+    /// cache afterwards. A stale snapshot is safe: the transaction condition forces revalidation.
+    async fn ensure_manifest_validated(&self) -> Result<ValidatedMarker, Error> {
         if let Some(cached) = *self.validated_marker() {
-            return Ok(Some(cached));
+            return Ok(cached);
         }
 
         let observed = self.read_manifest().await?;
         let validated = features::validate_marker(observed.as_ref())?;
 
         let mut cached = self.validated_marker();
-        if cached.is_none() {
-            *cached = Some(validated);
-        }
 
-        Ok(*cached)
+        Ok(*cached.get_or_insert(validated))
     }
 
     /// Drops the cached validation, so the next write re-reads and re-validates the manifest.
@@ -222,19 +224,17 @@ impl DynamoRepository {
 
     /// Builds the feature-marker check every commit carries: the validated version must still be
     /// the stored one, or the row must still be absent.
-    fn marker_check(&self, cached: CachedMarker) -> Result<TransactWriteItem, Error> {
+    fn marker_check(&self, validated: ValidatedMarker) -> Result<TransactWriteItem, Error> {
         let mut check = ConditionCheck::builder()
             .table_name(&self.table)
             .key("pk", s(crate::features::FEATURES_ID))
             .key("sk", n(crate::features::FEATURES_SORT_KEY));
 
-        check = match cached {
-            Some(ValidatedMarker::Version(version)) => check
+        check = match validated {
+            ValidatedMarker::Version(version) => check
                 .condition_expression(wire::MARKER_CONDITION)
                 .expression_attribute_values(":v", n(version)),
-            None | Some(ValidatedMarker::Absent) => {
-                check.condition_expression("attribute_not_exists(pk)")
-            }
+            ValidatedMarker::Absent => check.condition_expression("attribute_not_exists(pk)"),
         };
 
         Ok(TransactWriteItem::builder()
@@ -247,7 +247,7 @@ impl DynamoRepository {
     fn transaction_items(
         &self,
         commit: &Commit<TransactWriteItem>,
-        cached: CachedMarker,
+        validated: ValidatedMarker,
     ) -> Result<Vec<TransactWriteItem>, Error> {
         let (Some(first), Some(last_sequence)) = (
             commit.events.first().map(|event| n(event.sequence.0)),
@@ -257,7 +257,7 @@ impl DynamoRepository {
         };
 
         let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 2);
-        items.push(self.marker_check(cached)?);
+        items.push(self.marker_check(validated)?);
         items.extend(commit.operations.iter().cloned());
 
         for event in &commit.events {
@@ -627,10 +627,9 @@ impl Repository for DynamoRepository {
             ));
         }
 
-        // Newest first: `ScanIndexForward = false` with `Limit = n` reads the `n` highest event
-        // sequences. Large items can close a page early, so keep paging until `n` events or the
-        // end of the stream.
-        let mut events = Vec::with_capacity(count);
+        // Newest first, with bounded allocation and query limits even for usize::MAX. Large
+        // items can close a page early, so keep paging until `count` events or the stream ends.
+        let mut events = Vec::with_capacity(count.min(LATEST_PAGE_SIZE));
         let mut start = None;
 
         loop {
@@ -643,7 +642,7 @@ impl Repository for DynamoRepository {
                 .expression_attribute_values(":pk", s(entity_id.as_str()))
                 .expression_attribute_values(":sk", n(0))
                 .scan_index_forward(false)
-                .limit((count - events.len()) as i32)
+                .limit((count - events.len()).min(LATEST_PAGE_SIZE) as i32)
                 .set_exclusive_start_key(start)
                 .send()
                 .await
@@ -1211,7 +1210,7 @@ mod tests {
         let repository = offline_repository();
 
         let check = repository
-            .marker_check(Some(ValidatedMarker::Version(7)))
+            .marker_check(ValidatedMarker::Version(7))
             .unwrap()
             .condition_check()
             .unwrap()
@@ -1230,13 +1229,33 @@ mod tests {
         );
 
         let absent = repository
-            .marker_check(Some(ValidatedMarker::Absent))
+            .marker_check(ValidatedMarker::Absent)
             .unwrap()
             .condition_check()
             .unwrap()
             .clone();
         assert_eq!(absent.condition_expression(), "attribute_not_exists(pk)");
         assert!(absent.expression_attribute_values().is_none());
+    }
+
+    #[tokio::test]
+    async fn validated_snapshot_survives_concurrent_cache_invalidation() {
+        let repository = std::sync::Arc::new(offline_repository());
+        *repository.validated_marker() = Some(ValidatedMarker::Version(7));
+        let validated = repository.ensure_manifest_validated().await.unwrap();
+
+        std::thread::spawn({
+            let repository = std::sync::Arc::clone(&repository);
+            move || repository.invalidate_manifest()
+        })
+        .join()
+        .unwrap();
+        assert!(repository.validated_marker().is_none());
+
+        let item = repository.marker_check(validated).unwrap();
+        let check = item.condition_check().unwrap();
+        assert_eq!(check.condition_expression(), wire::MARKER_CONDITION);
+        assert_eq!(check.expression_attribute_values().unwrap()[":v"], n(7));
     }
 
     #[test]
@@ -1306,7 +1325,7 @@ mod tests {
             let mut repository = offline_repository();
             repository.table = input["eventsTable"].as_str().unwrap().into();
             let actual = repository
-                .transaction_items(&commit, Some(observed))
+                .transaction_items(&commit, observed)
                 .unwrap()
                 .iter()
                 .map(|action| {

@@ -125,7 +125,7 @@ func Test_MaintenanceHoldsFeatureLock(t *testing.T) {
 			})
 			require.NoError(t, err)
 			_, err = writer.CompactBelow(ctx, id, 1)
-			require.True(t, evt.IsHistoryDependentProjectionErr(err))
+			require.True(t, evt.IsUnsupportedFeatureErr(err))
 			require.True(t, evt.IsUnsupportedFeatureErr(writer.PutSnapshot(ctx, "account", id, []byte(`{}`), 3, 3)))
 		})
 	}
@@ -158,6 +158,76 @@ func Test_DefaultAndDeclaringWritersRefuseUnsupported(t *testing.T) {
 	stored, err := repo.GetSnapshot(ctx, id)
 	require.NoError(t, err)
 	require.Nil(t, stored)
+}
+
+func Test_CompactionRefusesUnsupportedFeature(t *testing.T) {
+	ctx := context.Background()
+	repo, marker, _ := newIsolatedEventLog(ctx, t)
+	id := evt.EntityID("account-1")
+	events := serializeAs(t, id, "account", 0, &test.EntityCreated{ID: id, Value: "one"})
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "account", id, []byte(`{}`), 1))
+	_, err := marker.Declare(ctx, func(m *evt.FeatureManifest) { m.Features[evt.FeatureJournal] = 1 })
+	require.NoError(t, err)
+
+	deleted, err := repo.CompactBelow(ctx, id, 1)
+	require.True(t, evt.IsUnsupportedFeatureErr(err), "unsupported extensions refuse compaction without a history-dependent declaration: %v", err)
+	require.Zero(t, deleted)
+	stored, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+}
+
+func Test_PreMarkerSchemaRemainsWritable(t *testing.T) {
+	ctx := context.Background()
+	repo, marker, name := newIsolatedEventLog(ctx, t)
+	_, err := newPool(ctx, t).Exec(ctx, "DROP TABLE "+name+"__evt_features")
+	require.NoError(t, err)
+	manifest, err := marker.Manifest(ctx)
+	require.NoError(t, err)
+	require.Nil(t, manifest)
+
+	id := evt.EntityID("account-1")
+	events := serializeAs(t, id, "account", 0, &test.EntityCreated{ID: id, Value: "one"})
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events}))
+	events = serializeAs(t, id, "account", 1, &test.EntityUpdated{ID: id, Value: "two"})
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "account", id, []byte(`{}`), 1))
+	require.NoError(t, repo.PutSnapshot(ctx, "account", id, []byte(`{"new":true}`), 2, 2))
+	deleted, err := repo.CompactBelow(ctx, id, 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, deleted)
+	stored, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	require.Equal(t, evt.EventSequence(2), stored[0].Sequence)
+
+	// Schema setup and declarations still work after these legacy transactions.
+	require.NoError(t, repo.EnsureSchema(ctx))
+	_, err = marker.Declare(ctx, func(m *evt.FeatureManifest) { m.Features[evt.FeatureJournal] = 1 })
+	require.NoError(t, err)
+	require.True(t, evt.IsUnsupportedFeatureErr(repo.PutSnapshot(ctx, "account", id, []byte(`{}`), 3, 3)))
+}
+
+func Test_ConcurrentEnsureSchema(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	repo, _, name := newIsolatedEventLog(ctx, t)
+	_, err := newPool(ctx, t).Exec(ctx, fmt.Sprintf("DROP TABLE %s, %s_snapshots, %s__evt_features", name, name, name))
+	require.NoError(t, err)
+
+	const writers = 8
+	start := make(chan struct{})
+	errs := make(chan error, writers)
+	for range writers {
+		go func() {
+			<-start
+			errs <- repo.EnsureSchema(ctx)
+		}()
+	}
+	close(start)
+	for range writers {
+		require.NoError(t, <-errs)
+	}
+	require.NoError(t, repo.PutSnapshot(ctx, "account", "account-1", []byte(`{}`), 1, 1))
 }
 
 func Test_SchemaIndexUpgradeAndLogIsolation(t *testing.T) {

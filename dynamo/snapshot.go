@@ -95,11 +95,7 @@ func (repo *Repository) PutSnapshot(
 		},
 	}
 
-	if err = repo.features.Validate(ctx); err != nil {
-		return err
-	}
-
-	check, err := repo.features.checkItem()
+	check, err := repo.features.checkItem(ctx)
 	if err != nil {
 		return err
 	}

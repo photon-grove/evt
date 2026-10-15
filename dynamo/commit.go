@@ -372,11 +372,7 @@ func (repo *Repository) commitEventsWithTransaction(
 
 	// Every v0.9 commit carries the feature-marker ConditionCheck, ordered before every other
 	// item so the transaction layout stays pinned across implementations (storage spec, Writes).
-	if verr := repo.features.Validate(ctx); verr != nil {
-		return verr
-	}
-
-	check, cerr := repo.features.checkItem()
+	check, cerr := repo.features.checkItem(ctx)
 	if cerr != nil {
 		return cerr
 	}

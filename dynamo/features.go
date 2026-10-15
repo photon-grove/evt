@@ -42,7 +42,7 @@ type FeatureMarker struct {
 	eventsTable string
 	supported   evt.SupportedFeatures
 
-	//mu guards the cached validation below; commits and declarations run concurrently.
+	// mu guards the cached validation below; commits and declarations run concurrently.
 	mu            sync.Mutex
 	validated     bool
 	hasMarker     bool  // whether the cached version came from an existing row
@@ -241,10 +241,14 @@ func (m *FeatureMarker) manifestItem(manifest evt.FeatureManifest) (map[string]t
 // invalidates the cache (see invalidate) and the next commit re-validates.
 func (m *FeatureMarker) Validate(ctx context.Context) error {
 	m.mu.Lock()
-	validated := m.validated
-	m.mu.Unlock()
+	defer m.mu.Unlock()
 
-	if validated {
+	return m.validateLocked(ctx)
+}
+
+// validateLocked reads and caches validation while mu is held.
+func (m *FeatureMarker) validateLocked(ctx context.Context) error {
+	if m.validated {
 		return nil
 	}
 
@@ -255,7 +259,9 @@ func (m *FeatureMarker) Validate(ctx context.Context) error {
 
 	if manifest == nil {
 		// No marker row: nothing is declared; cache "no marker" and condition on absence.
-		m.cacheVersion(0, false)
+		m.validated = true
+		m.hasMarker = false
+		m.cachedVersion = 0
 
 		return nil
 	}
@@ -264,19 +270,11 @@ func (m *FeatureMarker) Validate(ctx context.Context) error {
 		return err
 	}
 
-	m.cacheVersion(manifest.Version, true)
+	m.validated = true
+	m.hasMarker = true
+	m.cachedVersion = manifest.Version
 
 	return nil
-}
-
-// cacheVersion stores the validated version.
-func (m *FeatureMarker) cacheVersion(version int64, hasMarker bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.validated = true
-	m.hasMarker = hasMarker
-	m.cachedVersion = version
 }
 
 // invalidate drops the cached validation so the next commit re-reads the manifest.
@@ -289,15 +287,14 @@ func (m *FeatureMarker) invalidate() {
 	m.cachedVersion = 0
 }
 
-// checkItem builds the per-commit ConditionCheck on the marker: version = :v against the cached
-// validation, or attribute_not_exists(pk) when no marker row existed at validation. Validate must
-// have run first.
-func (m *FeatureMarker) checkItem() (types.TransactWriteItem, error) {
+// checkItem validates and builds the per-commit condition under one cache lock. A concurrent
+// declaration may invalidate the cache afterward, but cannot change this check's validated version.
+func (m *FeatureMarker) checkItem(ctx context.Context) (types.TransactWriteItem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if !m.validated {
-		return types.TransactWriteItem{}, errors.New("features: committing before validating the manifest")
+	if err := m.validateLocked(ctx); err != nil {
+		return types.TransactWriteItem{}, err
 	}
 
 	check := types.ConditionCheck{

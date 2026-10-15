@@ -4,6 +4,8 @@ package integration
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -37,8 +39,11 @@ func (c *pausedWriteClient) TransactWriteItems(ctx context.Context, in *dynamodb
 }
 
 func Test_CompactionFencesCompletedDeclaration(t *testing.T) {
-	for _, existingMarker := range []bool{false, true} {
-		t.Run(map[bool]string{false: "absent", true: "versioned"}[existingMarker], func(t *testing.T) {
+	for _, tc := range []struct {
+		existingMarker bool
+		unsupported    bool
+	}{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("existing=%t/unsupported=%t", tc.existingMarker, tc.unsupported), func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			repo, marker := newIsolatedEventLog(ctx, t)
@@ -46,7 +51,7 @@ func Test_CompactionFencesCompletedDeclaration(t *testing.T) {
 			events, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "one"}}, 0, id, evt.Metadata{})
 			require.NoError(t, err)
 			require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, test.EntityType, id, []byte(`{}`), 1))
-			if existingMarker {
+			if tc.existingMarker {
 				_, err = marker.Declare(ctx, func(m *evt.FeatureManifest) { m.Retention = []evt.EntityType{"session"} })
 				require.NoError(t, err)
 			}
@@ -64,15 +69,77 @@ func Test_CompactionFencesCompletedDeclaration(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
-			_, err = marker.Declare(ctx, func(m *evt.FeatureManifest) { m.HistoryDependent = []evt.EntityType{test.EntityType} })
+			_, err = marker.Declare(ctx, func(m *evt.FeatureManifest) {
+				if tc.unsupported {
+					m.Features[evt.FeatureJournal] = 1
+				} else {
+					m.HistoryDependent = []evt.EntityType{test.EntityType}
+				}
+			})
 			// Always resume, including on a failed assertion, to avoid leaking the paused writer.
 			close(client.resume)
 			require.NoError(t, err)
-			require.True(t, evt.IsHistoryDependentProjectionErr(<-done))
+			compactErr := <-done
+			if tc.unsupported {
+				require.True(t, evt.IsUnsupportedFeatureErr(compactErr), "expected unsupported feature refusal, got %v", compactErr)
+			} else {
+				require.True(t, evt.IsHistoryDependentProjectionErr(compactErr), "expected history-dependent refusal, got %v", compactErr)
+			}
 			stored, err := repo.GetEvents(ctx, id)
 			require.NoError(t, err)
 			require.Len(t, stored, 1, "a completed declaration fences the paused compactor")
 		})
+	}
+}
+
+func Test_CommitAndDeclareShareMarker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	repo, marker := newIsolatedEventLog(ctx, t)
+	writer := repo.WithFeatureMarker(marker)
+	const commits = 24
+	start := make(chan struct{})
+	errs := make(chan error, commits+1)
+
+	go func() {
+		<-start
+		for range commits {
+			if _, err := marker.Declare(ctx, func(m *evt.FeatureManifest) {
+				m.Retention = []evt.EntityType{"session"}
+			}); err != nil {
+				errs <- err
+				return
+			}
+		}
+		errs <- nil
+	}()
+	for i := range commits {
+		go func() {
+			<-start
+			id := evt.EntityID(fmt.Sprintf("account-%d", i))
+			events, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "one"}}, 0, id, evt.Metadata{})
+			if err != nil {
+				errs <- err
+				return
+			}
+			for {
+				err = writer.Commit(ctx, evt.SerializedResult{Events: events})
+				if !errors.Is(err, evt.ErrFeatureManifestChanged) || ctx.Err() != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+
+	for range commits + 1 {
+		require.NoError(t, <-errs, "concurrent declarations may require revalidation, never a permanent cache error")
+	}
+	for i := range commits {
+		stored, err := repo.GetEvents(ctx, evt.EntityID(fmt.Sprintf("account-%d", i)))
+		require.NoError(t, err)
+		require.Len(t, stored, 1)
 	}
 }
 

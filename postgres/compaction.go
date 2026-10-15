@@ -8,9 +8,10 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// checkHistoryDependent refuses compaction for an entity type declared history-dependent in the
-// store's durable feature manifest. The refusal holds in every process that opens the log, whether
-// or not it registered the projector or configured a feature marker. A log with no marker row
+// checkHistoryDependent validates supported features and refuses compaction for an entity type
+// declared history-dependent in the store's durable feature manifest. The refusal holds in every
+// process that opens the log, whether or not it registered the projector or configured a feature
+// marker. A log with no marker row
 // declares nothing and compaction proceeds as it always has.
 func (repo *Repository) checkHistoryDependent(ctx context.Context, tx pgx.Tx, entityType evt.EntityType) error {
 	if err := repo.features.lockShared(ctx, tx); err != nil {
@@ -23,6 +24,10 @@ func (repo *Repository) checkHistoryDependent(ctx context.Context, tx pgx.Tx, en
 	}
 	if manifest == nil {
 		return nil
+	}
+
+	if err := manifest.Validate(repo.features.supported); err != nil {
+		return err
 	}
 
 	for _, declared := range manifest.HistoryDependent {

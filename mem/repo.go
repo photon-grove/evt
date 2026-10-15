@@ -201,7 +201,7 @@ func (repo Repository) GetRecentEvents(
 
 	id := string(entityID)
 
-	latest := make([]evt.SerializedEvent, 0, limit)
+	latest := make([]evt.SerializedEvent, 0, min(limit, len(repo.events[id])))
 	for i := len(repo.events[id]) - 1; i >= 0 && len(latest) < limit; i-- {
 		event := repo.events[id][i]
 		if event.Sequence == 0 {

@@ -1001,6 +1001,14 @@ async fn latest_n<R: Repository>(repo: &R) -> CaseResult {
         "latest(10) returns the whole remaining stream"
     );
 
+    for count in [i32::MAX as usize + 1, usize::MAX] {
+        ensure_eq!(
+            repo.latest(&stream.id, count).await?,
+            descending(&[4, 5, 6]),
+            "latest with an oversized count returns stored events without overflowing"
+        );
+    }
+
     let missing = Stream::new(&namespace(), "latest-missing", "ledger");
     ensure!(
         repo.latest(&missing.id, 3).await?.is_empty(),
@@ -1569,6 +1577,30 @@ where
         before_snapshot,
         "the refused snapshots did not advance the floor"
     );
+
+    // No historyDependent declaration is needed: an unsupported extension alone must fence
+    // deletion. Exercise both the declaring handle and a previously validated writer.
+    ensure!(
+        manifest.history_dependent.is_empty(),
+        "the unsupported-feature regression has no historyDependent set"
+    );
+    for compactor in [other, repo] {
+        expect_err(
+            compactor.compact_below(&stream.id, EventSequence(2)).await,
+            "compacting a log declaring an unsupported extension without historyDependent",
+            |err| matches!(err, Error::UnsupportedFeature { .. }),
+        )?;
+        ensure_eq!(
+            repo.events(&stream.id).await?,
+            stream.events(1..=5),
+            "unsupported-feature compaction deleted nothing"
+        );
+        ensure_eq!(
+            repo.snapshot(&stream.id).await?,
+            before_snapshot,
+            "unsupported-feature compaction preserved the snapshot"
+        );
+    }
 
     // A declaration touching only a durable set must not bless existing unsupported features.
     let retained = stream.entity_type.as_str().to_owned();

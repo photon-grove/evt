@@ -1,6 +1,7 @@
 //! Live PostgreSQL parity checks; run with `--features drivers --test postgres_atomicity`.
 #![cfg(feature = "drivers")]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use evt_compat::drivers;
@@ -15,12 +16,15 @@ use photon_evt::{
 use serde_json::Value;
 
 fn unique() -> String {
+    // Wall-clock precision alone can give parallel tests the same log and manifest.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
-        "pa{}",
+        "pa{:x}_{:x}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }
 
@@ -88,6 +92,25 @@ async fn wait_for(repo: &PostgresRepository, query: &str) {
     })
     .await
     .expect("operation reached its database lock wait");
+}
+
+#[tokio::test]
+async fn legacy_schema_without_features_table_remains_writable() {
+    let (repo, events, _) = repository().await;
+    let client = repo.pool().get().await.unwrap();
+    client
+        .batch_execute(&format!("DROP TABLE {}", features_table(&events)))
+        .await
+        .unwrap();
+    assert!(repo.read_manifest().await.unwrap().is_none());
+
+    // Both commit and standalone snapshot transactions probe the absent relation while holding
+    // the shared feature lock. Neither may poison its transaction with undefined_table (42P01).
+    let id = EntityId::new("legacy-account");
+    seed(&repo, &id).await;
+    assert_eq!(repo.events(&id).await.unwrap().len(), 1);
+    assert_eq!(repo.snapshot(&id).await.unwrap(), Some(snapshot(&id)));
+    assert_eq!(repo.compact_below(&id, EventSequence(1)).await.unwrap(), 1);
 }
 
 #[tokio::test]
