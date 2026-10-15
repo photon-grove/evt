@@ -7,16 +7,33 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
+use crate::features::{self, CachedMarker, FeatureManifest, FeatureMarker};
 use crate::ids::{EntityId, EntityType, EventSequence};
 use crate::repository::{Commit, Repository};
 
 /// An in-memory [`Repository`]. Clones share the same storage.
 ///
 /// Unlike Go's in-memory test double, it enforces optimistic concurrency the same way the
-/// DynamoDB backend does, so tests catch conflicts.
-#[derive(Clone, Debug, Default)]
+/// DynamoDB backend does, so tests catch conflicts. A clone is an independent writer over the
+/// shared storage: it keeps its own feature-marker cache, like a second handle on a live
+/// backend, so a declaration one clone writes refuses the other on its next commit.
+#[derive(Debug, Default)]
 pub struct MemRepository {
     streams: Arc<Mutex<BTreeMap<EntityId, Stream>>>,
+    manifest: Arc<Mutex<Option<FeatureManifest>>>,
+    /// The feature-marker version this handle validated, if it has written yet. Per handle, not
+    /// shared with clones.
+    validated: Mutex<CachedMarker>,
+}
+
+impl Clone for MemRepository {
+    fn clone(&self) -> Self {
+        Self {
+            streams: self.streams.clone(),
+            manifest: self.manifest.clone(),
+            validated: Mutex::new(*self.validated()),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -59,6 +76,33 @@ impl MemRepository {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn manifest_lock(&self) -> MutexGuard<'_, Option<FeatureManifest>> {
+        self.manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn validated(&self) -> MutexGuard<'_, CachedMarker> {
+        self.validated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Re-validates the writer's cached marker state against the stored manifest. Every commit
+    /// checks the version, as the live backends' condition does: a manifest that changed under
+    /// this writer is re-validated here, refusing an unsupported declared feature.
+    fn check_manifest(&self, stored: Option<&FeatureManifest>) -> Result<(), Error> {
+        let mut validated = self.validated();
+
+        if features::marker_matches(*validated, stored) {
+            return Ok(());
+        }
+
+        *validated = Some(features::validate_marker(stored)?);
+
+        Ok(())
+    }
 }
 
 impl Repository for MemRepository {
@@ -66,9 +110,15 @@ impl Repository for MemRepository {
 
     async fn commit(&self, commit: Commit<Infallible>) -> Result<(), Error> {
         commit.validate()?;
+        features::check_not_reserved(&commit.entity_id)?;
         if commit.events.is_empty() {
             return Ok(());
         }
+
+        // Both locks are held through the write, so a manifest change cannot slip between the
+        // version check and the events, mirroring the live backends' transaction condition.
+        let stored_manifest = self.manifest_lock();
+        self.check_manifest(stored_manifest.as_ref())?;
 
         let mut streams = self.lock();
         let stream = streams.entry(commit.entity_id.clone()).or_default();
@@ -156,6 +206,21 @@ impl Repository for MemRepository {
             .unwrap_or_default())
     }
 
+    async fn latest(&self, entity_id: &EntityId, n: usize) -> Result<Vec<SerializedEvent>, Error> {
+        if n == 0 {
+            return Err(Error::InvalidArgument(
+                "latest(n) requires at least one event: got n = 0".into(),
+            ));
+        }
+
+        let streams = self.lock();
+
+        Ok(streams
+            .get(entity_id)
+            .map(|stream| stream.events.values().rev().take(n).cloned().collect())
+            .unwrap_or_default())
+    }
+
     async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
         Ok(self
             .lock()
@@ -164,6 +229,8 @@ impl Repository for MemRepository {
     }
 
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+        features::check_not_reserved(&snapshot.entity_id)?;
+
         let mut streams = self.lock();
         let stream = streams.entry(snapshot.entity_id.clone()).or_default();
 
@@ -189,6 +256,13 @@ impl Repository for MemRepository {
             return Ok(0);
         }
 
+        features::check_not_reserved(entity_id)?;
+
+        let manifest = self.manifest_lock();
+        if let Some(manifest) = manifest.as_ref() {
+            manifest.validate_supported()?;
+        }
+
         let mut streams = self.lock();
         let Some(stream) = streams.get_mut(entity_id) else {
             return Err(Error::CompactionUncovered {
@@ -210,6 +284,16 @@ impl Repository for MemRepository {
             });
         }
 
+        if let Some(manifest) = manifest.as_ref()
+            && let Some(entity_type) = stream.entity_type()
+            && manifest.is_history_dependent(entity_type)
+        {
+            return Err(Error::HistoryDependentProjection {
+                entity_type: entity_type.clone(),
+                entity_id: entity_id.clone(),
+            });
+        }
+
         let before = stream.events.len();
         stream.events.retain(|sequence, _| *sequence > through);
 
@@ -224,6 +308,7 @@ impl Repository for MemRepository {
 
         Ok(streams
             .iter()
+            .filter(|(id, _)| !features::is_reserved(id))
             .filter(|(_, stream)| {
                 entity_type.is_none_or(|wanted| stream.entity_type() == Some(wanted))
             })
@@ -233,13 +318,42 @@ impl Repository for MemRepository {
     }
 }
 
+impl FeatureMarker for MemRepository {
+    async fn read_manifest(&self) -> Result<Option<FeatureManifest>, Error> {
+        Ok(self.manifest_lock().clone())
+    }
+
+    async fn update_manifest(
+        &self,
+        change: impl Fn(&mut FeatureManifest) + Send,
+    ) -> Result<(), Error> {
+        let mut stored = self.manifest_lock();
+        let mut next = stored.clone().unwrap_or_default();
+        change(&mut next);
+        next.version = stored.as_ref().map_or(1, |manifest| manifest.version + 1);
+        *stored = Some(next);
+
+        // Every writer compares versions on its next commit, so no cache needs invalidating.
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conformance::Suite;
+    use crate::conformance::{Suite, feature_marker_cases};
 
     #[tokio::test]
     async fn conforms() {
         Suite::new(&MemRepository::new()).run().await;
+    }
+
+    #[tokio::test]
+    async fn conforms_to_the_feature_marker() {
+        let first = MemRepository::new();
+
+        // The clone shares the storage but keeps its own marker cache, so the cases see two
+        // writers.
+        feature_marker_cases(&first, &first.clone()).await;
     }
 }

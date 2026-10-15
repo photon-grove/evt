@@ -46,6 +46,13 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
 - `pk` + `sk` combination must be unique (enforced by conditional write)
 - `sk` (sequence) starts at 1 and increments monotonically per entity
 - `sk` = 0 is reserved for inline snapshots (filtered out by event queries)
+- In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C8,
+  C9) the `SYSTEM#` and `command-outcome#` partition prefixes are reserved for engine rows (the
+  feature marker, the rebuild fence, command outcomes): every entity-addressed write path refuses
+  an entity ID beginning with one (`ReservedEntityId`), entity heads and rebuild scans skip them,
+  and a `SYSTEM#FEATURES` marker row carries the declared feature set every commit conditions on.
+  The byte-level rules are specified in the
+  [storage format](docs/spec/storage-format.md#reserved-namespaces).
 - `ttl` is written **only** for entity types covered by a `Repository` retention policy
   (`WithRetention`); every other row omits the attribute entirely (`json:"ttl,omitempty"`) and is
   never auto-expired. It is a no-op unless the table has DynamoDB TTL enabled on the `ttl` attribute.

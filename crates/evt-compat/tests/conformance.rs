@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use deadpool_postgres::Pool;
 use evt_compat::drivers;
-use photon_evt::conformance::{Add, Ledger, LedgerEvent, Suite, ViewTarget};
+use photon_evt::conformance::{Add, Ledger, LedgerEvent, Suite, ViewTarget, feature_marker_cases};
 use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository};
 use photon_evt::wire::dynamo::DEFAULT_VIEW_SORT_KEY;
@@ -126,6 +126,20 @@ impl ViewTarget<PostgresRepository> for PostgresViews {
     }
 }
 
+/// Clears the feature manifest a previous run may have left features in, so unsupported
+/// declarations cannot refuse this run's writers, and validates that this build supports
+/// whatever remains (nothing).
+async fn clear_manifest<R: photon_evt::FeatureMarker>(repository: &R) {
+    repository
+        .update_manifest(|manifest| {
+            manifest.features.clear();
+            manifest.history_dependent.clear();
+            manifest.retention.clear();
+        })
+        .await
+        .expect("clear the feature manifest");
+}
+
 // One test, run in sequence: Moto rolls back a failed transaction by restoring a copy of every
 // table it touched, which drops writes that a concurrent test made in the meantime. Real DynamoDB
 // does not, but the projector-condition case deliberately fails a transaction.
@@ -137,8 +151,50 @@ async fn dynamo_conforms() {
         table: drivers::views_table(),
     };
 
+    clear_manifest(&repository).await;
     Suite::new(&repository).with_views(views).run().await;
+
+    // A second handle over the same table is a second writer with its own marker cache.
+    let second = DynamoRepository::new(repository.client().clone(), repository.table());
+    feature_marker_cases(&repository, &second).await;
+    dynamo_marker_row_matches_the_wire_format(&repository).await;
     projector_condition_failure_is_not_a_conflict(&repository).await;
+}
+
+/// Reads the marker row back through the raw client and asserts it is byte-for-byte the item the
+/// wire format pins, so the stored bytes match the storage spec, not just the crate's model.
+async fn dynamo_marker_row_matches_the_wire_format(repository: &DynamoRepository) {
+    use photon_evt::wire::dynamo;
+
+    let manifest = repository
+        .read_manifest()
+        .await
+        .expect("read the manifest")
+        .expect("the feature-marker row exists");
+
+    let output = repository
+        .client()
+        .get_item()
+        .table_name(repository.table())
+        .consistent_read(true)
+        .key("pk", AttributeValue::S(photon_evt::FEATURES_ID.into()))
+        .key("sk", AttributeValue::N("0".into()))
+        .send()
+        .await
+        .expect("read the marker item");
+
+    let stored = photon_evt::dynamodb::from_sdk_item(&output.item.expect("the marker item"));
+    let want = dynamo::feature_marker_item(&manifest).expect("encode the marker item");
+
+    assert_eq!(
+        stored, want,
+        "the stored marker item must match the wire format"
+    );
+    assert_eq!(
+        manifest.features_json(),
+        "{}",
+        "the cleared manifest stores an empty sorted JSON object"
+    );
 }
 
 /// Writes a view only if it already exists, so its condition fails for a new entity.
@@ -481,6 +537,8 @@ async fn postgres_conforms() {
         .await
         .expect("create the view table");
 
+    clear_manifest(&repository).await;
+
     // PostgreSQL does not check snapshot sequences: the event-sequence conflict already rejects
     // racing writers, and the snapshot upsert keeps the event sequence monotonic.
     Suite::new(&repository)
@@ -488,4 +546,54 @@ async fn postgres_conforms() {
         .with_views(views)
         .run()
         .await;
+
+    // A second handle over the same pool is a second writer with its own marker cache.
+    let second = PostgresRepository::new(repository.pool().clone());
+    feature_marker_cases(&repository, &second).await;
+    postgres_features_text_matches_the_manifest(&repository).await;
+}
+
+/// Reads the features row back through raw SQL and asserts the stored JSON text is exactly the
+/// manifest's encoding, matching the DynamoDB attribute byte for byte.
+async fn postgres_features_text_matches_the_manifest(repository: &PostgresRepository) {
+    use photon_evt::wire::postgres::features_table;
+
+    let manifest = repository
+        .read_manifest()
+        .await
+        .expect("read the manifest")
+        .expect("the feature-marker row exists");
+
+    let row = repository
+        .pool()
+        .get()
+        .await
+        .expect("connect to PostgreSQL")
+        .query_opt(
+            &format!(
+                "SELECT features, history_dependent, retention FROM {} WHERE id = 0",
+                features_table("evt_events")
+            ),
+            &[],
+        )
+        .await
+        .expect("read the features row")
+        .expect("the features row");
+
+    assert_eq!(row.get::<_, String>(0), manifest.features_json());
+    assert_eq!(
+        row.get::<_, String>(1),
+        manifest
+            .history_dependent_json()
+            .unwrap_or_else(|| "[]".into())
+    );
+    assert_eq!(
+        row.get::<_, String>(2),
+        manifest.retention_json().unwrap_or_else(|| "[]".into())
+    );
+    assert_eq!(
+        manifest.features_json(),
+        "{}",
+        "the cleared manifest stores an empty sorted JSON object"
+    );
 }

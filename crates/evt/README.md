@@ -17,6 +17,10 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
 - Upcasters migrate old payload versions on read. `compact_below` deletes only events a snapshot
   covers.
 - In-band projectors write views in the same transaction as the events.
+- `latest(n)` reads a stream's last `n` events newest-first. The `SYSTEM#` and `command-outcome#`
+  namespaces are reserved for engine rows: writes to them are refused, entity heads skip them,
+  and a `SYSTEM#FEATURES` marker row declares the extensions a table uses — a writer that does
+  not support a declared feature refuses to write.
 
 ## Example
 

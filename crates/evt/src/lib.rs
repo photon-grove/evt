@@ -25,6 +25,7 @@ mod aggregate;
 pub mod conformance;
 mod error;
 mod event;
+mod features;
 mod ids;
 pub mod json;
 mod mem;
@@ -46,6 +47,10 @@ pub mod postgres;
 pub use aggregate::{Aggregate, Projector};
 pub use error::{BoxError, Error, ExecuteError, ReplayPhase};
 pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
+pub use features::{
+    COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker, SUPPORTED_FEATURES,
+    SYSTEM_PREFIX, ValidatedMarker,
+};
 pub use ids::{CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 pub use mem::MemRepository;
 pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};

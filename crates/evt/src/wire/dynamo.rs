@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
+use crate::features::{FEATURES_ID, FEATURES_SORT_KEY, FeatureManifest};
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::json;
 use crate::metadata::Metadata;
@@ -56,6 +57,11 @@ pub const NEXT_SNAPSHOT_CONDITION: &str = "seq = :seq AND eventSeq < :first";
 
 /// Condition for out-of-band snapshot puts: never lower the stored `eventSeq` (`:new`).
 pub const PUT_SNAPSHOT_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq <= :new";
+
+/// Condition for the feature-marker check every v0.9 commit carries (`:v` is the version the
+/// writer validated). A writer that validated a table with no marker conditions on
+/// `attribute_not_exists(pk)` instead.
+pub const MARKER_CONDITION: &str = "attribute_not_exists(pk) OR version = :v";
 
 /// A DynamoDB attribute value. Serializes as DynamoDB JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +142,34 @@ pub fn snapshot_item(snapshot: &SerializedSnapshot, ttl: Option<i64>) -> Result<
     insert_ttl(&mut item, ttl);
 
     Ok(item)
+}
+
+/// Encodes the feature-marker item (`pk = SYSTEM#FEATURES`, `sk = 0`). `historyDependent` and
+/// `retention` are written only when their set is non-empty.
+pub fn feature_marker_item(manifest: &FeatureManifest) -> Result<Item, Error> {
+    let mut item = Item::new();
+    item.insert("pk".into(), s(FEATURES_ID));
+    item.insert("sk".into(), n(FEATURES_SORT_KEY));
+    item.insert("version".into(), n(manifest.version));
+    item.insert("features".into(), s(manifest.features_json()));
+    if let Some(history_dependent) = manifest.history_dependent_json() {
+        item.insert("historyDependent".into(), s(history_dependent));
+    }
+    if let Some(retention) = manifest.retention_json() {
+        item.insert("retention".into(), s(retention));
+    }
+
+    Ok(item)
+}
+
+/// Decodes the feature-marker item.
+pub fn feature_marker_from_item(item: &Item) -> Result<FeatureManifest, Error> {
+    FeatureManifest::from_attributes(
+        required_number(item, "version")?,
+        required_string(item, "features")?,
+        optional_string(item, "historyDependent")?,
+        optional_string(item, "retention")?,
+    )
 }
 
 /// Encodes a single-item view row: `pk = {entityType}#{entityId}`, `sk = "VIEW"`.
@@ -284,5 +318,29 @@ mod tests {
             matches!(event_from_item(&item(" ")), Err(Error::InvalidRecord(_))),
             "empty metadata"
         );
+    }
+
+    #[test]
+    fn feature_marker_round_trips() {
+        let mut manifest = FeatureManifest {
+            version: 3,
+            ..FeatureManifest::default()
+        };
+        manifest.features.insert("journal".into(), 1);
+        manifest.history_dependent.insert("audit-feed".into());
+
+        let item = feature_marker_item(&manifest).unwrap();
+        assert_eq!(item.get("pk"), Some(&s(crate::features::FEATURES_ID)));
+        assert_eq!(item.get("sk"), Some(&n(0)));
+        assert_eq!(
+            item.get("features"),
+            Some(&s(r#"{"journal":1}"#)),
+            "sorted keys"
+        );
+        assert_eq!(item.get("historyDependent"), Some(&s(r#"["audit-feed"]"#)));
+        assert_eq!(item.get("retention"), None, "an empty set is absent");
+
+        assert_eq!(feature_marker_from_item(&item).unwrap(), manifest);
+        assert!(feature_marker_from_item(&Item::new()).is_err());
     }
 }

@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Mutex;
 
 use deadpool_postgres::{GenericClient, Pool, PoolError};
 use tokio_postgres::error::SqlState;
@@ -13,11 +14,15 @@ use tokio_postgres::types::ToSql;
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
+use crate::features::{
+    self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
+};
 use crate::ids::{EntityId, EntityType, EventSequence};
 use crate::repository::{Commit, Repository};
 use crate::wire::postgres::{
-    DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, SnapshotRow,
-    check_table_names, schema_ddl,
+    DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, FEATURES_LOCK_EXCLUSIVE,
+    FEATURES_LOCK_SHARED, SnapshotRow, check_table_names, features_lock_key, features_table,
+    schema_ddl,
 };
 
 /// A SQL statement that an in-band projector adds to a commit. It runs in the same transaction
@@ -50,11 +55,24 @@ impl fmt::Debug for PgStatement {
 }
 
 /// A PostgreSQL-backed [`Repository`]. Clones share the pool.
-#[derive(Clone)]
 pub struct PostgresRepository {
     pool: Pool,
     events_table: String,
     snapshots_table: String,
+    /// The feature-marker version this handle validated, if it has written yet. Each handle is
+    /// its own writer: clones validate independently, like separate processes.
+    validated_marker: Mutex<CachedMarker>,
+}
+
+impl Clone for PostgresRepository {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            events_table: self.events_table.clone(),
+            snapshots_table: self.snapshots_table.clone(),
+            validated_marker: Mutex::new(*self.validated_marker()),
+        }
+    }
 }
 
 impl fmt::Debug for PostgresRepository {
@@ -76,6 +94,7 @@ impl PostgresRepository {
             pool,
             events_table: DEFAULT_EVENTS_TABLE.to_owned(),
             snapshots_table: DEFAULT_SNAPSHOTS_TABLE.to_owned(),
+            validated_marker: Mutex::new(None),
         }
     }
 
@@ -104,6 +123,133 @@ impl PostgresRepository {
             .batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
             .await
             .map_err(Error::backend)
+    }
+
+    fn validated_marker(&self) -> std::sync::MutexGuard<'_, CachedMarker> {
+        self.validated_marker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reads the feature manifest row, if one exists.
+    pub async fn read_manifest(&self) -> Result<Option<FeatureManifest>, Error> {
+        let client = self.pool.get().await.map_err(pool_error)?;
+
+        self.read_manifest_in(&client).await
+    }
+
+    /// Reads the feature manifest row on an open transaction or connection.
+    async fn read_manifest_in(
+        &self,
+        client: &impl GenericClient,
+    ) -> Result<Option<FeatureManifest>, Error> {
+        let sql = format!(
+            "SELECT version, features, history_dependent, retention FROM {} WHERE id = 0",
+            features_table(&self.events_table)
+        );
+        let row = client.query_opt(&sql, &[]).await.map_err(Error::backend)?;
+
+        row.map(|row| {
+            FeatureManifest::from_attributes(
+                row.get(0),
+                row.get(1),
+                Some(row.get(2)),
+                Some(row.get(3)),
+            )
+        })
+        .transpose()
+    }
+
+    /// Applies the change to the stored feature manifest in one transaction that bumps `version`
+    /// by exactly one, under the manifest's exclusive advisory lock. Declaring does not require
+    /// support — commits do — so a table can be prepared for, or tested against, a feature this
+    /// build does not model.
+    pub async fn update_manifest(
+        &self,
+        change: impl Fn(&mut FeatureManifest),
+    ) -> Result<(), Error> {
+        let mut client = self.pool.get().await.map_err(pool_error)?;
+        let tx = client.transaction().await.map_err(Error::backend)?;
+        let lock_key = features_lock_key(&self.events_table);
+        tx.execute(FEATURES_LOCK_EXCLUSIVE, &[&lock_key])
+            .await
+            .map_err(statement_error)?;
+
+        let observed = self.read_manifest_in(&tx).await?;
+        let mut next = observed.clone().unwrap_or_default();
+        change(&mut next);
+        next.version = observed.as_ref().map_or(1, |manifest| manifest.version + 1);
+
+        let history_dependent = next.history_dependent_json().unwrap_or_else(|| "[]".into());
+        let retention = next.retention_json().unwrap_or_else(|| "[]".into());
+        let table = features_table(&self.events_table);
+
+        match &observed {
+            None => {
+                let sql = format!(
+                    "INSERT INTO {table} (id, version, features, history_dependent, retention) \
+                     VALUES (0, $1, $2, $3, $4)"
+                );
+                tx.execute(
+                    &sql,
+                    &[
+                        &next.version,
+                        &next.features_json(),
+                        &history_dependent,
+                        &retention,
+                    ],
+                )
+                .await
+                .map_err(Error::backend)
+            }
+            Some(manifest) => {
+                let sql = format!(
+                    "UPDATE {table} SET version = $1, features = $2, history_dependent = $3, \
+                     retention = $4 WHERE id = 0 AND version = $5"
+                );
+                let written = tx
+                    .execute(
+                        &sql,
+                        &[
+                            &next.version,
+                            &next.features_json(),
+                            &history_dependent,
+                            &retention,
+                            &manifest.version,
+                        ],
+                    )
+                    .await
+                    .map_err(Error::backend)?;
+                if written == 0 {
+                    // Impossible while the exclusive lock is held; refuse rather than guess.
+                    return Err(Error::Backend(
+                        "the feature manifest moved during its \
+                        declaration despite the exclusive lock"
+                            .into(),
+                    ));
+                }
+
+                Ok(written)
+            }
+        }?;
+
+        tx.commit().await.map_err(Error::backend)?;
+        *self.validated_marker() = None;
+
+        Ok(())
+    }
+
+    /// Compares the commit's manifest row against the writer's cached validation, re-validating
+    /// when the row changed under it. Runs inside the commit transaction under the shared
+    /// advisory lock, so a declaration cannot slip between this check and the `COMMIT`.
+    fn check_manifest(&self, observed: Option<&FeatureManifest>) -> Result<(), Error> {
+        let mut cached = self.validated_marker();
+
+        if !features::marker_matches(*cached, observed) {
+            *cached = Some(features::validate_marker(observed)?);
+        }
+
+        Ok(())
     }
 
     /// Returns the raw event rows for an entity, ascending. Intended for diagnostics and
@@ -213,6 +359,7 @@ impl Repository for PostgresRepository {
 
     async fn commit(&self, commit: Commit<PgStatement>) -> Result<(), Error> {
         commit.validate()?;
+        features::check_not_reserved(&commit.entity_id)?;
 
         let Some(last_sequence) = commit.events.last().map(|event| event.sequence) else {
             return Ok(());
@@ -229,6 +376,16 @@ impl Repository for PostgresRepository {
         tx.execute(ENTITY_LOCK, &[&commit.entity_id.as_str()])
             .await
             .map_err(statement_error)?;
+
+        // The feature-marker check is the first action of every v0.9 commit (spec Writes step 1).
+        // The shared advisory lock is held to COMMIT, so a declaration cannot slip between the
+        // version check and the commit.
+        let lock_key = features_lock_key(&self.events_table);
+        tx.execute(FEATURES_LOCK_SHARED, &[&lock_key])
+            .await
+            .map_err(statement_error)?;
+        let manifest = self.read_manifest_in(&tx).await?;
+        self.check_manifest(manifest.as_ref())?;
 
         let insert = format!(
             "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
@@ -324,6 +481,43 @@ impl Repository for PostgresRepository {
             .collect()
     }
 
+    async fn latest(
+        &self,
+        entity_id: &EntityId,
+        count: usize,
+    ) -> Result<Vec<SerializedEvent>, Error> {
+        if count == 0 {
+            return Err(Error::InvalidArgument(
+                "latest(n) requires at least one event: got n = 0".into(),
+            ));
+        }
+
+        let client = self.pool.get().await.map_err(pool_error)?;
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM {} WHERE entity_id = $1 ORDER BY sequence DESC LIMIT $2",
+            self.events_table
+        );
+
+        let rows = client
+            .query(&sql, &[&entity_id.as_str(), &(count as i64)])
+            .await
+            .map_err(Error::backend)?;
+
+        rows.into_iter()
+            .map(|row| EventRow {
+                event_id: row.get(0),
+                sequence: row.get(1),
+                event_type: row.get(2),
+                version: row.get(3),
+                entity_id: row.get(4),
+                entity_type: row.get(5),
+                payload: row.get(6),
+                metadata: row.get(7),
+            })
+            .map(EventRow::into_event)
+            .collect()
+    }
+
     async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
         Ok(self
             .snapshot_row(entity_id)
@@ -332,6 +526,8 @@ impl Repository for PostgresRepository {
     }
 
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+        features::check_not_reserved(&snapshot.entity_id)?;
+
         let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
         tx.execute(ENTITY_LOCK, &[&snapshot.entity_id.as_str()])
@@ -355,16 +551,32 @@ impl Repository for PostgresRepository {
             return Ok(0);
         }
 
-        let covered = self
-            .snapshot(entity_id)
-            .await?
-            .map(|snapshot| snapshot.event_sequence);
+        features::check_not_reserved(entity_id)?;
+
+        let snapshot = self.snapshot(entity_id).await?;
+        let covered = snapshot.as_ref().map(|snapshot| snapshot.event_sequence);
         if covered.is_none_or(|covered| covered < through) {
             return Err(Error::CompactionUncovered {
                 entity_id: entity_id.clone(),
                 through,
                 covered,
             });
+        }
+
+        // The manifest is durable, shared state: a process that never registered the projector
+        // refuses all the same. The check runs before anything is deleted.
+        let manifest = self.read_manifest().await?;
+        if let Some(manifest) = &manifest {
+            manifest.validate_supported()?;
+
+            if let Some(entity_type) = snapshot.as_ref().map(|snapshot| &snapshot.entity_type)
+                && manifest.is_history_dependent(entity_type)
+            {
+                return Err(Error::HistoryDependentProjection {
+                    entity_type: entity_type.clone(),
+                    entity_id: entity_id.clone(),
+                });
+            }
         }
 
         let client = self.pool.get().await.map_err(pool_error)?;
@@ -391,9 +603,11 @@ impl Repository for PostgresRepository {
                  UNION ALL
                  SELECT entity_id, event_sequence AS head, entity_type FROM {}
              ) sources
-             WHERE $1::text IS NULL OR entity_type = $1
+             WHERE ($1::text IS NULL OR entity_type = $1)
+                 AND entity_id NOT LIKE '{}%'
+                 AND entity_id NOT LIKE '{}%'
              GROUP BY entity_id",
-            self.events_table, self.snapshots_table
+            self.events_table, self.snapshots_table, SYSTEM_PREFIX, COMMAND_OUTCOME_PREFIX
         );
         let filter = entity_type.map(EntityType::as_str);
 
@@ -411,6 +625,19 @@ impl Repository for PostgresRepository {
                 )
             })
             .collect())
+    }
+}
+
+impl FeatureMarker for PostgresRepository {
+    async fn read_manifest(&self) -> Result<Option<FeatureManifest>, Error> {
+        PostgresRepository::read_manifest(self).await
+    }
+
+    async fn update_manifest(
+        &self,
+        change: impl Fn(&mut FeatureManifest) + Send,
+    ) -> Result<(), Error> {
+        PostgresRepository::update_manifest(self, change).await
     }
 }
 
@@ -482,6 +709,8 @@ mod tests {
     use deadpool_postgres::Manager;
     use tokio_postgres::NoTls;
 
+    use crate::wire::postgres::MAX_EVENTS_TABLE_NAME_LEN;
+
     use super::*;
 
     fn repository() -> PostgresRepository {
@@ -501,15 +730,19 @@ mod tests {
     #[test]
     fn rejects_unsafe_or_shared_table_names() {
         let too_long = "e".repeat(48);
+        let events_too_long = "e".repeat(MAX_EVENTS_TABLE_NAME_LEN + 1);
+        let events_max = "e".repeat(MAX_EVENTS_TABLE_NAME_LEN);
 
         for (events, snapshots) in [
             ("evt_events", "evt_events"),
             ("Evt_Events", "evt_events"),
-            ("events", "events_entity_type_idx"),
+            ("events", "events__evt_features"),
             ("events_pkey", "events"),
+            ("orders__evt_features", "evt_snapshots"),
             ("evt_events; drop", "evt_snapshots"),
             ("Select", "evt_snapshots"),
             (too_long.as_str(), "evt_snapshots"),
+            (events_too_long.as_str(), "evt_snapshots"),
         ] {
             assert!(
                 matches!(
@@ -521,5 +754,6 @@ mod tests {
         }
 
         assert!(repository().with_tables("a_events", "a_snapshots").is_ok());
+        assert!(repository().with_tables(&events_max, "a_snapshots").is_ok());
     }
 }

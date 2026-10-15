@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::ids::{CommandId, EntityId, EventSequence, EventType, EventVersion};
+use crate::ids::{CommandId, EntityId, EntityType, EventSequence, EventType, EventVersion};
 
 /// A boxed, thread-safe error for backend and user-callback failures.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -99,6 +99,47 @@ pub enum Error {
     /// The repository was configured with an invalid value, such as an unsafe table name.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// A read or write was called with an invalid argument, such as
+    /// [`Repository::latest`](crate::Repository::latest) with `n = 0`. Returned before any
+    /// request.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// A write path was given an entity ID in a reserved namespace (`SYSTEM#`,
+    /// `command-outcome#`), which only the engine may write. Nothing was written.
+    #[error("entity ID {entity_id} is in a reserved namespace (SYSTEM#, command-outcome#)")]
+    ReservedEntityId {
+        /// The reserved entity ID.
+        entity_id: EntityId,
+    },
+
+    /// The table's feature manifest declares a `(name, formatVersion)` pair this writer does not
+    /// model, so it refuses to write. Nothing was written.
+    #[error(
+        "the feature manifest declares {feature} at stored-format version {version}, which this \
+         writer does not support"
+    )]
+    UnsupportedFeature {
+        /// The declared feature name.
+        feature: String,
+        /// The declared stored-format version.
+        version: i64,
+    },
+
+    /// Compaction was refused because the entity type appears in the feature manifest's durable
+    /// `historyDependent` set: its commit-wide projectors need the full commit stream. Nothing
+    /// was deleted.
+    #[error(
+        "compaction refused: entity type {entity_type} has history-dependent projectors \
+         (entity {entity_id})"
+    )]
+    HistoryDependentProjection {
+        /// The entity's type.
+        entity_type: EntityType,
+        /// The entity.
+        entity_id: EntityId,
+    },
 
     /// The storage backend failed.
     #[error(transparent)]

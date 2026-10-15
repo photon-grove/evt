@@ -6,6 +6,7 @@
 //! key `sk`. See [`crate::wire::dynamo`] for the item layout.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use aws_sdk_dynamodb::Client;
@@ -21,6 +22,10 @@ use aws_sdk_dynamodb::types::{
 use crate::aggregate::{Aggregate, Projector};
 use crate::error::{BoxError, Error};
 use crate::event::{SerializedEvent, SerializedSnapshot};
+use crate::features::{
+    self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
+    ValidatedMarker,
+};
 use crate::ids::{EntityId, EntityType, EventSequence};
 use crate::json;
 use crate::repository::{Commit, Repository};
@@ -29,19 +34,44 @@ use crate::wire::dynamo::{self as wire, AttributeValue, Item};
 /// DynamoDB's limit on actions per transaction.
 pub const MAX_TRANSACTION_ITEMS: usize = 100;
 
+/// How many times a commit re-validates the feature marker when its condition fails before the
+/// commit gives up. Each revalidation re-reads the manifest, so only a table whose manifest keeps
+/// changing under the writer can exhaust it.
+const MAX_MARKER_REVALIDATIONS: usize = 8;
+
+/// How many times a manifest declaration retries its conditional write when another declaration
+/// changed the row first.
+const MAX_DECLARATION_RETRIES: usize = 8;
+
 const BATCH_DELETE_SIZE: usize = 25;
 const MAX_UNPROCESSED_RETRIES: u32 = 8;
 const UNPROCESSED_BASE_DELAY: Duration = Duration::from_millis(50);
 const UNPROCESSED_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// A DynamoDB-backed [`Repository`]. Clones share the client.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DynamoRepository {
     client: Client,
     table: String,
     consistent_read: bool,
     retention: BTreeMap<EntityType, Duration>,
     clock: fn() -> SystemTime,
+    /// The feature-marker version this handle validated, if it has written yet. Each handle is
+    /// its own writer: clones validate independently, like separate processes.
+    validated_marker: Mutex<CachedMarker>,
+}
+
+impl Clone for DynamoRepository {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            table: self.table.clone(),
+            consistent_read: self.consistent_read,
+            retention: self.retention.clone(),
+            clock: self.clock,
+            validated_marker: Mutex::new(*self.validated_marker()),
+        }
+    }
 }
 
 impl DynamoRepository {
@@ -53,6 +83,7 @@ impl DynamoRepository {
             consistent_read: true,
             retention: BTreeMap::new(),
             clock: SystemTime::now,
+            validated_marker: Mutex::new(None),
         }
     }
 
@@ -97,6 +128,178 @@ impl DynamoRepository {
         let retention = self.retention.get(entity_type)?;
 
         wire::expiry((self.clock)(), *retention)
+    }
+
+    fn validated_marker(&self) -> MutexGuard<'_, CachedMarker> {
+        self.validated_marker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Returns the marker version this handle validated, reading and validating the manifest at
+    /// first write. The read is strongly consistent regardless of `with_consistent_read`, so a
+    /// declaration another writer just wrote cannot be missed.
+    async fn ensure_manifest_validated(&self) -> Result<CachedMarker, Error> {
+        if let Some(cached) = *self.validated_marker() {
+            return Ok(Some(cached));
+        }
+
+        let observed = self.read_manifest().await?;
+        let validated = features::validate_marker(observed.as_ref())?;
+
+        let mut cached = self.validated_marker();
+        if cached.is_none() {
+            *cached = Some(validated);
+        }
+
+        Ok(*cached)
+    }
+
+    /// Drops the cached validation, so the next write re-reads and re-validates the manifest.
+    fn invalidate_manifest(&self) {
+        *self.validated_marker() = None;
+    }
+
+    /// Reads the feature manifest row, if one exists. Always strongly consistent.
+    pub async fn read_manifest(&self) -> Result<Option<FeatureManifest>, Error> {
+        let output = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .key("pk", s(crate::features::FEATURES_ID))
+            .key("sk", n(crate::features::FEATURES_SORT_KEY))
+            .send()
+            .await
+            .map_err(sdk_error)?;
+
+        match output.item {
+            Some(item) if !item.is_empty() => {
+                Ok(Some(wire::feature_marker_from_item(&from_sdk_item(&item))?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Applies the change to the stored feature manifest in one conditional write that bumps
+    /// `version` by exactly one. Declaring does not require support — commits do — so a table
+    /// can be prepared for, or tested against, a feature this build does not model. The change
+    /// is applied to the freshly observed manifest on every retry, so a racing declaration is
+    /// merged, not overwritten.
+    pub async fn update_manifest(
+        &self,
+        change: impl Fn(&mut FeatureManifest),
+    ) -> Result<(), Error> {
+        for _ in 0..=MAX_DECLARATION_RETRIES {
+            let observed = self.read_manifest().await?;
+            let mut next = observed.clone().unwrap_or_default();
+            change(&mut next);
+            next.version = observed.as_ref().map_or(1, |manifest| manifest.version + 1);
+
+            let item = wire::feature_marker_item(&next)?;
+            let mut put = self
+                .client
+                .put_item()
+                .table_name(&self.table)
+                .set_item(Some(to_sdk_item(&item)));
+
+            put = match &observed {
+                None => put.condition_expression("attribute_not_exists(pk)"),
+                Some(manifest) => put
+                    .condition_expression("version = :observed")
+                    .expression_attribute_values(":observed", n(manifest.version)),
+            };
+
+            match put.send().await {
+                Ok(_) => {
+                    self.invalidate_manifest();
+                    return Ok(());
+                }
+                Err(SdkError::ServiceError(err))
+                    if matches!(err.err(), PutItemError::ConditionalCheckFailedException(_)) => {}
+                Err(err) => return Err(sdk_error(err)),
+            }
+        }
+
+        Err(Error::Backend(
+            "feature-marker declaration kept racing another declaration".into(),
+        ))
+    }
+
+    /// Builds the feature-marker check every commit carries: the validated version must still be
+    /// the stored one, or the row must still be absent.
+    fn marker_check(&self, cached: CachedMarker) -> Result<TransactWriteItem, Error> {
+        let mut check = ConditionCheck::builder()
+            .table_name(&self.table)
+            .key("pk", s(crate::features::FEATURES_ID))
+            .key("sk", n(crate::features::FEATURES_SORT_KEY));
+
+        check = match cached {
+            Some(ValidatedMarker::Version(version)) => check
+                .condition_expression(wire::MARKER_CONDITION)
+                .expression_attribute_values(":v", n(version)),
+            None | Some(ValidatedMarker::Absent) => {
+                check.condition_expression("attribute_not_exists(pk)")
+            }
+        };
+
+        Ok(TransactWriteItem::builder()
+            .condition_check(check.build().map_err(Error::backend)?)
+            .build())
+    }
+
+    /// Builds the commit's transaction items in the pinned order: the feature-marker check, the
+    /// projector operations, the event puts, then the snapshot put or floor check.
+    fn transaction_items(
+        &self,
+        commit: &Commit<TransactWriteItem>,
+        cached: CachedMarker,
+    ) -> Result<Vec<TransactWriteItem>, Error> {
+        let (Some(first), Some(last_sequence)) = (
+            commit.events.first().map(|event| n(event.sequence.0)),
+            commit.events.last().map(|event| event.sequence),
+        ) else {
+            return Ok(Vec::new());
+        };
+
+        let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 2);
+        items.push(self.marker_check(cached)?);
+        items.extend(commit.operations.iter().cloned());
+
+        for event in &commit.events {
+            let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
+            items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
+        }
+
+        if let Some(snapshot) = &commit.snapshot {
+            let ttl = self.ttl_for(&snapshot.entity_type);
+            let item = wire::snapshot_item(
+                &SerializedSnapshot {
+                    entity_type: snapshot.entity_type.clone(),
+                    entity_id: commit.entity_id.clone(),
+                    sequence: snapshot.sequence,
+                    event_sequence: last_sequence,
+                    payload: snapshot.payload.clone(),
+                },
+                ttl,
+            )?;
+            // Commit::validate guarantees the sequence is at least 1.
+            let expected = snapshot.sequence.0 - 1;
+            items.push(if expected == 0 {
+                put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
+            } else {
+                put(
+                    &self.table,
+                    item,
+                    Some(wire::NEXT_SNAPSHOT_CONDITION),
+                    &[(":seq", n(expected)), (":first", first)],
+                )?
+            });
+        } else {
+            items.push(floor_check(&self.table, &commit.entity_id, first)?);
+        }
+
+        Ok(items)
     }
 
     /// Returns every item in an entity's partition, including the snapshot at `sk = 0`, in sort
@@ -327,64 +530,56 @@ impl Repository for DynamoRepository {
 
     async fn commit(&self, commit: Commit<TransactWriteItem>) -> Result<(), Error> {
         commit.validate()?;
+        features::check_not_reserved(&commit.entity_id)?;
 
-        let (Some(first), Some(last_sequence)) = (
-            commit.events.first().map(|event| n(event.sequence.0)),
-            commit.events.last().map(|event| event.sequence),
-        ) else {
+        if commit.events.is_empty() {
             return Ok(());
-        };
+        }
 
         let operations = commit.operations.len();
-        let mut items = commit.operations;
+        let mut revalidations = 0;
 
-        for event in &commit.events {
-            let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
-            items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
+        loop {
+            let cached = self.ensure_manifest_validated().await?;
+            let items = self.transaction_items(&commit, cached)?;
+
+            if items.len() > MAX_TRANSACTION_ITEMS {
+                return Err(Error::TooManyOperations {
+                    count: items.len(),
+                    limit: MAX_TRANSACTION_ITEMS,
+                });
+            }
+
+            match self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    let codes = cancellation_reasons(&err);
+                    if classify_cancellation(operations, &codes) == Some(Cancellation::Marker) {
+                        // The feature set changed under this writer: re-validate it, then
+                        // retry. Re-validating refuses a feature this writer does not support.
+                        if revalidations >= MAX_MARKER_REVALIDATIONS {
+                            return Err(Error::Backend(Box::new(err)));
+                        }
+                        revalidations += 1;
+                        self.invalidate_manifest();
+
+                        continue;
+                    }
+
+                    return Err(classify_transaction_error(
+                        &commit.entity_id,
+                        operations,
+                        err,
+                    ));
+                }
+            }
         }
-
-        if let Some(snapshot) = commit.snapshot {
-            let ttl = self.ttl_for(&snapshot.entity_type);
-            let item = wire::snapshot_item(
-                &SerializedSnapshot {
-                    entity_type: snapshot.entity_type,
-                    entity_id: commit.entity_id.clone(),
-                    sequence: snapshot.sequence,
-                    event_sequence: last_sequence,
-                    payload: snapshot.payload,
-                },
-                ttl,
-            )?;
-            // Commit::validate guarantees the sequence is at least 1.
-            let expected = snapshot.sequence.0 - 1;
-            items.push(if expected == 0 {
-                put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
-            } else {
-                put(
-                    &self.table,
-                    item,
-                    Some(wire::NEXT_SNAPSHOT_CONDITION),
-                    &[(":seq", n(expected)), (":first", first)],
-                )?
-            });
-        } else {
-            items.push(floor_check(&self.table, &commit.entity_id, first)?);
-        }
-
-        if items.len() > MAX_TRANSACTION_ITEMS {
-            return Err(Error::TooManyOperations {
-                count: items.len(),
-                limit: MAX_TRANSACTION_ITEMS,
-            });
-        }
-
-        self.client
-            .transact_write_items()
-            .set_transact_items(Some(items))
-            .send()
-            .await
-            .map(|_| ())
-            .map_err(|err| classify_transaction_error(&commit.entity_id, operations, err))
     }
 
     async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
@@ -399,11 +594,65 @@ impl Repository for DynamoRepository {
         self.query_events(entity_id, after).await
     }
 
+    async fn latest(
+        &self,
+        entity_id: &EntityId,
+        count: usize,
+    ) -> Result<Vec<SerializedEvent>, Error> {
+        if count == 0 {
+            return Err(Error::InvalidArgument(
+                "latest(n) requires at least one event: got n = 0".into(),
+            ));
+        }
+
+        // Newest first: `ScanIndexForward = false` with `Limit = n` reads the `n` highest event
+        // sequences. Large items can close a page early, so keep paging until `n` events or the
+        // end of the stream.
+        let mut events = Vec::with_capacity(count);
+        let mut start = None;
+
+        loop {
+            let page = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .consistent_read(self.consistent_read)
+                .key_condition_expression("pk = :pk AND sk > :sk")
+                .expression_attribute_values(":pk", s(entity_id.as_str()))
+                .expression_attribute_values(":sk", n(0))
+                .scan_index_forward(false)
+                .limit((count - events.len()) as i32)
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(sdk_error)?;
+
+            for item in page.items() {
+                let item = from_sdk_item(item);
+                if !wire::is_snapshot_item(&item) {
+                    events.push(wire::event_from_item(&item)?);
+                }
+            }
+
+            if events.len() >= count {
+                events.truncate(count);
+                return Ok(events);
+            }
+
+            match page.last_evaluated_key {
+                Some(key) if !key.is_empty() => start = Some(key),
+                _ => return Ok(events),
+            }
+        }
+    }
+
     async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
         self.read_snapshot(entity_id, self.consistent_read).await
     }
 
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+        features::check_not_reserved(&snapshot.entity_id)?;
+
         let item = wire::snapshot_item(snapshot, self.ttl_for(&snapshot.entity_type))?;
 
         let result = self
@@ -436,17 +685,33 @@ impl Repository for DynamoRepository {
             return Ok(0);
         }
 
+        features::check_not_reserved(entity_id)?;
+
         // Strongly consistent regardless of `with_consistent_read`, like the key query below.
-        let covered = self
-            .read_snapshot(entity_id, true)
-            .await?
-            .map(|snapshot| snapshot.event_sequence);
+        let snapshot = self.read_snapshot(entity_id, true).await?;
+        let covered = snapshot.as_ref().map(|snapshot| snapshot.event_sequence);
         if covered.is_none_or(|covered| covered < through) {
             return Err(Error::CompactionUncovered {
                 entity_id: entity_id.clone(),
                 through,
                 covered,
             });
+        }
+
+        // The manifest is durable, shared state: a process that never registered the projector
+        // refuses all the same. The check runs before anything is deleted.
+        let manifest = self.read_manifest().await?;
+        if let Some(manifest) = &manifest {
+            manifest.validate_supported()?;
+
+            if let Some(entity_type) = snapshot.as_ref().map(|snapshot| &snapshot.entity_type)
+                && manifest.is_history_dependent(entity_type)
+            {
+                return Err(Error::HistoryDependentProjection {
+                    entity_type: entity_type.clone(),
+                    entity_id: entity_id.clone(),
+                });
+            }
         }
 
         let keys = self.event_keys_through(entity_id, through).await?;
@@ -471,6 +736,11 @@ impl Repository for DynamoRepository {
                 .table_name(&self.table)
                 .consistent_read(self.consistent_read)
                 .projection_expression("pk, sk, eventSeq")
+                // The reserved SYSTEM# and command-outcome# partitions are engine-managed rows,
+                // never ordinary aggregates (v0.9, C8).
+                .filter_expression("NOT begins_with(pk, :system) AND NOT begins_with(pk, :outcome)")
+                .expression_attribute_values(":system", s(SYSTEM_PREFIX))
+                .expression_attribute_values(":outcome", s(COMMAND_OUTCOME_PREFIX))
                 .set_exclusive_start_key(start);
 
             if let Some(entity_type) = entity_type {
@@ -497,6 +767,19 @@ impl Repository for DynamoRepository {
         heads.retain(|_, head| *head > EventSequence::ZERO);
 
         Ok(heads)
+    }
+}
+
+impl FeatureMarker for DynamoRepository {
+    async fn read_manifest(&self) -> Result<Option<FeatureManifest>, Error> {
+        DynamoRepository::read_manifest(self).await
+    }
+
+    async fn update_manifest(
+        &self,
+        change: impl Fn(&mut FeatureManifest) + Send,
+    ) -> Result<(), Error> {
+        DynamoRepository::update_manifest(self, change).await
     }
 }
 
@@ -591,6 +874,9 @@ fn item_head(item: &HashMap<String, sdk::AttributeValue>) -> Option<(&str, i64)>
 /// How a cancelled commit transaction failed.
 #[derive(Debug, PartialEq, Eq)]
 enum Cancellation {
+    /// The feature-marker check failed: the manifest changed under the writer, which re-validates
+    /// it and retries the commit (or refuses, if it does not support the declared features).
+    Marker,
     /// A stream event or snapshot condition failed: another writer moved the stream.
     StreamCondition,
     /// Only projector conditions failed. Reloading cannot fix it.
@@ -601,12 +887,16 @@ enum Cancellation {
     Throttled,
 }
 
-/// Classifies cancellation reason codes, which are in transaction order: the first `operations`
-/// belong to projectors, the rest to the stream's events and snapshot.
+/// Classifies cancellation reason codes, which are in transaction order. Item 0 is always the
+/// feature-marker check; the next `operations` are the projector operations, and the rest are the
+/// stream's events and snapshot.
 fn classify_cancellation(operations: usize, codes: &[Option<&str>]) -> Option<Cancellation> {
     let failed = |code| failed_items(codes, code);
 
-    if failed("ConditionalCheckFailed").any(|index| index >= operations) {
+    if failed("ConditionalCheckFailed").next() == Some(0) {
+        return Some(Cancellation::Marker);
+    }
+    if failed("ConditionalCheckFailed").any(|index| index > operations) {
         return Some(Cancellation::StreamCondition);
     }
     if failed("ConditionalCheckFailed").next().is_some() {
@@ -622,6 +912,24 @@ fn classify_cancellation(operations: usize, codes: &[Option<&str>]) -> Option<Ca
     }
 
     None
+}
+
+/// The cancellation reason codes of a failed commit, in transaction order.
+fn cancellation_reasons<R>(err: &SdkError<TransactWriteItemsError, R>) -> Vec<Option<&str>>
+where
+    R: std::fmt::Debug + Send + Sync + 'static,
+{
+    match err {
+        SdkError::ServiceError(service) => match service.err() {
+            TransactWriteItemsError::TransactionCanceledException(cancelled) => cancelled
+                .cancellation_reasons()
+                .iter()
+                .map(|reason| reason.code())
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 /// The indexes of the transaction items cancelled with the given reason code.
@@ -644,17 +952,7 @@ fn classify_transaction_error<R>(
 where
     R: std::fmt::Debug + Send + Sync + 'static,
 {
-    let codes: Vec<Option<&str>> = match &err {
-        SdkError::ServiceError(service) => match service.err() {
-            TransactWriteItemsError::TransactionCanceledException(cancelled) => cancelled
-                .cancellation_reasons()
-                .iter()
-                .map(|reason| reason.code())
-                .collect(),
-            _ => Vec::new(),
-        },
-        _ => Vec::new(),
-    };
+    let codes = cancellation_reasons(&err);
 
     let conflict = |message: &str| Error::Conflict {
         entity_id: entity_id.clone(),
@@ -662,6 +960,8 @@ where
     };
 
     match classify_cancellation(operations, &codes) {
+        // Handled by the commit loop's revalidation before this mapper runs.
+        Some(Cancellation::Marker) => Error::backend(err),
         Some(Cancellation::StreamCondition) => {
             conflict("conditional check failed: the sequence or snapshot changed since it was read")
         }
@@ -811,27 +1111,28 @@ mod tests {
         const CONFLICT: Option<&str> = Some("TransactionConflict");
         const NONE: Option<&str> = Some("None");
 
+        // Item 0 is the feature-marker check; item 1 is the one projector operation.
         let cases = [
-            (vec![NONE, CHECK], Some(Cancellation::StreamCondition)),
-            (vec![CHECK, CHECK], Some(Cancellation::StreamCondition)),
-            (vec![CHECK, NONE], Some(Cancellation::ProjectorCondition)),
+            (vec![CHECK, NONE], Some(Cancellation::Marker)),
+            (vec![NONE, CHECK], Some(Cancellation::ProjectorCondition)),
+            (vec![NONE, NONE, CHECK], Some(Cancellation::StreamCondition)),
             (
-                vec![CHECK, CONFLICT],
+                vec![NONE, CHECK, CONFLICT],
                 Some(Cancellation::ProjectorCondition),
             ),
             (
-                vec![NONE, CONFLICT],
+                vec![NONE, NONE, CONFLICT],
                 Some(Cancellation::TransactionConflict),
             ),
             (
-                vec![CONFLICT, NONE],
+                vec![CONFLICT, NONE, NONE],
                 Some(Cancellation::TransactionConflict),
             ),
             (
-                vec![NONE, Some("ThrottlingError")],
+                vec![NONE, NONE, Some("ThrottlingError")],
                 Some(Cancellation::Throttled),
             ),
-            (vec![NONE, Some("ValidationError")], None),
+            (vec![NONE, NONE, Some("ValidationError")], None),
             (vec![], None),
         ];
 
@@ -846,18 +1147,7 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_000_900)
         }
 
-        // No async runtime is configured, so turn off every client feature that sleeps. The test
-        // never sends a request.
-        let config = aws_sdk_dynamodb::Config::builder()
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
-            .timeout_config(aws_sdk_dynamodb::config::timeout::TimeoutConfig::disabled())
-            .stalled_stream_protection(
-                aws_sdk_dynamodb::config::StalledStreamProtectionConfig::disabled(),
-            )
-            .identity_cache(aws_sdk_dynamodb::config::IdentityCache::no_cache())
-            .build();
-        let repository = DynamoRepository::new(Client::from_conf(config), "events")
+        let repository = offline_repository()
             .with_clock(clock)
             .with_retention("scratch", Duration::from_millis(1_500))
             .with_retention("disabled", Duration::ZERO);
@@ -867,6 +1157,55 @@ mod tests {
         assert_eq!(repository.ttl_for(&"disabled".into()), None);
         assert_eq!(repository.ttl_for(&"account".into()), None);
         assert_eq!(wire::expiry(clock(), Duration::MAX), None, "overflow");
+    }
+
+    /// Builds a repository whose client never sends a request: no async runtime is configured, so
+    /// every client feature that sleeps is turned off. Only offline builders are exercised.
+    fn offline_repository() -> DynamoRepository {
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+            .timeout_config(aws_sdk_dynamodb::config::timeout::TimeoutConfig::disabled())
+            .stalled_stream_protection(
+                aws_sdk_dynamodb::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .identity_cache(aws_sdk_dynamodb::config::IdentityCache::no_cache())
+            .build();
+
+        DynamoRepository::new(Client::from_conf(config), "events")
+    }
+
+    #[test]
+    fn the_marker_check_conditions_on_the_validated_version() {
+        let repository = offline_repository();
+
+        let check = repository
+            .marker_check(Some(ValidatedMarker::Version(7)))
+            .unwrap()
+            .condition_check()
+            .unwrap()
+            .clone();
+        assert_eq!(check.condition_expression(), wire::MARKER_CONDITION);
+        assert_eq!(
+            check.key().get("pk").and_then(|value| value.as_s().ok()),
+            Some(&crate::features::FEATURES_ID.to_owned())
+        );
+        assert_eq!(
+            check
+                .expression_attribute_values()
+                .and_then(|values| values.get(":v"))
+                .and_then(|value| value.as_n().ok()),
+            Some(&"7".to_owned())
+        );
+
+        let absent = repository
+            .marker_check(Some(ValidatedMarker::Absent))
+            .unwrap()
+            .condition_check()
+            .unwrap()
+            .clone();
+        assert_eq!(absent.condition_expression(), "attribute_not_exists(pk)");
+        assert!(absent.expression_attribute_values().is_none());
     }
 
     #[test]

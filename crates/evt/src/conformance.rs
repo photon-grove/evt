@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::aggregate::{Aggregate, Projector};
 use crate::error::{BoxError, Error};
 use crate::event::{SerializedEvent, SerializedSnapshot};
+use crate::features::{self, FeatureMarker};
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::metadata::Metadata;
 use crate::repository::{Commit, NewSnapshot, Repository};
@@ -217,6 +218,14 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             compacted_floor(repo).await,
         );
         record("entity heads", entity_heads(repo).await);
+        record(
+            "latest(n) reads the newest events first",
+            latest_n(repo).await,
+        );
+        record(
+            "refuse reserved namespaces on every write path",
+            reserved_namespaces(repo).await,
+        );
         record("store loads from a snapshot", store_snapshots(repo).await);
         record(
             "store rejects a stale commit",
@@ -903,6 +912,127 @@ async fn entity_heads<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+async fn latest_n<R: Repository>(repo: &R) -> CaseResult {
+    let stream = Stream::new(&namespace(), "latest", "ledger");
+
+    // A snapshot and compaction in the middle of the stream: `latest` reads the stored events
+    // only, never the snapshot item, whether or not earlier events were compacted away.
+    stream
+        .commit(
+            repo,
+            stream.events(1..=3),
+            Some(stream.new_snapshot(1, "{}")),
+        )
+        .await?;
+    stream.commit(repo, stream.events(4..=6), None).await?;
+    repo.compact_below(&stream.id, EventSequence(3)).await?;
+
+    let descending = |sequences: &[i64]| -> Vec<SerializedEvent> {
+        sequences
+            .iter()
+            .rev()
+            .map(|sequence| stream.event(*sequence, *sequence))
+            .collect()
+    };
+
+    ensure_eq!(
+        repo.latest(&stream.id, 3).await?,
+        descending(&[4, 5, 6]),
+        "latest(3) over a compacted stream"
+    );
+    ensure_eq!(
+        repo.latest(&stream.id, 2).await?,
+        descending(&[5, 6]),
+        "latest(2)"
+    );
+    ensure_eq!(
+        repo.latest(&stream.id, 1).await?,
+        descending(&[6]),
+        "latest(1)"
+    );
+    ensure_eq!(
+        repo.latest(&stream.id, 10).await?,
+        descending(&[4, 5, 6]),
+        "latest(10) returns the whole remaining stream"
+    );
+
+    let missing = Stream::new(&namespace(), "latest-missing", "ledger");
+    ensure!(
+        repo.latest(&missing.id, 3).await?.is_empty(),
+        "a missing entity has no latest events"
+    );
+
+    expect_err(repo.latest(&stream.id, 0).await, "latest(0)", |err| {
+        matches!(err, Error::InvalidArgument(_))
+    })?;
+
+    Ok(())
+}
+
+async fn reserved_namespaces<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+
+    // The reserved prefix starts the entity ID itself, so these are not namespaced like the
+    // other cases' IDs. They are refused before any write, so nothing collides across runs.
+    let reserved: Vec<EntityId> = ["SYSTEM#", "command-outcome#"]
+        .into_iter()
+        .map(|prefix| EntityId::new(format!("{prefix}{ns}-acct")))
+        .collect();
+
+    for id in &reserved {
+        let template = Stream::new(&ns, "template", "ledger");
+        let events = vec![SerializedEvent {
+            entity_id: id.clone(),
+            id: EventId::for_event(id, EventSequence(1)),
+            ..template.event(1, 1)
+        }];
+        expect_err(
+            repo.commit(Commit {
+                entity_id: id.clone(),
+                events,
+                snapshot: None,
+                operations: Vec::new(),
+            })
+            .await,
+            &format!("committing to {id}"),
+            |err| matches!(err, Error::ReservedEntityId { .. }),
+        )?;
+        ensure!(
+            repo.events(id).await?.is_empty() && repo.snapshot(id).await?.is_none(),
+            "the refused commit wrote nothing to {id}"
+        );
+
+        expect_err(
+            repo.put_snapshot(&SerializedSnapshot {
+                entity_type: EntityType::new(format!("{ns}-ledger")),
+                entity_id: id.clone(),
+                sequence: EventSequence(1),
+                event_sequence: EventSequence(1),
+                payload: b"{}".to_vec(),
+            })
+            .await,
+            &format!("put_snapshot at {id}"),
+            |err| matches!(err, Error::ReservedEntityId { .. }),
+        )?;
+
+        expect_err(
+            repo.compact_below(id, EventSequence(1)).await,
+            &format!("compact_below at {id}"),
+            |err| matches!(err, Error::ReservedEntityId { .. }),
+        )?;
+    }
+
+    let heads = repo.entity_heads(None).await?;
+    for id in &reserved {
+        ensure!(
+            !heads.contains_key(id),
+            "the refused writes left no head for {id}"
+        );
+    }
+
+    Ok(())
+}
+
 fn metadata() -> Metadata {
     Metadata::new("local").with_origin("conformance", "suite")
 }
@@ -1090,6 +1220,10 @@ impl<R: Repository> Repository for Interfering<'_, R> {
         self.inner.events_after(entity_id, after).await
     }
 
+    async fn latest(&self, entity_id: &EntityId, n: usize) -> Result<Vec<SerializedEvent>, Error> {
+        self.inner.latest(entity_id, n).await
+    }
+
     async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
         self.inner.snapshot(entity_id).await
     }
@@ -1238,6 +1372,292 @@ async fn store_projector<R: Repository, V: ViewTarget<R>>(repo: &R, views: &V) -
             entries: 2
         }),
         "a rejected commit does not write its view"
+    );
+
+    Ok(())
+}
+
+/// Runs the feature-marker cases (v0.9, C9) against a repository that stores the
+/// `SYSTEM#FEATURES` marker row. Like [`Suite`], it tolerates a table that holds data from
+/// earlier runs: it clears the manifest first, so features a previous run left behind cannot
+/// brick the table, and it leaves the manifest empty at the end.
+///
+/// The cases use two writers — `first` and `second` — because the refusal binds a writer whose
+/// cached validation predates a declaration made by another writer. Pass two handles over the
+/// same storage that each keep their own state, such as a repository and its clone (mem) or two
+/// repositories built on the same client or pool (the live backends).
+pub async fn feature_marker_cases<R>(first: &R, second: &R)
+where
+    R: FeatureMarker + Repository,
+{
+    let repo = first;
+    let other = second;
+    let mut failures = Vec::new();
+
+    let mut record = |name: &str, result: CaseResult| match result {
+        Ok(()) => println!("ok   {name}"),
+        Err(Failure(message)) => {
+            println!("FAIL {name}");
+            failures.push(format!("{name}: {message}"));
+        }
+    };
+
+    record(
+        "the manifest starts empty",
+        clear_manifest(repo, other).await,
+    );
+    record(
+        "a declaration bumps the version and the cached writer refuses, then revalidates",
+        declaration_bumps_and_refuses(repo, other).await,
+    );
+    record(
+        "the durable historyDependent set refuses compaction across writers",
+        history_dependent_refusal(repo, other).await,
+    );
+    record(
+        "the retention set round-trips and entity heads skip the marker row",
+        retention_and_heads(repo, other).await,
+    );
+    record(
+        "one declaration transaction bumps the version once",
+        one_bump_per_declaration(repo, other).await,
+    );
+
+    // Leave the manifest empty even when a case failed, so leftovers cannot brick the table's
+    // writers after this run.
+    if let Err(Failure(message)) = clear_manifest(repo, other).await {
+        println!("FAIL cleanup");
+        failures.push(format!("cleanup: {message}"));
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{} feature-marker case(s) failed:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+}
+
+/// Clears every declaration, so the run starts and ends with a manifest no writer refuses.
+async fn clear_manifest<R: FeatureMarker>(repo: &R, other: &R) -> CaseResult {
+    for repository in [repo, other] {
+        repository
+            .update_manifest(|manifest| {
+                manifest.features.clear();
+                manifest.history_dependent.clear();
+                manifest.retention.clear();
+            })
+            .await?;
+    }
+
+    let manifest = repo.read_manifest().await?;
+    ensure!(
+        manifest.is_some_and(|manifest| {
+            manifest.features.is_empty()
+                && manifest.history_dependent.is_empty()
+                && manifest.retention.is_empty()
+        }),
+        "the cleared manifest stores an empty feature set"
+    );
+
+    Ok(())
+}
+
+async fn declaration_bumps_and_refuses<R>(repo: &R, other: &R) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+{
+    let ns = namespace();
+    let stream = Stream::new(&ns, "marker", "ledger");
+    stream
+        .commit(
+            repo,
+            stream.events(1..=4),
+            Some(stream.new_snapshot(1, "{}")),
+        )
+        .await?;
+
+    // The commit caches the version it validated; nothing declares a feature yet.
+    stream.commit(repo, stream.events(5..=5), None).await?;
+
+    other
+        .update_manifest(|manifest| {
+            manifest.features.insert("journal".to_owned(), 1);
+        })
+        .await?;
+    let manifest = other
+        .read_manifest()
+        .await?
+        .ok_or(Failure("no manifest".into()))?;
+    ensure_eq!(
+        manifest.features.get("journal"),
+        Some(&1),
+        "the declaration"
+    );
+
+    // The cached version no longer matches, and the declared pair is unsupported: the writer
+    // refuses, and the refused commit writes nothing.
+    expect_err(
+        stream.commit(repo, stream.events(6..=6), None).await,
+        "committing to a table that declares journal",
+        |err| {
+            matches!(
+                err,
+                Error::UnsupportedFeature {
+                    feature,
+                    version: 1
+                } if feature == "journal"
+            )
+        },
+    )?;
+    ensure_eq!(
+        repo.events(&stream.id).await?,
+        stream.events(1..=5),
+        "the refused commit wrote nothing"
+    );
+
+    // Removing the feature revalidates the writer, which then commits again.
+    other
+        .update_manifest(|manifest| {
+            manifest.features.remove("journal");
+        })
+        .await?;
+    stream.commit(repo, stream.events(6..=6), None).await?;
+    ensure_eq!(
+        repo.events(&stream.id).await?,
+        stream.events(1..=6),
+        "the writer commits after the feature is removed"
+    );
+
+    Ok(())
+}
+
+async fn history_dependent_refusal<R>(repo: &R, other: &R) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+{
+    let ns = namespace();
+    let stream = Stream::new(&ns, "history", "history-ledger");
+    stream
+        .commit(
+            repo,
+            stream.events(1..=4),
+            Some(stream.new_snapshot(1, "{}")),
+        )
+        .await?;
+
+    // The set is durable, so a writer that never registered the projector refuses all the same.
+    let entity_type = stream.entity_type.as_str().to_owned();
+    other
+        .update_manifest(|manifest| {
+            manifest.history_dependent.insert(entity_type.clone());
+        })
+        .await?;
+    expect_err(
+        repo.compact_below(&stream.id, EventSequence(2)).await,
+        "compacting a history-dependent entity type",
+        |err| {
+            matches!(
+                err,
+                Error::HistoryDependentProjection { entity_type, .. }
+                    if *entity_type == stream.entity_type
+            )
+        },
+    )?;
+    ensure_eq!(
+        repo.events(&stream.id).await?,
+        stream.events(1..=4),
+        "the refused compaction deleted nothing"
+    );
+
+    let entity_type = stream.entity_type.as_str().to_owned();
+    other
+        .update_manifest(|manifest| {
+            manifest.history_dependent.remove(&entity_type);
+        })
+        .await?;
+    ensure_eq!(
+        repo.compact_below(&stream.id, EventSequence(2)).await?,
+        2,
+        "compaction proceeds once the type leaves the set"
+    );
+
+    Ok(())
+}
+
+async fn retention_and_heads<R>(repo: &R, other: &R) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+{
+    let ns = namespace();
+    let retained = format!("{ns}-retained");
+
+    other
+        .update_manifest(|manifest| {
+            manifest.retention.insert(retained.clone());
+        })
+        .await?;
+    let manifest = other
+        .read_manifest()
+        .await?
+        .ok_or(Failure("no manifest".into()))?;
+    ensure!(
+        manifest.is_retained(&EntityType::new(&retained)),
+        "the declared retention set"
+    );
+
+    other
+        .update_manifest(|manifest| {
+            manifest.retention.remove(&retained);
+        })
+        .await?;
+    let manifest = other
+        .read_manifest()
+        .await?
+        .ok_or(Failure("no manifest".into()))?;
+    ensure!(
+        !manifest.is_retained(&EntityType::new(&retained)),
+        "the removed retention declaration"
+    );
+
+    // The marker row lives in the reserved SYSTEM# namespace, which entity heads skip.
+    let heads = repo.entity_heads(None).await?;
+    ensure!(
+        !heads.contains_key(&EntityId::new(features::FEATURES_ID)),
+        "entity heads skip the feature-marker row"
+    );
+
+    Ok(())
+}
+
+async fn one_bump_per_declaration<R>(repo: &R, other: &R) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+{
+    let _ = repo;
+    let before = other
+        .read_manifest()
+        .await?
+        .map_or(0, |manifest| manifest.version);
+
+    // Two features in one declaration still bump the version by exactly one, so every writer
+    // cached at the old version revalidates once, not once per feature.
+    let ns = namespace();
+    other
+        .update_manifest(|manifest| {
+            manifest.features.insert(format!("{ns}-one"), 1);
+            manifest.features.insert(format!("{ns}-two"), 1);
+        })
+        .await?;
+    let manifest = other
+        .read_manifest()
+        .await?
+        .ok_or(Failure("no manifest".into()))?;
+    ensure_eq!(
+        manifest.version,
+        before + 1,
+        "the version after a two-feature declaration"
     );
 
     Ok(())

@@ -50,10 +50,16 @@ pub fn postgres_pool() -> Result<Pool, BoxError> {
     Ok(Pool::builder(manager).max_size(4).build()?)
 }
 
-/// A repository over the default tables, with the schema created.
+/// A repository over the default tables, with the schema created. The schema is created once per
+/// process: concurrent `CREATE TABLE IF NOT EXISTS` for a new table can race in PostgreSQL's
+/// catalog (the `pg_type` unique constraint), so parallel tests must not each create it.
 pub async fn postgres() -> Result<PostgresRepository, BoxError> {
+    static SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
     let repository = PostgresRepository::new(postgres_pool()?);
-    repository.ensure_schema().await?;
+    SCHEMA
+        .get_or_init(|| async { repository.ensure_schema().await.expect("create the schema") })
+        .await;
 
     Ok(repository)
 }
