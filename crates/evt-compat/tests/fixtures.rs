@@ -9,7 +9,8 @@ use evt_compat::{Account, Runner, ScenarioFixtures, Scenarios};
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Aggregate, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion,
-    MemRepository, Metadata, SerializedEvent, SerializedSnapshot, json, snapshot_events_due,
+    FeatureManifest, FeatureMarker, MemRepository, Metadata, SerializedEvent, SerializedSnapshot,
+    json, snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -113,6 +114,106 @@ fn codec_fixtures() -> CodecFixtures {
 
 fn utf8(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap()
+}
+
+#[derive(Deserialize)]
+struct FeatureMarkerFixtures {
+    declarations: Vec<FeatureDeclarationVector>,
+}
+
+#[derive(Deserialize)]
+struct FeatureDeclarationVector {
+    name: String,
+    input: FeatureDeclarationInput,
+    output: FeatureDeclarationOutput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeatureDeclarationInput {
+    features: BTreeMap<String, i64>,
+    history_dependent: Vec<String>,
+    retention: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeatureDeclarationOutput {
+    features_json: String,
+    history_dependent_json: String,
+    retention_json: String,
+    dynamo_item: Value,
+    postgres_row: Value,
+}
+
+#[tokio::test]
+async fn feature_marker_declarations_match_go_byte_for_byte() {
+    let data = std::fs::read(compat_dir().join("fixtures/feature-marker.json")).unwrap();
+    let fixtures: FeatureMarkerFixtures = serde_json::from_slice(&data).unwrap();
+    let repo = MemRepository::new();
+
+    for vector in fixtures.declarations {
+        let name = &vector.name;
+        repo.update_manifest(|manifest| {
+            manifest.features = vector.input.features.clone();
+            manifest.history_dependent = vector.input.history_dependent.iter().cloned().collect();
+            manifest.retention = vector.input.retention.iter().cloned().collect();
+        })
+        .await
+        .unwrap();
+        let manifest = repo.read_manifest().await.unwrap().unwrap();
+        let features = manifest.features_json();
+        let history = manifest
+            .history_dependent_json()
+            .unwrap_or_else(|| "[]".into());
+        let retention = manifest.retention_json().unwrap_or_else(|| "[]".into());
+        assert_eq!(
+            features, vector.output.features_json,
+            "{name}: features bytes"
+        );
+        assert_eq!(
+            history, vector.output.history_dependent_json,
+            "{name}: history bytes"
+        );
+        assert_eq!(
+            retention, vector.output.retention_json,
+            "{name}: retention bytes"
+        );
+
+        assert_eq!(
+            serde_json::to_value(dynamo::feature_marker_item(&manifest).unwrap()).unwrap(),
+            vector.output.dynamo_item,
+            "{name}: complete marker item"
+        );
+        let go_item: dynamo::Item = serde_json::from_value(vector.output.dynamo_item).unwrap();
+        assert_eq!(
+            dynamo::feature_marker_from_item(&go_item).unwrap(),
+            manifest,
+            "{name}: decode Go marker"
+        );
+        assert_eq!(
+            serde_json::json!({
+                "id": 0,
+                "version": manifest.version,
+                "features": features,
+                "history_dependent": history,
+                "retention": retention,
+            }),
+            vector.output.postgres_row,
+            "{name}: PostgreSQL row fields"
+        );
+        assert_eq!(
+            FeatureManifest::from_attributes(
+                vector.output.postgres_row["version"].as_i64().unwrap(),
+                vector.output.postgres_row["features"].as_str().unwrap(),
+                vector.output.postgres_row["history_dependent"].as_str(),
+                vector.output.postgres_row["retention"].as_str(),
+            )
+            .unwrap(),
+            manifest,
+            "{name}: decode Go PostgreSQL row"
+        );
+    }
 }
 
 #[test]

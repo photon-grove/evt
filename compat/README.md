@@ -24,6 +24,12 @@ Both sides implement the same account domain: `internal/compat/account.go` and
 | `scripts/compat-integration.sh dynamo`   | Go and Rust take turns writing the same streams in the local DynamoDB emulator, then both verify every stream. |
 | `scripts/compat-integration.sh postgres` | The same against local PostgreSQL.                                                                             |
 
+The marker vectors include duplicate-input set canonicalization and the complete transaction
+order (marker check, projector puts, event puts, snapshot put or floor check). Rust consumes these
+vectors in its fixture tests and DynamoDB transaction tests. With `--features drivers`, the live
+PostgreSQL tests also compare declaration-row bytes and execute both languages' schema DDL in
+either creation/upgrade order.
+
 The live runs need the local stacks from the root [README](../README.md#local-development). Moon
 runs them, together with the Rust conformance suite, as `evt-rust:integration` and
 `evt-rust:integration-postgres`.

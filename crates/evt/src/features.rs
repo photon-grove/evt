@@ -1,0 +1,358 @@
+//! Reserved namespaces and the feature marker (v0.9, C8, C9).
+//!
+//! Two partition prefixes are reserved for engine-managed rows: [`SYSTEM_PREFIX`] (the feature
+//! marker and the rebuild fence) and [`COMMAND_OUTCOME_PREFIX`] (command outcomes). Enumeration,
+//! entity heads, and rebuild scans skip them, and every entity-addressed write path refuses an
+//! entity ID that begins with one, before any request.
+//!
+//! A store declares the extensions it uses on a single [`FEATURES_ID`] marker row. Any writer
+//! that does not support a declared `(name, formatVersion)` pair refuses to write to the table:
+//! a writer validates the feature set once, at first write, caches the version it validated, and
+//! every commit then carries a condition on that version. A declaration bumps `version` in the
+//! same conditional write that updates the feature set, so every writer cached at the old version
+//! fails its condition, re-validates, and refuses when the feature is not one it models.
+//!
+//! See `docs/spec/storage-format.md` ("Reserved Namespaces", "Feature Marker") for the stored
+//! shapes; the manifest's JSON encoding is byte-identical across languages.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+
+use crate::error::Error;
+use crate::ids::{EntityId, EntityType};
+use crate::json;
+
+/// The reserved `SYSTEM#` partition prefix (the feature marker, the rebuild fence).
+pub const SYSTEM_PREFIX: &str = "SYSTEM#";
+
+/// The reserved `command-outcome#` partition prefix (command outcomes).
+pub const COMMAND_OUTCOME_PREFIX: &str = "command-outcome#";
+
+/// The partition key of the feature-marker row.
+pub const FEATURES_ID: &str = "SYSTEM#FEATURES";
+
+/// The sort key of the feature-marker row.
+pub const FEATURES_SORT_KEY: i64 = 0;
+
+/// The `(name, stored-format version)` pairs this build of the crate models. A writer refuses a
+/// table whose manifest declares anything else. The extensions this spec defines (`journal`,
+/// `journal-compaction`) are Rust-first and land behind feature flags in later releases, so this
+/// build supports none yet.
+pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[];
+
+/// Reports whether an entity ID falls in a reserved namespace: a case-sensitive byte prefix of
+/// [`SYSTEM_PREFIX`] or [`COMMAND_OUTCOME_PREFIX`].
+pub fn is_reserved(entity_id: &EntityId) -> bool {
+    let id = entity_id.as_str();
+
+    id.starts_with(SYSTEM_PREFIX) || id.starts_with(COMMAND_OUTCOME_PREFIX)
+}
+
+/// Refuses a reserved entity ID on a write path, before any request.
+pub fn check_not_reserved(entity_id: &EntityId) -> Result<(), Error> {
+    if is_reserved(entity_id) {
+        return Err(Error::ReservedEntityId {
+            entity_id: entity_id.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+/// The feature manifest stored on the marker row: the declared features with their stored-format
+/// versions, and the durable `historyDependent` and `retention` entity-type sets.
+///
+/// The map and both sets encode as JSON with sorted keys, exactly as Go's `encoding/json` writes
+/// them, so the stored bytes match across languages. An empty set is stored as an absent
+/// attribute on DynamoDB and as `[]` in PostgreSQL.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FeatureManifest {
+    /// Bumped by exactly one on every change to the manifest.
+    pub version: i64,
+    /// Declared feature name → its stored-format version.
+    pub features: BTreeMap<String, i64>,
+    /// Entity types whose commit-wide projectors are history-dependent; compaction is forbidden
+    /// for them.
+    pub history_dependent: BTreeSet<String>,
+    /// Entity types configured with retention (TTL); fences are refused for them.
+    pub retention: BTreeSet<String>,
+}
+
+impl FeatureManifest {
+    /// Decodes a manifest from its stored attributes. `historyDependent` and `retention` are
+    /// absent when their set is empty.
+    pub fn from_attributes(
+        version: i64,
+        features: &str,
+        history_dependent: Option<&str>,
+        retention: Option<&str>,
+    ) -> Result<Self, Error> {
+        let features = json_text(features, "features")?;
+        let history_dependent = optional_json(history_dependent, "historyDependent")?;
+        let retention = optional_json(retention, "retention")?;
+
+        Ok(Self {
+            version,
+            features,
+            history_dependent,
+            retention,
+        })
+    }
+
+    /// The `features` attribute text: a JSON object with sorted keys.
+    pub fn features_json(&self) -> String {
+        json::to_string(&self.features).expect("a map of strings serializes")
+    }
+
+    /// The `historyDependent` attribute text: a sorted JSON array; `None` when empty.
+    pub fn history_dependent_json(&self) -> Option<String> {
+        set_json(&self.history_dependent)
+    }
+
+    /// The `retention` attribute text: a sorted JSON array; `None` when empty.
+    pub fn retention_json(&self) -> Option<String> {
+        set_json(&self.retention)
+    }
+
+    /// Reports whether the entity type appears in the durable `historyDependent` set, which
+    /// forbids compaction for it.
+    pub fn is_history_dependent(&self, entity_type: &EntityType) -> bool {
+        self.history_dependent.contains(entity_type.as_str())
+    }
+
+    /// Reports whether the entity type appears in the durable `retention` set, which refuses
+    /// fences for it.
+    pub fn is_retained(&self, entity_type: &EntityType) -> bool {
+        self.retention.contains(entity_type.as_str())
+    }
+
+    /// Refuses the manifest when it declares a `(name, formatVersion)` pair this build does not
+    /// support.
+    pub fn validate_supported(&self) -> Result<(), Error> {
+        for (name, version) in &self.features {
+            if !SUPPORTED_FEATURES
+                .iter()
+                .any(|(supported, at)| supported == name && at == version)
+            {
+                return Err(Error::UnsupportedFeature {
+                    feature: name.clone(),
+                    version: *version,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn set_json(set: &BTreeSet<String>) -> Option<String> {
+    if set.is_empty() {
+        return None;
+    }
+
+    Some(json::to_string(set).expect("a set of strings serializes"))
+}
+
+fn json_text<T: serde::de::DeserializeOwned>(text: &str, what: &str) -> Result<T, Error> {
+    json::from_slice(text.as_bytes())
+        .map_err(|err| Error::InvalidRecord(format!("feature manifest {what}: {err}")))
+}
+
+fn optional_json<T: Default + serde::de::DeserializeOwned>(
+    text: Option<&str>,
+    what: &str,
+) -> Result<T, Error> {
+    match text.filter(|text| !text.trim().is_empty()) {
+        Some(text) => json_text(text, what),
+        None => Ok(Default::default()),
+    }
+}
+
+/// The marker state a writer validated: the row's version, or that the table had no marker row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidatedMarker {
+    /// The writer validated a table with no marker row.
+    Absent,
+    /// The writer validated the marker row at this version.
+    Version(i64),
+}
+
+/// A writer's cached marker state: not yet validated, or the result of the first validation.
+pub type CachedMarker = Option<ValidatedMarker>;
+
+/// Reports whether the observed manifest row still matches the writer's cached validation.
+/// A row that changed version, appeared, or disappeared must be re-validated.
+pub fn marker_matches(validated: CachedMarker, observed: Option<&FeatureManifest>) -> bool {
+    match (validated, observed) {
+        (Some(ValidatedMarker::Absent), None) => true,
+        (Some(ValidatedMarker::Version(version)), Some(manifest)) => manifest.version == version,
+        _ => false,
+    }
+}
+
+/// Validates a freshly observed manifest for a writer and returns the state to cache. A manifest
+/// declaring an unsupported `(name, formatVersion)` pair refuses the writer.
+pub fn validate_marker(observed: Option<&FeatureManifest>) -> Result<ValidatedMarker, Error> {
+    match observed {
+        None => Ok(ValidatedMarker::Absent),
+        Some(manifest) => {
+            manifest.validate_supported()?;
+
+            Ok(ValidatedMarker::Version(manifest.version))
+        }
+    }
+}
+
+/// A repository that stores the feature-marker row ([`FEATURES_ID`]). Every backend implements it,
+/// so the declaration and refusal behavior is testable on the in-memory backend and enforced on
+/// the live ones.
+pub trait FeatureMarker: Send + Sync {
+    /// Reads the manifest row, if one exists. Strongly consistent where the backend
+    /// distinguishes, so a declaration another writer just wrote cannot be missed.
+    fn read_manifest(&self) -> impl Future<Output = Result<Option<FeatureManifest>, Error>> + Send;
+
+    /// Applies `change` to the stored manifest in one conditional write that bumps `version` by
+    /// exactly one, no matter how many entries the change touches. Declaring does not require
+    /// support: the refusal binds data writes (commits, [`crate::Repository::put_snapshot`],
+    /// [`crate::Repository::compact_below`]), and this is how a table is prepared for, or tested
+    /// against, a feature this build does not model.
+    fn update_manifest(
+        &self,
+        change: impl Fn(&mut FeatureManifest) + Send,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_prefixes_match_bytewise() {
+        assert!(is_reserved(&EntityId::new("SYSTEM#FEATURES")));
+        assert!(is_reserved(&EntityId::new("SYSTEM#account")));
+        assert!(is_reserved(&EntityId::new("command-outcome#cmd-1")));
+        assert!(!is_reserved(&EntityId::new("system#lowercase")));
+        assert!(!is_reserved(&EntityId::new("command-outcome")));
+        assert!(!is_reserved(&EntityId::new("acct-1")));
+        assert!(!is_reserved(&EntityId::new("")));
+    }
+
+    #[test]
+    fn encodes_the_spec_example() {
+        let mut manifest = FeatureManifest {
+            version: 3,
+            ..FeatureManifest::default()
+        };
+        manifest.features.insert("journal".into(), 1);
+        manifest.features.insert("journal-compaction".into(), 1);
+        manifest.history_dependent.insert("audit-feed".into());
+        manifest.retention.insert("session".into());
+
+        assert_eq!(
+            manifest.features_json(),
+            r#"{"journal":1,"journal-compaction":1}"#
+        );
+        assert_eq!(
+            manifest.history_dependent_json().as_deref(),
+            Some(r#"["audit-feed"]"#)
+        );
+        assert_eq!(manifest.retention_json().as_deref(), Some(r#"["session"]"#));
+    }
+
+    #[test]
+    fn empty_sets_are_absent() {
+        let manifest = FeatureManifest {
+            version: 1,
+            features: BTreeMap::from([("journal".to_owned(), 2)]),
+            ..FeatureManifest::default()
+        };
+
+        assert_eq!(manifest.features_json(), r#"{"journal":2}"#);
+        assert_eq!(manifest.history_dependent_json(), None);
+        assert_eq!(manifest.retention_json(), None);
+    }
+
+    #[test]
+    fn decodes_the_spec_example() {
+        let manifest = FeatureManifest::from_attributes(
+            3,
+            r#"{"journal":1,"journal-compaction":1}"#,
+            Some(r#"["audit-feed"]"#),
+            Some(r#"["session"]"#),
+        )
+        .unwrap();
+
+        assert_eq!(manifest.version, 3);
+        assert_eq!(manifest.features.get("journal"), Some(&1));
+        assert!(manifest.is_history_dependent(&"audit-feed".into()));
+        assert!(manifest.is_retained(&"session".into()));
+        assert_eq!(
+            manifest.features_json(),
+            r#"{"journal":1,"journal-compaction":1}"#
+        );
+    }
+
+    #[test]
+    fn empty_attribute_text_decodes_to_an_empty_set() {
+        let manifest = FeatureManifest::from_attributes(1, "{}", Some(""), None).unwrap();
+
+        assert!(manifest.features.is_empty());
+        assert!(manifest.history_dependent.is_empty());
+        assert!(manifest.retention.is_empty());
+    }
+
+    #[test]
+    fn malformed_manifest_attributes_are_invalid_records() {
+        for (features, history, retention) in [
+            ("{", None, None),
+            ("{}", Some("["), None),
+            ("{}", None, Some(r#"["a""#)),
+        ] {
+            assert!(
+                FeatureManifest::from_attributes(1, features, history, retention).is_err(),
+                "{features:?}, {history:?}, {retention:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_unsupported_declared_features() {
+        let mut manifest = FeatureManifest::default();
+        manifest.features.insert("journal".into(), 1);
+        assert!(matches!(
+            manifest.validate_supported(),
+            Err(Error::UnsupportedFeature { feature, version }) if feature == "journal" && version == 1
+        ));
+
+        // The declared version matters, not just the name: this build supports nothing, but a
+        // build that models a feature at version 1 still refuses version 2.
+        assert!(FeatureManifest::default().validate_supported().is_ok());
+    }
+
+    #[test]
+    fn marker_checks_compare_versions() {
+        let manifest = FeatureManifest {
+            version: 4,
+            ..FeatureManifest::default()
+        };
+
+        assert!(marker_matches(
+            Some(ValidatedMarker::Version(4)),
+            Some(&manifest)
+        ));
+        assert!(!marker_matches(
+            Some(ValidatedMarker::Version(3)),
+            Some(&manifest)
+        ));
+        assert!(!marker_matches(
+            Some(ValidatedMarker::Absent),
+            Some(&manifest)
+        ));
+        assert!(marker_matches(Some(ValidatedMarker::Absent), None));
+        assert!(!marker_matches(Some(ValidatedMarker::Version(4)), None));
+        assert!(
+            !marker_matches(None, None),
+            "an unvalidated writer revalidates"
+        );
+    }
+}

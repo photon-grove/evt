@@ -406,7 +406,7 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 - DynamoDB: descending queries (`ScanIndexForward = false`, `Limit = min(n, 100)`) whose `sk > 0` key
   condition excludes the snapshot item; when a page closes early (large items), the reader keeps
   paging until it has collected `n` items or the stream runs out. PostgreSQL: `ORDER BY sequence
-  DESC LIMIT n`. The in-memory backend walks its stream backwards.
+DESC LIMIT n`. The in-memory backend walks its stream backwards.
 - A `limit` below 1 is a programmer error returned before any request, in every backend.
   Initial buffer capacity is bounded by a page or the available events, even for the largest limit.
 
@@ -438,6 +438,9 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
   name), or `*evt.FeatureMarkerTableMismatchError` for another table. Writes return the typed
   mismatch error if the binding no longer matches; snapshot writes and compaction enforce the
   same rule.
+
+  Rust markers are repository-owned rather than attachable: DynamoDB's table is immutable, and
+  PostgreSQL `with_tables` rebinds the marker together with the events table and clears validation.
 
 - A store declares the extensions it uses on the reserved `SYSTEM#FEATURES` marker row (storage
   spec, Feature Marker): `version` (bumped by exactly one per declaration transaction), `features`

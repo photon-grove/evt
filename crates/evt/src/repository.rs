@@ -173,7 +173,12 @@ impl<Op> Commit<Op> {
 ///   there is no stored snapshot) with [`Error::Conflict`] (DynamoDB), or keep the stored snapshot's event sequence monotonic
 ///   (PostgreSQL, where the event-sequence conflict already covers racing writers);
 /// - write events, snapshot, and operations atomically;
-/// - return events in ascending sequence order.
+/// - return events in ascending sequence order, and `latest` in descending order;
+/// - refuse an entity ID in a reserved namespace (`SYSTEM#`, `command-outcome#`) on every
+///   entity-addressed write path (commit, `put_snapshot`, `compact_below`) with
+///   [`Error::ReservedEntityId`], before any request, and skip those partitions in `entity_heads`
+///   (v0.9, C8). Explicit event and snapshot reads by ID retain legacy reserved-prefix streams
+///   so migration tooling can read them.
 pub trait Repository: Send + Sync {
     /// Backend-specific operations that in-band projectors can add to a commit. Backends without
     /// projector support use [`std::convert::Infallible`].
@@ -196,6 +201,16 @@ pub trait Repository: Send + Sync {
         &self,
         entity_id: &EntityId,
         after: EventSequence,
+    ) -> impl Future<Output = Result<Vec<SerializedEvent>, Error>> + Send;
+
+    /// Returns the entity's last `n` events, newest first (descending sequence), excluding the
+    /// snapshot item. At most `n` events: a backend may close a page early, so the read keeps
+    /// paging until it has `n` events or the stream runs out. `n = 0` is a programmer error
+    /// returned before any request, with [`Error::InvalidArgument`].
+    fn latest(
+        &self,
+        entity_id: &EntityId,
+        n: usize,
     ) -> impl Future<Output = Result<Vec<SerializedEvent>, Error>> + Send;
 
     /// Returns the entity's snapshot, if one exists.
@@ -252,6 +267,14 @@ macro_rules! forward_repository {
                 after: EventSequence,
             ) -> impl Future<Output = Result<Vec<SerializedEvent>, Error>> + Send {
                 (**self).events_after(entity_id, after)
+            }
+
+            fn latest(
+                &self,
+                entity_id: &EntityId,
+                n: usize,
+            ) -> impl Future<Output = Result<Vec<SerializedEvent>, Error>> + Send {
+                (**self).latest(entity_id, n)
             }
 
             fn snapshot(

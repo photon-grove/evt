@@ -17,6 +17,15 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
 - Upcasters migrate old payload versions on read. `compact_below` deletes only events a snapshot
   covers.
 - In-band projectors write views in the same transaction as the events.
+- `latest(n)` reads a stream's last `n` events newest-first. The `SYSTEM#` and `command-outcome#`
+  namespaces are reserved for engine rows: writes to them are refused, entity heads skip them,
+  and a `SYSTEM#FEATURES` marker row declares the extensions a table uses — a writer that does
+  not support a declared feature refuses to write, including maintenance snapshots. Declaration
+  invalidates the writer's cache; it never grants feature support. Durable history-dependent
+  declarations fence each compaction batch under a marker check (DynamoDB) or all deletes under
+  one transaction lock (PostgreSQL). DynamoDB has no whole-operation lease: a declaration racing
+  multi-batch compaction can leave a partially compacted stream, whose history-dependent rebuild
+  reports `CompactionUncovered`. Declare history dependence before writing data of that type.
 
 ## Example
 
@@ -158,7 +167,11 @@ The table needs a string partition key `pk` and a number sort key `sk`, the same
 ## PostgreSQL
 
 Enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
-`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`.
+`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`. Engine relations use the
+reserved `__evt_` infix; schema setup migrates the old `{events}_entity_type_idx` index to
+`{events}__evt_entity_type_idx`. Configured unquoted names are lowercase-canonicalized, with a
+34-byte events-table limit and a 58-byte snapshots-table limit. Both names must avoid `__evt_`
+and any collision among the tables and derived relations.
 
 ```rust,ignore
 use photon_evt::postgres::PostgresRepository;

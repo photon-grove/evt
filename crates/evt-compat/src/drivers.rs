@@ -50,10 +50,15 @@ pub fn postgres_pool() -> Result<Pool, BoxError> {
     Ok(Pool::builder(manager).max_size(4).build()?)
 }
 
-/// A repository over the default tables, with the schema created.
+/// A repository over the default tables, creating the schema once per process to avoid redundant
+/// DDL. The repository also serializes schema setup across processes with an advisory lock.
 pub async fn postgres() -> Result<PostgresRepository, BoxError> {
+    static SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
     let repository = PostgresRepository::new(postgres_pool()?);
-    repository.ensure_schema().await?;
+    SCHEMA
+        .get_or_init(|| async { repository.ensure_schema().await.expect("create the schema") })
+        .await;
 
     Ok(repository)
 }
