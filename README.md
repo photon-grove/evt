@@ -162,9 +162,10 @@ Two v0.9.0 changes are source-breaking without a deprecation window:
   struct non-comparable. Use `evt.Metadata.Equal` instead; it treats nil and empty maps as equal.
 - `evt.Repository` now requires `GetRecentEvents(ctx context.Context, entityID evt.EntityID,
   limit int) ([]evt.SerializedEvent, error)` (C8). Add it to custom backends and mocks. Return
-  a typed `evt.InvalidLimitError` for `limit < 1` before any I/O; return at most `limit` events
-  newest-first, excluding snapshot rows. Bound the storage query itself — do not call
-  `GetEvents` and slice a full replay.
+  a typed `*evt.InvalidArgumentError` for `limit < 1` before any I/O (match it with
+  `errors.Is(err, evt.ErrInvalidArgument)`); return at most `limit` events newest-first by
+  sequence, regardless of insertion order, excluding snapshot rows. Bound the storage query
+  itself — do not call `GetEvents` and slice a full replay.
 
 For example, a SQL backend with a separate events table can implement the method below.
 Here `queryEvents` is the backend's existing query-and-decode helper; it executes the supplied
@@ -175,7 +176,7 @@ func (r *Repository) GetRecentEvents(
     ctx context.Context, entityID evt.EntityID, limit int,
 ) ([]evt.SerializedEvent, error) {
     if limit < 1 {
-        return nil, &evt.InvalidLimitError{Limit: limit}
+        return nil, &evt.InvalidArgumentError{Argument: "limit", Message: "must be at least 1"}
     }
 
     return r.queryEvents(ctx,

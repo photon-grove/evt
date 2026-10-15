@@ -10,7 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/photon-grove/evt"
 )
@@ -41,7 +41,7 @@ func reportReservedStreams(ids []evt.EntityID) {
 
 // reservedStreamIDs scans the DynamoDB event log and returns the distinct entity IDs in reserved
 // namespaces that are not engine-written rows.
-func reservedStreamIDs(ctx context.Context, client *dynamodb.Client, eventsTable string) ([]evt.EntityID, error) {
+func reservedStreamIDs(ctx context.Context, client dynamodb.ScanAPIClient, eventsTable string) ([]evt.EntityID, error) {
 	// version, owner, leaseExpiresAt, and value are DynamoDB reserved words, so they are reached
 	// through ExpressionAttributeNames aliases.
 	input := dynamodb.ScanInput{
@@ -141,11 +141,15 @@ func numAttrValue(item map[string]types.AttributeValue, name string) (int64, boo
 	return n, true
 }
 
+type postgresQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
 // postgresReservedStreamIDs runs the storage spec's two queries against the configured events and
 // snapshots tables and returns every entity ID they report. Engine-written rows are exempt
 // structurally: the engine-row relations derive from the events table name through the reserved
 // infix, so these queries never see them.
-func postgresReservedStreamIDs(ctx context.Context, pool *pgxpool.Pool, eventsTable, snapshotsTable string) ([]evt.EntityID, error) {
+func postgresReservedStreamIDs(ctx context.Context, pool postgresQuerier, eventsTable, snapshotsTable string) ([]evt.EntityID, error) {
 	if !validPgIdentifier(eventsTable) || !validPgIdentifier(snapshotsTable) {
 		return nil, fmt.Errorf("invalid table name %q or %q", eventsTable, snapshotsTable)
 	}
