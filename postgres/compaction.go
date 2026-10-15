@@ -7,6 +7,32 @@ import (
 	"github.com/photon-grove/evt"
 )
 
+// checkHistoryDependent refuses compaction for an entity type declared history-dependent in the
+// store's durable feature manifest. The refusal holds in every process that opens the log, whether
+// or not it registered the projector or configured a feature marker. A log with no marker row
+// declares nothing and compaction proceeds as it always has.
+func (repo *Repository) checkHistoryDependent(ctx context.Context, entityType evt.EntityType) error {
+	if entityType == "" {
+		return nil
+	}
+
+	manifest, err := NewFeatureMarker(repo.db, repo.eventsTable, nil).Manifest(ctx)
+	if err != nil {
+		return err
+	}
+	if manifest == nil {
+		return nil
+	}
+
+	for _, declared := range manifest.HistoryDependent {
+		if declared == entityType {
+			return evt.NewHistoryDependentProjectionError(entityType)
+		}
+	}
+
+	return nil
+}
+
 // CompactBelow deletes events for the entity whose sequence is in [1, throughSequence], but only
 // after confirming a durable snapshot covers (>=) throughSequence. It implements evt.Compactor.
 //
@@ -18,6 +44,10 @@ func (repo *Repository) CompactBelow(
 	entityID evt.EntityID,
 	throughSequence evt.EventSequence,
 ) (int, error) {
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return 0, err
+	}
+
 	if throughSequence < 1 {
 		return 0, nil
 	}
@@ -29,6 +59,13 @@ func (repo *Repository) CompactBelow(
 
 	if snapshot == nil {
 		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
+	}
+
+	// A durable refusal: the manifest's historyDependent set forbids compaction for the entity's
+	// type in every process that opens the log, whether or not it registered the projector.
+	err = repo.checkHistoryDependent(ctx, snapshot.EntityType)
+	if err != nil {
+		return 0, err
 	}
 
 	if snapshot.EventSequence < throughSequence {

@@ -392,6 +392,60 @@ eventSeq < :first`, so a commit cannot write at or below a snapshot's floor afte
 
 - Same as GetEvents but with `sk > :lastSequence` condition
 
+### GetRecentEvents
+
+- Bounded, newest-first read of an entity's last `limit` events (storage spec, latest(n); ADR-0004
+  C8) — for "recent activity" reads that must not replay a long stream. No item shape changes.
+- DynamoDB: one descending query (`ScanIndexForward = false`, `Limit = n`) whose `sk > 0` key
+  condition excludes the snapshot item; when a page closes early (large items), the reader keeps
+  paging until it has collected `n` items or the stream runs out. PostgreSQL: `ORDER BY sequence
+  DESC LIMIT n`. The in-memory backend walks its stream backwards.
+- A `limit` below 1 is a programmer error returned before any request, in every backend.
+
+### Reserved Namespaces (ADR-0004 C8)
+
+- The partition prefixes `SYSTEM#` and `command-outcome#` are reserved for engine-managed rows
+  (matching is a case-sensitive byte prefix on the entity ID).
+- Every entity-addressed write path refuses a reserved entity ID before any request, with a typed
+  `evt.ReservedEntityIdError`: `Commit` (one reserved stream fails a multi-stream commit whole),
+  `CommitWithSnapshot`, `CommitStream`, out-of-band snapshot writes (`dynamo.PutSnapshot`), and
+  `CompactBelow` (which writes no new rows but is refused all the same).
+- Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
+  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition.
+- Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
+  become silently invisible after upgrading. `evt-doctor` reports pre-existing streams in reserved
+  namespaces — on DynamoDB by scanning the table (exempting engine-written rows: the feature
+  marker, the rebuild fence, and command outcomes), on PostgreSQL with the two spec queries against
+  the configured events and snapshots tables — and the upgrade note requires renaming (migrating)
+  such streams before enabling the v0.9 features.
+
+### Feature Marker (ADR-0004 C9)
+
+- A store declares the extensions it uses on the reserved `SYSTEM#FEATURES` marker row (storage
+  spec, Feature Marker): `version` (bumped by exactly one per declaration transaction), `features`
+  (JSON object, feature name → stored-format version, keys sorted), and two sorted JSON-array sets,
+  `historyDependent` and `retention`, each omitted when empty. On PostgreSQL the row lives in the
+  derived `{events}__evt_features` table and holds the same JSON text.
+- Any writer that does not support a declared `(name, formatVersion)` pair refuses to write, with a
+  typed `evt.UnsupportedFeatureError`.
+- Every commit on a store that enforces the manifest carries a `ConditionCheck` on the marker
+  (`attribute_not_exists(pk) OR version = :v`; a store that never declared features validates
+  against `attribute_not_exists(pk)`), ordered first in the transaction. A writer validates the
+  feature set once, at first write, and caches the version; a declaration bumps the version in the
+  same conditional write that updates the feature set, so every writer cached at the old version
+  fails, re-validates, and retries (typed via `evt.ErrFeatureManifestChanged`, classified
+  transient); a re-validation that finds an unsupported pair refuses outright.
+- Enforcement is opt-in per repository instance until the v0.9 store wiring lands: a repository
+  built without a feature marker writes exactly the pre-v0.9 transaction shape. Enable it with
+  `dynamo.Repository.WithFeatureMarker` / `postgres.Repository.WithFeatureMarker` around a
+  `dynamo.NewFeatureMarker` / `postgres.NewFeatureMarker` constructed with the (feature,
+  formatVersion) pairs the writer models.
+- `CompactBelow` reads `historyDependent` (strongly consistent on DynamoDB, regardless of
+  `WithConsistentRead`) and refuses an entity type in the set with a typed
+  `evt.HistoryDependentProjectionError` before deleting anything — in every process that opens the
+  log, whether or not it registered the projector. A table with no marker row declares nothing and
+  compaction proceeds as it always has.
+
 ### GetSnapshot
 
 - Returns `nil, nil` if not found
@@ -460,6 +514,10 @@ EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this wi
   double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency` is false for it.)
 - **Stable event ordering** — `GetEvents` returns an entity's events in ascending sequence order,
   and `GetLatestEvents(lastSequence)` returns only events with `sequence > lastSequence`.
+  `GetRecentEvents(limit)` returns at most `limit` events in descending sequence order.
+- **Reserved namespaces** — every entity-addressed write path refuses a reserved entity ID
+  (`SYSTEM#`, `command-outcome#`) with a typed `evt.ReservedEntityIdError` before any request, and
+  enumeration, heads, and rebuild scans skip every reserved partition (ADR-0004 C8).
 - **Read isolation by entity** — `GetEvents`/`GetLatestEvents`/`GetSnapshot` return only the
   requested entity's data; an unknown entity yields an empty result (no error).
 - **Snapshot consistency** — a snapshot written by `CommitWithSnapshot` is read back intact by

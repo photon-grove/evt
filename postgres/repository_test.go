@@ -125,6 +125,17 @@ func TestFoldEntityPropagatesApplyError(t *testing.T) {
 func TestSchemaDDLIsIdempotent(t *testing.T) {
 	ddl := NewRepository(nil).schemaDDL()
 
-	require.Equal(t, 2, strings.Count(ddl, "CREATE TABLE IF NOT EXISTS"))
+	require.Equal(t, 3, strings.Count(ddl, "CREATE TABLE IF NOT EXISTS"))
 	require.Contains(t, ddl, "CREATE INDEX IF NOT EXISTS")
+	require.Contains(t, ddl, defaultEventsTable+"__evt_features")
+}
+
+func TestNewRepositoryRejectsReservedInfix(t *testing.T) {
+	require.Panics(t, func() {
+		NewRepository(nil, WithEventsTable("orders__evt_features"))
+	}, "a configured name containing the reserved infix could collide with a derived relation")
+
+	require.Panics(t, func() {
+		NewRepository(nil, WithEventsTable("orders"), WithSnapshotsTable("ORDERS__EVT_features"))
+	}, "the infix check is case-insensitive")
 }

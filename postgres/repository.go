@@ -31,6 +31,11 @@ const (
 // user input, but validating them keeps the interpolation provably injection-free.
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// reservedInfix derives the engine-row relation names from the configured events table name
+// ({events}__evt_features today). A configured table name may not contain it, so one log's events
+// or snapshots table can never equal another log's derived relation.
+const reservedInfix = "__evt_"
+
 // reservedKeywords are PostgreSQL's reserved keywords (pg_get_keywords() categories R and T), which
 // cannot be used as unquoted table names.
 var reservedKeywords = map[string]struct{}{}
@@ -118,6 +123,7 @@ type Repository struct {
 	db             DB
 	eventsTable    string
 	snapshotsTable string
+	features       *FeatureMarker // nil when the store does not enforce the feature manifest (C9)
 }
 
 // Compile-time checks that the Repository satisfies the core contract and every optional capability
@@ -147,6 +153,21 @@ func WithSnapshotsTable(name string) Option {
 	}
 }
 
+// WithFeatureMarker returns a shallow copy of the repository whose commits enforce the store's
+// feature manifest (ADR-0004 C9): the first commit validates the {events}__evt_features manifest
+// against the supported feature set and caches its version, and every commit then re-checks the
+// version inside its own transaction under the shared advisory lock, so a manifest declared by
+// another writer (say, a Rust service using an extension this writer does not model) fails the
+// check and re-validates; an unsupported pair refuses the writer outright.
+//
+// Without this option commits are unchanged: no manifest is read.
+func (repo *Repository) WithFeatureMarker(marker *FeatureMarker) *Repository {
+	r := *repo
+	r.features = marker
+
+	return &r
+}
+
 // NewRepository constructs a Repository over the given pgx handle (typically a *pgxpool.Pool). It
 // panics if a configured table name is not a valid SQL identifier, since that is a programming
 // error in wiring rather than a runtime condition.
@@ -164,6 +185,15 @@ func NewRepository(db DB, opts ...Option) *Repository {
 	for _, name := range []string{repo.eventsTable, repo.snapshotsTable} {
 		if !validIdentifier(name) {
 			panic(fmt.Sprintf("postgres: invalid table name %q", name))
+		}
+	}
+
+	// The reserved infix derives the engine-row table names (the feature marker today, command
+	// outcomes and the rebuild fence as their capabilities land). A configured name containing it
+	// could collide with another log's derived relation, so it is rejected outright.
+	for _, name := range []string{repo.eventsTable, repo.snapshotsTable} {
+		if strings.Contains(strings.ToLower(name), reservedInfix) {
+			panic(fmt.Sprintf("postgres: table name %q contains the reserved infix %q", name, reservedInfix))
 		}
 	}
 
@@ -212,6 +242,14 @@ CREATE TABLE IF NOT EXISTS %[2]s (
     payload        bytea  NOT NULL,
     updated_at     timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
+    id                integer PRIMARY KEY,
+    version           bigint NOT NULL,
+    features          text   NOT NULL,
+    history_dependent text   NOT NULL DEFAULT '[]',
+    retention         text   NOT NULL DEFAULT '[]'
+);
 `, repo.eventsTable, repo.snapshotsTable)
 }
 
@@ -224,12 +262,20 @@ CREATE TABLE IF NOT EXISTS %[2]s (
 // PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
 // same transaction as the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
+	if err := evt.CheckReservedEntityIDs(res.Events); err != nil {
+		return err
+	}
+
 	if err := checkContiguous(res.Events); err != nil {
 		return err
 	}
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
 		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		if err := repo.checkFeatures(ctx, tx); err != nil {
 			return err
 		}
 
@@ -282,6 +328,14 @@ func (repo *Repository) CommitWithSnapshot(
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
 	}
 
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return err
+	}
+
+	if err := evt.CheckReservedEntityIDs(res.Events); err != nil {
+		return err
+	}
+
 	if err := checkContiguous(res.Events); err != nil {
 		return err
 	}
@@ -290,6 +344,10 @@ func (repo *Repository) CommitWithSnapshot(
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
 		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+			return err
+		}
+
+		if err := repo.checkFeatures(ctx, tx); err != nil {
 			return err
 		}
 
@@ -349,6 +407,31 @@ func (repo *Repository) GetLatestEvents(
 	return scanEvents(rows)
 }
 
+// GetRecentEvents returns at most limit events for an entity, newest-first (descending sequence).
+// A limit below 1 is a programmer error returned before any request. PostgreSQL's LIMIT returns
+// the same at-most-limit window in one statement.
+func (repo *Repository) GetRecentEvents(
+	ctx context.Context,
+	entityID evt.EntityID,
+	limit int,
+) ([]evt.SerializedEvent, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("postgres: limit must be at least 1, got %d", limit)
+	}
+
+	query := fmt.Sprintf(
+		`SELECT %s FROM %s WHERE entity_id = $1 ORDER BY sequence DESC LIMIT $2`,
+		eventColumns, repo.eventsTable,
+	)
+
+	rows, err := repo.db.Query(ctx, query, string(entityID), int64(limit))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: get recent events: %w", err)
+	}
+
+	return scanEvents(rows)
+}
+
 // GetSnapshot returns the entity's durable snapshot, or nil when none exists.
 func (repo *Repository) GetSnapshot(
 	ctx context.Context,
@@ -384,6 +467,17 @@ func (repo *Repository) GetSnapshot(
 	snapshot.EventSequence = evt.EventSequence(eventSequence)
 
 	return &snapshot, nil
+}
+
+// checkFeatures runs the commit-time feature-marker check when the store enforces the manifest.
+// It runs after the per-entity locks, before the inserts, matching the control-checks-first order
+// the DynamoDB transaction pins.
+func (repo *Repository) checkFeatures(ctx context.Context, tx pgx.Tx) error {
+	if repo.features == nil {
+		return nil
+	}
+
+	return repo.features.checkInTx(ctx, tx)
 }
 
 // inTx runs fn inside a transaction, committing on success and rolling back on error or panic.

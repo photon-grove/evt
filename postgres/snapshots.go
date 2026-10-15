@@ -98,7 +98,7 @@ SELECT DISTINCT entity_id FROM (
     UNION
     SELECT entity_id, entity_type FROM %s
 ) sources
-WHERE $1 = '' OR entity_type = $1
+WHERE ($1 = '' OR entity_type = $1) AND `+reservedExclusion+`
 ORDER BY entity_id ASC`, repo.eventsTable, repo.snapshotsTable)
 
 	rows, err := repo.db.Query(ctx, query, string(entityType))

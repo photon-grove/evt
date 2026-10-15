@@ -27,6 +27,9 @@ func (stubRepo) GetEvents(context.Context, evt.EntityID) ([]evt.SerializedEvent,
 func (stubRepo) GetLatestEvents(context.Context, evt.EntityID, evt.EventSequence) ([]evt.SerializedEvent, error) {
 	return nil, nil
 }
+func (stubRepo) GetRecentEvents(context.Context, evt.EntityID, int) ([]evt.SerializedEvent, error) {
+	return nil, nil
+}
 func (stubRepo) GetSnapshot(context.Context, evt.EntityID) (*evt.SerializedSnapshot, error) {
 	return nil, nil
 }

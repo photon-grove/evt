@@ -38,12 +38,27 @@ func eventKeyPage(entityID string, sequences ...int) *dynamodb.QueryOutput {
 	return &dynamodb.QueryOutput{Items: items}
 }
 
+// expectSnapshot scopes a GetItem expectation to the entity's sk=0 snapshot read.
+func (s *RepositorySuite) expectSnapshot(entityID string, out *dynamodb.GetItemOutput) {
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		return in.Key["pk"].(*types.AttributeValueMemberS).Value == entityID
+	}), mock.Anything).Return(out, nil)
+}
+
+// expectNoMarker scopes a GetItem expectation to the feature-marker key and returns its absence:
+// a table with no marker row declares nothing.
+func (s *RepositorySuite) expectNoMarker() {
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		return in.Key["pk"].(*types.AttributeValueMemberS).Value == "SYSTEM#FEATURES"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
+}
+
 func (s *RepositorySuite) Test_CompactBelow_Success() {
 	ctx := context.Background()
 	const entityID = "acct-1"
 
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(snapshotItem(entityID, 5), nil)
+	s.expectSnapshot(entityID, snapshotItem(entityID, 5))
+	s.expectNoMarker()
 
 	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
 		Return(eventKeyPage(entityID, 1, 2, 3, 4, 5), nil)
@@ -74,8 +89,8 @@ func (s *RepositorySuite) Test_CompactBelow_Success() {
 func (s *RepositorySuite) Test_CompactBelow_RefusesWithoutSnapshot() {
 	ctx := context.Background()
 
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.GetItemOutput{Item: nil}, nil)
+	s.expectSnapshot("acct-nosnap", &dynamodb.GetItemOutput{Item: nil})
+	s.expectNoMarker()
 
 	deleted, err := s.repo.CompactBelow(ctx, "acct-nosnap", 5)
 	require.ErrorIs(s.T(), err, evt.ErrCompactionUncovered)
@@ -91,8 +106,8 @@ func (s *RepositorySuite) Test_CompactBelow_RefusesWhenUncovered() {
 	const entityID = "acct-uncovered"
 
 	// Snapshot only covers through event 3, but compaction requested through 5.
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(snapshotItem(entityID, 3), nil)
+	s.expectSnapshot(entityID, snapshotItem(entityID, 3))
+	s.expectNoMarker()
 
 	deleted, err := s.repo.CompactBelow(ctx, entityID, 5)
 	require.ErrorIs(s.T(), err, evt.ErrCompactionUncovered)
@@ -115,8 +130,8 @@ func (s *RepositorySuite) Test_CompactBelow_NothingToDelete() {
 	ctx := context.Background()
 	const entityID = "acct-empty"
 
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(snapshotItem(entityID, 5), nil)
+	s.expectSnapshot(entityID, snapshotItem(entityID, 5))
+	s.expectNoMarker()
 	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
 		Return(eventKeyPage(entityID), nil)
 
@@ -130,8 +145,8 @@ func (s *RepositorySuite) Test_CompactBelow_RetriesUnprocessedItems() {
 	ctx := context.Background()
 	const entityID = "acct-retry"
 
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(snapshotItem(entityID, 2), nil)
+	s.expectSnapshot(entityID, snapshotItem(entityID, 2))
+	s.expectNoMarker()
 	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
 		Return(eventKeyPage(entityID, 1, 2), nil)
 
@@ -168,8 +183,10 @@ func (s *RepositorySuite) Test_CompactBelow_ReadsStronglyConsistent() {
 	consistent := func(read *bool) bool { return read != nil && *read }
 
 	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		return consistent(in.ConsistentRead)
+		return consistent(in.ConsistentRead) &&
+			in.Key["pk"].(*types.AttributeValueMemberS).Value == entityID
 	}), mock.Anything).Return(snapshotItem(entityID, 2), nil)
+	s.expectNoMarker()
 	s.client.On("Query", mock.Anything, mock.MatchedBy(func(in *dynamodb.QueryInput) bool {
 		return consistent(in.ConsistentRead)
 	}), mock.Anything).Return(eventKeyPage(entityID, 1, 2), nil)

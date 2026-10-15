@@ -15,6 +15,34 @@ import (
 // BatchWriteItem so a persistently throttled table cannot spin forever.
 const maxBatchDeleteUnprocessedRetries = 8
 
+// checkHistoryDependent refuses compaction for an entity type declared history-dependent in the
+// store's durable feature manifest (storage spec, Feature Marker). The refusal reads the manifest
+// itself — strongly consistent, regardless of WithConsistentRead, so it cannot miss a just-written
+// set — and holds in every process that opens the log, whether or not it registered the projector
+// or configured a feature marker. A table with no marker row declares nothing and compaction
+// proceeds as it always has.
+func (repo *Repository) checkHistoryDependent(ctx context.Context, entityType evt.EntityType) error {
+	if entityType == "" {
+		return nil
+	}
+
+	manifest, err := NewFeatureMarker(repo.client, repo.EventsTable, nil).Manifest(ctx)
+	if err != nil {
+		return err
+	}
+	if manifest == nil {
+		return nil
+	}
+
+	for _, declared := range manifest.HistoryDependent {
+		if declared == entityType {
+			return evt.NewHistoryDependentProjectionError(entityType)
+		}
+	}
+
+	return nil
+}
+
 // CompactBelow truncates an entity's event log by deleting events whose sequence is in the
 // range [1, throughSequence], but only after verifying that a durable snapshot exists whose
 // recorded EventSequence covers (>=) throughSequence. This guarantees every deleted event is
@@ -32,6 +60,10 @@ func (repo *Repository) CompactBelow(
 	entityID evt.EntityID,
 	throughSequence evt.EventSequence,
 ) (int, error) {
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return 0, err
+	}
+
 	if throughSequence < 1 {
 		return 0, nil
 	}
@@ -45,6 +77,12 @@ func (repo *Repository) CompactBelow(
 	if snapshot == nil {
 		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
 	}
+
+	err = repo.checkHistoryDependent(ctx, snapshot.EntityType)
+	if err != nil {
+		return 0, err
+	}
+
 	if snapshot.EventSequence < throughSequence {
 		return 0, fmt.Errorf(
 			"%w: entity %s snapshot covers through event %d but compaction was requested through %d",

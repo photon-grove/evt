@@ -7,6 +7,14 @@ import (
 	"github.com/photon-grove/evt"
 )
 
+// reservedExclusion excludes the reserved namespaces (SYSTEM# and command-outcome#) from
+// enumeration, heads, and rebuild scans: their rows are engine-managed, never ordinary aggregates.
+// reservedExclusion is a query-format fragment (used only inside fmt.Sprintf format strings, so
+// the LIKE wildcards are doubled). It excludes the reserved namespaces (SYSTEM# and
+// command-outcome#) from enumeration, heads, and rebuild scans: their rows are engine-managed,
+// never ordinary aggregates.
+const reservedExclusion = `entity_id NOT LIKE 'SYSTEM#%%' AND entity_id NOT LIKE 'command-outcome#%%'`
+
 // headsQuery folds the event log and the snapshot table down to one head per entity: the larger of
 // the highest stored event sequence and the snapshot's recorded event_sequence. The UNION ALL lets
 // a single GROUP BY/MAX cover both sources, so an entity whose early events were compacted away (and
@@ -19,7 +27,7 @@ SELECT entity_id, MAX(head) AS head FROM (
     UNION ALL
     SELECT entity_id, event_sequence AS head, entity_type FROM %s
 ) sources
-WHERE $1 = '' OR entity_type = $1
+WHERE ($1 = '' OR entity_type = $1) AND `+reservedExclusion+`
 GROUP BY entity_id`, repo.eventsTable, repo.snapshotsTable)
 }
 

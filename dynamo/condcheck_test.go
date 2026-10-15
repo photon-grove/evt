@@ -32,7 +32,7 @@ func Test_handleConditionalCheckFailure_NoConditionalCheck(t *testing.T) {
 
 	// Regular error without conditional check failure
 	originalErr := errors.New("some error")
-	result := repo.handleConditionalCheckFailure(ctx, nil, nil, originalErr)
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 0, originalErr)
 	require.Equal(t, originalErr, result)
 }
 
@@ -49,7 +49,7 @@ func Test_handleConditionalCheckFailure_RaceCondition(t *testing.T) {
 
 	// Empty transactItems means the failure is for events (index 0 >= 0)
 	// but we have no transaction groups, so it's a race condition
-	result := repo.handleConditionalCheckFailure(ctx, nil, nil, conditionalErr)
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 0, conditionalErr)
 	require.ErrorIs(t, result, ErrSnapshotRaceCondition)
 
 	var classified *policy.ClassifiedError
@@ -67,7 +67,7 @@ func Test_handleConditionalCheckFailure_ClassifiesTransientTransactionConflict(t
 		},
 	}
 
-	result := repo.handleConditionalCheckFailure(ctx, nil, nil, transactionErr)
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 0, transactionErr)
 	require.ErrorIs(t, result, transactionErr)
 
 	var classified *policy.ClassifiedError
@@ -96,7 +96,7 @@ func Test_handleConditionalCheckFailure_TransactionGroupHandlesError(t *testing.
 		},
 	}
 
-	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 0, conditionalErr)
 	require.Equal(t, expectedErr, result)
 }
 
@@ -129,7 +129,7 @@ func Test_handleConditionalCheckFailure_MultipleGroups(t *testing.T) {
 		},
 	}
 
-	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 0, conditionalErr)
 	require.Equal(t, expectedErr, result)
 }
 
@@ -156,7 +156,7 @@ func Test_handleConditionalCheckFailure_FailureBeyondTransactionGroups(t *testin
 		},
 	}
 
-	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 0, conditionalErr)
 	require.ErrorIs(t, result, conditionalErr)
 
 	var classified *policy.ClassifiedError
@@ -209,7 +209,7 @@ func Test_handleConditionalCheckFailure_IndexCalculation(t *testing.T) {
 				CancellationReasons: reasons,
 			}
 
-			result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, conditionalErr)
+			result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 0, conditionalErr)
 			require.Equal(t, tc.expectedErr, result)
 		})
 	}

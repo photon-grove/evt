@@ -63,6 +63,10 @@ func (repo *Repository) PutSnapshot(
 	snapshotSequence evt.EventSequence,
 	eventSequence evt.EventSequence,
 ) error {
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return err
+	}
+
 	snapshot := Snapshot{
 		PK:            entityID,
 		SK:            0,

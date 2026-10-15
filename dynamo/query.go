@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -108,6 +109,63 @@ func (repo *Repository) GetMaxSequence(
 	return evt.EventSequence(sk), nil
 }
 
+// GetRecentEvents returns at most limit events for an entity, newest-first (descending sequence).
+// The query reads the highest event sequences with ScanIndexForward=false and Limit=limit; the
+// `sk > 0` key condition excludes the sk=0 snapshot item. When a response returns fewer than limit
+// items and carries a pagination key (large items can close a page early), the reader keeps paging
+// until it has collected limit items or the stream runs out. A limit below 1 is a programmer error
+// returned before any request.
+func (repo *Repository) GetRecentEvents(
+	ctx context.Context,
+	entityID evt.EntityID,
+	limit int,
+) ([]evt.SerializedEvent, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("dynamo: limit must be at least 1, got %d", limit)
+	}
+
+	input := dynamodb.QueryInput{
+		TableName:              &repo.EventsTable,
+		ConsistentRead:         aws.Bool(repo.consistentRead),
+		KeyConditionExpression: aws.String("pk = :pk AND sk > :sk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: string(entityID)},
+			":sk": &types.AttributeValueMemberN{Value: "0"}, // Exclude sk=0 snapshots
+		},
+		ScanIndexForward: aws.Bool(false), // Descending order
+		// A limit above int32 is clamped; callers pass small recent-activity windows.
+		Limit: aws.Int32(int32(min(limit, math.MaxInt32))), //nolint:gosec // clamped to MaxInt32 just above
+	}
+
+	recent := make([]evt.SerializedEvent, 0, limit)
+
+	p := dynamodb.NewQueryPaginator(repo.client, &input)
+
+	for p.HasMorePages() && len(recent) < limit {
+		result, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil {
+			break
+		}
+
+		page, err := repo.decodeQueryPage(result.Items)
+		if err != nil {
+			return nil, err
+		}
+
+		recent = append(recent, page...)
+	}
+
+	// The first request's Limit bounds each page; trim a page that still overshot the window.
+	if len(recent) > limit {
+		recent = recent[:limit]
+	}
+
+	return recent, nil
+}
+
 // Submit the given QueryInput to retrieve Event records from the DynamoDB table
 func (repo *Repository) queryEvents(
 	ctx context.Context,
@@ -126,34 +184,52 @@ func (repo *Repository) queryEvents(
 			return serializedEvents, nil
 		}
 
-		for _, item := range result.Items {
-			event := Event{}
-			if err = repo.unmarshalMap(item, &event); err != nil {
-				return nil, err
-			}
-
-			// Defensive guard: the primary sk>0 filter is in the KeyConditionExpression,
-			// but skip here too in case a query omits the sk condition.
-			if event.SK == 0 {
-				continue
-			}
-
-			var metadata evt.Metadata
-			if err = json.Unmarshal([]byte(event.Metadata), &metadata); err != nil {
-				return nil, err
-			}
-
-			serializedEvents = append(serializedEvents, evt.SerializedEvent{
-				ID:         evt.GetEventID(event.PK, event.SK),
-				EntityType: event.EntityType,
-				EntityID:   event.PK,
-				Sequence:   event.SK,
-				Type:       event.Type,
-				Version:    event.Version,
-				Payload:    []byte(event.Payload),
-				Metadata:   metadata,
-			})
+		page, err := repo.decodeQueryPage(result.Items)
+		if err != nil {
+			return nil, err
 		}
+
+		serializedEvents = append(serializedEvents, page...)
+	}
+
+	return serializedEvents, nil
+}
+
+// decodeQueryPage turns a page of raw Query items into SerializedEvents, skipping the sk=0
+// snapshot and any item in a reserved namespace.
+func (repo *Repository) decodeQueryPage(items []map[string]types.AttributeValue) ([]evt.SerializedEvent, error) {
+	serializedEvents := make([]evt.SerializedEvent, 0, len(items))
+
+	for _, item := range items {
+		event := Event{}
+		if err := repo.unmarshalMap(item, &event); err != nil {
+			return nil, err
+		}
+
+		if event.SK == 0 {
+			continue
+		}
+
+		if evt.IsReservedEntityID(event.PK) {
+			// Reserved namespaces hold engine-managed rows, never ordinary events.
+			continue
+		}
+
+		var metadata evt.Metadata
+		if err := json.Unmarshal([]byte(event.Metadata), &metadata); err != nil {
+			return nil, err
+		}
+
+		serializedEvents = append(serializedEvents, evt.SerializedEvent{
+			ID:         evt.GetEventID(event.PK, event.SK),
+			EntityType: event.EntityType,
+			EntityID:   event.PK,
+			Sequence:   event.SK,
+			Type:       event.Type,
+			Version:    event.Version,
+			Payload:    []byte(event.Payload),
+			Metadata:   metadata,
+		})
 	}
 
 	return serializedEvents, nil
