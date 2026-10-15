@@ -100,19 +100,21 @@ func (repo Repository) checkSnapshots(snapshots []evt.SerializedSnapshot) error 
 // head, or any snapshot covering it, means another writer advanced the stream. This is the
 // in-memory form of the slot check plus the snapshot companion (ADR 0004, C2).
 func (repo Repository) checkFences(fences []evt.ReadFence) error {
-	for _, fence := range fences {
+	for i, fence := range fences {
 		for _, event := range repo.events[string(fence.EntityID)] {
 			if event.Sequence > fence.Head {
-				return evt.NewConflictError(fmt.Sprintf(
-					"mem: read fence on %s failed: head moved past %d", fence.EntityID, fence.Head,
-				))
+				return &evt.FenceConflictError{
+					Fence: fence,
+					Index: i,
+				}
 			}
 		}
 
 		if snapshot, ok := repo.snapshots[string(fence.EntityID)]; ok && snapshot.EventSequence > fence.Head {
-			return evt.NewConflictError(fmt.Sprintf(
-				"mem: read fence on %s failed: snapshot covers past head %d", fence.EntityID, fence.Head,
-			))
+			return &evt.FenceConflictError{
+				Fence: fence,
+				Index: i,
+			}
 		}
 	}
 

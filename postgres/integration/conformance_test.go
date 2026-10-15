@@ -23,8 +23,18 @@ func Test_RepositoryConformance(t *testing.T) {
 		return postgres.NewRepository(pool)
 	}
 
+	marker := postgres.NewRepository(pool).FeatureMarker(nil)
+
 	conformance.RunRepositorySuite(t, newRepo, conformance.SuiteOptions{
 		SupportsSnapshots:             true,
 		EnforcesOptimisticConcurrency: true,
+		SupportsTransactions:          true,
+		DeclareRetention: func(ctx context.Context, entityType evt.EntityType) error {
+			_, err := marker.Declare(ctx, func(manifest *evt.FeatureManifest) {
+				manifest.Retention = append(manifest.Retention, entityType)
+			})
+
+			return err
+		},
 	})
 }

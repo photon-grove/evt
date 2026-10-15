@@ -14,5 +14,6 @@ func Test_RepositoryConformance(t *testing.T) {
 	conformance.RunRepositorySuite(t, mem.NewRepository, conformance.SuiteOptions{
 		SupportsSnapshots:             true,
 		EnforcesOptimisticConcurrency: false,
+		SupportsTransactions:          true,
 	})
 }

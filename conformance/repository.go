@@ -7,6 +7,7 @@ package conformance
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -33,6 +34,16 @@ type SuiteOptions struct {
 	// Both the in-memory and DynamoDB backends do; a minimal backend may leave it false to skip the
 	// snapshot assertions.
 	SupportsSnapshots bool
+
+	// SupportsTransactions indicates the backend commits a multi-stream SerializedResult — events
+	// for several streams, per-stream snapshots, and read fences — atomically. The in-memory
+	// double and every durable backend support it; a minimal backend may leave it false.
+	SupportsTransactions bool
+
+	// DeclareRetention, when non-nil, durably adds the given entity type to the feature manifest's
+	// retention set, enabling the fence-retention-refusal case. It must run last: the declaration
+	// refuses every later fence for that type.
+	DeclareRetention func(context.Context, evt.EntityType) error
 }
 
 // RunRepositorySuite runs the full backend-neutral contract suite against the repository produced by
@@ -94,6 +105,38 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		t.Run("RejectsCommitsBelowCompactedFloor", func(t *testing.T) {
 			testCompactedFloor(t, newRepo())
 		})
+	}
+
+	if opts.SupportsTransactions {
+		t.Run("MultiStreamCommit", func(t *testing.T) {
+			testMultiStreamCommit(t, newRepo())
+		})
+
+		if opts.EnforcesOptimisticConcurrency {
+			t.Run("MultiStreamAtomicity", func(t *testing.T) {
+				testMultiStreamAtomicity(t, newRepo())
+			})
+		}
+
+		t.Run("ReadFence", func(t *testing.T) {
+			testReadFence(t, newRepo())
+		})
+
+		t.Run("CommitTooLarge", func(t *testing.T) {
+			testCommitTooLarge(t, newRepo())
+		})
+
+		if opts.SupportsSnapshots {
+			t.Run("FenceCompactionABA", func(t *testing.T) {
+				testFenceCompactionABA(t, newRepo())
+			})
+		}
+
+		if opts.DeclareRetention != nil {
+			t.Run("RejectsFencesForRetention", func(t *testing.T) {
+				testRejectsFencesForRetention(t, newRepo(), opts.DeclareRetention)
+			})
+		}
 	}
 
 	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
@@ -659,4 +702,173 @@ func requireAscendingSequences(t *testing.T, events []evt.SerializedEvent) {
 		require.Greater(t, events[i].Sequence, events[i-1].Sequence,
 			"events must be returned in ascending sequence order")
 	}
+}
+
+// --- transactional contract cases (C1/C2) ---
+
+func testMultiStreamCommit(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA, idB := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-b")
+	eventsA := serialize(t, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+	)
+	eventsB := serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "sibling"})
+
+	// Deliberately declared out of bytewise stream order: the commit pins the order itself.
+	err := repo.Commit(ctx, evt.SerializedResult{Events: append(eventsB, eventsA...)})
+	require.NoError(t, err)
+
+	storedA, err := repo.GetEvents(ctx, idA)
+	require.NoError(t, err)
+	require.Len(t, storedA, 2)
+	require.Equal(t, evt.EventSequence(1), eventsA[0].Sequence)
+	require.Equal(t, evt.EventSequence(2), eventsA[1].Sequence)
+
+	storedB, err := repo.GetEvents(ctx, idB)
+	require.NoError(t, err)
+	require.Len(t, storedB, 1)
+}
+
+func testMultiStreamAtomicity(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA, idB := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-b")
+	commitEvents(t, repo, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+	)
+
+	eventsB := serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "sibling"})
+	colliding := serialize(t, idA, "test", 1, &test.EntityUpdated{ID: idA, Value: "reused"})
+	err := repo.Commit(ctx, evt.SerializedResult{Events: append(eventsB, colliding...)})
+	require.Error(t, err, "a commit that collides on one stream must fail")
+
+	// All-or-nothing: the sibling stream that shared the failed commit must be untouched.
+	events, err := repo.GetEvents(ctx, idB)
+	require.NoError(t, err)
+	require.Empty(t, events)
+}
+
+func testReadFence(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA, idC := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-c")
+	commitEvents(t, repo, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+	)
+
+	// A fence at the observed head passes while the transaction writes another stream. A fence
+	// on an absent stream (head 0) passes too.
+	fenced := evt.ReadFence{EntityID: idA, EntityType: "test", Head: 2}
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", 0, &test.EntityCreated{ID: idC, Value: "writer"}),
+		Fences: []evt.ReadFence{fenced, {EntityID: evt.EntityID(ns + "-absent"), EntityType: "test"}},
+	})
+	require.NoError(t, err)
+
+	// Another writer moves the fenced stream past the head.
+	commitEvents(t, repo, idA, "test", 2, &test.EntityUpdated{ID: idA, Value: "moved"})
+
+	// A stale fence now fails the whole commit, and the failing item carries the fence.
+	events, err := repo.GetEvents(ctx, idC)
+	require.NoError(t, err)
+	before := len(events)
+	err = repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", evt.EventSequence(before),
+			&test.EntityUpdated{ID: idC, Value: "later"}),
+		Fences: []evt.ReadFence{fenced},
+	})
+	require.Error(t, err)
+
+	var conflict *evt.FenceConflictError
+	require.ErrorAs(t, err, &conflict)
+	require.Equal(t, idA, conflict.Fence.EntityID)
+	require.Equal(t, evt.EventSequence(2), conflict.Fence.Head)
+	var conflictError *evt.ConflictError
+	require.ErrorAs(t, err, &conflictError, "a fence conflict is an optimistic-concurrency conflict")
+
+	// Nothing from the failed commit was written.
+	events, err = repo.GetEvents(ctx, idC)
+	require.NoError(t, err)
+	require.Len(t, events, before)
+}
+
+func testCommitTooLarge(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA := evt.EntityID(ns + "-a")
+	// 101 event puts plus the control checks and the floor check exceed the 100-item budget.
+	events := make([]evt.Event, 0, 101)
+	for i := range 101 {
+		events = append(events, &test.EntityUpdated{ID: idA, Value: fmt.Sprintf("value-%d", i)})
+	}
+	serialized := serialize(t, idA, "test", 0, events...)
+
+	err := repo.Commit(ctx, evt.SerializedResult{Events: serialized})
+	var tooLarge *evt.CommitTooLargeError
+	require.ErrorAs(t, err, &tooLarge)
+
+	stored, err := repo.GetEvents(ctx, idA)
+	require.NoError(t, err)
+	require.Empty(t, stored, "an oversized commit is refused before any write")
+}
+
+func testFenceCompactionABA(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	compactor, ok := repo.(evt.Compactor)
+	if !ok {
+		t.Skip("repository does not compact")
+	}
+
+	idA, idC := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-c")
+	events := serialize(t, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+		&test.EntityUpdated{ID: idA, Value: "three"},
+	)
+	payload, err := json.Marshal(test.NewEntity(idA))
+	require.NoError(t, err)
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "test", idA, payload, 1))
+
+	// Compaction deletes the events the snapshot covers, which empties the slot a stale fence
+	// checks — the companion on the snapshot item must catch the move.
+	_, err = compactor.CompactBelow(ctx, idA, 3)
+	require.NoError(t, err)
+
+	err = repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", 0, &test.EntityCreated{ID: idC, Value: "writer"}),
+		Fences: []evt.ReadFence{{EntityID: idA, EntityType: "test", Head: 1}},
+	})
+	var conflict *evt.FenceConflictError
+	require.ErrorAs(t, err, &conflict)
+}
+
+func testRejectsFencesForRetention(t *testing.T, repo evt.Repository, declare func(context.Context, evt.EntityType) error) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA := evt.EntityID(ns + "-a")
+	require.NoError(t, declare(ctx, "test"))
+
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Fences: []evt.ReadFence{{EntityID: idA, EntityType: "test", Head: 0}},
+	})
+	var refused *evt.RetentionConflictError
+	require.ErrorAs(t, err, &refused)
+	require.Equal(t, evt.EntityType("test"), refused.EntityType)
 }
