@@ -11,9 +11,38 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// maxBatchDeleteUnprocessedRetries bounds the retry loop for UnprocessedItems returned by
-// BatchWriteItem so a persistently throttled table cannot spin forever.
-const maxBatchDeleteUnprocessedRetries = 8
+// compactionCheck reads the durable history-dependent set strongly and pins that exact marker
+// version (or its absence). Every delete batch carries this check, fencing declarations that
+// complete after validation but before deletion.
+func (repo *Repository) compactionCheck(ctx context.Context, entityType evt.EntityType) (types.TransactWriteItem, error) {
+	manifest, err := repo.features.Manifest(ctx)
+	if err != nil {
+		return types.TransactWriteItem{}, err
+	}
+
+	check := &types.ConditionCheck{
+		TableName: &repo.EventsTable,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: featuresPK},
+			"sk": &types.AttributeValueMemberN{Value: "0"},
+		},
+		ConditionExpression: aws.String("attribute_not_exists(pk)"),
+	}
+	if manifest != nil {
+		for _, declared := range manifest.HistoryDependent {
+			if declared == entityType {
+				return types.TransactWriteItem{}, evt.NewHistoryDependentProjectionError(entityType)
+			}
+		}
+
+		check.ConditionExpression = aws.String("version = :observed")
+		check.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":observed": &types.AttributeValueMemberN{Value: strconv.FormatInt(manifest.Version, 10)},
+		}
+	}
+
+	return types.TransactWriteItem{ConditionCheck: check}, nil
+}
 
 // CompactBelow truncates an entity's event log by deleting events whose sequence is in the
 // range [1, throughSequence], but only after verifying that a durable snapshot exists whose
@@ -26,12 +55,17 @@ const maxBatchDeleteUnprocessedRetries = 8
 //
 // Concurrency: compaction only removes low, immutable, already-snapshotted events. Concurrent
 // command handlers only append higher sequences and advance the sk=0 snapshot forward, so they
-// never touch the deleted range; the coverage check is therefore safe without a transaction.
+// never touch the deleted range. Each transactional delete batch also pins the feature manifest,
+// so no deletion can escape a completed history-dependent declaration.
 func (repo *Repository) CompactBelow(
 	ctx context.Context,
 	entityID evt.EntityID,
 	throughSequence evt.EventSequence,
 ) (int, error) {
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return 0, err
+	}
+
 	if throughSequence < 1 {
 		return 0, nil
 	}
@@ -45,6 +79,12 @@ func (repo *Repository) CompactBelow(
 	if snapshot == nil {
 		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
 	}
+
+	check, err := repo.compactionCheck(ctx, snapshot.EntityType)
+	if err != nil {
+		return 0, err
+	}
+
 	if snapshot.EventSequence < throughSequence {
 		return 0, fmt.Errorf(
 			"%w: entity %s snapshot covers through event %d but compaction was requested through %d",
@@ -60,7 +100,7 @@ func (repo *Repository) CompactBelow(
 		return 0, nil
 	}
 
-	deleted, err := repo.batchDeleteKeys(ctx, keys)
+	deleted, err := repo.deleteCompactionKeys(ctx, keys, snapshot.EntityType, check)
 	if err != nil {
 		return deleted, fmt.Errorf("compaction: deleting events for %s: %w", entityID, err)
 	}
@@ -118,67 +158,48 @@ func (repo *Repository) eventKeysInRange(
 	return keys, nil
 }
 
-// batchDeleteKeys deletes the given keys from the events table using BatchWriteItem in chunks
-// of 25 (the DynamoDB per-batch limit), retrying any UnprocessedItems a bounded number of
-// times. It returns the number of keys successfully deleted.
-func (repo *Repository) batchDeleteKeys(
+// deleteCompactionKeys reserves one of DynamoDB's 100 transaction items for the marker check.
+// A changed marker forces a fresh durable refusal check before retrying the unchanged batch.
+func (repo *Repository) deleteCompactionKeys(
 	ctx context.Context,
 	keys []map[string]types.AttributeValue,
+	entityType evt.EntityType,
+	check types.TransactWriteItem,
 ) (int, error) {
-	const batchSize = 25
+	const batchSize = 99
 
 	deleted := 0
-
 	for start := 0; start < len(keys); start += batchSize {
-		end := start + batchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
-
-		requests := make([]types.WriteRequest, 0, end-start)
+		end := min(start+batchSize, len(keys))
+		items := make([]types.TransactWriteItem, 1, end-start+1)
 		for _, key := range keys[start:end] {
-			requests = append(requests, types.WriteRequest{
-				DeleteRequest: &types.DeleteRequest{Key: key},
-			})
+			items = append(items, types.TransactWriteItem{Delete: &types.Delete{
+				TableName: &repo.EventsTable,
+				Key:       key,
+			}})
 		}
 
-		written, err := repo.flushDeleteBatch(ctx, requests)
-		deleted += written
-		if err != nil {
-			return deleted, err
+		for attempt := 0; ; attempt++ {
+			items[0] = check
+			_, err := repo.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+			if err == nil {
+				deleted += end - start
+				break
+			}
+
+			if failed, index := HasConditionalCheckFailure(err); !failed || index != 0 {
+				return deleted, err
+			}
+
+			check, err = repo.compactionCheck(ctx, entityType)
+			if err != nil {
+				return deleted, err
+			}
+			if attempt >= maxDeclareAttempts {
+				return deleted, transientFeatureChanged("compaction marker kept changing")
+			}
 		}
 	}
 
 	return deleted, nil
-}
-
-// flushDeleteBatch sends a single BatchWriteItem of delete requests and drains any
-// UnprocessedItems with bounded retries. It returns the count of deletes that completed.
-func (repo *Repository) flushDeleteBatch(
-	ctx context.Context,
-	requests []types.WriteRequest,
-) (int, error) {
-	total := len(requests)
-	pending := requests
-
-	for attempt := 0; ; attempt++ {
-		out, err := repo.client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
-			RequestItems: map[string][]types.WriteRequest{repo.EventsTable: pending},
-		})
-		if err != nil {
-			return total - len(pending), err
-		}
-
-		pending = out.UnprocessedItems[repo.EventsTable]
-		if len(pending) == 0 {
-			return total, nil
-		}
-
-		if attempt >= maxBatchDeleteUnprocessedRetries {
-			return total - len(pending), fmt.Errorf(
-				"compaction: %d items still unprocessed after %d retries",
-				len(pending), maxBatchDeleteUnprocessedRetries,
-			)
-		}
-	}
 }

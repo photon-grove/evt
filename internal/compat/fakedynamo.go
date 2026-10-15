@@ -99,8 +99,17 @@ func conditionHolds(
 	case "":
 		return true, nil
 
-	case "attribute_not_exists(sk)":
+	case "attribute_not_exists(sk)", "attribute_not_exists(pk)":
 		return existing == nil, nil
+
+	case "attribute_not_exists(pk) OR version = :v":
+		return compareIfExists(existing, "version", values, ":v", func(have, want int64) bool { return have == want })
+
+	case "version = :observed":
+		if existing == nil {
+			return false, nil
+		}
+		return compareIfExists(existing, "version", values, ":observed", func(have, want int64) bool { return have == want })
 
 	case dynamo.FloorCondition:
 		return compareIfExists(existing, "eventSeq", values, ":first", func(have, first int64) bool { return have < first })
@@ -158,19 +167,23 @@ type transactTarget struct {
 	put       map[string]types.AttributeValue
 	condition string
 	values    map[string]types.AttributeValue
+	delete    bool
 }
 
 func targetOf(write types.TransactWriteItem) (transactTarget, error) {
 	switch {
 	case write.Put != nil:
 		pk, sk, err := keyOf(write.Put.Item)
-		return transactTarget{pk, sk, write.Put.Item, aws.ToString(write.Put.ConditionExpression), write.Put.ExpressionAttributeValues}, err
+		return transactTarget{pk, sk, write.Put.Item, aws.ToString(write.Put.ConditionExpression), write.Put.ExpressionAttributeValues, false}, err
 	case write.ConditionCheck != nil:
 		pk, sk, err := keyOf(write.ConditionCheck.Key)
-		return transactTarget{pk, sk, nil, aws.ToString(write.ConditionCheck.ConditionExpression), write.ConditionCheck.ExpressionAttributeValues}, err
+		return transactTarget{pk, sk, nil, aws.ToString(write.ConditionCheck.ConditionExpression), write.ConditionCheck.ExpressionAttributeValues, false}, err
+	case write.Delete != nil:
+		pk, sk, err := keyOf(write.Delete.Key)
+		return transactTarget{pk, sk, nil, aws.ToString(write.Delete.ConditionExpression), write.Delete.ExpressionAttributeValues, true}, err
 	}
 
-	return transactTarget{}, errors.New("fake dynamo: only Put and ConditionCheck are supported in transactions")
+	return transactTarget{}, errors.New("fake dynamo: unsupported transaction action")
 }
 
 // TransactWriteItems applies puts atomically, cancelling the whole transaction on any failed
@@ -223,6 +236,8 @@ func (f *FakeDynamo) TransactWriteItems(
 	for _, target := range targets {
 		if target.put != nil {
 			f.putLocked(target.pk, target.sk, target.put)
+		} else if target.delete {
+			delete(f.items[target.pk], target.sk)
 		}
 	}
 

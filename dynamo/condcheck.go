@@ -12,14 +12,18 @@ import (
 // transaction between read and write. Callers can retry with a fresh entity load.
 var ErrSnapshotRaceCondition = errors.New("race condition - sequence number updated since it was read, try again")
 
-// handleConditionalCheckFailure translates conditional check failures into domain errors.
+// handleConditionalCheckFailure translates conditional check failures into domain errors. The
+// itemIndexOffset is the number of control items (the feature-marker check) prepended to the
+// transaction ahead of the caller's groups; indices reported by DynamoDB include them.
 func (repo *Repository) handleConditionalCheckFailure(
 	_ context.Context,
 	transaction evt.Transaction,
 	transactItems []types.TransactWriteItem,
+	itemIndexOffset int,
 	err error,
 ) error {
 	if ok, i := HasConditionalCheckFailure(err); ok {
+		i -= itemIndexOffset
 		if i < len(transactItems) {
 			// Identify the failing group and delegate error handling
 			offset := 0

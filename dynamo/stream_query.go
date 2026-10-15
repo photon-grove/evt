@@ -277,6 +277,10 @@ func (repo *Repository) enumerateEntityIDs(
 			if _, dup := seen[id]; dup {
 				continue
 			}
+			if evt.IsReservedEntityID(id) {
+				// Reserved namespaces hold engine-managed rows, never ordinary aggregates.
+				continue
+			}
 			seen[id] = struct{}{}
 
 			if !visit(id) {

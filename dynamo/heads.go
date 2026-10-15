@@ -76,12 +76,18 @@ func (repo *Repository) StreamEntityHeads(
 				continue
 			}
 
+			id := evt.EntityID(pkAttr.Value)
+			if evt.IsReservedEntityID(id) {
+				// Reserved namespaces hold engine-managed rows, never ordinary aggregates.
+				continue
+			}
+
 			seq, ok := headSeqFromItem(item)
 			if !ok {
 				continue
 			}
 
-			if id := evt.EntityID(pkAttr.Value); seq > heads[id] {
+			if seq > heads[id] {
 				heads[id] = seq
 			}
 		}

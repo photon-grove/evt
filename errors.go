@@ -5,6 +5,25 @@ import (
 	"fmt"
 )
 
+// ErrInvalidArgument identifies programmer errors in repository arguments.
+var ErrInvalidArgument = errors.New("invalid argument")
+
+// InvalidArgumentError reports an invalid argument before any storage request.
+type InvalidArgumentError struct {
+	Argument string
+	Message  string
+}
+
+// Error returns the argument and validation failure.
+func (e *InvalidArgumentError) Error() string {
+	return fmt.Sprintf("%s: %s: %s", ErrInvalidArgument, e.Argument, e.Message)
+}
+
+// Unwrap keeps invalid arguments matchable with errors.Is(err, ErrInvalidArgument).
+func (e *InvalidArgumentError) Unwrap() error {
+	return ErrInvalidArgument
+}
+
 // A NotFoundError indicates a required record was not found
 type NotFoundError struct {
 	msg string

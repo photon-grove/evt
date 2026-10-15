@@ -91,6 +91,15 @@ type Repository interface {
 		lastSequence EventSequence,
 	) ([]SerializedEvent, error)
 
+	// GetRecentEvents returns at most limit Events newest-first (descending sequence) — a bounded
+	// "recent activity" read that must not replay a long stream. A limit below 1 is a programmer
+	// error returned before any request.
+	GetRecentEvents(
+		ctx context.Context,
+		entityID EntityID,
+		limit int,
+	) ([]SerializedEvent, error)
+
 	// Get the latest Snapshot for an Entity instance.
 	GetSnapshot(
 		ctx context.Context,
