@@ -19,11 +19,13 @@ type TransactionStream struct {
 	Snapshot *TransactionSnapshot `json:"snapshot,omitempty"`
 }
 
+// TransactionSnapshot is one written stream's inline snapshot relative to the scenario ID.
 type TransactionSnapshot struct {
 	Sequence int64  `json:"sequence"`
 	Payload  string `json:"payload"`
 }
 
+// TransactionFence is one read-only fenced stream relative to the scenario ID.
 type TransactionFence struct {
 	Suffix        string `json:"suffix"`
 	Head          int64  `json:"head"`

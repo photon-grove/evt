@@ -275,7 +275,8 @@ func (repo *Repository) buildSnapshotPut(
 	return types.TransactWriteItem{Put: &put}, nil
 }
 
-// carries one floor check per entity (see FloorCondition), built when the batch is flushed: a
+// CommitStream drains a channel of serialized results, committing each batch as one transaction.
+// It carries one floor check per entity (see FloorCondition), built when the batch is flushed: a
 // transaction cannot touch an entity's snapshot item twice.
 //
 // Deprecated: Cut in ADR-0006 (K1). Commit batched commands through the normal commit path

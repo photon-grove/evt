@@ -585,8 +585,6 @@ func newNamespace() string {
 // suite case in isolation.
 func NewNamespaceForTest() string { return newNamespace() }
 
-// serialize prepares events for an entity and overrides the serialized EntityType so a single Go
-// event type can stand in for multiple logical entity types in filter tests.
 // SerializeForTest exposes event serialization to integration test doubles that reproduce a suite
 // case in isolation.
 func SerializeForTest(
@@ -599,6 +597,8 @@ func SerializeForTest(
 	return serialize(t, id, entityType, fromSequence, events...)
 }
 
+// serialize prepares events for an entity and overrides the serialized EntityType so a single Go
+// event type can stand in for multiple logical entity types in filter tests.
 func serialize(
 	t *testing.T,
 	id evt.EntityID,

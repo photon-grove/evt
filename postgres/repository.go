@@ -96,26 +96,6 @@ func sharedRelationName(eventsTable, snapshotsTable string) string {
 	return ""
 }
 
-// lockEntities takes the entity lock for every entity in events, in sorted order so concurrent
-// multi-entity commits cannot deadlock.
-func (repo *Repository) lockEntities(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
-	ids := make([]string, 0, 1)
-	for _, event := range events {
-		if !slices.Contains(ids, string(event.EntityID)) {
-			ids = append(ids, string(event.EntityID))
-		}
-	}
-	slices.Sort(ids)
-
-	for _, id := range ids {
-		if _, err := tx.Exec(ctx, entityLockQuery, id); err != nil {
-			return classifyWriteError(fmt.Errorf("postgres: lock entity %s: %w", id, err))
-		}
-	}
-
-	return nil
-}
-
 // DB is the minimal subset of the pgx API the Repository depends on. Both *pgxpool.Pool and pgx.Tx
 // satisfy it, so callers can pass a pool (the common case) or an ambient transaction. It is the
 // abstraction point for the backend, mirroring dynamo.Client.

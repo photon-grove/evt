@@ -51,7 +51,7 @@
         { "by": "go", "op": "execute", "commandId": "c5", "timestamp": "2026-10-12T01:02:03Z", "command": { "type": "withdraw", "amountCents": 600 }, "expect": { "result": "ok", "events": 1 } },
         { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "tag", "tags": ["café", "naïve", "漢字"] }, "expect": { "result": "ok", "events": 1 } },
         { "by": "go", "op": "execute", "commandId": "c7", "command": { "type": "setLabels", "labels": { "z": "last", "a": "first", "m": "middle" } }, "expect": { "result": "ok", "events": 1 } },
-        { "by": "rust", "op": "execute", "command": { "type": "setLabels", "labels": { "b": "second" } }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commitId": "compat-rust-manual", "command": { "type": "setLabels", "labels": { "b": "second" } }, "expect": { "result": "ok", "events": 1 } },
         { "by": "go", "op": "execute", "commandId": "c9", "command": { "type": "close", "reason": "customer request" }, "expect": { "result": "ok", "events": 1 } },
         { "by": "rust", "op": "execute", "commandId": "c10", "command": { "type": "deposit", "amountCents": 5 }, "expect": { "result": "rejected" } }
       ]

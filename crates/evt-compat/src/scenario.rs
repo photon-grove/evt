@@ -104,6 +104,10 @@ pub struct Step {
     pub fences: Vec<TransactionFence>,
     #[serde(default)]
     pub suffix: Option<String>,
+    /// An explicit commit ID for steps without a command, pinning what the engine would
+    /// otherwise generate unpredictably so fixtures stay byte-for-byte reproducible.
+    #[serde(default)]
+    pub commit_id: Option<String>,
 }
 
 impl Step {
@@ -125,6 +129,11 @@ impl Step {
             .clone()
             .filter(|id| !id.is_empty())
             .map(Into::into);
+        metadata.commit_id = self
+            .commit_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_default();
         metadata.principal_id = self
             .principal_id
             .clone()

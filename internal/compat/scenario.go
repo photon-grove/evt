@@ -58,6 +58,7 @@ type Step struct {
 	By          string              `json:"by"`
 	Op          string              `json:"op"`
 	CommandID   string              `json:"commandId,omitempty"`
+	CommitID    string              `json:"commitId,omitempty"`
 	PrincipalID string              `json:"principalId,omitempty"`
 	CausationID string              `json:"causationId,omitempty"`
 	Extensions  map[string]string   `json:"extensions,omitempty"`
@@ -138,8 +139,14 @@ func StepMetadata(step Step) evt.Metadata {
 		id := evt.CommandID(step.CausationID)
 		metadata.CausationID = &id
 	}
-	if step.CommandID != "" {
+	// The engine derives the commit ID from the command ID, preserves a caller-stamped one,
+	// or generates an unpredictable ULID. Scenarios pin an explicit commit ID for steps
+	// without a command so the golden fixtures stay byte-for-byte reproducible.
+	switch {
+	case step.CommandID != "":
 		metadata.CommitID = "compat-" + step.By + "-" + step.CommandID
+	case step.CommitID != "":
+		metadata.CommitID = step.CommitID
 	}
 	metadata.Extensions = step.Extensions
 
