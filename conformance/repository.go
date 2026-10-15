@@ -297,6 +297,17 @@ func testRejectsReservedEntityIds(t *testing.T, repo evt.Repository) {
 		require.Error(t, err)
 		require.True(t, evt.IsReservedEntityIdErr(err))
 
+		// Out-of-band snapshot writes refuse all the same, on backends that offer them.
+		if snapshotter, ok := repo.(interface {
+			PutSnapshot(
+				context.Context, evt.EntityType, evt.EntityID, []byte, evt.EventSequence, evt.EventSequence,
+			) error
+		}); ok {
+			err = snapshotter.PutSnapshot(ctx, "test", id, []byte(`{"id":"x"}`), 1, 1)
+			require.Error(t, err, "an out-of-band snapshot of %q must be refused", id)
+			require.True(t, evt.IsReservedEntityIdErr(err), "expected a ReservedEntityIdError, got %v", err)
+		}
+
 		// Compaction writes no new rows but is refused all the same.
 		compactor, ok := repo.(evt.Compactor)
 		if !ok {
