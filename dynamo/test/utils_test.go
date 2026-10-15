@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,7 +92,7 @@ func Test_MarshalJSON_Success(t *testing.T) {
 		Origin:     &evt.Origin{Source: "test", Endpoint: "test-endpoint"},
 		Extensions: map[string]string{},
 	}
-	metadataJSON, err := json.Marshal(metadata)
+	metadataJSON, err := eventjson.MarshalMetadata(metadata)
 	require.NoError(t, err)
 
 	item := map[string]events.DynamoDBAttributeValue{

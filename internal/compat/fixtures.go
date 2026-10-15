@@ -19,6 +19,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/snapshots"
 	"github.com/photon-grove/evt/stream"
 )
@@ -276,7 +277,7 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 	}
 
 	for _, event := range stored {
-		data, err := json.Marshal(event)
+		data, err := eventjson.MarshalEvent(event)
 		if err != nil {
 			return expectation, err
 		}

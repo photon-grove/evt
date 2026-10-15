@@ -2,7 +2,6 @@ package dynamo
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 )
 
 // GetEvents returns all events for an entity instance.
@@ -139,7 +139,7 @@ func (repo *Repository) queryEvents(
 			}
 
 			var metadata evt.Metadata
-			if err = json.Unmarshal([]byte(event.Metadata), &metadata); err != nil {
+			if err = eventjson.UnmarshalMetadata([]byte(event.Metadata), &metadata); err != nil {
 				return nil, err
 			}
 

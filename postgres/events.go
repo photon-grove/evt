@@ -1,12 +1,12 @@
 package postgres
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 )
 
 // eventColumns is the SELECT list for reading a SerializedEvent back out of the event-log table.
@@ -63,7 +63,7 @@ func scanEvent(rows pgx.Rows) (evt.SerializedEvent, error) {
 	event.Version = evt.EventVersion(version)
 
 	if len(metadata) > 0 {
-		if err := json.Unmarshal(metadata, &event.Metadata); err != nil {
+		if err := eventjson.UnmarshalMetadata(metadata, &event.Metadata); err != nil {
 			return evt.SerializedEvent{}, fmt.Errorf("postgres: unmarshal metadata for %s: %w", event.ID, err)
 		}
 	}

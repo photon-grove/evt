@@ -2,7 +2,6 @@ package test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -31,7 +31,7 @@ func (s *RepositorySuite) Test_Commit_Ok() {
 		},
 	}
 
-	metadata, err := json.Marshal(evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}})
+	metadata, err := eventjson.MarshalMetadata(evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}})
 	require.NoError(s.T(), err)
 
 	expected := []types.TransactWriteItem{
@@ -96,7 +96,7 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 		},
 	}
 
-	metadata, err := json.Marshal(evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}})
+	metadata, err := eventjson.MarshalMetadata(evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}})
 	require.NoError(s.T(), err)
 
 	expected := []types.TransactWriteItem{

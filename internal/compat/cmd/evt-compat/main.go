@@ -30,6 +30,7 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/internal/compat"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/postgres"
 	"github.com/photon-grove/evt/snapshots"
 )
@@ -350,11 +351,11 @@ func expectedRows(expected compat.ScenarioExpectation) ([]row, *row, error) {
 	events := []row{}
 	for _, encoded := range expected.Events {
 		var event evt.SerializedEvent
-		if err := json.Unmarshal([]byte(encoded), &event); err != nil {
+		if err := eventjson.UnmarshalEvent([]byte(encoded), &event); err != nil {
 			return nil, nil, err
 		}
 
-		metadata, err := json.Marshal(event.Metadata)
+		metadata, err := eventjson.MarshalMetadata(event.Metadata)
 		if err != nil {
 			return nil, nil, err
 		}

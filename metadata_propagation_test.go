@@ -2,12 +2,12 @@ package evt_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/mem"
 	evttest "github.com/photon-grove/evt/test"
 )
@@ -53,14 +53,14 @@ func Test_Metadata_V09Propagation(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, events, 2)
 
-	data, err := json.Marshal(events[0].Metadata)
+	data, err := eventjson.MarshalMetadata(events[0].Metadata)
 	require.NoError(t, err)
 	require.Contains(t, string(data), `"principalId":null`)
 	require.Contains(t, string(data), `"causationId":null`)
 	require.Contains(t, string(data), `"extensions":{}`)
 
 	// The second command's causationId defaults to its command ID.
-	data, err = json.Marshal(events[1].Metadata)
+	data, err = eventjson.MarshalMetadata(events[1].Metadata)
 	require.NoError(t, err)
 	require.Contains(t, string(data), `"causationId":"cmd-0002"`)
 }

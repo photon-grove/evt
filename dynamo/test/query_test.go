@@ -2,13 +2,13 @@ package test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -40,7 +40,7 @@ func (s *RepositorySuite) Test_GetEvents_Success() {
 		},
 	}
 
-	metadata, err := json.Marshal(evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}})
+	metadata, err := eventjson.MarshalMetadata(evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}})
 	require.NoError(s.T(), err)
 
 	output := new(dynamodb.QueryOutput)
@@ -93,7 +93,7 @@ func (s *RepositorySuite) Test_GetLatestEvents_Success() {
 		},
 	}
 
-	metadata, err := json.Marshal(evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}})
+	metadata, err := eventjson.MarshalMetadata(evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Endpoint: "Testing"}})
 	require.NoError(s.T(), err)
 
 	output := new(dynamodb.QueryOutput)

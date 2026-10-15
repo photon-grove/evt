@@ -2,7 +2,6 @@ package dynamo
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -13,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -238,7 +238,7 @@ func (repo *Repository) buildEventPutTransactions(serializedEvents []evt.Seriali
 		currentSequence = event.Sequence
 
 		// Do the same for the Metadata
-		metadataBytes, err := json.Marshal(event.Metadata)
+		metadataBytes, err := eventjson.MarshalMetadata(event.Metadata)
 		if err != nil {
 			return nil, currentSequence, err
 		}

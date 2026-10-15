@@ -10,6 +10,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/internal/eventjson"
 )
 
 type namedEvent struct {
@@ -181,10 +182,10 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 
 	for _, c := range metadataDecodeInputs {
 		var metadata evt.Metadata
-		if err := json.Unmarshal([]byte(c.input), &metadata); err != nil {
+		if err := eventjson.UnmarshalMetadata([]byte(c.input), &metadata); err != nil {
 			return fixtures, fmt.Errorf("metadata %s: %w", c.name, err)
 		}
-		canonical, err := json.Marshal(metadata)
+		canonical, err := eventjson.MarshalMetadata(metadata)
 		if err != nil {
 			return fixtures, err
 		}
@@ -193,10 +194,10 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 
 	for _, c := range eventDecodeInputs {
 		var event evt.SerializedEvent
-		if err := json.Unmarshal([]byte(c.input), &event); err != nil {
+		if err := eventjson.UnmarshalEvent([]byte(c.input), &event); err != nil {
 			return fixtures, fmt.Errorf("event decode %s: %w", c.name, err)
 		}
-		canonical, err := json.Marshal(event)
+		canonical, err := eventjson.MarshalEvent(event)
 		if err != nil {
 			return fixtures, err
 		}
@@ -236,12 +237,12 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 }
 
 func eventVector(ctx context.Context, c namedEvent) (EventVector, error) {
-	serialized, err := json.Marshal(c.event)
+	serialized, err := eventjson.MarshalEvent(c.event)
 	if err != nil {
 		return EventVector{}, err
 	}
 
-	metadata, err := json.Marshal(c.event.Metadata)
+	metadata, err := eventjson.MarshalMetadata(c.event.Metadata)
 	if err != nil {
 		return EventVector{}, err
 	}
@@ -390,7 +391,7 @@ func ttlVector(ctx context.Context) (TTLVector, error) {
 
 		stream := TTLStream{Name: c.name, RetentionNanos: int64(c.retention)}
 		for _, event := range events {
-			encoded, err := json.Marshal(event)
+			encoded, err := eventjson.MarshalEvent(event)
 			if err != nil {
 				return vector, err
 			}

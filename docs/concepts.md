@@ -119,11 +119,16 @@ md := evt.NewMetadata(ctx, region,
 ```
 
 `WithCausationID` overrides the default for commands triggered by another command.
-When unset, the encoded `causationId` defaults to `CommandID`; with neither set,
-it is `null`. `PrincipalID` is optional and encodes as `null` when unset.
+In framework storage and stream encodings, an unset `causationId` defaults to
+`CommandID`; with neither set, it is `null`. `PrincipalID` is optional and encodes
+as `null` when unset.
 `WithPrincipalID("")` and `WithCausationID("")` clear their fields. `Extensions`
 always encodes as an object (`{}` when nil or empty); call `WithExtension` once
 per key. Decoding preserves stored values without filling in defaults.
+
+These defaults belong to the framework's codecs, not `Metadata` JSON methods.
+Direct `encoding/json` calls use the struct's field values (including nil values),
+so embedding `evt.Metadata` in an application DTO preserves sibling fields.
 
 Use `md.Equal(other)` to compare metadata: it compares effective causation IDs
 and treats nil and empty extension maps as equal, so encoded round trips remain

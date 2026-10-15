@@ -2,7 +2,6 @@ package evt
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -26,9 +25,9 @@ type Metadata struct {
 	PrincipalID *PrincipalID `json:"principalId"`
 	CausationID *CommandID   `json:"causationId"`
 
-	// Extensions carries application-specific metadata. It always encodes, as {} when unset or
-	// empty: a stored object decodes to a non-nil map, while a pre-v0.9 row without the key
-	// decodes to nil. The two encode identically and Equal treats them as the same.
+	// Extensions carries application-specific metadata. The framework's storage and stream codecs
+	// encode unset or empty extensions as {}. A stored object decodes to a non-nil map, while a
+	// pre-v0.9 row without the key decodes to nil. Equal treats the two as the same.
 	Extensions map[string]string `json:"extensions"`
 }
 
@@ -211,21 +210,4 @@ func extensionsEqual(a, b map[string]string) bool {
 	}
 
 	return true
-}
-
-// MarshalJSON encodes metadata with the storage format's rules: every key is always written, and
-// the v0.9 keys carry their effective values — causationId is the explicitly set causation,
-// otherwise the commandId, otherwise null, and extensions is an object, {} when unset or empty.
-// Decoding stays faithful to the stored bytes and does not apply the defaults.
-func (m Metadata) MarshalJSON() ([]byte, error) {
-	type metadataWire Metadata
-
-	wire := metadataWire(m)
-	wire.CausationID = m.effectiveCausationID()
-
-	if wire.Extensions == nil {
-		wire.Extensions = map[string]string{}
-	}
-
-	return json.Marshal(wire)
 }
