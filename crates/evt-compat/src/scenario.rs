@@ -129,11 +129,15 @@ impl Step {
             .clone()
             .filter(|id| !id.is_empty())
             .map(Into::into);
-        metadata.commit_id = self
-            .commit_id
-            .clone()
-            .filter(|id| !id.is_empty())
-            .unwrap_or_default();
+        // Mirror Go's StepMetadata: the commit ID follows the command ID, or an explicit one
+        // pinned for steps without a command (a raw commit writes it as-is; the store derives it
+        // from the command ID either way).
+        metadata.commit_id = match &self.command_id {
+            Some(command_id) if !command_id.is_empty() => {
+                format!("compat-{}-{command_id}", self.by)
+            }
+            _ => self.commit_id.clone().unwrap_or_default(),
+        };
         metadata.principal_id = self
             .principal_id
             .clone()
@@ -245,9 +249,9 @@ pub struct Expectation {
     pub state: String,
     pub events: Vec<String>,
     pub snapshot: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty")]
     pub dynamo_items: Vec<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty")]
     pub sns_messages: Vec<String>,
     #[serde(default)]
     pub sibling: Option<SiblingExpectation>,
@@ -260,8 +264,18 @@ pub struct SiblingExpectation {
     pub entity_id: String,
     pub events: Vec<String>,
     pub snapshot: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty")]
     pub dynamo_items: Vec<serde_json::Value>,
+}
+
+/// Decodes a Go-emitted sequence the way Go means it: a missing key or an explicit `null` (a nil
+/// slice) is empty, so fixtures round-trip without Go having to distinguish nil from empty.
+fn null_to_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Unexpected failures while running a step.
@@ -337,17 +351,6 @@ impl<R: Repository> Runner<R> {
     /// one atomic commit.
     async fn transaction(&self, entity_id: &EntityId, step: &Step) -> Result<Outcome, StepError> {
         let metadata = step.metadata();
-        let commit_id = metadata
-            .command_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| {
-                format!(
-                    "compat-{}-{}",
-                    step.by,
-                    step.command_id.clone().unwrap_or_default()
-                )
-            });
 
         let mut streams = Vec::new();
         for stream in &step.streams {
@@ -355,8 +358,7 @@ impl<R: Repository> Runner<R> {
             let mut events = Vec::new();
             for (index, raw) in stream.events.iter().enumerate() {
                 let sequence = EventSequence(stream.sequence + index as i64);
-                let mut event = raw_event(&id, sequence, raw, &metadata);
-                event.metadata.commit_id = commit_id.clone();
+                let event = raw_event(&id, sequence, raw, &metadata);
                 events.push(event);
             }
             let mut commit = Commit::new(id, events);
@@ -484,7 +486,23 @@ impl<R: Repository> Runner<R> {
         let repository = self.store.repository();
         let events = repository.events(entity_id).await?;
         let snapshot = repository.snapshot(entity_id).await?;
-        let loaded = self.store.load(entity_id).await?;
+
+        // A stream with a sequence gap — a failed transaction burned a sequence, or compaction
+        // landed mid-load — has no coherent aggregate view. Mirroring Go's Observe, its stored
+        // rows are still compared while the loaded state is recorded as absent.
+        let loaded = match self.store.load(entity_id).await {
+            Ok(loaded) => Some(loaded),
+            Err(Error::Conflict { message, .. }) if message.contains("skips from sequence") => None,
+            Err(err) => return Err(err),
+        };
+        let (state, sequence, snapshot_sequence) = match &loaded {
+            Some(loaded) => (
+                json::to_string(loaded.aggregate())?,
+                loaded.sequence().0,
+                loaded.snapshot_sequence().0,
+            ),
+            None => (String::new(), 0, 0),
+        };
 
         let mut dynamo_items = Vec::new();
         if let Some(snapshot) = &snapshot {
@@ -504,9 +522,9 @@ impl<R: Repository> Runner<R> {
         Ok(Expectation {
             name: name.to_owned(),
             entity_id: entity_id.to_string(),
-            sequence: loaded.sequence().0,
-            snapshot_sequence: loaded.snapshot_sequence().0,
-            state: json::to_string(loaded.aggregate())?,
+            sequence,
+            snapshot_sequence,
+            state,
             events: encoded_events,
             snapshot: snapshot.map(|s| s.to_json()).transpose()?.map(utf8),
             dynamo_items,

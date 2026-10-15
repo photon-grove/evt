@@ -632,16 +632,18 @@ impl Repository for DynamoRepository {
         let operations = commit.operations.len();
         let mut revalidations = 0;
 
+        // The shared budget covers every item the transaction carries, with the projector
+        // operations sized exactly from the items this backend will write. It fails with
+        // CommitTooLarge before any write, identically on every backend.
+        let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
+        for operation in &commit.operations {
+            sizes.push(sdk_item_size(operation));
+        }
+        crate::repository::check_budget(sizes)?;
+
         loop {
             let cached = self.ensure_manifest_validated().await?;
             let items = self.transaction_items(&commit, cached)?;
-
-            if items.len() > MAX_TRANSACTION_ITEMS {
-                return Err(Error::TooManyOperations {
-                    count: items.len(),
-                    limit: MAX_TRANSACTION_ITEMS,
-                });
-            }
 
             match self
                 .client

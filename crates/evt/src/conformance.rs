@@ -34,7 +34,9 @@ use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{self, FeatureMarker};
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::metadata::Metadata;
-use crate::repository::{Commit, NewSnapshot, Repository};
+use crate::repository::{
+    Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
+};
 use crate::retry::RetryPolicy;
 use crate::store::Store;
 
@@ -217,6 +219,26 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
         record(
             "reject a commit below the compacted floor",
             compacted_floor(repo).await,
+        );
+        record(
+            "a multi-stream commit appends to every stream in pinned order",
+            multi_stream_commit(repo).await,
+        );
+        record(
+            "a multi-stream commit is all-or-nothing",
+            multi_stream_atomicity(repo).await,
+        );
+        record(
+            "read fences pass at the head and fail once another writer moves the stream",
+            read_fences(repo).await,
+        );
+        record(
+            "an oversized commit is refused with CommitTooLarge before any write",
+            commit_too_large(repo).await,
+        );
+        record(
+            "append, snapshot, compact must fail a stale fence",
+            fence_compaction_aba(repo).await,
         );
         record("entity heads", entity_heads(repo).await);
         record(
@@ -904,6 +926,172 @@ async fn compacted_floor<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+/// A one-stream write, for transactions that append to a single stream.
+fn write<Op>(entity: &Stream, sequences: RangeInclusive<i64>) -> Commit<Op> {
+    Commit {
+        entity_id: entity.id.clone(),
+        events: entity.events(sequences),
+        snapshot: None,
+        operations: Vec::new(),
+    }
+}
+
+async fn multi_stream_commit<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+
+    // Deliberately declared out of bytewise stream order: the commit pins the order itself, and
+    // each stream keeps its own ascending sequences.
+    let commit = TransactionCommit::new(vec![write(&b, 1..=1), write(&a, 1..=2)]);
+    repo.commit_transaction(commit).await?;
+
+    ensure_eq!(repo.events(&a.id).await?, a.events(1..=2), "events(a)");
+    ensure_eq!(repo.events(&b.id).await?, b.events(1..=1), "events(b)");
+
+    Ok(())
+}
+
+async fn multi_stream_atomicity<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+
+    a.commit(repo, a.events(1..=2), None).await?;
+
+    // The sibling stream's event collides with nothing; stream a's reuses sequence 1.
+    let collision = Commit {
+        events: vec![a.event(1, 99)],
+        ..write(&a, 1..=1)
+    };
+    let commit = TransactionCommit::new(vec![write(&b, 1..=1), collision]);
+    let result = repo.commit_transaction(commit).await;
+
+    ensure!(
+        matches!(&result, Err(Error::Conflict { entity_id, .. }) if *entity_id == a.id),
+        "a commit that collides on one stream must fail with a conflict"
+    );
+
+    // All-or-nothing: the sibling stream that shared the failed commit must be untouched.
+    ensure!(
+        repo.events(&b.id).await?.is_empty(),
+        "the sibling stream of a failed commit is untouched"
+    );
+
+    Ok(())
+}
+
+async fn read_fences<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let c = Stream::new(&ns, "c", "ledger");
+    let absent = Stream::new(&ns, "absent", "ledger");
+
+    a.commit(repo, a.events(1..=2), None).await?;
+
+    // A fence at the observed head passes while the transaction writes another stream. A fence
+    // on an absent stream (head 0) passes too.
+    let fence = ReadFence::new(
+        a.id.clone(),
+        a.entity_type.clone(),
+        EventSequence(2),
+        FenceProvenance::Engine,
+    );
+    let mut commit = TransactionCommit::new(vec![write(&c, 1..=1)]);
+    commit.fences = vec![
+        fence.clone(),
+        ReadFence::new(
+            absent.id.clone(),
+            absent.entity_type.clone(),
+            EventSequence::ZERO,
+            FenceProvenance::Engine,
+        ),
+    ];
+    repo.commit_transaction(commit).await?;
+
+    // Another writer moves the fenced stream past the head.
+    a.commit(repo, vec![a.event(3, 3)], None).await?;
+
+    // A stale fence now fails the whole commit, and the conflict names the fenced stream.
+    let before = repo.events(&c.id).await?.len();
+    let mut commit = TransactionCommit::new(vec![write(&c, 2..=2)]);
+    commit.fences = vec![fence];
+    let Err(err) = repo.commit_transaction(commit).await else {
+        return Err(Failure("a stale fence must fail the commit".into()));
+    };
+
+    ensure!(
+        matches!(
+            &err,
+            Error::FenceConflict { entity_id, provenance: FenceProvenance::Engine, .. }
+                if *entity_id == a.id
+        ),
+        "a stale fence fails with a fence conflict naming the fenced stream"
+    );
+    ensure!(
+        err.is_conflict(),
+        "a fence conflict is an optimistic-concurrency conflict"
+    );
+
+    // Nothing from the failed commit was written.
+    ensure_eq!(
+        repo.events(&c.id).await?.len(),
+        before,
+        "a failed fenced commit writes nothing"
+    );
+
+    Ok(())
+}
+
+async fn commit_too_large<R: Repository>(repo: &R) -> CaseResult {
+    let stream = Stream::new(&namespace(), "large", "ledger");
+
+    // 101 event puts plus the control rows and the floor check exceed the 100-item budget.
+    let result = stream.commit(repo, stream.events(1..=101), None).await;
+
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { .. })),
+        "an oversized commit is refused with CommitTooLarge"
+    );
+    ensure!(
+        repo.events(&stream.id).await?.is_empty(),
+        "an oversized commit is refused before any write"
+    );
+
+    Ok(())
+}
+
+async fn fence_compaction_aba<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let c = Stream::new(&ns, "c", "ledger");
+
+    a.commit(repo, a.events(1..=3), Some(a.new_snapshot(1, "{}")))
+        .await?;
+
+    // Compaction deletes the events the snapshot covers, which empties the slot a stale fence
+    // checks — the companion on the snapshot item must catch the move.
+    repo.compact_below(&a.id, EventSequence(3)).await?;
+
+    let mut commit = TransactionCommit::new(vec![write(&c, 1..=1)]);
+    commit.fences = vec![ReadFence::new(
+        a.id.clone(),
+        a.entity_type.clone(),
+        EventSequence(1),
+        FenceProvenance::Engine,
+    )];
+
+    ensure!(
+        matches!(
+            repo.commit_transaction(commit).await,
+            Err(Error::FenceConflict { .. })
+        ),
+        "append, snapshot, compact must fail a stale fence"
+    );
+
+    Ok(())
+}
+
 async fn entity_heads<R: Repository>(repo: &R) -> CaseResult {
     let ns = namespace();
     let a1 = Stream::new(&ns, "alpha-1", "alpha");
@@ -1474,6 +1662,10 @@ where
         retention_and_heads(repo, other).await,
     );
     record(
+        "the durable retention set refuses transaction fences",
+        fence_retention_refusal(repo, other).await,
+    );
+    record(
         "one declaration transaction bumps the version once",
         one_bump_per_declaration(repo, other).await,
     );
@@ -1756,6 +1948,42 @@ where
         manifest.version,
         before + 1,
         "the version after a two-feature declaration"
+    );
+
+    Ok(())
+}
+
+/// The refusal must consult the manifest, not the calling instance's configuration: retention is
+/// declared on one writer and the fenced transaction is committed by the other. This case runs
+/// before the unsupported-feature declaration case, whose leftover manifest would refuse every
+/// later commit, and the suite's final cleanup clears the retention entry.
+async fn fence_retention_refusal<R>(repo: &R, other: &R) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+{
+    let ns = namespace();
+    let retained = format!("{ns}-retained");
+
+    other
+        .update_manifest(|manifest| {
+            manifest.retention.insert(retained.clone());
+        })
+        .await?;
+
+    let mut commit = TransactionCommit::<R::Operation>::new(Vec::new());
+    commit.fences = vec![ReadFence::new(
+        EntityId::new(format!("{ns}-a")),
+        EntityType::new(&retained),
+        EventSequence::ZERO,
+        FenceProvenance::Engine,
+    )];
+
+    ensure!(
+        matches!(
+            repo.commit_transaction(commit).await,
+            Err(Error::RetentionConflict { .. })
+        ),
+        "a fence for a retention-enabled type is refused with RetentionConflict"
     );
 
     Ok(())

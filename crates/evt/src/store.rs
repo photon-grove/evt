@@ -463,7 +463,6 @@ pub fn serialize_events<A: Aggregate>(
         .collect()
 }
 
-
 /// One multi-stream transaction (ADR 0004, C1/C2). A caller loads aggregates with
 /// [`Store::load`], hands them to [`read`](Transaction::read), appends decided events to any
 /// subset with [`append`](Transaction::append), adds caller-stamped fences with

@@ -115,6 +115,10 @@ impl Repository for MemRepository {
             return Ok(());
         }
 
+        // Budget parity: an oversized commit fails identically on every backend, before any
+        // write.
+        crate::repository::check_budget(commit.sizes(|_| None)?)?;
+
         // Both locks are held through the write, so a manifest change cannot slip between the
         // version check and the events, mirroring the live backends' transaction condition.
         let stored_manifest = self.manifest_lock();

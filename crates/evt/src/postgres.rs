@@ -422,6 +422,11 @@ impl Repository for PostgresRepository {
             return Ok(());
         };
 
+        // The budget is backend-neutral, so an oversized commit is refused before any write,
+        // identically to the other backends. Projector statements are opaque here and skipped,
+        // like in `commit_transaction`.
+        crate::repository::check_budget(commit.sizes(|_| None)?)?;
+
         let rows = commit
             .events
             .iter()

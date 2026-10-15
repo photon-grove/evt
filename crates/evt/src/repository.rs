@@ -77,6 +77,51 @@ impl<Op> Commit<Op> {
         self
     }
 
+    /// Exact backend-neutral event/snapshot/check representation, matching Dynamo item sizes,
+    /// for the shared commit budget: the two control rows, the event puts, then the snapshot put
+    /// or floor check. Backend projector operations are opaque here and sized by the backend.
+    pub(crate) fn sizes(
+        &self,
+        ttl: impl Fn(&EntityType) -> Option<i64>,
+    ) -> Result<Vec<usize>, Error> {
+        use crate::wire::dynamo::{self as wire, AttributeValue as V};
+        let key = |id: &str, seq: i64| {
+            wire::Item::from([
+                ("pk".into(), V::S(id.into())),
+                ("sk".into(), V::N(seq.to_string())),
+            ])
+        };
+        let mut sizes = vec![
+            item_size(&key(crate::features::FEATURES_ID, 0)),
+            item_size(&key("SYSTEM#REBUILD", 0)),
+        ];
+        for event in &self.events {
+            sizes.push(item_size(&wire::event_item(
+                event,
+                ttl(&event.entity_type),
+            )?));
+        }
+        if let Some(snapshot) = &self.snapshot {
+            sizes.push(item_size(&wire::snapshot_item(
+                &SerializedSnapshot {
+                    entity_type: snapshot.entity_type.clone(),
+                    entity_id: self.entity_id.clone(),
+                    sequence: snapshot.sequence,
+                    event_sequence: self
+                        .events
+                        .last()
+                        .expect("validated commit with a snapshot has events")
+                        .sequence,
+                    payload: snapshot.payload.clone(),
+                },
+                ttl(&snapshot.entity_type),
+            )?));
+        } else {
+            sizes.push(item_size(&key(self.entity_id.as_str(), 0)));
+        }
+        Ok(sizes)
+    }
+
     /// Checks that the events can be stored as written: each belongs to the commit's entity and
     /// has the ID `{entity_id}:{sequence}`, they share one entity type, the first sequence is at
     /// least 1, and sequences are contiguous. A snapshot must have the events' entity type and a

@@ -67,15 +67,6 @@ pub enum Error {
     #[error("invalid stored record: {0}")]
     InvalidRecord(String),
 
-    /// A commit would exceed the backend's transaction size limit.
-    #[error("too many operations: {count}, the backend supports at most {limit} per transaction")]
-    TooManyOperations {
-        /// Operations in the commit.
-        count: usize,
-        /// The backend limit.
-        limit: usize,
-    },
-
     /// Shared DynamoDB-compatible transaction budget exceeded.
     #[error(
         "commit exceeds transaction budget: {actions} actions, {bytes} bytes, largest item {largest_item}"
@@ -190,10 +181,7 @@ impl Error {
     /// Reports whether the error is an optimistic-concurrency conflict. A fence conflict is one:
     /// another writer moved the fenced stream, like a competing sequence put.
     pub fn is_conflict(&self) -> bool {
-        matches!(
-            self,
-            Self::Conflict { .. } | Self::FenceConflict { .. }
-        )
+        matches!(self, Self::Conflict { .. } | Self::FenceConflict { .. })
     }
 
     /// Reports whether the error is a duplicate command (an idempotent success).
