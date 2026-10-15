@@ -148,7 +148,7 @@ func (repo *Repository) CommitStream(
 			continue
 		}
 
-		if err := checkContiguous(serializedResult.Events); err != nil {
+		if err = checkContiguous(serializedResult.Events); err != nil {
 			errs = append(errs, err)
 			continue
 		}

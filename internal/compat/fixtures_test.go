@@ -37,11 +37,11 @@ func assertFixture(t *testing.T, name string, value any) {
 
 	path := FixturePath(name)
 	if *update {
-		require.NoError(t, os.WriteFile(path, data, 0o644))
+		require.NoError(t, os.WriteFile(path, data, 0o644)) //nolint:gosec // fixtures are committed public files, not secrets
 		return
 	}
 
-	existing, err := os.ReadFile(path)
+	existing, err := os.ReadFile(path) //nolint:gosec // path is FixturePath of a package-constant fixture name
 	require.NoError(t, err, "missing fixture; run go test ./internal/compat -run TestFixtures -update")
 	require.Equal(t, string(existing), string(data),
 		"Go output differs from %s; if the change is intentional, regenerate with -update and update the Rust side", name)

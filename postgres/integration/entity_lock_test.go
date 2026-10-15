@@ -25,7 +25,7 @@ func Test_CommitWaitsForEntityLock(t *testing.T) {
 
 	lock, err := pool.Begin(ctx)
 	require.NoError(t, err)
-	defer func() { _ = lock.Rollback(ctx) }()
+	defer func() { _ = lock.Rollback(ctx) }() //nolint:errcheck // releasing the lock is best-effort cleanup; the test already asserted what it needs
 
 	_, err = lock.Exec(ctx, "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))", string(id))
 	require.NoError(t, err)

@@ -52,73 +52,105 @@ func NewAccount(id evt.EntityID) *Account {
 
 // AccountOpened is the payload of account:opened (v1).
 type AccountOpened struct {
+	accountEvent
+
 	Owner    string    `json:"owner"`
 	OpenedAt time.Time `json:"openedAt"`
 }
 
 // MoneyDeposited is the payload of account:deposited (v1).
 type MoneyDeposited struct {
+	accountEvent
+
 	AmountCents int64   `json:"amountCents"`
 	Memo        *string `json:"memo"`
 }
 
 // MoneyWithdrawn is the payload of account:withdrawn (v1).
 type MoneyWithdrawn struct {
+	accountEvent
+
 	AmountCents int64 `json:"amountCents"`
 }
 
 // AccountTagged is the payload of account:tagged (v1).
 type AccountTagged struct {
+	accountEvent
+
 	Tags []string `json:"tags"`
 }
 
 // AccountLabeled is the payload of account:labeled (v1).
 type AccountLabeled struct {
+	accountEvent
+
 	Labels map[string]string `json:"labels"`
 }
 
 // AccountRenamed is the payload of account:renamed (v2). Version 1 stored the owner as "name".
 type AccountRenamed struct {
+	accountEvent
+
 	Owner string `json:"owner"`
 }
 
 // AccountClosed is the payload of account:closed (v1).
 type AccountClosed struct {
+	accountEvent
+
 	Reason *string `json:"reason"`
 }
 
-func (AccountOpened) Type() evt.EventType  { return OpenedEvent }
+// accountEvent supplies the evt.Event methods every account event shares. It has no fields, so
+// embedding it leaves the JSON payloads unchanged.
+type accountEvent struct{}
+
+func (accountEvent) EntityType() evt.EntityType { return AccountType }
+
+// EntityID is empty: events carry no entity ID, and the store assigns it when serializing.
+func (accountEvent) EntityID() evt.EntityID { return "" }
+
+// Type implements evt.Event.
+func (AccountOpened) Type() evt.EventType { return OpenedEvent }
+
+// Version implements evt.Event.
+func (AccountOpened) Version() evt.EventVersion { return 1 }
+
+// Type implements evt.Event.
 func (MoneyDeposited) Type() evt.EventType { return DepositedEvent }
-func (MoneyWithdrawn) Type() evt.EventType { return WithdrawnEvent }
-func (AccountTagged) Type() evt.EventType  { return TaggedEvent }
-func (AccountLabeled) Type() evt.EventType { return LabeledEvent }
-func (AccountRenamed) Type() evt.EventType { return RenamedEvent }
-func (AccountClosed) Type() evt.EventType  { return ClosedEvent }
 
-func (AccountOpened) Version() evt.EventVersion  { return 1 }
+// Version implements evt.Event.
 func (MoneyDeposited) Version() evt.EventVersion { return 1 }
+
+// Type implements evt.Event.
+func (MoneyWithdrawn) Type() evt.EventType { return WithdrawnEvent }
+
+// Version implements evt.Event.
 func (MoneyWithdrawn) Version() evt.EventVersion { return 1 }
-func (AccountTagged) Version() evt.EventVersion  { return 1 }
+
+// Type implements evt.Event.
+func (AccountTagged) Type() evt.EventType { return TaggedEvent }
+
+// Version implements evt.Event.
+func (AccountTagged) Version() evt.EventVersion { return 1 }
+
+// Type implements evt.Event.
+func (AccountLabeled) Type() evt.EventType { return LabeledEvent }
+
+// Version implements evt.Event.
 func (AccountLabeled) Version() evt.EventVersion { return 1 }
+
+// Type implements evt.Event.
+func (AccountRenamed) Type() evt.EventType { return RenamedEvent }
+
+// Version implements evt.Event.
 func (AccountRenamed) Version() evt.EventVersion { return 2 }
-func (AccountClosed) Version() evt.EventVersion  { return 1 }
 
-func (AccountOpened) EntityType() evt.EntityType  { return AccountType }
-func (MoneyDeposited) EntityType() evt.EntityType { return AccountType }
-func (MoneyWithdrawn) EntityType() evt.EntityType { return AccountType }
-func (AccountTagged) EntityType() evt.EntityType  { return AccountType }
-func (AccountLabeled) EntityType() evt.EntityType { return AccountType }
-func (AccountRenamed) EntityType() evt.EntityType { return AccountType }
-func (AccountClosed) EntityType() evt.EntityType  { return AccountType }
+// Type implements evt.Event.
+func (AccountClosed) Type() evt.EventType { return ClosedEvent }
 
-// Events carry no entity ID. The store assigns it when serializing.
-func (AccountOpened) EntityID() evt.EntityID  { return "" }
-func (MoneyDeposited) EntityID() evt.EntityID { return "" }
-func (MoneyWithdrawn) EntityID() evt.EntityID { return "" }
-func (AccountTagged) EntityID() evt.EntityID  { return "" }
-func (AccountLabeled) EntityID() evt.EntityID { return "" }
-func (AccountRenamed) EntityID() evt.EntityID { return "" }
-func (AccountClosed) EntityID() evt.EntityID  { return "" }
+// Version implements evt.Event.
+func (AccountClosed) Version() evt.EventVersion { return 1 }
 
 // Command is the account command, decoded from a scenario step. Kind selects the operation.
 type Command struct {

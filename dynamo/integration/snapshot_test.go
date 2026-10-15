@@ -46,7 +46,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateValueResult.Events...)
-	result.Transaction = append(result.Transaction, updateValueResult.Transaction...)
+	result.Transaction = append(result.Transaction, updateValueResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	// Set "other" to an intermediate value
 	updateOtherResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
@@ -56,7 +56,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateOtherResult.Events...)
-	result.Transaction = append(result.Transaction, updateOtherResult.Transaction...)
+	result.Transaction = append(result.Transaction, updateOtherResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	s.applyEvents(result.Events)
 	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
@@ -105,7 +105,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.NoError(s.T(), err)
 
 	newResult.Events = append(newResult.Events, newOtherResult.Events...)
-	newResult.Transaction = append(newResult.Transaction, newOtherResult.Transaction...)
+	newResult.Transaction = append(newResult.Transaction, newOtherResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	s.applyEvents(newResult.Events)
 	_, err = s.store.Commit(ctx, newResult, s.eventContext, metadata)
@@ -183,7 +183,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateValueResult.Events...)
-	result.Transaction = append(result.Transaction, updateValueResult.Transaction...)
+	result.Transaction = append(result.Transaction, updateValueResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	// Set "other" to an intermediate value
 	updateOtherResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
@@ -193,7 +193,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateOtherResult.Events...)
-	result.Transaction = append(result.Transaction, updateOtherResult.Transaction...)
+	result.Transaction = append(result.Transaction, updateOtherResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	s.applyEvents(result.Events)
 	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
