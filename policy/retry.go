@@ -7,8 +7,10 @@ import (
 
 // Attempt contains retry telemetry fields emitted by Execute.
 //
-// Deprecated: Cut in ADR-0006 (K6): attempt callbacks are replaced by fence-aware retry plus
-// structured telemetry. It will be removed in the next minor release.
+// Planned for removal in the next minor release (ADR-0006, K6): attempt callbacks are replaced
+// by fence-aware retry plus structured telemetry. It carries no Deprecated notice yet because
+// Execute/ExecuteWithRetry still take a Hooks argument, so the notice would break builds with
+// no warning-free path; it lands once the core reshape (C5) replaces the signature.
 type Attempt struct {
 	Attempt int
 	Delay   time.Duration
@@ -18,8 +20,10 @@ type Attempt struct {
 
 // Hooks emits retry lifecycle callbacks for telemetry.
 //
-// Deprecated: Cut in ADR-0006 (K6): retry lifecycle hooks are replaced by fence-aware retry
-// (C5) plus structured telemetry. It will be removed in the next minor release.
+// Planned for removal in the next minor release (ADR-0006, K6): retry lifecycle hooks are
+// replaced by fence-aware retry plus structured telemetry. It carries no Deprecated notice yet
+// because Execute/ExecuteWithRetry still take a Hooks argument, so the notice would break
+// builds with no warning-free path; it lands once the core reshape (C5) replaces the signature.
 type Hooks struct {
 	OnRetry  func(Attempt)
 	OnGiveUp func(Attempt)

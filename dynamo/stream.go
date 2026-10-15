@@ -96,6 +96,9 @@ func (repo *Repository) StreamAllEvents(
 // the whole table. When the repository is configured with WithScanSegments, the scan runs in
 // parallel across segments and pages from different segments interleave on the channel in no
 // particular order.
+//
+// Deprecated: Cut in ADR-0006 (K7). Use StreamAllEvents with evt.StreamFilter instead. It
+// will be removed in the next minor release.
 func (repo *Repository) StreamAllEventsByExpression(
 	ctx context.Context,
 	expr *expression.Expression,
@@ -130,7 +133,7 @@ func (repo *Repository) StreamEntities(
 		return channel
 	}
 
-	return repo.StreamEntitiesByExpression(ctx, expr, applyEvent)
+	return repo.StreamEntitiesByExpression(ctx, expr, applyEvent) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 }
 
 // StreamEntitiesByExpression streams Events from the table, optionally filtered by a raw DynamoDB
@@ -146,6 +149,9 @@ func (repo *Repository) StreamEntities(
 // As a result it buffers all matched Events in memory for the duration of the scan. It is intended
 // for rebuild/diagnostic flows (see evt.RebuildProjections), not hot read paths. For large tables,
 // pair it with WithScanSegments to parallelize the read.
+//
+// Deprecated: Cut in ADR-0006 (K7). Use StreamEntities with evt.StreamFilter instead. It
+// will be removed in the next minor release.
 func (repo *Repository) StreamEntitiesByExpression(
 	ctx context.Context,
 	expr *expression.Expression,

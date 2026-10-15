@@ -120,20 +120,34 @@ All packages live under `github.com/photon-grove/evt`.
 
 The v0.9.0 core reshape deprecates the features cut by plan decision D6
 ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md)); they keep compiling but are
-deleted in the next minor release. Each deprecation notice points at its replacement:
+deleted in the next minor release. Each carries a `Deprecated:` godoc notice pointing at its
+replacement, so adopting the replacement today builds warning-free:
 
 - `CommitStream` (K1) — commit batched commands through the normal commit path
-- snapshot freshness observer / replay estimate / budget (K2) — structured load telemetry replaces it
+- snapshot freshness observer / replay estimate / budget (K2) — removed without a Go
+  replacement; wrap `Load` with your own metrics (Rust gains structured load telemetry, P9)
 - `StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` (K3) —
   `StreamEntities` plus `evt.RebuildProjectionsFromStream`
 - `HeadStore` (heads table) and incremental/delta rebuild (K4) — scan-derived `StreamEntityHeads`
 - `evt/publishers`, `BudgetController`, and `stream.SNSPublisher`/FIFO (K5) — command outcomes and
   the stream envelope (which stays: it is the cross-language wire format)
-- `policy` hooks / attempt callbacks / pluggable classifier (K6) — fence-aware retry plus telemetry
-  (retry classification itself stays)
-- `BaseEntity`, `NewEntity`, the `WithFactory` helpers, `ByCommandID`, `dynamo.Delete`,
-  `dynamo/mock`, `evt/result`, the `do.go` DI providers, and `dynamo.ExpressionStreamer` (K7) —
-  direct store calls, `CompactBelow`, plain `(value, error)` returns, and `StreamFilter`
+- `policy.Config.Classify` / `policy.Classifier` (K6) — leave `Classify` unset; the built-in
+  `policy.Classify` mapping applies
+- the `WithFactory` helpers (including `snapshots.Store`'s), `ByCommandID`, `dynamo.Delete`,
+  `dynamo/mock`, the `do.go` DI providers, `dynamo.ExpressionStreamer` (and the concrete
+  `*dynamo.Repository` `...ByExpression` methods), and handler-attached
+  `CommandResult.Transaction` (K7) — direct store calls, `CompactBelow`, `StreamFilter`,
+  projector-produced transaction groups, and (planned) commit-wide projectors
+
+Three more D6-cut surfaces have **no warning-free migration path yet**, so they carry no
+`Deprecated:` notice in v0.9.0. They are planned for removal once the core reshape (C1–C11)
+replaces the contracts that require them:
+
+- `evt.BaseEntity` / `evt.NewEntity` — `Entity.Base` still requires `BaseEntity`
+- `evt/result` — `Repository.StreamAllEvents`, `Repository.StreamEntities`,
+  `SnapshotStreamer`, and `RebuildProjectionsFromStream` still return `result.Result` channels
+- `policy.Hooks` / `policy.Attempt` — `policy.Execute` and `policy.ExecuteWithRetry` still take
+  a `Hooks` argument
 
 ## Rust
 

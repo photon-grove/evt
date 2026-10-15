@@ -241,6 +241,9 @@ func (store *Store) Execute(
 }
 
 // LoadEntityWithFactory creates a fresh entity instance and loads it from the repository.
+//
+// Deprecated: Cut in ADR-0006 (K7): use Store.LoadEntity directly. It will be removed in the
+// next minor release.
 func (store *Store) LoadEntityWithFactory(
 	ctx context.Context,
 	factory evt.EntityFactory,
@@ -250,6 +253,9 @@ func (store *Store) LoadEntityWithFactory(
 }
 
 // ExecuteWithFactory creates a fresh entity instance, executes the command, and returns it.
+//
+// Deprecated: Cut in ADR-0006 (K7): use Store.Execute directly. It will be removed in the next
+// minor release.
 func (store *Store) ExecuteWithFactory(
 	ctx context.Context,
 	factory evt.EntityFactory,

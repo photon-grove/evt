@@ -24,9 +24,12 @@ type Entity interface {
 }
 ```
 
-*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):* `evt.BaseEntity`
-and `evt.NewEntity` go away in the next minor release — define your own identity and lifecycle
-fields instead. The `Base() BaseEntity` interface method goes with them.
+*Planned for removal in the next minor release* ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):
+`evt.BaseEntity` and `evt.NewEntity` go away then — define your own identity and lifecycle
+fields instead, so the switch is a one-line change. The `Base() BaseEntity` interface method
+goes with them. No `Deprecated:` notice is carried in v0.9.0 because `Entity.Base` still
+requires the type, so a notice would break builds with no warning-free path; the notice lands
+once the core reshape (C1–C11) replaces the contract.
 
 Embed `evt.BaseEntity` (and construct it with `evt.NewEntity(id)`) to get the
 `ID`, `IsActive`, `CreatedAt`, and `UpdatedAt` bookkeeping for free. The critical
@@ -52,7 +55,7 @@ type Command interface {
 ```go
 type CommandResult struct {
     Events      []Event     // the immutable facts to commit
-    Transaction Transaction // optional related writes ([]TransactionGroup)
+    Transaction Transaction // deprecated in v0.9.0 (K7); see [Transaction](#transaction)
 }
 ```
 
@@ -173,11 +176,19 @@ over the log. That is what makes a projection table disposable. See
 
 ## Transaction
 
-A `Transaction` is `[]TransactionGroup`: a command can return related writes
-alongside its events so they commit together. A `TransactionGroup` is
-backend-specific (a DynamoDB view projector returns a DynamoDB group), and the
-framework merges compatible groups before committing. This is how a single command
-appends facts and updates derived rows atomically where the backend supports it.
+A `Transaction` is `[]TransactionGroup`: a set of related writes committed together. A
+`TransactionGroup` is backend-specific (a DynamoDB view projector returns a DynamoDB group), and
+the framework merges compatible groups before committing.
+
+The supported way to produce those groups is a projector: an `EventProjector` runs inside the
+commit and its `TransactionGroup` is merged into the same atomic write as the command's events.
+
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):*
+handler-attached `CommandResult.Transaction` — the pattern of a handler returning related writes
+on the command's result. Return zero transactions and let projectors produce the view writes
+instead; commit-wide projectors ([ADR 0004](adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md),
+C7) are the planned replacement that lets a projector emit writes for every event in a commit,
+not just one entity's.
 
 ## Upcaster
 

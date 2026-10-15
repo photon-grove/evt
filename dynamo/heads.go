@@ -31,10 +31,11 @@ var (
 // StreamEntityHeads implements evt.EntityHeadStreamer by scanning the event log directly. It folds
 // the log down to each entity's head: the larger of the highest event sort key (sk >= 1) and the
 // snapshot's recorded eventSeq (the sk=0 row), so a stream whose early events were compacted away
-// still reports the sequence its snapshot covers. It is the dependency-free fallback (and the
-// backfill source for a HeadStore): correct, but it reads the whole event log every call — DynamoDB
-// bills a Scan by item size regardless of projection. Prefer a HeadStore, backed by a small heads
-// table maintained by the heads projector, for the steady-state change-detection path.
+// still reports the sequence its snapshot covers.
+//
+// This is the supported change-detection path (ADR-0006, K4), but it reads the whole event log on
+// every call — DynamoDB bills a Scan by item size regardless of projection — so budget for the
+// scan cost on each change-detection pass, and keep the passes infrequent relative to commits.
 func (repo *Repository) StreamEntityHeads(
 	ctx context.Context,
 	entityType evt.EntityType,

@@ -105,8 +105,10 @@ type Entity interface {
 
 // BaseEntity provides common fields for all entities.
 //
-// Deprecated: Cut in ADR-0006 (K7): entities define their own identity and lifecycle fields
-// instead of embedding BaseEntity. It will be removed in the next minor release.
+// Planned for removal in the next minor release (ADR-0006, K7): entities define their own
+// identity and lifecycle fields instead of embedding BaseEntity. It carries no Deprecated
+// notice yet because Entity.Base still requires this type, so the notice would break builds
+// with no warning-free path; it lands once the core reshape (C1-C11) replaces the contract.
 type BaseEntity struct {
 	ID        EntityID  `json:"id"`        // A unique identifier
 	IsActive  bool      `json:"isActive"`  // Whether this record has been deleted
@@ -116,7 +118,7 @@ type BaseEntity struct {
 
 // NewEntity creates a new BaseEntity with the given ID, setting IsActive to true and timestamps to now.
 //
-// Deprecated: Cut in ADR-0006 (K7). It will be removed in the next minor release.
+// Planned for removal in the next minor release (ADR-0006, K7), together with BaseEntity.
 func NewEntity(id EntityID) BaseEntity {
 	return BaseEntity{
 		ID:        id,

@@ -20,9 +20,10 @@ An aggregate implements [`evt.Entity`](concepts.md#entity). It does three jobs:
 **handle** commands into new events, **apply** events to its own state, and
 **deserialize** historical events back into current Go types.
 
-> **Deprecated in v0.9.0** ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):
-> `evt.BaseEntity` and `evt.NewEntity` go away in the next minor release — define your own
-> identity and lifecycle fields instead.
+> **Planned for removal in the next minor release** ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):
+> `evt.BaseEntity` and `evt.NewEntity` go away then — define your own identity and lifecycle
+> fields instead. No `Deprecated:` notice is carried in v0.9.0 because `Entity.Base` still
+> requires the type; the notice lands once the core reshape (C1–C11) replaces the contract.
 
 ```go
 const entityType evt.EntityType = "bank_account"
