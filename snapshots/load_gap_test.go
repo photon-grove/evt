@@ -70,7 +70,7 @@ func TestExecuteWithRetryRetriesALoadGap(t *testing.T) {
 		&test.ReplaceEntity{Value: "six"},
 		newTestMetadata(),
 		policy.Config{MaxAttempts: 3, Sleep: func(context.Context, time.Duration) error { return nil }},
-		policy.Hooks{OnRetry: func(policy.Attempt) { retries++ }},
+		policy.Hooks{OnRetry: func(policy.Attempt) { retries++ }}, //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	)
 
 	require.NoError(t, err)

@@ -18,6 +18,9 @@ const (
 )
 
 // Classifier maps an error into a retry/failure class.
+//
+// Deprecated: Cut in ADR-0006 (K6): the pluggable classifier hook is cut; the built-in Classify
+// mapping stays (B16). It will be removed in the next minor release.
 type Classifier func(error) Class
 
 // Classify maps errors already wrapped with ClassifiedError into their stored

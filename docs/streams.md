@@ -73,6 +73,10 @@ The runtime adds:
 
 ## Publishers
 
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K5):*
+`evt/publishers`, `BudgetController`, and the SNS/FIFO publisher are cut; command outcomes and
+the stream envelope (which stays as the cross-language wire format) replace them.
+
 `evt/publishers` is the single DynamoDB-Stream consumer: it reads committed
 events and republishes them to the SNS topic the consumers above subscribe to.
 The handler takes a `StreamPublisher` and a `BudgetController`:

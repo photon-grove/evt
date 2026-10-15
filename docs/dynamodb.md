@@ -77,7 +77,9 @@ full replay from sequence 1 — the early events are gone.
 
 The raw `dynamo.Delete` helper is snapshot-unsafe, intended for local/staging
 fixtures only, and excluded from production builds behind a `//go:build !prod`
-tag. Prefer `CompactBelow` for any principled truncation. Background and rationale
+tag. It is deprecated in v0.9.0
+([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7) and will be removed in the next
+minor release. Prefer `CompactBelow` for any principled truncation. Background and rationale
 live in [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
 
 ### Retention

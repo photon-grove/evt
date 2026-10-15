@@ -19,6 +19,10 @@ import (
 // snapshot-verified log truncation in any environment, use CompactBelow (evt.Compactor) instead.
 //
 // WARNING: Use only in local and staging environments.
+//
+// Deprecated: Cut in ADR-0006 (K7): point-deleting events is snapshot-unsafe. Use
+// evt.Compactor.CompactBelow, which only deletes events a durable snapshot already covers. It
+// will be removed in the next minor release.
 func (repo *Repository) Delete(
 	ctx context.Context,
 	serializedEvents []evt.SerializedEvent,

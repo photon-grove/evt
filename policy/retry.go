@@ -6,6 +6,9 @@ import (
 )
 
 // Attempt contains retry telemetry fields emitted by Execute.
+//
+// Deprecated: Cut in ADR-0006 (K6): attempt callbacks are replaced by fence-aware retry plus
+// structured telemetry. It will be removed in the next minor release.
 type Attempt struct {
 	Attempt int
 	Delay   time.Duration
@@ -14,6 +17,9 @@ type Attempt struct {
 }
 
 // Hooks emits retry lifecycle callbacks for telemetry.
+//
+// Deprecated: Cut in ADR-0006 (K6): retry lifecycle hooks are replaced by fence-aware retry
+// (C5) plus structured telemetry. It will be removed in the next minor release.
 type Hooks struct {
 	OnRetry  func(Attempt)
 	OnGiveUp func(Attempt)
@@ -27,7 +33,9 @@ type Config struct {
 	Jitter      func(time.Duration) time.Duration
 	Sleep       func(context.Context, time.Duration) error
 	IsRetryable func(error) bool
-	Classify    Classifier
+	// Deprecated: Cut in ADR-0006 (K6): the pluggable classifier hook is cut; the built-in
+	// Classify mapping stays (B16). It will be removed in the next minor release.
+	Classify Classifier
 }
 
 // Execute runs op with bounded retries using the configured policy.

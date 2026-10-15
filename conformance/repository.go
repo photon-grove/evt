@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
 )
@@ -216,7 +216,7 @@ func testCommitStream(t *testing.T, repo evt.Repository) {
 	channel <- result.Ok(evt.SerializedResult{Events: serialized})
 	close(channel)
 
-	errs := repo.CommitStream(ctx, channel)
+	errs := repo.CommitStream(ctx, channel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Empty(t, errs)
 
 	events, err := repo.GetEvents(ctx, id)
@@ -294,7 +294,7 @@ func testCompactedFloor(t *testing.T, repo evt.Repository) {
 	streamed := make(chan result.Result[evt.SerializedResult], 1)
 	streamed <- result.Ok(evt.SerializedResult{Events: stale})
 	close(streamed)
-	require.NotEmpty(t, repo.CommitStream(ctx, streamed), "a streamed commit below the floor must be rejected")
+	require.NotEmpty(t, repo.CommitStream(ctx, streamed), "a streamed commit below the floor must be rejected") //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	events, err := repo.GetEvents(ctx, id)
 	require.NoError(t, err)

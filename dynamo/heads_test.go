@@ -11,7 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/dynamo/mock"
+	"github.com/photon-grove/evt/dynamo/mock" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/photon-grove/evt/mem"
 	"github.com/photon-grove/evt/projectors"
 	"github.com/stretchr/testify/require"

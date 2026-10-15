@@ -10,7 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // The Repository satisfies the backend-neutral streaming contract and the DynamoDB-specific
@@ -28,9 +28,16 @@ var (
 // Like evt's other optional capabilities (Compactor, SnapshotStreamer), it is detected via a type
 // assertion (repo.(dynamo.ExpressionStreamer)) and is not part of the backend-neutral contract a
 // future SQL backend must satisfy.
+//
+// Deprecated: Cut in ADR-0006 (K7): raw server-side expressions leak backend types past the
+// backend-neutral contract. Use StreamAllEvents / StreamEntities with evt.StreamFilter instead.
+// It will be removed in the next minor release.
 type ExpressionStreamer interface {
 	// StreamAllEventsByExpression scans all Events in the table, optionally filtered by a raw
 	// DynamoDB expression. A nil expression streams every event.
+	//
+	// Deprecated: Cut in ADR-0006 (K7). Use StreamAllEvents with evt.StreamFilter instead. It
+	// will be removed in the next minor release.
 	StreamAllEventsByExpression(
 		ctx context.Context,
 		expr *expression.Expression,
@@ -38,6 +45,9 @@ type ExpressionStreamer interface {
 
 	// StreamEntitiesByExpression streams reconstituted Entities, optionally filtered by a raw
 	// DynamoDB expression. A nil expression streams every entity.
+	//
+	// Deprecated: Cut in ADR-0006 (K7). Use StreamEntities with evt.StreamFilter instead. It
+	// will be removed in the next minor release.
 	StreamEntitiesByExpression(
 		ctx context.Context,
 		expr *expression.Expression,

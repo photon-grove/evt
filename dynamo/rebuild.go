@@ -13,6 +13,9 @@ import (
 // opts.EntityType defaults to cfg.EntityType; if both are set, they must match.
 // This path rejects SeedEntity because it cannot safely rebuild compacted streams. Use
 // evt.RebuildProjections for snapshot-seeded replay.
+//
+// Deprecated: Cut in ADR-0006 (K3): use evt.RebuildProjections (snapshot-seeded, B11) instead.
+// It will be removed in the next minor release.
 func (repo *Repository) RebuildProjectionsByQuery(
 	ctx context.Context,
 	opts StreamByQueryOptions,

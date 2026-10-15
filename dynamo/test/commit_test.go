@@ -10,7 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -193,7 +193,7 @@ func (s *RepositorySuite) Test_CommitStream_Ok() {
 	output := new(dynamodb.TransactWriteItemsOutput)
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).Return(output, nil).Times(1)
 
-	errors := s.repo.CommitStream(ctx, resultChannel)
+	errors := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Empty(s.T(), errors)
 	s.client.AssertExpectations(s.T())
 }
@@ -232,7 +232,7 @@ func (s *RepositorySuite) Test_CommitStream_OneFloorCheckPerStream() {
 	output := new(dynamodb.TransactWriteItemsOutput)
 	s.client.On("TransactWriteItems", mock.Anything, capture, mock.Anything).Return(output, nil).Once()
 
-	require.Empty(s.T(), s.repo.CommitStream(ctx, resultChannel))
+	require.Empty(s.T(), s.repo.CommitStream(ctx, resultChannel)) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	floors := make(map[string]string)
 	for _, check := range checks {
@@ -263,7 +263,7 @@ func (s *RepositorySuite) Test_CommitStream_WithErrors() {
 	output := new(dynamodb.TransactWriteItemsOutput)
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).Return(output, nil).Once()
 
-	errors := s.repo.CommitStream(ctx, resultChannel)
+	errors := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Len(s.T(), errors, 1)
 	require.Contains(s.T(), errors[0].Error(), "processing error")
 	s.client.AssertExpectations(s.T())
@@ -286,7 +286,7 @@ func (s *RepositorySuite) Test_CommitStream_CommitErrors() {
 	commitError := errors.New("DynamoDB commit failed")
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).Return((*dynamodb.TransactWriteItemsOutput)(nil), commitError)
 
-	errors := s.repo.CommitStream(ctx, resultChannel)
+	errors := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Len(s.T(), errors, 1)
 	require.Contains(s.T(), errors[0].Error(), "DynamoDB commit failed")
 	s.client.AssertExpectations(s.T())
@@ -311,7 +311,7 @@ func (s *RepositorySuite) Test_CommitStream_OversizedSingleResult() {
 	close(resultChannel)
 
 	// No DynamoDB calls should be made — the guard rejects before commit
-	errors := s.repo.CommitStream(ctx, resultChannel)
+	errors := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Len(s.T(), errors, 1)
 	require.Contains(s.T(), errors[0].Error(), "exceeding DynamoDB 100-item transaction limit")
 	s.client.AssertNotCalled(s.T(), "TransactWriteItems")

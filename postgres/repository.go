@@ -14,7 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // StorageTypePostgres identifies transaction groups and repositories backed by PostgreSQL.
@@ -244,6 +244,9 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 // CommitStream commits each SerializedResult from the channel in its own transaction, collecting
 // per-result errors without aborting the stream. The batch size is one result, which keeps each
 // commit atomic and lets a single bad result fail in isolation.
+//
+// Deprecated: Cut in ADR-0006 (K1). Commit batched commands through the normal commit path
+// instead. It will be removed in the next minor release.
 func (repo *Repository) CommitStream(
 	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],

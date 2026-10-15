@@ -109,6 +109,10 @@ flowchart TB
   ht -.->|"read, not the log"| read
 ```
 
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K4):* the heads
+table and `dynamo.HeadStore` are cut — derive heads from the log with
+`StreamEntityHeads` instead. The flow below shows the pre-v0.9 setup.
+
 `dynamo.HeadStore` plays both projector and reader roles. Putting the pieces
 together:
 

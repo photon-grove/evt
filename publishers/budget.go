@@ -6,6 +6,8 @@ import (
 )
 
 // BudgetDecision captures a publisher budget result.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 type BudgetDecision string
 
 const (
@@ -16,6 +18,8 @@ const (
 )
 
 // BudgetController exposes ingress and retry budget checks.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 type BudgetController interface {
 	AllowEvent(now time.Time) BudgetDecision
 	AllowRetry(now time.Time) BudgetDecision
@@ -27,6 +31,8 @@ type budgetController struct {
 }
 
 // NewBudgetController creates a publisher budget controller with events/min and retries/min limits.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 func NewBudgetController(eventsPerMinute, retriesPerMinute int, now time.Time) BudgetController {
 	return &budgetController{
 		events: newBucket(eventsPerMinute, now),

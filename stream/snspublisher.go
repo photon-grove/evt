@@ -19,6 +19,9 @@ import (
 // GroupIDExtractor maps a serialized domain event to an SNS FIFO
 // MessageGroupId. Returning ("", false) skips FIFO publish for the event,
 // leaving the standard topic as the sole delivery path.
+//
+// Deprecated: Cut in ADR-0006 (K5): the SNS publisher runtime is cut; the stream envelope it
+// wraps stays (B15). It will be removed in the next minor release.
 type GroupIDExtractor func(event evt.SerializedEvent) (groupID string, ok bool)
 
 // fifoTarget holds the optional FIFO companion topic configuration.
@@ -30,6 +33,9 @@ type fifoTarget struct {
 // SNSPublisher converts event-log INSERT records into CloudWatchEvent envelopes and publishes them
 // to SNS. WithFIFOTarget, eligible events also go to a FIFO topic with a group ID and event-ID
 // deduplication key.
+//
+// Deprecated: Cut in ADR-0006 (K5): the SNS publisher runtime is cut; the stream envelope it
+// wraps stays (B15). It will be removed in the next minor release.
 type SNSPublisher struct {
 	client   snsPublishClient
 	topicARN string
@@ -43,12 +49,16 @@ type snsPublishClient interface {
 }
 
 // Option customizes SNSPublisher construction.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 type Option func(*SNSPublisher) error
 
 // WithFIFOTarget configures an SNS FIFO companion topic. Events for which the
 // extractor returns ok=true are published to the FIFO topic with the returned
 // MessageGroupId; the serialized event ID is used as MessageDeduplicationId.
 // Events where the extractor returns ok=false are not forwarded to FIFO.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 func WithFIFOTarget(topicARN string, extractor GroupIDExtractor) Option {
 	return func(p *SNSPublisher) error {
 		arn := strings.TrimSpace(topicARN)
@@ -67,6 +77,8 @@ func WithFIFOTarget(topicARN string, extractor GroupIDExtractor) Option {
 }
 
 // WithLogger configures the logger used by the publisher. If unset, slog.Default() is used.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 func WithLogger(logger *slog.Logger) Option {
 	return func(p *SNSPublisher) error {
 		p.logger = logger
@@ -77,6 +89,8 @@ func WithLogger(logger *slog.Logger) Option {
 
 // NewSNSPublisher creates a new SNS publisher.
 // source is the logical event source (e.g. "example.events").
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 func NewSNSPublisher(client snsPublishClient, topicARN string, source string, opts ...Option) (*SNSPublisher, error) {
 	if client == nil {
 		return nil, fmt.Errorf("client is required")
@@ -110,6 +124,8 @@ func (p *SNSPublisher) loggerOrDefault() *slog.Logger {
 }
 
 // PublishResult contains the outcome of publishing a batch of records.
+//
+// Deprecated: Cut in ADR-0006 (K5). It will be removed in the next minor release.
 type PublishResult struct {
 	// FailedIndices contains the indices of records that failed to publish.
 	// These can be used to construct DynamoDB batch item failures.

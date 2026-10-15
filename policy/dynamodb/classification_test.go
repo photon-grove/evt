@@ -50,13 +50,13 @@ func TestAllTransient(t *testing.T) {
 func TestDefaultConfigInstallsDynamoDBClassifier(t *testing.T) {
 	cfg := DefaultConfig()
 
-	if cfg.Classify == nil {
+	if cfg.Classify == nil { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		t.Fatal("expected Classify to be set")
 	}
 	if cfg.IsRetryable == nil {
 		t.Fatal("expected IsRetryable to be set")
 	}
-	if cfg.Classify(dynamo.ErrSnapshotRaceCondition) != policy.ClassTransient {
+	if cfg.Classify(dynamo.ErrSnapshotRaceCondition) != policy.ClassTransient { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		t.Fatal("expected snapshot race to classify as transient")
 	}
 	if !cfg.IsRetryable(dynamo.ErrSnapshotRaceCondition) {

@@ -89,12 +89,12 @@ repo := dynamo.NewRepository(dynamoClient, "event-log")
 store := snapshots.NewStore(repo, 25) // snapshot every 25 events
 ```
 
-When aggregates carry injected dependencies, construct them with a factory:
+When aggregates carry injected dependencies, construct them and pass the instance to `Execute`:
 
 ```go
-account, err := evt.ExecuteWithFactory(ctx, store, func() evt.Entity {
-    return NewAccount("acct-1", projectors...)
-}, "acct-1", command, metadata)
+entity := NewAccount("acct-1", projectors...)
+err := store.Execute(ctx, entity, "acct-1", command, metadata)
+// entity now holds the post-command state
 ```
 
 ## Packages
@@ -108,13 +108,32 @@ account, err := evt.ExecuteWithFactory(ctx, store, func() evt.Entity {
 | `evt/snapshots` | Store with snapshot loading and write thresholds |
 | `evt/stream` | Stream handler and publisher helpers for event fanout |
 | `evt/projectors` | Projector runtime (SNS/SQS fan-out, or direct stream) with idempotency and retry classification |
-| `evt/publishers` | DynamoDB Streams publisher handler that fans events out to SNS, with ingress and retry budgets |
+| `evt/publishers` | DynamoDB Streams publisher handler that fans events out to SNS, with ingress and retry budgets (deprecated) |
 | `evt/policy` | Backend-neutral retry helpers for commit paths |
 | `evt/policy/dynamodb` | DynamoDB-specific retry classification |
 | `evt/viewstore` | Typed JSON helper around `evt.ViewRepository` |
 | `evt/test` | Test aggregate, commands, events, and helpers for adopters and framework tests |
 
 All packages live under `github.com/photon-grove/evt`.
+
+## Deprecations (v0.9.0)
+
+The v0.9.0 core reshape deprecates the features cut by plan decision D6
+([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md)); they keep compiling but are
+deleted in the next minor release. Each deprecation notice points at its replacement:
+
+- `CommitStream` (K1) — commit batched commands through the normal commit path
+- snapshot freshness observer / replay estimate / budget (K2) — structured load telemetry replaces it
+- `StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` (K3) —
+  `StreamEntities` plus `evt.RebuildProjectionsFromStream`
+- `HeadStore` (heads table) and incremental/delta rebuild (K4) — scan-derived `StreamEntityHeads`
+- `evt/publishers`, `BudgetController`, and `stream.SNSPublisher`/FIFO (K5) — command outcomes and
+  the stream envelope (which stays: it is the cross-language wire format)
+- `policy` hooks / attempt callbacks / pluggable classifier (K6) — fence-aware retry plus telemetry
+  (retry classification itself stays)
+- `BaseEntity`, `NewEntity`, the `WithFactory` helpers, `ByCommandID`, `dynamo.Delete`,
+  `dynamo/mock`, `evt/result`, the `do.go` DI providers, and `dynamo.ExpressionStreamer` (K7) —
+  direct store calls, `CompactBelow`, plain `(value, error)` returns, and `StreamFilter`
 
 ## Rust
 

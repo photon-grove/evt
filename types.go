@@ -20,7 +20,11 @@ type Command interface {
 
 // CommandResult is the outcome of executing a Command.
 type CommandResult struct {
-	Events      []Event     `json:"events"`
+	Events []Event `json:"events"`
+
+	// Deprecated: Cut in ADR-0006 (K7): handlers no longer attach a Transaction to a
+	// CommandResult; commits go through the repository commit path. It will be removed in the
+	// next minor release.
 	Transaction Transaction `json:"transaction"`
 }
 
@@ -100,6 +104,9 @@ type Entity interface {
 }
 
 // BaseEntity provides common fields for all entities.
+//
+// Deprecated: Cut in ADR-0006 (K7): entities define their own identity and lifecycle fields
+// instead of embedding BaseEntity. It will be removed in the next minor release.
 type BaseEntity struct {
 	ID        EntityID  `json:"id"`        // A unique identifier
 	IsActive  bool      `json:"isActive"`  // Whether this record has been deleted
@@ -108,6 +115,8 @@ type BaseEntity struct {
 }
 
 // NewEntity creates a new BaseEntity with the given ID, setting IsActive to true and timestamps to now.
+//
+// Deprecated: Cut in ADR-0006 (K7). It will be removed in the next minor release.
 func NewEntity(id EntityID) BaseEntity {
 	return BaseEntity{
 		ID:        id,
@@ -131,6 +140,9 @@ func entityFromFactory(factory EntityFactory) (Entity, error) {
 }
 
 // LoadEntityWithFactory creates a fresh entity instance and loads it from the store.
+//
+// Deprecated: Cut in ADR-0006 (K7): use Store.LoadEntity directly. It will be removed in the
+// next minor release.
 func LoadEntityWithFactory(
 	ctx context.Context,
 	store Store,
@@ -151,6 +163,9 @@ func LoadEntityWithFactory(
 }
 
 // ExecuteWithFactory creates a fresh entity instance, executes the command, and returns it.
+//
+// Deprecated: Cut in ADR-0006 (K7): use Store.Execute directly. It will be removed in the next
+// minor release.
 func ExecuteWithFactory(
 	ctx context.Context,
 	store Store,

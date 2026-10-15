@@ -46,7 +46,7 @@ func (s *RepositorySuite) Test_Delete_Success() {
 	output := new(dynamodb.TransactWriteItemsOutput)
 	s.client.On("TransactWriteItems", mock.Anything, &input, mock.Anything).Return(output, nil)
 
-	err := s.repo.Delete(ctx, serializedEvents)
+	err := s.repo.Delete(ctx, serializedEvents) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.NoError(s.T(), err)
 	s.client.AssertExpectations(s.T())
 }
@@ -67,7 +67,7 @@ func (s *RepositorySuite) Test_Delete_Error() {
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
 		Return((*dynamodb.TransactWriteItemsOutput)(nil), expectedError)
 
-	err := s.repo.Delete(ctx, serializedEvents)
+	err := s.repo.Delete(ctx, serializedEvents) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Error(s.T(), err)
 	require.Contains(s.T(), err.Error(), "delete failed")
 	s.client.AssertExpectations(s.T())

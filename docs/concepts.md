@@ -24,6 +24,10 @@ type Entity interface {
 }
 ```
 
+*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):* `evt.BaseEntity`
+and `evt.NewEntity` go away in the next minor release — define your own identity and lifecycle
+fields instead. The `Base() BaseEntity` interface method goes with them.
+
 Embed `evt.BaseEntity` (and construct it with `evt.NewEntity(id)`) to get the
 `ID`, `IsActive`, `CreatedAt`, and `UpdatedAt` bookkeeping for free. The critical
 discipline is the split between `Handle` and `Apply`: **`Handle` validates and
@@ -139,8 +143,10 @@ type Store interface {
 
 `Execute` is the everyday entry point: it loads the entity from the log, handles
 the command, and commits the result in one call. When an aggregate needs injected
-dependencies, construct it through `evt.ExecuteWithFactory(ctx, store, factory,
-…)` so the store can build a fresh instance per call.
+dependencies, construct a fresh instance yourself and pass it to `store.Execute(ctx, entity,
+entityID, command, metadata)` — `evt.ExecuteWithFactory` is deprecated in v0.9.0
+([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7) and will be removed in the next
+minor release.
 
 ## Snapshot
 

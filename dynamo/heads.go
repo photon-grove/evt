@@ -14,6 +14,9 @@ import (
 )
 
 // DefaultHeadsProjectorName is the stable projector name used for idempotency keys and telemetry.
+//
+// Deprecated: Cut in ADR-0006 (K4): the heads table and HeadStore go away; entity heads are
+// scan-derived (see StreamEntityHeads). It will be removed in the next minor release.
 const DefaultHeadsProjectorName = "entity-heads"
 
 // Compile-time checks: the event-log scan and the heads table both satisfy the change-detection
@@ -126,6 +129,10 @@ func numAttr(item map[string]types.AttributeValue, name string) (int, bool) {
 // HeadStore maintains one monotonic event head per entity for incremental rebuilds. A stream
 // projector updates it asynchronously, so it adds no commit-path work and tolerates duplicate or
 // out-of-order delivery. As an evt.EntityHeadStreamer, it scans the heads table instead of the log.
+//
+// Deprecated: Cut in ADR-0006 (K4): the heads-table rebuild path never earned its complexity.
+// Use Repository.StreamEntityHeads (scan-derived heads) instead. It will be removed in the next
+// minor release.
 type HeadStore struct {
 	client         Client
 	headsTable     string
@@ -138,6 +145,9 @@ type HeadStore struct {
 // rebuild, never skips it. Derive a
 // strongly consistent variant with WithConsistentRead(true) when a read must reflect the latest
 // projector write.
+//
+// Deprecated: Cut in ADR-0006 (K4). Use Repository.StreamEntityHeads instead. It will be removed
+// in the next minor release.
 func NewHeadStore(client Client, headsTable string) *HeadStore {
 	return &HeadStore{
 		client:         client,
@@ -310,6 +320,8 @@ func (h *HeadStore) StreamEntityHeadsFunc(
 // with the projector and safe to re-run. Pass a non-empty entityType to scope the source read and
 // to record that type on the written rows; call once per type to fully populate the type attribute.
 // It returns the number of heads written.
+//
+// Deprecated: Cut in ADR-0006 (K4). It will be removed in the next minor release.
 func (h *HeadStore) Backfill(
 	ctx context.Context,
 	source evt.EntityHeadStreamer,

@@ -18,7 +18,7 @@ func TestExecute_ProjectorCalled(t *testing.T) {
 
 	projector := &MockProjector{}
 	entity := &MockEntity{
-		BaseEntity: evt.NewEntity(setup.entityID),
+		BaseEntity: evt.NewEntity(setup.entityID), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		projectors: []evt.EventProjector{projector},
 	}
 	command := &test.CreateEntity{Value: "test-value"}
@@ -38,7 +38,7 @@ func TestExecute_ProjectorError(t *testing.T) {
 
 	projector := &MockProjector{projectError: errors.New("projector failed")}
 	entity := &MockEntity{
-		BaseEntity: evt.NewEntity(setup.entityID),
+		BaseEntity: evt.NewEntity(setup.entityID), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		projectors: []evt.EventProjector{projector},
 	}
 	command := &test.CreateEntity{Value: "test-value"}
