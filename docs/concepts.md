@@ -126,9 +126,14 @@ as `null` when unset.
 always encodes as an object (`{}` when nil or empty); call `WithExtension` once
 per key. Decoding preserves stored values without filling in defaults.
 
-These defaults belong to the framework's codecs, not `Metadata` JSON methods.
-Direct `encoding/json` calls use the struct's field values (including nil values),
-so embedding `evt.Metadata` in an application DTO preserves sibling fields.
+`evt.SerializedEvent` owns its JSON encoding: `json.Marshal(event)` and
+`evt.MarshalEvent(event)` both write the canonical storage and stream format,
+including these metadata defaults. `json.Unmarshal(data, &event)` and
+`evt.UnmarshalEvent(data, &event)` preserve stored values without filling defaults.
+
+`Metadata` itself has no JSON methods. Direct `encoding/json` calls on standalone
+metadata use the struct's field values (including nil values), so embedding
+`evt.Metadata` in an application DTO preserves sibling fields.
 
 Use `md.Equal(other)` to compare metadata: it compares effective causation IDs
 and treats nil and empty extension maps as equal, so encoded round trips remain

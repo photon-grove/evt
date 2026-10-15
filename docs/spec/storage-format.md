@@ -94,6 +94,11 @@ defaults a command with none of the optional metadata produces: `principalId` an
 `null`, `extensions` `{}`; the event's `commandId` is `null`, so its engine-generated `commitId`
 is a ULID).
 
+Go's `evt.SerializedEvent` owns this JSON encoding: `encoding/json` uses the same canonical
+codec as the public `evt.MarshalEvent` / `evt.UnmarshalEvent` helpers. Encode-time metadata
+defaults apply to the event envelope, not to standalone `evt.Metadata`, which has no JSON methods
+and can be embedded in application DTOs without hiding sibling fields.
+
 ## Metadata
 
 Every key is always written; absent values are `null` (or `""` for `region` and `timestamp`).
