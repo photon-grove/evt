@@ -193,6 +193,17 @@ photon_evt::conformance::Suite::new(&my_repository).run().await;
 The known differences are listed in the
 [storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md#known-differences).
 
+The [feature parity matrix](https://github.com/photon-grove/evt/blob/main/docs/parity/feature-matrix.md)
+tracks every capability across languages. The vNext plan's core reshape (multi-stream
+transactions, command outcomes, fences —
+[ADR 0004](https://github.com/photon-grove/evt/blob/main/docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md)),
+Rust-first extensions such as the journal and the Lambda toolkit
+([ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md)),
+and the port/defer/cut parity policy
+([ADR 0006](https://github.com/photon-grove/evt/blob/main/docs/adr/0006-parity-policy-and-feature-cuts.md))
+decide what lands here and when. Core changes land in Go and Rust together; extensions are
+Rust-first, and Go ports them from the spec and fixtures rather than hand-rolling them in apps.
+
 ## Minimum Rust version
 
 Rust 1.88 for the core crate and the `postgres` and `conformance` features. CI checks this.

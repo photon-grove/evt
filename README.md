@@ -2,7 +2,7 @@
 
 **Event sourcing for Go without a framework runtime.**
 
-[Documentation](https://photon-grove.github.io/evt/) · [Concepts](docs/concepts.md) · [Getting Started](docs/getting-started.md) · [Invariants](BEHAVIORAL_INVARIANTS.md) · [Storage Format](docs/spec/storage-format.md)
+[Documentation](https://photon-grove.github.io/evt/) · [Concepts](docs/concepts.md) · [Getting Started](docs/getting-started.md) · [Invariants](BEHAVIORAL_INVARIANTS.md) · [Storage Format](docs/spec/storage-format.md) · [Feature Matrix](docs/parity/feature-matrix.md)
 
 `evt` provides append-only logs, optimistic concurrency, snapshots, replayable
 read models, and DynamoDB or PostgreSQL persistence as small Go packages. There
@@ -196,6 +196,16 @@ backend.
 The [docs site](https://photon-grove.github.io/evt/) covers architecture, the
 integration cookbook, and runnable examples. Static docs live in [`docs/`](docs/);
 the interactive site lives in [`website/`](website/).
+
+Architecture decision records live in [`docs/adr/`](docs/adr/): event-log compaction
+([ADR 0001](docs/adr/0001-event-compaction-and-snapshot-truncation.md)), backend-neutral storage
+contracts ([ADR 0002](docs/adr/0002-backend-neutral-storage-contracts.md)), the Rust implementation
+and cross-language compatibility ([ADR 0003](docs/adr/0003-rust-implementation-and-cross-language-compatibility.md)),
+the vNext core reshape — multi-stream transactions, command outcomes, and the rebuild fence
+([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md)), Rust-first
+extensions ([ADR 0005](docs/adr/0005-rust-first-extensions-journal-and-lambda.md)), and the parity
+policy ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md)). The
+[feature parity matrix](docs/parity/feature-matrix.md) tracks every capability across languages.
 
 ```sh
 moon run website:dev
