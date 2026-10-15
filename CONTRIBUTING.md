@@ -5,8 +5,11 @@
 ```sh
 pnpm install
 go test ./...
+moon run evt:lint
 moon run website:build
 ```
+
+`evt:lint` runs golangci-lint with `.golangci.yml`. CI fails on any finding.
 
 For the Rust crates (toolchain pinned in `rust-toolchain.toml`):
 

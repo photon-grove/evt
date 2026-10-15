@@ -159,13 +159,13 @@ func (repo *Repository) CommitStream(
 			continue
 		}
 
-		if rerr := evt.CheckReservedEntityIDs(serializedResult.Events); rerr != nil {
-			errs = append(errs, rerr)
+		if err = evt.CheckReservedEntityIDs(serializedResult.Events); err != nil {
+			errs = append(errs, err)
 			continue
 		}
 
-		if cerr := checkContiguous(serializedResult.Events); cerr != nil {
-			errs = append(errs, cerr)
+		if err = checkContiguous(serializedResult.Events); err != nil {
+			errs = append(errs, err)
 			continue
 		}
 

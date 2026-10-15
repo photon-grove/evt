@@ -346,7 +346,11 @@ func (f *FakeDynamo) Query(
 
 	var items []map[string]types.AttributeValue
 	for _, item := range f.sortedLocked(pk.Value, ascending) {
-		_, sk, _ := keyOf(item)
+		_, sk, err := keyOf(item)
+		if err != nil {
+			return nil, err
+		}
+
 		if !match(sk) {
 			continue
 		}
@@ -357,7 +361,7 @@ func (f *FakeDynamo) Query(
 		}
 	}
 
-	return &dynamodb.QueryOutput{Items: items, Count: int32(len(items))}, nil
+	return &dynamodb.QueryOutput{Items: items, Count: int32(len(items))}, nil //nolint:gosec // an in-memory fixture partition holds a handful of items
 }
 
 func project(item map[string]types.AttributeValue, projection string) map[string]types.AttributeValue {

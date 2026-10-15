@@ -153,7 +153,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_StreamEntitiesByQuery() {
 	}
 
 	// Enumerate-then-query path with a small worker pool.
-	stream := s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 4}, applier)
+	stream := s.repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 4}, applier) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	values := map[evt.EntityID]string{}
 	for res := range stream {

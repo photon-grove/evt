@@ -52,7 +52,7 @@ func main() {
 	backendName := flags.String("backend", "", "dynamo or postgres")
 	run := flags.String("run", "", "run identifier")
 	index := flags.Int("index", 0, "step index")
-	_ = flags.Parse(os.Args[2:])
+	check(flags.Parse(os.Args[2:]))
 
 	ctx := context.Background()
 
@@ -283,10 +283,11 @@ func normalize(items any) any {
 		items = rendered
 	}
 
-	data, _ := json.Marshal(items)
+	data, err := json.Marshal(items)
+	check(err)
 
 	var out any
-	_ = json.Unmarshal(data, &out)
+	check(json.Unmarshal(data, &out))
 
 	return out
 }
@@ -319,16 +320,16 @@ func postgresRows(ctx context.Context, pool *pgxpool.Pool, entityID evt.EntityID
 			payload  []byte
 			metadata string
 		)
-		if err := rows.Scan(&r.EntityID, &r.Sequence, &r.EventID, &r.EventType, &r.Version, &r.EntityType, &payload, &metadata); err != nil {
+		if err = rows.Scan(&r.EntityID, &r.Sequence, &r.EventID, &r.EventType, &r.Version, &r.EntityType, &payload, &metadata); err != nil {
 			return nil, nil, err
 		}
 		r.Payload = string(payload)
-		if err := json.Unmarshal([]byte(metadata), &r.Metadata); err != nil {
+		if err = json.Unmarshal([]byte(metadata), &r.Metadata); err != nil {
 			return nil, nil, err
 		}
 		events = append(events, r)
 	}
-	if err := rows.Err(); err != nil {
+	if err = rows.Err(); err != nil {
 		return nil, nil, err
 	}
 

@@ -93,6 +93,7 @@
   - Go tests: `go test ./...`
   - Moon tests: `pnpm exec moon run evt:test`
   - Go vet/check: `pnpm exec moon run evt:check`
+  - Go lint (golangci-lint, must report zero findings): `pnpm exec moon run evt:lint`
   - Website typecheck/build: `pnpm exec moon run website:typecheck website:build`
   - React diagram tests: `pnpm exec moon run react-flow-diagrams:test`
   - Rust (toolchain pinned in `rust-toolchain.toml`): `pnpm exec moon run evt-rust:check
@@ -125,7 +126,7 @@
   - `go mod tidy` with no `go.mod`/`go.sum` diff.
   - `go vet ./...`
   - `go test ./...`
-  - `pnpm exec moon run evt:check evt:test website:typecheck website:build react-flow-diagrams:test`
+  - `pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build react-flow-diagrams:test`
   - `pnpm exec moon run evt-rust:check evt-rust:test` (Rust job)
 - CI integration checks start Moto or PostgreSQL, apply the local Terraform, and run
   `evt:integration` / `evt:integration-postgres`, plus `evt-rust:integration` /

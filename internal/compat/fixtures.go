@@ -276,25 +276,19 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 		return expectation, err
 	}
 
-	for _, event := range stored {
-		data, err := eventjson.MarshalEvent(event)
-		if err != nil {
-			return expectation, err
-		}
-		expectation.Events = append(expectation.Events, string(data))
+	expectation.Events, err = encodeEvents(stored)
+	if err != nil {
+		return expectation, err
 	}
 
 	snapshot, err := runner.Repo.GetSnapshot(ctx, entityID)
 	if err != nil {
 		return expectation, err
 	}
-	if snapshot != nil {
-		data, err := json.Marshal(snapshot)
-		if err != nil {
-			return expectation, err
-		}
-		encoded := string(data)
-		expectation.Snapshot = &encoded
+
+	expectation.Snapshot, err = encodeSnapshot(snapshot)
+	if err != nil {
+		return expectation, err
 	}
 
 	entity := NewAccount(entityID)
@@ -313,6 +307,37 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 	expectation.SnapshotSequence = int64(*eventContext.CurrentSnapshot)
 
 	return expectation, nil
+}
+
+// encodeEvents renders stored events in their canonical JSON form. It never returns nil, so an empty
+// stream encodes as [].
+func encodeEvents(events []evt.SerializedEvent) ([]string, error) {
+	encoded := make([]string, 0, len(events))
+	for _, event := range events {
+		data, err := eventjson.MarshalEvent(event)
+		if err != nil {
+			return nil, err
+		}
+		encoded = append(encoded, string(data))
+	}
+
+	return encoded, nil
+}
+
+// encodeSnapshot renders a stored snapshot as JSON, or nil when there is none.
+func encodeSnapshot(snapshot *evt.SerializedSnapshot) (*string, error) {
+	if snapshot == nil {
+		return nil, nil
+	}
+
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, err
+	}
+
+	encoded := string(data)
+
+	return &encoded, nil
 }
 
 // GenerateScenarioFixtures runs every scenario through the Go implementation against a fake

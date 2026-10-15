@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
@@ -23,13 +24,13 @@ const headsTable = "evt-local-entity-heads"
 // than the whole table to stay isolated from other tests' rows.
 func (s *DynamoEventsIntegrationSuite) TestHeadStore_ProjectAndRead() {
 	ctx := context.Background()
-	store := dynamo.NewHeadStore(s.client, headsTable)
+	store := dynamo.NewHeadStore(s.client, headsTable) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	id := evt.EntityID("heads-it-project")
 
 	rec := func(seq int) projectors.StreamRecord {
 		return projectors.StreamRecord{
-			EventID:    string(id) + ":" + string(rune('0'+seq)),
+			EventID:    string(id) + ":" + strconv.Itoa(seq),
 			EntityID:   string(id),
 			EntityType: "heads-it-widget",
 			Sequence:   seq,
@@ -61,13 +62,13 @@ func (s *DynamoEventsIntegrationSuite) TestHeadStore_ProjectAndRead() {
 // specific entity ID rather than the whole table to stay isolated from other tests' rows.
 func (s *DynamoEventsIntegrationSuite) TestHeadStore_StreamEntityHeadsFunc() {
 	ctx := context.Background()
-	store := dynamo.NewHeadStore(s.client, headsTable)
+	store := dynamo.NewHeadStore(s.client, headsTable) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	id := evt.EntityID("heads-it-visit")
 
 	rec := func(seq int) projectors.StreamRecord {
 		return projectors.StreamRecord{
-			EventID:    string(id) + ":" + string(rune('0'+seq)),
+			EventID:    string(id) + ":" + strconv.Itoa(seq),
 			EntityID:   string(id),
 			EntityType: "heads-it-visit-widget",
 			Sequence:   seq,
