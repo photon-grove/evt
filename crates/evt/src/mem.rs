@@ -254,7 +254,11 @@ impl Repository for MemRepository {
         }
 
         for (index, fence) in commit.fences.iter().enumerate() {
-            if commit.streams.iter().any(|stream| stream.entity_id == fence.entity_id) {
+            if commit
+                .streams
+                .iter()
+                .any(|stream| stream.entity_id == fence.entity_id)
+            {
                 // A written stream's event put supersedes its fence.
                 continue;
             }

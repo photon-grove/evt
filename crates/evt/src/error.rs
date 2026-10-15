@@ -77,7 +77,9 @@ pub enum Error {
     },
 
     /// Shared DynamoDB-compatible transaction budget exceeded.
-    #[error("commit exceeds transaction budget: {actions} actions, {bytes} bytes, largest item {largest_item}")]
+    #[error(
+        "commit exceeds transaction budget: {actions} actions, {bytes} bytes, largest item {largest_item}"
+    )]
     CommitTooLarge {
         /// Number of actions.
         actions: usize,
@@ -185,9 +187,13 @@ impl Error {
         Self::Backend(err.into())
     }
 
-    /// Reports whether the error is an optimistic-concurrency conflict.
+    /// Reports whether the error is an optimistic-concurrency conflict. A fence conflict is one:
+    /// another writer moved the fenced stream, like a competing sequence put.
     pub fn is_conflict(&self) -> bool {
-        matches!(self, Self::Conflict { .. })
+        matches!(
+            self,
+            Self::Conflict { .. } | Self::FenceConflict { .. }
+        )
     }
 
     /// Reports whether the error is a duplicate command (an idempotent success).
@@ -198,7 +204,15 @@ impl Error {
     /// Reports whether reloading and running the command again may succeed: a conflict or a
     /// transient backend failure.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Conflict { .. } | Self::Transient(_) | Self::FenceConflict { provenance: crate::repository::FenceProvenance::Engine, .. })
+        matches!(
+            self,
+            Self::Conflict { .. }
+                | Self::Transient(_)
+                | Self::FenceConflict {
+                    provenance: crate::repository::FenceProvenance::Engine,
+                    ..
+                }
+        )
     }
 }
 

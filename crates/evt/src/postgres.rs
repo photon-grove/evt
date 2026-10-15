@@ -505,7 +505,8 @@ impl Repository for PostgresRepository {
         }
 
         if let Some(snapshot) = commit.snapshot {
-            self.check_snapshot_predecessor(&tx, &commit.entity_id, snapshot.sequence.0).await?;
+            self.check_snapshot_predecessor(&tx, &commit.entity_id, snapshot.sequence.0)
+                .await?;
             let row = SnapshotRow {
                 entity_id: commit.entity_id.to_string(),
                 entity_type: snapshot.entity_type.to_string(),
@@ -519,7 +520,10 @@ impl Repository for PostgresRepository {
         tx.commit().await.map_err(commit_error)
     }
 
-    async fn commit_transaction(&self, commit: TransactionCommit<PgStatement>) -> Result<(), Error> {
+    async fn commit_transaction(
+        &self,
+        commit: TransactionCommit<PgStatement>,
+    ) -> Result<(), Error> {
         let mut commit = commit;
         commit.normalize()?;
 
@@ -544,7 +548,9 @@ impl Repository for PostgresRepository {
         ids.sort_unstable();
         ids.dedup();
         for id in &ids {
-            tx.execute(ENTITY_LOCK, &[id]).await.map_err(statement_error)?;
+            tx.execute(ENTITY_LOCK, &[id])
+                .await
+                .map_err(statement_error)?;
         }
 
         // The feature-marker check is the first action of every v0.9 commit (spec Writes step 1).

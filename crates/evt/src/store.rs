@@ -12,7 +12,10 @@ use crate::event::{DomainEvent, SerializedEvent};
 use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
-use crate::repository::{Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit, snapshot_events_due};
+use crate::repository::{
+    Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
+    snapshot_events_due,
+};
 use crate::retry::RetryPolicy;
 use crate::upcast::upcast_event;
 
@@ -460,22 +463,6 @@ pub fn serialize_events<A: Aggregate>(
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::conformance::{Added, Ledger};
-
-    #[test]
-    fn serializing_past_the_maximum_sequence_fails() {
-        let events = [Added { amount: 1 }.into()];
-        let id = EntityId::new("ledger-1");
-
-        let result =
-            serialize_events::<Ledger>(&id, EventSequence(i64::MAX), &events, &Metadata::default());
-
-        assert!(matches!(result, Err(Error::InvalidCommit(_))), "{result:?}");
-    }
-}
 
 /// One multi-stream transaction (ADR 0004, C1/C2). A caller loads aggregates with
 /// [`Store::load`], hands them to [`read`](Transaction::read), appends decided events to any
@@ -526,7 +513,11 @@ where
                 "the transaction is already consumed".to_owned(),
             ));
         }
-        if self.streams.iter().any(|existing| existing.entity_id == loaded.entity_id) {
+        if self
+            .streams
+            .iter()
+            .any(|existing| existing.entity_id == loaded.entity_id)
+        {
             return Err(Error::InvalidCommit(format!(
                 "duplicate read of {}",
                 loaded.entity_id
@@ -646,19 +637,18 @@ where
                 operations.extend(ops);
             }
 
-            let snapshot = if snapshot_events_due(
-                loaded.sequence,
-                events.len(),
-                self.store.snapshot_interval,
-            ) > 0 {
-                Some(NewSnapshot {
-                    entity_type: EntityType::new(A::TYPE),
-                    sequence: loaded.snapshot_sequence.next(),
-                    payload: json::to_vec(&loaded.aggregate)?,
-                })
-            } else {
-                None
-            };
+            let snapshot =
+                if snapshot_events_due(loaded.sequence, events.len(), self.store.snapshot_interval)
+                    > 0
+                {
+                    Some(NewSnapshot {
+                        entity_type: EntityType::new(A::TYPE),
+                        sequence: loaded.snapshot_sequence.next(),
+                        payload: json::to_vec(&loaded.aggregate)?,
+                    })
+                } else {
+                    None
+                };
 
             committed.extend(serialized.iter().cloned());
             streams.push(Commit {
@@ -694,4 +684,21 @@ pub(crate) fn stamp_commit_id(metadata: &Metadata) -> Metadata {
     }
 
     metadata
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conformance::{Added, Ledger};
+
+    #[test]
+    fn serializing_past_the_maximum_sequence_fails() {
+        let events = [Added { amount: 1 }.into()];
+        let id = EntityId::new("ledger-1");
+
+        let result =
+            serialize_events::<Ledger>(&id, EventSequence(i64::MAX), &events, &Metadata::default());
+
+        assert!(matches!(result, Err(Error::InvalidCommit(_))), "{result:?}");
+    }
 }

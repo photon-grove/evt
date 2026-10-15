@@ -718,7 +718,8 @@ impl Repository for DynamoRepository {
                     let codes = cancellation_reasons(&err);
 
                     let failed_check = failed_items(&codes, "ConditionalCheckFailed").next();
-                    let fence_conflict = failed_check.and_then(|index| layout.fence_at(index).cloned());
+                    let fence_conflict =
+                        failed_check.and_then(|index| layout.fence_at(index).cloned());
 
                     if failed_check == Some(0) {
                         // The feature set changed under this writer: re-validate it, then
@@ -733,10 +734,10 @@ impl Repository for DynamoRepository {
                     }
 
                     let fallback_entity = || {
-                        commit
-                            .streams
-                            .first()
-                            .map_or_else(|| EntityId::new("unknown"), |stream| stream.entity_id.clone())
+                        commit.streams.first().map_or_else(
+                            || EntityId::new("unknown"),
+                            |stream| stream.entity_id.clone(),
+                        )
                     };
 
                     if let Some(fence) = fence_conflict {
@@ -761,7 +762,11 @@ impl Repository for DynamoRepository {
                         });
                     }
 
-                    return Err(classify_transaction_error(&fallback_entity(), layout.operations, err));
+                    return Err(classify_transaction_error(
+                        &fallback_entity(),
+                        layout.operations,
+                        err,
+                    ));
                 }
             }
         }
@@ -1068,9 +1073,7 @@ fn fence_checks(
         .map_err(Error::backend)?;
 
     Ok([
-        TransactWriteItem::builder()
-            .condition_check(slot)
-            .build(),
+        TransactWriteItem::builder().condition_check(slot).build(),
         TransactWriteItem::builder()
             .condition_check(companion)
             .build(),

@@ -138,7 +138,9 @@ func StepMetadata(step Step) evt.Metadata {
 		id := evt.CommandID(step.CausationID)
 		metadata.CausationID = &id
 	}
-	metadata.CommitID = "compat-" + step.By + "-" + step.CommandID
+	if step.CommandID != "" {
+		metadata.CommitID = "compat-" + step.By + "-" + step.CommandID
+	}
 	metadata.Extensions = step.Extensions
 
 	if step.Trace != nil {

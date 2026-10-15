@@ -57,6 +57,9 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Success() {
 	committedEvents, err := s.repo.GetEvents(ctx, s.entityID)
 	require.NoError(s.T(), err)
 
+	// The engine assigns the commit ID, which is a fresh ULID for a command without one.
+	require.NotEmpty(s.T(), committedEvents[0].Metadata.CommitID)
+	expected[0].Metadata.CommitID = committedEvents[0].Metadata.CommitID
 	require.Equal(s.T(), expected, committedEvents)
 }
 

@@ -581,8 +581,24 @@ func newNamespace() string {
 	return fmt.Sprintf("conf-%d-%d", time.Now().UnixNano(), nsCounter.Add(1))
 }
 
+// NewNamespaceForTest exposes namespace generation to integration test doubles that reproduce a
+// suite case in isolation.
+func NewNamespaceForTest() string { return newNamespace() }
+
 // serialize prepares events for an entity and overrides the serialized EntityType so a single Go
 // event type can stand in for multiple logical entity types in filter tests.
+// SerializeForTest exposes event serialization to integration test doubles that reproduce a suite
+// case in isolation.
+func SerializeForTest(
+	t *testing.T,
+	id evt.EntityID,
+	entityType evt.EntityType,
+	fromSequence evt.EventSequence,
+	events ...evt.Event,
+) []evt.SerializedEvent {
+	return serialize(t, id, entityType, fromSequence, events...)
+}
+
 func serialize(
 	t *testing.T,
 	id evt.EntityID,
@@ -862,13 +878,16 @@ func testRejectsFencesForRetention(t *testing.T, repo evt.Repository, declare fu
 	ctx := context.Background()
 	ns := newNamespace()
 
+	// The retention type is namespaced to this run so a shared manifest's declarations from other
+	// tests never collide.
+	entityType := evt.EntityType(ns + "-retained")
 	idA := evt.EntityID(ns + "-a")
-	require.NoError(t, declare(ctx, "test"))
+	require.NoError(t, declare(ctx, entityType))
 
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Fences: []evt.ReadFence{{EntityID: idA, EntityType: "test", Head: 0}},
+		Fences: []evt.ReadFence{{EntityID: idA, EntityType: entityType, Head: 0}},
 	})
 	var refused *evt.RetentionConflictError
 	require.ErrorAs(t, err, &refused)
-	require.Equal(t, evt.EntityType("test"), refused.EntityType)
+	require.Equal(t, entityType, refused.EntityType)
 }

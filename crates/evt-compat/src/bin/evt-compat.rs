@@ -157,6 +157,44 @@ async fn verify_common<R: Repository>(
         &expected.sns_messages,
     );
 
+    if let Some(expected_sibling) = &expected.sibling {
+        let sibling_id = EntityId::new(&expected_sibling.entity_id);
+        let observed_events = repository.events(&sibling_id).await?;
+        let observed_snapshot = repository.snapshot(&sibling_id).await?;
+
+        let observed_events: Vec<String> = observed_events
+            .iter()
+            .map(|event| {
+                event
+                    .to_json()
+                    .map(|bytes| String::from_utf8(bytes).expect("JSON encoders write UTF-8"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let observed_snapshot = observed_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .to_json()
+                    .map(|bytes| String::from_utf8(bytes).expect("JSON encoders write UTF-8"))
+            })
+            .transpose()?;
+
+        check(
+            failures,
+            name,
+            "sibling events",
+            &observed_events,
+            &expected_sibling.events,
+        );
+        check(
+            failures,
+            name,
+            "sibling snapshot",
+            &observed_snapshot,
+            &expected_sibling.snapshot,
+        );
+    }
+
     Ok(())
 }
 

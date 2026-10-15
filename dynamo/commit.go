@@ -631,8 +631,16 @@ func (repo *Repository) classifyCommitFailure(
 		return repo.features.handleCheckFailure(ctx, err)
 	}
 
-	if fence, failed := layout.fenceIndexes[i]; failed {
+	// The layout's indexes are relative to the stream items, which sit after the control items
+	// and the projector operations in the combined transaction.
+	streamIndex := i - len(transactItems) - 1
+	if fence, failed := layout.fenceIndexes[streamIndex]; failed {
 		return &evt.FenceConflictError{Fence: fence, Index: i}
+	}
+
+	// A failed condition on a written stream's own items is an ordinary conflict.
+	if _, written := layout.streamIndexes[streamIndex]; written {
+		return wrapClassifiedError(ErrSnapshotRaceCondition)
 	}
 
 	// Projector items sit between the control items and the stream items.
