@@ -47,7 +47,7 @@ func AllTransient(errs []error) bool {
 // DefaultConfig returns the generic policy defaults with DynamoDB classification installed.
 func DefaultConfig() policy.Config {
 	cfg := policy.DefaultConfig()
-	cfg.Classify = Classify
+	cfg.Classify = Classify //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	cfg.IsRetryable = IsTransient
 
 	return cfg

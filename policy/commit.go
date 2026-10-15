@@ -60,7 +60,7 @@ func ExecuteWithRetry(
 	var entity evt.Entity
 
 	err := Execute(ctx, cfg, func() error {
-		e, execErr := evt.ExecuteWithFactory(ctx, store, factory, entityID, command, metadata)
+		e, execErr := evt.ExecuteWithFactory(ctx, store, factory, entityID, command, metadata) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		if execErr == nil {
 			entity = e
 		}

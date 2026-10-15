@@ -40,7 +40,7 @@ func (m *MockEntity) Projectors() []evt.EventProjector {
 	return m.projectors
 }
 
-func (m *MockEntity) Base() evt.BaseEntity {
+func (m *MockEntity) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	return m.BaseEntity
 }
 

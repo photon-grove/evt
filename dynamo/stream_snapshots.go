@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // snapshotStreamWorkers is the default number of entity partitions reconstructed concurrently by
@@ -40,6 +40,10 @@ type StreamFromSnapshotsOptions struct {
 	// The default path collects every ID before emitting an entity. HeadSource emits while enumerating,
 	// so an enumeration error can follow emitted entities. Rebuilds are idempotent, so resume with Skip
 	// or rerun the rebuild.
+	//
+	// Deprecated: Cut in ADR-0006 (K3): the heads-registry enumeration path goes away with
+	// HeadStore. Use the default key-only scan enumeration. It will be removed in the next minor
+	// release.
 	HeadSource evt.EntityHeadVisitor
 }
 

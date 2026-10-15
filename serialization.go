@@ -210,6 +210,8 @@ func CalculateAdditionalEvents(currentSequence EventSequence, numEvents int, max
 
 // ByCommandID allows you to sort SerializedEvents by the CommandID in the Metadata, falling back to
 // sorting by event ID if the CommandID is empty.
+//
+// Deprecated: Cut in ADR-0006 (K7). It will be removed in the next minor release.
 type ByCommandID []SerializedEvent
 
 // Len returns the length of the slice.

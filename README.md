@@ -22,11 +22,10 @@ your application needs.
   per-entity sequence ordering. Stable command IDs prevent retries from duplicating
   facts.
 - **Long logs can be rebuilt efficiently.** Inline snapshots, versioned upcasters,
-  and snapshot-verified compaction limit replay work without rewriting history. An
-  optional entity-heads table tracks each entity's latest sequence so rebuilds can
-  target changed entities.
-- **DynamoDB Streams support.** A publisher fans committed events out over SNS to
-  idempotent projectors with retry classification.
+  and snapshot-verified compaction limit replay work without rewriting history.
+- **DynamoDB Streams support.** Projectors consume the stream directly
+  (`projectors.NewLambdaHandler`); idempotency and retry classification included. (The
+  SNS publisher runtime that used to sit in the middle is deprecated in v0.9.0 — K5.)
 - **A Rust crate shares the log.** [`photon-evt`](crates/evt) reads and writes the
   same DynamoDB items, PostgreSQL rows, and stream envelopes, so Go and Rust
   services can append to the same streams.
@@ -89,12 +88,12 @@ repo := dynamo.NewRepository(dynamoClient, "event-log")
 store := snapshots.NewStore(repo, 25) // snapshot every 25 events
 ```
 
-When aggregates carry injected dependencies, construct them with a factory:
+When aggregates carry injected dependencies, construct them and pass the instance to `Execute`:
 
 ```go
-account, err := evt.ExecuteWithFactory(ctx, store, func() evt.Entity {
-    return NewAccount("acct-1", projectors...)
-}, "acct-1", command, metadata)
+entity := NewAccount("acct-1", projectors...)
+err := store.Execute(ctx, entity, "acct-1", command, metadata)
+// entity now holds the post-command state
 ```
 
 ## Packages
@@ -108,13 +107,54 @@ account, err := evt.ExecuteWithFactory(ctx, store, func() evt.Entity {
 | `evt/snapshots` | Store with snapshot loading and write thresholds |
 | `evt/stream` | Stream handler and publisher helpers for event fanout |
 | `evt/projectors` | Projector runtime (SNS/SQS fan-out, or direct stream) with idempotency and retry classification |
-| `evt/publishers` | DynamoDB Streams publisher handler that fans events out to SNS, with ingress and retry budgets |
+| `evt/publishers` | DynamoDB Streams publisher handler that fans events out to SNS, with ingress and retry budgets (deprecated) |
 | `evt/policy` | Backend-neutral retry helpers for commit paths |
 | `evt/policy/dynamodb` | DynamoDB-specific retry classification |
 | `evt/viewstore` | Typed JSON helper around `evt.ViewRepository` |
 | `evt/test` | Test aggregate, commands, events, and helpers for adopters and framework tests |
 
 All packages live under `github.com/photon-grove/evt`.
+
+## Deprecations (v0.9.0)
+
+The v0.9.0 core reshape deprecates the features cut by plan decision D6
+([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md)); they keep compiling but are
+deleted in the next minor release. Each carries a `Deprecated:` godoc notice — pointing at its
+replacement where one exists, and saying plainly where the feature is removed without one:
+
+- `CommitStream` (K1) — commit batched commands through the normal commit path
+- snapshot freshness observer / replay estimate / budget (K2) — removed without a Go
+  replacement; wrap `Load` with your own metrics (Rust gains structured load telemetry, P9)
+- `StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` (K3) —
+  removed without a bounded-memory in-library replacement: `StreamEntities` buffers every
+  matched event, so for large tables page your own DynamoDB Query/Scan with `LastEvaluatedKey`
+  (one partition query per entity keeps memory bounded)
+- `HeadStore` (heads table) and incremental/delta rebuild (K4) — scan-derived `StreamEntityHeads`
+- `evt/publishers`, `BudgetController`, and `stream.SNSPublisher`/FIFO (K5) — removed without an
+  in-library replacement: read the DynamoDB Stream directly (`projectors.NewLambdaHandler`) or
+  publish with your own handler; the envelope format stays (it is the cross-language wire format).
+  Command outcomes are planned, not shipped
+- the `WithFactory` helpers (including `snapshots.Store`'s), `ByCommandID`, `dynamo.Delete`,
+  `dynamo/mock`, the `do.go` DI providers, `dynamo.ExpressionStreamer` (and the concrete
+  `*dynamo.Repository` `...ByExpression` methods), and handler-attached
+  `CommandResult.Transaction` (K7) — direct store calls, `StreamFilter` (entity-type filtering
+  only: raw server-side expressions have no like-for-like replacement, so apply richer
+  predicates client-side), projector-produced transaction groups, and (planned) commit-wide
+  projectors; for `dynamo.Delete`, delete fixture items with the AWS SDK or recreate the test
+  table
+
+Three more D6-cut surfaces have **no warning-free migration path yet**, so they carry no
+`Deprecated:` notice in v0.9.0. They are planned for removal once the core reshape (C1–C11)
+replaces the contracts that require them:
+
+- `evt.BaseEntity` / `evt.NewEntity` — `Entity.Base` still requires `BaseEntity`
+- `evt/result` — `Repository.StreamAllEvents`, `Repository.StreamEntities`,
+  `SnapshotStreamer`, and `RebuildProjectionsFromStream` still return `result.Result` channels
+- `policy.Hooks` / `policy.Attempt` / `policy.Config.Classify` / `policy.Classifier` (K6) —
+  `policy.Execute`/`ExecuteWithRetry` still take a `Hooks` argument, and custom retry
+  decisions (`Config.Classify`) have no replacement until the core reshape (C5) lands
+  (the built-in `policy.Classify` only recognizes `ClassifiedError`, so a custom classifier
+  is the only supported way to mark raw backend errors transient)
 
 ## Rust
 

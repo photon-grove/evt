@@ -9,10 +9,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // StreamByQueryOptions configures StreamEntitiesByQuery.
+//
+// Deprecated: Cut in ADR-0006 (K3): removed without a bounded-memory in-library replacement.
+// For large tables, page your own DynamoDB Query/Scan with LastEvaluatedKey (one partition
+// query per entity keeps memory bounded); StreamEntities buffers every matched event from the
+// scan. It will be removed in the next minor release.
 type StreamByQueryOptions struct {
 	// EntityType, if set, restricts the rebuild to entities of this type. Enumeration filters the
 	// key-only scan by entityType so non-matching partitions are never queried.
@@ -36,6 +41,10 @@ type StreamByQueryOptions struct {
 	// The default path collects every ID before emitting an entity. HeadSource emits while enumerating,
 	// so an enumeration error can follow emitted entities. Rebuilds are idempotent, so resume with Skip
 	// or rerun the rebuild.
+	//
+	// Deprecated: Cut in ADR-0006 (K3): the heads-registry enumeration path goes away with
+	// HeadStore. Use the default key-only scan enumeration. It will be removed in the next minor
+	// release.
 	HeadSource evt.EntityHeadVisitor
 }
 
@@ -48,6 +57,12 @@ type StreamByQueryOptions struct {
 // entity as soon as it is rebuilt. Memory is bounded to the set of distinct entity IDs collected
 // during enumeration plus up to Workers in-flight aggregates, rather than the entire event log. It
 // is the preferred source for RebuildProjectionsFromStream on large tables.
+//
+// Deprecated: Cut in ADR-0006 (K3): removed without a bounded-memory in-library replacement —
+// StreamEntities plus evt.RebuildProjectionsFromStream buffers every matched event from the
+// scan. For large tables, page your own DynamoDB Query/Scan with LastEvaluatedKey instead (one
+// partition query per entity keeps memory bounded). It will be removed in the next minor
+// release.
 //
 // Enumeration still uses a table Scan. Its ProjectionExpression reduces returned data, not read
 // capacity, which DynamoDB charges by item size. Set opts.HeadSource to enumerate IDs from a heads

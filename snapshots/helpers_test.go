@@ -86,7 +86,7 @@ func combineResults(results ...evt.CommandResult) evt.CommandResult {
 	combined := evt.CommandResult{}
 	for _, result := range results {
 		combined.Events = append(combined.Events, result.Events...)
-		combined.Transaction = append(combined.Transaction, result.Transaction...)
+		combined.Transaction = append(combined.Transaction, result.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	}
 	return combined
 }

@@ -85,10 +85,10 @@ export const diagrams: DiagramSpec[] = [
   },
   {
     id: 'incremental-rebuild',
-    title: 'Incremental rebuild',
+    title: 'Incremental rebuild (deprecated in v0.9.0)',
     group: 'Operations',
     description:
-      'A heads projector records each entity’s highest sequence. A rebuild reads the heads table and reprojects entities whose heads exceed their checkpoints.',
+      'A heads projector records each entity’s highest sequence and a rebuild reprojects changed entities. The heads table (HeadStore) is deprecated in v0.9.0 — derive heads from the log with StreamEntityHeads instead.',
     layout: {direction: 'DOWN'},
     nodes: [
       {id: 'topic', kind: 'topic', label: 'events topic', sublabel: 'SNS fan-out', domain: 'queue', icon: 'topic'},
@@ -111,10 +111,10 @@ export const diagrams: DiagramSpec[] = [
   },
   {
     id: 'streams',
-    title: 'Streams, projectors, and publishers',
+    title: 'Streams and projectors',
     group: 'Async flows',
     description:
-      'One publisher consumes the DynamoDB stream and fans events out over SNS. Projectors, the heads table, and other consumers each subscribe to the topic and build read models independently.',
+      'Projectors consume the DynamoDB stream directly, or through the SNS fan-out shown here. The publisher-driven SNS fan-out is deprecated in v0.9.0; direct stream consumption is the shipped path.',
     layout: {direction: 'DOWN'},
     nodes: [
       {id: 'eventlog', kind: 'datastore', label: 'event-log stream', sublabel: 'DynamoDB NEW_IMAGE', domain: 'event', icon: 'datastore'},

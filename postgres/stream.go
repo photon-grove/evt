@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // streamEventsByEntity selects every event matching the filter, ordered so that a single ascending

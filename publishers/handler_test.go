@@ -13,12 +13,12 @@ import (
 )
 
 type stubPublisher struct {
-	result *stream.PublishResult
+	result *stream.PublishResult //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	err    error
 	calls  int
 }
 
-func (s *stubPublisher) Publish(_ context.Context, _ []events.DynamoDBEventRecord) (*stream.PublishResult, error) {
+func (s *stubPublisher) Publish(_ context.Context, _ []events.DynamoDBEventRecord) (*stream.PublishResult, error) { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	s.calls++
 	return s.result, s.err
 }
@@ -60,7 +60,7 @@ func newInsertEvent(id string) events.DynamoDBEvent {
 }
 
 func TestHandleDynamoDBEvent_Success(t *testing.T) {
-	pub := &stubPublisher{result: &stream.PublishResult{}}
+	pub := &stubPublisher{result: &stream.PublishResult{}} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	budget := &stubBudget{}
 
 	resp, err := publishers.HandleDynamoDBEvent(context.Background(), newInsertEvent("evt-1"), pub, budget)
@@ -70,7 +70,7 @@ func TestHandleDynamoDBEvent_Success(t *testing.T) {
 }
 
 func TestHandleDynamoDBEvent_DropsOnIngressBudget(t *testing.T) {
-	pub := &stubPublisher{result: &stream.PublishResult{}}
+	pub := &stubPublisher{result: &stream.PublishResult{}} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	budget := &stubBudget{eventDecision: publishers.DecisionDrop}
 
 	resp, err := publishers.HandleDynamoDBEvent(context.Background(), newInsertEvent("evt-1"), pub, budget, nil)
@@ -103,7 +103,7 @@ func TestHandleDynamoDBEvent_RetryBudgetDropSuppressesRetry(t *testing.T) {
 
 func TestHandleDynamoDBEvent_FailedIndicesReturnBatchItemFailure(t *testing.T) {
 	pub := &stubPublisher{
-		result: &stream.PublishResult{
+		result: &stream.PublishResult{ //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 			FailedIndices: []int{0},
 		},
 	}
@@ -118,7 +118,7 @@ func TestHandleDynamoDBEvent_FailedIndicesReturnBatchItemFailure(t *testing.T) {
 
 func TestHandleDynamoDBEvent_DropsMalformedRecordWithoutRetryFailure(t *testing.T) {
 	pub := &stubPublisher{
-		result: &stream.PublishResult{
+		result: &stream.PublishResult{ //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 			DroppedMalformedCount: 1,
 		},
 	}
@@ -131,7 +131,7 @@ func TestHandleDynamoDBEvent_DropsMalformedRecordWithoutRetryFailure(t *testing.
 }
 
 func TestHandleDynamoDBEvent_IgnoresNonInsertRecords(t *testing.T) {
-	pub := &stubPublisher{result: &stream.PublishResult{}}
+	pub := &stubPublisher{result: &stream.PublishResult{}} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	budget := &stubBudget{}
 
 	event := events.DynamoDBEvent{

@@ -60,7 +60,7 @@ tables.
 
 ## Treat stream handlers as batch processors
 
-[Projectors and publishers](streams.md) receive batches. Process each record
+[Projectors](streams.md) receive batches. Process each record
 independently, report **partial-batch failures** precisely so retries are scoped
 to the records that actually failed, and keep every handler idempotent — the same
 event will eventually arrive twice.

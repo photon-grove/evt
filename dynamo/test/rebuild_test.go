@@ -50,7 +50,7 @@ func (g *rebuildTxnGroup) HandleError(err error, _ int) error   { return err }
 func rebuildApplyFunc() func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error) {
 	return func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
@@ -67,7 +67,7 @@ func (e *testTypedEntity) Type() evt.EntityType { return "TestEntity" }
 func typedApplyFunc() func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error) {
 	return func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &testTypedEntity{MockEntity: &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}}, nil
+			return &testTypedEntity{MockEntity: &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		}
 
 		return entity, nil
@@ -99,7 +99,7 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_ScanEnumeration() {
 		CommitGroup: func(context.Context, evt.TransactionGroup) error { committed++; return nil },
 	}
 
-	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), cfg)
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), cfg) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 2, res.Processed)
 	require.Empty(s.T(), res.Errors)
@@ -130,8 +130,8 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_HeadSource() {
 		CommitGroup: func(context.Context, evt.TransactionGroup) error { return nil },
 	}
 
-	opts := dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}
-	res, err := s.repo.RebuildProjectionsByQuery(ctx, opts, rebuildApplyFunc(), cfg)
+	opts := dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}               //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, opts, rebuildApplyFunc(), cfg) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 2, res.Processed)
 	require.ElementsMatch(s.T(), []evt.EntityID{"a", "b"}, proj.projected())
@@ -160,8 +160,8 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_DefaultsEntityTypeFromC
 	}
 
 	// opts.EntityType left empty: it should default to cfg.EntityType and scope the head source.
-	opts := dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}
-	res, err := s.repo.RebuildProjectionsByQuery(ctx, opts, typedApplyFunc(), cfg)
+	opts := dynamo.StreamByQueryOptions{Workers: 1, HeadSource: heads}             //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, opts, typedApplyFunc(), cfg) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 1, res.Processed)
 	require.Equal(s.T(), evt.EntityType("TestEntity"), heads.gotType, "cfg.EntityType scoped enumeration")
@@ -194,7 +194,7 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_ScanEntityTypeFromConfi
 	}
 
 	// opts.EntityType empty: defaults to cfg.EntityType and scopes the enumeration scan.
-	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, typedApplyFunc(), cfg)
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, typedApplyFunc(), cfg) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 1, res.Processed)
 	require.Equal(s.T(), []evt.EntityID{"a"}, proj.projected())
@@ -209,13 +209,13 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_ConfigErrorFailsFast() 
 
 	// DryRun false with no CommitGroup must fail before consuming read capacity.
 	missingCommit := evt.RebuildConfig{Projectors: []evt.EventProjector{&rebuildProjector{}}}
-	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), missingCommit)
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), missingCommit) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Nil(s.T(), res)
 	require.ErrorContains(s.T(), err, "CommitGroup is required")
 
 	// No projectors must also fail before streaming.
 	noProjectors := evt.RebuildConfig{CommitGroup: func(context.Context, evt.TransactionGroup) error { return nil }}
-	res, err = s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), noProjectors)
+	res, err = s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), noProjectors) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Nil(s.T(), res)
 	require.ErrorContains(s.T(), err, "at least one projector is required")
 
@@ -237,7 +237,7 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_RejectsSeedEntity() {
 		},
 	}
 
-	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), cfg)
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{Workers: 1}, rebuildApplyFunc(), cfg) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Nil(s.T(), res)
 	require.ErrorContains(s.T(), err, "SeedEntity is not supported")
 	s.client.AssertExpectations(s.T())
@@ -253,7 +253,7 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_NilApplyEvent() {
 		CommitGroup: func(context.Context, evt.TransactionGroup) error { return nil },
 	}
 
-	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{}, nil, cfg)
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{}, nil, cfg) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Nil(s.T(), res)
 	require.ErrorContains(s.T(), err, "applyEvent callback is required")
 	// No Scan or Query was registered, so the mock confirms no stream was started.
@@ -272,8 +272,8 @@ func (s *RepositorySuite) Test_RebuildProjectionsByQuery_EntityTypeMismatch() {
 		CommitGroup: func(context.Context, evt.TransactionGroup) error { return nil },
 	}
 
-	opts := dynamo.StreamByQueryOptions{EntityType: evt.EntityType("User")}
-	res, err := s.repo.RebuildProjectionsByQuery(ctx, opts, rebuildApplyFunc(), cfg)
+	opts := dynamo.StreamByQueryOptions{EntityType: evt.EntityType("User")}          //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	res, err := s.repo.RebuildProjectionsByQuery(ctx, opts, rebuildApplyFunc(), cfg) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	require.Nil(s.T(), res)
 	require.ErrorContains(s.T(), err, "entity type mismatch")
 	s.client.AssertExpectations(s.T())

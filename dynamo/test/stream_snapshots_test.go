@@ -15,7 +15,7 @@ import (
 
 // seedMockEntity reconstructs a MockEntity from a snapshot payload.
 func seedMockEntity(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Entity, error) {
-	return &MockEntity{BaseEntity: evt.NewEntity(snapshot.EntityID)}, nil
+	return &MockEntity{BaseEntity: evt.NewEntity(snapshot.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 }
 
 // enumScanOutput builds a key-only Scan page (the entity-ID enumeration) for the given pks. It
@@ -122,7 +122,7 @@ func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_NoSnapshotFullReplay(
 	}
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
 		applied = append(applied, event.Sequence)
-		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil
+		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	}
 
 	var entities []evt.Entity

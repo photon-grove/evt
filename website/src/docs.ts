@@ -51,12 +51,13 @@ const DOC_CONFIG: Record<string, DocConfig> = {
     group: GUIDES,
     order: 3,
     summary:
-      'Rebuild views from the log, including incremental delta rebuilds and constant-memory enumeration.',
+      'Rebuild views from the log with scan-based streaming and snapshot-aware seeds.',
   },
   streams: {
     group: GUIDES,
     order: 4,
-    summary: 'DynamoDB Streams projectors and SNS publishers with idempotency and retry classification.',
+    summary:
+      'DynamoDB Streams projectors with idempotency and retry classification (SNS fan-out is deprecated in v0.9.0).',
   },
   dynamodb: {
     group: GUIDES,
