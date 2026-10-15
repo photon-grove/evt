@@ -26,7 +26,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      # go: anything outside the Rust crates (Go, docs, website, infra).
+      # go: anything outside the Rust crates (Go, docs, website, infra), plus moon config, which
+      # Quality checks from a renamed checkout.
       # rust: the Rust crates and the shared compatibility fixtures.
       # compat: anything that can change the shared storage format, which runs the
       # cross-language suite against live backends.
@@ -49,6 +50,8 @@ jobs:
           while IFS= read -r file; do
             case "$file" in
               .github/*)
+                go=true rust=true compat=true ;;
+              crates/moon.yml)
                 go=true rust=true compat=true ;;
               crates/* | Cargo.toml | Cargo.lock | rust-toolchain.toml)
                 rust=true compat=true ;;
@@ -92,6 +95,16 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
+
+      # actions/checkout always names the directory evt, which hides project ids that fall back to
+      # the directory name. Building every task from a differently named checkout catches that.
+      - name: Check the moon graph outside an evt directory
+        run: |
+          moon="$PWD/node_modules/.bin/moon"
+          git worktree add --detach "$RUNNER_TEMP/evt-graph-check" HEAD
+          cd "$RUNNER_TEMP/evt-graph-check"
+          "$moon" tasks >/dev/null
+          "$moon" task evt-rust:integration >/dev/null
 
       - name: Go checks
         run: |
