@@ -57,6 +57,11 @@ func nsEventItem(pk string, sk int64, withMetadata bool) map[string]types.Attrib
 func (s *NamespacesSuite) Test_GetRecentEvents_NewestFirst() {
 	client, repo := s.repo()
 
+	current := nsEventItem("acct-1", 3, true)
+	current["metadata"] = &types.AttributeValueMemberS{Value: `{"commandId":"cmd-3","principalId":"user-1","causationId":"cmd-2","extensions":{"scope":"account"},"region":"us-west-2"}`}
+	legacy := nsEventItem("acct-1", 2, true)
+	legacy["metadata"] = &types.AttributeValueMemberS{Value: `{"commandId":"cmd-2","region":"us-west-2"}`}
+
 	var input dynamodb.QueryInput
 	client.On("Query", mock.Anything, mock.MatchedBy(func(in *dynamodb.QueryInput) bool {
 		input = *in
@@ -64,8 +69,8 @@ func (s *NamespacesSuite) Test_GetRecentEvents_NewestFirst() {
 		return true
 	}), mock.Anything).
 		Return(&dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{
-			nsEventItem("acct-1", 3, true),
-			nsEventItem("acct-1", 2, true),
+			current,
+			legacy,
 		}}, nil).Once()
 
 	recent, err := repo.GetRecentEvents(context.Background(), "acct-1", 2)
@@ -73,6 +78,12 @@ func (s *NamespacesSuite) Test_GetRecentEvents_NewestFirst() {
 	require.Len(s.T(), recent, 2)
 	require.Equal(s.T(), evt.EventSequence(3), recent[0].Sequence)
 	require.Equal(s.T(), evt.EventSequence(2), recent[1].Sequence)
+	require.Equal(s.T(), evt.PrincipalID("user-1"), *recent[0].Metadata.PrincipalID)
+	require.Equal(s.T(), evt.CommandID("cmd-2"), *recent[0].Metadata.CausationID)
+	require.Equal(s.T(), map[string]string{"scope": "account"}, recent[0].Metadata.Extensions)
+	// Reading legacy rows must not apply encode-time causation or extension defaults.
+	require.Nil(s.T(), recent[1].Metadata.CausationID)
+	require.Nil(s.T(), recent[1].Metadata.Extensions)
 
 	require.Equal(s.T(), "pk = :pk AND sk > :sk", aws.ToString(input.KeyConditionExpression))
 	require.True(s.T(), aws.ToBool(input.ScanIndexForward) == false)
