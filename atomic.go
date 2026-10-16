@@ -268,7 +268,9 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 	keySize := func(id EntityID, sequence EventSequence) int {
 		return len("pk") + len("sk") + len(id) + len(strconv.Itoa(int(sequence)))
 	}
-	sizes := []int{keySize(SystemNamespacePrefix+"FEATURES", 0), keySize(SystemNamespacePrefix+"REBUILD", 0)}
+	// Only actions a commit actually emits are budgeted: the feature-marker check today. The
+	// rebuild-lock check (C10) joins this list in the change that starts emitting it.
+	sizes := []int{keySize(SystemNamespacePrefix+"FEATURES", 0)}
 
 	written := map[EntityID]bool{}
 	for _, event := range result.Events {

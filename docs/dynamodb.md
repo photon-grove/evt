@@ -43,12 +43,12 @@ Event rows are **append-only and protected by conditional writes** — a commit 
 succeeds if the next sequence is unclaimed, which is how concurrent writers on one
 entity stay correctly ordered. Each commit also checks the `sk = 0` snapshot row: a
 commit that starts at or below the snapshot's `eventSequence` is rejected, so a writer
-that loaded before a compaction cannot recreate the deleted events. The current Go C9
-implementation also includes a mandatory feature-marker check. Of the 100 transaction
-items, a single-stream commit without a snapshot reserves two (floor + marker), leaving
-**98 event/projector operations**. A commit with a snapshot also leaves **98**: the
-snapshot put replaces the floor check, and the marker check remains. These checks are
-billed as writes.
+that loaded before a compaction cannot recreate the deleted events. Every v0.9 commit also carries a
+feature-marker check. Of the 100 transaction items, a single-stream commit without a snapshot
+reserves two (floor + marker), leaving **98 event/projector operations**. A commit with a
+snapshot also leaves **98**: the snapshot put replaces the floor check, and the marker check
+remains. These checks are billed as writes. The commit budget counts only the actions a commit
+actually emits.
 
 The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C2/C3/C10) is:
 
@@ -56,13 +56,14 @@ The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C
 items = Σ(events per written stream + 1 snapshot/floor)
       + 2 × read-only fenced streams
       + optional outcome put
-      + feature-marker check + rebuild-lock check
+      + feature-marker check
+      + rebuild-lock check (once C10 emits it)
       + projector operations
 ```
 
-A basic single-stream commit with no read fences or outcome then leaves **97**
-event/projector operations. The rebuild-lock check (C10) is a target, **not implemented
-by this Go C9 change**; do not count it as a current transaction item.
+Today a basic single-stream commit with no read fences or outcome leaves **98**
+event/projector operations. The rebuild-lock check (C10) is **not implemented yet** and is not
+budgeted; when C10 starts emitting it, that capacity drops by one, to **97**.
 
 The `sk = 0` snapshot row records the entity's serialized state plus the
 `eventSequence` it covers, and snapshot writes are monotonic: a write that would move

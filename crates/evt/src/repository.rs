@@ -78,7 +78,7 @@ impl<Op> Commit<Op> {
     }
 
     /// Exact backend-neutral event/snapshot/check representation, matching Dynamo item sizes,
-    /// for the shared commit budget: the two control rows, the event puts, then the snapshot put
+    /// for the shared commit budget: the feature-marker check, the event puts, then the snapshot put
     /// or floor check. Backend projector operations are opaque here and sized by the backend.
     pub(crate) fn sizes(
         &self,
@@ -91,10 +91,9 @@ impl<Op> Commit<Op> {
                 ("sk".into(), V::N(seq.to_string())),
             ])
         };
-        let mut sizes = vec![
-            item_size(&key(crate::features::FEATURES_ID, 0)),
-            item_size(&key("SYSTEM#REBUILD", 0)),
-        ];
+        // Only actions a commit actually emits are budgeted: the feature-marker check today. The
+        // rebuild-lock check (C10) joins this list in the change that starts emitting it.
+        let mut sizes = vec![item_size(&key(crate::features::FEATURES_ID, 0))];
         for event in &self.events {
             sizes.push(item_size(&wire::event_item(
                 event,
@@ -402,10 +401,9 @@ impl<Op> TransactionCommit<Op> {
                 ("sk".into(), V::N(seq.to_string())),
             ])
         };
-        let mut sizes = vec![
-            item_size(&key(crate::features::FEATURES_ID, 0)),
-            item_size(&key("SYSTEM#REBUILD", 0)),
-        ];
+        // Only actions a commit actually emits are budgeted: the feature-marker check today. The
+        // rebuild-lock check (C10) joins this list in the change that starts emitting it.
+        let mut sizes = vec![item_size(&key(crate::features::FEATURES_ID, 0))];
         for stream in &self.streams {
             for event in &stream.events {
                 sizes.push(item_size(&wire::event_item(
@@ -747,6 +745,26 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn the_budget_counts_only_emitted_actions() {
+        // marker check + events + floor check: 98 events fill the 100 actions exactly.
+        let fits = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect());
+        assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
+        check_budget(fits.sizes(|_| None).unwrap()).unwrap();
+
+        let over = Commit::<u8>::new("a", (1..=99).map(|n| event("a", n)).collect());
+        assert!(matches!(
+            check_budget(over.sizes(|_| None).unwrap()),
+            Err(Error::CommitTooLarge { actions: 101, .. })
+        ));
+
+        // The same holds for a transaction over one stream, and a snapshot put replaces the floor.
+        let snapshotted = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect())
+            .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
+        let transaction = TransactionCommit::new(vec![snapshotted]);
+        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 100);
     }
 
     #[test]

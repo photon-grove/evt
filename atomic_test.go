@@ -38,15 +38,15 @@ func TestTransactionItemSizesWithTTL_CountsTheTTLAttributeOnRetainedTypesOnly(t 
 	})
 	require.NoError(t, err)
 
-	// Two control rows, then the event puts, the snapshot put, the floor check for the stream
+	// The feature-marker check, then the event puts, the snapshot put, the floor check for the stream
 	// without a snapshot, and the two checks of the fence.
-	require.Len(t, plain, 2+2+1+1+2)
+	require.Len(t, plain, 1+2+1+1+2)
 	require.Len(t, retained, len(plain))
 
 	attribute := len("ttl") + len("1800000000")
 	want := append([]int(nil), plain...)
-	want[2] += attribute // a's event put
-	want[4] += attribute // a's snapshot put
+	want[1] += attribute // a's event put
+	want[3] += attribute // a's snapshot put
 	require.Equal(t, want, retained, "only retained types' event and snapshot items carry a ttl")
 }
 
@@ -84,4 +84,28 @@ func TestCommitMetadata_TreatsAnEmptyCommandIDAsAbsent(t *testing.T) {
 	command := evt.CommandID("cmd-1")
 	derived := evt.CommitMetadata(evt.Metadata{CommandID: &command, CommitID: "caller-commit"})
 	require.Equal(t, "cmd-1", derived.CommitID, "a non-empty command ID wins")
+}
+
+func TestPreflightCommit_BudgetsOnlyEmittedActions(t *testing.T) {
+	events := func(count int) []evt.SerializedEvent {
+		out := make([]evt.SerializedEvent, 0, count)
+		for sequence := 1; sequence <= count; sequence++ {
+			out = append(out, evt.SerializedEvent{
+				ID: evt.GetEventID("a", evt.EventSequence(sequence)), Sequence: evt.EventSequence(sequence),
+				Type: "t:created", Version: 1, EntityID: "a", EntityType: "t", Payload: []byte(`{}`),
+			})
+		}
+
+		return out
+	}
+
+	// The feature-marker check, 98 event puts, and the floor check fill the 100 actions exactly.
+	fits, err := evt.TransactionItemSizes(evt.SerializedResult{Events: events(98)})
+	require.NoError(t, err)
+	require.Len(t, fits, 100)
+	require.NoError(t, evt.PreflightCommit(evt.SerializedResult{Events: events(98)}))
+
+	var tooLarge *evt.CommitTooLargeError
+	require.ErrorAs(t, evt.PreflightCommit(evt.SerializedResult{Events: events(99)}), &tooLarge)
+	require.Equal(t, 101, tooLarge.Items)
 }

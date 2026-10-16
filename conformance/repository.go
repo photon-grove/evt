@@ -850,6 +850,15 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 	ctx := context.Background()
 	ns := newNamespace()
 
+	// The feature-marker check, 98 event puts, and the floor check are exactly 100 actions, so a
+	// 98-event commit fits on every backend. Only emitted actions count against the budget.
+	idFits := evt.EntityID(ns + "-fits")
+	fitting := make([]evt.Event, 0, 98)
+	for i := range 98 {
+		fitting = append(fitting, &test.EntityUpdated{ID: idFits, Value: fmt.Sprintf("value-%d", i)})
+	}
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idFits, "test", 0, fitting...)}))
+
 	idA := evt.EntityID(ns + "-a")
 	// 101 event puts plus the control checks and the floor check exceed the 100-item budget.
 	events := make([]evt.Event, 0, 101)

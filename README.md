@@ -174,7 +174,10 @@ streams and snapshots at once and the engine pins their order bytewise by stream
 commit fails with `*evt.FenceConflictError` when another writer (or a compaction) moves it —
 and fences for entity types durably declared with retention are refused. Every commit, single
 or multi-stream, is checked against the shared 100-item / 3.8 MB / 380 KB budget and fails with
-`*evt.CommitTooLargeError` before any write, on every backend. The exact contract is specified
+`*evt.CommitTooLargeError` before any write, on every backend. The budget counts the actions a
+commit actually emits, so a single-stream commit leaves room for 98 events and projector
+operations beside the feature-marker and floor (or snapshot) actions; that drops to 97 when the
+rebuild-lock check (C10) starts being emitted. The exact contract is specified
 in the [storage format](docs/spec/storage-format.md#writes).
 
 A custom `Repository` written before v0.9 compiles unchanged but now receives

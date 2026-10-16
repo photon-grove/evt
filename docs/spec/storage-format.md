@@ -200,9 +200,10 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
 1. The feature-marker check (`SYSTEM#FEATURES`), present in every v0.9 commit
    ([Feature Marker](#feature-marker)).
 2. The rebuild-lock check (`SYSTEM#REBUILD`), when the store carries one
-   ([Rebuild Fence](#rebuild-fence)). The position is pinned and the commit budget below already
-   counts the item, but an implementation that does not yet implement the rebuild fence (C10)
-   emits no action here, and every later action then moves up by one.
+   ([Rebuild Fence](#rebuild-fence)). The position is pinned, but an implementation that does not
+   yet implement the rebuild fence (C10) emits no action here, every later action moves up by
+   one, and the commit budget below does not count it. The budget counts exactly the actions
+   emitted.
 3. Projector operations, in projector declaration order; within one projector, in emission order.
    A commit that carries projector operations must also write at least one event: views are
    projections of committed events, so operations with no backing event are refused with a typed
@@ -227,7 +228,7 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
 Steps 5 and 6 apply only when the corresponding capability is enabled for the store. The
 feature-marker check (step 1) is not optional: every commit in a v0.9 store carries it, and a
 store that never declares features still validates the marker against `attribute_not_exists(pk)`.
-The rebuild-lock check (step 2) is likewise part of the target layout for every v0.9 commit. A
+The rebuild-lock check (step 2) is part of the target layout once C10 lands. A
 store built without the v0.9 capabilities writes exactly the actions the older paragraphs
 describe. The order is pinned so fixtures byte-match across implementations: the shared
 compatibility scenarios record the action order of every multi-stream and fenced transaction,
@@ -252,11 +253,12 @@ check:
 **Pre-v0.9 capacity:** the floor check counts toward the 100 actions and is billed as a write,
 so a commit without a snapshot costs one more write unit than its events and projector puts,
 and holds at most 99 of them. `CommitStream` adds one check per entity in each batch. This is
-not the v0.9 capacity: the current Go C9 implementation reserves a marker check as well,
-leaving 98 event/projector operations for a single-stream commit, with or without a snapshot
-(the snapshot put replaces the floor check). The full v0.9 target below adds the C10 rebuild
-check and leaves 97 for a basic single-stream commit with no read fences or outcome. C10 is
-not implemented by the Go C9 change.
+not the v0.9 capacity: every v0.9 commit also carries the feature-marker check, leaving 98
+event/projector operations for a single-stream commit, with or without a snapshot (the snapshot
+put replaces the floor check). The budget counts only the actions a commit actually emits. The
+rebuild-lock check (C10) is not emitted yet, so it is not budgeted; the change that starts
+emitting it adds it to the budget, and a basic single-stream commit with no read fences or
+outcome then leaves 97.
 
 **Multi-stream commits (v0.9, C1).** A commit may append to any number of streams. Each written
 stream keeps its existing protections — `attribute_not_exists(sk)` on every event put and the
@@ -270,7 +272,7 @@ items = Σ over written streams (events_s + 1)     event puts + snapshot put or 
       + fenced read-only streams × 2              slot check + snapshot companion
       + 1                                         outcome put, when outcomes are enabled
       + 1                                         feature-marker check, always in v0.9 stores
-      + 1                                         rebuild-lock check, always in v0.9 stores
+      + 1                                         rebuild-lock check, once C10 emits it (not yet)
       + projector puts and deletes
 ```
 
@@ -290,7 +292,7 @@ items' sizes. The preflight compares the estimates against 95% of the backend li
 **3,800,000 bytes** in aggregate and **380,000 bytes** for any single item, a 5% safety margin
 for key-encoding and rounding differences. It covers every item the transaction carries: the
 event puts, the snapshot and floor items, the projector operations, the fenced checks, the
-outcome row, and the two control checks. A commit over either byte budget fails with the same
+outcome row, and the control checks the commit emits (the feature-marker check today). A commit over either byte budget fails with the same
 typed `CommitTooLarge` error before any write, and is never split.
 
 The preflight counts projector operations **on every backend that writes them**. DynamoDB sizes

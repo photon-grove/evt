@@ -1092,6 +1092,16 @@ async fn read_fences<R: Repository>(repo: &R) -> CaseResult {
 async fn commit_too_large<R: Repository>(repo: &R) -> CaseResult {
     let stream = Stream::new(&namespace(), "large", "ledger");
 
+    // The feature-marker check, 98 event puts, and the floor check are exactly 100 actions, so a
+    // 98-event commit fits on every backend. Only emitted actions count against the budget.
+    let fits = Stream::new(&namespace(), "fits", "ledger");
+    fits.commit(repo, fits.events(1..=98), None).await?;
+    ensure_eq!(
+        repo.events(&fits.id).await?.len(),
+        98,
+        "a commit that fills the budget exactly is accepted"
+    );
+
     // 101 event puts plus the control rows and the floor check exceed the 100-item budget.
     let result = stream.commit(repo, stream.events(1..=101), None).await;
 
