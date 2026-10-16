@@ -149,30 +149,36 @@ func CheckProjectorOperationsSupported(backend string, result SerializedResult) 
 }
 
 // UnsupportedBatchEntryError refuses a SerializedResult sent through the deprecated CommitStream
-// batch path that carries Snapshots or Fences. The batch path writes events (and projector
-// operations) only, so it would drop them silently; commit such a result with Repository.Commit
-// instead. Nothing from the entry was written.
+// batch path that carries Snapshots, Fences, or an Outcome. The batch path writes events (and
+// projector operations) only, so it would drop them silently; commit such a result with
+// Repository.Commit instead. Nothing from the entry was written.
 type UnsupportedBatchEntryError struct {
 	Snapshots int
 	Fences    int
+	Outcomes  int
 }
 
 func (e *UnsupportedBatchEntryError) Error() string {
 	return fmt.Sprintf(
-		"CommitStream entry carries %d snapshots and %d read fences, which the batch path cannot honor; use Repository.Commit",
-		e.Snapshots, e.Fences,
+		"CommitStream entry carries %d snapshots, %d read fences, and %d outcomes, which the batch path cannot honor; use Repository.Commit",
+		e.Snapshots, e.Fences, e.Outcomes,
 	)
 }
 
-// CheckBatchEntry returns *UnsupportedBatchEntryError for a result with Snapshots or Fences. A
-// legacy batch path that does not route each entry through Repository.Commit calls it before
-// batching, so it fails closed instead of dropping the new fields.
+// CheckBatchEntry returns *UnsupportedBatchEntryError for a result with Snapshots, Fences, or an
+// Outcome. A legacy batch path that does not route each entry through Repository.Commit calls it
+// before batching, so it fails closed instead of dropping the new fields.
 func CheckBatchEntry(result SerializedResult) error {
-	if len(result.Snapshots) == 0 && len(result.Fences) == 0 {
+	outcomes := 0
+	if result.Outcome != nil {
+		outcomes = 1
+	}
+
+	if len(result.Snapshots) == 0 && len(result.Fences) == 0 && outcomes == 0 {
 		return nil
 	}
 
-	return &UnsupportedBatchEntryError{Snapshots: len(result.Snapshots), Fences: len(result.Fences)}
+	return &UnsupportedBatchEntryError{Snapshots: len(result.Snapshots), Fences: len(result.Fences), Outcomes: outcomes}
 }
 
 // NormalizeCommit validates a transactional commit and returns a normalized copy: events sorted
@@ -182,6 +188,18 @@ func CheckBatchEntry(result SerializedResult) error {
 func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
 	if err := CheckProjectorOperations(result); err != nil {
 		return result, err
+	}
+
+	if result.Outcome != nil {
+		// The outcome is checked before anything else is derived: a bad command ID, an oversized
+		// response, or an oversized rejection fails the commit before any write.
+		if err := CheckOutcome(result.Outcome); err != nil {
+			return result, err
+		}
+
+		if result.Outcome.Rejected() && len(result.Events) > 0 {
+			return result, &InvalidArgumentError{Argument: "outcome", Message: "a rejected outcome cannot be committed with events"}
+		}
 	}
 
 	result.Events = slices.Clone(result.Events)
@@ -236,6 +254,29 @@ func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
 		}
 	}
 	result.Fences = fences
+
+	if result.Outcome != nil {
+		// The stored event IDs are exactly the events this commit writes, in the order of the
+		// transaction's event puts: stream ID bytewise, then sequence. The caller's copy is
+		// never mutated.
+		outcome := *result.Outcome
+		outcome.EventIDs = make([]EventID, 0, len(result.Events))
+
+		// An empty response is no response: the attribute is absent on every backend.
+		if len(outcome.Response) == 0 {
+			outcome.Response = nil
+		}
+
+		for _, event := range result.Events {
+			outcome.EventIDs = append(outcome.EventIDs, event.ID)
+		}
+
+		if len(outcome.EventIDs) == 0 {
+			outcome.EventIDs = nil
+		}
+
+		result.Outcome = &outcome
+	}
 
 	return result, nil
 }
@@ -397,6 +438,16 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 	}
 	for _, fence := range result.Fences {
 		sizes = append(sizes, keySize(fence.EntityID, fence.Head+1), keySize(fence.EntityID, 0))
+	}
+
+	// The outcome put is the last action (storage spec, Writes).
+	if result.Outcome != nil {
+		size, err := OutcomeItemSize(*result.Outcome, result.Events)
+		if err != nil {
+			return nil, err
+		}
+
+		sizes = append(sizes, size)
 	}
 
 	return sizes, nil
