@@ -199,7 +199,7 @@ func Test_FeatureMarker_ChangedManifestRetries(t *testing.T) {
 	// The next commit's cached condition fails; the re-validation still succeeds, so the error is
 	// the transient changed-manifest error.
 	serialized, serr := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}},
-		2, id, evt.NewMetadata(ctx, aws.String("us-west-2")))
+		1, id, evt.NewMetadata(ctx, aws.String("us-west-2")))
 	require.NoError(t, serr)
 
 	err = enforcing.Commit(ctx, evt.SerializedResult{Events: serialized})
