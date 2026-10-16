@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use photon_evt::{Aggregate, BoxError, JsonUpcaster, Upcaster, domain_events, json::null_default};
+use photon_evt::{
+    Aggregate, BoxError, JsonUpcaster, OutcomeCommand, Rejection, ToRejection, Upcaster,
+    domain_events, json, json::null_default,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -118,12 +121,12 @@ domain_events! {
 pub enum AccountCommand {
     Open {
         owner: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         opened_at: Option<String>,
     },
     Deposit {
         amount_cents: i64,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         memo: Option<String>,
     },
     BatchDeposit {
@@ -142,15 +145,91 @@ pub enum AccountCommand {
         owner: String,
     },
     Close {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Accepted with no events and no response.
+    Ping,
+    /// Accepted with no events; the response is the balance.
+    Balance,
 }
 
-/// A business-rule rejection.
+impl AccountCommand {
+    /// The command's kind, as it appears in the scenario's `type` field.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Open { .. } => "open",
+            Self::Deposit { .. } => "deposit",
+            Self::BatchDeposit { .. } => "batchDeposit",
+            Self::Withdraw { .. } => "withdraw",
+            Self::Tag { .. } => "tag",
+            Self::SetLabels { .. } => "setLabels",
+            Self::Rename { .. } => "rename",
+            Self::Close { .. } => "close",
+            Self::Ping => "ping",
+            Self::Balance => "balance",
+        }
+    }
+
+    /// Reports whether the command answers with the balance after its events.
+    pub fn responds_with_balance(&self) -> bool {
+        matches!(
+            self,
+            Self::Deposit { .. }
+                | Self::BatchDeposit { .. }
+                | Self::Withdraw { .. }
+                | Self::Balance
+        )
+    }
+}
+
+/// The command's identity for the outcome digest: `account:<kind>` and the step's command object,
+/// keys sorted and compact, exactly as Go's `Command.MarshalJSON` writes it. Optional fields the
+/// step omitted are not serialized, so the payload is the step's own object.
+impl OutcomeCommand for AccountCommand {
+    fn command_type(&self) -> String {
+        format!("account:{}", self.kind())
+    }
+
+    fn canonical_payload(&self) -> Result<Option<Vec<u8>>, BoxError> {
+        // A `Value` object sorts its keys, as Go sorts the keys of the raw map.
+        Ok(Some(json::to_vec(&serde_json::to_value(self)?)?))
+    }
+}
+
+/// The response of a command that answers with the balance: `{"balanceCents":<balance>}`.
+pub fn balance_response(account: &Account) -> Vec<u8> {
+    format!(r#"{{"balanceCents":{}}}"#, account.balance_cents).into_bytes()
+}
+
+/// A business-rule rejection. It maps onto the standard rejection as Go does: the code is the
+/// reason with spaces replaced by `-`, the message the reason itself.
 #[derive(Debug, thiserror::Error)]
-#[error("rejected: {0}")]
-pub struct Rejected(pub &'static str);
+#[error("rejected: {reason}")]
+pub struct Rejected {
+    pub reason: &'static str,
+    pub details: Option<Value>,
+}
+
+impl Rejected {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            details: None,
+        }
+    }
+}
+
+impl ToRejection for Rejected {
+    fn to_rejection(&self) -> Option<Rejection> {
+        let rejection = Rejection::new(self.reason.replace(' ', "-"), self.reason);
+
+        Some(match &self.details {
+            Some(details) => rejection.with_details(details.clone()),
+            None => rejection,
+        })
+    }
+}
 
 fn rename_name_to_owner(payload: &mut Value) -> Result<(), BoxError> {
     let object = payload
@@ -180,7 +259,7 @@ impl Aggregate for Account {
 
         if let C::Open { owner, opened_at } = command {
             if !self.status.is_empty() {
-                return Err(Rejected("account already opened"));
+                return Err(Rejected::new("account already opened"));
             }
 
             let opened_at = opened_at
@@ -191,26 +270,26 @@ impl Aggregate for Account {
         }
 
         if self.status != "open" {
-            return Err(Rejected("account is not open"));
+            return Err(Rejected::new("account is not open"));
         }
 
         match command {
             C::Open { .. } => unreachable!("handled above"),
             C::Deposit { amount_cents, memo } => {
                 if amount_cents <= 0 {
-                    return Err(Rejected("amount must be positive"));
+                    return Err(Rejected::new("amount must be positive"));
                 }
                 Ok(vec![MoneyDeposited { amount_cents, memo }.into()])
             }
             C::BatchDeposit { amounts } => {
                 if amounts.is_empty() {
-                    return Err(Rejected("no amounts"));
+                    return Err(Rejected::new("no amounts"));
                 }
                 amounts
                     .into_iter()
                     .map(|amount_cents| {
                         if amount_cents <= 0 {
-                            return Err(Rejected("amount must be positive"));
+                            return Err(Rejected::new("amount must be positive"));
                         }
                         Ok(MoneyDeposited {
                             amount_cents,
@@ -222,32 +301,39 @@ impl Aggregate for Account {
             }
             C::Withdraw { amount_cents } => {
                 if amount_cents <= 0 {
-                    return Err(Rejected("amount must be positive"));
+                    return Err(Rejected::new("amount must be positive"));
                 }
                 if amount_cents > self.balance_cents {
-                    return Err(Rejected("insufficient funds"));
+                    return Err(Rejected {
+                        reason: "insufficient funds",
+                        details: Some(serde_json::json!({
+                            "balanceCents": self.balance_cents,
+                            "requestedCents": amount_cents,
+                        })),
+                    });
                 }
                 Ok(vec![MoneyWithdrawn { amount_cents }.into()])
             }
             C::Tag { tags } => {
                 if tags.is_empty() {
-                    return Err(Rejected("no tags"));
+                    return Err(Rejected::new("no tags"));
                 }
                 Ok(vec![AccountTagged { tags }.into()])
             }
             C::SetLabels { labels } => {
                 if labels.is_empty() {
-                    return Err(Rejected("no labels"));
+                    return Err(Rejected::new("no labels"));
                 }
                 Ok(vec![AccountLabeled { labels }.into()])
             }
             C::Rename { owner } => {
                 if owner.is_empty() {
-                    return Err(Rejected("owner is required"));
+                    return Err(Rejected::new("owner is required"));
                 }
                 Ok(vec![AccountRenamed { owner }.into()])
             }
             C::Close { reason } => Ok(vec![AccountClosed { reason }.into()]),
+            C::Ping | C::Balance => Ok(Vec::new()),
         }
     }
 
