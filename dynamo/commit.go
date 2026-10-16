@@ -44,15 +44,22 @@ func (repo *Repository) Commit(
 		return err
 	}
 
-	// Fences are refused outright for entity types durably declared with retention: TTL deletes
-	// reopen fenced slots without leaving a successor snapshot, so the two checks cannot protect
-	// them. The manifest is read from the table, not from this instance's configuration.
+	// Fences are refused outright for entity types with retention: TTL deletes reopen fenced
+	// slots without leaving a successor snapshot, so the two checks cannot protect them. The
+	// refusal is the union of this repository's own WithRetention configuration, which needs no
+	// I/O, and the durable manifest read from the table, which binds writers configured
+	// differently. Declare retained types in the marker too, so other processes refuse them.
 	if len(normalized.Fences) > 0 {
+		retained := func(entityType evt.EntityType) bool { return repo.retention[entityType] > 0 }
+		if ferr := evt.CheckFenceRetentionWith(normalized.Fences, nil, retained); ferr != nil {
+			return ferr
+		}
+
 		manifest, merr := repo.features.Manifest(ctx)
 		if merr != nil {
 			return merr
 		}
-		if ferr := evt.CheckFenceRetention(normalized.Fences, manifest); ferr != nil {
+		if ferr := evt.CheckFenceRetentionWith(normalized.Fences, manifest, retained); ferr != nil {
 			return ferr
 		}
 	}
@@ -331,6 +338,13 @@ func (repo *Repository) CommitStream(
 	for result := range channel {
 		serializedResult, err := result.Unwrap()
 		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		// The batch path writes events and projector operations only. An entry carrying
+		// snapshots or read fences fails closed instead of having them silently dropped.
+		if err = evt.CheckBatchEntry(serializedResult); err != nil {
 			errs = append(errs, err)
 			continue
 		}

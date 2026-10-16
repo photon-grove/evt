@@ -172,7 +172,9 @@ Multi-stream transactions and read fences (C1/C2) land in v0.9.0 without a new i
 streams and snapshots at once and the engine pins their order bytewise by stream ID. A
 `SerializedResult.Fences` entry pins a read-only stream to the head it was observed at — the
 commit fails with `*evt.FenceConflictError` when another writer (or a compaction) moves it —
-and fences for entity types durably declared with retention are refused. Every commit, single
+and fences for entity types with retention are refused (the union of the repository's own
+`WithRetention` configuration and the feature marker's durable retention set; declare retained
+types in the marker so every process refuses them). Every commit, single
 or multi-stream, is checked against the shared 100-item / 3.8 MB / 380 KB budget and fails with
 `*evt.CommitTooLargeError` before any write, on every backend. The budget counts the actions a
 commit actually emits, so a single-stream commit leaves room for 98 events and projector

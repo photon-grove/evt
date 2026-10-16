@@ -112,6 +112,33 @@ func CheckProjectorOperations(result SerializedResult) error {
 	return &ProjectorOnlyCommitError{Operations: operations}
 }
 
+// UnsupportedBatchEntryError refuses a SerializedResult sent through the deprecated CommitStream
+// batch path that carries Snapshots or Fences. The batch path writes events (and projector
+// operations) only, so it would drop them silently; commit such a result with Repository.Commit
+// instead. Nothing from the entry was written.
+type UnsupportedBatchEntryError struct {
+	Snapshots int
+	Fences    int
+}
+
+func (e *UnsupportedBatchEntryError) Error() string {
+	return fmt.Sprintf(
+		"CommitStream entry carries %d snapshots and %d read fences, which the batch path cannot honor; use Repository.Commit",
+		e.Snapshots, e.Fences,
+	)
+}
+
+// CheckBatchEntry returns *UnsupportedBatchEntryError for a result with Snapshots or Fences. A
+// legacy batch path that does not route each entry through Repository.Commit calls it before
+// batching, so it fails closed instead of dropping the new fields.
+func CheckBatchEntry(result SerializedResult) error {
+	if len(result.Snapshots) == 0 && len(result.Fences) == 0 {
+		return nil
+	}
+
+	return &UnsupportedBatchEntryError{Snapshots: len(result.Snapshots), Fences: len(result.Fences)}
+}
+
 // NormalizeCommit validates a transactional commit and returns a normalized copy: events sorted
 // bytewise by stream ID (the pinned transaction order), snapshots and fences likewise, fences
 // for written streams dropped (the event put at head + 1 supersedes them), and stream-local
@@ -189,15 +216,22 @@ func compareID(a, b EntityID) int {
 }
 
 // CheckFenceRetention refuses fences for entity types in the durable manifest's retention set.
-// The set is read from the manifest, never from the calling instance's configuration, so the
-// refusal does not depend on every writer being configured alike. A nil manifest declares
-// nothing and refuses nothing.
+// The set is read from the manifest, so the refusal binds writers that configured no retention
+// themselves. A nil manifest declares nothing and refuses nothing. Use CheckFenceRetentionWith to
+// also refuse the types a repository was locally configured to expire.
 func CheckFenceRetention(fences []ReadFence, manifest *FeatureManifest) error {
-	if manifest == nil {
-		return nil
-	}
+	return CheckFenceRetentionWith(fences, manifest, nil)
+}
+
+// CheckFenceRetentionWith refuses fences whose entity type is in the durable manifest's retention
+// set or reports true from locallyRetained, the repository's own retention configuration. The two
+// are a union: local configuration protects a writer whose types were never declared in the
+// manifest, and the manifest protects against writers configured differently. A nil
+// locallyRetained consults the manifest only.
+func CheckFenceRetentionWith(fences []ReadFence, manifest *FeatureManifest, locallyRetained func(EntityType) bool) error {
 	for _, fence := range fences {
-		if slices.Contains(manifest.Retention, fence.EntityType) {
+		durable := manifest != nil && slices.Contains(manifest.Retention, fence.EntityType)
+		if durable || (locallyRetained != nil && locallyRetained(fence.EntityType)) {
 			return &RetentionConflictError{EntityType: fence.EntityType}
 		}
 	}

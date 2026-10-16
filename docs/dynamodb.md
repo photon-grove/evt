@@ -129,6 +129,14 @@ individually, so an older prefix can disappear while newer events remain. Use
 retention only for streams never replayed and never appended after becoming
 terminal. For accumulating streams, keep a snapshot and use [compaction](#compaction).
 
+**Read fences refuse retained types.** TTL deletion reopens a fenced slot without leaving a
+successor snapshot, so a fence on a retained entity type is refused with a retention conflict.
+The refusal is the union of two sources: this repository's own `WithRetention` configuration
+(checked without any I/O) and the retention set in the durable feature marker. Local
+configuration alone protects only this process. Also declare each retained type in the marker
+(`FeatureMarker.Declare`, adding it to `Retention`) so every other writer refuses fences on it too;
+the Rust crate's `with_retention` follows the same rule.
+
 ## Entity-views table
 
 Read models live in their own table, separate from the log:

@@ -122,6 +122,13 @@ impl DynamoRepository {
         &self.table
     }
 
+    /// Reports whether this repository was configured to expire the entity type's rows.
+    fn retains(&self, entity_type: &EntityType) -> bool {
+        self.retention
+            .get(entity_type)
+            .is_some_and(|duration| !duration.is_zero())
+    }
+
     fn ttl_for(&self, entity_type: &EntityType) -> Option<i64> {
         let retention = self.retention.get(entity_type)?;
 
@@ -694,6 +701,11 @@ impl Repository for DynamoRepository {
             return Ok(());
         }
 
+        // Fences are refused for entity types this repository was configured to expire: it needs
+        // no I/O, so it runs first. The durable manifest's retention set is checked in the loop,
+        // and the refusal is the union of the two.
+        commit.check_retention(None, |entity_type| self.retains(entity_type))?;
+
         let mut revalidations = 0;
 
         loop {
@@ -706,7 +718,8 @@ impl Repository for DynamoRepository {
             // marker check fails, and the retry must see the type it now declares.
             if !commit.fences.is_empty() {
                 let manifest = self.read_manifest().await?;
-                commit.check_retention(manifest.as_ref())?;
+                commit
+                    .check_retention(manifest.as_ref(), |entity_type| self.retains(entity_type))?;
             }
 
             let (items, layout) = self.transaction_stream_items(&commit, cached)?;
@@ -1962,6 +1975,42 @@ mod tests {
         assert!(matches!(
             crate::repository::check_budget(sizes),
             Err(Error::CommitTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fences_for_locally_retained_types_are_refused_without_a_manifest() {
+        let repository = offline_repository()
+            .with_retention("scratch", Duration::from_secs(60))
+            .with_retention("disabled", Duration::ZERO);
+
+        let fenced = |entity_type: &str| {
+            let mut commit = crate::TransactionCommit::<TransactWriteItem>::new(Vec::new());
+            commit.fences = vec![crate::ReadFence::new(
+                "watched",
+                entity_type,
+                EventSequence(0),
+                crate::FenceProvenance::Engine,
+            )];
+
+            commit
+        };
+
+        // The refusal needs no manifest read: the offline client could not make one.
+        let error = repository
+            .commit_transaction(fenced("scratch"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::RetentionConflict { entity_type } if entity_type.as_str() == "scratch"),
+            "{error:?}"
+        );
+
+        // A zero duration disables retention, so it is not refused here (the commit then needs
+        // the table, which this offline repository lacks).
+        assert!(!matches!(
+            repository.commit_transaction(fenced("disabled")).await,
+            Err(Error::RetentionConflict { .. })
         ));
     }
 

@@ -204,7 +204,7 @@ impl Repository for MemRepository {
         self.check_manifest(stored_manifest.as_ref())?;
 
         // Fences are refused for entity types durably declared with retention.
-        commit.check_retention(stored_manifest.as_ref())?;
+        commit.check_retention(stored_manifest.as_ref(), |_| false)?;
 
         let mut streams = self.lock();
 

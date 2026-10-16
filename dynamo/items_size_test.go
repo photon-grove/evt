@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -12,6 +13,7 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/internal/compat"
+	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // projectorGroup is a DynamoDB projector group carrying arbitrary write items.
@@ -134,4 +136,76 @@ func TestCommit_NamesTheStreamWhoseItemFailed(t *testing.T) {
 	require.ErrorContains(t, err, "stream name-d")
 	require.NotContains(t, err.Error(), "name-c")
 	require.NotContains(t, err.Error(), "name-e")
+}
+
+func TestCommitStream_FailsClosedOnSnapshotsAndFences(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	repo := dynamo.NewRepository(fake, "events")
+
+	event := func(id string) evt.SerializedEvent {
+		return evt.SerializedEvent{
+			ID: evt.GetEventID(evt.EntityID(id), 1), Sequence: 1, Type: "t:created", Version: 1,
+			EntityID: evt.EntityID(id), EntityType: "t", Payload: []byte(`{}`),
+		}
+	}
+
+	entries := []evt.SerializedResult{
+		{
+			Events: []evt.SerializedEvent{event("batch-snapshot")},
+			Snapshots: []evt.SerializedSnapshot{{
+				EntityType: "t", EntityID: "batch-snapshot", Sequence: 1, EventSequence: 1, Payload: []byte(`{}`),
+			}},
+		},
+		{
+			Events: []evt.SerializedEvent{event("batch-fence")},
+			Fences: []evt.ReadFence{{EntityID: "batch-watched", EntityType: "t", Head: 0}},
+		},
+		{Events: []evt.SerializedEvent{event("batch-plain")}},
+	}
+
+	channel := make(chan result.Result[evt.SerializedResult], len(entries))
+	for _, entry := range entries {
+		channel <- result.Ok(entry)
+	}
+	close(channel)
+
+	errs := repo.CommitStream(ctx, channel)
+
+	require.Len(t, errs, 2)
+	var unsupported *evt.UnsupportedBatchEntryError
+	require.ErrorAs(t, errs[0], &unsupported)
+	require.Equal(t, 1, unsupported.Snapshots)
+	require.ErrorAs(t, errs[1], &unsupported)
+	require.Equal(t, 1, unsupported.Fences)
+
+	require.Empty(t, fake.Items("batch-snapshot"), "the refused entries wrote nothing")
+	require.Empty(t, fake.Items("batch-fence"))
+	require.NotEmpty(t, fake.Items("batch-plain"), "an ordinary entry still commits")
+}
+
+func TestCommit_RefusesFencesForLocallyRetainedTypesWithoutAManifest(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	repo := dynamo.NewRepository(fake, "events").WithRetention(dynamo.Retention{"scratch": time.Hour})
+
+	fenced := func(entityType evt.EntityType) evt.SerializedResult {
+		return evt.SerializedResult{
+			Events: []evt.SerializedEvent{{
+				ID: "retained-writer:1", Sequence: 1, Type: "t:created", Version: 1,
+				EntityID: "retained-writer", EntityType: "t", Payload: []byte(`{}`),
+			}},
+			Fences: []evt.ReadFence{{EntityID: "retained-watched", EntityType: entityType}},
+		}
+	}
+
+	// No manifest exists, yet the repository's own WithRetention refuses the fence.
+	err := repo.Commit(ctx, fenced("scratch"))
+	var refused *evt.RetentionConflictError
+	require.ErrorAs(t, err, &refused)
+	require.Equal(t, evt.EntityType("scratch"), refused.EntityType)
+	require.Empty(t, fake.Transactions(), "refused before any request")
+
+	// A type outside the policy is still fenceable.
+	require.NoError(t, repo.Commit(ctx, fenced("plain")))
 }

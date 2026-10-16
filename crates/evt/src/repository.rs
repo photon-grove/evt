@@ -371,12 +371,17 @@ impl<Op> TransactionCommit<Op> {
             .filter(|f| !self.streams.iter().any(|s| s.entity_id == f.entity_id))
     }
 
+    /// Refuses fences for entity types in the durable manifest's retention set or retained by the
+    /// repository's own configuration (`locally_retained`): the union of the two.
     pub(crate) fn check_retention(
         &self,
         manifest: Option<&crate::FeatureManifest>,
+        locally_retained: impl Fn(&EntityType) -> bool,
     ) -> Result<(), Error> {
         for fence in &self.fences {
-            if manifest.is_some_and(|m| m.retention.contains(fence.entity_type.as_str())) {
+            let durable =
+                manifest.is_some_and(|m| m.retention.contains(fence.entity_type.as_str()));
+            if durable || locally_retained(&fence.entity_type) {
                 return Err(Error::RetentionConflict {
                     entity_type: fence.entity_type.clone(),
                 });

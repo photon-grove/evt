@@ -549,11 +549,14 @@ the same commit**, both checks are omitted: the event put at `head + 1` and that
 or snapshot condition supersede them.
 
 **Retention conflicts with fences (v0.9, C2, C9).** Fences are refused outright for entity types
-in the feature manifest's durable `retention` set ([Feature Marker](#feature-marker)), with a
-typed `RetentionConflict` error returned before any write — in both languages, regardless of
-backend. The set is **durable**, not the calling instance's configuration: an instance that
-configured no retention still refuses fences for a type another instance declared, so the
-refusal does not depend on every writer being configured alike. Retention deletes event items by
+that have retention, with a typed `RetentionConflict` error returned before any write — in both
+languages, regardless of backend. The refusal is the **union** of two sources: the feature
+manifest's durable `retention` set ([Feature Marker](#feature-marker)), and the repository's own
+retention configuration (`WithRetention` in Go, `with_retention` in Rust), which needs no I/O. The
+durable set binds writers configured differently: an instance that configured no retention still
+refuses fences for a type another instance declared. The local configuration protects a writer
+whose retained types were never declared; it cannot protect any other process, so declare every
+retained type in the marker as well. Retention deletes event items by
 TTL — possibly the item at `head + 1`, possibly an event and its TTL-bearing snapshot together —
 without a newer snapshot ever covering them, and the deletion reopens the fenced slot: both
 checks can pass while the stream has in fact moved. The snapshot companion closes the compaction

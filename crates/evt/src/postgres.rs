@@ -583,7 +583,7 @@ impl Repository for PostgresRepository {
         // Fences are refused for entity types durably declared with retention: TTL deletes reopen
         // fenced slots without leaving a successor snapshot. The refusal consults the manifest in
         // this transaction, not this instance's configuration.
-        commit.check_retention(manifest.as_ref())?;
+        commit.check_retention(manifest.as_ref(), |_| false)?;
 
         let insert = format!(
             "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
