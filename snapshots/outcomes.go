@@ -203,7 +203,15 @@ func (store *Store) executeOutcome(
 	}
 
 	if len(result.Events) == 0 {
-		outcome, cerr := cmd.commit(ctx, evt.SerializedResult{}, evt.OutcomeAccepted, result.Response, nil)
+		// Projector operations without an event are never silently dropped: the commit keeps them
+		// so the shared validation refuses them (ProjectorOnlyCommitError) before any write.
+		outcome, cerr := cmd.commit(
+			ctx,
+			evt.SerializedResult{Transaction: result.Transaction}, //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+			evt.OutcomeAccepted,
+			result.Response,
+			nil,
+		)
 
 		return executed{outcome: outcome}, cerr
 	}

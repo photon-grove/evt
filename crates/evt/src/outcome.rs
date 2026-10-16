@@ -793,7 +793,8 @@ pub(crate) async fn pre_check<R: Repository>(
 /// Resolves the result of a commit that carried an outcome:
 ///
 /// - a lost outcome put ([`Error::OutcomeConflict`]) resolves through the winner's row;
-/// - an indeterminate failure ([`Error::Backend`]) is recovered by re-reading the row: present with
+/// - an indeterminate failure ([`Error::Indeterminate`], which backends return only for a commit
+///   whose result is genuinely unknown) is recovered by re-reading the row: present with
 ///   the same digest, the commit won; another digest, [`Error::IdempotencyKeyReuse`]; absent,
 ///   [`Error::AmbiguousWrite`] with `not_applied` set, safe to retry. When the re-read itself
 ///   fails, the original error is returned as an `AmbiguousWrite` that is not known to be
@@ -813,7 +814,7 @@ pub(crate) async fn settle<R: Repository>(
                 None => Err(conflict),
             }
         }
-        Err(Error::Backend(source)) => match repository.outcome(command_id).await {
+        Err(Error::Indeterminate(source)) => match repository.outcome(command_id).await {
             Ok(Some(stored)) => Ok(Settled::Replayed(same_command(stored, digest)?)),
             Ok(None) => Err(Error::AmbiguousWrite {
                 command_id: command_id.clone(),

@@ -141,6 +141,9 @@ pub struct Transaction<'a, R: Repository> {
     /// Set when a step failed after an append changed a handle's aggregate, leaving the handle
     /// ahead of what the transaction staged. Further appends and the commit are refused.
     poisoned: bool,
+    /// Set when [`Transaction::begin_command`] returned a replayed outcome: the command already
+    /// ran, so the transaction is finished and every further call is refused.
+    finished: bool,
     /// Set by [`Transaction::with_outcomes`] or [`Store::with_outcomes`].
     outcomes: Option<OutcomeConfig>,
     /// The command fixed by [`Transaction::begin_command`].
@@ -200,6 +203,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             streams: Vec::new(),
             fences: Vec::new(),
             poisoned: false,
+            finished: false,
             outcomes: None,
             command: None,
         }
@@ -239,16 +243,25 @@ impl<'a, R: Repository> Transaction<'a, R> {
         let config = self.outcomes.as_ref().ok_or_else(|| {
             Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
         })?;
+        self.check_open()?;
         if self.command.is_some() {
             return Err(Error::InvalidCommit(
                 "begin_command was already called on this transaction".into(),
             ));
+        }
+        if !self.streams.is_empty() || !self.fences.is_empty() {
+            return Err(Error::CommandOrder {
+                reason: "begin_command must be the first operation on a transaction, before any \
+                         read, append, or fence",
+            });
         }
 
         let command_id = require_command_id(metadata)?;
         let digest = config.digest(&identity.digest_input(metadata))?;
 
         if let Some(stored) = pre_check(self.repository, &command_id, &digest).await? {
+            self.finished = true;
+
             return Ok(Begin::Replayed(Box::new(CommandOutcome::replay(stored))));
         }
 
@@ -278,6 +291,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         entity_id: impl Into<EntityId>,
     ) -> Result<Read<A, R::Operation>, Error> {
         let entity_id = entity_id.into();
+        self.check_open()?;
         self.check_unread(&entity_id)?;
 
         let loaded = load_aggregate::<A, R>(self.repository, entity_id).await?;
@@ -290,6 +304,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         &mut self,
         loaded: Loaded<A>,
     ) -> Result<Read<A, R::Operation>, Error> {
+        self.check_open()?;
         self.check_unread(loaded.entity_id())?;
 
         self.streams.push(StreamState {
@@ -310,6 +325,17 @@ impl<'a, R: Repository> Transaction<'a, R> {
             projectors: None,
             loaded,
         })
+    }
+
+    /// Refuses further work on a transaction whose command already ran (a replayed outcome).
+    fn check_open(&self) -> Result<(), Error> {
+        if self.finished {
+            return Err(Error::CommandOrder {
+                reason: "the command replayed a stored outcome, so this transaction is finished",
+            });
+        }
+
+        Ok(())
     }
 
     fn check_unread(&self, entity_id: &EntityId) -> Result<(), Error> {
@@ -372,6 +398,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
                 read.loaded.entity_id
             )));
         }
+        self.check_open()?;
         if self.poisoned {
             return Err(Error::TransactionPoisoned);
         }
@@ -493,6 +520,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
     /// dropped, whether `fence` is called before or after `read`: the engine's own fence
     /// provenance supersedes it.
     pub fn fence(&mut self, mut fence: ReadFence) -> Result<&mut Self, Error> {
+        self.check_open()?;
         if self
             .streams
             .iter()
@@ -602,6 +630,16 @@ impl<'a, R: Repository> Transaction<'a, R> {
             return Err(Error::TransactionPoisoned);
         }
 
+        // A pre-v0.9 event in a stream this command read already carries its ID without an
+        // outcome row: the command ran, so no terminal rejection is recorded for it.
+        if self
+            .streams
+            .iter()
+            .any(|stream| stream.seen_command_ids.contains(&pending.command_id))
+        {
+            return Err(Error::DuplicateCommand(pending.command_id));
+        }
+
         let streams = std::mem::take(&mut self.streams);
         let mut fences: Vec<ReadFence> = streams
             .into_iter()
@@ -649,6 +687,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
     }
 
     fn take_command(&mut self) -> Result<PendingCommand, Error> {
+        self.check_open()?;
         if self.outcomes.is_none() {
             return Err(Error::InvalidConfig(
                 "command outcomes are not enabled; call with_outcomes".into(),
@@ -1816,5 +1855,120 @@ mod tests {
             tx.commit_with_outcome(None).await,
             Err(Error::DuplicateCommand(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn begin_command_must_be_the_first_operation_on_a_transaction() {
+        let store = outcome_store();
+
+        for stage in ["read", "fence"] {
+            let mut tx = store.transaction();
+            match stage {
+                "read" => {
+                    tx.read::<Ledger>("a").await.unwrap();
+                }
+                _ => {
+                    tx.fence(crate::ReadFence::new(
+                        "z",
+                        "ledger",
+                        EventSequence(0),
+                        FenceProvenance::Caller,
+                    ))
+                    .unwrap();
+                }
+            }
+
+            assert!(
+                matches!(
+                    tx.begin_command(&identity("a"), &command("c")).await,
+                    Err(Error::CommandOrder { .. })
+                ),
+                "begin_command after a {stage} is refused"
+            );
+        }
+
+        // Nothing was recorded or fixed by the refused call.
+        assert!(
+            store
+                .repository()
+                .outcome(&"c".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_command_finishes_the_transaction() {
+        let store = outcome_store();
+        store
+            .execute_with_outcome("a", Add(1), command("done"))
+            .await
+            .unwrap();
+
+        let mut tx = store.transaction();
+        let begun = tx
+            .begin_command(
+                &CommandIdentity::new("ledger:add")
+                    .with_streams(["a"])
+                    .with_payload(&1_i64)
+                    .unwrap(),
+                &command("done"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(begun, Begin::Replayed(_)), "{begun:?}");
+
+        // The command already ran: no further begin, read, append, fence, or commit is accepted,
+        // so the staged work can never be recorded under another command's outcome.
+        assert!(matches!(
+            tx.begin_command(&identity("a"), &command("other")).await,
+            Err(Error::CommandOrder { .. })
+        ));
+        assert!(matches!(
+            tx.read::<Ledger>("a").await,
+            Err(Error::CommandOrder { .. })
+        ));
+        assert!(matches!(
+            tx.fence(crate::ReadFence::new(
+                "z",
+                "ledger",
+                EventSequence(0),
+                FenceProvenance::Caller
+            )),
+            Err(Error::CommandOrder { .. })
+        ));
+        assert!(matches!(
+            tx.commit_with_outcome(None).await,
+            Err(Error::CommandOrder { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rejection_of_a_pre_outcome_command_id_is_a_duplicate_not_a_terminal_rejection() {
+        let store = outcome_store();
+        let plain =
+            Store::<Ledger, _>::new(store.repository().clone(), ()).with_snapshot_interval(0);
+        plain.execute("a", Add(1), command("legacy")).await.unwrap();
+
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("a"), &command("legacy"))
+            .await
+            .unwrap();
+        tx.read::<Ledger>("a").await.unwrap();
+
+        assert!(matches!(
+            tx.reject(Rejection::new("invalid", "nope")).await,
+            Err(Error::DuplicateCommand(_))
+        ));
+        assert!(
+            store
+                .repository()
+                .outcome(&"legacy".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "no terminal rejection is recorded for a command that already ran"
+        );
     }
 }

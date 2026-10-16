@@ -289,6 +289,13 @@ error before any write and is never split.
   different digest is `IdempotencyKeyReuse` carrying the stored outcome, and is never stored. The
   stored digest is computed before execution from the command's identity alone (SHA-256 over the
   type, the sorted declared target streams, the canonical payload JSON, and the principal)
+- Before any outcome is recorded — accepted, rejected, or stale-fence — the load-time duplicate
+  window of the streams the command read is applied: a pre-v0.9 event that carries this command ID
+  is a duplicate (`DuplicateCommandError` / `Error::DuplicateCommand`), and no terminal outcome is
+  written for a command that already ran
+- A multi-stream command begins with the outcome pre-check (`BeginCommand` /
+  `Transaction::begin_command`) before any read, append, or fence; a transaction whose pre-check
+  returned a stored outcome is finished and accepts no further work
 - This check covers command IDs folded into snapshots and compacted away; on an upgraded log the
   load-time event window remains the only guard for pre-v0.9 IDs
 - A lost outcome put is never a generic optimistic-concurrency conflict and is never resolved by
@@ -296,6 +303,11 @@ error before any write and is never split.
   commit's classification, so the engine resolves it by re-reading the row. An ordinary conflict
   of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
   returns the winner's outcome
+- Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
+  cancelled context, a dispatch or connection failure, a truncated response, a 5xx or server fault,
+  a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust
+  `Error::Indeterminate`). A definitive failure (validation, a missing table or relation,
+  authorization, a constraint error other than the outcome-row conflict) is returned as is
 - After an indeterminate commit failure (timeout, lost connection, server fault) the engine
   re-reads the row: present with the same digest returns the stored outcome, a different digest is
   `IdempotencyKeyReuse`, absent proves the commit did not apply and is returned as a retryable
@@ -319,7 +331,9 @@ error before any write and is never split.
   that write no outcome, so a retry after the fix starts clean. An oversized rejection fails with
   `OutcomeTooLarge` and writes nothing
 - A command that produces zero events is an accepted outcome with no events (still storing any
-  response), not an error. Outcome-only commits carry the feature-marker check and, for a
+  response), not an error; if it carries projector operations (the deprecated
+  `CommandResult.Transaction`) it is refused with `ProjectorOnlyCommitError` and nothing is
+  written. Outcome-only commits carry the feature-marker check and, for a
   multi-stream transaction, the fence checks of its reads; the single-aggregate shortcut has no
   fences to check
 - A failed caller-stamped fence is persisted as a `stale-fence` rejection by an outcome-only

@@ -256,6 +256,12 @@ func (tx *Transaction) finish(
 		return nil, err
 	}
 
+	// A pre-v0.9 event in a stream this command read already carries its ID without an outcome
+	// row: the command ran, so no outcome — accepted, rejected, or stale-fence — is recorded for it.
+	if err := tx.checkLegacyDuplicate(); err != nil {
+		return nil, err
+	}
+
 	metadata := evt.CommitMetadata(tx.command.metadata)
 
 	var (
@@ -278,6 +284,19 @@ func (tx *Transaction) finish(
 	}
 
 	return outcome, err
+}
+
+// checkLegacyDuplicate applies the load-time duplicate window of the streams the transaction read.
+func (tx *Transaction) checkLegacyDuplicate() error {
+	id := tx.command.id
+
+	for _, entityID := range tx.order {
+		if tx.streams[entityID].context.HasCommandID(id) {
+			return evt.NewDuplicateCommandError(id)
+		}
+	}
+
+	return nil
 }
 
 // staleFence records the engine's stale-fence rejection: a caller-stamped fence went stale, so the

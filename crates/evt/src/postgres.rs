@@ -643,7 +643,9 @@ impl Repository for PostgresRepository {
             self.insert_outcome(&tx, outcome).await?;
         }
 
-        tx.commit().await.map_err(commit_error)
+        tx.commit()
+            .await
+            .map_err(|err| commit_error(err, outcome.is_some()))
     }
 
     async fn commit_transaction(
@@ -826,7 +828,9 @@ impl Repository for PostgresRepository {
             self.insert_outcome(&tx, outcome).await?;
         }
 
-        tx.commit().await.map_err(commit_error)
+        tx.commit()
+            .await
+            .map_err(|err| commit_error(err, outcome.is_some()))
     }
 
     /// Reads the outcome row. PostgreSQL reads are transactionally consistent, so no flag is
@@ -1092,11 +1096,17 @@ fn projector_error(err: tokio_postgres::Error) -> Error {
 
 /// Maps a failed `COMMIT`. The event inserts and the snapshot upsert check their own keys, so an
 /// integrity violation raised at commit comes from a deferred constraint on a projector's table.
-fn commit_error(err: tokio_postgres::Error) -> Error {
+/// An error the database did not raise (the connection dropped while `COMMIT` was in flight) leaves
+/// it unknown whether the transaction applied: for a commit that carries an outcome that is
+/// [`Error::Indeterminate`], which the store settles by re-reading the outcome row. A database
+/// error is a definitive refusal.
+fn commit_error(err: tokio_postgres::Error, carries_outcome: bool) -> Error {
     if transient(&err) {
         Error::Transient(Box::new(err))
     } else if err.code().is_some_and(|code| code.code().starts_with("23")) {
         Error::Projector(Box::new(err))
+    } else if carries_outcome && err.as_db_error().is_none() {
+        Error::Indeterminate(Box::new(err))
     } else {
         Error::backend(err)
     }

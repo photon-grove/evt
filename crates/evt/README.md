@@ -144,10 +144,12 @@ implements `ToRejection`:
   starts clean.
 - A command that decides no events is an accepted no-op, and a response (at most 65536 bytes) is
   stored with the outcome. See `Store::execute_with_response`.
-- A commit whose result is unknown (`Error::Backend`) is settled by re-reading the outcome row, never
+- A commit whose result is unknown (`Error::Indeterminate`: a timeout, a dropped connection, a server fault; a definitive refusal such as a validation or authorization error stays `Error::Backend` and is not recovered) is settled by re-reading the outcome row, never
   by running the handler again: the stored outcome comes back with `replayed` set, or
   `Error::AmbiguousWrite { not_applied: true, .. }` says it is safe to retry with the same ID.
-- `Store::transaction` records multi-stream commands with `Transaction::begin_command`, then
+- `Store::transaction` records multi-stream commands with `Transaction::begin_command`, which must
+  be the first call on the transaction (`Error::CommandOrder` after any read, append, or fence; a
+  replayed result finishes the transaction), then
   `commit_with_outcome` or `reject`. A failed caller-stamped fence persists a `stale-fence`
   rejection instead of retrying; the remedy is a new command ID.
 

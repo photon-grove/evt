@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/photon-grove/evt"
 )
@@ -86,24 +91,39 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 }
 
 // indeterminateCommit reports whether a TransactWriteItems failure leaves the caller unable to
-// know whether the transaction applied: a timeout, a lost connection or response, or a server
-// fault. A definitive refusal — a cancelled transaction (its reasons are known), throttling, or a
-// client-side validation or authorization error — means nothing was written.
+// know whether the transaction applied: a timeout or cancelled context, a connection or dispatch
+// failure, a truncated response, a 5xx, or a server fault. Everything else is a definitive
+// refusal and is returned as is, never recovered: a cancelled transaction (its reasons are
+// known), throttling, a client-side validation, missing-table, or authorization error, a request
+// that could not be built or signed.
 func indeterminateCommit(err error) bool {
 	var canceled *types.TransactionCanceledException
 	if err == nil || errors.As(err, &canceled) {
 		return false
 	}
 
-	// Client faults (validation, access, throttling) are refused before anything is written. A
-	// server fault may follow a partially processed request.
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.ErrorFault() != smithy.FaultClient
+		switch apiErr.ErrorCode() {
+		case "InternalServerError", "ServiceUnavailable", "TransactionInProgressException",
+			"IdempotentParameterMismatchException":
+			return true
+		}
+
+		// Client faults (validation, access, throttling, a missing table) are refused before
+		// anything is written.
+		return apiErr.ErrorFault() == smithy.FaultServer
 	}
 
-	// Anything else — a deadline, a cancelled context, a reset connection, a truncated response —
-	// is indeterminate. Recovery is a single consistent read, so an unnecessary one is harmless
-	// where a missed one would report a committed command as failed.
-	return true
+	var response *awshttp.ResponseError
+	if errors.As(err, &response) && response.HTTPStatusCode() >= http.StatusInternalServerError {
+		return true
+	}
+
+	var send *smithyhttp.RequestSendError
+	var netErr net.Error
+
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.As(err, &send) || errors.As(err, &netErr)
 }

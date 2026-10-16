@@ -842,7 +842,12 @@ A store with outcomes enabled **requires a command ID** on every command; a miss
 programmer error returned before the commit — no outcome row, no events. Stores built without
 outcomes keep the older behavior. The older load-time duplicate window still runs after the
 outcome read misses, and only for command IDs recorded by events with no outcome row (pre-v0.9
-commands); a command executed with outcomes enabled always has its row.
+commands); a command executed with outcomes enabled always has its row. The window check precedes
+recording **any** outcome — an accepted one, a rejection (including the engine's stale-fence
+rejection): a command whose ID a read stream already carries has run, so it is a duplicate and no
+terminal outcome is written for it. A multi-stream command performs the outcome read first, before
+any stream is read, fenced, or appended to, and a transaction whose read returned a stored outcome
+is finished.
 
 **Outcome-only commits and their checks.** An accepted no-op, a persisted rejection, and an
 outcome-only command write no event, snapshot, or floor item. Their transaction is the
@@ -874,10 +879,12 @@ not_applied: true }`), which is retryable: the same command ID runs again from i
 pre-check. If the recovery read itself fails, the error is returned `AmbiguousWrite` without the
 mark. The recovery read does not depend on the caller's cancellation: a context cancelled while the
 commit was in flight is the usual reason the result is unknown. Which failures are indeterminate:
-a commit that carries an outcome and fails with a timeout, a lost connection or response, a server
-fault, or a cancelled context; a definitive refusal (a cancelled transaction with known reasons,
-throttling, a client-side validation or authorization error, a database error at statement or
-`COMMIT` time) is not.
+a commit that carries an outcome and fails with a timeout, a lost connection or response, a dispatch
+failure, a server fault, or a cancelled context, or a PostgreSQL connection dropped while `COMMIT`
+was in flight. Backends classify these themselves (Go `*AmbiguousWriteError` from the backend, Rust
+`Error::Indeterminate`), and only they are recovered. A definitive refusal (a cancelled transaction
+with known reasons, throttling, a validation, missing-table, or authorization error, a database
+error at statement or `COMMIT` time) is returned as is.
 
 `IdempotencyKeyReuse` is returned as an error and is **not stored**: the existing outcome row
 belongs to the first command that claimed the ID, and nothing overwrites it.

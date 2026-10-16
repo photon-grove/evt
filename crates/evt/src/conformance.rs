@@ -2698,7 +2698,7 @@ where
 /// command-outcome cases. It forwards everything, and can be armed to:
 ///
 /// - [apply the next outcome-carrying commit and then fail it](Self::arm_after_apply) with
-///   [`Error::Backend`], the way a timeout or a lost response looks to the caller while the
+///   [`Error::Indeterminate`], the way a timeout or a lost response looks to the caller while the
 ///   transaction really committed;
 /// - [fail the next outcome-carrying commit without applying it](Self::arm_before_apply);
 /// - [commit a rival commit first](Self::race_with), as another writer winning a race between a
@@ -2722,6 +2722,7 @@ struct FaultState<Op> {
 enum Fault {
     AfterApply,
     BeforeApply,
+    Definitive,
 }
 
 impl<R: Repository> FaultInjectingRepository<R> {
@@ -2748,14 +2749,21 @@ impl<R: Repository> FaultInjectingRepository<R> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The next outcome-carrying commit really applies, then fails with [`Error::Backend`].
+    /// The next outcome-carrying commit really applies, then fails with [`Error::Indeterminate`].
     pub fn arm_after_apply(&self) {
         self.state().fault = Some(Fault::AfterApply);
     }
 
-    /// The next outcome-carrying commit fails with [`Error::Backend`] without applying.
+    /// The next outcome-carrying commit fails with [`Error::Indeterminate`] without applying.
     pub fn arm_before_apply(&self) {
         self.state().fault = Some(Fault::BeforeApply);
+    }
+
+    /// The next outcome-carrying commit fails with a plain [`Error::Backend`] without applying: a
+    /// definitive refusal (validation, a missing table, authorization), not an unknown result.
+    /// The store must return it as is, never recover it as an ambiguous write.
+    pub fn arm_definitive_failure(&self) {
+        self.state().fault = Some(Fault::Definitive);
     }
 
     /// Commits `rival` through the wrapped repository just before the next outcome-carrying
@@ -2776,7 +2784,7 @@ impl<R: Repository> FaultInjectingRepository<R> {
     }
 
     fn injected() -> Error {
-        Error::backend("injected fault: the commit's result is unknown")
+        Error::Indeterminate("injected fault: the commit's result is unknown".into())
     }
 }
 
@@ -2798,6 +2806,9 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
                     return Err(Self::injected());
                 }
                 Some(Fault::BeforeApply) => return Err(Self::injected()),
+                Some(Fault::Definitive) => {
+                    return Err(Error::backend("injected fault: the request was refused"));
+                }
                 None => {}
             }
         }
@@ -2823,6 +2834,9 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
                     return Err(Self::injected());
                 }
                 Some(Fault::BeforeApply) => return Err(Self::injected()),
+                Some(Fault::Definitive) => {
+                    return Err(Error::backend("injected fault: the request was refused"));
+                }
                 None => {}
             }
         }
@@ -2922,6 +2936,10 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
     record(
         "a domain rejection is persisted once and replayed verbatim",
         outcome_rejection(repo).await,
+    );
+    record(
+        "a pre-outcome command ID is a duplicate, never a recorded rejection",
+        outcome_legacy_duplicate(repo).await,
     );
     record(
         "an internal handler failure is an error and writes no outcome",
@@ -3169,6 +3187,65 @@ async fn outcome_key_reuse<R: Repository>(repo: &R) -> CaseResult {
     );
     let entries = store.load(&id).await?.aggregate().entries;
     ensure_eq!(entries, 1, "only the first command applied");
+
+    Ok(())
+}
+
+async fn outcome_legacy_duplicate<R: Repository>(repo: &R) -> CaseResult {
+    // An upgraded log: a command recorded before outcomes existed left its ID in an event and no
+    // outcome row. A store without outcomes writes exactly that.
+    let legacy: Store<Ledger, &R> = Store::new(repo, ()).with_snapshot_interval(0);
+    let id = ledger_id();
+    let command = command_id();
+    legacy
+        .execute(&id, Add(5), command_metadata(&command))
+        .await
+        .map_err(|err| Failure(format!("the legacy command: {err}")))?;
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "a legacy command has no outcome row"
+    );
+
+    let store = outcome_store(repo);
+
+    // The single-aggregate path: the window check precedes the handler, so a command that would
+    // be rejected now is a duplicate, and nothing is recorded.
+    let direct = store
+        .execute_with_outcome(&id, Add(0), command_metadata(&command))
+        .await;
+    ensure!(
+        matches!(direct, Err(Error::DuplicateCommand(_))),
+        "the window check precedes the rejection: {direct:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "no terminal rejection was recorded"
+    );
+
+    // The transaction path: a rejection of a command whose ID the read stream already carries.
+    let mut transaction = store.transaction();
+    let identity = CommandIdentity::new("ledger:add");
+    ensure!(
+        matches!(
+            transaction
+                .begin_command(&identity, &command_metadata(&command))
+                .await?,
+            Begin::Proceed
+        ),
+        "no outcome row, so the command proceeds"
+    );
+    transaction.read::<Ledger>(&id).await?;
+    let rejected = transaction
+        .reject(Rejection::new("invalid-amount", "amount must be positive"))
+        .await;
+    ensure!(
+        matches!(rejected, Err(Error::DuplicateCommand(_))),
+        "reject applies the window check: {rejected:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "no terminal rejection was recorded for a command that already ran"
+    );
 
     Ok(())
 }
@@ -3652,6 +3729,25 @@ async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
         prior.digest,
         ledger_digest(&id, 6)?,
         "the prior outcome's digest"
+    );
+
+    // A definitive refusal is not an unknown result: it is returned as is, with no recovery read
+    // and nothing that would make the command run again.
+    let id = ledger_id();
+    let command = command_id();
+    fault.arm_definitive_failure();
+    let error = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await
+        .err();
+    ensure!(
+        matches!(&error, Some(err @ Error::Backend(_)) if !err.is_retryable()),
+        "a definitive backend error is returned as is, not recovered: {error:?}"
+    );
+    ensure!(repo.events(&id).await?.is_empty(), "nothing was written");
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "no outcome row exists for a refused commit"
     );
 
     // Recovery that cannot read the row cannot tell: the original failure, not known unapplied.

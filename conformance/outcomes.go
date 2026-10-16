@@ -48,6 +48,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("TransactionOutcomes", func(t *testing.T) { testTransactionOutcomes(t, outcomes(t)) })
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
+	t.Run("LegacyCommandIDWindow", func(t *testing.T) { testLegacyCommandIDWindow(t, outcomes(t)) })
 	t.Run("RejectsReservedOutcomeStreams", func(t *testing.T) { testOutcomeStreamsAreReserved(t, outcomes(t)) })
 
 	if enforcesConcurrency {
@@ -882,6 +883,50 @@ func mustEvents(t *testing.T, repo evt.Repository, id evt.EntityID) []evt.Serial
 	require.NoError(t, err)
 
 	return events
+}
+
+func testLegacyCommandIDWindow(t *testing.T, repo evt.OutcomeRepository) {
+	env := newOutcomeEnv(t, repo, 0)
+	ctx := context.Background()
+
+	// An upgraded log: a command recorded before outcomes existed left its ID on an event and no
+	// outcome row. A store without outcomes writes exactly that.
+	id := env.commandID("legacy")
+	legacy := snapshots.NewStore(repo, 0)
+	require.NoError(t, legacy.Execute(ctx, newLedger(env.id), env.id, &ledgerCommand{Kind: "deposit", Amount: 5}, withCommand(id)))
+	env.requireNoOutcome(t, id)
+
+	// The command ran, so no outcome is recorded for it: not an accepted one, not a rejection that
+	// would then replay forever, and not a stale-fence rejection.
+	_, err := env.run(t, &ledgerCommand{Kind: "withdraw", Amount: 1000}, id)
+	require.True(t, evt.IsDuplicateCommandErr(err), "the single-aggregate path: %v", err)
+	env.requireNoOutcome(t, id)
+
+	identity := evt.CommandIdentity{Type: "ledger:withdraw", Streams: []evt.EntityID{env.id}}
+
+	tx, replayed, err := env.store.BeginCommand(ctx, identity, withCommand(id))
+	require.NoError(t, err)
+	require.Nil(t, replayed)
+	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
+
+	_, err = tx.Reject(ctx, evt.Rejection{Code: "insufficient-funds", Message: "balance is too low"})
+	require.True(t, evt.IsDuplicateCommandErr(err), "a rejection: %v", err)
+	env.requireNoOutcome(t, id)
+
+	referral := evt.EntityID(env.ns + "-referral")
+	tx, _, err = env.store.BeginCommand(ctx, identity, withCommand(id))
+	require.NoError(t, err)
+	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
+	require.NoError(t, tx.Fence(evt.ReadFence{EntityID: referral, EntityType: ledgerType, Head: 0}))
+
+	rival := snapshots.NewStore(repo, 0).WithOutcomes()
+	_, err = rival.ExecuteWithOutcome(ctx, newLedger(referral), referral,
+		&ledgerCommand{Kind: "deposit", Amount: 1}, withCommand(env.commandID("referral")))
+	require.NoError(t, err)
+
+	_, err = tx.Complete(ctx, nil)
+	require.True(t, evt.IsDuplicateCommandErr(err), "a stale caller-stamped fence: %v", err)
+	env.requireNoOutcome(t, id)
 }
 
 func testOutcomeStreamsAreReserved(t *testing.T, repo evt.OutcomeRepository) {

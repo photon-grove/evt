@@ -109,6 +109,17 @@ pub enum Error {
         provenance: crate::repository::FenceProvenance,
     },
 
+    /// A transaction's calls arrived in an order that would detach the work from its command:
+    /// [`begin_command`](crate::Transaction::begin_command) must be the first operation on a
+    /// transaction (before any read, append, or fence), and once it returns
+    /// [`Begin::Replayed`](crate::Begin::Replayed) the transaction is finished, so no further
+    /// begin, read, append, fence, or commit is accepted. Nothing was written.
+    #[error("transaction call order: {reason}")]
+    CommandOrder {
+        /// What the caller did wrong.
+        reason: &'static str,
+    },
+
     /// A transaction carried projector operations but wrote no event. Views are derived state, so
     /// operations without a backing event in the same commit could never be rebuilt by replay.
     /// Nothing was written.
@@ -281,9 +292,18 @@ pub enum Error {
         source: BoxError,
     },
 
-    /// The storage backend failed. When it came from a commit that carried an outcome, the
-    /// commit may or may not have applied; a [`Store`](crate::Store) settles that with an outcome
-    /// read and reports [`Error::AmbiguousWrite`].
+    /// A commit that carries a command outcome failed in a way that leaves it unknown whether the
+    /// transaction applied: a timeout, a lost connection or response, an internal server error, a
+    /// connection dropped during `COMMIT`. Backends return it only for such genuinely indeterminate
+    /// failures of outcome-carrying commits; a [`Store`](crate::Store) settles it by re-reading the
+    /// outcome row and reports [`Error::AmbiguousWrite`]. A definitive failure (validation, a
+    /// missing table or relation, authorization, a constraint error) stays [`Error::Backend`] and
+    /// is never recovered.
+    #[error("commit result unknown: {0}")]
+    Indeterminate(#[source] BoxError),
+
+    /// The storage backend failed. This is a definitive failure, or a failure of a commit that
+    /// carries no outcome (whose result may be unknown but cannot be recovered).
     #[error(transparent)]
     Backend(BoxError),
 }

@@ -820,6 +820,7 @@ impl Repository for DynamoRepository {
                     return Err(classify_transaction_error(
                         &commit.entity_id,
                         operations,
+                        outcome.is_some(),
                         err,
                     ));
                 }
@@ -957,6 +958,7 @@ impl Repository for DynamoRepository {
                     return Err(classify_transaction_error(
                         &entity_at(colliding),
                         layout.operations,
+                        outcome.is_some(),
                         err,
                     ));
                 }
@@ -1545,9 +1547,14 @@ fn failed_items<'a>(codes: &'a [Option<&str>], code: &'a str) -> impl Iterator<I
 /// Maps a failed commit to an error. A failed stream condition or a concurrent transaction is an
 /// optimistic-concurrency conflict, and throttling is transient: `execute_with_retry` retries
 /// both. A failed projector condition is a projector error, so the command is not rerun for it.
+///
+/// A commit that carries an outcome (`carries_outcome`) whose result is genuinely unknown (see
+/// [`commit_result_unknown`]) is [`Error::Indeterminate`], which the store settles by re-reading the
+/// outcome row; every other failure keeps its classification and is never recovered.
 fn classify_transaction_error<R>(
     entity_id: &EntityId,
     operations: usize,
+    carries_outcome: bool,
     err: SdkError<TransactWriteItemsError, R>,
 ) -> Error
 where
@@ -1575,7 +1582,34 @@ where
         // response the transaction may have been applied, and running the command again would
         // write its events twice.
         None if throttled(&err) => Error::Transient(Box::new(err)),
+        None if carries_outcome && commit_result_unknown(&err) => {
+            Error::Indeterminate(Box::new(err))
+        }
         None => Error::backend(err),
+    }
+}
+
+/// Reports whether a failed commit leaves it unknown whether the transaction applied: a timeout, a
+/// connection or dispatch failure, an unparseable response, or a server fault. A definitive refusal
+/// (validation, a missing table, authorization, a cancelled transaction with known reasons) is not.
+fn commit_result_unknown<R>(err: &SdkError<TransactWriteItemsError, R>) -> bool
+where
+    R: std::fmt::Debug + Send + Sync + 'static,
+{
+    match err {
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
+            true
+        }
+        SdkError::ServiceError(service) => matches!(
+            service.err().code(),
+            Some(
+                "InternalServerError"
+                    | "ServiceUnavailable"
+                    | "TransactionInProgressException"
+                    | "IdempotentParameterMismatchException"
+            )
+        ),
+        _ => false,
     }
 }
 
@@ -2407,12 +2441,64 @@ mod tests {
     fn a_timed_out_commit_is_not_retryable() {
         let err = SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost");
 
-        let classified = classify_transaction_error(&EntityId::new("acct-1"), 0, err);
+        let classified = classify_transaction_error(&EntityId::new("acct-1"), 0, false, err);
 
         assert!(
             matches!(classified, Error::Backend(_)),
             "the commit may have landed, so retrying could apply it twice: {classified:?}"
         );
+    }
+
+    #[test]
+    fn only_a_genuinely_unknown_result_of_an_outcome_commit_is_indeterminate() {
+        use aws_sdk_dynamodb::error::ErrorMetadata;
+
+        let entity = EntityId::new("acct-1");
+        let service = |code: &str| {
+            SdkError::<TransactWriteItemsError, ()>::service_error(
+                TransactWriteItemsError::generic(ErrorMetadata::builder().code(code).build()),
+                (),
+            )
+        };
+
+        // Unknown results: a timeout, a server fault, and a transaction still in progress.
+        for unknown in [
+            SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost"),
+            service("InternalServerError"),
+            service("ServiceUnavailable"),
+            service("TransactionInProgressException"),
+        ] {
+            assert!(
+                matches!(
+                    classify_transaction_error(&entity, 0, true, unknown),
+                    Error::Indeterminate(_)
+                ),
+                "an unknown result of an outcome commit is indeterminate"
+            );
+        }
+
+        // Without an outcome there is nothing to recover from: the classification is unchanged.
+        let classified = classify_transaction_error(
+            &entity,
+            0,
+            false,
+            SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost"),
+        );
+        assert!(matches!(classified, Error::Backend(_)), "{classified:?}");
+
+        // Definitive refusals are plain errors, with or without an outcome: recovering them would
+        // turn a request that can never succeed into a retryable ambiguous write.
+        for definitive in [
+            "ValidationException",
+            "ResourceNotFoundException",
+            "AccessDeniedException",
+        ] {
+            let classified = classify_transaction_error(&entity, 0, true, service(definitive));
+            assert!(
+                matches!(classified, Error::Backend(_)),
+                "{definitive} is definitive: {classified:?}"
+            );
+        }
     }
 
     #[test]

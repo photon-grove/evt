@@ -3,11 +3,14 @@ package dynamo_test
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/stretchr/testify/require"
 
 	"github.com/photon-grove/evt"
@@ -176,7 +179,11 @@ func TestGetOutcomeReadsStronglyConsistentlyWhateverTheRepositorySetting(t *test
 
 func TestIndeterminateCommitFailuresAreAmbiguousWrites(t *testing.T) {
 	validation := &smithy.GenericAPIError{Code: "ValidationException", Fault: smithy.FaultClient}
+	missingTable := &smithy.GenericAPIError{Code: "ResourceNotFoundException", Fault: smithy.FaultClient}
+	denied := &smithy.GenericAPIError{Code: "AccessDeniedException", Fault: smithy.FaultClient}
 	server := &smithy.GenericAPIError{Code: "InternalServerError", Fault: smithy.FaultServer}
+	unavailable := &smithy.GenericAPIError{Code: "ServiceUnavailable", Fault: smithy.FaultUnknown}
+	dispatch := &smithyhttp.RequestSendError{Err: errors.New("dial tcp: connection refused")}
 	cancelled := &types.TransactionCanceledException{CancellationReasons: []types.CancellationReason{{Code: strPtr("None")}}}
 
 	tests := []struct {
@@ -187,8 +194,14 @@ func TestIndeterminateCommitFailuresAreAmbiguousWrites(t *testing.T) {
 		{"deadline", context.DeadlineExceeded, true},
 		{"cancelled context", context.Canceled, true},
 		{"server fault", server, true},
-		{"connection failure", errors.New("read: connection reset by peer"), true},
-		{"client fault", validation, false},
+		{"service unavailable", unavailable, true},
+		{"dispatch failure", dispatch, true},
+		{"network error", &net.OpError{Op: "read", Err: errors.New("connection reset by peer")}, true},
+		{"truncated response", io.ErrUnexpectedEOF, true},
+		{"validation error", validation, false},
+		{"missing table", missingTable, false},
+		{"authorization error", denied, false},
+		{"unrecognized failure", errors.New("failed to sign request"), false},
 		{"cancelled transaction", cancelled, false},
 	}
 
