@@ -209,6 +209,17 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 		compare("events", observed.Events, expected.Events)
 		compare("snapshot", deref(observed.Snapshot), deref(expected.Snapshot))
 
+		// Every other stream the scenario touches, written or only fenced.
+		for _, sibling := range expected.Siblings {
+			observedSibling, err := compat.ObserveSibling(ctx, runner, sibling.EntityID)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", scenario.Name, err)
+			}
+
+			compare("sibling "+string(sibling.EntityID)+" events", observedSibling.Events, sibling.Events)
+			compare("sibling "+string(sibling.EntityID)+" snapshot", deref(observedSibling.Snapshot), deref(sibling.Snapshot))
+		}
+
 		if b.dynamo != nil {
 			items, err := partitionItems(ctx, b, string(expected.EntityID))
 			if err != nil {
@@ -228,6 +239,14 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 				messages = append(messages, message)
 			}
 			compare("sns messages", messages, expected.SNSMessages)
+
+			for _, sibling := range expected.Siblings {
+				siblingItems, err := partitionItems(ctx, b, string(sibling.EntityID))
+				if err != nil {
+					return nil, err
+				}
+				compare("sibling "+string(sibling.EntityID)+" dynamo items", normalize(siblingItems), normalize(sibling.DynamoItems))
+			}
 		}
 
 		if b.postgres != nil {
@@ -236,13 +255,28 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 				return nil, err
 			}
 
-			wantRows, wantSnapshot, err := expectedRows(expected)
+			wantRows, wantSnapshot, err := expectedRows(expected.Events, expected.Snapshot)
 			if err != nil {
 				return nil, err
 			}
 
 			compare("event rows", rows, wantRows)
 			compare("snapshot row", snapshot, wantSnapshot)
+
+			for _, sibling := range expected.Siblings {
+				siblingRows, siblingSnapshot, err := postgresRows(ctx, b.postgres, sibling.EntityID)
+				if err != nil {
+					return nil, err
+				}
+
+				wantSiblingRows, wantSiblingSnapshot, err := expectedRows(sibling.Events, sibling.Snapshot)
+				if err != nil {
+					return nil, err
+				}
+
+				compare("sibling "+string(sibling.EntityID)+" event rows", siblingRows, wantSiblingRows)
+				compare("sibling "+string(sibling.EntityID)+" snapshot row", siblingSnapshot, wantSiblingSnapshot)
+			}
 		}
 
 		if len(failures) == before {
@@ -348,9 +382,9 @@ func postgresRows(ctx context.Context, pool *pgxpool.Pool, entityID evt.EntityID
 	return events, &snapshot, nil
 }
 
-func expectedRows(expected compat.ScenarioExpectation) ([]row, *row, error) {
+func expectedRows(encodedEvents []string, encodedSnapshot *string) ([]row, *row, error) {
 	events := []row{}
-	for _, encoded := range expected.Events {
+	for _, encoded := range encodedEvents {
 		var event evt.SerializedEvent
 		if err := eventjson.UnmarshalEvent([]byte(encoded), &event); err != nil {
 			return nil, nil, err
@@ -376,12 +410,12 @@ func expectedRows(expected compat.ScenarioExpectation) ([]row, *row, error) {
 		events = append(events, r)
 	}
 
-	if expected.Snapshot == nil {
+	if encodedSnapshot == nil {
 		return events, nil, nil
 	}
 
 	var snapshot evt.SerializedSnapshot
-	if err := json.Unmarshal([]byte(*expected.Snapshot), &snapshot); err != nil {
+	if err := json.Unmarshal([]byte(*encodedSnapshot), &snapshot); err != nil {
 		return nil, nil, err
 	}
 

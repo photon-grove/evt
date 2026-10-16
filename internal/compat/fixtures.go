@@ -5,12 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -52,9 +52,20 @@ type ScenarioExpectation struct {
 	DynamoItems      []map[string]any `json:"dynamoItems"`
 	SNSMessages      []string         `json:"snsMessages"`
 
-	// Sibling records a second stream a scenario touches outside its primary partition
-	// (transactional sibling streams, fenced read-only streams). Nil when there is none.
-	Sibling *SiblingExpectation `json:"sibling,omitempty"`
+	// Siblings records every other stream a scenario touches outside its primary partition
+	// (transactional sibling streams, fenced read-only streams), ordered by suffix. A stream a
+	// scenario fences but never writes is recorded too, as empty.
+	Siblings []SiblingExpectation `json:"siblings,omitempty"`
+
+	// Transactions pins the TransactWriteItems action order of each transaction step, so an
+	// implementation that reorders actions fails even when the stored state is identical.
+	Transactions []TransactionExpectation `json:"transactions,omitempty"`
+}
+
+// TransactionExpectation is the ordered TransactWriteItems actions one transaction step sent.
+type TransactionExpectation struct {
+	Step    int                 `json:"step"`
+	Actions []TransactionAction `json:"actions"`
 }
 
 // SiblingExpectation is the stored state of a scenario's sibling stream.
@@ -307,7 +318,7 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 
 	entity := NewAccount(entityID)
 	eventContext, err := runner.Store.LoadEntity(ctx, entity, entityID)
-	if err != nil && !strings.Contains(err.Error(), "skips from sequence") {
+	if err != nil && !errors.Is(err, evt.ErrSequenceGap) {
 		return expectation, err
 	}
 
@@ -399,7 +410,11 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 		runner, fake, _ := newFakeRunner(scenario.SnapshotInterval)
 		entityID := EntityID(FixtureRun, scenario)
 
+		var transactions []TransactionExpectation
+
 		for index, step := range scenario.Steps {
+			sent := len(fake.Transactions())
+
 			outcome, err := runner.Execute(ctx, entityID, step)
 			if err != nil {
 				return fixtures, fmt.Errorf("%s step %d: %w", scenario.Name, index, err)
@@ -407,6 +422,16 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 			if outcome != step.Expect {
 				return fixtures, fmt.Errorf("%s step %d: got %s, want %s", scenario.Name, index, outcome, step.Expect)
 			}
+
+			if step.Op != "transaction" {
+				continue
+			}
+
+			calls := fake.Transactions()[sent:]
+			if len(calls) != 1 {
+				return fixtures, fmt.Errorf("%s step %d: transaction sent %d requests, want 1", scenario.Name, index, len(calls))
+			}
+			transactions = append(transactions, TransactionExpectation{Step: index, Actions: calls[0]})
 		}
 
 		expectation, err := Observe(ctx, runner, scenario.Name, entityID)
@@ -431,14 +456,20 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 			expectation.SNSMessages = append(expectation.SNSMessages, message)
 		}
 
-		sibling, serr := ObserveSibling(ctx, runner, entityID+"-watched")
-		if serr != nil {
-			return fixtures, fmt.Errorf("%s: %w", scenario.Name, serr)
+		expectation.Transactions = transactions
+
+		for _, suffix := range scenario.SiblingSuffixes() {
+			siblingID := transactionID(entityID, suffix)
+
+			sibling, serr := ObserveSibling(ctx, runner, siblingID)
+			if serr != nil {
+				return fixtures, fmt.Errorf("%s: %w", scenario.Name, serr)
+			}
+			for _, item := range fake.Items(string(siblingID)) {
+				sibling.DynamoItems = append(sibling.DynamoItems, DynamoItemJSON(item))
+			}
+			expectation.Siblings = append(expectation.Siblings, *sibling)
 		}
-		for _, item := range fake.Items(string(entityID) + "-watched") {
-			sibling.DynamoItems = append(sibling.DynamoItems, DynamoItemJSON(item))
-		}
-		expectation.Sibling = sibling
 
 		fixtures.Scenarios = append(fixtures.Scenarios, expectation)
 	}

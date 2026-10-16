@@ -157,50 +157,48 @@ async fn verify_common<R: Repository>(
         &expected.sns_messages,
     );
 
-    if let Some(expected_sibling) = &expected.sibling {
-        let sibling_id = EntityId::new(&expected_sibling.entity_id);
-        let observed_events = repository.events(&sibling_id).await?;
-        let observed_snapshot = repository.snapshot(&sibling_id).await?;
+    // Every other stream the scenario touches: written siblings and fenced read-only streams.
+    let sibling_ids: Vec<EntityId> = expected
+        .siblings
+        .iter()
+        .map(|sibling| EntityId::new(&sibling.entity_id))
+        .collect();
+    let observed_siblings = runner.observe_siblings(&sibling_ids).await?;
+    check(
+        failures,
+        name,
+        "sibling streams",
+        observed_siblings.len(),
+        expected.siblings.len(),
+    );
 
-        let observed_events: Vec<String> = observed_events
-            .iter()
-            .map(|event| {
-                event
-                    .to_json()
-                    .map(|bytes| String::from_utf8(bytes).expect("JSON encoders write UTF-8"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let observed_snapshot = observed_snapshot
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .to_json()
-                    .map(|bytes| String::from_utf8(bytes).expect("JSON encoders write UTF-8"))
-            })
-            .transpose()?;
+    for (observed, wanted) in observed_siblings.iter().zip(&expected.siblings) {
+        let what = |part: &str| format!("sibling {} {part}", wanted.entity_id);
 
         check(
             failures,
             name,
-            "sibling events",
-            &observed_events,
-            &expected_sibling.events,
+            &what("events"),
+            &observed.events,
+            &wanted.events,
         );
         check(
             failures,
             name,
-            "sibling snapshot",
-            &observed_snapshot,
-            &expected_sibling.snapshot,
+            &what("snapshot"),
+            &observed.snapshot,
+            &wanted.snapshot,
         );
     }
 
     Ok(())
 }
 
-fn expected_rows(expected: &Expectation) -> Result<(Vec<EventRow>, Option<SnapshotRow>), BoxError> {
-    let events = expected
-        .events
+fn expected_rows(
+    events: &[String],
+    snapshot: &Option<String>,
+) -> Result<(Vec<EventRow>, Option<SnapshotRow>), BoxError> {
+    let events = events
         .iter()
         .map(|json| {
             Ok(EventRow::from_event(&SerializedEvent::from_json(
@@ -208,8 +206,7 @@ fn expected_rows(expected: &Expectation) -> Result<(Vec<EventRow>, Option<Snapsh
             )?)?)
         })
         .collect::<Result<Vec<_>, BoxError>>()?;
-    let snapshot = expected
-        .snapshot
+    let snapshot = snapshot
         .as_ref()
         .map(|json| {
             SerializedSnapshot::from_json(json.as_bytes()).map(|s| SnapshotRow::from_snapshot(&s))
@@ -266,6 +263,22 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
                     &items,
                     &expected.dynamo_items,
                 );
+
+                for sibling in &expected.siblings {
+                    let items = repository
+                        .partition_items(&EntityId::new(&sibling.entity_id))
+                        .await?
+                        .into_iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    check(
+                        &mut failures,
+                        &scenario.name,
+                        &format!("sibling {} dynamo items", sibling.entity_id),
+                        &items,
+                        &sibling.dynamo_items,
+                    );
+                }
             }
             Backend::Postgres(repository) => {
                 verify_common(
@@ -276,7 +289,8 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
                 )
                 .await?;
 
-                let (want_events, want_snapshot) = expected_rows(&expected)?;
+                let (want_events, want_snapshot) =
+                    expected_rows(&expected.events, &expected.snapshot)?;
                 let rows = comparable(repository.event_rows(&entity_id).await?)?;
                 check(
                     &mut failures,
@@ -294,6 +308,26 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
                     snapshot,
                     want_snapshot,
                 );
+
+                for sibling in &expected.siblings {
+                    let sibling_id = EntityId::new(&sibling.entity_id);
+                    let (want_events, want_snapshot) =
+                        expected_rows(&sibling.events, &sibling.snapshot)?;
+                    check(
+                        &mut failures,
+                        &scenario.name,
+                        &format!("sibling {} event rows", sibling.entity_id),
+                        comparable(repository.event_rows(&sibling_id).await?)?,
+                        comparable(want_events)?,
+                    );
+                    check(
+                        &mut failures,
+                        &scenario.name,
+                        &format!("sibling {} snapshot row", sibling.entity_id),
+                        repository.snapshot_row(&sibling_id).await?,
+                        want_snapshot,
+                    );
+                }
             }
         }
 

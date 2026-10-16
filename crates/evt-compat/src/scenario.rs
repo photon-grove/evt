@@ -68,6 +68,32 @@ impl Scenario {
     pub fn entity_id(&self, run: &str) -> EntityId {
         EntityId::new(format!("compat-{run}-{}", self.name))
     }
+
+    /// Every non-empty stream suffix the scenario writes, fences, appends to, or compacts, in
+    /// ascending order: each is a stream beside the primary one that the fixtures and both
+    /// languages' verification observe.
+    pub fn sibling_suffixes(&self) -> Vec<String> {
+        let mut suffixes = std::collections::BTreeSet::new();
+
+        for step in &self.steps {
+            suffixes.extend(step.suffix.clone());
+            suffixes.extend(step.streams.iter().map(|stream| stream.suffix.clone()));
+            suffixes.extend(step.fences.iter().map(|fence| fence.suffix.clone()));
+        }
+        suffixes.remove("");
+
+        suffixes.into_iter().collect()
+    }
+
+    /// The stream IDs of [`Scenario::sibling_suffixes`] within a run.
+    pub fn sibling_ids(&self, run: &str) -> Vec<EntityId> {
+        let entity_id = self.entity_id(run);
+
+        self.sibling_suffixes()
+            .iter()
+            .map(|suffix| transaction_id(&entity_id, suffix))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -253,11 +279,22 @@ pub struct Expectation {
     pub dynamo_items: Vec<serde_json::Value>,
     #[serde(default, deserialize_with = "null_to_empty")]
     pub sns_messages: Vec<String>,
-    #[serde(default)]
-    pub sibling: Option<SiblingExpectation>,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub siblings: Vec<SiblingExpectation>,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub transactions: Vec<TransactionExpectation>,
 }
 
-/// The stored state of a scenario's sibling stream (transactional siblings, fenced streams).
+/// The ordered `TransactWriteItems` actions one transaction step sent, as the Go implementation
+/// recorded them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TransactionExpectation {
+    pub step: usize,
+    pub actions: Vec<serde_json::Value>,
+}
+
+/// The stored state of one of a scenario's sibling streams (transactional siblings, fenced
+/// streams).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiblingExpectation {
@@ -392,14 +429,27 @@ impl<R: Repository> Runner<R> {
             return Err(error.into());
         }
 
-        let before = self.observe_watched(entity_id).await?;
+        // Every stream the transaction touches: a failed transaction must leave all of them
+        // unchanged, not just one watched sibling.
+        let touched: Vec<EntityId> = step
+            .streams
+            .iter()
+            .map(|stream| transaction_id(entity_id, &stream.suffix))
+            .chain(
+                step.fences
+                    .iter()
+                    .map(|fence| transaction_id(entity_id, &fence.suffix)),
+            )
+            .collect();
+
+        let before = self.observe_stored(&touched).await?;
         match self.store.repository().commit_transaction(commit).await {
             Ok(()) => Ok(Outcome {
                 events: step.streams.iter().map(|stream| stream.events.len()).sum(),
                 ..Outcome::of("ok")
             }),
             Err(error) => {
-                let after = self.observe_watched(entity_id).await?;
+                let after = self.observe_stored(&touched).await?;
                 if before != after {
                     return Err(StepError::Unexpected(format!(
                         "failed transaction left partial events: {error}"
@@ -413,16 +463,19 @@ impl<R: Repository> Runner<R> {
         }
     }
 
-    /// Reads the watched sibling stream so a failed transaction can be checked to have left it
-    /// unchanged.
-    async fn observe_watched(&self, entity_id: &EntityId) -> Result<String, StepError> {
+    /// Reads the stored events and snapshot of each stream, so a failed transaction can be
+    /// checked to have left every touched stream unchanged.
+    async fn observe_stored(&self, entity_ids: &[EntityId]) -> Result<String, StepError> {
         let repository = self.store.repository();
-        let watched = transaction_id(entity_id, "watched");
-        let events = repository.events(&watched).await?;
-        let snapshot = repository.snapshot(&watched).await?;
+        let mut states = Vec::new();
 
-        serde_json::to_string(&(events, snapshot))
-            .map_err(|error| StepError::Unexpected(error.to_string()))
+        for entity_id in entity_ids {
+            let events = repository.events(entity_id).await?;
+            let snapshot = repository.snapshot(entity_id).await?;
+            states.push((events, snapshot));
+        }
+
+        serde_json::to_string(&states).map_err(|error| StepError::Unexpected(error.to_string()))
     }
 
     async fn execute_command(
@@ -492,7 +545,7 @@ impl<R: Repository> Runner<R> {
         // rows are still compared while the loaded state is recorded as absent.
         let loaded = match self.store.load(entity_id).await {
             Ok(loaded) => Some(loaded),
-            Err(Error::Conflict { message, .. }) if message.contains("skips from sequence") => None,
+            Err(Error::SequenceGap { .. }) => None,
             Err(err) => return Err(err),
         };
         let (state, sequence, snapshot_sequence) = match &loaded {
@@ -529,38 +582,49 @@ impl<R: Repository> Runner<R> {
             snapshot: snapshot.map(|s| s.to_json()).transpose()?.map(utf8),
             dynamo_items,
             sns_messages,
-            sibling: None,
+            siblings: Vec::new(),
+            transactions: Vec::new(),
         })
     }
 
-    /// Reads the stored events and snapshot of a sibling stream.
-    pub async fn observe_sibling(&self, entity_id: &EntityId) -> Result<SiblingExpectation, Error> {
+    /// Reads the stored events, snapshot, and DynamoDB items of each sibling stream, in the order
+    /// given. A stream a scenario fences but never writes reads back as empty.
+    pub async fn observe_siblings(
+        &self,
+        entity_ids: &[EntityId],
+    ) -> Result<Vec<SiblingExpectation>, Error> {
         let repository = self.store.repository();
-        let events = repository.events(entity_id).await?;
-        let snapshot = repository.snapshot(entity_id).await?;
+        let mut siblings = Vec::with_capacity(entity_ids.len());
 
-        let mut dynamo_items = Vec::new();
-        if let Some(snapshot) = &snapshot {
-            dynamo_items.push(serde_json::to_value(dynamo::snapshot_item(
-                snapshot, None,
-            )?)?);
-        }
-        for event in &events {
-            dynamo_items.push(serde_json::to_value(dynamo::event_item(event, None)?)?);
+        for entity_id in entity_ids {
+            let events = repository.events(entity_id).await?;
+            let snapshot = repository.snapshot(entity_id).await?;
+
+            let mut dynamo_items = Vec::new();
+            if let Some(snapshot) = &snapshot {
+                dynamo_items.push(serde_json::to_value(dynamo::snapshot_item(
+                    snapshot, None,
+                )?)?);
+            }
+            for event in &events {
+                dynamo_items.push(serde_json::to_value(dynamo::event_item(event, None)?)?);
+            }
+
+            siblings.push(SiblingExpectation {
+                entity_id: entity_id.to_string(),
+                events: events
+                    .iter()
+                    .map(|event| event.to_json().map(utf8))
+                    .collect::<Result<Vec<_>, _>>()?,
+                snapshot: snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.to_json().map(utf8))
+                    .transpose()?,
+                dynamo_items,
+            });
         }
 
-        Ok(SiblingExpectation {
-            entity_id: entity_id.to_string(),
-            events: events
-                .iter()
-                .map(|event| event.to_json().map(utf8))
-                .collect::<Result<Vec<_>, _>>()?,
-            snapshot: snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.to_json().map(utf8))
-                .transpose()?,
-            dynamo_items,
-        })
+        Ok(siblings)
     }
 }
 

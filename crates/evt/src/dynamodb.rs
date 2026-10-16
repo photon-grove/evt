@@ -688,18 +688,21 @@ impl Repository for DynamoRepository {
             return Ok(());
         }
 
-        // Fences are refused for entity types durably declared with retention: TTL deletes reopen
-        // fenced slots without leaving a successor snapshot. The refusal consults the manifest,
-        // not this instance's configuration.
-        if !commit.fences.is_empty() {
-            let manifest = self.read_manifest().await?;
-            commit.check_retention(manifest.as_ref())?;
-        }
-
         let mut revalidations = 0;
 
         loop {
             let cached = self.ensure_manifest_validated().await?;
+
+            // Fences are refused for entity types durably declared with retention: TTL deletes
+            // reopen fenced slots without leaving a successor snapshot. The refusal consults the
+            // stored manifest, not this instance's configuration, and runs again on every
+            // iteration: a declaration that races the marker revalidation bumps the version, the
+            // marker check fails, and the retry must see the type it now declares.
+            if !commit.fences.is_empty() {
+                let manifest = self.read_manifest().await?;
+                commit.check_retention(manifest.as_ref())?;
+            }
+
             let (items, layout) = self.transaction_stream_items(&commit, cached)?;
 
             let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
@@ -745,7 +748,7 @@ impl Repository for DynamoRepository {
                     if let Some(fence) = fence_conflict {
                         return Err(Error::FenceConflict {
                             entity_id: fence.entity_id,
-                            index: failed_check.unwrap_or_default(),
+                            head: fence.head,
                             provenance: fence.provenance,
                         });
                     }
@@ -1604,6 +1607,190 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(json!(actual), case["output"], "{}", case["name"]);
         }
+    }
+
+    /// Summarizes a transaction action the way the Go fixtures record it: operation, key, and
+    /// the condition with its expression values.
+    fn action_summary(action: &TransactWriteItem) -> serde_json::Value {
+        use serde_json::json;
+
+        let key_number = |item: &HashMap<String, sdk::AttributeValue>| {
+            item["sk"].as_n().unwrap().parse::<i64>().unwrap()
+        };
+
+        let (operation, key, condition, values) = if let Some(put) = action.put() {
+            (
+                "Put",
+                (
+                    put.item()["pk"].as_s().unwrap().clone(),
+                    key_number(put.item()),
+                ),
+                put.condition_expression(),
+                put.expression_attribute_values(),
+            )
+        } else {
+            let check = action.condition_check().expect("only puts and checks");
+
+            (
+                "ConditionCheck",
+                (
+                    check.key()["pk"].as_s().unwrap().clone(),
+                    key_number(check.key()),
+                ),
+                Some(check.condition_expression()),
+                check.expression_attribute_values(),
+            )
+        };
+
+        let mut summary = json!({"operation": operation, "pk": key.0, "sk": key.1});
+        if let Some(condition) = condition {
+            summary["condition"] = json!(condition);
+        }
+        if let Some(values) = values.filter(|values| !values.is_empty()) {
+            summary["values"] = json!(from_sdk_item(values));
+        }
+
+        summary
+    }
+
+    /// The shared scenarios' transaction steps build the same `TransactWriteItems` action order
+    /// the Go generator recorded from its repository: a divergence fails here even when both
+    /// languages store identical state.
+    #[test]
+    fn transaction_action_order_matches_the_go_fixtures() {
+        use serde_json::Value;
+
+        let compat = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compat");
+        let read = |path: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(compat.join(path)).unwrap()).unwrap()
+        };
+        let scenarios = read("scenarios.json");
+        let fixtures = read("fixtures/scenarios.json");
+        let run = fixtures["run"].as_str().unwrap();
+
+        let id_of = |base: &str, suffix: &str| {
+            if suffix.is_empty() {
+                EntityId::new(base)
+            } else {
+                EntityId::new(format!("{base}-{suffix}"))
+            }
+        };
+
+        let mut transactions = 0;
+        for scenario in scenarios["scenarios"].as_array().unwrap() {
+            let name = scenario["name"].as_str().unwrap();
+            let base = format!("compat-{run}-{name}");
+            let expected = fixtures["scenarios"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|fixture| fixture["name"] == name)
+                .unwrap_or_else(|| panic!("no fixture for {name}"));
+            let recorded = expected["transactions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+
+            let steps = scenario["steps"].as_array().unwrap();
+            let planned: Vec<_> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["op"] == "transaction")
+                .collect();
+            assert_eq!(
+                planned.len(),
+                recorded.len(),
+                "{name}: one recorded order per transaction step"
+            );
+
+            for ((index, step), recorded) in planned.into_iter().zip(&recorded) {
+                assert_eq!(recorded["step"], index, "{name}: recorded step");
+
+                let streams = step["streams"]
+                    .as_array()
+                    .map(|streams| {
+                        streams
+                            .iter()
+                            .map(|stream| {
+                                let id = id_of(&base, stream["suffix"].as_str().unwrap_or(""));
+                                let first = stream["sequence"].as_i64().unwrap();
+                                let events = stream["events"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(offset, raw)| SerializedEvent {
+                                        id: crate::EventId::for_event(
+                                            &id,
+                                            EventSequence(first + offset as i64),
+                                        ),
+                                        sequence: EventSequence(first + offset as i64),
+                                        event_type: raw["type"].as_str().unwrap().into(),
+                                        version: crate::EventVersion(
+                                            raw["version"].as_i64().unwrap(),
+                                        ),
+                                        entity_id: id.clone(),
+                                        entity_type: "account".into(),
+                                        payload: raw["payload"].as_str().unwrap().into(),
+                                        metadata: crate::Metadata::default(),
+                                    })
+                                    .collect();
+                                let mut commit = Commit::new(id, events);
+                                if let Some(snapshot) = stream.get("snapshot") {
+                                    commit = commit.with_snapshot(crate::NewSnapshot::new(
+                                        "account",
+                                        EventSequence(snapshot["sequence"].as_i64().unwrap()),
+                                        snapshot["payload"].as_str().unwrap(),
+                                    ));
+                                }
+
+                                commit
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut commit = TransactionCommit::new(streams);
+                commit.fences = step["fences"]
+                    .as_array()
+                    .map(|fences| {
+                        fences
+                            .iter()
+                            .map(|fence| {
+                                crate::ReadFence::new(
+                                    id_of(&base, fence["suffix"].as_str().unwrap_or("")),
+                                    "account",
+                                    EventSequence(fence["head"].as_i64().unwrap()),
+                                    if fence["callerStamped"].as_bool().unwrap_or(false) {
+                                        crate::FenceProvenance::Caller
+                                    } else {
+                                        crate::FenceProvenance::Engine
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                commit.normalize().unwrap();
+
+                // The scenarios declare no features, so every writer validated an absent marker.
+                let (items, _) = offline_repository()
+                    .transaction_stream_items(&commit, ValidatedMarker::Absent)
+                    .unwrap();
+                let actual: Vec<_> = items.iter().map(action_summary).collect();
+
+                assert_eq!(
+                    Value::Array(actual),
+                    recorded["actions"],
+                    "{name} step {index}: TransactWriteItems action order"
+                );
+                transactions += 1;
+            }
+        }
+
+        assert!(
+            transactions >= 8,
+            "the scenarios cover multi-stream and fenced commits"
+        );
     }
 
     #[test]

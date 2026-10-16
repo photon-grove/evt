@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/internal/eventjson"
@@ -30,6 +31,31 @@ type TransactionFence struct {
 	Suffix        string `json:"suffix"`
 	Head          int64  `json:"head"`
 	CallerStamped bool   `json:"callerStamped,omitempty"`
+}
+
+// SiblingSuffixes lists, in ascending order, every non-empty stream suffix the scenario writes,
+// fences, appends to, or compacts: each is a stream beside the primary one that the fixtures and
+// both languages' verification must observe.
+func (s Scenario) SiblingSuffixes() []string {
+	seen := map[string]bool{}
+	for _, step := range s.Steps {
+		seen[step.Suffix] = true
+		for _, stream := range step.Streams {
+			seen[stream.Suffix] = true
+		}
+		for _, fence := range step.Fences {
+			seen[fence.Suffix] = true
+		}
+	}
+	delete(seen, "")
+
+	suffixes := make([]string, 0, len(seen))
+	for suffix := range seen {
+		suffixes = append(suffixes, suffix)
+	}
+	slices.Sort(suffixes)
+
+	return suffixes
 }
 
 func transactionID(base evt.EntityID, suffix string) evt.EntityID {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,22 @@ import (
 type FakeDynamo struct {
 	mu    sync.Mutex
 	items map[string]map[int64]map[string]types.AttributeValue
+
+	// transactions records the actions of every TransactWriteItems call in request order,
+	// including calls the table then cancels.
+	transactions [][]TransactionAction
+}
+
+// TransactionAction is one TransactWriteItems action as the repository sent it: the action
+// kind, the item key it touches, and the condition it carries. Cross-language fixtures pin
+// the sequence so an implementation that reorders actions fails even when the stored state is
+// identical.
+type TransactionAction struct {
+	Operation string         `json:"operation"`
+	PK        string         `json:"pk"`
+	SK        int64          `json:"sk"`
+	Condition string         `json:"condition,omitempty"`
+	Values    map[string]any `json:"values,omitempty"`
 }
 
 var _ dynamo.Client = (*FakeDynamo)(nil)
@@ -29,6 +46,14 @@ var _ dynamo.Client = (*FakeDynamo)(nil)
 // NewFakeDynamo returns an empty table.
 func NewFakeDynamo() *FakeDynamo {
 	return &FakeDynamo{items: make(map[string]map[int64]map[string]types.AttributeValue)}
+}
+
+// Transactions returns the actions of every TransactWriteItems call so far, in request order.
+func (f *FakeDynamo) Transactions() [][]TransactionAction {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.transactions)
 }
 
 // Items returns every item in a partition, ascending by sort key (the snapshot at sk=0 first).
@@ -189,6 +214,24 @@ func targetOf(write types.TransactWriteItem) (transactTarget, error) {
 	return transactTarget{}, errors.New("fake dynamo: unsupported transaction action")
 }
 
+// action summarizes the target for the recorded transaction order.
+func (t transactTarget) action(write types.TransactWriteItem) TransactionAction {
+	operation := "ConditionCheck"
+	switch {
+	case write.Put != nil:
+		operation = "Put"
+	case write.Delete != nil:
+		operation = "Delete"
+	}
+
+	action := TransactionAction{Operation: operation, PK: t.pk, SK: t.sk, Condition: t.condition}
+	if len(t.values) > 0 {
+		action.Values = DynamoItemJSON(t.values)
+	}
+
+	return action
+}
+
 // TransactWriteItems applies puts atomically, cancelling the whole transaction on any failed
 // condition with the same exception shape DynamoDB returns.
 func (f *FakeDynamo) TransactWriteItems(
@@ -202,6 +245,7 @@ func (f *FakeDynamo) TransactWriteItems(
 	reasons := make([]types.CancellationReason, len(params.TransactItems))
 	targets := make([]transactTarget, len(params.TransactItems))
 	touched := make(map[string]bool, len(params.TransactItems))
+	recorded := make([]TransactionAction, 0, len(params.TransactItems))
 	failed := false
 
 	for i, write := range params.TransactItems {
@@ -217,6 +261,7 @@ func (f *FakeDynamo) TransactWriteItems(
 		}
 		touched[key] = true
 		targets[i] = target
+		recorded = append(recorded, target.action(write))
 
 		reasons[i] = types.CancellationReason{Code: aws.String("None")}
 		ok, err := conditionHolds(f.items[target.pk][target.sk], target.condition, target.values)
@@ -228,6 +273,8 @@ func (f *FakeDynamo) TransactWriteItems(
 			failed = true
 		}
 	}
+
+	f.transactions = append(f.transactions, recorded)
 
 	if failed {
 		return nil, &types.TransactionCanceledException{
