@@ -319,6 +319,8 @@ impl DynamoRepository {
                 continue;
             };
 
+            let group_start = items.len();
+
             for event in &stream.events {
                 let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
                 items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
@@ -355,6 +357,10 @@ impl DynamoRepository {
             } else {
                 items.push(floor_check(&self.table, &stream.entity_id, first)?);
             }
+
+            layout
+                .streams
+                .push((group_start..items.len(), stream.entity_id.clone()));
         }
 
         for fence in &commit.fences {
@@ -738,11 +744,18 @@ impl Repository for DynamoRepository {
                         continue;
                     }
 
+                    // The stream whose action failed, when the cancellation index maps back to
+                    // one; the first stream is only a fallback for an index that does not.
                     let fallback_entity = || {
                         commit.streams.first().map_or_else(
                             || EntityId::new("unknown"),
                             |stream| stream.entity_id.clone(),
                         )
+                    };
+                    let entity_at = |index: Option<usize>| {
+                        index
+                            .and_then(|index| layout.stream_at(index).cloned())
+                            .unwrap_or_else(fallback_entity)
                     };
 
                     if let Some(fence) = fence_conflict {
@@ -760,15 +773,18 @@ impl Repository for DynamoRepository {
                         }
 
                         return Err(Error::Conflict {
-                            entity_id: fallback_entity(),
+                            entity_id: entity_at(Some(index)),
                             message:
                                 "conditional check failed: the sequence or snapshot changed since it was read"
                                     .to_owned(),
                         });
                     }
 
+                    // A concurrent transaction is reported on the item it collided with.
+                    let colliding = failed_items(&codes, "TransactionConflict").next();
+
                     return Err(classify_transaction_error(
-                        &fallback_entity(),
+                        &entity_at(colliding),
                         layout.operations,
                         err,
                     ));
@@ -1053,6 +1069,9 @@ struct TransactionLayout {
     operations: usize,
     /// Fences by their slot-check and companion-check item indexes.
     fences: Vec<(usize, crate::repository::ReadFence)>,
+    /// Each written stream's contiguous run of action indexes (event puts and the snapshot put or
+    /// floor check), so a failed action maps back to the stream that owns it.
+    streams: Vec<(std::ops::Range<usize>, EntityId)>,
 }
 
 impl TransactionLayout {
@@ -1061,6 +1080,14 @@ impl TransactionLayout {
             .iter()
             .find(|(item_index, _)| *item_index == index)
             .map(|(_, fence)| fence)
+    }
+
+    /// The written stream whose action sits at `index`, if the index is one of a stream's.
+    fn stream_at(&self, index: usize) -> Option<&EntityId> {
+        self.streams
+            .iter()
+            .find(|(range, _)| range.contains(&index))
+            .map(|(_, entity_id)| entity_id)
     }
 }
 

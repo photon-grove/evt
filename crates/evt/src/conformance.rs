@@ -1020,6 +1020,29 @@ async fn multi_stream_atomicity<R: Repository>(repo: &R) -> CaseResult {
         "the sibling stream of a failed commit is untouched"
     );
 
+    // The conflict names the stream whose action failed, not the first stream of the commit: the
+    // collision here is on `d`, which sorts after the clean streams `c` and `e`.
+    let c = Stream::new(&ns, "c", "ledger");
+    let d = Stream::new(&ns, "d", "ledger");
+    let e = Stream::new(&ns, "e", "ledger");
+    d.commit(repo, d.events(1..=1), None).await?;
+
+    let collision = Commit {
+        events: vec![d.event(1, 99)],
+        ..write(&d, 1..=1)
+    };
+    let commit = TransactionCommit::new(vec![write(&c, 1..=1), collision, write(&e, 1..=1)]);
+    let result = repo.commit_transaction(commit).await;
+
+    ensure!(
+        matches!(&result, Err(Error::Conflict { entity_id, .. }) if *entity_id == d.id),
+        "a conflict on a later stream is attributed to that stream, got {result:?}"
+    );
+    ensure!(
+        repo.events(&c.id).await?.is_empty() && repo.events(&e.id).await?.is_empty(),
+        "the clean streams of the failed commit are untouched"
+    );
+
     Ok(())
 }
 
