@@ -31,6 +31,9 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
   they saw, and every event of the commit carries one `commitId` (the command ID when present,
   else a generated ULID). The shared 100-item / 3.8 MB / 380 KB budget fails an oversized commit
   with `CommitTooLarge` before any write, identically across backends and languages.
+- `Store::with_outcomes` records every command as a durable outcome in the same transaction as
+  its events, so a retried command returns the stored answer instead of running twice
+  ([command outcomes](#command-outcomes)).
 
 ## Example
 
@@ -117,6 +120,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Command outcomes
+
+A store built with `with_outcomes` writes one `command-outcome#<commandId>` row per command,
+once and in its final state, inside the commit transaction. Every command needs a command ID
+(at most 512 UTF-8 bytes) and a type that implements `OutcomeCommand`, and `Aggregate::Error`
+implements `ToRejection`:
+
+- A repeat of a command (same ID, same identity digest) returns the stored outcome and does not
+  run the handler or write. The dedupe is global, so it survives snapshots and compaction. The
+  digest is a SHA-256 over the command's type, declared streams, canonical payload JSON, and
+  principal, and `OutcomeConfig::with_digester` replaces it. The same ID with another digest is
+  `Error::IdempotencyKeyReuse`, carrying the stored `prior_outcome`; it is never stored.
+- An error from `handle` that `ToRejection` maps to `Some` is a domain rejection: it is persisted
+  as a `rejected` outcome (`Rejection { code, message, details }`) and a retried command replays it
+  verbatim. A `None` is an internal failure the handler could not decide: it is returned as
+  `Error::Handler` and records nothing, like every other internal failure, so a retry after the fix
+  starts clean.
+- A command that decides no events is an accepted no-op, and a response (at most 65536 bytes) is
+  stored with the outcome. See `Store::execute_with_response`.
+- A commit whose result is unknown (`Error::Backend`) is settled by re-reading the outcome row, never
+  by running the handler again: the stored outcome comes back with `replayed` set, or
+  `Error::AmbiguousWrite { not_applied: true, .. }` says it is safe to retry with the same ID.
+- `Store::transaction` records multi-stream commands with `Transaction::begin_command`, then
+  `commit_with_outcome` or `reject`. A failed caller-stamped fence persists a `stale-fence`
+  rejection instead of retrying; the remedy is a new command ID.
+
+```rust
+use photon_evt::{
+    Aggregate, BoxError, MemRepository, Metadata, OutcomeCommand, OutcomeConfig, Rejection,
+    Store, ToRejection, canonical_json, domain_events,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Counted {
+    pub by: i64,
+}
+
+domain_events! {
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum CounterEvent {
+        Counted(Counted) => ("counter:counted", 1),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("count must be positive")]
+pub struct NotPositive;
+
+impl ToRejection for NotPositive {
+    fn to_rejection(&self) -> Option<Rejection> {
+        Some(Rejection::new("not-positive", self.to_string()))
+    }
+}
+
+pub struct Count(pub i64);
+
+impl OutcomeCommand for Count {
+    fn command_type(&self) -> String {
+        "counter:count".into()
+    }
+
+    fn canonical_payload(&self) -> Result<Option<Vec<u8>>, BoxError> {
+        Ok(Some(canonical_json(&self.0)?))
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Counter {
+    pub total: i64,
+}
+
+impl Aggregate for Counter {
+    const TYPE: &'static str = "counter";
+
+    type Command = Count;
+    type Event = CounterEvent;
+    type Error = NotPositive;
+    type Services = ();
+
+    async fn handle(&self, Count(by): Count, _: &()) -> Result<Vec<CounterEvent>, NotPositive> {
+        if by <= 0 {
+            return Err(NotPositive);
+        }
+
+        Ok(vec![Counted { by }.into()])
+    }
+
+    fn apply(&mut self, event: CounterEvent) {
+        match event {
+            CounterEvent::Counted(counted) => self.total += counted.by,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Store::<Counter, _>::new(MemRepository::new(), ())
+        .with_outcomes(OutcomeConfig::new());
+    let metadata = Metadata::new("us-west-2").with_command_id("cmd-1");
+
+    let first = store.execute_with_outcome("c-1", Count(5), metadata.clone()).await?;
+    assert!(first.is_accepted() && !first.replayed);
+
+    // The retry returns the stored outcome; the handler does not run again.
+    let again = store.execute_with_outcome("c-1", Count(5), metadata.clone()).await?;
+    assert!(again.replayed);
+    assert_eq!(store.load("c-1").await?.aggregate().total, 5);
+
+    // The same ID for a different command is refused.
+    let reused = store.execute_with_outcome("c-1", Count(6), metadata).await;
+    assert!(matches!(reused, Err(photon_evt::Error::IdempotencyKeyReuse { .. })));
+
+    // A domain error is a durable rejection.
+    let rejected = store
+        .execute_with_outcome("c-1", Count(0), Metadata::new("us-west-2").with_command_id("cmd-2"))
+        .await?;
+    assert_eq!(rejected.rejection().map(|r| r.code.as_str()), Some("not-positive"));
+
+    Ok(())
+}
+```
+
+`photon_evt::conformance::FaultInjectingRepository` wraps a repository to make a commit apply and
+then report an indeterminate failure, and `outcome_cases` runs the outcome conformance cases
+against a repository that stores them. With outcomes enabled, the plain `Store::execute`,
+`Store::commit`, and `Transaction::commit` refuse to run, so no outcome is skipped silently. The
+older duplicate-command window is kept as a pre-check for IDs written before outcomes existed.
+
 ## Events and versions
 
 Each `domain_events!` variant declares its stored type and version. Loading a stored event whose
@@ -194,6 +326,7 @@ backends:
 
 ```rust,ignore
 photon_evt::conformance::Suite::new(&my_repository).run().await;
+photon_evt::conformance::outcome_cases(&my_repository, &second_handle).await;
 ```
 
 ## Compatibility with Go

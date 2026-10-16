@@ -150,6 +150,12 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
+    /// The aggregate's handler failed with an error that is not a domain rejection
+    /// ([`ToRejection`](crate::ToRejection) returned `None`): an internal failure. Nothing was
+    /// committed and no outcome was recorded, so a retry after the cause is fixed starts clean.
+    #[error("command handler failed: {0}")]
+    Handler(#[source] BoxError),
+
     /// An in-band projector failed. Nothing was committed.
     #[error("projector failed: {0}")]
     Projector(#[source] BoxError),
@@ -211,7 +217,73 @@ pub enum Error {
         entity_id: EntityId,
     },
 
-    /// The storage backend failed.
+    /// A command ID is longer than 512 UTF-8 bytes, the bound for a store with command outcomes.
+    /// Returned before any write.
+    #[error(
+        "command ID is {length} bytes; the limit is {} bytes",
+        crate::outcome::MAX_COMMAND_ID_BYTES
+    )]
+    CommandIdTooLong {
+        /// The ID's length in UTF-8 bytes.
+        length: usize,
+    },
+
+    /// A stored response or an encoded rejection is over 65536 bytes. Returned before any write.
+    #[error(
+        "outcome {what} is {size} bytes; the limit is {} bytes",
+        crate::outcome::MAX_OUTCOME_BYTES
+    )]
+    OutcomeTooLarge {
+        /// The oversized value: `response` or `rejection`.
+        what: &'static str,
+        /// The value's size in bytes.
+        size: usize,
+    },
+
+    /// The command ID already carries an outcome recorded under a different identity digest. It
+    /// is returned as an error and never stored: the existing row belongs to the first command
+    /// that claimed the ID.
+    #[error("command ID {command_id} was already used by a different command")]
+    IdempotencyKeyReuse {
+        /// The reused command ID.
+        command_id: CommandId,
+        /// The stored outcome the ID belongs to.
+        prior_outcome: Box<crate::outcome::Outcome>,
+    },
+
+    /// A commit's outcome put lost its `attribute_not_exists(pk)` condition: another writer
+    /// already recorded an outcome for the command ID. It is never a generic conflict, and
+    /// re-preparing the command cannot resolve it. A [`Store`](crate::Store) resolves it by
+    /// reading the row; a repository returns it.
+    #[error("an outcome is already recorded for command {command_id}")]
+    OutcomeConflict {
+        /// The command ID.
+        command_id: CommandId,
+    },
+
+    /// A commit's result is unknown (a timeout, a lost connection) and re-reading the outcome row
+    /// could not settle it. With `not_applied`, the row is absent: the commit did not apply and
+    /// running the command again with the same ID is safe, so the error is retryable.
+    #[error(
+        "command {command_id} {}: {source}",
+        if *not_applied {
+            "did not apply; safe to retry with the same command ID"
+        } else {
+            "may or may not have been applied"
+        }
+    )]
+    AmbiguousWrite {
+        /// The command ID.
+        command_id: CommandId,
+        /// Recovery found no outcome row, so the commit did not apply.
+        not_applied: bool,
+        /// The indeterminate failure.
+        source: BoxError,
+    },
+
+    /// The storage backend failed. When it came from a commit that carried an outcome, the
+    /// commit may or may not have applied; a [`Store`](crate::Store) settles that with an outcome
+    /// read and reports [`Error::AmbiguousWrite`].
     #[error(transparent)]
     Backend(BoxError),
 }
@@ -236,14 +308,18 @@ impl Error {
         matches!(self, Self::DuplicateCommand(_))
     }
 
-    /// Reports whether reloading and running the command again may succeed: a conflict or a
-    /// transient backend failure.
+    /// Reports whether reloading and running the command again may succeed: a conflict, a
+    /// transient backend failure, or an ambiguous write that provably did not apply.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
             Self::Conflict { .. }
                 | Self::SequenceGap { .. }
                 | Self::Transient(_)
+                | Self::AmbiguousWrite {
+                    not_applied: true,
+                    ..
+                }
                 | Self::FenceConflict {
                     provenance: crate::repository::FenceProvenance::Engine,
                     ..

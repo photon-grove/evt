@@ -23,8 +23,9 @@ use crate::features::{
     self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
     ValidatedMarker,
 };
-use crate::ids::{EntityId, EntityType, EventSequence};
+use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::json;
+use crate::outcome::Outcome;
 use crate::repository::{Commit, Repository, TransactionCommit};
 use crate::wire::dynamo::{self as wire, AttributeValue, Item};
 
@@ -252,22 +253,27 @@ impl DynamoRepository {
 
     /// Builds the commit's transaction items in the pinned order: the feature-marker check, the
     /// projector operations, then the stream's group (see [`stream_group`](Self::stream_group)).
+    /// An outcome-only commit has no group; the outcome put is appended by the caller.
     fn transaction_items(
         &self,
         commit: &Commit<TransactWriteItem>,
         validated: ValidatedMarker,
         pin: Option<Continuation>,
     ) -> Result<Vec<TransactWriteItem>, Error> {
-        if commit.events.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 3);
         items.push(self.marker_check(validated)?);
         items.extend(commit.operations.iter().cloned());
         items.extend(self.stream_group(commit, pin)?);
 
         Ok(items)
+    }
+
+    /// Builds the command-outcome put: the last action of every commit that records one, written
+    /// once in its final state and conditioned on the row not existing.
+    fn outcome_put(&self, outcome: &Outcome) -> Result<TransactWriteItem, Error> {
+        let item = wire::outcome_item(outcome)?;
+
+        put(&self.table, item, Some(wire::OUTCOME_CONDITION), &[])
     }
 
     /// Builds one written stream's contiguous group: the continuation check on the event just
@@ -728,11 +734,12 @@ impl Repository for DynamoRepository {
         commit.validate()?;
         features::check_not_reserved(&commit.entity_id)?;
 
-        if commit.events.is_empty() {
+        if commit.events.is_empty() && commit.outcome.is_none() {
             return Ok(());
         }
 
         let operations = commit.operations.len();
+        let outcome = commit.stored_outcome();
         let mut revalidations = 0;
 
         // The shared budget covers every item the transaction carries, with the projector
@@ -751,7 +758,18 @@ impl Repository for DynamoRepository {
 
         loop {
             let cached = self.ensure_manifest_validated().await?;
-            let items = self.transaction_items(&commit, cached, pin)?;
+            let mut items = self.transaction_items(&commit, cached, pin)?;
+
+            // The outcome row is the last action. Its index is how a failed condition on it is
+            // told apart from a stream's.
+            let outcome_index = match &outcome {
+                Some(outcome) => {
+                    items.push(self.outcome_put(outcome)?);
+
+                    Some(items.len() - 1)
+                }
+                None => None,
+            };
 
             match self
                 .client
@@ -775,6 +793,16 @@ impl Repository for DynamoRepository {
                         continue;
                     }
 
+                    // A lost outcome put outranks every other failure: the command already ran, and
+                    // the writer resolves it through the winner's row. It is never a conflict.
+                    if let Some(outcome) = &outcome
+                        && outcome_failed(outcome_index, &codes)
+                    {
+                        return Err(Error::OutcomeConflict {
+                            command_id: outcome.command_id.clone(),
+                        });
+                    }
+
                     return Err(classify_transaction_error(
                         &commit.entity_id,
                         operations,
@@ -795,6 +823,8 @@ impl Repository for DynamoRepository {
         if commit.is_empty() {
             return Ok(());
         }
+
+        let outcome = commit.stored_outcome();
 
         // Fences are refused for entity types this repository was configured to expire: it needs
         // no I/O, so it runs first. The durable manifest's retention set is checked in the loop,
@@ -821,7 +851,11 @@ impl Repository for DynamoRepository {
                     .check_retention(manifest.as_ref(), |entity_type| self.retains(entity_type))?;
             }
 
-            let (items, layout) = self.transaction_stream_items(&commit, cached, &pins)?;
+            let (mut items, mut layout) = self.transaction_stream_items(&commit, cached, &pins)?;
+            if let Some(outcome) = &outcome {
+                items.push(self.outcome_put(outcome)?);
+                layout.outcome = Some(items.len() - 1);
+            }
 
             let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
             for operation in &commit.operations {
@@ -854,6 +888,17 @@ impl Repository for DynamoRepository {
                         self.invalidate_manifest();
 
                         continue;
+                    }
+
+                    // A lost outcome put outranks every other failure, a failed fence included:
+                    // the command already ran, and the writer resolves it through the winner's
+                    // row. It is never a conflict.
+                    if let Some(outcome) = &outcome
+                        && outcome_failed(layout.outcome, &codes)
+                    {
+                        return Err(Error::OutcomeConflict {
+                            command_id: outcome.command_id.clone(),
+                        });
                     }
 
                     // The stream whose action failed, when the cancellation index maps back to
@@ -902,6 +947,31 @@ impl Repository for DynamoRepository {
                     ));
                 }
             }
+        }
+    }
+
+    /// Reads the outcome row with a strongly consistent `GetItem`, whatever
+    /// [`with_consistent_read`](DynamoRepository::with_consistent_read) says: an eventually
+    /// consistent miss would re-execute a command that already committed.
+    async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        crate::outcome::check_command_id(command_id)?;
+
+        let output = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .key("pk", s(&wire::outcome_key(command_id)))
+            .key("sk", n(wire::OUTCOME_SORT_KEY))
+            .send()
+            .await
+            .map_err(sdk_error)?;
+
+        match output.item {
+            Some(item) if !item.is_empty() => {
+                Ok(Some(wire::outcome_from_item(&from_sdk_item(&item))?))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1184,6 +1254,8 @@ struct TransactionLayout {
     /// Each written stream's contiguous run of action indexes (event puts and the snapshot put or
     /// floor check), so a failed action maps back to the stream that owns it.
     streams: Vec<(std::ops::Range<usize>, EntityId)>,
+    /// The index of the command-outcome put, the last action, when the commit records one.
+    outcome: Option<usize>,
 }
 
 impl TransactionLayout {
@@ -1420,6 +1492,13 @@ fn classify_cancellation(operations: usize, codes: &[Option<&str>]) -> Option<Ca
     }
 
     None
+}
+
+/// Reports whether the command-outcome put (the action at `outcome_index`) failed its condition.
+fn outcome_failed(outcome_index: Option<usize>, codes: &[Option<&str>]) -> bool {
+    outcome_index.is_some_and(|index| {
+        failed_items(codes, "ConditionalCheckFailed").any(|failed| failed == index)
+    })
 }
 
 /// The cancellation reason codes of a failed commit, in transaction order.
@@ -1925,6 +2004,12 @@ mod tests {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
+            // Steps of outcomes scenarios record every request they sent (`calls`); those are
+            // asserted against a live run by the evt-compat tests.
+            let recorded: Vec<Value> = recorded
+                .into_iter()
+                .filter(|recorded| recorded.get("actions").is_some())
+                .collect();
 
             let steps = scenario["steps"].as_array().unwrap();
             let planned: Vec<_> = steps
@@ -2312,5 +2397,106 @@ mod tests {
             matches!(classified, Error::Backend(_)),
             "the commit may have landed, so retrying could apply it twice: {classified:?}"
         );
+    }
+
+    #[test]
+    fn a_lost_outcome_put_is_told_apart_from_a_stream_condition() {
+        const CHECK: Option<&str> = Some("ConditionalCheckFailed");
+        const NONE: Option<&str> = Some("None");
+
+        // marker, event put, floor check, outcome put
+        assert!(outcome_failed(Some(3), &[NONE, NONE, NONE, CHECK]));
+        assert!(outcome_failed(Some(3), &[NONE, CHECK, NONE, CHECK]));
+        assert!(!outcome_failed(Some(3), &[NONE, CHECK, NONE, NONE]));
+        assert!(!outcome_failed(None, &[NONE, NONE, NONE, CHECK]));
+        assert!(!outcome_failed(Some(3), &[]));
+    }
+
+    #[test]
+    fn the_outcome_put_is_the_last_action_and_an_outcome_only_commit_is_marker_then_outcome() {
+        let repository = offline_repository();
+        let outcome = Outcome::accepted("cmd", "digest");
+
+        // Outcome-only, no fences: the marker check and the outcome put.
+        let mut commit = TransactionCommit::new(Vec::new()).with_outcome(outcome.clone());
+        commit.normalize().unwrap();
+        let (mut items, mut layout) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Absent, &HashMap::new())
+            .unwrap();
+        items.push(
+            repository
+                .outcome_put(&commit.stored_outcome().unwrap())
+                .unwrap(),
+        );
+        layout.outcome = Some(items.len() - 1);
+
+        let summary: Vec<_> = items.iter().map(action_summary).collect();
+        assert_eq!(
+            summary,
+            vec![
+                serde_json::json!({
+                    "operation": "ConditionCheck", "pk": "SYSTEM#FEATURES", "sk": 0,
+                    "condition": "attribute_not_exists(pk)"
+                }),
+                serde_json::json!({
+                    "operation": "Put", "pk": "command-outcome#cmd", "sk": 1,
+                    "condition": "attribute_not_exists(pk)"
+                }),
+            ]
+        );
+        assert_eq!(layout.outcome, Some(1));
+
+        // With events and a fence, the outcome stays last, after the fence checks.
+        let event = SerializedEvent {
+            id: "a:1".into(),
+            sequence: EventSequence(1),
+            event_type: "t:e".into(),
+            version: crate::EventVersion(1),
+            entity_id: "a".into(),
+            entity_type: "t".into(),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        };
+        let mut commit =
+            TransactionCommit::new(vec![Commit::new("a", vec![event])]).with_outcome(outcome);
+        commit.fences = vec![crate::ReadFence::new(
+            "f",
+            "t",
+            EventSequence(2),
+            crate::FenceProvenance::Engine,
+        )];
+        commit.normalize().unwrap();
+        let (mut items, _) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Absent, &HashMap::new())
+            .unwrap();
+        items.push(
+            repository
+                .outcome_put(&commit.stored_outcome().unwrap())
+                .unwrap(),
+        );
+
+        let keys: Vec<_> = items
+            .iter()
+            .map(|item| {
+                let summary = action_summary(item);
+                (
+                    summary["pk"].as_str().unwrap().to_owned(),
+                    summary["sk"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("SYSTEM#FEATURES".to_owned(), 0),
+                ("a".to_owned(), 1),
+                ("a".to_owned(), 0),
+                ("f".to_owned(), 3),
+                ("f".to_owned(), 0),
+                ("command-outcome#cmd".to_owned(), 1),
+            ]
+        );
+        let outcome_put = items.last().unwrap().put().unwrap();
+        assert_eq!(outcome_put.item()["events"].as_s().unwrap(), r#"["a:1"]"#);
     }
 }

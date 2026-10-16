@@ -18,6 +18,10 @@ use crate::event::SerializedEvent;
 use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
+use crate::outcome::{
+    CommandIdentity, CommandOutcome, Outcome, OutcomeConfig, Rejection, Settled, pre_check,
+    require_command_id, settle,
+};
 use crate::repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
     snapshot_events_due,
@@ -27,6 +31,25 @@ use crate::store::{
 };
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
+
+/// The command a transaction with outcomes enabled is executing, fixed by
+/// [`Transaction::begin_command`].
+struct PendingCommand {
+    command_id: CommandId,
+    digest: String,
+    metadata: Metadata,
+}
+
+/// The result of [`Transaction::begin_command`].
+#[derive(Debug)]
+pub enum Begin {
+    /// No outcome is recorded for the command ID: read, append, and commit with
+    /// [`Transaction::commit_with_outcome`] (or refuse with [`Transaction::reject`]).
+    Proceed,
+    /// The command already has an outcome with the same identity digest. Nothing ran and nothing
+    /// is written; return it to the caller.
+    Replayed(Box<CommandOutcome>),
+}
 
 /// One stream of a transaction, independent of its aggregate type.
 struct StreamState<Op> {
@@ -118,6 +141,10 @@ pub struct Transaction<'a, R: Repository> {
     /// Set when a step failed after an append changed a handle's aggregate, leaving the handle
     /// ahead of what the transaction staged. Further appends and the commit are refused.
     poisoned: bool,
+    /// Set by [`Transaction::with_outcomes`] or [`Store::with_outcomes`].
+    outcomes: Option<OutcomeConfig>,
+    /// The command fixed by [`Transaction::begin_command`].
+    command: Option<PendingCommand>,
 }
 
 impl<A: Aggregate, R: Repository> Store<A, R> {
@@ -126,11 +153,14 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// run this store's projectors for its own aggregate type, stage events with
     /// [`Store::append_to`]; [`Transaction::append`] runs none.
     pub fn transaction(&self) -> Transaction<'_, R> {
-        Transaction::with_settings(
+        let mut transaction = Transaction::with_settings(
             &self.repository,
             self.commit_ids.clone(),
             self.snapshot_interval,
-        )
+        );
+        transaction.outcomes = self.outcomes.clone();
+
+        transaction
     }
 
     /// Stages events for a stream of this store's aggregate type, running the store's projectors
@@ -170,7 +200,65 @@ impl<'a, R: Repository> Transaction<'a, R> {
             streams: Vec::new(),
             fences: Vec::new(),
             poisoned: false,
+            outcomes: None,
+            command: None,
         }
+    }
+
+    /// Records the command as a durable outcome (C3, C4). A transaction with outcomes enabled
+    /// must begin with [`begin_command`](Transaction::begin_command) and end with
+    /// [`commit_with_outcome`](Transaction::commit_with_outcome) or
+    /// [`reject`](Transaction::reject); [`commit`](Transaction::commit) refuses to run, so no
+    /// outcome is skipped silently. [`Store::transaction`] carries the store's configuration.
+    #[must_use]
+    pub fn with_outcomes(mut self, config: OutcomeConfig) -> Self {
+        self.outcomes = Some(config);
+        self
+    }
+
+    /// Starts a command on a transaction with outcomes enabled: validates the command ID,
+    /// computes the identity digest, and reads the command's outcome row (strongly consistent).
+    /// Call it before the reads, so a repeated command does no work:
+    ///
+    /// - [`Begin::Replayed`]: the command already ran with the same identity digest; return the
+    ///   stored outcome;
+    /// - [`Error::IdempotencyKeyReuse`]: the ID belongs to a different command;
+    /// - [`Begin::Proceed`]: read and append, then
+    ///   [`commit_with_outcome`](Transaction::commit_with_outcome) or
+    ///   [`reject`](Transaction::reject).
+    ///
+    /// The identity declares the streams the command will write; `metadata` supplies the command
+    /// ID, the principal, and the commit's stamped metadata. A missing command ID is
+    /// [`Error::InvalidArgument`] and one over 512 bytes [`Error::CommandIdTooLong`], both before
+    /// any read.
+    pub async fn begin_command(
+        &mut self,
+        identity: &CommandIdentity,
+        metadata: &Metadata,
+    ) -> Result<Begin, Error> {
+        let config = self.outcomes.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
+        })?;
+        if self.command.is_some() {
+            return Err(Error::InvalidCommit(
+                "begin_command was already called on this transaction".into(),
+            ));
+        }
+
+        let command_id = require_command_id(metadata)?;
+        let digest = config.digest(&identity.digest_input(metadata))?;
+
+        if let Some(stored) = pre_check(self.repository, &command_id, &digest).await? {
+            return Ok(Begin::Replayed(Box::new(CommandOutcome::replay(stored))));
+        }
+
+        self.command = Some(PendingCommand {
+            command_id,
+            digest,
+            metadata: metadata.clone(),
+        });
+
+        Ok(Begin::Proceed)
     }
 
     /// Sets the number of events between snapshots for streams staged with
@@ -423,7 +511,194 @@ impl<'a, R: Repository> Transaction<'a, R> {
     /// exactly one atomic repository commit. On failure nothing is written. It returns the
     /// committed events in the canonical order the commit persists them: stream ID bytewise,
     /// then sequence.
+    ///
+    /// A transaction with [outcomes enabled](Transaction::with_outcomes) refuses with
+    /// [`Error::InvalidConfig`]: use [`commit_with_outcome`](Transaction::commit_with_outcome).
     pub async fn commit(mut self, metadata: &Metadata) -> Result<Vec<SerializedEvent>, Error> {
+        if self.outcomes.is_some() {
+            return Err(Error::InvalidConfig(
+                "this transaction records command outcomes: commit would skip the outcome row; \
+                 call begin_command, then commit_with_outcome or reject"
+                    .into(),
+            ));
+        }
+
+        let (commit, committed) = self.prepare(metadata)?;
+
+        self.repository.commit_transaction(commit).await?;
+
+        Ok(committed)
+    }
+
+    /// Commits the transaction and records the command as an accepted outcome, in one atomic
+    /// repository commit: the appended events (none is an accepted no-op), the read set's
+    /// fences, and then the outcome row, which stores `response` for a retried command to
+    /// return. The transaction must have been started with
+    /// [`begin_command`](Transaction::begin_command).
+    ///
+    /// Failures resolve as the storage spec pins:
+    ///
+    /// - a lost outcome put resolves through the winner's row (the stored outcome, or
+    ///   [`Error::IdempotencyKeyReuse`]);
+    /// - an indeterminate commit failure is recovered by re-reading the row, never by re-running
+    ///   the command ([`Error::AmbiguousWrite`] when it did not apply or cannot be told);
+    /// - a failed **caller-stamped** fence persists a `stale-fence` rejection instead of
+    ///   retrying, and returns it as the command's (rejected) outcome. The old command ID stays
+    ///   terminal: the caller re-reads, re-decides, and submits a new command ID;
+    /// - an engine-filled fence, event, floor, or snapshot conflict is an ordinary retryable
+    ///   conflict: build a new transaction and call [`begin_command`](Transaction::begin_command)
+    ///   again.
+    pub async fn commit_with_outcome(
+        mut self,
+        response: Option<Vec<u8>>,
+    ) -> Result<CommandOutcome, Error> {
+        let pending = self.take_command()?;
+        let (mut commit, committed) = self.prepare(&pending.metadata)?;
+
+        let mut outcome = Outcome::accepted(pending.command_id.clone(), pending.digest.clone());
+        if let Some(response) = response {
+            outcome = outcome.with_response(response);
+        }
+        commit.outcome = Some(outcome);
+        let stored = commit
+            .stored_outcome()
+            .expect("the commit carries the outcome");
+
+        let result = self.repository.commit_transaction(commit).await;
+        if let Err(Error::FenceConflict {
+            provenance: FenceProvenance::Caller,
+            ..
+        }) = &result
+        {
+            return self.persist_stale_fence(&pending).await;
+        }
+
+        match settle(
+            self.repository,
+            &pending.command_id,
+            &pending.digest,
+            result,
+        )
+        .await?
+        {
+            Settled::Committed => Ok(CommandOutcome::fresh(stored, committed, Vec::new())),
+            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
+        }
+    }
+
+    /// Records the command as a rejected outcome (C4) without writing events: the domain refused
+    /// it. Staged appends are discarded. The commit is an outcome-only transaction: the
+    /// feature-marker check, then the fence check of every stream the transaction read (at the
+    /// head it saw) and every caller-stamped fence, then the rejected outcome row. A rejection
+    /// decided from stale input is therefore not persisted: an engine-filled fence conflict is
+    /// a retryable error, and a failed caller-stamped fence persists a `stale-fence` rejection
+    /// instead, as in [`commit_with_outcome`](Transaction::commit_with_outcome).
+    ///
+    /// The rejection's encoded form is at most 65536 bytes ([`Error::OutcomeTooLarge`], before
+    /// any write). A retried command replays the stored rejection verbatim.
+    pub async fn reject(mut self, rejection: Rejection) -> Result<CommandOutcome, Error> {
+        let pending = self.take_command()?;
+        if self.poisoned {
+            return Err(Error::TransactionPoisoned);
+        }
+
+        let streams = std::mem::take(&mut self.streams);
+        let mut fences: Vec<ReadFence> = streams
+            .into_iter()
+            .map(|stream| ReadFence {
+                entity_id: stream.entity_id,
+                entity_type: stream.entity_type,
+                head: stream.head,
+                provenance: FenceProvenance::Engine,
+            })
+            .collect();
+        fences.append(&mut self.fences);
+
+        let outcome = Outcome::rejected(
+            pending.command_id.clone(),
+            pending.digest.clone(),
+            rejection,
+        );
+        let commit = TransactionCommit::new(Vec::new())
+            .with_fences(fences)
+            .with_outcome(outcome);
+        let stored = commit
+            .stored_outcome()
+            .expect("the commit carries the outcome");
+
+        let result = self.repository.commit_transaction(commit).await;
+        if let Err(Error::FenceConflict {
+            provenance: FenceProvenance::Caller,
+            ..
+        }) = &result
+        {
+            return self.persist_stale_fence(&pending).await;
+        }
+
+        match settle(
+            self.repository,
+            &pending.command_id,
+            &pending.digest,
+            result,
+        )
+        .await?
+        {
+            Settled::Committed => Ok(CommandOutcome::fresh(stored, Vec::new(), Vec::new())),
+            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
+        }
+    }
+
+    fn take_command(&mut self) -> Result<PendingCommand, Error> {
+        if self.outcomes.is_none() {
+            return Err(Error::InvalidConfig(
+                "command outcomes are not enabled; call with_outcomes".into(),
+            ));
+        }
+
+        self.command.take().ok_or_else(|| {
+            Error::InvalidArgument(
+                "begin_command must be called before the transaction records an outcome".into(),
+            )
+        })
+    }
+
+    /// Persists the `stale-fence` rejection of a failed caller-stamped fence with an outcome-only
+    /// transaction that carries none of the failed commit's other items: no fences (they are
+    /// stale by definition), no events, no snapshots, no projector operations.
+    async fn persist_stale_fence(&self, pending: &PendingCommand) -> Result<CommandOutcome, Error> {
+        let outcome = Outcome::rejected(
+            pending.command_id.clone(),
+            pending.digest.clone(),
+            Rejection::stale_fence(),
+        );
+        let commit = TransactionCommit::new(Vec::new()).with_outcome(outcome);
+        let stored = commit
+            .stored_outcome()
+            .expect("the commit carries the outcome");
+
+        let result = self.repository.commit_transaction(commit).await;
+
+        match settle(
+            self.repository,
+            &pending.command_id,
+            &pending.digest,
+            result,
+        )
+        .await?
+        {
+            Settled::Committed => Ok(CommandOutcome::fresh(stored, Vec::new(), Vec::new())),
+            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
+        }
+    }
+
+    /// Stamps the commit ID once and builds the repository commit: every unwritten read becomes
+    /// an engine fence at the head it saw, the written streams carry their events, snapshots, and
+    /// operations. Returns it with the events in their persisted order.
+    #[allow(clippy::type_complexity)]
+    fn prepare(
+        &mut self,
+        metadata: &Metadata,
+    ) -> Result<(TransactionCommit<R::Operation>, Vec<SerializedEvent>), Error> {
         if self.poisoned {
             return Err(Error::TransactionPoisoned);
         }
@@ -491,16 +766,15 @@ impl<'a, R: Repository> Transaction<'a, R> {
                 events,
                 snapshot: stream.snapshot,
                 operations: Vec::new(),
+                outcome: None,
             });
         }
 
         let mut commit = TransactionCommit::new(commits);
-        commit.fences = self.fences;
+        commit.fences = std::mem::take(&mut self.fences);
         commit.operations = operations;
 
-        self.repository.commit_transaction(commit).await?;
-
-        Ok(committed)
+        Ok((commit, committed))
     }
 }
 
@@ -1272,5 +1546,275 @@ mod tests {
             committed[0].operations,
             vec!["put fixed total=3 events=2".to_owned()]
         );
+    }
+
+    fn outcome_store() -> Store<Ledger, MemRepository> {
+        Store::new(MemRepository::new(), ())
+            .with_snapshot_interval(0)
+            .with_outcomes(OutcomeConfig::new())
+    }
+
+    fn command(id: &str) -> Metadata {
+        Metadata::default().with_command_id(id)
+    }
+
+    fn identity(stream: &str) -> CommandIdentity {
+        CommandIdentity::new("ledger:test").with_streams([stream])
+    }
+
+    #[tokio::test]
+    async fn a_transaction_with_outcomes_refuses_the_plain_commit() {
+        let store = outcome_store();
+
+        let tx = store.transaction();
+        assert!(matches!(
+            tx.commit(&command("c")).await,
+            Err(Error::InvalidConfig(_))
+        ));
+
+        // Beginning the command does not make the plain commit safe either.
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("a"), &command("c"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.commit(&command("c")).await,
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn recording_an_outcome_needs_begin_command() {
+        let store = outcome_store();
+
+        assert!(matches!(
+            store.transaction().commit_with_outcome(None).await,
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            store.transaction().reject(Rejection::new("c", "m")).await,
+            Err(Error::InvalidArgument(_))
+        ));
+
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("a"), &command("c"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.begin_command(&identity("a"), &command("c")).await,
+            Err(Error::InvalidCommit(_))
+        ));
+
+        // Without outcomes the whole flow is refused as a configuration error.
+        let plain = MemRepository::new();
+        let mut tx = Transaction::new(&plain);
+        assert!(matches!(
+            tx.begin_command(&identity("a"), &command("c")).await,
+            Err(Error::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            Transaction::new(&plain).commit_with_outcome(None).await,
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn begin_command_validates_the_command_id_before_reading() {
+        let store = outcome_store();
+
+        for (metadata, want_missing) in [
+            (Metadata::default(), true),
+            (Metadata::default().with_command_id(""), true),
+            (command(&"c".repeat(513)), false),
+        ] {
+            let result = store
+                .transaction()
+                .begin_command(&identity("a"), &metadata)
+                .await;
+            if want_missing {
+                assert!(
+                    matches!(result, Err(Error::InvalidArgument(_))),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::CommandIdTooLong { length: 513 })),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_commit_records_events_in_stream_order_with_the_response() {
+        let store = outcome_store();
+
+        let mut tx = store.transaction();
+        assert!(matches!(
+            tx.begin_command(&identity("b"), &command("cmd"))
+                .await
+                .unwrap(),
+            Begin::Proceed
+        ));
+        let mut b = tx.read::<Ledger>("b").await.unwrap();
+        let mut a = tx.read::<Ledger>("a").await.unwrap();
+        tx.append(&mut b, added(1)).unwrap();
+        tx.append(&mut a, added(2)).unwrap();
+        let done = tx.commit_with_outcome(Some(b"ok".to_vec())).await.unwrap();
+
+        assert!(done.is_accepted() && !done.replayed && !done.is_noop());
+        assert_eq!(done.response(), Some(&b"ok"[..]));
+        assert_eq!(
+            done.outcome.event_ids,
+            vec![crate::EventId::new("a:1"), crate::EventId::new("b:1")],
+            "stream ID bytewise, then sequence"
+        );
+        assert_eq!(done.events.len(), 2);
+        assert!(
+            done.events
+                .iter()
+                .all(|event| event.metadata.commit_id == "cmd")
+        );
+
+        // A repeat replays it.
+        let mut again = store.transaction();
+        match again
+            .begin_command(&identity("b"), &command("cmd"))
+            .await
+            .unwrap()
+        {
+            Begin::Replayed(replayed) => {
+                assert!(replayed.replayed);
+                assert_eq!(replayed.outcome, done.outcome);
+            }
+            Begin::Proceed => panic!("a recorded command must replay"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_caller_fence_persists_a_stale_fence_rejection() {
+        let store = outcome_store();
+        seed_ledger(&store, "ext", 2).await;
+
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("t"), &command("cmd"))
+            .await
+            .unwrap();
+        let mut target = tx.read::<Ledger>("t").await.unwrap();
+        tx.append(&mut target, added(1)).unwrap();
+        tx.fence(ReadFence::new(
+            "ext",
+            "ledger",
+            EventSequence(1),
+            FenceProvenance::Engine,
+        ))
+        .unwrap();
+        let outcome = tx.commit_with_outcome(None).await.unwrap();
+
+        assert!(outcome.is_rejected() && !outcome.replayed);
+        assert_eq!(outcome.rejection(), Some(&Rejection::stale_fence()));
+        assert_eq!(
+            stored_events(&store, "t").await,
+            0,
+            "the command never wrote"
+        );
+        assert_eq!(
+            store.repository().outcome(&"cmd".into()).await.unwrap(),
+            Some(outcome.outcome.clone())
+        );
+
+        // The old ID is terminal.
+        let mut again = store.transaction();
+        match again
+            .begin_command(&identity("t"), &command("cmd"))
+            .await
+            .unwrap()
+        {
+            Begin::Replayed(replayed) => assert_eq!(replayed.outcome, outcome.outcome),
+            Begin::Proceed => panic!("the stale-fence rejection must replay"),
+        }
+    }
+
+    async fn seed_ledger(store: &Store<Ledger, MemRepository>, id: &str, additions: usize) {
+        let plain =
+            Store::<Ledger, _>::new(store.repository().clone(), ()).with_snapshot_interval(0);
+        for _ in 0..additions {
+            plain
+                .execute(id, Add(1), Metadata::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejecting_fences_the_read_set_and_discards_staged_appends() {
+        let store = outcome_store();
+        seed_ledger(&store, "ext", 1).await;
+
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("t"), &command("cmd"))
+            .await
+            .unwrap();
+        tx.read::<Ledger>("ext").await.unwrap();
+        let mut target = tx.read::<Ledger>("t").await.unwrap();
+        tx.append(&mut target, added(1)).unwrap();
+        let rejected = tx.reject(Rejection::new("denied", "no")).await.unwrap();
+
+        assert!(rejected.is_rejected() && rejected.events.is_empty());
+        assert_eq!(
+            stored_events(&store, "t").await,
+            0,
+            "staged appends are discarded"
+        );
+
+        // A read that went stale before the rejection is not persisted.
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("t"), &command("other"))
+            .await
+            .unwrap();
+        tx.read::<Ledger>("ext").await.unwrap();
+        seed_ledger(&store, "ext", 1).await;
+        let error = tx.reject(Rejection::new("denied", "no")).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::FenceConflict {
+                    provenance: FenceProvenance::Engine,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            store
+                .repository()
+                .outcome(&"other".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_id_on_a_pre_outcome_event_is_still_a_duplicate() {
+        let store = outcome_store();
+        let plain =
+            Store::<Ledger, _>::new(store.repository().clone(), ()).with_snapshot_interval(0);
+        plain.execute("a", Add(1), command("legacy")).await.unwrap();
+
+        let mut tx = store.transaction();
+        assert!(matches!(
+            tx.begin_command(&identity("a"), &command("legacy"))
+                .await
+                .unwrap(),
+            Begin::Proceed
+        ));
+        let mut a = tx.read::<Ledger>("a").await.unwrap();
+        tx.append(&mut a, added(1)).unwrap();
+
+        assert!(matches!(
+            tx.commit_with_outcome(None).await,
+            Err(Error::DuplicateCommand(_))
+        ));
     }
 }

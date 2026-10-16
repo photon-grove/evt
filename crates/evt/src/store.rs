@@ -8,11 +8,15 @@ use std::time::Duration;
 
 use crate::aggregate::{Aggregate, Projector};
 use crate::commit_id::{self, CommitIdGenerator};
-use crate::error::{Error, ExecuteError, ReplayPhase};
+use crate::error::{BoxError, Error, ExecuteError, ReplayPhase};
 use crate::event::{DomainEvent, SerializedEvent};
 use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
+use crate::outcome::{
+    CommandOutcome, DigestInput, Outcome, OutcomeCommand, OutcomeConfig, Settled, ToRejection,
+    pre_check, principal, require_command_id, settle,
+};
 use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
 use crate::retry::RetryPolicy;
 use crate::upcast::upcast_event;
@@ -35,6 +39,7 @@ pub struct Store<A: Aggregate, R: Repository> {
     pub(crate) snapshot_interval: usize,
     pub(crate) projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
     pub(crate) commit_ids: CommitIdGenerator,
+    pub(crate) outcomes: Option<OutcomeConfig>,
 }
 
 impl<A, R> Clone for Store<A, R>
@@ -50,6 +55,7 @@ where
             snapshot_interval: self.snapshot_interval,
             projectors: self.projectors.clone(),
             commit_ids: self.commit_ids.clone(),
+            outcomes: self.outcomes.clone(),
         }
     }
 }
@@ -74,7 +80,29 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             projectors: Vec::new(),
             commit_ids: commit_id::default_generator(),
+            outcomes: None,
         }
+    }
+
+    /// Records every command as a durable outcome (C3, C4): a global `command-outcome#<id>` row,
+    /// written in the same transaction as the events. The store then requires a command ID on
+    /// every command, replays the stored outcome of a repeated command, and persists domain
+    /// rejections. Use [`execute_with_outcome`](Store::execute_with_outcome) and
+    /// [`Store::transaction`] with [`Transaction::begin_command`](crate::Transaction::begin_command);
+    /// the plain [`execute`](Store::execute) and [`commit`](Store::commit) refuse to run on such a
+    /// store with [`Error::InvalidConfig`] instead of silently skipping the outcome.
+    ///
+    /// The repository must support outcomes ([`Repository::outcome`]); the in-memory, DynamoDB, and
+    /// PostgreSQL repositories do.
+    #[must_use]
+    pub fn with_outcomes(mut self, config: OutcomeConfig) -> Self {
+        self.outcomes = Some(config);
+        self
+    }
+
+    /// The outcome configuration, when command outcomes are enabled.
+    pub fn outcomes(&self) -> Option<&OutcomeConfig> {
+        self.outcomes.as_ref()
     }
 
     /// Replaces the generator that stamps a commit ID on commits whose metadata carries neither
@@ -154,6 +182,8 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         command: A::Command,
         metadata: Metadata,
     ) -> Result<Executed<A>, ExecuteError<A::Error>> {
+        self.refuse_outcomes("execute")?;
+
         let loaded = self.load(entity_id).await?;
 
         if let Some(command_id) = &metadata.command_id
@@ -210,12 +240,18 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// Applies events to a loaded aggregate and commits them, snapshotting when the commit
     /// reaches the snapshot interval. Consumes `loaded` so a failed commit cannot leave stale
     /// state in use. On success it returns the updated state and the stored events.
+    ///
+    /// Refuses with [`Error::InvalidConfig`] on a store with
+    /// [outcomes enabled](Store::with_outcomes); use
+    /// [`execute_with_outcome`](Store::execute_with_outcome).
     pub async fn commit(
         &self,
-        mut loaded: Loaded<A>,
+        loaded: Loaded<A>,
         events: Vec<A::Event>,
         metadata: &Metadata,
     ) -> Result<(Loaded<A>, Vec<SerializedEvent>), Error> {
+        self.refuse_outcomes("commit")?;
+
         if let Some(command_id) = &metadata.command_id
             && loaded.has_seen(command_id)
         {
@@ -226,6 +262,34 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             return Ok((loaded, Vec::new()));
         }
 
+        let (loaded, serialized, commit) = self.stage(loaded, events, metadata)?;
+
+        self.repository.commit(commit).await?;
+
+        Ok((loaded, serialized))
+    }
+
+    fn refuse_outcomes(&self, method: &str) -> Result<(), Error> {
+        if self.outcomes.is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "this store records command outcomes: {method} would skip the outcome row; use \
+                 execute_with_outcome (or a Transaction with begin_command)"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Applies the decided events to the loaded aggregate and builds the repository commit that
+    /// persists them (events, snapshot, projector operations), without writing it. The returned
+    /// state is the one after the commit applies; it is only used if the commit succeeds.
+    #[allow(clippy::type_complexity)]
+    fn stage(
+        &self,
+        mut loaded: Loaded<A>,
+        events: Vec<A::Event>,
+        metadata: &Metadata,
+    ) -> Result<(Loaded<A>, Vec<SerializedEvent>, Commit<R::Operation>), Error> {
         // The engine stamps the commit ID once per commit; every event of this commit carries it.
         let stamped = stamp_commit_id(metadata, &*self.commit_ids);
         let serialized =
@@ -260,14 +324,13 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
         let snapshot_sequence = snapshot.as_ref().map(|snapshot| snapshot.sequence);
 
-        self.repository
-            .commit(Commit {
-                entity_id: loaded.entity_id.clone(),
-                events: serialized.clone(),
-                snapshot,
-                operations,
-            })
-            .await?;
+        let commit = Commit {
+            entity_id: loaded.entity_id.clone(),
+            events: serialized.clone(),
+            snapshot,
+            operations,
+            outcome: None,
+        };
 
         loaded.sequence = serialized
             .last()
@@ -283,7 +346,224 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             loaded.seen_command_ids.insert(command_id.clone());
         }
 
-        Ok((loaded, serialized))
+        Ok((loaded, serialized, commit))
+    }
+
+    /// Loads the aggregate, handles the command, and records the result as a durable outcome on a
+    /// store with [outcomes enabled](Store::with_outcomes) (C3, C4).
+    ///
+    /// Every attempt starts by reading the command's outcome row, strongly consistent:
+    ///
+    /// - present with the same identity digest: the stored outcome is returned
+    ///   ([`CommandOutcome::replayed`]), the handler does not run, and nothing is written;
+    /// - present with another digest: [`Error::IdempotencyKeyReuse`];
+    /// - absent: the aggregate is loaded and the command handled. Events (if any) and the outcome
+    ///   commit in one transaction. An error returned by the handler is a domain rejection: it is
+    ///   mapped with [`ToRejection`] and, when that yields a rejection, persisted as a rejected
+    ///   outcome (a `None` is an internal failure: [`Error::Handler`], nothing recorded), which a retry of the
+    ///   command replays verbatim. A handler that returns no events is an accepted no-op.
+    ///
+    /// Internal failures (encoding, storage, replay, projector errors) are errors and record no
+    /// outcome. A lost outcome-put race resolves through the winner's row; an indeterminate commit
+    /// failure is recovered by re-reading the row (see [`Error::AmbiguousWrite`]).
+    ///
+    /// The identity digest covers the command's type and payload ([`OutcomeCommand`]), the entity
+    /// ID, and the metadata's principal. The command ID is required ([`Error::InvalidArgument`])
+    /// and at most 512 bytes ([`Error::CommandIdTooLong`]), both checked before any read.
+    ///
+    /// # Cancellation
+    ///
+    /// Not cancellation safe, like [`execute`](Store::execute). If the future is dropped while the
+    /// commit is in flight, the outcome row tells whether it applied: run the command again with
+    /// the same command ID.
+    pub async fn execute_with_outcome(
+        &self,
+        entity_id: impl Into<EntityId>,
+        command: A::Command,
+        metadata: Metadata,
+    ) -> Result<CommandOutcome<A::Event>, Error>
+    where
+        A::Command: OutcomeCommand,
+        A::Error: ToRejection,
+    {
+        self.execute_with_response(entity_id, command, metadata, |_, _| Ok(None))
+            .await
+    }
+
+    /// Like [`execute_with_outcome`](Store::execute_with_outcome), and stores a response with an
+    /// accepted outcome so a retried command returns the original answer. `respond` runs after the
+    /// handler succeeds, with the aggregate as it is after the decided events (the current state
+    /// for a no-op) and those events. The response is at most 65536 bytes
+    /// ([`Error::OutcomeTooLarge`]); `None` or empty stores none.
+    pub async fn execute_with_response<F>(
+        &self,
+        entity_id: impl Into<EntityId>,
+        command: A::Command,
+        metadata: Metadata,
+        respond: F,
+    ) -> Result<CommandOutcome<A::Event>, Error>
+    where
+        A::Command: OutcomeCommand,
+        A::Error: ToRejection,
+        F: FnOnce(&A, &[A::Event]) -> Result<Option<Vec<u8>>, BoxError>,
+    {
+        let config = self.outcomes.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
+        })?;
+
+        let entity_id = entity_id.into();
+        let command_id = require_command_id(&metadata)?;
+        let digest = config.digest(&DigestInput {
+            command_type: command.command_type(),
+            streams: vec![entity_id.clone()],
+            payload: command
+                .canonical_payload()
+                .map_err(|err| Error::InvalidArgument(format!("the command payload: {err}")))?
+                .unwrap_or_default(),
+            principal: principal(&metadata),
+        })?;
+
+        if let Some(stored) = pre_check(&self.repository, &command_id, &digest).await? {
+            return Ok(CommandOutcome::replay(stored));
+        }
+
+        let loaded = self.load(entity_id).await?;
+
+        // Events written before outcomes existed carry command IDs but have no outcome row; the
+        // window catches those duplicates (and only those: this store's own commits write rows).
+        if loaded.has_seen(&command_id) {
+            return Err(Error::DuplicateCommand(command_id));
+        }
+
+        let entity_id = loaded.entity_id.clone();
+
+        let events = match loaded.aggregate.handle(command, &self.services).await {
+            Ok(events) => events,
+            Err(error) => {
+                // `None` is an internal failure: returned, and nothing is recorded.
+                let Some(rejection) = error.to_rejection() else {
+                    return Err(Error::Handler(Box::new(error)));
+                };
+
+                let outcome = Outcome::rejected(command_id, digest, rejection);
+                let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
+
+                return self.record(commit, Vec::new(), Vec::new()).await;
+            }
+        };
+
+        let decided = events.clone();
+
+        if events.is_empty() {
+            let response = respond(&loaded.aggregate, &[]).map_err(response_error)?;
+            let outcome = with_response(Outcome::accepted(command_id, digest), response);
+            let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
+
+            return self.record(commit, Vec::new(), decided).await;
+        }
+
+        let (loaded, serialized, mut commit) = self.stage(loaded, events, &metadata)?;
+        let response = respond(&loaded.aggregate, &decided).map_err(response_error)?;
+        commit.outcome = Some(with_response(
+            Outcome::accepted(command_id, digest),
+            response,
+        ));
+
+        self.record(commit, serialized, decided).await
+    }
+
+    /// Reads the outcome row of a command without running or writing anything, as ambiguous-write
+    /// recovery does. `command` supplies the identity (its type and payload) and `entity_id` the
+    /// declared stream, exactly as [`execute_with_outcome`](Store::execute_with_outcome) digests
+    /// them; `metadata` supplies the command ID and principal.
+    ///
+    /// Returns `None` when no row exists (a command that did not apply is safe to run again), the
+    /// stored outcome ([`CommandOutcome::replayed`]) for the same identity digest, and
+    /// [`Error::IdempotencyKeyReuse`] for another.
+    pub async fn resolve_outcome(
+        &self,
+        entity_id: impl Into<EntityId>,
+        command: &A::Command,
+        metadata: &Metadata,
+    ) -> Result<Option<CommandOutcome<A::Event>>, Error>
+    where
+        A::Command: OutcomeCommand,
+    {
+        let config = self.outcomes.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
+        })?;
+
+        let command_id = require_command_id(metadata)?;
+        let digest = config.digest(&DigestInput {
+            command_type: command.command_type(),
+            streams: vec![entity_id.into()],
+            payload: command
+                .canonical_payload()
+                .map_err(|err| Error::InvalidArgument(format!("the command payload: {err}")))?
+                .unwrap_or_default(),
+            principal: principal(metadata),
+        })?;
+
+        Ok(pre_check(&self.repository, &command_id, &digest)
+            .await?
+            .map(CommandOutcome::replay))
+    }
+
+    /// Writes a commit that carries an outcome and settles the result.
+    async fn record(
+        &self,
+        commit: Commit<R::Operation>,
+        serialized: Vec<SerializedEvent>,
+        typed_events: Vec<A::Event>,
+    ) -> Result<CommandOutcome<A::Event>, Error> {
+        let stored = commit
+            .stored_outcome()
+            .expect("record is only called with an outcome");
+        let (command_id, digest) = (stored.command_id.clone(), stored.digest.clone());
+
+        let result = self.repository.commit(commit).await;
+
+        match settle(&self.repository, &command_id, &digest, result).await? {
+            Settled::Committed => Ok(CommandOutcome::fresh(stored, serialized, typed_events)),
+            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
+        }
+    }
+
+    /// Like [`execute_with_outcome`](Store::execute_with_outcome), but reloads and re-handles the
+    /// command after a [retryable](Error::is_retryable) error (a conflict, a transient backend
+    /// failure, or an ambiguous write that provably did not apply), waiting
+    /// [`RetryPolicy::delay`] between attempts with `sleep`. Every attempt starts by reading the
+    /// outcome row, so a retry never repeats a command that already committed.
+    pub async fn execute_with_outcome_retry<S, F>(
+        &self,
+        entity_id: impl Into<EntityId>,
+        command: A::Command,
+        metadata: Metadata,
+        policy: &RetryPolicy,
+        sleep: S,
+    ) -> Result<CommandOutcome<A::Event>, Error>
+    where
+        A::Command: OutcomeCommand + Clone,
+        A::Error: ToRejection,
+        S: Fn(Duration) -> F + Send,
+        F: Future<Output = ()> + Send,
+    {
+        let entity_id = entity_id.into();
+        let max_attempts = policy.max_attempts.max(1);
+        let mut retry = 0;
+
+        loop {
+            match self
+                .execute_with_outcome(entity_id.clone(), command.clone(), metadata.clone())
+                .await
+            {
+                Err(err) if err.is_retryable() && retry + 1 < max_attempts => {
+                    sleep(policy.delay(retry)).await;
+                    retry += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Lists the IDs of every stored entity of this aggregate type, for rebuilds. Load each with
@@ -460,6 +740,17 @@ pub struct Executed<A> {
     pub events: Vec<SerializedEvent>,
 }
 
+fn response_error(err: BoxError) -> Error {
+    Error::InvalidArgument(format!("the response callback failed: {err}"))
+}
+
+fn with_response(outcome: Outcome, response: Option<Vec<u8>>) -> Outcome {
+    match response {
+        Some(response) => outcome.with_response(response),
+        None => outcome,
+    }
+}
+
 /// Serializes typed events into stored events starting after `sequence`.
 pub fn serialize_events<A: Aggregate>(
     entity_id: &EntityId,
@@ -585,5 +876,379 @@ mod tests {
             duplicate.unwrap_err().as_store_error(),
             Some(Error::DuplicateCommand(_))
         ));
+    }
+
+    mod outcomes {
+        use serde::{Deserialize, Serialize};
+
+        use super::*;
+        use crate::conformance::FaultInjectingRepository;
+        use crate::outcome::{Rejection, ToRejection};
+        use crate::{Aggregate, MemRepository, OutcomeCommand, OutcomeConfig, RetryPolicy};
+
+        /// A counter whose command is the amount to add: zero is a no-op, a negative amount is
+        /// refused.
+        #[derive(Debug, Default, Serialize, Deserialize)]
+        struct Counter {
+            total: i64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+        struct Bumped {
+            amount: i64,
+        }
+
+        crate::domain_events! {
+            #[derive(Clone, Debug, PartialEq)]
+            enum CounterEvent {
+                Bumped(Bumped) => ("counter:bumped", 1),
+            }
+        }
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("negative amount {0}")]
+        struct Negative(i64);
+
+        impl ToRejection for Negative {
+            fn to_rejection(&self) -> Option<Rejection> {
+                Some(
+                    Rejection::new("negative", self.to_string())
+                        .with_details(serde_json::json!({ "amount": self.0 })),
+                )
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Bump(i64);
+
+        impl OutcomeCommand for Bump {
+            fn command_type(&self) -> String {
+                "counter:bump".into()
+            }
+
+            fn canonical_payload(&self) -> Result<Option<Vec<u8>>, BoxError> {
+                Ok(Some(crate::canonical_json(&self.0)?))
+            }
+        }
+
+        impl Aggregate for Counter {
+            const TYPE: &'static str = "counter";
+
+            type Command = Bump;
+            type Event = CounterEvent;
+            type Error = Negative;
+            type Services = ();
+
+            async fn handle(
+                &self,
+                Bump(amount): Bump,
+                _: &(),
+            ) -> Result<Vec<CounterEvent>, Negative> {
+                match amount {
+                    0 => Ok(Vec::new()),
+                    amount if amount < 0 => Err(Negative(amount)),
+                    amount => Ok(vec![Bumped { amount }.into()]),
+                }
+            }
+
+            fn apply(&mut self, event: CounterEvent) {
+                match event {
+                    CounterEvent::Bumped(bumped) => self.total += bumped.amount,
+                }
+            }
+        }
+
+        fn store() -> Store<Counter, MemRepository> {
+            Store::new(MemRepository::new(), ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new())
+        }
+
+        fn command(id: &str) -> Metadata {
+            Metadata::default().with_command_id(id)
+        }
+
+        #[tokio::test]
+        async fn a_zero_event_command_is_an_accepted_no_op_with_its_response() {
+            let store = store();
+
+            let first = store
+                .execute_with_response("c-1", Bump(0), command("noop"), |counter, events| {
+                    assert!(events.is_empty());
+
+                    Ok(Some(format!("total={}", counter.total).into_bytes()))
+                })
+                .await
+                .unwrap();
+            assert!(first.is_accepted() && first.is_noop() && !first.replayed);
+            assert_eq!(first.response(), Some(&b"total=0"[..]));
+            assert!(first.events.is_empty() && first.typed_events.is_empty());
+
+            // The retry answers from the stored row; the handler and the callback do not run.
+            let again = store
+                .execute_with_response("c-1", Bump(0), command("noop"), |_, _| {
+                    panic!("the response callback must not run on a replay")
+                })
+                .await
+                .unwrap();
+            assert!(again.replayed);
+            assert_eq!(again.outcome, first.outcome);
+            assert_eq!(
+                store
+                    .repository()
+                    .events(&"c-1".into())
+                    .await
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
+
+        #[tokio::test]
+        async fn the_response_sees_the_state_after_the_decided_events() {
+            let store = store();
+
+            let done = store
+                .execute_with_response("c-1", Bump(5), command("bump"), |counter, events| {
+                    assert_eq!(events, [CounterEvent::from(Bumped { amount: 5 })]);
+
+                    Ok(Some(counter.total.to_string().into_bytes()))
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(done.response(), Some(&b"5"[..]));
+            assert_eq!(
+                done.typed_events,
+                vec![CounterEvent::from(Bumped { amount: 5 })]
+            );
+            assert_eq!(done.events.len(), 1);
+            assert_eq!(
+                done.events[0].metadata.commit_id, "bump",
+                "the command ID is the commit ID"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_domain_error_is_a_durable_rejection_and_an_internal_error_is_not() {
+            let store = store();
+
+            let rejected = store
+                .execute_with_outcome("c-1", Bump(-3), command("refused"))
+                .await
+                .unwrap();
+            assert!(rejected.is_rejected());
+            let rejection = rejected.rejection().unwrap().clone();
+            assert_eq!(rejection.code, "negative");
+            assert_eq!(rejection.details, Some(serde_json::json!({ "amount": -3 })));
+
+            let again = store
+                .execute_with_outcome("c-1", Bump(-3), command("refused"))
+                .await
+                .unwrap();
+            assert!(again.replayed);
+            assert_eq!(again.rejection(), Some(&rejection));
+
+            // A failing response callback is an error before any write: no outcome is recorded.
+            let error = store
+                .execute_with_response("c-2", Bump(1), command("broken"), |_, _| Err("boom".into()))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+            assert!(
+                store
+                    .repository()
+                    .outcome(&"broken".into())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .repository()
+                    .events(&"c-2".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_command_id_is_checked_before_anything_is_read() {
+            let store = store();
+
+            let missing = store
+                .execute_with_outcome("c-1", Bump(1), Metadata::default())
+                .await;
+            assert!(
+                matches!(missing, Err(Error::InvalidArgument(_))),
+                "{missing:?}"
+            );
+
+            let long = store
+                .execute_with_outcome("c-1", Bump(1), command(&"x".repeat(513)))
+                .await;
+            assert!(
+                matches!(long, Err(Error::CommandIdTooLong { length: 513 })),
+                "{long:?}"
+            );
+
+            assert!(
+                store
+                    .repository()
+                    .events(&"c-1".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_store_without_outcomes_refuses_the_outcome_methods_and_vice_versa() {
+            let plain = Store::<Counter, _>::new(MemRepository::new(), ());
+            let result = plain
+                .execute_with_outcome("c-1", Bump(1), command("c"))
+                .await;
+            assert!(matches!(result, Err(Error::InvalidConfig(_))), "{result:?}");
+
+            let with = store();
+            let executed = with.execute("c-1", Bump(1), command("c")).await;
+            assert!(matches!(
+                executed.unwrap_err().as_store_error(),
+                Some(Error::InvalidConfig(_))
+            ));
+            let loaded = with.load("c-1").await.unwrap();
+            let committed = with.commit(loaded, Vec::new(), &Metadata::default()).await;
+            assert!(matches!(committed, Err(Error::InvalidConfig(_))));
+        }
+
+        #[tokio::test]
+        async fn resolving_reads_the_row_without_running_anything() {
+            let store = store();
+            let metadata = command("resolve");
+
+            assert!(
+                store
+                    .resolve_outcome("c-1", &Bump(2), &metadata)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            store
+                .execute_with_outcome("c-1", Bump(2), metadata.clone())
+                .await
+                .unwrap();
+
+            let resolved = store
+                .resolve_outcome("c-1", &Bump(2), &metadata)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(resolved.replayed && resolved.is_accepted());
+
+            let reuse = store.resolve_outcome("c-1", &Bump(3), &metadata).await;
+            assert!(
+                matches!(reuse, Err(Error::IdempotencyKeyReuse { .. })),
+                "{reuse:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_custom_digester_decides_identity() {
+            // Only the command type is identity: another payload is the same command.
+            let store = Store::<Counter, _>::new(MemRepository::new(), ())
+                .with_snapshot_interval(0)
+                .with_outcomes(
+                    OutcomeConfig::new().with_digester(|input| Ok(input.command_type.clone())),
+                );
+
+            store
+                .execute_with_outcome("c-1", Bump(1), command("c"))
+                .await
+                .unwrap();
+            let repeat = store
+                .execute_with_outcome("c-1", Bump(9), command("c"))
+                .await
+                .unwrap();
+
+            assert!(repeat.replayed);
+            assert_eq!(repeat.outcome.digest, "counter:bump");
+        }
+
+        #[tokio::test]
+        async fn an_unapplied_ambiguous_write_retries_with_the_same_command_id() {
+            let fault = FaultInjectingRepository::new(MemRepository::new());
+            let store = Store::<Counter, _>::new(&fault, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new());
+
+            fault.arm_before_apply();
+            let error = store
+                .execute_with_outcome("c-1", Bump(1), command("c"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    Error::AmbiguousWrite {
+                        not_applied: true,
+                        ..
+                    }
+                ) && error.is_retryable(),
+                "{error:?}"
+            );
+
+            fault.arm_before_apply();
+            let done = store
+                .execute_with_outcome_retry(
+                    "c-1",
+                    Bump(1),
+                    command("c"),
+                    &RetryPolicy::immediate(3),
+                    |_| async {},
+                )
+                .await
+                .unwrap();
+            assert!(
+                done.is_accepted() && !done.replayed,
+                "the second attempt commits"
+            );
+            assert_eq!(fault.inner().events(&"c-1".into()).await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn an_applied_ambiguous_write_returns_the_stored_outcome_without_rerunning() {
+            let fault = FaultInjectingRepository::new(MemRepository::new());
+            let store = Store::<Counter, _>::new(&fault, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new());
+
+            fault.arm_after_apply();
+            let done = store
+                .execute_with_outcome("c-1", Bump(4), command("c"))
+                .await
+                .unwrap();
+            assert!(done.replayed && done.is_accepted());
+            assert_eq!(fault.inner().events(&"c-1".into()).await.unwrap().len(), 1);
+
+            // When the recovery read fails too, the original failure is reported, not unapplied.
+            fault.arm_after_apply();
+            fault.fail_outcome_read_after(1);
+            let error = store
+                .execute_with_outcome("c-2", Bump(4), command("d"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    Error::AmbiguousWrite {
+                        not_applied: false,
+                        ..
+                    }
+                ) && !error.is_retryable(),
+                "{error:?}"
+            );
+        }
     }
 }

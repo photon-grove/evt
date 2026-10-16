@@ -27,10 +27,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
-use crate::features::{FEATURES_ID, FEATURES_SORT_KEY, FeatureManifest};
+use crate::features::{COMMAND_OUTCOME_PREFIX, FEATURES_ID, FEATURES_SORT_KEY, FeatureManifest};
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::json;
 use crate::metadata::Metadata;
+use crate::outcome::{Outcome, OutcomeStatus, Rejection};
 
 /// The sort key of the inline snapshot item.
 pub const SNAPSHOT_SORT_KEY: i64 = 0;
@@ -80,6 +81,10 @@ pub const FENCE_COMPANION_CONDITION: &str = "attribute_not_exists(sk) OR eventSe
 
 /// Condition for out-of-band snapshot puts: never lower the stored `eventSeq` (`:new`).
 pub const PUT_SNAPSHOT_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq <= :new";
+
+/// Condition for the command-outcome put (v0.9, C3): no outcome is recorded for the command ID
+/// yet. The row is written once, in its final state.
+pub const OUTCOME_CONDITION: &str = "attribute_not_exists(pk)";
 
 /// Condition for the feature-marker check every v0.9 commit carries (`:v` is the version the
 /// writer validated). A writer that validated a table with no marker conditions on
@@ -193,6 +198,99 @@ pub fn feature_marker_from_item(item: &Item) -> Result<FeatureManifest, Error> {
         optional_string(item, "historyDependent")?,
         optional_string(item, "retention")?,
     )
+}
+
+/// The sort key of a command-outcome item.
+pub const OUTCOME_SORT_KEY: i64 = 1;
+
+/// The partition key of a command's outcome row: `command-outcome#<id>`.
+pub fn outcome_key(command_id: &crate::ids::CommandId) -> String {
+    format!("{COMMAND_OUTCOME_PREFIX}{command_id}")
+}
+
+/// Encodes a command outcome as its item (`pk = command-outcome#<id>`, `sk = 1`): `status`,
+/// `digest`, then `response` (padded base64) when there are response bytes, `events` (a JSON array
+/// of event IDs) when the commit wrote any, and `rejection` with `code` when rejected. This is
+/// the single source of the item's shape, shared by the writer and the commit budget.
+pub fn outcome_item(outcome: &Outcome) -> Result<Item, Error> {
+    let mut item = Item::new();
+    item.insert("pk".into(), s(outcome_key(&outcome.command_id)));
+    item.insert("sk".into(), n(OUTCOME_SORT_KEY));
+    item.insert("status".into(), s(outcome.status.as_str()));
+    item.insert("digest".into(), s(outcome.digest.as_str()));
+
+    if let Some(response) = outcome
+        .response
+        .as_ref()
+        .filter(|response| !response.is_empty())
+    {
+        item.insert("response".into(), s(json::base64_bytes::encode(response)));
+    }
+
+    if !outcome.event_ids.is_empty() {
+        item.insert(
+            "events".into(),
+            s(crate::outcome::encode_event_ids(&outcome.event_ids)?),
+        );
+    }
+
+    if let Some(rejection) = &outcome.rejection {
+        item.insert("rejection".into(), s(rejection.encode()?));
+        item.insert("code".into(), s(rejection.code.as_str()));
+    }
+
+    Ok(item)
+}
+
+/// The DynamoDB-encoded size of the outcome item, as the commit budget counts it: the sum over its
+/// attributes of the name's UTF-8 length plus the value's length. `outcome.event_ids` fills the
+/// `events` attribute.
+pub fn outcome_item_size(outcome: &Outcome) -> Result<usize, Error> {
+    Ok(crate::repository::item_size(&outcome_item(outcome)?))
+}
+
+/// Decodes a command-outcome item. The command ID comes from the key.
+pub fn outcome_from_item(item: &Item) -> Result<Outcome, Error> {
+    let pk = required_string(item, "pk")?;
+    let command_id = pk
+        .strip_prefix(COMMAND_OUTCOME_PREFIX)
+        .ok_or_else(|| Error::InvalidRecord(format!("item {pk} is not a command outcome")))?;
+
+    let status = required_string(item, "status")?;
+    let status = OutcomeStatus::parse(status)
+        .ok_or_else(|| Error::InvalidRecord(format!("unknown outcome status {status:?}")))?;
+
+    let response = match optional_string(item, "response")?.filter(|text| !text.is_empty()) {
+        Some(text) => Some(
+            json::base64_bytes::decode(text)
+                .map_err(|err| Error::InvalidRecord(format!("decode outcome response: {err}")))?,
+        ),
+        None => None,
+    };
+
+    let event_ids = match optional_string(item, "events")?.filter(|text| !text.is_empty()) {
+        Some(text) => crate::outcome::decode_event_ids(text)?,
+        None => Vec::new(),
+    };
+
+    let rejection = optional_string(item, "rejection")?
+        .filter(|text| !text.is_empty())
+        .map(Rejection::decode)
+        .transpose()?;
+    if (status == OutcomeStatus::Rejected) != rejection.is_some() {
+        return Err(Error::InvalidRecord(format!(
+            "outcome {command_id} is {status} but its rejection attribute disagrees"
+        )));
+    }
+
+    Ok(Outcome {
+        command_id: command_id.into(),
+        status,
+        digest: required_string(item, "digest")?.to_owned(),
+        response,
+        event_ids,
+        rejection,
+    })
 }
 
 /// Encodes a single-item view row: `pk = {entityType}#{entityId}`, `sk = "VIEW"`.
@@ -340,6 +438,135 @@ mod tests {
         assert!(
             matches!(event_from_item(&item(" ")), Err(Error::InvalidRecord(_))),
             "empty metadata"
+        );
+    }
+
+    fn outcome_row(item: &Item) -> Vec<(&str, &str)> {
+        item.iter()
+            .map(|(name, value)| match value {
+                AttributeValue::S(text) | AttributeValue::N(text) => (name.as_str(), text.as_str()),
+                other => panic!("unexpected attribute {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outcome_items_match_the_spec_rows() {
+        let accepted = Outcome {
+            event_ids: vec!["acct-1:1".into()],
+            ..Outcome::accepted(
+                "cmd-0001",
+                "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6",
+            )
+            .with_response(br#"{"accountId":"acct-1","balanceCents":0}"#.to_vec())
+        };
+        let item = outcome_item(&accepted).unwrap();
+
+        assert_eq!(
+            outcome_row(&item),
+            vec![
+                (
+                    "digest",
+                    "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6"
+                ),
+                ("events", r#"["acct-1:1"]"#),
+                ("pk", "command-outcome#cmd-0001"),
+                (
+                    "response",
+                    "eyJhY2NvdW50SWQiOiJhY2N0LTEiLCJiYWxhbmNlQ2VudHMiOjB9"
+                ),
+                ("sk", "1"),
+                ("status", "accepted"),
+            ]
+        );
+        assert_eq!(item.get("sk"), Some(&n(1)), "sk is a number");
+
+        let noop = outcome_item(&Outcome::accepted("cmd-0003", "d")).unwrap();
+        assert_eq!(
+            noop.len(),
+            4,
+            "an accepted no-op has no events and no response"
+        );
+
+        let rejected = outcome_item(&Outcome::rejected(
+            "cmd-0002",
+            "d",
+            Rejection::new("username-taken", "handle ada is taken")
+                .with_details(serde_json::json!({ "handle": "ada" })),
+        ))
+        .unwrap();
+        assert_eq!(
+            rejected.get("rejection"),
+            Some(&s(
+                r#"{"code":"username-taken","message":"handle ada is taken","details":{"handle":"ada"}}"#
+            ))
+        );
+        assert_eq!(rejected.get("code"), Some(&s("username-taken")));
+        assert_eq!(rejected.get("events"), None);
+    }
+
+    #[test]
+    fn outcome_items_round_trip() {
+        let accepted = Outcome {
+            event_ids: vec!["a:1".into(), "b:1".into()],
+            ..Outcome::accepted("cmd-1", "d").with_response(vec![0, 1, 2, 255])
+        };
+        assert_eq!(
+            outcome_from_item(&outcome_item(&accepted).unwrap()).unwrap(),
+            accepted
+        );
+
+        let rejected = Outcome::rejected("cmd-2", "d", Rejection::stale_fence());
+        assert_eq!(
+            outcome_from_item(&outcome_item(&rejected).unwrap()).unwrap(),
+            rejected
+        );
+
+        let noop = Outcome::accepted("cmd-3", "d");
+        assert_eq!(
+            outcome_from_item(&outcome_item(&noop).unwrap()).unwrap(),
+            noop
+        );
+    }
+
+    #[test]
+    fn malformed_outcome_items_are_invalid_records() {
+        let good = outcome_item(&Outcome::accepted("cmd-1", "d")).unwrap();
+
+        for (name, mutate) in [
+            ("status", Some(s("pending"))),
+            ("status", None),
+            ("digest", None),
+            (
+                "rejection",
+                Some(s(r#"{"code":"c","message":"m","details":null}"#)),
+            ),
+            ("response", Some(s("not base64!"))),
+            ("events", Some(s("{"))),
+            ("pk", Some(s("acct-1"))),
+        ] {
+            let mut item = good.clone();
+            match mutate {
+                Some(value) => item.insert(name.into(), value),
+                None => item.remove(name),
+            };
+
+            assert!(
+                matches!(outcome_from_item(&item), Err(Error::InvalidRecord(_))),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_item_sizes_sum_names_and_values() {
+        let item = outcome_item(&Outcome::accepted("c", "dd")).unwrap();
+
+        // pk(2) + "command-outcome#c"(17) + sk(2) + "1"(1) + status(6) + "accepted"(8)
+        // + digest(6) + "dd"(2)
+        assert_eq!(
+            crate::repository::item_size(&item),
+            2 + 17 + 2 + 1 + 6 + 8 + 6 + 2
         );
     }
 

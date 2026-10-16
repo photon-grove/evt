@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,13 +33,21 @@ use crate::aggregate::{Aggregate, Projector};
 use crate::error::{BoxError, Error};
 use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{self, FeatureMarker};
-use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
+use crate::ids::{
+    CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion,
+};
 use crate::metadata::Metadata;
+use crate::outcome::Outcome;
+use crate::outcome::{
+    CommandIdentity, DigestInput, OutcomeCommand, OutcomeConfig, Rejection, ToRejection,
+    canonical_json, default_digest,
+};
 use crate::repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
 };
 use crate::retry::RetryPolicy;
-use crate::store::Store;
+use crate::store::{Store, serialize_events};
+use crate::transaction::Begin;
 
 /// The aggregate the [`Store`] cases use: a running total of positive amounts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,22 +79,52 @@ crate::domain_events! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Add(pub i64);
 
-/// The [`Ledger`] rejection for a non-positive amount.
+/// The [`Ledger`] handler's errors: a domain rejection for a non-positive amount, and an internal
+/// failure (`Add(i64::MAX)` simulates an unavailable dependency) that is never persisted.
 #[derive(Debug, thiserror::Error)]
-#[error("amount must be positive")]
-pub struct InvalidAmount;
+pub enum LedgerError {
+    /// The amount was not positive: a domain rejection.
+    #[error("amount must be positive")]
+    InvalidAmount,
+    /// The handler could not decide: an internal failure, not a rejection.
+    #[error("the ledger dependency is unavailable")]
+    Unavailable,
+}
+
+impl OutcomeCommand for Add {
+    fn command_type(&self) -> String {
+        "ledger:add".into()
+    }
+
+    fn canonical_payload(&self) -> Result<Option<Vec<u8>>, BoxError> {
+        Ok(Some(canonical_json(&self.0)?))
+    }
+}
+
+impl ToRejection for LedgerError {
+    fn to_rejection(&self) -> Option<Rejection> {
+        match self {
+            Self::InvalidAmount => Some(Rejection::new("invalid-amount", self.to_string())),
+            Self::Unavailable => None,
+        }
+    }
+}
 
 impl Aggregate for Ledger {
     const TYPE: &'static str = "ledger";
 
     type Command = Add;
     type Event = LedgerEvent;
-    type Error = InvalidAmount;
+    type Error = LedgerError;
     type Services = ();
 
-    async fn handle(&self, Add(amount): Add, _: &()) -> Result<Vec<LedgerEvent>, InvalidAmount> {
+    async fn handle(&self, Add(amount): Add, _: &()) -> Result<Vec<LedgerEvent>, LedgerError> {
+        if amount == i64::MAX {
+            return Err(LedgerError::Unavailable);
+        }
+
         if amount <= 0 {
-            return Err(InvalidAmount);
+            return Err(LedgerError::InvalidAmount);
         }
 
         Ok(vec![Added { amount }.into()])
@@ -134,6 +173,22 @@ pub struct Take(pub String);
 #[derive(Debug, thiserror::Error)]
 #[error("the claim is already held")]
 pub struct AlreadyHeld;
+
+impl OutcomeCommand for Take {
+    fn command_type(&self) -> String {
+        "claim:take".into()
+    }
+
+    fn canonical_payload(&self) -> Result<Option<Vec<u8>>, BoxError> {
+        Ok(Some(canonical_json(&self.0)?))
+    }
+}
+
+impl ToRejection for AlreadyHeld {
+    fn to_rejection(&self) -> Option<Rejection> {
+        Some(Rejection::new("already-held", self.to_string()))
+    }
+}
 
 impl Aggregate for Claim {
     const TYPE: &'static str = "claim";
@@ -477,6 +532,7 @@ impl Stream {
             events,
             snapshot,
             operations: Vec::new(),
+            outcome: None,
         })
         .await
     }
@@ -1006,6 +1062,7 @@ fn write<Op>(entity: &Stream, sequences: RangeInclusive<i64>) -> Commit<Op> {
         events: entity.events(sequences),
         snapshot: None,
         operations: Vec::new(),
+        outcome: None,
     }
 }
 
@@ -1530,6 +1587,7 @@ async fn reserved_namespaces<R: Repository>(repo: &R) -> CaseResult {
                 events,
                 snapshot: None,
                 operations: Vec::new(),
+                outcome: None,
             })
             .await,
             &format!("committing to {id}"),
@@ -1735,11 +1793,16 @@ impl<R: Repository> Repository for Interfering<'_, R> {
                     events: competing,
                     snapshot: None,
                     operations: Vec::new(),
+                    outcome: None,
                 })
                 .await?;
         }
 
         self.inner.commit(commit).await
+    }
+
+    async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        self.inner.outcome(command_id).await
     }
 
     async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
@@ -2317,6 +2380,1348 @@ where
             Err(Error::RetentionConflict { .. })
         ),
         "a fence for a retention-enabled type is refused with RetentionConflict"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Command outcomes and rejections (C3, C4)
+// ---------------------------------------------------------------------------------------------
+
+/// Wraps a repository to simulate the failures that make a commit's result unknown, for the
+/// command-outcome cases. It forwards everything, and can be armed to:
+///
+/// - [apply the next outcome-carrying commit and then fail it](Self::arm_after_apply) with
+///   [`Error::Backend`], the way a timeout or a lost response looks to the caller while the
+///   transaction really committed;
+/// - [fail the next outcome-carrying commit without applying it](Self::arm_before_apply);
+/// - [commit a rival commit first](Self::race_with), as another writer winning a race between a
+///   command's outcome pre-check and its commit;
+/// - [fail an outcome read](Self::fail_outcome_read_after).
+///
+/// Each arming fires once, on the next commit that carries an outcome (or, for the read, on the
+/// chosen outcome read).
+pub struct FaultInjectingRepository<R: Repository> {
+    inner: R,
+    state: Mutex<FaultState<R::Operation>>,
+}
+
+struct FaultState<Op> {
+    fault: Option<Fault>,
+    rival: Option<Commit<Op>>,
+    reads_before_failure: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum Fault {
+    AfterApply,
+    BeforeApply,
+}
+
+impl<R: Repository> FaultInjectingRepository<R> {
+    /// Wraps a repository with nothing armed.
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(FaultState {
+                fault: None,
+                rival: None,
+                reads_before_failure: None,
+            }),
+        }
+    }
+
+    /// The wrapped repository.
+    pub fn inner(&self) -> &R {
+        &self.inner
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, FaultState<R::Operation>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The next outcome-carrying commit really applies, then fails with [`Error::Backend`].
+    pub fn arm_after_apply(&self) {
+        self.state().fault = Some(Fault::AfterApply);
+    }
+
+    /// The next outcome-carrying commit fails with [`Error::Backend`] without applying.
+    pub fn arm_before_apply(&self) {
+        self.state().fault = Some(Fault::BeforeApply);
+    }
+
+    /// Commits `rival` through the wrapped repository just before the next outcome-carrying
+    /// commit, so that commit finds the rival's rows already written.
+    pub fn race_with(&self, rival: Commit<R::Operation>) {
+        self.state().rival = Some(rival);
+    }
+
+    /// Fails an outcome read with [`Error::Backend`]: the read after `reads` successful ones.
+    pub fn fail_outcome_read_after(&self, reads: usize) {
+        self.state().reads_before_failure = Some(reads);
+    }
+
+    fn take_armed(&self) -> (Option<Commit<R::Operation>>, Option<Fault>) {
+        let mut state = self.state();
+
+        (state.rival.take(), state.fault.take())
+    }
+
+    fn injected() -> Error {
+        Error::backend("injected fault: the commit's result is unknown")
+    }
+}
+
+impl<R: Repository> Repository for FaultInjectingRepository<R> {
+    type Operation = R::Operation;
+
+    async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
+        if commit.outcome.is_some() {
+            let (rival, fault) = self.take_armed();
+
+            if let Some(rival) = rival {
+                self.inner.commit(rival).await?;
+            }
+
+            match fault {
+                Some(Fault::AfterApply) => {
+                    self.inner.commit(commit).await?;
+
+                    return Err(Self::injected());
+                }
+                Some(Fault::BeforeApply) => return Err(Self::injected()),
+                None => {}
+            }
+        }
+
+        self.inner.commit(commit).await
+    }
+
+    async fn commit_transaction(
+        &self,
+        commit: TransactionCommit<R::Operation>,
+    ) -> Result<(), Error> {
+        if commit.outcome.is_some() {
+            let (rival, fault) = self.take_armed();
+
+            if let Some(rival) = rival {
+                self.inner.commit(rival).await?;
+            }
+
+            match fault {
+                Some(Fault::AfterApply) => {
+                    self.inner.commit_transaction(commit).await?;
+
+                    return Err(Self::injected());
+                }
+                Some(Fault::BeforeApply) => return Err(Self::injected()),
+                None => {}
+            }
+        }
+
+        self.inner.commit_transaction(commit).await
+    }
+
+    async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        let fail = {
+            let mut state = self.state();
+
+            match state.reads_before_failure {
+                Some(0) => {
+                    state.reads_before_failure = None;
+
+                    true
+                }
+                Some(remaining) => {
+                    state.reads_before_failure = Some(remaining - 1);
+
+                    false
+                }
+                None => false,
+            }
+        };
+
+        if fail {
+            return Err(Error::backend("injected fault: the outcome read failed"));
+        }
+
+        self.inner.outcome(command_id).await
+    }
+
+    async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
+        self.inner.events(entity_id).await
+    }
+
+    async fn events_after(
+        &self,
+        entity_id: &EntityId,
+        after: EventSequence,
+    ) -> Result<Vec<SerializedEvent>, Error> {
+        self.inner.events_after(entity_id, after).await
+    }
+
+    async fn latest(&self, entity_id: &EntityId, n: usize) -> Result<Vec<SerializedEvent>, Error> {
+        self.inner.latest(entity_id, n).await
+    }
+
+    async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
+        self.inner.snapshot(entity_id).await
+    }
+
+    async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+        self.inner.put_snapshot(snapshot).await
+    }
+
+    async fn compact_below(
+        &self,
+        entity_id: &EntityId,
+        through: EventSequence,
+    ) -> Result<usize, Error> {
+        self.inner.compact_below(entity_id, through).await
+    }
+
+    async fn entity_heads(
+        &self,
+        entity_type: Option<&EntityType>,
+    ) -> Result<BTreeMap<EntityId, EventSequence>, Error> {
+        self.inner.entity_heads(entity_type).await
+    }
+}
+
+/// Runs the command-outcome and rejection cases (C3, C4) against a repository that supports
+/// outcomes. `other` must be a second handle over the same storage: the cases check that a second
+/// writer sees the first one's outcomes. Like [`feature_marker_cases`], it panics after running
+/// every case if any failed.
+pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
+    let mut failures = Vec::new();
+
+    let mut record = |name: &str, result: CaseResult| match result {
+        Ok(()) => println!("ok   {name}"),
+        Err(Failure(message)) => {
+            println!("FAIL {name}");
+            failures.push(format!("{name}: {message}"));
+        }
+    };
+
+    record(
+        "a repeated command returns its stored outcome, across writers and snapshots",
+        outcome_replay(repo, other).await,
+    );
+    record(
+        "a reused command ID with another identity is IdempotencyKeyReuse",
+        outcome_key_reuse(repo).await,
+    );
+    record(
+        "a domain rejection is persisted once and replayed verbatim",
+        outcome_rejection(repo).await,
+    );
+    record(
+        "an internal handler failure is an error and writes no outcome",
+        outcome_internal_failure(repo).await,
+    );
+    record(
+        "a zero-event command is an accepted no-op that stores its response",
+        outcome_noop(repo).await,
+    );
+    record(
+        "a transaction persists a rejection after checking its fences",
+        outcome_transaction_reject(repo).await,
+    );
+    record(
+        "command ID and outcome bounds are refused before any write",
+        outcome_limits(repo).await,
+    );
+    record(
+        "ambiguous writes are settled by re-reading the outcome row",
+        outcome_ambiguous(repo).await,
+    );
+    record(
+        "a lost outcome put resolves through the winner's row and writes nothing",
+        outcome_race(repo).await,
+    );
+    record(
+        "a failed caller-stamped fence persists a stale-fence rejection",
+        outcome_stale_fence(repo).await,
+    );
+    record(
+        "a failed commit leaves no outcome row",
+        outcome_atomicity(repo).await,
+    );
+    record(
+        "the outcome row counts against the commit budget",
+        outcome_budget(repo).await,
+    );
+
+    if !failures.is_empty() {
+        panic!(
+            "{} command-outcome case(s) failed:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+}
+
+fn outcome_store<R: Repository>(repo: R) -> Store<Ledger, R> {
+    Store::new(repo, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(OutcomeConfig::new())
+}
+
+fn command_id() -> CommandId {
+    CommandId::new(format!("{}-cmd", namespace()))
+}
+
+fn command_metadata(command_id: &CommandId) -> Metadata {
+    metadata().with_command_id(command_id.clone())
+}
+
+/// The default digest of `Add(amount)` on a ledger, as the store computes it.
+fn ledger_digest(entity_id: &EntityId, amount: i64) -> Result<String, Failure> {
+    let command = Add(amount);
+    let input = DigestInput {
+        command_type: command.command_type(),
+        streams: vec![entity_id.clone()],
+        payload: command
+            .canonical_payload()
+            .map_err(|err| Failure(err.to_string()))?
+            .unwrap_or_default(),
+        principal: String::new(),
+    };
+
+    default_digest(&input).map_err(|err| Failure(err.to_string()))
+}
+
+/// A commit another writer would make for `Add(amount)` on `entity_id` under `command_id`, whose
+/// outcome carries the digest of `Add(digest_amount)`.
+fn rival_commit<Op>(
+    entity_id: &EntityId,
+    command_id: &CommandId,
+    amount: i64,
+    digest_amount: i64,
+) -> Result<Commit<Op>, Failure> {
+    let events = serialize_events::<Ledger>(
+        entity_id,
+        EventSequence::ZERO,
+        &[LedgerEvent::from(Added { amount })],
+        &Metadata::default().with_command_id(command_id.clone()),
+    )?;
+
+    Ok(
+        Commit::new(entity_id.clone(), events).with_outcome(Outcome::accepted(
+            command_id.clone(),
+            ledger_digest(entity_id, digest_amount)?,
+        )),
+    )
+}
+
+fn expect_reuse(result: Result<impl fmt::Debug, Error>, what: &str) -> Result<Outcome, Failure> {
+    match result {
+        Err(Error::IdempotencyKeyReuse { prior_outcome, .. }) => Ok(*prior_outcome),
+        other => Err(Failure(format!(
+            "{what}: want IdempotencyKeyReuse, got {other:?}"
+        ))),
+    }
+}
+
+async fn outcome_replay<R: Repository>(repo: &R, other: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let second = outcome_store(other);
+    let id = ledger_id();
+    let command = command_id();
+
+    let first = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+    ensure!(
+        first.is_accepted() && !first.is_noop() && !first.replayed,
+        "the first execution is a fresh accepted outcome: {first:?}"
+    );
+    ensure_eq!(
+        first.outcome.event_ids,
+        vec![EventId::for_event(&id, EventSequence(1))],
+        "the outcome names the event the commit wrote"
+    );
+    ensure_eq!(
+        (first.events.len(), first.typed_events.len()),
+        (1, 1),
+        "the fresh result carries the committed events"
+    );
+
+    // The same command again, from the same writer and from a second one, replays the stored
+    // outcome without running the handler or writing.
+    for (what, store) in [("same writer", &store), ("second writer", &second)] {
+        let again = store
+            .execute_with_outcome(&id, Add(5), command_metadata(&command))
+            .await?;
+        ensure!(again.replayed, "{what}: the repeat is a replay");
+        ensure!(again.events.is_empty(), "{what}: a replay commits nothing");
+        ensure_eq!(
+            again.outcome,
+            first.outcome,
+            format!("{what}: stored outcome")
+        );
+    }
+    let loaded = store.load(&id).await?;
+    ensure_eq!(
+        loaded.aggregate(),
+        &Ledger {
+            total: 5,
+            entries: 1
+        },
+        "the command applied once"
+    );
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(first.outcome.clone()),
+        "the stored row"
+    );
+
+    // The plain entry points would skip the outcome row, so they refuse.
+    let refused = store.execute(&id, Add(1), metadata()).await;
+    ensure!(
+        matches!(
+            refused.as_ref().err().and_then(|err| err.as_store_error()),
+            Some(Error::InvalidConfig(_))
+        ),
+        "execute on a store with outcomes is refused: {refused:?}"
+    );
+
+    // A command ID folded into a snapshot, whose events are compacted, is still deduplicated:
+    // the outcome row is global, unlike the event window.
+    let snapshots = Store::<Ledger, _>::new(repo, ())
+        .with_snapshot_interval(1)
+        .with_outcomes(OutcomeConfig::new());
+    let id = ledger_id();
+    let commands: Vec<CommandId> = (0..3).map(|_| command_id()).collect();
+    for (amount, command) in (1..=3).zip(&commands) {
+        snapshots
+            .execute_with_outcome(&id, Add(amount), command_metadata(command))
+            .await?;
+    }
+    repo.compact_below(&id, EventSequence(3)).await?;
+
+    let repeated = snapshots
+        .execute_with_outcome(&id, Add(1), command_metadata(&commands[0]))
+        .await?;
+    ensure!(
+        repeated.replayed,
+        "a command folded into a snapshot is still deduplicated"
+    );
+    let total = snapshots.load(&id).await?.aggregate().total;
+    ensure_eq!(total, 6, "the compacted command did not apply twice");
+
+    Ok(())
+}
+
+async fn outcome_key_reuse<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let id = ledger_id();
+    let command = command_id();
+
+    let first = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+
+    // Another payload, another stream, and another principal are each another command.
+    let prior = expect_reuse(
+        store
+            .execute_with_outcome(&id, Add(6), command_metadata(&command))
+            .await,
+        "another payload",
+    )?;
+    ensure_eq!(prior, first.outcome, "the error carries the stored outcome");
+
+    let elsewhere = ledger_id();
+    expect_reuse(
+        store
+            .execute_with_outcome(&elsewhere, Add(5), command_metadata(&command))
+            .await,
+        "another stream",
+    )?;
+    ensure!(
+        repo.events(&elsewhere).await?.is_empty(),
+        "the refused command wrote nothing"
+    );
+
+    expect_reuse(
+        store
+            .execute_with_outcome(
+                &id,
+                Add(5),
+                command_metadata(&command).with_principal_id("user:2"),
+            )
+            .await,
+        "another principal",
+    )?;
+
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(first.outcome),
+        "the reuse is never stored: the first command's row stands"
+    );
+    let entries = store.load(&id).await?.aggregate().entries;
+    ensure_eq!(entries, 1, "only the first command applied");
+
+    Ok(())
+}
+
+async fn outcome_internal_failure<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let id = ledger_id();
+    let command = command_id();
+
+    // `ToRejection` returned `None`: the handler could not decide, which is not a domain refusal.
+    let failed = store
+        .execute_with_outcome(&id, Add(i64::MAX), command_metadata(&command))
+        .await;
+    ensure!(
+        matches!(failed, Err(Error::Handler(_))),
+        "an internal failure is returned as Error::Handler: {failed:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "no outcome row is written for an internal failure"
+    );
+    ensure!(
+        repo.events(&id).await?.is_empty(),
+        "an internal failure writes no events"
+    );
+
+    // Nothing was recorded, so the retry decides again: after the cause is fixed it succeeds under
+    // the same command ID instead of replaying a durable failure.
+    let recovered = store
+        .execute_with_outcome(&id, Add(3), command_metadata(&command))
+        .await?;
+    ensure!(
+        recovered.is_accepted() && !recovered.replayed,
+        "the retry under the same ID starts clean: {recovered:?}"
+    );
+
+    Ok(())
+}
+
+async fn outcome_rejection<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let id = ledger_id();
+    let command = command_id();
+
+    let rejected = store
+        .execute_with_outcome(&id, Add(0), command_metadata(&command))
+        .await?;
+    ensure!(
+        rejected.is_rejected() && !rejected.replayed && rejected.events.is_empty(),
+        "a domain error is a fresh rejected outcome: {rejected:?}"
+    );
+    let rejection = rejected
+        .rejection()
+        .ok_or_else(|| Failure("a rejected outcome carries its rejection".into()))?
+        .clone();
+    ensure_eq!(
+        rejection.code.as_str(),
+        "invalid-amount",
+        "the rejection code"
+    );
+    ensure_eq!(
+        rejection.message.as_str(),
+        "amount must be positive",
+        "message"
+    );
+    ensure_eq!(rejection.details, None, "details");
+
+    let stored = repo
+        .outcome(&command)
+        .await?
+        .ok_or_else(|| Failure("the rejection was not persisted".into()))?;
+    ensure!(
+        stored.is_rejected() && stored.event_ids.is_empty(),
+        "stored status"
+    );
+    ensure_eq!(
+        stored.rejection,
+        Some(rejection.clone()),
+        "stored rejection"
+    );
+    ensure!(
+        repo.events(&id).await?.is_empty(),
+        "a rejection writes no events"
+    );
+
+    // Terminal for the digest: the retry replays the original rejection verbatim.
+    let again = store
+        .execute_with_outcome(&id, Add(0), command_metadata(&command))
+        .await?;
+    ensure!(
+        again.replayed && again.is_rejected(),
+        "the retry replays: {again:?}"
+    );
+    ensure_eq!(
+        again.rejection(),
+        Some(&rejection),
+        "the replayed rejection"
+    );
+
+    // Another command ID with the same input is a fresh decision.
+    let fresh = store
+        .execute_with_outcome(&id, Add(0), command_metadata(&command_id()))
+        .await?;
+    ensure!(
+        !fresh.replayed && fresh.is_rejected(),
+        "a new ID decides again"
+    );
+
+    Ok(())
+}
+
+async fn outcome_noop<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let id = ledger_id();
+    let command = command_id();
+    let identity = CommandIdentity::new("ledger:review").with_streams([id.clone()]);
+    let metadata = command_metadata(&command);
+    let response = br#"{"reviewed":true}"#.to_vec();
+
+    // A transaction that appends nothing is an accepted no-op that still stores its response.
+    let mut tx = store.transaction();
+    ensure!(
+        matches!(
+            tx.begin_command(&identity, &metadata).await?,
+            Begin::Proceed
+        ),
+        "an unseen command proceeds"
+    );
+    tx.read::<Ledger>(&id).await?;
+    let noop = tx.commit_with_outcome(Some(response.clone())).await?;
+    ensure!(
+        noop.is_accepted() && noop.is_noop() && !noop.replayed && noop.events.is_empty(),
+        "an accepted no-op: {noop:?}"
+    );
+    ensure_eq!(
+        noop.response(),
+        Some(response.as_slice()),
+        "the stored response"
+    );
+
+    let stored = repo
+        .outcome(&command)
+        .await?
+        .ok_or_else(|| Failure("the no-op was not persisted".into()))?;
+    ensure_eq!(stored, noop.outcome.clone(), "the stored row");
+    ensure!(stored.event_ids.is_empty(), "a no-op names no events");
+
+    // A retry returns the original answer.
+    let mut tx = store.transaction();
+    match tx.begin_command(&identity, &metadata).await? {
+        Begin::Replayed(replayed) => {
+            ensure!(replayed.replayed && replayed.is_noop(), "the no-op replays");
+            ensure_eq!(replayed.outcome, noop.outcome, "the replayed outcome");
+        }
+        Begin::Proceed => return Err(Failure("a recorded no-op must replay".into())),
+    }
+
+    // The no-op still checks the read set's fences: a stream that moved fails it, retryably, and
+    // records nothing.
+    let command = command_id();
+    let identity = CommandIdentity::new("ledger:review").with_streams([id.clone()]);
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    tx.read::<Ledger>(&id).await?;
+    outcome_store(repo)
+        .execute_with_outcome(&id, Add(1), command_metadata(&command_id()))
+        .await?;
+    let result = tx.commit_with_outcome(None).await;
+    ensure!(
+        matches!(
+            &result,
+            Err(err @ Error::FenceConflict { provenance: FenceProvenance::Engine, .. }) if err.is_retryable()
+        ),
+        "a no-op over a stale read fails its fence: {result:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "the failed no-op recorded nothing"
+    );
+
+    // The repository-level outcome-only commit is the same row, written once.
+    let command = command_id();
+    let accepted = Outcome::accepted(command.clone(), "digest");
+    repo.commit(Commit::<R::Operation>::new(id.clone(), Vec::new()).with_outcome(accepted.clone()))
+        .await?;
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(accepted.clone()),
+        "outcome-only row"
+    );
+    let again = repo
+        .commit(Commit::<R::Operation>::new(id.clone(), Vec::new()).with_outcome(accepted))
+        .await;
+    ensure!(
+        matches!(&again, Err(Error::OutcomeConflict { command_id }) if *command_id == command),
+        "a second outcome for the ID is OutcomeConflict, not a generic conflict: {again:?}"
+    );
+
+    // A rejected outcome cannot carry events.
+    let stream = Stream::new(&namespace(), "rejected", "ledger");
+    let rejected = Outcome::rejected(command_id(), "digest", Rejection::new("c", "m"));
+    let result = stream
+        .commit_with_outcome(repo, stream.events(1..=1), rejected)
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::InvalidCommit(_))),
+        "a rejection with events is an invalid commit: {result:?}"
+    );
+    ensure!(
+        repo.events(&stream.id).await?.is_empty(),
+        "nothing was written"
+    );
+
+    Ok(())
+}
+
+impl Stream {
+    async fn commit_with_outcome<R: Repository>(
+        &self,
+        repo: &R,
+        events: Vec<SerializedEvent>,
+        outcome: Outcome,
+    ) -> Result<(), Error> {
+        repo.commit(Commit::new(self.id.clone(), events).with_outcome(outcome))
+            .await
+    }
+}
+
+async fn outcome_transaction_reject<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let ext = ledger_id();
+    let plain = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(0);
+    plain.execute(&ext, Add(1), metadata()).await?;
+    let command = command_id();
+    let identity = CommandIdentity::new("username:claim").with_streams([ext.clone()]);
+    let rejection = Rejection::new("username-taken", "handle ada is taken")
+        .with_details(serde_json::json!({ "handle": "ada" }));
+
+    // A rejection decided from a read that is still current is persisted, with its details.
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    tx.read::<Ledger>(&ext).await?;
+    let rejected = tx.reject(rejection.clone()).await?;
+    ensure!(
+        rejected.is_rejected() && !rejected.replayed && rejected.events.is_empty(),
+        "a fresh rejection: {rejected:?}"
+    );
+    ensure_eq!(
+        rejected.rejection(),
+        Some(&rejection),
+        "the returned rejection"
+    );
+    ensure_eq!(
+        repo.outcome(&command)
+            .await?
+            .and_then(|stored| stored.rejection),
+        Some(rejection.clone()),
+        "the stored rejection"
+    );
+
+    let mut tx = store.transaction();
+    match tx
+        .begin_command(&identity, &command_metadata(&command))
+        .await?
+    {
+        Begin::Replayed(replayed) => {
+            ensure_eq!(replayed.outcome, rejected.outcome, "replayed verbatim");
+        }
+        Begin::Proceed => return Err(Failure("a recorded rejection must replay".into())),
+    }
+
+    // A rejection decided from a stream that has since moved is not persisted: the engine-filled
+    // fence fails the outcome-only transaction as a retryable conflict.
+    let command = command_id();
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    tx.read::<Ledger>(&ext).await?;
+    plain.execute(&ext, Add(1), metadata()).await?;
+    let result = tx.reject(rejection.clone()).await;
+    ensure!(
+        matches!(
+            &result,
+            Err(err @ Error::FenceConflict { provenance: FenceProvenance::Engine, .. }) if err.is_retryable()
+        ),
+        "a rejection over a stale read fails its fence: {result:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "the stale rejection recorded nothing"
+    );
+
+    Ok(())
+}
+
+async fn outcome_limits<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let id = ledger_id();
+
+    // A missing command ID is a programmer error before any read or write.
+    let result = store.execute_with_outcome(&id, Add(1), metadata()).await;
+    ensure!(
+        matches!(&result, Err(Error::InvalidArgument(_))),
+        "a missing command ID: {result:?}"
+    );
+    let result = store
+        .execute_with_outcome(&id, Add(1), metadata().with_command_id(""))
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::InvalidArgument(_))),
+        "an empty command ID is absent: {result:?}"
+    );
+
+    // 512 UTF-8 bytes is the limit, counted in bytes, not characters.
+    let too_long = CommandId::new("c".repeat(513));
+    let result = store
+        .execute_with_outcome(&id, Add(1), command_metadata(&too_long))
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommandIdTooLong { length: 513 })),
+        "a 513-byte command ID: {result:?}"
+    );
+    let multibyte = CommandId::new("é".repeat(257));
+    let result = store
+        .execute_with_outcome(&id, Add(1), command_metadata(&multibyte))
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommandIdTooLong { length: 514 })),
+        "257 two-byte characters are 514 bytes: {result:?}"
+    );
+    ensure!(
+        repo.events(&id).await?.is_empty(),
+        "a refused command ID wrote nothing"
+    );
+
+    let exact = CommandId::new(format!("{:x<512}", namespace()));
+    ensure_eq!(exact.as_str().len(), 512, "test setup");
+    let accepted = store
+        .execute_with_outcome(&id, Add(1), command_metadata(&exact))
+        .await?;
+    ensure!(accepted.is_accepted(), "a 512-byte command ID is accepted");
+    ensure!(
+        store
+            .execute_with_outcome(&id, Add(1), command_metadata(&exact))
+            .await?
+            .replayed,
+        "and replays"
+    );
+
+    // Oversized responses and rejections are refused before any write, events included.
+    let stream = Stream::new(&namespace(), "limits", "ledger");
+    let oversized = Outcome::accepted(command_id(), "digest").with_response(vec![7; 65537]);
+    let result = stream
+        .commit_with_outcome(repo, stream.events(1..=1), oversized)
+        .await;
+    ensure!(
+        matches!(
+            &result,
+            Err(Error::OutcomeTooLarge {
+                what: "response",
+                size: 65537
+            })
+        ),
+        "a 65537-byte response: {result:?}"
+    );
+    ensure!(
+        repo.events(&stream.id).await?.is_empty(),
+        "no event was written"
+    );
+
+    let at_limit = command_id();
+    stream
+        .commit_with_outcome(
+            repo,
+            stream.events(1..=1),
+            Outcome::accepted(at_limit.clone(), "digest").with_response(vec![7; 65536]),
+        )
+        .await?;
+    ensure_eq!(
+        repo.outcome(&at_limit)
+            .await?
+            .and_then(|stored| stored.response)
+            .map(|r| r.len()),
+        Some(65536),
+        "a 65536-byte response round-trips"
+    );
+
+    // The command ID check comes first.
+    let both = Outcome::accepted(too_long.clone(), "digest").with_response(vec![7; 65537]);
+    let result = Stream::new(&namespace(), "both", "ledger")
+        .commit_with_outcome(repo, Vec::new(), both)
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommandIdTooLong { .. })),
+        "the ID bound precedes the size bounds: {result:?}"
+    );
+
+    let command = command_id();
+    let identity = CommandIdentity::new("ledger:review").with_streams([id.clone()]);
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    let result = tx.reject(Rejection::new("c", "x".repeat(65536))).await;
+    ensure!(
+        matches!(
+            &result,
+            Err(Error::OutcomeTooLarge {
+                what: "rejection",
+                ..
+            })
+        ),
+        "an oversized rejection: {result:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "an oversized rejection writes no outcome"
+    );
+
+    Ok(())
+}
+
+async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
+    let fault = FaultInjectingRepository::new(repo);
+    let store = outcome_store(&fault);
+
+    // The commit applied but the caller saw a failure: recovery returns the stored outcome and
+    // the command does not run again.
+    let id = ledger_id();
+    let command = command_id();
+    fault.arm_after_apply();
+    let recovered = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+    ensure!(
+        recovered.replayed && recovered.is_accepted(),
+        "an applied ambiguous write returns the stored outcome: {recovered:?}"
+    );
+    ensure_eq!(
+        recovered.outcome.event_ids,
+        vec![EventId::for_event(&id, EventSequence(1))],
+        "the recovered outcome names the committed event"
+    );
+    ensure_eq!(repo.events(&id).await?.len(), 1, "the command applied once");
+
+    // The commit did not apply: the row is absent, so retrying the same command ID is safe.
+    let id = ledger_id();
+    let command = command_id();
+    fault.arm_before_apply();
+    let error = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await
+        .err();
+    ensure!(
+        matches!(&error, Some(err @ Error::AmbiguousWrite { not_applied: true, .. }) if err.is_retryable()),
+        "an unapplied ambiguous write is a retryable AmbiguousWrite: {error:?}"
+    );
+    ensure!(repo.events(&id).await?.is_empty(), "nothing was written");
+    let retried = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+    ensure!(
+        retried.is_accepted() && !retried.replayed,
+        "the retry commits: {retried:?}"
+    );
+
+    // Another command claimed the ID with a different identity before the ambiguous commit.
+    let id = ledger_id();
+    let command = command_id();
+    fault.race_with(rival_commit(&id, &command, 6, 6)?);
+    fault.arm_before_apply();
+    let prior = expect_reuse(
+        store
+            .execute_with_outcome(&id, Add(5), command_metadata(&command))
+            .await,
+        "ambiguous write whose ID was claimed by another command",
+    )?;
+    ensure_eq!(
+        prior.digest,
+        ledger_digest(&id, 6)?,
+        "the prior outcome's digest"
+    );
+
+    // Recovery that cannot read the row cannot tell: the original failure, not known unapplied.
+    let id = ledger_id();
+    let command = command_id();
+    fault.arm_after_apply();
+    fault.fail_outcome_read_after(1);
+    let error = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await
+        .err();
+    ensure!(
+        matches!(&error, Some(err @ Error::AmbiguousWrite { not_applied: false, .. }) if !err.is_retryable()),
+        "an unreadable recovery is AmbiguousWrite, not known unapplied: {error:?}"
+    );
+    ensure_eq!(repo.events(&id).await?.len(), 1, "the commit did apply");
+    let later = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+    ensure!(later.replayed, "a later attempt finds the row");
+
+    Ok(())
+}
+
+async fn outcome_race<R: Repository>(repo: &R) -> CaseResult {
+    let fault = FaultInjectingRepository::new(repo);
+    let store = outcome_store(&fault);
+
+    // Another writer commits the same command, with the same identity, between this command's
+    // pre-check and its commit. The loser returns the winner's outcome and applies nothing.
+    let id = ledger_id();
+    let command = command_id();
+    fault.race_with(rival_commit(&id, &command, 5, 5)?);
+    let result = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+    ensure!(
+        result.replayed && result.is_accepted(),
+        "the race loser replays the winner: {result:?}"
+    );
+    ensure_eq!(repo.events(&id).await?.len(), 1, "the command applied once");
+
+    // The same race with another identity is IdempotencyKeyReuse.
+    let id = ledger_id();
+    let command = command_id();
+    fault.race_with(rival_commit(&id, &command, 6, 6)?);
+    expect_reuse(
+        store
+            .execute_with_outcome(&id, Add(5), command_metadata(&command))
+            .await,
+        "a race lost to another command",
+    )?;
+    ensure_eq!(
+        repo.events(&id).await?.len(),
+        1,
+        "only the winner's event is stored"
+    );
+
+    // The winner wrote only the outcome and another stream: the loser's events do not conflict,
+    // so only its outcome put fails. That is OutcomeConflict, never a generic conflict, and it
+    // rolls back the loser's events with it.
+    let id = ledger_id();
+    let winner_stream = ledger_id();
+    let command = command_id();
+    let mut rival = rival_commit::<R::Operation>(&winner_stream, &command, 5, 5)?;
+    rival.outcome = Some(Outcome::accepted(command.clone(), ledger_digest(&id, 5)?));
+    fault.race_with(rival);
+    let result = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+    ensure!(
+        result.replayed,
+        "an outcome-only race resolves through the row: {result:?}"
+    );
+    ensure!(
+        repo.events(&id).await?.is_empty(),
+        "the loser's events were rolled back with its outcome"
+    );
+
+    // The repository reports the lost put as the typed error.
+    let command = command_id();
+    let accepted = Outcome::accepted(command.clone(), "digest");
+    let stream = Stream::new(&namespace(), "race", "ledger");
+    stream
+        .commit_with_outcome(repo, stream.events(1..=1), accepted.clone())
+        .await?;
+    let other = Stream::new(&namespace(), "race-other", "ledger");
+    let result = other
+        .commit_with_outcome(repo, other.events(1..=1), accepted)
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::OutcomeConflict { command_id }) if *command_id == command),
+        "a lost outcome put is OutcomeConflict: {result:?}"
+    );
+    ensure!(
+        repo.events(&other.id).await?.is_empty(),
+        "the failed commit's events were not written"
+    );
+
+    Ok(())
+}
+
+async fn outcome_stale_fence<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let plain = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(0);
+    let external = ledger_id();
+    plain.execute(&external, Add(1), metadata()).await?;
+    plain.execute(&external, Add(1), metadata()).await?;
+
+    let target = ledger_id();
+    let command = command_id();
+    let identity = CommandIdentity::new("ledger:copy").with_streams([target.clone()]);
+    let metadata = command_metadata(&command);
+
+    // The caller stamped a fence at head 1; the stream is at 2.
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &metadata).await?;
+    let mut ledger = tx.read::<Ledger>(&target).await?;
+    tx.append(&mut ledger, vec![Added { amount: 1 }.into()])?;
+    tx.fence(ReadFence::new(
+        external.clone(),
+        Ledger::TYPE,
+        EventSequence(1),
+        FenceProvenance::Engine,
+    ))?;
+    let stale = tx.commit_with_outcome(None).await?;
+
+    ensure!(
+        stale.is_rejected() && !stale.replayed && stale.events.is_empty(),
+        "a stale caller-stamped fence is a persisted rejection: {stale:?}"
+    );
+    let rejection = stale
+        .rejection()
+        .cloned()
+        .unwrap_or_else(|| Rejection::new("", ""));
+    ensure_eq!(
+        rejection,
+        Rejection::stale_fence(),
+        "the stale-fence rejection"
+    );
+    ensure_eq!(rejection.code.as_str(), "stale-fence", "code");
+    ensure_eq!(
+        rejection.message.as_str(),
+        "a caller-stamped fence went stale",
+        "message"
+    );
+    ensure!(
+        repo.events(&target).await?.is_empty(),
+        "the command wrote nothing"
+    );
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(stale.outcome.clone()),
+        "the rejection is the command's stored outcome"
+    );
+
+    // The old command ID is terminal: it replays the rejection verbatim. The remedy is a new ID.
+    let mut tx = store.transaction();
+    match tx.begin_command(&identity, &metadata).await? {
+        Begin::Replayed(replayed) => {
+            ensure_eq!(replayed.outcome, stale.outcome, "the replayed stale-fence");
+        }
+        Begin::Proceed => return Err(Failure("the old ID must replay its rejection".into())),
+    }
+
+    // An engine-filled fence conflict is an ordinary retryable conflict: no rejection.
+    let command = command_id();
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    tx.read::<Ledger>(&external).await?;
+    let mut ledger = tx.read::<Ledger>(&target).await?;
+    tx.append(&mut ledger, vec![Added { amount: 1 }.into()])?;
+    plain
+        .execute(&external, Add(1), metadata_for_plain())
+        .await?;
+    let result = tx.commit_with_outcome(None).await;
+    ensure!(
+        matches!(
+            &result,
+            Err(err @ Error::FenceConflict { provenance: FenceProvenance::Engine, .. }) if err.is_retryable()
+        ),
+        "an engine-filled fence conflict stays a retryable conflict: {result:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "no rejection was persisted for it"
+    );
+
+    // A passing caller-stamped fence says nothing about an event conflict: it re-prepares.
+    let command = command_id();
+    let head = plain.load(&external).await?.sequence();
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    let mut ledger = tx.read::<Ledger>(&target).await?;
+    tx.append(&mut ledger, vec![Added { amount: 1 }.into()])?;
+    tx.fence(ReadFence::new(
+        external.clone(),
+        Ledger::TYPE,
+        head,
+        FenceProvenance::Engine,
+    ))?;
+    plain.execute(&target, Add(1), metadata_for_plain()).await?;
+    let result = tx.commit_with_outcome(None).await;
+    ensure!(
+        matches!(&result, Err(err) if err.is_conflict() && !matches!(err, Error::FenceConflict { .. })),
+        "an event conflict beside a passing caller fence is an ordinary conflict: {result:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "no rejection was persisted for an event conflict"
+    );
+
+    // The stale caller-stamped fence also wins when the transaction rejects.
+    let command = command_id();
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    tx.fence(ReadFence::new(
+        external.clone(),
+        Ledger::TYPE,
+        EventSequence(1),
+        FenceProvenance::Engine,
+    ))?;
+    let outcome = tx.reject(Rejection::new("denied", "not allowed")).await?;
+    ensure_eq!(
+        outcome
+            .rejection()
+            .map(|rejection| rejection.code.as_str().to_owned()),
+        Some("stale-fence".to_owned()),
+        "a stale fence replaces the rejection it would have recorded"
+    );
+
+    Ok(())
+}
+
+fn metadata_for_plain() -> Metadata {
+    metadata()
+}
+
+async fn outcome_atomicity<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let plain = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(0);
+    let (a, b) = (ledger_id(), ledger_id());
+    let command = command_id();
+    let identity = CommandIdentity::new("ledger:pair").with_streams([a.clone(), b.clone()]);
+
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    let mut first = tx.read::<Ledger>(&a).await?;
+    let mut second = tx.read::<Ledger>(&b).await?;
+    tx.append(&mut first, vec![Added { amount: 1 }.into()])?;
+    tx.append(&mut second, vec![Added { amount: 1 }.into()])?;
+
+    // Another writer takes the second stream's first sequence.
+    plain.execute(&b, Add(9), metadata()).await?;
+
+    let result = tx.commit_with_outcome(None).await;
+    ensure!(
+        matches!(&result, Err(err) if err.is_conflict()),
+        "a stream conflict fails the commit: {result:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "a failed commit leaves no outcome row"
+    );
+    ensure!(
+        repo.events(&a).await?.is_empty(),
+        "and no events on the other stream"
+    );
+
+    // The retry decides again against the new state and commits both streams with the outcome.
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    let mut first = tx.read::<Ledger>(&a).await?;
+    let mut second = tx.read::<Ledger>(&b).await?;
+    tx.append(&mut first, vec![Added { amount: 1 }.into()])?;
+    tx.append(&mut second, vec![Added { amount: 1 }.into()])?;
+    let committed = tx.commit_with_outcome(Some(b"done".to_vec())).await?;
+    let mut want = [a.clone(), b.clone()];
+    want.sort_by(|x, y| x.as_str().as_bytes().cmp(y.as_str().as_bytes()));
+    let sequences = [
+        (want[0].clone(), if want[0] == a { 1 } else { 2 }),
+        (want[1].clone(), if want[1] == a { 1 } else { 2 }),
+    ];
+    ensure_eq!(
+        committed.outcome.event_ids,
+        sequences
+            .iter()
+            .map(|(id, sequence)| EventId::for_event(id, EventSequence(*sequence)))
+            .collect::<Vec<_>>(),
+        "the outcome lists the events in stream-ID byte order"
+    );
+    ensure_eq!(committed.response(), Some(b"done".as_slice()), "response");
+
+    Ok(())
+}
+
+async fn outcome_budget<R: Repository>(repo: &R) -> CaseResult {
+    let accepted = |command| Outcome::accepted(command, "digest");
+
+    // marker check + 97 event puts + floor check + outcome put = 100 actions.
+    let creates = Stream::new(&namespace(), "creates", "ledger");
+    let command = command_id();
+    let result = creates
+        .commit_with_outcome(repo, creates.events(1..=98), accepted(command.clone()))
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
+        "98 events plus the outcome are one action too many: {result:?}"
+    );
+    ensure!(
+        repo.events(&creates.id).await?.is_empty() && repo.outcome(&command).await?.is_none(),
+        "an oversized commit writes nothing"
+    );
+    creates
+        .commit_with_outcome(repo, creates.events(1..=97), accepted(command.clone()))
+        .await?;
+    ensure_eq!(
+        repo.outcome(&command)
+            .await?
+            .map(|stored| stored.event_ids.len()),
+        Some(97),
+        "97 events fill the budget with the outcome"
+    );
+
+    // Appending adds a continuation check: marker + check + 96 puts + floor + outcome.
+    let grows = Stream::new(&namespace(), "grows", "ledger");
+    grows.commit(repo, grows.events(1..=1), None).await?;
+    let result = grows
+        .commit_with_outcome(repo, grows.events(2..=98), accepted(command_id()))
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
+        "97 appended events plus the outcome are one too many: {result:?}"
+    );
+    grows
+        .commit_with_outcome(repo, grows.events(2..=97), accepted(command_id()))
+        .await?;
+    ensure_eq!(
+        repo.events(&grows.id).await?.len(),
+        97,
+        "96 appended events fit"
+    );
+
+    // The same arithmetic holds for a transaction.
+    let multi = Stream::new(&namespace(), "multi", "ledger");
+    let result = repo
+        .commit_transaction(
+            TransactionCommit::new(vec![write(&multi, 1..=98)])
+                .with_outcome(accepted(command_id())),
+        )
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
+        "a transaction counts the outcome item too: {result:?}"
+    );
+    repo.commit_transaction(
+        TransactionCommit::new(vec![write(&multi, 1..=97)]).with_outcome(accepted(command_id())),
+    )
+    .await?;
+
+    // An outcome-only commit is the marker check and the outcome put.
+    let command = command_id();
+    repo.commit_transaction(
+        TransactionCommit::<R::Operation>::new(Vec::new()).with_outcome(accepted(command.clone())),
+    )
+    .await?;
+    ensure!(
+        repo.outcome(&command)
+            .await?
+            .is_some_and(|stored| stored.is_noop()),
+        "an outcome-only transaction stores an accepted no-op"
     );
 
     Ok(())

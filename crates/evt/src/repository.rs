@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
-use crate::ids::{EntityId, EntityType, EventId, EventSequence};
+use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
+use crate::outcome::{Outcome, check_outcome};
 
 /// A snapshot to write with a commit. Its event sequence is the last event in the commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,8 +36,9 @@ impl NewSnapshot {
     }
 }
 
-/// Everything a repository writes atomically for one command. A commit with no events is a
-/// no-op: repositories ignore its snapshot. Operations without an event are refused.
+/// Everything a repository writes atomically for one command. A commit with no events and no
+/// [outcome](Commit::with_outcome) is a no-op: repositories ignore its snapshot. Operations
+/// without an event are refused.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Commit<Op> {
@@ -50,17 +52,36 @@ pub struct Commit<Op> {
     /// transaction. DynamoDB puts them before the events. PostgreSQL runs them after the event
     /// inserts and the floor check, so a racing writer fails on the event key first.
     pub operations: Vec<Op>,
+    /// The command outcome to record in the same transaction (C3), after every other write. With
+    /// no events it is an outcome-only commit: a rejection or an accepted no-op.
+    pub outcome: Option<Outcome>,
 }
 
 impl<Op> Commit<Op> {
-    /// Creates a commit of events with no snapshot and no operations.
+    /// Creates a commit of events with no snapshot, no operations, and no outcome.
     pub fn new(entity_id: impl Into<EntityId>, events: Vec<SerializedEvent>) -> Self {
         Self {
             entity_id: entity_id.into(),
             events,
             snapshot: None,
             operations: Vec::new(),
+            outcome: None,
         }
+    }
+
+    /// Records a command outcome in the same transaction, as the last write. The outcome's event
+    /// IDs are derived from the commit's events and need not be set.
+    #[must_use]
+    pub fn with_outcome(mut self, outcome: Outcome) -> Self {
+        self.outcome = Some(outcome);
+        self
+    }
+
+    /// The outcome as the commit stores it: event IDs derived from the commit's events.
+    pub fn stored_outcome(&self) -> Option<Outcome> {
+        self.outcome.as_ref().map(|outcome| {
+            outcome.stored(self.events.iter().map(|event| event.id.clone()).collect())
+        })
     }
 
     /// Writes a snapshot with the events.
@@ -113,23 +134,25 @@ impl<Op> Commit<Op> {
                 first.sequence.0 - 1,
             )));
         }
-        if let Some(snapshot) = &self.snapshot {
+        if let Some(snapshot) = &self.snapshot
+            && let Some(last) = self.events.last()
+        {
             sizes.push(item_size(&wire::snapshot_item(
                 &SerializedSnapshot {
                     entity_type: snapshot.entity_type.clone(),
                     entity_id: self.entity_id.clone(),
                     sequence: snapshot.sequence,
-                    event_sequence: self
-                        .events
-                        .last()
-                        .expect("validated commit with a snapshot has events")
-                        .sequence,
+                    event_sequence: last.sequence,
                     payload: snapshot.payload.clone(),
                 },
                 ttl(&snapshot.entity_type),
             )?));
-        } else {
+        } else if !self.events.is_empty() {
             sizes.push(item_size(&key(self.entity_id.as_str(), 0)));
+        }
+        // The outcome row comes last, and an outcome-only commit carries nothing else.
+        if let Some(outcome) = self.stored_outcome() {
+            sizes.push(item_size(&wire::outcome_item(&outcome)?));
         }
         Ok(sizes)
     }
@@ -141,12 +164,25 @@ impl<Op> Commit<Op> {
     /// checks only look at `entity_id` and the first event's sequence, loads reject streams with
     /// gaps, typed scans read each row's entity type, and DynamoDB does not store the event ID.
     ///
-    /// A commit with no events and no operations is a valid no-op, and repositories ignore its
-    /// snapshot. Operations without an event are refused with
+    /// A commit with an [outcome](Commit::with_outcome) is validated first: the command ID, the
+    /// response and rejection bounds, and a rejected outcome with events is invalid. A commit
+    /// with no events and no operations is a valid no-op (or an outcome-only commit when it
+    /// carries an outcome), and repositories ignore its snapshot. Operations without an event are refused with
     /// [`Error::ProjectorWithoutEvents`]: views are projections of committed events, so a
     /// projector operation with no backing event could never be rebuilt by replay (ADR-0012).
     pub fn validate(&self) -> Result<(), Error> {
         let invalid = |message: String| Err(Error::InvalidCommit(message));
+
+        if let Some(outcome) = &self.outcome {
+            check_outcome(outcome)?;
+
+            if outcome.is_rejected() && !self.events.is_empty() {
+                return invalid(format!(
+                    "a rejected outcome for command {} cannot carry events",
+                    outcome.command_id
+                ));
+            }
+        }
 
         let Some(first) = self.events.first() else {
             if !self.operations.is_empty() {
@@ -272,6 +308,9 @@ pub struct TransactionCommit<Op> {
     pub fences: Vec<ReadFence>,
     /// Additional transaction operations, after stream-local operations.
     pub operations: Vec<Op>,
+    /// The command outcome to record in the same transaction (C3), after the fence checks. With
+    /// no events it is an outcome-only commit: a rejection or an accepted no-op, still fenced.
+    pub outcome: Option<Outcome>,
 }
 
 impl<Op> TransactionCommit<Op> {
@@ -281,7 +320,30 @@ impl<Op> TransactionCommit<Op> {
             streams,
             fences: Vec::new(),
             operations: Vec::new(),
+            outcome: None,
         }
+    }
+
+    /// Records a command outcome in the same transaction, as the last write. The outcome's event
+    /// IDs are derived from the commit's events and need not be set.
+    #[must_use]
+    pub fn with_outcome(mut self, outcome: Outcome) -> Self {
+        self.outcome = Some(outcome);
+        self
+    }
+
+    /// The outcome as the commit stores it: event IDs derived from the written streams, ordered
+    /// by stream ID bytewise, then sequence. Call after [`normalize`](Self::normalize), which
+    /// sorts the streams.
+    pub fn stored_outcome(&self) -> Option<Outcome> {
+        self.outcome.as_ref().map(|outcome| {
+            outcome.stored(
+                self.streams
+                    .iter()
+                    .flat_map(|stream| stream.events.iter().map(|event| event.id.clone()))
+                    .collect(),
+            )
+        })
     }
 
     /// Adds read fences.
@@ -300,6 +362,10 @@ impl<Op> TransactionCommit<Op> {
 
     /// Validates every stream and normalizes the pinned event/fence ordering.
     pub fn normalize(&mut self) -> Result<(), Error> {
+        if let Some(outcome) = &self.outcome {
+            check_outcome(outcome)?;
+        }
+
         let mut ids = std::collections::BTreeSet::new();
         for stream in &self.streams {
             stream.validate()?;
@@ -356,6 +422,15 @@ impl<Op> TransactionCommit<Op> {
         operations.append(&mut self.operations);
         self.operations = operations;
         self.streams.retain(|stream| !stream.events.is_empty());
+        if let Some(outcome) = &self.outcome
+            && outcome.is_rejected()
+            && !self.streams.is_empty()
+        {
+            return Err(Error::InvalidCommit(format!(
+                "a rejected outcome for command {} cannot carry events",
+                outcome.command_id
+            )));
+        }
         self.streams.sort_by(|a, b| {
             a.entity_id
                 .as_str()
@@ -404,7 +479,10 @@ impl<Op> TransactionCommit<Op> {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.streams.is_empty() && self.fences.is_empty() && self.operations.is_empty()
+        self.streams.is_empty()
+            && self.fences.is_empty()
+            && self.operations.is_empty()
+            && self.outcome.is_none()
     }
 
     /// Exact backend-neutral event/snapshot/check representation, matching Dynamo item sizes.
@@ -464,6 +542,10 @@ impl<Op> TransactionCommit<Op> {
                 fence.head.next().0,
             )));
             sizes.push(item_size(&key(fence.entity_id.as_str(), 0)));
+        }
+        // The outcome row comes last, and an outcome-only commit carries nothing else.
+        if let Some(outcome) = self.stored_outcome() {
+            sizes.push(item_size(&wire::outcome_item(&outcome)?));
         }
         Ok(sizes)
     }
@@ -552,6 +634,28 @@ pub trait Repository: Send + Sync {
         }
     }
 
+    /// Reads the command outcome row for a command ID, or `None` when none exists. The read must
+    /// be strongly consistent regardless of the repository's read-consistency setting: an
+    /// eventually consistent miss would re-execute a committed command. The default refuses with
+    /// [`Error::InvalidConfig`], so a repository that has not declared outcome support cannot be
+    /// used with a store that records them.
+    ///
+    /// A repository that supports outcomes also writes [`Commit::outcome`] and
+    /// [`TransactionCommit::outcome`] as the commit transaction's last write, conditioned on the
+    /// row not existing, and reports a lost condition as [`Error::OutcomeConflict`] (never a
+    /// generic conflict) and an indeterminate failure as [`Error::Backend`]. It counts the outcome
+    /// item in the commit budget.
+    fn outcome(
+        &self,
+        _command_id: &CommandId,
+    ) -> impl Future<Output = Result<Option<Outcome>, Error>> + Send {
+        async {
+            Err(Error::InvalidConfig(
+                "repository does not support command outcomes".into(),
+            ))
+        }
+    }
+
     /// Returns every stored event for the entity, ascending.
     fn events(
         &self,
@@ -618,6 +722,13 @@ macro_rules! forward_repository {
 
             fn commit_transaction(&self, commit: TransactionCommit<Self::Operation>) -> impl Future<Output = Result<(), Error>> + Send {
                 (**self).commit_transaction(commit)
+            }
+
+            fn outcome(
+                &self,
+                command_id: &CommandId,
+            ) -> impl Future<Output = Result<Option<Outcome>, Error>> + Send {
+                (**self).outcome(command_id)
             }
 
             fn events(
@@ -826,5 +937,140 @@ mod tests {
         commit.normalize().unwrap();
 
         assert!(commit.is_empty());
+    }
+
+    fn outcome(command_id: &str) -> Outcome {
+        Outcome::accepted(command_id, "digest")
+    }
+
+    #[test]
+    fn the_outcome_item_counts_against_the_commit_budget() {
+        // marker + 97 events + floor + outcome = 100 actions; 98 events are one too many.
+        let fits = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
+            .with_outcome(outcome("c"));
+        assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
+        check_budget(fits.sizes(|_| None).unwrap()).unwrap();
+
+        let over = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect())
+            .with_outcome(outcome("c"));
+        assert!(matches!(
+            check_budget(over.sizes(|_| None).unwrap()),
+            Err(Error::CommitTooLarge { actions: 101, .. })
+        ));
+
+        // Appending adds the continuation check: 96 events fit, 97 do not.
+        let appends = |last| {
+            Commit::<u8>::new("a", (2..=last).map(|n| event("a", n)).collect())
+                .with_outcome(outcome("c"))
+        };
+        assert_eq!(appends(97).sizes(|_| None).unwrap().len(), 100);
+        assert_eq!(appends(98).sizes(|_| None).unwrap().len(), 101);
+
+        // The same arithmetic for a transaction.
+        let transaction = |last| {
+            TransactionCommit::new(vec![Commit::<u8>::new(
+                "a",
+                (1..=last).map(|n| event("a", n)).collect(),
+            )])
+            .with_outcome(outcome("c"))
+        };
+        assert_eq!(transaction(97).sizes(|_| None).unwrap().len(), 100);
+        assert_eq!(transaction(98).sizes(|_| None).unwrap().len(), 101);
+    }
+
+    #[test]
+    fn an_outcome_only_commit_budgets_the_marker_check_and_the_outcome() {
+        let single = Commit::<u8>::new("a", Vec::new()).with_outcome(outcome("c"));
+        assert_eq!(single.sizes(|_| None).unwrap().len(), 2, "no floor check");
+
+        let transaction = TransactionCommit::<u8>::new(Vec::new()).with_outcome(outcome("c"));
+        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 2);
+
+        // Fences are budgeted between the marker and the outcome.
+        let mut fenced = TransactionCommit::<u8>::new(Vec::new()).with_outcome(outcome("c"));
+        fenced.fences = vec![ReadFence::new(
+            "f",
+            "t",
+            EventSequence(1),
+            FenceProvenance::Engine,
+        )];
+        assert_eq!(fenced.sizes(|_| None).unwrap().len(), 4);
+
+        // Without an outcome it is still a no-op.
+        assert!(TransactionCommit::<u8>::new(Vec::new()).is_empty());
+        assert!(!transaction.is_empty());
+    }
+
+    #[test]
+    fn the_outcome_event_ids_are_derived_in_canonical_order() {
+        let mut commit = TransactionCommit::new(vec![
+            Commit::<u8>::new("profile#u-1", vec![event("profile#u-1", 1)]),
+            Commit::<u8>::new(
+                "claim#ada",
+                vec![event("claim#ada", 1), event("claim#ada", 2)],
+            ),
+        ])
+        .with_outcome(outcome("c"));
+        commit.normalize().unwrap();
+
+        let ids: Vec<String> = commit
+            .stored_outcome()
+            .unwrap()
+            .event_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(ids, ["claim#ada:1", "claim#ada:2", "profile#u-1:1"]);
+
+        // A caller-supplied list is replaced, and an empty response is no response.
+        let mut supplied = outcome("c").with_response(Vec::new());
+        supplied.event_ids = vec![EventId::new("bogus:9")];
+        let single = Commit::<u8>::new("a", vec![event("a", 1)]).with_outcome(supplied);
+        let stored = single.stored_outcome().unwrap();
+        assert_eq!(stored.event_ids, vec![EventId::new("a:1")]);
+        assert_eq!(stored.response, None);
+    }
+
+    #[test]
+    fn commits_validate_their_outcome_before_anything_else() {
+        let rejected = Outcome::rejected("c", "digest", crate::outcome::Rejection::new("x", "y"));
+
+        // A rejection cannot carry events, in either commit shape.
+        let with_events =
+            Commit::<u8>::new("a", vec![event("a", 1)]).with_outcome(rejected.clone());
+        assert!(matches!(
+            with_events.validate(),
+            Err(Error::InvalidCommit(_))
+        ));
+        let mut transaction =
+            TransactionCommit::new(vec![Commit::<u8>::new("a", vec![event("a", 1)])])
+                .with_outcome(rejected.clone());
+        assert!(matches!(
+            transaction.normalize(),
+            Err(Error::InvalidCommit(_))
+        ));
+
+        // Without events it is a valid outcome-only commit.
+        Commit::<u8>::new("a", Vec::new())
+            .with_outcome(rejected)
+            .validate()
+            .unwrap();
+
+        // The command ID is checked first, before the response bound or the events.
+        let mut bad = Outcome::accepted("", "digest");
+        bad.response = Some(vec![0; crate::MAX_OUTCOME_BYTES + 1]);
+        let commit = Commit::<u8>::new("a", vec![event("b", 1)]).with_outcome(bad);
+        assert!(matches!(commit.validate(), Err(Error::InvalidArgument(_))));
+
+        let oversized = outcome("c").with_response(vec![0; crate::MAX_OUTCOME_BYTES + 1]);
+        assert!(matches!(
+            Commit::<u8>::new("a", Vec::new())
+                .with_outcome(oversized)
+                .validate(),
+            Err(Error::OutcomeTooLarge {
+                what: "response",
+                ..
+            })
+        ));
     }
 }
