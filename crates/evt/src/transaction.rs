@@ -29,8 +29,7 @@ use crate::store::{
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
 
 /// One stream of a transaction, independent of its aggregate type.
-#[derive(Debug)]
-struct StreamState {
+struct StreamState<Op> {
     entity_id: EntityId,
     entity_type: EntityType,
     /// The head the stream was read at: its last event sequence, snapshot-aware.
@@ -41,18 +40,23 @@ struct StreamState {
     /// metadata is stamped once at commit.
     events: Vec<SerializedEvent>,
     snapshot: Option<NewSnapshot>,
+    /// The projector operations for the stream's cumulative appended events, recomputed on every
+    /// append from the final aggregate state, never accumulated across appends.
+    operations: Vec<Op>,
 }
 
 /// A stream read into a [`Transaction`]: the loaded aggregate, typed by its own `A`. Pass it to
 /// [`Transaction::append`] to stage events for the stream; a read that is never appended to is
 /// fenced at the head it saw.
 #[derive(Debug)]
-pub struct Read<A> {
+pub struct Read<A: Aggregate> {
     transaction: u64,
     index: usize,
     loaded: Loaded<A>,
     /// The sequence the stream was read at; appended events continue from `loaded.sequence`.
     base_sequence: EventSequence,
+    /// Every event appended through this handle so far, so projectors see the cumulative set.
+    appended: Vec<A::Event>,
 }
 
 impl<A: Aggregate> Read<A> {
@@ -88,14 +92,21 @@ impl<A: Aggregate> Read<A> {
 /// recoverable and leave the transaction unchanged: a duplicate [`read`](Transaction::read), or an
 /// [`append`](Transaction::append) with a handle from another transaction, returns
 /// [`Error::InvalidCommit`], and the caller can carry on and commit.
+///
+/// The one exception is a failure after an append has already changed a handle's aggregate: a
+/// projector error or a snapshot that cannot be serialized. That handle is then ahead of the
+/// staged events, so the transaction is poisoned and every later `append` and the `commit` return
+/// [`Error::TransactionPoisoned`]. Discard it and build a new transaction.
 pub struct Transaction<'a, R: Repository> {
     id: u64,
     repository: &'a R,
     commit_ids: CommitIdGenerator,
     snapshot_interval: usize,
-    streams: Vec<StreamState>,
-    operations: Vec<R::Operation>,
+    streams: Vec<StreamState<R::Operation>>,
     fences: Vec<ReadFence>,
+    /// Set when a step failed after an append changed a handle's aggregate, leaving the handle
+    /// ahead of what the transaction staged. Further appends and the commit are refused.
+    poisoned: bool,
 }
 
 impl<A: Aggregate, R: Repository> Store<A, R> {
@@ -146,8 +157,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
             commit_ids,
             snapshot_interval,
             streams: Vec::new(),
-            operations: Vec::new(),
             fences: Vec::new(),
+            poisoned: false,
         }
     }
 
@@ -186,12 +197,14 @@ impl<'a, R: Repository> Transaction<'a, R> {
             seen_command_ids: loaded.seen_command_ids.clone(),
             events: Vec::new(),
             snapshot: None,
+            operations: Vec::new(),
         });
 
         Ok(Read {
             transaction: self.id,
             index: self.streams.len() - 1,
             base_sequence: loaded.sequence,
+            appended: Vec::new(),
             loaded,
         })
     }
@@ -252,11 +265,14 @@ impl<'a, R: Repository> Transaction<'a, R> {
                 read.loaded.entity_id
             )));
         }
+        if self.poisoned {
+            return Err(Error::TransactionPoisoned);
+        }
         if events.is_empty() {
             return Ok(());
         }
 
-        // Everything fallible runs before the handle or the transaction changes.
+        // Serialization changes nothing, so its failure leaves the transaction usable.
         let serialized = serialize_events::<A>(
             &read.loaded.entity_id,
             read.loaded.sequence,
@@ -264,24 +280,64 @@ impl<'a, R: Repository> Transaction<'a, R> {
             &Metadata::default(),
         )?;
 
+        // From here the handle's aggregate changes. A failure in any later step leaves it ahead
+        // of the staged events, so the transaction is poisoned: a half-applied handle must never
+        // reach a commit, where a snapshot could capture state its persisted events lack.
         let projected = (!projectors.is_empty()).then(|| events.clone());
-        for event in events {
-            read.loaded.aggregate.apply(event);
+        for event in &events {
+            read.loaded.aggregate.apply(event.clone());
         }
 
+        let staged =
+            self.stage_derived(read, &serialized, projected, projectors, snapshot_interval);
+        let (operations, snapshot) = match staged {
+            Ok(derived) => derived,
+            Err(error) => {
+                self.poisoned = true;
+
+                return Err(error);
+            }
+        };
+
+        read.appended.extend(events);
+        read.loaded.sequence = serialized
+            .last()
+            .map_or(read.loaded.sequence, |event| event.sequence);
+
+        let stream = &mut self.streams[read.index];
+        stream.events.extend(serialized);
+        stream.snapshot = snapshot;
+        stream.operations = operations;
+
+        Ok(())
+    }
+
+    /// Derives the projector operations (from the stream's cumulative appended events and final
+    /// aggregate state) and the snapshot for the state after the new events.
+    #[allow(clippy::type_complexity)]
+    fn stage_derived<A: Aggregate>(
+        &self,
+        read: &Read<A>,
+        serialized: &[SerializedEvent],
+        projected: Option<Vec<A::Event>>,
+        projectors: &[Arc<dyn Projector<A, R::Operation>>],
+        snapshot_interval: usize,
+    ) -> Result<(Vec<R::Operation>, Option<NewSnapshot>), Error> {
         let mut operations = Vec::new();
-        if let Some(projected) = &projected {
+        if let Some(new_events) = projected {
+            let mut cumulative = read.appended.clone();
+            cumulative.extend(new_events);
+
             for projector in projectors {
                 operations.extend(
                     projector
-                        .project(&read.loaded.entity_id, &read.loaded.aggregate, projected)
+                        .project(&read.loaded.entity_id, &read.loaded.aggregate, &cumulative)
                         .map_err(Error::Projector)?,
                 );
             }
         }
 
-        let stream = &mut self.streams[read.index];
-        let appended = stream.events.len() + serialized.len();
+        let appended = self.streams[read.index].events.len() + serialized.len();
         let snapshot = if snapshot_events_due(read.base_sequence, appended, snapshot_interval) > 0 {
             Some(NewSnapshot {
                 entity_type: EntityType::new(A::TYPE),
@@ -292,14 +348,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             None
         };
 
-        read.loaded.sequence = serialized
-            .last()
-            .map_or(read.loaded.sequence, |event| event.sequence);
-        stream.events.extend(serialized);
-        stream.snapshot = snapshot;
-        self.operations.extend(operations);
-
-        Ok(())
+        Ok((operations, snapshot))
     }
 
     /// Adds a caller-stamped read fence for a stream the transaction did not read. The fence fails
@@ -327,6 +376,10 @@ impl<'a, R: Repository> Transaction<'a, R> {
     /// committed events in the canonical order the commit persists them: stream ID bytewise,
     /// then sequence.
     pub async fn commit(mut self, metadata: &Metadata) -> Result<Vec<SerializedEvent>, Error> {
+        if self.poisoned {
+            return Err(Error::TransactionPoisoned);
+        }
+
         let metadata = stamp_commit_id(metadata, &*self.commit_ids);
 
         if let Some(command_id) = &metadata.command_id
@@ -348,8 +401,11 @@ impl<'a, R: Repository> Transaction<'a, R> {
                 .any(|stream| stream.entity_id == fence.entity_id)
         });
 
+        // Projector operations follow the streams in read order, each stream's own in emission
+        // order, as recomputed from its final appended state.
+        let mut operations = Vec::new();
         let mut written = Vec::new();
-        for stream in streams {
+        for mut stream in streams {
             if stream.events.is_empty() {
                 self.fences.push(ReadFence {
                     entity_id: stream.entity_id,
@@ -361,6 +417,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
                 continue;
             }
 
+            operations.append(&mut stream.operations);
             written.push(stream);
         }
 
@@ -391,7 +448,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
         let mut commit = TransactionCommit::new(commits);
         commit.fences = self.fences;
-        commit.operations = self.operations;
+        commit.operations = operations;
 
         self.repository.commit_transaction(commit).await?;
 
@@ -840,5 +897,244 @@ mod tests {
             .await
             .expect("an empty command ID is absent");
         assert_eq!(stored_events(&store, "later").await, 1);
+    }
+
+    /// A repository that records the transaction it is asked to commit, with string operations.
+    #[derive(Default)]
+    struct Recording {
+        committed: std::sync::Mutex<Vec<TransactionCommit<String>>>,
+    }
+
+    impl Repository for Recording {
+        type Operation = String;
+
+        async fn commit(&self, _: Commit<String>) -> Result<(), Error> {
+            unimplemented!("transactions only")
+        }
+
+        async fn commit_transaction(&self, commit: TransactionCommit<String>) -> Result<(), Error> {
+            self.committed.lock().unwrap().push(commit);
+
+            Ok(())
+        }
+
+        async fn events(&self, _: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
+            Ok(Vec::new())
+        }
+
+        async fn events_after(
+            &self,
+            _: &EntityId,
+            _: EventSequence,
+        ) -> Result<Vec<SerializedEvent>, Error> {
+            Ok(Vec::new())
+        }
+
+        async fn latest(&self, _: &EntityId, _: usize) -> Result<Vec<SerializedEvent>, Error> {
+            Ok(Vec::new())
+        }
+
+        async fn snapshot(&self, _: &EntityId) -> Result<Option<crate::SerializedSnapshot>, Error> {
+            Ok(None)
+        }
+
+        async fn put_snapshot(&self, _: &crate::SerializedSnapshot) -> Result<bool, Error> {
+            Ok(true)
+        }
+
+        async fn compact_below(&self, _: &EntityId, _: EventSequence) -> Result<usize, Error> {
+            Ok(0)
+        }
+
+        async fn entity_heads(
+            &self,
+            _: Option<&EntityType>,
+        ) -> Result<std::collections::BTreeMap<EntityId, EventSequence>, Error> {
+            Ok(Default::default())
+        }
+    }
+
+    /// Writes one view operation per call, describing the final state and every event it saw,
+    /// the way a state-keyed view projector writes one row per stream.
+    struct ViewRow;
+
+    impl Projector<Ledger, String> for ViewRow {
+        fn project(
+            &self,
+            entity_id: &EntityId,
+            ledger: &Ledger,
+            events: &[crate::conformance::LedgerEvent],
+        ) -> Result<Vec<String>, crate::BoxError> {
+            Ok(vec![format!(
+                "put {entity_id} total={} events={}",
+                ledger.total,
+                events.len()
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_appends_project_once_from_the_final_state() {
+        let repository = Recording::default();
+        let projectors: Vec<Arc<dyn Projector<Ledger, String>>> = vec![Arc::new(ViewRow)];
+
+        let mut tx = Transaction::new(&repository).with_snapshot_interval(0);
+        let mut ledger = tx.read::<Ledger>("view-1").await.unwrap();
+        tx.append_with(&mut ledger, added(1), &projectors).unwrap();
+        tx.append_with(&mut ledger, added(2), &projectors).unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+
+        let committed = repository.committed.lock().unwrap();
+        assert_eq!(
+            committed[0].operations,
+            vec!["put view-1 total=3 events=2".to_owned()],
+            "one operation for the stream, from the final state and both batches' events"
+        );
+    }
+
+    #[tokio::test]
+    async fn operations_follow_each_streams_final_state_across_streams() {
+        let repository = Recording::default();
+        let projectors: Vec<Arc<dyn Projector<Ledger, String>>> = vec![Arc::new(ViewRow)];
+
+        let mut tx = Transaction::new(&repository).with_snapshot_interval(0);
+        let mut first = tx.read::<Ledger>("a").await.unwrap();
+        let mut second = tx.read::<Ledger>("b").await.unwrap();
+        tx.append_with(&mut first, added(1), &projectors).unwrap();
+        tx.append_with(&mut second, added(5), &projectors).unwrap();
+        tx.append_with(&mut first, added(1), &projectors).unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+
+        let committed = repository.committed.lock().unwrap();
+        assert_eq!(
+            committed[0].operations,
+            vec![
+                "put a total=2 events=2".to_owned(),
+                "put b total=5 events=1".to_owned()
+            ]
+        );
+    }
+
+    /// An aggregate whose snapshot encoding fails once its count reaches two.
+    #[derive(Debug, Default, serde::Deserialize)]
+    struct Fragile {
+        count: i64,
+    }
+
+    impl serde::Serialize for Fragile {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            if self.count >= 2 {
+                return Err(serde::ser::Error::custom("too fragile to snapshot"));
+            }
+
+            serializer.collect_str(&self.count)
+        }
+    }
+
+    crate::domain_events! {
+        #[derive(Clone, Debug, PartialEq)]
+        enum FragileEvent {
+            Bumped(Bumped) => ("fragile:bumped", 1),
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Bumped {}
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("never")]
+    struct Never;
+
+    impl Aggregate for Fragile {
+        const TYPE: &'static str = "fragile";
+
+        type Command = ();
+        type Event = FragileEvent;
+        type Error = Never;
+        type Services = ();
+
+        async fn handle(&self, _: (), _: &()) -> Result<Vec<FragileEvent>, Never> {
+            Ok(vec![Bumped {}.into()])
+        }
+
+        fn apply(&mut self, _: FragileEvent) {
+            self.count += 1;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_append_after_the_aggregate_changed_poisons_the_transaction() {
+        let repository = MemRepository::new();
+        let bump = || -> Vec<FragileEvent> { vec![Bumped {}.into()] };
+
+        // Every append crosses the snapshot interval, so the second one's snapshot cannot encode.
+        let mut tx = Transaction::new(&repository).with_snapshot_interval(1);
+        let mut fragile = tx.read::<Fragile>("fragile-1").await.unwrap();
+        tx.append(&mut fragile, bump()).unwrap();
+
+        let failed = tx.append(&mut fragile, bump()).map(|_| ()).unwrap_err();
+        assert!(matches!(failed, Error::Json(_)), "{failed:?}");
+
+        // The handle is ahead of the staged events now: nothing more can be staged or committed.
+        assert!(matches!(
+            tx.append(&mut fragile, bump()).map(|_| ()),
+            Err(Error::TransactionPoisoned)
+        ));
+        assert!(matches!(
+            tx.commit(&Metadata::default()).await,
+            Err(Error::TransactionPoisoned)
+        ));
+        assert!(
+            repository
+                .events(&"fragile-1".into())
+                .await
+                .unwrap()
+                .is_empty(),
+            "a poisoned transaction writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_projector_failure_poisons_the_transaction_too() {
+        struct Failing;
+        impl Projector<Ledger, String> for Failing {
+            fn project(
+                &self,
+                _: &EntityId,
+                _: &Ledger,
+                _: &[crate::conformance::LedgerEvent],
+            ) -> Result<Vec<String>, crate::BoxError> {
+                Err("projection failed".into())
+            }
+        }
+
+        let repository = Recording::default();
+        let projectors: Vec<Arc<dyn Projector<Ledger, String>>> = vec![Arc::new(Failing)];
+
+        let mut tx = Transaction::new(&repository).with_snapshot_interval(0);
+        let mut ledger = tx.read::<Ledger>("view-2").await.unwrap();
+        assert!(matches!(
+            tx.append_with(&mut ledger, added(1), &projectors)
+                .map(|_| ()),
+            Err(Error::Projector(_))
+        ));
+        assert!(matches!(
+            tx.commit(&Metadata::default()).await,
+            Err(Error::TransactionPoisoned)
+        ));
+        assert!(repository.committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_serialization_error_before_any_change_leaves_the_transaction_usable() {
+        let store = store(0);
+        let mut tx = store.transaction();
+        let mut ledger = tx.read::<Ledger>("usable").await.unwrap();
+
+        // Appending nothing stages nothing and poisons nothing.
+        tx.append(&mut ledger, Vec::new()).unwrap();
+        tx.append(&mut ledger, added(1)).unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+        assert_eq!(stored_events(&store, "usable").await, 1);
     }
 }

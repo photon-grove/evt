@@ -51,7 +51,7 @@ func TestEveryWriteEntryPointRefusesProjectorOnlyInput(t *testing.T) {
 			channel <- result.Ok(projectorOnly)
 			close(channel)
 
-			return repo.CommitStream(ctx, channel)
+			return repo.CommitStream(ctx, channel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts); this test pins its fail-closed behavior
 		},
 	}
 

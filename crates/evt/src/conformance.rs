@@ -329,6 +329,10 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
                 "projector operations commit with events",
                 store_projector(repo, views).await,
             );
+            record(
+                "a transaction projects each stream once from its final state",
+                transaction_projector(repo, views).await,
+            );
         }
 
         if !failures.is_empty() {
@@ -1781,6 +1785,42 @@ async fn store_retry<R: Repository>(repo: &R) -> CaseResult {
     ensure!(
         result.as_ref().is_err_and(|err| err.is_conflict()),
         "a single attempt returns the conflict: got {result:?}"
+    );
+
+    Ok(())
+}
+
+async fn transaction_projector<R: Repository, V: ViewTarget<R>>(repo: &R, views: &V) -> CaseResult {
+    use crate::Transaction;
+    use std::sync::Arc;
+
+    let id = ledger_id();
+    let projectors: Vec<Arc<dyn Projector<Ledger, R::Operation>>> =
+        vec![Arc::new(views.projector())];
+
+    // Two appends to one handle write the stream's view row once, from the final state. Writing
+    // the row per append would touch one item twice in the transaction, which DynamoDB refuses.
+    let mut tx = Transaction::new(repo).with_snapshot_interval(0);
+    let mut ledger = tx.read::<Ledger>(id.clone()).await?;
+    tx.append_with(&mut ledger, vec![Added { amount: 1 }.into()], &projectors)?;
+    tx.append_with(&mut ledger, vec![Added { amount: 2 }.into()], &projectors)?;
+    tx.commit(&metadata()).await?;
+
+    ensure_eq!(
+        views
+            .view(&id)
+            .await
+            .map_err(|err| Failure(err.to_string()))?,
+        Some(Ledger {
+            total: 3,
+            entries: 2
+        }),
+        "the view reflects both appends"
+    );
+    ensure_eq!(
+        repo.events(&id).await?.len(),
+        2,
+        "both appends are committed"
     );
 
     Ok(())

@@ -2014,6 +2014,49 @@ mod tests {
         ));
     }
 
+    /// Every public write entry point refuses projector operations that have no backing event
+    /// (ADR-0012) before it touches the network: the offline client could not have served it.
+    #[tokio::test]
+    async fn every_write_entry_point_refuses_projector_only_input() {
+        let repository = offline_repository();
+        let operation = || {
+            put(
+                "views",
+                Item::from([("pk".into(), AttributeValue::S("view".into()))]),
+                None,
+                &[],
+            )
+            .unwrap()
+        };
+
+        let single = Commit::new("a", Vec::new()).with_operations([operation()]);
+        let mut transaction = crate::TransactionCommit::new(Vec::new());
+        transaction.operations = vec![operation()];
+        let mut eventless_stream = crate::TransactionCommit::new(vec![
+            Commit::new("a", Vec::new()).with_operations([operation()]),
+        ]);
+        eventless_stream.operations = Vec::new();
+
+        let results = [
+            ("commit", repository.commit(single).await),
+            (
+                "commit_transaction (top-level operations)",
+                repository.commit_transaction(transaction).await,
+            ),
+            (
+                "commit_transaction (eventless stream operations)",
+                repository.commit_transaction(eventless_stream).await,
+            ),
+        ];
+
+        for (entry_point, result) in results {
+            assert!(
+                matches!(result, Err(Error::ProjectorWithoutEvents { operations: 1 })),
+                "{entry_point}: {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn entity_heads_skip_malformed_items() {
         let item = |sk: sdk::AttributeValue, event_seq: Option<sdk::AttributeValue>| {

@@ -120,6 +120,12 @@ pub enum Error {
         operations: usize,
     },
 
+    /// A transaction's append failed after it had already changed a handle's aggregate, leaving
+    /// the handle ahead of the staged events. A half-applied handle can never reach a commit, so
+    /// every later append and the commit are refused. Discard the transaction and build a new one.
+    #[error("the transaction is poisoned by an earlier failed append; discard it")]
+    TransactionPoisoned,
+
     /// TTL retention cannot protect a read fence.
     #[error("read fences refused for retention-enabled entity type {entity_type}")]
     RetentionConflict {
