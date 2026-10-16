@@ -92,6 +92,19 @@ func (e *ProjectorOnlyCommitError) Error() string {
 	return fmt.Sprintf("commit carries %d projector operations but no events; views must be projections of committed events", e.Operations)
 }
 
+// ProjectorOperationCount returns the number of projector operations the result carries across all
+// of its transaction groups.
+func ProjectorOperationCount(result SerializedResult) int {
+	operations := 0
+	for _, group := range result.Transaction {
+		if group != nil {
+			operations += group.Len()
+		}
+	}
+
+	return operations
+}
+
 // CheckProjectorOperations returns a *ProjectorOnlyCommitError when the result carries projector
 // operations but no events. Backends call it before any other work; NormalizeCommit calls it too.
 func CheckProjectorOperations(result SerializedResult) error {
@@ -99,17 +112,40 @@ func CheckProjectorOperations(result SerializedResult) error {
 		return nil
 	}
 
-	operations := 0
-	for _, group := range result.Transaction {
-		if group != nil {
-			operations += group.Len()
-		}
-	}
+	operations := ProjectorOperationCount(result)
 	if operations == 0 {
 		return nil
 	}
 
 	return &ProjectorOnlyCommitError{Operations: operations}
+}
+
+// ProjectorOperationsUnsupportedError refuses a commit that carries projector operations to a
+// backend that cannot execute them in the commit's transaction. Dropping them would commit the
+// events without the view writes that were meant to be atomic with them, so the backend fails
+// closed before any write.
+type ProjectorOperationsUnsupportedError struct {
+	// Backend names the refusing backend.
+	Backend string
+	// Operations is the number of projector operations the commit carried.
+	Operations int
+}
+
+func (e *ProjectorOperationsUnsupportedError) Error() string {
+	return fmt.Sprintf(
+		"%s cannot execute projector operations in the commit transaction; refusing %d operations instead of dropping them",
+		e.Backend, e.Operations,
+	)
+}
+
+// CheckProjectorOperationsSupported returns *ProjectorOperationsUnsupportedError when the result
+// carries any projector operation. A backend without projector support calls it before writing.
+func CheckProjectorOperationsSupported(backend string, result SerializedResult) error {
+	if operations := ProjectorOperationCount(result); operations > 0 {
+		return &ProjectorOperationsUnsupportedError{Backend: backend, Operations: operations}
+	}
+
+	return nil
 }
 
 // UnsupportedBatchEntryError refuses a SerializedResult sent through the deprecated CommitStream

@@ -482,3 +482,28 @@ func serializedClaimEvent(t *testing.T, sequence evt.EventSequence) evt.Serializ
 		Metadata: evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Source: "test", Endpoint: "test"}},
 	}}}
 }
+
+func TestTransaction_AnEmptyCommandIDIsNeverADuplicate(t *testing.T) {
+	setup := newTransactionSetup(0)
+	ctx := context.Background()
+
+	empty := evt.CommandID("")
+	metadata := newTestMetadata()
+	metadata.CommandID = &empty
+
+	// A stream already holds an event written with an empty command ID.
+	setup.seed(t, "tx-empty-earlier", 0, metadata)
+
+	tx := setup.store.Transaction()
+	setup.read(t, tx, "tx-empty-earlier")
+	setup.read(t, tx, "tx-empty-later")
+	require.NoError(t, tx.Append("tx-empty-later", created("tx-empty-later")))
+
+	_, err := tx.Commit(ctx, metadata)
+	require.NoError(t, err, "an empty command ID is absent, not a duplicate")
+
+	// The single-stream path agrees: the same empty ID twice is not a duplicate.
+	entity := test.NewEntity("tx-empty-single")
+	require.NoError(t, setup.store.Execute(ctx, entity, "tx-empty-single", &test.CreateEntity{Value: "one"}, metadata))
+	require.NoError(t, setup.store.Execute(ctx, entity, "tx-empty-single", &test.ReplaceEntity{Value: "two"}, metadata))
+}

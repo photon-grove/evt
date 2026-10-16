@@ -301,9 +301,10 @@ counts its key attributes plus its expression strings, attribute-name placeholde
 placeholder and the name), and attribute values. A PostgreSQL repository that executes projector statements counts
 each statement as one action sized by its SQL text; the bound parameters are opaque, so the byte
 estimate is a lower bound while the action count is exact. Rust's PostgreSQL repository does this
-today. Go's PostgreSQL repository writes no projector operations until commit-wide projector
-support lands (E2.6), so its preflight counts none; when that support lands it must count its
-statements the same way. Until then it has no projector operations to count.
+today. Go's PostgreSQL repository executes no projector operations until commit-wide projector
+support lands (E2.6): a commit carrying any projector operation is refused before any write with
+`ProjectorOperationsUnsupported`, never silently dropped, so there is nothing to count. When that
+support lands it must count its statements the same way.
 
 | Write                                  | Condition                                             |
 | -------------------------------------- | ----------------------------------------------------- |

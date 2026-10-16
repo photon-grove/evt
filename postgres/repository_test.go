@@ -151,3 +151,45 @@ func TestNewRepositoryRejectsReservedInfix(t *testing.T) {
 		NewRepository(nil, WithEventsTable("orders"), WithSnapshotsTable("ORDERS__EVT_features"))
 	}, "the infix check is case-insensitive")
 }
+
+// stubProjectorGroup is a backend-neutral projector group with operations.
+type stubProjectorGroup struct{ size int }
+
+func (g stubProjectorGroup) Len() int                           { return g.size }
+func (stubProjectorGroup) StorageType() evt.StorageType         { return "stub" }
+func (stubProjectorGroup) TransactionType() evt.TransactionType { return "stub" }
+func (stubProjectorGroup) HandleError(err error, _ int) error   { return err }
+func (g stubProjectorGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
+	return g, nil
+}
+
+func TestCommitRefusesProjectorOperationsBeforeAnyWrite(t *testing.T) {
+	// The repository has no database: the refusal must come before the first use of the pool.
+	repo := NewRepository(nil)
+	event := evt.SerializedEvent{
+		ID: "pg-projector:1", Sequence: 1, Type: "t:created", Version: 1,
+		EntityID: "pg-projector", EntityType: "t", Payload: []byte(`{}`),
+	}
+
+	err := repo.Commit(context.Background(), evt.SerializedResult{
+		Events:      []evt.SerializedEvent{event},
+		Transaction: evt.Transaction{stubProjectorGroup{size: 2}},
+	})
+
+	var unsupported *evt.ProjectorOperationsUnsupportedError
+	require.ErrorAs(t, err, &unsupported)
+	require.Equal(t, "postgres", unsupported.Backend)
+	require.Equal(t, 2, unsupported.Operations)
+
+	// An empty group carries no operation, so it is not refused here (the commit then needs the
+	// database, which this repository lacks).
+	require.NotPanics(t, func() {
+		err := repo.Commit(context.Background(), evt.SerializedResult{
+			Transaction: evt.Transaction{stubProjectorGroup{size: 0}},
+		})
+		require.NoError(t, err, "an eventless commit with no operations is a no-op")
+	})
+
+	// The capability is still declared for event, fence, and snapshot-only commits.
+	require.NoError(t, evt.RequireTransactions(repo))
+}

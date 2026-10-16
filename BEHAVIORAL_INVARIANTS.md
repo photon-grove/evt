@@ -242,6 +242,8 @@ error before any write and is never split.
 - Multi-stream transactions require a repository that declares `evt.TransactionalRepository`;
   `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
   before dispatching anything
+- Go PostgreSQL refuses a commit carrying projector operations with
+  `*ProjectorOperationsUnsupportedError` before any write until E2.6 lands; it never drops them
 - A commit that carries projector operations but writes no event is refused before any write
   (`ProjectorOnlyCommitError` / `Error::ProjectorWithoutEvents`): views are projections of
   committed events (ADR-0012). An empty command ID is treated as absent when deriving the commit ID

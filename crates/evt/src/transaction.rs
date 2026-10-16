@@ -821,4 +821,24 @@ mod tests {
                 .all(|event| event.metadata.commit_id == "injected-commit")
         );
     }
+
+    #[tokio::test]
+    async fn an_empty_command_id_never_matches_a_stream_that_recorded_one() {
+        let store = store(0);
+        let empty = Metadata::default().with_command_id("");
+        store
+            .execute("earlier", Add(1), empty.clone())
+            .await
+            .unwrap();
+
+        let mut tx = store.transaction();
+        tx.read::<Ledger>("earlier").await.unwrap();
+        let mut later = tx.read::<Ledger>("later").await.unwrap();
+        tx.append(&mut later, added(1)).unwrap();
+
+        tx.commit(&empty)
+            .await
+            .expect("an empty command ID is absent");
+        assert_eq!(stored_events(&store, "later").await, 1);
+    }
 }

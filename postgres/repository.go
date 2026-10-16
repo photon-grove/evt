@@ -299,10 +299,12 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
 // (entity_id, sequence) pair violates the primary key and is returned as an evt.ConflictError,
 // giving the optimistic-concurrency guarantee the contract requires.
 //
-// This backend is an event log only: it does not interpret res.Transaction, since projector view
+// This backend is an event log only: it does not execute res.Transaction, since projector view
 // writes are backend-specific (the only TransactionGroup implementation today is DynamoDB's) and no
-// PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
-// same transaction as the events, preserving atomicity.
+// PostgreSQL view store exists yet. A result carrying any projector operation is refused with
+// *evt.ProjectorOperationsUnsupportedError before any write instead of dropping the operations.
+// Adding view support later would extend this to write the view rows in the same transaction as
+// the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
 	if err := repo.checkFeatureMarkerTable(); err != nil {
 		return err
@@ -311,6 +313,12 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 	// Projector operations need a backing event in the same commit (ADR-0012); refuse them even
 	// when nothing else would be written.
 	if err := evt.CheckProjectorOperations(res); err != nil {
+		return err
+	}
+
+	// This backend executes no projector groups until commit-wide projector support lands (E2.6).
+	// Fail closed rather than commit the events and silently drop the view writes.
+	if err := evt.CheckProjectorOperationsSupported("postgres", res); err != nil {
 		return err
 	}
 

@@ -195,6 +195,10 @@ only once its `Commit` honors the full contract above. `snapshots.Store.Transact
 `Read` and `Commit` refuse a repository without the capability with
 `*evt.TransactionsUnsupportedError` (`errors.Is(err, evt.ErrTransactionsUnsupported)`) before
 anything is loaded or written. The in-memory, DynamoDB, and PostgreSQL repositories declare it.
+The Go PostgreSQL repository does not yet execute projector transaction groups (E2.6), so it
+declares the capability for event, snapshot, and fence commits but refuses a commit that carries
+any projector operation with `*evt.ProjectorOperationsUnsupportedError` before writing, instead of
+dropping the view writes. Use DynamoDB projectors, or no projectors, with Go PostgreSQL until then.
 To use transactions on a custom backend, make `Commit` atomic over every stream, snapshot, and
 fence, then add the marker method. Wrapping a repository in a decorator type hides the capability
 unless the wrapper declares it too.

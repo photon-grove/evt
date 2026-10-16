@@ -57,9 +57,10 @@ type Context struct {
 	SeenCommandIDs  map[CommandID]struct{} // CommandIDs observed during event replay (dedupe guard)
 }
 
-// HasCommandID reports whether the given CommandID was already seen during event replay.
+// HasCommandID reports whether the given CommandID was already seen during event replay. An empty
+// CommandID is absent, never a duplicate, as in CommitMetadata.
 func (c Context) HasCommandID(id CommandID) bool {
-	if c.SeenCommandIDs == nil {
+	if id == "" || c.SeenCommandIDs == nil {
 		return false
 	}
 
@@ -68,8 +69,13 @@ func (c Context) HasCommandID(id CommandID) bool {
 	return ok
 }
 
-// RecordCommandID adds a CommandID to the seen set (initializing the map if needed).
+// RecordCommandID adds a CommandID to the seen set (initializing the map if needed). An empty
+// CommandID is absent and is not recorded.
 func (c *Context) RecordCommandID(id CommandID) {
+	if id == "" {
+		return
+	}
+
 	if c.SeenCommandIDs == nil {
 		c.SeenCommandIDs = make(map[CommandID]struct{})
 	}

@@ -275,7 +275,11 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         if let Some(sequence) = snapshot_sequence {
             loaded.snapshot_sequence = sequence;
         }
-        if let Some(command_id) = &metadata.command_id {
+        if let Some(command_id) = metadata
+            .command_id
+            .as_ref()
+            .filter(|id| !id.as_str().is_empty())
+        {
             loaded.seen_command_ids.insert(command_id.clone());
         }
 
@@ -401,7 +405,11 @@ impl<A: Aggregate> Loaded<A> {
                 })?;
 
         self.sequence = stored.sequence;
-        if let Some(command_id) = stored.metadata.command_id {
+        if let Some(command_id) = stored
+            .metadata
+            .command_id
+            .filter(|id| !id.as_str().is_empty())
+        {
             self.seen_command_ids.insert(command_id);
         }
 
@@ -437,7 +445,8 @@ impl<A: Aggregate> Loaded<A> {
 
     /// Reports whether a command ID was recorded by an event replayed since the latest snapshot.
     pub fn has_seen(&self, command_id: &CommandId) -> bool {
-        self.seen_command_ids.contains(command_id)
+        // An empty command ID is absent, never a duplicate, as when stamping the commit ID.
+        !command_id.as_str().is_empty() && self.seen_command_ids.contains(command_id)
     }
 }
 
@@ -542,5 +551,39 @@ mod tests {
         let mut derived = Metadata::default().with_command_id("cmd-1");
         derived.commit_id = "caller-commit".to_owned();
         assert_eq!(stamp_commit_id(&derived, &generated).commit_id, "cmd-1");
+    }
+
+    #[tokio::test]
+    async fn an_empty_command_id_is_never_a_duplicate() {
+        let store = crate::Store::<Ledger, _>::new(crate::MemRepository::new(), ());
+        let empty = Metadata::default().with_command_id("");
+
+        // The same empty command ID twice: absent both times, so neither is a duplicate.
+        store
+            .execute("ledger-1", crate::conformance::Add(1), empty.clone())
+            .await
+            .unwrap();
+        store
+            .execute("ledger-1", crate::conformance::Add(1), empty.clone())
+            .await
+            .unwrap();
+
+        let loaded = store.load("ledger-1").await.unwrap();
+        assert_eq!(loaded.aggregate().entries, 2);
+        assert!(!loaded.has_seen(&CommandId::new("")));
+
+        // A real command ID is still deduplicated.
+        let real = Metadata::default().with_command_id("cmd-1");
+        store
+            .execute("ledger-1", crate::conformance::Add(1), real.clone())
+            .await
+            .unwrap();
+        let duplicate = store
+            .execute("ledger-1", crate::conformance::Add(1), real)
+            .await;
+        assert!(matches!(
+            duplicate.unwrap_err().as_store_error(),
+            Some(Error::DuplicateCommand(_))
+        ));
     }
 }
