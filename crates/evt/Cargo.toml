@@ -26,7 +26,6 @@ conformance = []
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-ulid = "1"
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }

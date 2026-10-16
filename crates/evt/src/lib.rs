@@ -20,6 +20,7 @@
 #![warn(missing_docs)]
 
 mod aggregate;
+mod commit_id;
 #[cfg(any(test, feature = "conformance"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "conformance")))]
 pub mod conformance;
@@ -45,6 +46,7 @@ pub mod dynamodb;
 pub mod postgres;
 
 pub use aggregate::{Aggregate, Projector};
+pub use commit_id::CommitIdGenerator;
 pub use error::{BoxError, Error, ExecuteError, ReplayPhase};
 pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
 pub use features::{
@@ -61,7 +63,9 @@ pub use repository::{
     snapshot_events_due,
 };
 pub use retry::RetryPolicy;
-pub use store::{DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, serialize_events};
+pub use store::{
+    DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, Transaction, serialize_events,
+};
 pub use upcast::{JsonUpcaster, Upcaster};
 
 #[cfg(doctest)]

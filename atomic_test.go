@@ -71,3 +71,17 @@ func TestSequenceGapError_IsAConflictAndMatchesTheSentinel(t *testing.T) {
 		"stream stream-a skips from sequence 2 to 5: it was compacted during the load, or events expired",
 		err.Error())
 }
+
+func TestCommitMetadata_TreatsAnEmptyCommandIDAsAbsent(t *testing.T) {
+	empty := evt.CommandID("")
+
+	generated := evt.CommitMetadata(evt.Metadata{CommandID: &empty})
+	require.Len(t, generated.CommitID, 26, "a ULID is generated, not the empty command ID")
+
+	pinned := evt.CommitMetadata(evt.Metadata{CommandID: &empty, CommitID: "caller-commit"})
+	require.Equal(t, "caller-commit", pinned.CommitID)
+
+	command := evt.CommandID("cmd-1")
+	derived := evt.CommitMetadata(evt.Metadata{CommandID: &command, CommitID: "caller-commit"})
+	require.Equal(t, "cmd-1", derived.CommitID, "a non-empty command ID wins")
+}

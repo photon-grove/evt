@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::aggregate::{Aggregate, Projector};
+use crate::commit_id::{self, CommitIdGenerator};
 use crate::error::{Error, ExecuteError, ReplayPhase};
 use crate::event::{DomainEvent, SerializedEvent};
 use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
@@ -36,6 +37,7 @@ pub struct Store<A: Aggregate, R: Repository> {
     services: A::Services,
     snapshot_interval: usize,
     projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
+    commit_ids: CommitIdGenerator,
 }
 
 impl<A, R> Clone for Store<A, R>
@@ -50,6 +52,7 @@ where
             services: self.services.clone(),
             snapshot_interval: self.snapshot_interval,
             projectors: self.projectors.clone(),
+            commit_ids: self.commit_ids.clone(),
         }
     }
 }
@@ -73,7 +76,20 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             services,
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             projectors: Vec::new(),
+            commit_ids: commit_id::default_generator(),
         }
+    }
+
+    /// Replaces the generator that stamps a commit ID on commits whose metadata carries neither
+    /// a command ID nor a commit ID. The default produces ULID-format IDs from the system clock;
+    /// inject one for deterministic IDs in tests or to follow an existing ID scheme.
+    #[must_use]
+    pub fn with_commit_id_generator(
+        mut self,
+        generator: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.commit_ids = Arc::new(generator);
+        self
     }
 
     /// Sets the number of events between snapshots. 0 disables snapshots.
@@ -263,7 +279,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         }
 
         // The engine stamps the commit ID once per commit; every event of this commit carries it.
-        let stamped = stamp_commit_id(metadata);
+        let stamped = stamp_commit_id(metadata, &*self.commit_ids);
         let serialized =
             serialize_events::<A>(&loaded.entity_id, loaded.sequence, &events, &stamped)?;
         let snapshot_due =
@@ -591,7 +607,7 @@ where
         }
         self.used = true;
 
-        let metadata = stamp_commit_id(metadata);
+        let metadata = stamp_commit_id(metadata, &*self.store.commit_ids);
 
         // A caller-stamped fence for a stream this transaction read is superseded by the
         // engine's own fence (or by the write), whichever order `fence` and `read` were called in.
@@ -678,18 +694,26 @@ where
     }
 }
 
-/// Stamps the engine's commit identity: the command ID when present, a caller-supplied commit ID
-/// otherwise, else a generated ULID.
-pub(crate) fn stamp_commit_id(metadata: &Metadata) -> Metadata {
+/// Stamps the engine's commit identity: the command ID when present and non-empty, a
+/// caller-supplied commit ID otherwise, else a generated ULID-format ID. An empty command ID is
+/// absent, as in Go's `CommitMetadata`, so both languages derive the same commit ID.
+pub(crate) fn stamp_commit_id(
+    metadata: &Metadata,
+    generate: &(dyn Fn() -> String + Send + Sync),
+) -> Metadata {
     let mut metadata = metadata.clone();
-    if let Some(command_id) = &metadata.command_id {
+    if let Some(command_id) = metadata
+        .command_id
+        .as_ref()
+        .filter(|command_id| !command_id.as_str().is_empty())
+    {
         metadata.commit_id = command_id.to_string();
 
         return metadata;
     }
 
     if metadata.commit_id.is_empty() {
-        metadata.commit_id = ulid::Ulid::new().to_string();
+        metadata.commit_id = generate();
     }
 
     metadata
@@ -931,5 +955,54 @@ mod tests {
         tx.append(&"second".into(), added(4)).unwrap();
         let committed = tx.commit(&metadata).await.unwrap();
         assert!(committed.iter().all(|e| e.metadata.commit_id == "cmd-9"));
+    }
+
+    #[test]
+    fn an_empty_command_id_is_absent_when_stamping_the_commit_id() {
+        let generated = || "GENERATED".to_owned();
+
+        let empty = Metadata::default().with_command_id("");
+        assert_eq!(stamp_commit_id(&empty, &generated).commit_id, "GENERATED");
+
+        let mut pinned = Metadata::default().with_command_id("");
+        pinned.commit_id = "caller-commit".to_owned();
+        assert_eq!(
+            stamp_commit_id(&pinned, &generated).commit_id,
+            "caller-commit"
+        );
+
+        // A non-empty command ID still wins over a caller-supplied commit ID.
+        let mut derived = Metadata::default().with_command_id("cmd-1");
+        derived.commit_id = "caller-commit".to_owned();
+        assert_eq!(stamp_commit_id(&derived, &generated).commit_id, "cmd-1");
+    }
+
+    #[tokio::test]
+    async fn an_injected_generator_stamps_every_stream_of_a_commit() {
+        let store = Store::<Ledger, _>::new(MemRepository::new(), ())
+            .with_snapshot_interval(0)
+            .with_commit_id_generator(|| "injected-commit".to_owned());
+
+        let mut tx = store.transaction();
+        tx.read(store.load("first").await.unwrap()).unwrap();
+        tx.read(store.load("second").await.unwrap()).unwrap();
+        tx.append(&"first".into(), added(1)).unwrap();
+        tx.append(&"second".into(), added(1)).unwrap();
+        // An empty command ID must not blank the commit ID.
+        let committed = tx
+            .commit(&Metadata::default().with_command_id(""))
+            .await
+            .unwrap();
+        assert!(
+            committed
+                .iter()
+                .all(|event| event.metadata.commit_id == "injected-commit")
+        );
+
+        let executed = store
+            .execute("third", Add(1), Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(executed.events[0].metadata.commit_id, "injected-commit");
     }
 }
