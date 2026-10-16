@@ -264,10 +264,18 @@ async fn dynamo_refuses_projector_only_transactions(repository: &DynamoRepositor
         )
         .build();
     let mut commit = photon_evt::TransactionCommit::new(Vec::new());
-    commit.operations = vec![view];
+    commit.operations = vec![view.clone()];
 
     let err = repository.commit_transaction(commit).await.unwrap_err();
 
+    assert!(
+        matches!(err, Error::ProjectorWithoutEvents { operations: 1 }),
+        "{err:?}"
+    );
+
+    // The single-stream path refuses the same shape.
+    let single = Commit::new("projector-only", Vec::new()).with_operations([view]);
+    let err = repository.commit(single).await.unwrap_err();
     assert!(
         matches!(err, Error::ProjectorWithoutEvents { operations: 1 }),
         "{err:?}"
@@ -662,6 +670,15 @@ async fn postgres_refuses_projector_only_transactions(repository: &PostgresRepos
 
     let err = repository.commit_transaction(commit).await.unwrap_err();
 
+    assert!(
+        matches!(err, Error::ProjectorWithoutEvents { operations: 1 }),
+        "refused before the statement ever runs: {err:?}"
+    );
+
+    // The single-stream path refuses the same shape.
+    let single = Commit::new("projector-only", Vec::new())
+        .with_operations([PgStatement::new("SELECT 1/0", Vec::new())]);
+    let err = repository.commit(single).await.unwrap_err();
     assert!(
         matches!(err, Error::ProjectorWithoutEvents { operations: 1 }),
         "refused before the statement ever runs: {err:?}"

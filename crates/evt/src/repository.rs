@@ -36,7 +36,7 @@ impl NewSnapshot {
 }
 
 /// Everything a repository writes atomically for one command. A commit with no events is a
-/// no-op: repositories ignore its snapshot and operations.
+/// no-op: repositories ignore its snapshot. Operations without an event are refused.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Commit<Op> {
@@ -129,12 +129,20 @@ impl<Op> Commit<Op> {
     /// checks only look at `entity_id` and the first event's sequence, loads reject streams with
     /// gaps, typed scans read each row's entity type, and DynamoDB does not store the event ID.
     ///
-    /// A commit with no events is valid whatever its snapshot and operations, because
-    /// repositories ignore them.
+    /// A commit with no events and no operations is a valid no-op, and repositories ignore its
+    /// snapshot. Operations without an event are refused with
+    /// [`Error::ProjectorWithoutEvents`]: views are projections of committed events, so a
+    /// projector operation with no backing event could never be rebuilt by replay (ADR-0012).
     pub fn validate(&self) -> Result<(), Error> {
         let invalid = |message: String| Err(Error::InvalidCommit(message));
 
         let Some(first) = self.events.first() else {
+            if !self.operations.is_empty() {
+                return Err(Error::ProjectorWithoutEvents {
+                    operations: self.operations.len(),
+                });
+            }
+
             return Ok(());
         };
 
@@ -721,6 +729,24 @@ mod tests {
         commit.normalize().unwrap();
 
         assert_eq!(commit.operations, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_single_stream_commit_with_operations_but_no_events_is_refused() {
+        let commit = Commit::new("a", Vec::new()).with_operations([1u8, 2]);
+        assert!(matches!(
+            commit.validate(),
+            Err(Error::ProjectorWithoutEvents { operations: 2 })
+        ));
+
+        // Without operations an eventless commit stays a no-op, snapshot or not.
+        assert!(Commit::<u8>::new("a", Vec::new()).validate().is_ok());
+        assert!(
+            Commit::<u8>::new("a", Vec::new())
+                .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"))
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
