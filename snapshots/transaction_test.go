@@ -24,6 +24,10 @@ type recordingRepository struct {
 	committed []evt.SerializedResult
 }
 
+// AtomicTransactions forwards the wrapped repository's capability, which embedding the interface
+// does not promote.
+func (r *recordingRepository) AtomicTransactions() {}
+
 func (r *recordingRepository) Commit(ctx context.Context, result evt.SerializedResult) error {
 	r.committed = append(r.committed, result)
 
@@ -339,3 +343,29 @@ func (foreignEvent) EntityType() evt.EntityType { return "foreign" }
 func (foreignEvent) EntityID() evt.EntityID     { return "tx-broken" }
 func (foreignEvent) Type() evt.EventType        { return "foreign:happened" }
 func (foreignEvent) Version() evt.EventVersion  { return 1 }
+
+// plainRepository hides every optional capability of the repository it wraps.
+type plainRepository struct{ evt.Repository }
+
+func TestTransaction_RefusesARepositoryWithoutTheTransactionCapability(t *testing.T) {
+	ctx := context.Background()
+	recording := &recordingRepository{Repository: mem.NewRepository()}
+	store := snapshots.NewStore(plainRepository{Repository: recording}, 0)
+
+	tx := store.Transaction()
+	err := tx.Read(ctx, test.NewEntity("tx-plain"), "tx-plain")
+
+	var unsupported *evt.TransactionsUnsupportedError
+	require.ErrorAs(t, err, &unsupported)
+	require.ErrorIs(t, err, evt.ErrTransactionsUnsupported)
+	require.Contains(t, unsupported.Repository, "plainRepository")
+	require.Empty(t, recording.committed, "nothing is dispatched to the repository")
+
+	// Commit fails closed on its own, too, for a transaction built without a read.
+	_, err = store.Transaction().Commit(ctx, newTestMetadata())
+	require.ErrorIs(t, err, evt.ErrTransactionsUnsupported)
+	require.Empty(t, recording.committed)
+
+	// The repositories this module ships declare the capability.
+	require.NoError(t, evt.RequireTransactions(mem.NewRepository()))
+}

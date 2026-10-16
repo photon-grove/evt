@@ -46,7 +46,13 @@ var (
 	_ evt.SnapshotStreamer   = (*Repository)(nil)
 	_ evt.EntityHeadStreamer = (*Repository)(nil)
 	_ evt.EntityHeadVisitor  = (*Repository)(nil)
+
+	_ evt.TransactionalRepository = (*Repository)(nil)
 )
+
+// AtomicTransactions declares that Commit writes every stream, snapshot, and fence of a result
+// all or nothing (evt.TransactionalRepository).
+func (Repository) AtomicTransactions() {}
 
 // Commit Events to memory. It does not reject reused sequences, but like the durable backends it
 // rejects a commit at or below the entity's snapshot, which compaction may have deleted below.

@@ -2,6 +2,8 @@ package evt
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
@@ -68,6 +70,9 @@ type Repository interface {
 	// and projector operation in one transaction (all or nothing), refuse an oversized commit
 	// with *CommitTooLargeError before any write (see PreflightCommit), and report a moved fence
 	// as *FenceConflictError.
+	//
+	// An implementation that honors all of this declares it by implementing
+	// TransactionalRepository; transaction APIs refuse one that does not.
 	Commit(ctx context.Context, result SerializedResult) error
 
 	// Commit a stream of Events using whatever batch size works best for the Repository.
@@ -131,4 +136,52 @@ type Repository interface {
 		filter StreamFilter,
 		applyEvent func(context.Context, SerializedEvent, Entity) (Entity, error),
 	) <-chan result.Result[Entity]
+}
+
+// TransactionalRepository is the explicit capability a Repository declares when it commits a
+// multi-stream SerializedResult atomically: Events for several streams, per-stream Snapshots, and
+// read Fences, all in one transaction (ADR 0004, C1/C2). The Repository method set did not change
+// in v0.9, so a repository written earlier still compiles but may ignore Snapshots and Fences or
+// write streams one by one. Code that sends such a result, such as snapshots.Store.Transaction,
+// refuses a repository that does not implement this interface with *TransactionsUnsupportedError
+// before dispatching anything. The in-memory, DynamoDB, and PostgreSQL repositories implement it.
+//
+// Implement it only when Commit honors the full contract documented on Repository.Commit.
+type TransactionalRepository interface {
+	Repository
+
+	// AtomicTransactions is a marker: implementing it asserts the capability above.
+	AtomicTransactions()
+}
+
+// RequireTransactions returns *TransactionsUnsupportedError unless repo implements
+// TransactionalRepository.
+func RequireTransactions(repo Repository) error {
+	if _, ok := repo.(TransactionalRepository); ok {
+		return nil
+	}
+
+	return &TransactionsUnsupportedError{Repository: fmt.Sprintf("%T", repo)}
+}
+
+// ErrTransactionsUnsupported matches a TransactionsUnsupportedError with errors.Is.
+var ErrTransactionsUnsupported = errors.New("repository does not support atomic multi-stream transactions")
+
+// TransactionsUnsupportedError refuses a multi-stream transaction, snapshot batch, or read fence
+// sent to a Repository that has not declared TransactionalRepository. Nothing was written.
+type TransactionsUnsupportedError struct {
+	// Repository is the refused repository's Go type.
+	Repository string
+}
+
+func (e *TransactionsUnsupportedError) Error() string {
+	return fmt.Sprintf(
+		"repository %s does not implement evt.TransactionalRepository; refusing a commit that needs atomic snapshots or fences",
+		e.Repository,
+	)
+}
+
+// Is makes errors.Is(err, ErrTransactionsUnsupported) match.
+func (e *TransactionsUnsupportedError) Is(target error) bool {
+	return target == ErrTransactionsUnsupported
 }

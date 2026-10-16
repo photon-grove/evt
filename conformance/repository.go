@@ -115,6 +115,11 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 	}
 
 	if opts.SupportsTransactions {
+		t.Run("DeclaresTransactionalRepository", func(t *testing.T) {
+			require.NoError(t, evt.RequireTransactions(newRepo()),
+				"a backend claiming transactions must implement evt.TransactionalRepository")
+		})
+
 		t.Run("MultiStreamCommit", func(t *testing.T) {
 			testMultiStreamCommit(t, newRepo())
 		})

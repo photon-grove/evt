@@ -118,11 +118,12 @@ type Repository struct {
 // Compile-time checks that the Repository satisfies the core contract and every optional capability
 // the framework detects by type assertion.
 var (
-	_ evt.Repository         = (*Repository)(nil)
-	_ evt.Compactor          = (*Repository)(nil)
-	_ evt.SnapshotStreamer   = (*Repository)(nil)
-	_ evt.EntityHeadStreamer = (*Repository)(nil)
-	_ evt.EntityHeadVisitor  = (*Repository)(nil)
+	_ evt.Repository              = (*Repository)(nil)
+	_ evt.TransactionalRepository = (*Repository)(nil)
+	_ evt.Compactor               = (*Repository)(nil)
+	_ evt.SnapshotStreamer        = (*Repository)(nil)
+	_ evt.EntityHeadStreamer      = (*Repository)(nil)
+	_ evt.EntityHeadVisitor       = (*Repository)(nil)
 )
 
 // Option configures a Repository at construction time.
@@ -441,6 +442,10 @@ func (repo *Repository) checkFences(ctx context.Context, tx pgx.Tx, fences []evt
 
 	return nil
 }
+
+// AtomicTransactions declares that Commit writes every stream, snapshot, and fence of a result in
+// one database transaction (evt.TransactionalRepository).
+func (repo *Repository) AtomicTransactions() {}
 
 // CommitStream commits each SerializedResult from the channel in its own transaction, collecting
 // per-result errors without aborting the stream. The batch size is one result, which keeps each

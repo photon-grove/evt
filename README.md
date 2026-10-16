@@ -187,6 +187,16 @@ stale read with no isolation guarantee, and ignoring a snapshot loses one the en
 durable. See the contract on `evt.Repository.Commit`; `evt.NormalizeCommit` and
 `evt.PreflightCommit` give a backend the shared validation and budget checks.
 
+Atomic multi-stream support is also an explicit capability. A repository declares it by
+implementing `evt.TransactionalRepository` (a marker method, `AtomicTransactions()`), and does so
+only once its `Commit` honors the full contract above. `snapshots.Store.Transaction` fails closed:
+`Read` and `Commit` refuse a repository without the capability with
+`*evt.TransactionsUnsupportedError` (`errors.Is(err, evt.ErrTransactionsUnsupported)`) before
+anything is loaded or written. The in-memory, DynamoDB, and PostgreSQL repositories declare it.
+To use transactions on a custom backend, make `Commit` atomic over every stream, snapshot, and
+fence, then add the marker method. Wrapping a repository in a decorator type hides the capability
+unless the wrapper declares it too.
+
 For example, a SQL backend with a separate events table can implement the method below.
 Here `queryEvents` is the backend's existing query-and-decode helper; it executes the supplied
 SQL and decodes event rows, not a full-stream replay:

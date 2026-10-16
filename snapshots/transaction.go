@@ -22,6 +22,10 @@ import (
 // stream passed to Read, and an Append to a stream that was not read. Errors that can leave the
 // staged state inconsistent consume it: a failed load in Read, and an event of the wrong entity
 // type or one the entity cannot apply in Append. Build a new Transaction after those.
+//
+// The store's repository must implement evt.TransactionalRepository. Read and Commit refuse one
+// that does not with *evt.TransactionsUnsupportedError (errors.Is evt.ErrTransactionsUnsupported)
+// before anything is loaded or written, and consume the Transaction.
 type Transaction struct {
 	store   *Store
 	streams map[evt.EntityID]*transactionStream
@@ -52,6 +56,11 @@ func (store *Store) Transaction() *Transaction {
 func (tx *Transaction) Read(ctx context.Context, entity evt.Entity, entityID evt.EntityID) error {
 	if tx.used {
 		return fmt.Errorf("snapshots: transaction is already consumed")
+	}
+	if err := evt.RequireTransactions(tx.store.repo); err != nil {
+		tx.used = true
+
+		return err
 	}
 	if entity == nil {
 		return fmt.Errorf("snapshots: transaction read of %s has a nil entity", entityID)
@@ -135,6 +144,12 @@ func (tx *Transaction) Commit(ctx context.Context, metadata evt.Metadata) ([]evt
 		return nil, fmt.Errorf("snapshots: transaction is already consumed")
 	}
 	tx.used = true
+
+	// Fail closed before dispatch: a repository that has not declared atomic transactions could
+	// drop the fences and snapshots this result carries, or write only some streams.
+	if err := evt.RequireTransactions(tx.store.repo); err != nil {
+		return nil, err
+	}
 
 	metadata = evt.CommitMetadata(metadata)
 

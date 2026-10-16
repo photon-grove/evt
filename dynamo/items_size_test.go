@@ -110,3 +110,28 @@ func TestCommit_PreflightSizesNonPutProjectorItems(t *testing.T) {
 		})
 	}
 }
+
+func TestCommit_NamesTheStreamWhoseItemFailed(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	repo := dynamo.NewRepository(fake, "events")
+
+	event := func(id string, sequence evt.EventSequence) evt.SerializedEvent {
+		return evt.SerializedEvent{
+			ID: evt.GetEventID(evt.EntityID(id), sequence), Sequence: sequence, Type: "t:created", Version: 1,
+			EntityID: evt.EntityID(id), EntityType: "t", Payload: []byte(`{}`),
+		}
+	}
+
+	// Stream "d" already holds sequence 1; "c" and "e" sort around it and are clean.
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("name-d", 1)}}))
+
+	err := repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{
+		event("name-c", 1), event("name-d", 1), event("name-e", 1),
+	}})
+
+	require.ErrorIs(t, err, dynamo.ErrSnapshotRaceCondition)
+	require.ErrorContains(t, err, "stream name-d")
+	require.NotContains(t, err.Error(), "name-c")
+	require.NotContains(t, err.Error(), "name-e")
+}

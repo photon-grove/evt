@@ -65,6 +65,10 @@ func (repo *Repository) Commit(
 	return repo.commitStreamItems(ctx, normalized, streamItems, layout)
 }
 
+// AtomicTransactions declares that Commit writes every stream, snapshot, and fence of a result in
+// one TransactWriteItems call (evt.TransactionalRepository).
+func (repo *Repository) AtomicTransactions() {}
+
 // commitLayout records where each kind of item sits in the built transaction, so a failed commit
 // is classified by the item that failed (the cancellation reason index).
 type commitLayout struct {
@@ -647,8 +651,10 @@ func (repo *Repository) classifyCommitFailure(
 	}
 
 	// A failed condition on a written stream's own items is an ordinary conflict.
-	if _, written := layout.streamIndexes[streamIndex]; written {
-		return wrapClassifiedError(ErrSnapshotRaceCondition)
+	if streamID, written := layout.streamIndexes[streamIndex]; written {
+		// Name the stream whose own item failed, not just the commit: a multi-stream commit can
+		// collide on any of its streams. errors.Is(err, ErrSnapshotRaceCondition) still matches.
+		return wrapClassifiedError(fmt.Errorf("stream %s: %w", streamID, ErrSnapshotRaceCondition))
 	}
 
 	// Projector items sit between the control items and the stream items.

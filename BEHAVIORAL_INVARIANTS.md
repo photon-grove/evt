@@ -239,6 +239,9 @@ error before any write and is never split.
 - The engine pins the write order bytewise by stream ID regardless of declaration order; each
   stream keeps its own ascending sequences and its own snapshot-put-or-floor-check suffix
 - Every event of the commit carries one `commitId` (see Metadata Structure)
+- Multi-stream transactions require a repository that declares `evt.TransactionalRepository`;
+  `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
+  before dispatching anything
 - A commit that carries projector operations but writes no event is refused before any write
   (`ProjectorOnlyCommitError` / `Error::ProjectorWithoutEvents`): views are projections of
   committed events (ADR-0012). An empty command ID is treated as absent when deriving the commit ID
