@@ -177,6 +177,13 @@ or multi-stream, is checked against the shared 100-item / 3.8 MB / 380 KB budget
 `*evt.CommitTooLargeError` before any write, on every backend. The exact contract is specified
 in the [storage format](docs/spec/storage-format.md#writes).
 
+A custom `Repository` written before v0.9 compiles unchanged but now receives
+`SerializedResult.Snapshots` and `.Fences`. An implementation that cannot honor them atomically
+**must return an error** rather than ignore them: ignoring a fence commits a decision made on a
+stale read with no isolation guarantee, and ignoring a snapshot loses one the engine believes is
+durable. See the contract on `evt.Repository.Commit`; `evt.NormalizeCommit` and
+`evt.PreflightCommit` give a backend the shared validation and budget checks.
+
 For example, a SQL backend with a separate events table can implement the method below.
 Here `queryEvents` is the backend's existing query-and-decode helper; it executes the supplied
 SQL and decodes event rows, not a full-stream replay:

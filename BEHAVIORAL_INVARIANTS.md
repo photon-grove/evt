@@ -248,9 +248,12 @@ error before any write and is never split.
 - A read-only stream observed during a transaction is fenced with a `ConditionCheck` on
   `(pk, sk = head + 1)` plus a mandatory snapshot companion on `(pk, sk = 0)`, so a compaction
   that deletes the checked slot (the append → snapshot → compact ABA) still fails a stale fence
-- A fence conflict fails the whole commit and surfaces as `*FenceConflictError` naming the fenced
-  stream; it unwraps to a conflict, so an engine-filled fence is retryable after a reload while a
-  caller-stamped one is a stale-fence rejection
+- A fence conflict fails the whole commit and surfaces as `*FenceConflictError` carrying the
+  fenced stream ID, its fenced head, and the fence's provenance — never a transaction item
+  index, which is internal and differs by backend. It unwraps to a conflict. An engine-filled
+  fence conflict is classified transient (`policy.Classify`, so `policy.ExecuteWithRetry`
+  retries it exactly like an event-put conflict); a caller-stamped one is a stale-fence
+  rejection and is not retried
 - Fences for entity types in the feature manifest's durable `retention` set are refused with
   `*RetentionConflictError` — the refusal consults the manifest, so it binds writers that
   configured no retention themselves
