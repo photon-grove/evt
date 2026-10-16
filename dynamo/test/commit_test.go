@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/stretchr/testify/mock"
@@ -101,6 +102,16 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 
 	expected := []types.TransactWriteItem{
 		{
+			ConditionCheck: &types.ConditionCheck{
+				TableName: &s.repo.EventsTable,
+				Key: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: "test-id"},
+					"sk": &types.AttributeValueMemberN{Value: "1"},
+				},
+				ConditionExpression: aws.String("attribute_exists(sk)"),
+			},
+		},
+		{
 			Put: &types.Put{
 				TableName: &s.repo.EventsTable,
 				Item: map[string]types.AttributeValue{
@@ -131,6 +142,14 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 		},
 	}
 
+	// The commit continues from an existing head event, which the continuation check pins.
+	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.GetItemOutput{
+		Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "test-id"},
+			"sk": &types.AttributeValueMemberN{Value: "1"},
+		},
+	}, nil)
+
 	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{absentMarkerCheck(s.repo.EventsTable)}, expected...)}
 
 	// Return an empty output object, because the result isn't used
@@ -154,6 +173,14 @@ func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
 		EntityType: "test", EntityID: "test-id", Sequence: 7, Type: "test-event", Version: 1,
 		Payload: []byte{}, Metadata: evt.Metadata{Region: "us-east-1"},
 	}}
+
+	// The commit continues from an existing head event, which the continuation check pins.
+	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.GetItemOutput{
+		Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "test-id"},
+			"sk": &types.AttributeValueMemberN{Value: "6"},
+		},
+	}, nil)
 
 	var input *dynamodb.TransactWriteItemsInput
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
@@ -228,7 +255,8 @@ func (s *RepositorySuite) Test_CommitStream_OneFloorCheckPerStream() {
 			if item.ConditionCheck != nil {
 				pk, ok := item.ConditionCheck.Key["pk"].(*types.AttributeValueMemberS)
 				require.True(s.T(), ok)
-				if pk.Value != "SYSTEM#FEATURES" {
+				// Floor checks only: the marker and continuation checks carry no :first.
+				if pk.Value != "SYSTEM#FEATURES" && aws.ToString(item.ConditionCheck.ConditionExpression) != dynamo.ContinuationCondition {
 					checks = append(checks, item.ConditionCheck)
 				}
 			}
@@ -236,6 +264,14 @@ func (s *RepositorySuite) Test_CommitStream_OneFloorCheckPerStream() {
 
 		return true
 	})
+
+	// entity-1 continues from an existing head event (sequence 3); entity-2 starts at 1.
+	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.GetItemOutput{
+		Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "entity-1"},
+			"sk": &types.AttributeValueMemberN{Value: "3"},
+		},
+	}, nil).Once()
 
 	output := new(dynamodb.TransactWriteItemsOutput)
 	s.client.On("TransactWriteItems", mock.Anything, capture, mock.Anything).Return(output, nil).Once()

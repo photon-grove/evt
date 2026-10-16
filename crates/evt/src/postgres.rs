@@ -419,6 +419,46 @@ impl PostgresRepository {
     }
 }
 
+impl PostgresRepository {
+    /// Asserts, under the stream's advisory lock, that a commit whose first sequence is above 1
+    /// continues from the stored head. The head is the larger of the stream's highest event and
+    /// its snapshot's event sequence, because compaction can delete every covered event. A first
+    /// sequence at or below the head is left to the primary key and the floor check, which report
+    /// it as an ordinary conflict.
+    async fn check_continuation(
+        &self,
+        tx: &deadpool_postgres::Transaction<'_>,
+        entity_id: &EntityId,
+        first: EventSequence,
+    ) -> Result<(), Error> {
+        if first <= EventSequence(1) {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "SELECT GREATEST(
+                 COALESCE((SELECT MAX(sequence) FROM {} WHERE entity_id = $1), 0),
+                 COALESCE((SELECT MAX(event_sequence) FROM {} WHERE entity_id = $1), 0))",
+            self.events_table, self.snapshots_table
+        );
+        let row = tx
+            .query_one(&sql, &[&entity_id.as_str()])
+            .await
+            .map_err(statement_error)?;
+        let head: i64 = row.get(0);
+
+        if first.0 > head + 1 {
+            return Err(Error::SequenceGap {
+                entity_id: entity_id.clone(),
+                after: EventSequence(head),
+                found: first,
+            });
+        }
+
+        Ok(())
+    }
+}
+
 impl Repository for PostgresRepository {
     type Operation = PgStatement;
 
@@ -457,6 +497,12 @@ impl Repository for PostgresRepository {
             .map_err(statement_error)?;
         let manifest = self.read_manifest_in(&tx).await?;
         self.check_manifest(manifest.as_ref())?;
+
+        // Under the stream's advisory lock the commit must continue exactly from the stored head.
+        if let Some(first) = commit.events.first() {
+            self.check_continuation(&tx, &commit.entity_id, first.sequence)
+                .await?;
+        }
 
         let insert = format!(
             "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
@@ -584,6 +630,15 @@ impl Repository for PostgresRepository {
         // fenced slots without leaving a successor snapshot. The refusal consults the manifest in
         // this transaction, not this instance's configuration.
         commit.check_retention(manifest.as_ref(), |_| false)?;
+
+        // Under the streams' advisory locks every written stream must continue exactly from its
+        // stored head; a gap is refused before anything is inserted.
+        for stream in &commit.streams {
+            if let Some(first) = stream.events.first() {
+                self.check_continuation(&tx, &stream.entity_id, first.sequence)
+                    .await?;
+            }
+        }
 
         let insert = format!(
             "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)

@@ -284,7 +284,7 @@ func TestUpdateSnapshotSequence_NilSnapshot(t *testing.T) {
 	eventContext := evt.Context{
 		Entity:          setup.entity,
 		EntityID:        setup.entityID,
-		CurrentSequence: intPtr(1),
+		CurrentSequence: intPtr(0),
 		CurrentSnapshot: nil,
 	}
 

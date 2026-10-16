@@ -63,6 +63,26 @@ impl Stream {
     }
 }
 
+/// Refuses a first sequence that skips past the stored head. The head is the stream's highest
+/// event or, once compaction deleted every covered event, its snapshot's event sequence. A first
+/// sequence at or below the head is left to the event and floor checks, which report it as an
+/// ordinary conflict.
+fn check_continuation(
+    entity_id: &EntityId,
+    head: EventSequence,
+    first: EventSequence,
+) -> Result<(), Error> {
+    if first > head.next() {
+        return Err(Error::SequenceGap {
+            entity_id: entity_id.clone(),
+            after: head,
+            found: first,
+        });
+    }
+
+    Ok(())
+}
+
 impl MemRepository {
     /// Creates an empty repository.
     pub fn new() -> Self {
@@ -125,6 +145,16 @@ impl Repository for MemRepository {
         self.check_manifest(stored_manifest.as_ref())?;
 
         let mut streams = self.lock();
+
+        // The stream must continue from its stored head; a gap is refused before anything is
+        // created or written.
+        if let Some(first) = commit.events.first() {
+            let head = streams
+                .get(&commit.entity_id)
+                .map_or(EventSequence::ZERO, Stream::head);
+            check_continuation(&commit.entity_id, head, first.sequence)?;
+        }
+
         let stream = streams.entry(commit.entity_id.clone()).or_default();
 
         for (index, event) in commit.events.iter().enumerate() {
@@ -215,6 +245,10 @@ impl Repository for MemRepository {
         let absent = Stream::default();
         for stream in &commit.streams {
             let stored = streams.get(&stream.entity_id).unwrap_or(&absent);
+
+            if let Some(first) = stream.events.first() {
+                check_continuation(&stream.entity_id, stored.head(), first.sequence)?;
+            }
 
             for (index, event) in stream.events.iter().enumerate() {
                 let reused = stream.events[..index]

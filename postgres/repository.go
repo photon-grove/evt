@@ -354,6 +354,12 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 			return err
 		}
 
+		// Under the streams' advisory locks, every written stream must continue exactly from its
+		// stored head: a gap is refused before anything is inserted.
+		if err := repo.checkContinuations(ctx, tx, normalized.Events); err != nil {
+			return err
+		}
+
 		if err := repo.insertEvents(ctx, tx, normalized.Events); err != nil {
 			return err
 		}
@@ -368,6 +374,47 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 
 		return repo.checkFences(ctx, tx, normalized.Fences)
 	})
+}
+
+// checkContinuations asserts, for each written stream whose first sequence is above 1, that the
+// stored head is the sequence just before it. The head is the larger of the stream's highest event
+// and its snapshot's event sequence, because compaction can delete every covered event. The
+// per-entity advisory lock holds the stream steady through the assertion, so no writer can move
+// the head between this check and the insert. A first sequence at or below the head is left to the
+// primary key and the floor check, which report it as an ordinary conflict.
+func (repo *Repository) checkContinuations(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
+	seen := make(map[evt.EntityID]bool)
+
+	for _, event := range events {
+		if seen[event.EntityID] {
+			continue
+		}
+		seen[event.EntityID] = true
+
+		if event.Sequence <= 1 {
+			continue
+		}
+
+		var head int64
+		err := tx.QueryRow(ctx, fmt.Sprintf(
+			`SELECT GREATEST(
+			         COALESCE((SELECT MAX(sequence) FROM %s WHERE entity_id = $1), 0),
+			         COALESCE((SELECT MAX(event_sequence) FROM %s WHERE entity_id = $1), 0))`,
+			repo.eventsTable, repo.snapshotsTable,
+		), string(event.EntityID)).Scan(&head)
+		if err != nil {
+			return fmt.Errorf("postgres: check continuation %s: %w", event.EntityID, err)
+		}
+
+		if int64(event.Sequence) > head+1 {
+			return &policy.ClassifiedError{
+				Class: policy.ClassTransient,
+				Err:   &evt.SequenceGapError{EntityID: event.EntityID, After: evt.EventSequence(head), Found: event.Sequence},
+			}
+		}
+	}
+
+	return nil
 }
 
 // lockTransactionEntities takes the advisory lock for every stream a transactional commit

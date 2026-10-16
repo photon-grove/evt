@@ -139,6 +139,25 @@ func conditionHolds(
 	case dynamo.FloorCondition:
 		return compareIfExists(existing, "eventSeq", values, ":first", func(have, first int64) bool { return have < first })
 
+	case dynamo.ContinuationCondition:
+		return existing != nil, nil
+
+	case dynamo.PinnedFloorCondition:
+		if _, exists := existing["eventSeq"]; !exists {
+			return false, nil
+		}
+		return compareIfExists(existing, "eventSeq", values, ":prev", func(have, want int64) bool { return have == want })
+
+	case dynamo.PinnedNextSnapshotCondition:
+		if _, exists := existing["seq"]; !exists {
+			return false, nil
+		}
+		sameSnapshot, err := compareIfExists(existing, "seq", values, ":seq", func(have, want int64) bool { return have == want })
+		if err != nil || !sameSnapshot {
+			return false, err
+		}
+		return compareIfExists(existing, "eventSeq", values, ":prev", func(have, want int64) bool { return have == want })
+
 	case dynamo.FirstSnapshotCondition:
 		_, exists := existing["seq"]
 		return !exists, nil

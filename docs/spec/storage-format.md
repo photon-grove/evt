@@ -211,8 +211,11 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
    every backend.
 4. The written streams, in ascending entity-ID byte order. Each stream is one contiguous group,
    in this order:
-   1. one put per event, in ascending sequence;
-   2. then either the stream's snapshot put or, when the commit writes no snapshot for it, the
+   1. the **continuation check** (`ConditionCheck` on `(pk, sk = first - 1)` with
+      `attribute_exists(sk)`), present when the stream's first new sequence is above 1 and the
+      stream's head event exists (see [Continuity](#continuity) for the compacted-head case);
+   2. one put per event, in ascending sequence;
+   3. then either the stream's snapshot put or, when the commit writes no snapshot for it, the
       floor check on the stream's snapshot item (the group's last action).
 
    The layout is **interleaved by stream**, not two phases: stream A's snapshot put or floor
@@ -239,26 +242,28 @@ a snapshot) and fences the read-only streams `z` and `m` sends, with no outcome 
 check:
 
 ```text
-1. ConditionCheck (SYSTEM#FEATURES, sk = 0)
-2. Put            (a, sk = n)         event puts for a, ascending sequence
-3. Put            (a, sk = 0)         a's snapshot put (carries the floor condition)
-4. Put            (b, sk = k)         event puts for b, ascending sequence
-5. ConditionCheck (b, sk = 0)         b's floor check (b writes no snapshot)
-6. ConditionCheck (m, sk = head + 1)  m's slot check
-7. ConditionCheck (m, sk = 0)         m's snapshot companion
-8. ConditionCheck (z, sk = head + 1)  z's slot check
-9. ConditionCheck (z, sk = 0)         z's snapshot companion
+1.  ConditionCheck (SYSTEM#FEATURES, sk = 0)
+2.  ConditionCheck (a, sk = n - 1)      a's continuation check (a's first new sequence is n > 1)
+3.  Put            (a, sk = n)          event puts for a, ascending sequence
+4.  Put            (a, sk = 0)          a's snapshot put (carries the floor condition)
+5.  Put            (b, sk = 1)          event puts for b (b is new: no continuation check)
+6.  ConditionCheck (b, sk = 0)          b's floor check (b writes no snapshot)
+7.  ConditionCheck (m, sk = head + 1)   m's slot check
+8.  ConditionCheck (m, sk = 0)          m's snapshot companion
+9.  ConditionCheck (z, sk = head + 1)   z's slot check
+10. ConditionCheck (z, sk = 0)          z's snapshot companion
 ```
 
 **Pre-v0.9 capacity:** the floor check counts toward the 100 actions and is billed as a write,
 so a commit without a snapshot costs one more write unit than its events and projector puts,
 and holds at most 99 of them. `CommitStream` adds one check per entity in each batch. This is
-not the v0.9 capacity: every v0.9 commit also carries the feature-marker check, leaving 98
-event/projector operations for a single-stream commit, with or without a snapshot (the snapshot
-put replaces the floor check). The budget counts only the actions a commit actually emits. The
+not the v0.9 capacity: every v0.9 commit also carries the feature-marker check, and a commit that
+appends to an existing stream (first sequence above 1) carries a continuation check. A
+single-stream commit therefore holds at most **98** event/projector operations when it creates
+its stream and **97** when it appends to one, with or without a snapshot (the snapshot put
+replaces the floor check). The budget counts only the actions a commit actually emits. The
 rebuild-lock check (C10) is not emitted yet, so it is not budgeted; the change that starts
-emitting it adds it to the budget, and a basic single-stream commit with no read fences or
-outcome then leaves 97.
+emitting it adds it to the budget, and the two numbers then drop to 97 and 96.
 
 **Multi-stream commits (v0.9, C1).** A commit may append to any number of streams. Each written
 stream keeps its existing protections — `attribute_not_exists(sk)` on every event put and the
@@ -269,6 +274,7 @@ The item budget is the same for the single-aggregate shortcut and a multi-stream
 
 ```text
 items = Σ over written streams (events_s + 1)     event puts + snapshot put or floor check
+      + written streams with first sequence > 1   continuation check
       + fenced read-only streams × 2              slot check + snapshot companion
       + 1                                         outcome put, when outcomes are enabled
       + 1                                         feature-marker check, always in v0.9 stores
@@ -361,10 +367,39 @@ Both implementations reject a commit whose sequences are not contiguous for each
 more than the last), or start below 1, before writing anything. Sequence 0 is the DynamoDB snapshot
 slot. Rust also rejects an event whose ID is not `{entityId}:{sequence}`, because DynamoDB does not
 store the ID and rebuilds it from the key on read. The floor check reads the first event and the snapshot
-records the last, so both depend on that order, and loads reject a stream with a gap. Repositories
-do not check that a commit's first sequence follows the stored head: DynamoDB cannot express it in
-one transaction once compaction has deleted the previous event. Stores always continue from the head
-they loaded.
+records the last, so both depend on that order, and loads reject a stream with a gap. Every backend
+also enforces that a written stream **continues from its stored head** (next section).
+
+#### Continuity
+
+A commit's first sequence for a stream must be the stream's stored head plus one, so no sequence is
+ever skipped. The head is the stream's highest event or, once compaction has deleted every event a
+snapshot covers, the snapshot's `eventSeq`. A first sequence above head plus one, including any
+first sequence above 1 on a stream with no events, is refused before any write with a typed
+sequence-gap error (`SequenceGapError` in Go, `Error::SequenceGap` in Rust), which is a conflict
+(reload and retry). A first sequence at or below the head is not a gap; the event put and floor
+check report it as an ordinary conflict.
+
+- **DynamoDB.** For each written stream whose first sequence is above 1 the repository reads, strongly
+  consistent, the event at `first - 1`. If it exists, the group carries the continuation check
+  (`attribute_exists(sk)` on `(pk, first - 1)`), which together with the event put's
+  `attribute_not_exists(sk)` makes the append atomic: a failed check is a conflict for that stream.
+  **Compaction can delete the head event itself** (`CompactBelow(through)` deletes `[1, through]`
+  and `through` may equal the snapshot's `eventSeq`), so an existence check alone would refuse a
+  valid append to a compacted stream. When the event is missing the repository reads the snapshot:
+  if its `eventSeq` equals `first - 1` the snapshot is the head, no continuation check is emitted,
+  and the stream's floor check (or snapshot put) uses the pinned condition `eventSeq = :prev`
+  (`seq = :seq AND eventSeq = :prev` for a later snapshot put) instead of the floor condition;
+  otherwise the commit is a gap. Whatever was observed is pinned by conditions in the transaction, so
+  a head that moves, or an event that vanishes to compaction, between the read and the write fails
+  the transaction as a conflict.
+- **PostgreSQL.** Under the per-entity advisory locks the commit asserts that the larger of the
+  stream's highest event sequence and its snapshot's `event_sequence` is at least `first - 1`.
+- **In-memory.** The same assertion, directly.
+
+The continuation check is budgeted for every written stream whose first sequence is above 1, also on
+the pinned-snapshot path that emits no such action, so `CommitTooLarge` fires identically on every
+backend.
 
 A transaction cancelled with a `ConditionalCheckFailed` reason on an event put, the floor check, or
 the snapshot put is an optimistic-concurrency conflict: another writer committed the same sequence,
@@ -1613,6 +1648,9 @@ never rewritten. A failed upcast or decode fails the load.
 - On DynamoDB, the snapshot read and the key query are strongly consistent even when the repository
   is configured for eventually consistent reads, so compaction cannot miss recent events.
 - A compacted stream must be loaded or rebuilt from its snapshot, never by replaying from sequence 1.
+- Compaction may delete the stream's head event (when `through` equals the snapshot's
+  `eventSequence`). The snapshot's `eventSequence` is then the stream's head, and commits continue
+  from it ([Continuity](#continuity)).
 - A commit whose first event is at or below the snapshot's `eventSequence` is a conflict in both
   backends (see the floor checks above), so a writer that loaded before compaction cannot recreate
   compacted events.

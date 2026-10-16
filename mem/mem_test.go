@@ -30,10 +30,14 @@ func Test_Repository_GetRecentEvents_OutOfOrder(t *testing.T) {
 	ctx := context.Background()
 	repo := NewRepository()
 
+	// Commits continue from the stored head, so store the events in a scrambled order directly:
+	// GetRecentEvents must sort whatever order a backend holds them in.
+	memRepo, ok := repo.(*Repository)
+	require.True(t, ok)
 	for _, sequence := range []evt.EventSequence{3, 1, 4, 2} {
-		require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{
-			{EntityID: "account-1", Sequence: sequence},
-		}}))
+		memRepo.events["account-1"] = append(memRepo.events["account-1"], evt.SerializedEvent{
+			EntityID: "account-1", Sequence: sequence,
+		})
 	}
 
 	for _, tc := range []struct {

@@ -290,6 +290,10 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             mixed_type_transaction(repo).await,
         );
         record(
+            "a commit must continue from the stored head without a sequence gap",
+            sequence_gaps(repo).await,
+        );
+        record(
             "a multi-stream commit is all-or-nothing",
             multi_stream_atomicity(repo).await,
         );
@@ -1128,6 +1132,70 @@ async fn mixed_type_transaction<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+async fn sequence_gaps<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let gap = |result: Result<(), Error>, id: &EntityId, after: i64, found: i64| match result {
+        Err(Error::SequenceGap {
+            entity_id,
+            after: stored,
+            found: first,
+        }) if entity_id == *id
+            && stored == EventSequence(after)
+            && first == EventSequence(found) =>
+        {
+            Ok(())
+        }
+        other => Err(Failure(format!(
+            "want a sequence gap on {id} after {after} found {found}, got {other:?}"
+        ))),
+    };
+
+    // A first event above sequence 1 on a stream with no events is a gap.
+    let new = Stream::new(&ns, "new", "ledger");
+    gap(
+        new.commit(repo, new.events(3..=3), None).await,
+        &new.id,
+        0,
+        3,
+    )?;
+    ensure!(
+        repo.events(&new.id).await?.is_empty(),
+        "a refused gap writes nothing"
+    );
+
+    // Skipping a sequence on an existing stream is a gap; continuing from the head is not.
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+    a.commit(repo, a.events(1..=1), None).await?;
+    gap(a.commit(repo, a.events(3..=3), None).await, &a.id, 1, 3)?;
+
+    // One stream of a multi-stream commit with a gap fails the whole commit.
+    let mixed = TransactionCommit::new(vec![write(&b, 1..=1), write(&a, 3..=3)]);
+    gap(repo.commit_transaction(mixed).await, &a.id, 1, 3)?;
+    ensure!(
+        repo.events(&b.id).await?.is_empty(),
+        "the clean stream of the failed commit is untouched"
+    );
+
+    a.commit(repo, a.events(2..=2), None).await?;
+
+    // Compaction can delete every event a snapshot covers, including the head: the snapshot's
+    // event sequence is then the head, so the stream still continues from it and still refuses a
+    // gap.
+    let c = Stream::new(&ns, "c", "ledger");
+    c.commit(repo, c.events(1..=3), Some(c.new_snapshot(1, "{}")))
+        .await?;
+    ensure_eq!(
+        repo.compact_below(&c.id, EventSequence(3)).await?,
+        3,
+        "the head event is compacted away"
+    );
+    gap(c.commit(repo, c.events(5..=5), None).await, &c.id, 3, 5)?;
+    c.commit(repo, c.events(4..=4), None).await?;
+
+    Ok(())
+}
+
 async fn multi_stream_atomicity<R: Repository>(repo: &R) -> CaseResult {
     let ns = namespace();
     let a = Stream::new(&ns, "a", "ledger");
@@ -1248,6 +1316,22 @@ async fn read_fences<R: Repository>(repo: &R) -> CaseResult {
 
 async fn commit_too_large<R: Repository>(repo: &R) -> CaseResult {
     let stream = Stream::new(&namespace(), "large", "ledger");
+
+    // Appending to an existing stream adds a continuation check on its head event, so the marker
+    // check, that check, 97 event puts, and the floor check fill the 100 actions exactly.
+    let grows = Stream::new(&namespace(), "grows", "ledger");
+    grows.commit(repo, grows.events(1..=1), None).await?;
+    let result = grows.commit(repo, grows.events(2..=99), None).await;
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
+        "98 appended events are one action too many: {result:?}"
+    );
+    grows.commit(repo, grows.events(2..=98), None).await?;
+    ensure_eq!(
+        repo.events(&grows.id).await?.len(),
+        98,
+        "97 appended events fit"
+    );
 
     // The feature-marker check, 98 event puts, and the floor check are exactly 100 actions, so a
     // 98-event commit fits on every backend. Only emitted actions count against the budget.

@@ -239,6 +239,11 @@ error before any write and is never split.
 - The engine pins the write order bytewise by stream ID regardless of declaration order; each
   stream keeps its own ascending sequences and its own snapshot-put-or-floor-check suffix
 - Every event of the commit carries one `commitId` (see Metadata Structure)
+- Each written stream continues exactly from its stored head (the larger of its highest event and
+  its snapshot's event sequence): a first sequence that skips ahead is refused with
+  `*SequenceGapError` / `Error::SequenceGap` before any write, and on DynamoDB the observed head is
+  pinned in the transaction (a continuation check on the head event, or the snapshot's `eventSeq`
+  once compaction deleted it)
 - Multi-stream transactions require a repository that declares `evt.TransactionalRepository`;
   `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
   before dispatching anything

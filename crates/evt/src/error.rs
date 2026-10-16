@@ -120,6 +120,15 @@ pub enum Error {
         operations: usize,
     },
 
+    /// An append named a different projector set than the one already fixed for the stream by its
+    /// first projector-bearing append. The stream's operations are derived with one set, so the
+    /// append was refused and nothing changed.
+    #[error("stream {entity_id} already has a different projector set in this transaction")]
+    ProjectorSetConflict {
+        /// The stream whose projector set conflicts.
+        entity_id: EntityId,
+    },
+
     /// A transaction's append failed after it had already changed a handle's aggregate, leaving
     /// the handle ahead of the staged events. A half-applied handle can never reach a commit, so
     /// every later append and the commit are refused. Discard the transaction and build a new one.

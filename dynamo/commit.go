@@ -1,11 +1,14 @@
 package dynamo
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -64,7 +67,14 @@ func (repo *Repository) Commit(
 		}
 	}
 
-	streamItems, layout, err := repo.buildStreamItems(normalized)
+	// Each written stream must continue exactly from its stored head: a gap is refused here, and
+	// what was observed is pinned in the transaction (see observeContinuations).
+	pins, err := repo.observeContinuations(ctx, normalized.Events)
+	if err != nil {
+		return err
+	}
+
+	streamItems, layout, err := repo.buildStreamItems(normalized, pins)
 	if err != nil {
 		return err
 	}
@@ -123,7 +133,13 @@ func checkContiguous(events []evt.SerializedEvent) error {
 
 // buildFloorChecks returns one ConditionCheck on each entity's snapshot item (sk = 0) that the
 // commit starts above the snapshot's eventSeq.
-func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.TransactWriteItem {
+//
+// A stream pinned through its snapshot (the head event was compacted away) carries the pinned floor
+// instead: its snapshot's eventSeq must still equal the sequence before the commit's first.
+func (repo *Repository) buildFloorChecks(
+	events []evt.SerializedEvent,
+	pins map[evt.EntityID]continuation,
+) []types.TransactWriteItem {
 	first := make(map[evt.EntityID]evt.EventSequence)
 	order := make([]evt.EntityID, 0, 1)
 
@@ -139,7 +155,7 @@ func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.T
 
 	checks := make([]types.TransactWriteItem, 0, len(order))
 	for _, entityID := range order {
-		checks = append(checks, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+		condition := &types.ConditionCheck{
 			TableName: &repo.EventsTable,
 			Key: map[string]types.AttributeValue{
 				"pk": &types.AttributeValueMemberS{Value: string(entityID)},
@@ -149,18 +165,29 @@ func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.T
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(first[entityID]), 10)},
 			},
-		}})
+		}
+
+		if pin, pinned := pins[entityID]; pinned && pin.viaSnapshot {
+			condition.ConditionExpression = aws.String(PinnedFloorCondition)
+			condition.ExpressionAttributeValues = map[string]types.AttributeValue{
+				":prev": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(pin.previous), 10)},
+			}
+		}
+
+		checks = append(checks, types.TransactWriteItem{ConditionCheck: condition})
 	}
 
 	return checks
 }
 
 // buildStreamItems builds the transaction items for every written stream and every read fence,
-// in the pinned order: per written stream in bytewise stream-ID order its event puts (ascending
-// sequence) followed by its snapshot put or floor check; then per fenced read-only stream its
-// slot check and snapshot companion. The layout records each item's index for classification.
+// in the pinned order: per written stream in bytewise stream-ID order its continuation check (when
+// its first sequence is above 1 and the head event exists), its event puts (ascending sequence),
+// then its snapshot put or floor check; then per fenced read-only stream its slot check and
+// snapshot companion. The layout records each item's index for classification.
 func (repo *Repository) buildStreamItems(
 	result evt.SerializedResult,
+	pins map[evt.EntityID]continuation,
 ) ([]types.TransactWriteItem, commitLayout, error) {
 	layout := commitLayout{
 		streamIndexes: make(map[int]evt.EntityID),
@@ -185,6 +212,11 @@ func (repo *Repository) buildStreamItems(
 		}
 		stream := result.Events[position:end]
 
+		if pin, pinned := pins[streamID]; pinned && !pin.viaSnapshot {
+			layout.streamIndexes[len(items)] = streamID
+			items = append(items, repo.buildContinuationCheck(streamID, pin.previous))
+		}
+
 		puts, _, err := repo.buildEventPutTransactions(stream)
 		if err != nil {
 			return nil, layout, err
@@ -195,14 +227,14 @@ func (repo *Repository) buildStreamItems(
 		}
 
 		if snapshot, ok := snapshotByStream[streamID]; ok {
-			snapshotPut, err := repo.buildSnapshotPut(stream, snapshot)
+			snapshotPut, err := repo.buildSnapshotPut(stream, snapshot, pins[streamID])
 			if err != nil {
 				return nil, layout, err
 			}
 			layout.streamIndexes[len(items)] = streamID
 			items = append(items, snapshotPut)
 		} else {
-			floor := repo.buildFloorChecks(stream)
+			floor := repo.buildFloorChecks(stream, pins)
 			layout.streamIndexes[len(items)] = streamID
 			items = append(items, floor...)
 		}
@@ -261,6 +293,7 @@ func (repo *Repository) buildFenceChecks(fence evt.ReadFence) (types.TransactWri
 func (repo *Repository) buildSnapshotPut(
 	stream []evt.SerializedEvent,
 	snapshot evt.SerializedSnapshot,
+	pin continuation,
 ) (types.TransactWriteItem, error) {
 	item, err := repo.marshalMap(Snapshot{
 		PK:            snapshot.EntityID,
@@ -287,6 +320,14 @@ func (repo *Repository) buildSnapshotPut(
 		put.ExpressionAttributeValues = map[string]types.AttributeValue{
 			":seq":   &types.AttributeValueMemberN{Value: strconv.Itoa(int(expected))},
 			":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(stream[0].Sequence), 10)},
+		}
+
+		if pin.viaSnapshot {
+			put.ConditionExpression = aws.String(PinnedNextSnapshotCondition)
+			put.ExpressionAttributeValues = map[string]types.AttributeValue{
+				":seq":  &types.AttributeValueMemberN{Value: strconv.Itoa(int(expected))},
+				":prev": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(pin.previous), 10)},
+			}
 		}
 	}
 
@@ -327,12 +368,45 @@ func (repo *Repository) CommitStream(
 			return
 		}
 
-		items := append(batch, repo.buildFloorChecks(batchEvents)...)
+		pending, pendingEvents := batch, batchEvents
+		batch, batchEvents = nil, nil
+
+		// The batch's events for one entity must continue without a gap, and each entity must
+		// continue exactly from its stored head, pinned like Commit does.
+		ordered := slices.Clone(pendingEvents)
+		slices.SortStableFunc(ordered, func(a, b evt.SerializedEvent) int {
+			if a.EntityID != b.EntityID {
+				return strings.Compare(string(a.EntityID), string(b.EntityID))
+			}
+
+			return cmp.Compare(a.Sequence, b.Sequence)
+		})
+		if err := checkContiguous(ordered); err != nil {
+			errs = append(errs, err)
+
+			return
+		}
+
+		pins, err := repo.observeContinuations(ctx, pendingEvents)
+		if err != nil {
+			errs = append(errs, err)
+
+			return
+		}
+
+		order, _ := firstSequences(pendingEvents)
+		items := make([]types.TransactWriteItem, 0, len(pending)+2*len(order))
+		for _, entityID := range order {
+			if pin, pinned := pins[entityID]; pinned && !pin.viaSnapshot {
+				items = append(items, repo.buildContinuationCheck(entityID, pin.previous))
+			}
+		}
+		items = append(items, pending...)
+		items = append(items, repo.buildFloorChecks(pendingEvents, pins)...)
+
 		if err := repo.commitEventsWithTransaction(ctx, items, nil); err != nil {
 			errs = append(errs, err)
 		}
-
-		batch, batchEvents = nil, nil
 	}
 
 	for result := range channel {
@@ -382,7 +456,7 @@ func (repo *Repository) CommitStream(
 		combined := append(transactItems, items...)
 
 		// Guard against a single result that already exceeds the 100-item transaction limit
-		if size := len(combined) + countEntities(serializedResult.Events) + markerItems; size > 100 {
+		if size := len(combined) + 2*countEntities(serializedResult.Events) + markerItems; size > 100 {
 			errs = append(errs, fmt.Errorf(
 				"single result produces %d items, exceeding DynamoDB 100-item transaction limit",
 				size,
@@ -392,7 +466,7 @@ func (repo *Repository) CommitStream(
 
 		// Flush first if adding this result, and its floor checks, would overrun the limit
 		merged := append(append([]evt.SerializedEvent{}, batchEvents...), serializedResult.Events...)
-		if len(batch)+len(combined)+countEntities(merged)+markerItems > 100 {
+		if len(batch)+len(combined)+2*countEntities(merged)+markerItems > 100 {
 			flush()
 		}
 
@@ -407,7 +481,8 @@ func (repo *Repository) CommitStream(
 }
 
 // countEntities returns the number of distinct entities, which is the number of floor checks a
-// batch of these events needs.
+// batch of these events needs. A batch reserves a second slot per entity for the continuation
+// check of an entity whose first sequence is above 1.
 func countEntities(events []evt.SerializedEvent) int {
 	seen := make(map[evt.EntityID]struct{}, len(events))
 	for _, event := range events {

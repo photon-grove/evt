@@ -93,6 +93,10 @@ func (repo Repository) Commit(
 		return err
 	}
 
+	if err := repo.checkContinuation(normalized.Events); err != nil {
+		return err
+	}
+
 	if err := repo.checkSnapshots(normalized.Snapshots); err != nil {
 		return err
 	}
@@ -117,6 +121,36 @@ func (repo Repository) Commit(
 	}
 
 	return repo.applyTransactions(normalized.Transaction)
+}
+
+// checkContinuation refuses a written stream whose first sequence skips past the stored head. The
+// head is the stream's highest event or, once compaction deleted every covered event, its
+// snapshot's event sequence. Like the durable backends it leaves a first sequence at or below the
+// head to the event-put and floor checks. This is the in-memory form of the continuation check
+// (spec, Writes).
+func (repo Repository) checkContinuation(events []evt.SerializedEvent) error {
+	seen := map[evt.EntityID]bool{}
+
+	for _, event := range events {
+		if seen[event.EntityID] {
+			continue
+		}
+		seen[event.EntityID] = true
+
+		var head evt.EventSequence
+		for _, stored := range repo.events[string(event.EntityID)] {
+			head = max(head, stored.Sequence)
+		}
+		if snapshot, ok := repo.snapshots[string(event.EntityID)]; ok {
+			head = max(head, snapshot.EventSequence)
+		}
+
+		if event.Sequence > head+1 {
+			return &evt.SequenceGapError{EntityID: event.EntityID, After: head, Found: event.Sequence}
+		}
+	}
+
+	return nil
 }
 
 // checkSnapshots rejects a snapshot whose sequence does not follow the stored one, or whose

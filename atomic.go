@@ -344,7 +344,12 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 	sizes := []int{keySize(SystemNamespacePrefix+"FEATURES", 0)}
 
 	written := map[EntityID]bool{}
+	firstSequence := map[EntityID]EventSequence{}
 	for _, event := range result.Events {
+		if _, seen := firstSequence[event.EntityID]; !seen {
+			firstSequence[event.EntityID] = event.Sequence
+		}
+
 		metadata := event.Metadata
 		metadata.CausationID, metadata.Extensions = jsondefaults.Metadata(
 			metadata.CommandID, metadata.CausationID, metadata.Extensions,
@@ -367,6 +372,20 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 			ttlSize(snapshot.EntityType))
 		delete(written, snapshot.EntityID)
 	}
+	// A written stream whose first sequence is above 1 contributes a continuation check on the
+	// event just before it. It is budgeted for every such stream, also on the rare compacted-head
+	// path that pins the snapshot instead, so CommitTooLarge fires identically everywhere.
+	continued := make([]EntityID, 0, len(firstSequence))
+	for id, first := range firstSequence {
+		if first > 1 {
+			continued = append(continued, id)
+		}
+	}
+	slices.Sort(continued)
+	for _, id := range continued {
+		sizes = append(sizes, keySize(id, firstSequence[id]-1))
+	}
+
 	// A written stream without a snapshot contributes a floor check on its snapshot item.
 	ids := make([]EntityID, 0, len(written))
 	for id := range written {

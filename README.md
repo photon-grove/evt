@@ -189,8 +189,10 @@ types in the marker so every process refuses them). Every commit, single
 or multi-stream, is checked against the shared 100-item / 3.8 MB / 380 KB budget and fails with
 `*evt.CommitTooLargeError` before any write, on every backend. The budget counts the actions a
 commit actually emits, so a single-stream commit leaves room for 98 events and projector
-operations beside the feature-marker and floor (or snapshot) actions; that drops to 97 when the
-rebuild-lock check (C10) starts being emitted. The exact contract is specified
+operations when it creates its stream and 97 when it appends to one (the append adds a
+continuation check on the stream's head); both drop by one when the rebuild-lock check (C10)
+starts being emitted. A commit whose first sequence skips past the stream's stored head is refused
+with `*evt.SequenceGapError`. The exact contract is specified
 in the [storage format](docs/spec/storage-format.md#writes).
 
 A custom `Repository` written before v0.9 compiles unchanged but now receives

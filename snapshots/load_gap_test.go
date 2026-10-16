@@ -25,14 +25,40 @@ func TestLoadEntityRejectsSequenceGap(t *testing.T) {
 		require.NoError(t, store.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: value}, newTestMetadata()))
 	}
 
-	skipped, err := evt.SerializeEvents([]evt.Event{&test.EntityUpdated{ID: id, Value: "four"}}, 3, id, newTestMetadata())
-	require.NoError(t, err)
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: skipped}))
+	// Two more events land after the snapshot at 2, and then sequence 3 goes missing from the
+	// reads, the way a compaction racing the load would leave it.
+	plain := snapshots.NewStore(repo, 100)
+	for _, value := range []string{"three", "four"} {
+		require.NoError(t, plain.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: value}, newTestMetadata()))
+	}
+	store = snapshots.NewStore(&hideSequence{Repository: repo, hidden: 3}, 2)
 
-	_, err = store.LoadEntity(ctx, test.NewEntity(id), id)
+	_, err := store.LoadEntity(ctx, test.NewEntity(id), id)
 	require.True(t, evt.IsConflictErr(err), "want a conflict, got %v", err)
 	require.ErrorIs(t, err, evt.ErrSequenceGap)
 
+}
+
+// hideSequence drops one sequence from every read of events after a snapshot.
+type hideSequence struct {
+	evt.Repository
+	hidden evt.EventSequence
+}
+
+func (r *hideSequence) GetLatestEvents(ctx context.Context, id evt.EntityID, after evt.EventSequence) ([]evt.SerializedEvent, error) {
+	events, err := r.Repository.GetLatestEvents(ctx, id, after)
+	if err != nil {
+		return nil, err
+	}
+
+	kept := events[:0:0]
+	for _, event := range events {
+		if event.Sequence != r.hidden {
+			kept = append(kept, event)
+		}
+	}
+
+	return kept, nil
 }
 
 // gapOnce drops the first event of the first post-snapshot read, the way a compaction that lands

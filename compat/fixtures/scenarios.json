@@ -2260,6 +2260,12 @@
               "condition": "attribute_not_exists(pk)"
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-multi-stream",
+              "sk": 1,
+              "condition": "attribute_exists(sk)"
+            },
+            {
               "operation": "Put",
               "pk": "compat-fixture-multi-stream",
               "sk": 2,
@@ -2305,6 +2311,12 @@
               "condition": "attribute_not_exists(pk)"
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-multi-stream",
+              "sk": 2,
+              "condition": "attribute_exists(sk)"
+            },
+            {
               "operation": "Put",
               "pk": "compat-fixture-multi-stream",
               "sk": 3,
@@ -2320,6 +2332,12 @@
                   "N": "3"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-multi-stream-ledger",
+              "sk": 1,
+              "condition": "attribute_exists(sk)"
             },
             {
               "operation": "Put",
@@ -2348,6 +2366,12 @@
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
               "condition": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-multi-stream",
+              "sk": 3,
+              "condition": "attribute_exists(sk)"
             },
             {
               "operation": "Put",
@@ -2395,6 +2419,12 @@
               "condition": "attribute_not_exists(pk)"
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-multi-stream",
+              "sk": 4,
+              "condition": "attribute_exists(sk)"
+            },
+            {
               "operation": "Put",
               "pk": "compat-fixture-multi-stream",
               "sk": 5,
@@ -2413,14 +2443,14 @@
     {
       "name": "read-fences",
       "entityId": "compat-fixture-read-fences",
-      "sequence": 0,
+      "sequence": 4,
       "snapshotSequence": 0,
-      "state": "",
+      "state": "{\"owner\":\"Katherine Johnson\",\"status\":\"open\",\"balanceCents\":700,\"deposits\":3,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
       "events": [
         "{\"id\":\"compat-fixture-read-fences:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkthdGhlcmluZSBKb2huc29uIiwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiJ9\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}}",
         "{\"id\":\"compat-fixture-read-fences:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"compat-rust-c2\"}}",
         "{\"id\":\"compat-fixture-read-fences:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"compat-go-c3\"}}",
-        "{\"id\":\"compat-fixture-read-fences:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDAwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"compat-go-c5\"}}"
+        "{\"id\":\"compat-fixture-read-fences:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDAwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"compat-go-c5\"}}"
       ],
       "snapshot": null,
       "dynamoItems": [
@@ -2507,7 +2537,7 @@
             "S": "compat-fixture-read-fences"
           },
           "sk": {
-            "N": "5"
+            "N": "4"
           },
           "type": {
             "S": "account:deposited"
@@ -2521,7 +2551,7 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-read-fences:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-read-fences:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkthdGhlcmluZSBKb2huc29uIiwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiJ9\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-read-fences:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-read-fences:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"compat-rust-c2\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-read-fences:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-read-fences:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"compat-go-c3\"}}}",
-        "{\"version\":\"\",\"id\":\"compat-fixture-read-fences:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-read-fences:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDAwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"compat-go-c5\"}}}"
+        "{\"version\":\"\",\"id\":\"compat-fixture-read-fences:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-read-fences:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDAwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"compat-go-c5\"}}}"
       ],
       "siblings": [
         {
@@ -2596,6 +2626,12 @@
               "condition": "attribute_not_exists(pk)"
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-read-fences",
+              "sk": 1,
+              "condition": "attribute_exists(sk)"
+            },
+            {
               "operation": "Put",
               "pk": "compat-fixture-read-fences",
               "sk": 2,
@@ -2639,6 +2675,12 @@
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
               "condition": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-read-fences",
+              "sk": 2,
+              "condition": "attribute_exists(sk)"
             },
             {
               "operation": "Put",
@@ -2703,6 +2745,12 @@
               "condition": "attribute_not_exists(pk)"
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-read-fences",
+              "sk": 3,
+              "condition": "attribute_exists(sk)"
+            },
+            {
               "operation": "Put",
               "pk": "compat-fixture-read-fences",
               "sk": 4,
@@ -2748,9 +2796,15 @@
               "condition": "attribute_not_exists(pk)"
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-read-fences",
+              "sk": 3,
+              "condition": "attribute_exists(sk)"
+            },
+            {
               "operation": "Put",
               "pk": "compat-fixture-read-fences",
-              "sk": 5,
+              "sk": 4,
               "condition": "attribute_not_exists(sk)"
             },
             {
@@ -2760,9 +2814,15 @@
               "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
               "values": {
                 ":first": {
-                  "N": "5"
+                  "N": "4"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-read-fences-watched",
+              "sk": 1,
+              "condition": "attribute_exists(sk)"
             },
             {
               "operation": "Put",
@@ -2788,9 +2848,15 @@
               "condition": "attribute_not_exists(pk)"
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "compat-fixture-read-fences",
+              "sk": 4,
+              "condition": "attribute_exists(sk)"
+            },
+            {
               "operation": "Put",
               "pk": "compat-fixture-read-fences",
-              "sk": 6,
+              "sk": 5,
               "condition": "attribute_not_exists(sk)"
             },
             {
@@ -2800,7 +2866,7 @@
               "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
               "values": {
                 ":first": {
-                  "N": "6"
+                  "N": "5"
                 }
               }
             },

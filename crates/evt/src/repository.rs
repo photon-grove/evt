@@ -100,6 +100,19 @@ impl<Op> Commit<Op> {
                 ttl(&event.entity_type),
             )?));
         }
+        // A stream continuing from an existing head carries a continuation check on the event
+        // just before its first. It is budgeted for every such stream, also on the compacted-head
+        // path that pins the snapshot instead, so CommitTooLarge fires identically everywhere.
+        if let Some(first) = self
+            .events
+            .first()
+            .filter(|event| event.sequence > EventSequence(1))
+        {
+            sizes.push(item_size(&key(
+                self.entity_id.as_str(),
+                first.sequence.0 - 1,
+            )));
+        }
         if let Some(snapshot) = &self.snapshot {
             sizes.push(item_size(&wire::snapshot_item(
                 &SerializedSnapshot {
@@ -415,6 +428,18 @@ impl<Op> TransactionCommit<Op> {
                     event,
                     ttl(&event.entity_type),
                 )?));
+            }
+            // The continuation check of a stream continuing from an existing head (see
+            // `Commit::sizes`).
+            if let Some(first) = stream
+                .events
+                .first()
+                .filter(|event| event.sequence > EventSequence(1))
+            {
+                sizes.push(item_size(&key(
+                    stream.entity_id.as_str(),
+                    first.sequence.0 - 1,
+                )));
             }
         }
         for stream in &self.streams {
@@ -770,6 +795,28 @@ mod tests {
             .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
         let transaction = TransactionCommit::new(vec![snapshotted]);
         assert_eq!(transaction.sizes(|_| None).unwrap().len(), 100);
+    }
+
+    #[test]
+    fn appending_to_an_existing_stream_budgets_a_continuation_check() {
+        // marker + continuation check + 97 events + floor check: 97 appended events fill 100.
+        let fits = Commit::<u8>::new("a", (2..=98).map(|n| event("a", n)).collect());
+        assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
+        check_budget(fits.sizes(|_| None).unwrap()).unwrap();
+
+        let over = Commit::<u8>::new("a", (2..=99).map(|n| event("a", n)).collect());
+        assert!(matches!(
+            check_budget(over.sizes(|_| None).unwrap()),
+            Err(Error::CommitTooLarge { actions: 101, .. })
+        ));
+
+        // The transaction estimator agrees, per stream.
+        let transaction = TransactionCommit::new(vec![
+            Commit::<u8>::new("a", (2..=3).map(|n| event("a", n)).collect()),
+            Commit::<u8>::new("b", vec![event("b", 1)]),
+        ]);
+        // marker + a: check + 2 events + floor, b: 1 event + floor
+        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 1 + 4 + 2);
     }
 
     #[test]

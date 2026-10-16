@@ -191,12 +191,12 @@
             { "suffix": "watched", "head": 0, "callerStamped": true }
           ], "expect": { "result": "conflict" } },
         { "by": "go", "op": "transaction", "commandId": "c5", "streams": [
-            { "suffix": "", "sequence": 5, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":400}" }] },
+            { "suffix": "", "sequence": 4, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":400}" }] },
             { "suffix": "watched", "sequence": 2, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":20,\"memo\":\"appended\"}" }], "snapshot": { "sequence": 1, "payload": "{\"owner\":\"Katherine Johnson\",\"status\":\"open\",\"balanceCents\":30,\"deposits\":2,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":\"appended\"}" } }
           ], "expect": { "result": "ok", "events": 2 } },
         { "by": "go", "op": "compact", "through": 2, "suffix": "watched", "expect": { "result": "compacted", "deleted": 2 } },
         { "by": "rust", "op": "transaction", "commandId": "c6", "streams": [
-            { "suffix": "", "sequence": 6, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":500}" }] }
+            { "suffix": "", "sequence": 5, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":500}" }] }
           ], "fences": [
             { "suffix": "watched", "head": 1, "callerStamped": true }
           ], "expect": { "result": "conflict" } },

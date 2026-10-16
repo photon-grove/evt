@@ -157,6 +157,10 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 			})
 		}
 
+		t.Run("RejectsSequenceGaps", func(t *testing.T) {
+			testRejectsSequenceGaps(t, newRepo(), opts.SupportsSnapshots)
+		})
+
 		t.Run("RejectsProjectorOnlyCommits", func(t *testing.T) {
 			testRejectsProjectorOnlyCommits(t, newRepo())
 		})
@@ -877,6 +881,29 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 	}
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idFits, "test", 0, fitting...)}))
 
+	// Appending to an existing stream adds a continuation check on its head event, so the marker
+	// check, that check, 97 event puts, and the floor check fill the 100 actions: 97 fit, 98 do not.
+	idGrows := evt.EntityID(ns + "-grows")
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idGrows, "test", 0, &test.EntityCreated{ID: idGrows, Value: "first"}),
+	}))
+
+	growing := func(count int) []evt.Event {
+		out := make([]evt.Event, 0, count)
+		for i := range count {
+			out = append(out, &test.EntityUpdated{ID: idGrows, Value: fmt.Sprintf("value-%d", i)})
+		}
+
+		return out
+	}
+
+	tooMany := repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(98)...)})
+	var tooLargeAppend *evt.CommitTooLargeError
+	require.ErrorAs(t, tooMany, &tooLargeAppend)
+	require.Equal(t, 101, tooLargeAppend.Items)
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(97)...)}))
+
 	idA := evt.EntityID(ns + "-a")
 	// 101 event puts plus the control checks and the floor check exceed the 100-item budget.
 	events := make([]evt.Event, 0, 101)
@@ -1047,4 +1074,72 @@ func testProjectorBudget(t *testing.T, repo evt.Repository, group func(int) evt.
 	stored, err := repo.GetEvents(ctx, idOver)
 	require.NoError(t, err)
 	require.Empty(t, stored, "an oversized commit is refused before any write")
+}
+
+func testRejectsSequenceGaps(t *testing.T, repo evt.Repository, supportsSnapshots bool) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	created := func(id evt.EntityID) evt.Event { return &test.EntityCreated{ID: id, Value: "one"} }
+	updated := func(id evt.EntityID) evt.Event { return &test.EntityUpdated{ID: id, Value: "next"} }
+
+	// A first event above sequence 1 on a stream with no events is a gap.
+	idNew := evt.EntityID(ns + "-new")
+	err := repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idNew, "test", 2, created(idNew))})
+	require.ErrorIs(t, err, evt.ErrSequenceGap)
+	var gap *evt.SequenceGapError
+	require.ErrorAs(t, err, &gap)
+	require.Equal(t, idNew, gap.EntityID)
+	require.Equal(t, evt.EventSequence(0), gap.After)
+	require.Equal(t, evt.EventSequence(3), gap.Found)
+	stored, err := repo.GetEvents(ctx, idNew)
+	require.NoError(t, err)
+	require.Empty(t, stored, "a refused gap writes nothing")
+
+	// Skipping a sequence on an existing stream is a gap; continuing from the head is not.
+	idA := evt.EntityID(ns + "-a")
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idA, "test", 0, created(idA))}))
+
+	err = repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idA, "test", 2, updated(idA))})
+	require.ErrorAs(t, err, &gap)
+	require.Equal(t, evt.EventSequence(1), gap.After)
+	require.Equal(t, evt.EventSequence(3), gap.Found)
+
+	// One stream of a multi-stream commit with a gap fails the whole commit.
+	idB := evt.EntityID(ns + "-b")
+	err = repo.Commit(ctx, evt.SerializedResult{Events: append(
+		serialize(t, idB, "test", 0, created(idB)),
+		serialize(t, idA, "test", 2, updated(idA))...,
+	)})
+	require.ErrorIs(t, err, evt.ErrSequenceGap)
+	stored, err = repo.GetEvents(ctx, idB)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the clean stream of the failed commit is untouched")
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idA, "test", 1, updated(idA))}))
+
+	// Compaction can delete every event a snapshot covers, including the head: the snapshot's
+	// event sequence is then the head, so the stream still continues from it and still refuses a gap.
+	compactor, compacts := repo.(evt.Compactor)
+	if !supportsSnapshots || !compacts {
+		return
+	}
+
+	idC := evt.EntityID(ns + "-c")
+	payload, err := json.Marshal(test.NewEntity(idC))
+	require.NoError(t, err)
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", 0, created(idC), updated(idC), updated(idC)),
+	}, "test", idC, payload, 1))
+
+	deleted, err := compactor.CompactBelow(ctx, idC, 3)
+	require.NoError(t, err)
+	require.Equal(t, 3, deleted, "the head event is compacted away")
+
+	err = repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idC, "test", 4, updated(idC))})
+	require.ErrorIs(t, err, evt.ErrSequenceGap, "a gap above the snapshot's head is still refused")
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idC, "test", 3, updated(idC))}),
+		"the stream continues from the snapshot's head")
 }

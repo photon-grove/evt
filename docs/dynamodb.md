@@ -44,16 +44,18 @@ succeeds if the next sequence is unclaimed, which is how concurrent writers on o
 entity stay correctly ordered. Each commit also checks the `sk = 0` snapshot row: a
 commit that starts at or below the snapshot's `eventSequence` is rejected, so a writer
 that loaded before a compaction cannot recreate the deleted events. Every v0.9 commit also carries a
-feature-marker check. Of the 100 transaction items, a single-stream commit without a snapshot
-reserves two (floor + marker), leaving **98 event/projector operations**. A commit with a
-snapshot also leaves **98**: the snapshot put replaces the floor check, and the marker check
-remains. These checks are billed as writes. The commit budget counts only the actions a commit
-actually emits.
+feature-marker check, and a commit that appends to an existing stream also pins the stream's head
+with a continuation check, so no sequence is ever skipped ([Continuity](spec/storage-format.md#continuity)).
+Of the 100 transaction items, a single-stream commit that creates its stream reserves two (floor +
+marker), leaving **98 event/projector operations**, and one that appends to an existing stream
+reserves three (continuation + floor + marker), leaving **97**. A commit with a snapshot leaves
+the same numbers: the snapshot put replaces the floor check. These checks are billed as writes. The
+commit budget counts only the actions a commit actually emits.
 
 The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C2/C3/C10) is:
 
 ```text
-items = Σ(events per written stream + 1 snapshot/floor)
+items = Σ(events per written stream + 1 snapshot/floor + 1 continuation if first sequence > 1)
       + 2 × read-only fenced streams
       + optional outcome put
       + feature-marker check
@@ -61,9 +63,8 @@ items = Σ(events per written stream + 1 snapshot/floor)
       + projector operations
 ```
 
-Today a basic single-stream commit with no read fences or outcome leaves **98**
-event/projector operations. The rebuild-lock check (C10) is **not implemented yet** and is not
-budgeted; when C10 starts emitting it, that capacity drops by one, to **97**.
+The rebuild-lock check (C10) is **not implemented yet** and is not budgeted; when C10 starts
+emitting it, the two capacities above drop by one, to **97** and **96**.
 
 The `sk = 0` snapshot row records the entity's serialized state plus the
 `eventSequence` it covers, and snapshot writes are monotonic: a write that would move

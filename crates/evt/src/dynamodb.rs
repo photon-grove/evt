@@ -251,34 +251,68 @@ impl DynamoRepository {
     }
 
     /// Builds the commit's transaction items in the pinned order: the feature-marker check, the
-    /// projector operations, the event puts, then the snapshot put or floor check.
+    /// projector operations, then the stream's group (see [`stream_group`](Self::stream_group)).
     fn transaction_items(
         &self,
         commit: &Commit<TransactWriteItem>,
         validated: ValidatedMarker,
+        pin: Option<Continuation>,
+    ) -> Result<Vec<TransactWriteItem>, Error> {
+        if commit.events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 3);
+        items.push(self.marker_check(validated)?);
+        items.extend(commit.operations.iter().cloned());
+        items.extend(self.stream_group(commit, pin)?);
+
+        Ok(items)
+    }
+
+    /// Builds one written stream's contiguous group: the continuation check on the event just
+    /// before its first (when the first sequence is above 1 and the head event exists), the event
+    /// puts, then the snapshot put or floor check.
+    ///
+    /// Compaction can delete every event a snapshot covers, including the head, so a stream whose
+    /// head event is gone is pinned through its snapshot instead: the group then carries no
+    /// continuation check, and the snapshot put or floor check requires the snapshot's `eventSeq`
+    /// to still equal the sequence before the commit's first.
+    fn stream_group(
+        &self,
+        stream: &Commit<TransactWriteItem>,
+        pin: Option<Continuation>,
     ) -> Result<Vec<TransactWriteItem>, Error> {
         let (Some(first), Some(last_sequence)) = (
-            commit.events.first().map(|event| n(event.sequence.0)),
-            commit.events.last().map(|event| event.sequence),
+            stream.events.first().map(|event| n(event.sequence.0)),
+            stream.events.last().map(|event| event.sequence),
         ) else {
             return Ok(Vec::new());
         };
 
-        let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 2);
-        items.push(self.marker_check(validated)?);
-        items.extend(commit.operations.iter().cloned());
+        let mut items = Vec::with_capacity(stream.events.len() + 2);
 
-        for event in &commit.events {
+        if let Some(pin) = pin.filter(|pin| !pin.via_snapshot) {
+            items.push(continuation_check(
+                &self.table,
+                &stream.entity_id,
+                pin.previous,
+            )?);
+        }
+
+        for event in &stream.events {
             let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
             items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
         }
 
-        if let Some(snapshot) = &commit.snapshot {
+        let via_snapshot = pin.filter(|pin| pin.via_snapshot);
+
+        if let Some(snapshot) = &stream.snapshot {
             let ttl = self.ttl_for(&snapshot.entity_type);
             let item = wire::snapshot_item(
                 &SerializedSnapshot {
                     entity_type: snapshot.entity_type.clone(),
-                    entity_id: commit.entity_id.clone(),
+                    entity_id: stream.entity_id.clone(),
                     sequence: snapshot.sequence,
                     event_sequence: last_sequence,
                     payload: snapshot.payload.clone(),
@@ -289,6 +323,13 @@ impl DynamoRepository {
             let expected = snapshot.sequence.0 - 1;
             items.push(if expected == 0 {
                 put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
+            } else if let Some(pin) = via_snapshot {
+                put(
+                    &self.table,
+                    item,
+                    Some(wire::PINNED_NEXT_SNAPSHOT_CONDITION),
+                    &[(":seq", n(expected)), (":prev", n(pin.previous.0))],
+                )?
             } else {
                 put(
                     &self.table,
@@ -297,22 +338,97 @@ impl DynamoRepository {
                     &[(":seq", n(expected)), (":first", first)],
                 )?
             });
+        } else if let Some(pin) = via_snapshot {
+            items.push(pinned_floor_check(
+                &self.table,
+                &stream.entity_id,
+                pin.previous,
+            )?);
         } else {
-            items.push(floor_check(&self.table, &commit.entity_id, first)?);
+            items.push(floor_check(&self.table, &stream.entity_id, first)?);
         }
 
         Ok(items)
     }
 
+    /// Reads, strongly consistent, how each written stream whose first sequence is above 1
+    /// continues from its stored head, and refuses a gap with [`Error::SequenceGap`] before any
+    /// write. The returned pins are applied as conditions, so a head that moves or an event that
+    /// disappears between this read and the write fails the transaction as a conflict instead of
+    /// committing a gap. See [`stream_group`](Self::stream_group) for the compacted-head case.
+    async fn observe_continuations<'c>(
+        &self,
+        streams: impl IntoIterator<Item = &'c Commit<TransactWriteItem>>,
+    ) -> Result<HashMap<EntityId, Continuation>, Error> {
+        let mut pins = HashMap::new();
+
+        for stream in streams {
+            let Some(first) = stream.events.first().map(|event| event.sequence) else {
+                continue;
+            };
+            if first <= EventSequence(1) {
+                continue;
+            }
+
+            let previous = EventSequence(first.0 - 1);
+            let head = self
+                .client
+                .get_item()
+                .table_name(&self.table)
+                .consistent_read(true)
+                .key("pk", s(stream.entity_id.as_str()))
+                .key("sk", n(previous.0))
+                .projection_expression("sk")
+                .send()
+                .await
+                .map_err(sdk_error)?;
+
+            let via_snapshot = if head.item.is_some_and(|item| !item.is_empty()) {
+                false
+            } else {
+                let snapshot = self.read_snapshot(&stream.entity_id, true).await?;
+                if snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.event_sequence != previous)
+                {
+                    let stored = self.max_sequence(&stream.entity_id).await?;
+
+                    return Err(Error::SequenceGap {
+                        entity_id: stream.entity_id.clone(),
+                        after: stored.max(
+                            snapshot
+                                .map(|snapshot| snapshot.event_sequence)
+                                .unwrap_or_default(),
+                        ),
+                        found: first,
+                    });
+                }
+
+                true
+            };
+
+            pins.insert(
+                stream.entity_id.clone(),
+                Continuation {
+                    previous,
+                    via_snapshot,
+                },
+            );
+        }
+
+        Ok(pins)
+    }
+
     /// Builds a multi-stream commit's transaction items in the pinned order: the feature-marker
     /// check, the projector operations, then per written stream in bytewise stream-ID order its
-    /// event puts followed by its snapshot put or floor check, then per fenced read-only stream
-    /// its slot check and snapshot companion. The layout records each item's index so a failed
+    /// group (continuation check, event puts, snapshot put or floor check), then per fenced
+    /// read-only stream its slot check and snapshot companion. The layout records each item's index so a failed
     /// commit is classified by the item that failed.
     fn transaction_stream_items(
         &self,
         commit: &TransactionCommit<TransactWriteItem>,
         validated: ValidatedMarker,
+        pins: &HashMap<EntityId, Continuation>,
     ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
         let mut items = Vec::new();
         let mut layout = TransactionLayout::default();
@@ -322,48 +438,12 @@ impl DynamoRepository {
         layout.operations = items.len() - 1;
 
         for stream in &commit.streams {
-            let Some(first) = stream.events.first().map(|event| n(event.sequence.0)) else {
+            if stream.events.is_empty() {
                 continue;
-            };
+            }
 
             let group_start = items.len();
-
-            for event in &stream.events {
-                let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
-                items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
-            }
-
-            if let Some(snapshot) = &stream.snapshot {
-                let ttl = self.ttl_for(&snapshot.entity_type);
-                let item = wire::snapshot_item(
-                    &SerializedSnapshot {
-                        entity_type: snapshot.entity_type.clone(),
-                        entity_id: stream.entity_id.clone(),
-                        sequence: snapshot.sequence,
-                        event_sequence: stream
-                            .events
-                            .last()
-                            .expect("normalized stream has events")
-                            .sequence,
-                        payload: snapshot.payload.clone(),
-                    },
-                    ttl,
-                )?;
-                // Commit::validate guarantees the sequence is at least 1.
-                let expected = snapshot.sequence.0 - 1;
-                items.push(if expected == 0 {
-                    put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
-                } else {
-                    put(
-                        &self.table,
-                        item,
-                        Some(wire::NEXT_SNAPSHOT_CONDITION),
-                        &[(":seq", n(expected)), (":first", first)],
-                    )?
-                });
-            } else {
-                items.push(floor_check(&self.table, &stream.entity_id, first)?);
-            }
+            items.extend(self.stream_group(stream, pins.get(&stream.entity_id).copied())?);
 
             layout
                 .streams
@@ -654,9 +734,14 @@ impl Repository for DynamoRepository {
         }
         crate::repository::check_budget(sizes)?;
 
+        // The stream must continue exactly from its stored head; a gap is refused before any
+        // write, and what was observed is pinned in the transaction.
+        let pins = self.observe_continuations([&commit]).await?;
+        let pin = pins.get(&commit.entity_id).copied();
+
         loop {
             let cached = self.ensure_manifest_validated().await?;
-            let items = self.transaction_items(&commit, cached)?;
+            let items = self.transaction_items(&commit, cached, pin)?;
 
             match self
                 .client
@@ -706,6 +791,10 @@ impl Repository for DynamoRepository {
         // and the refusal is the union of the two.
         commit.check_retention(None, |entity_type| self.retains(entity_type))?;
 
+        // Each written stream must continue exactly from its stored head; a gap is refused before
+        // any write, and what was observed is pinned in the transaction.
+        let pins = self.observe_continuations(&commit.streams).await?;
+
         let mut revalidations = 0;
 
         loop {
@@ -722,7 +811,7 @@ impl Repository for DynamoRepository {
                     .check_retention(manifest.as_ref(), |entity_type| self.retains(entity_type))?;
             }
 
-            let (items, layout) = self.transaction_stream_items(&commit, cached)?;
+            let (items, layout) = self.transaction_stream_items(&commit, cached, &pins)?;
 
             let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
             for operation in &commit.operations {
@@ -1197,6 +1286,51 @@ fn sdk_item_size(operation: &TransactWriteItem) -> usize {
     0
 }
 
+/// How a written stream's first sequence was tied to its stored head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Continuation {
+    /// The commit's first sequence minus one: the head the writer believes in.
+    previous: EventSequence,
+    /// The head event was compacted away; the snapshot's `eventSeq` (equal to `previous`) pins the
+    /// head instead of the event item.
+    via_snapshot: bool,
+}
+
+/// Checks that the event just before a stream's first new event still exists.
+fn continuation_check(
+    table: &str,
+    entity_id: &EntityId,
+    previous: EventSequence,
+) -> Result<TransactWriteItem, Error> {
+    let check = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(entity_id.as_str()))
+        .key("sk", n(previous.0))
+        .condition_expression(wire::CONTINUATION_CONDITION)
+        .build()
+        .map_err(Error::backend)?;
+
+    Ok(TransactWriteItem::builder().condition_check(check).build())
+}
+
+/// Checks that a compacted stream's snapshot still ends exactly at the sequence before the commit.
+fn pinned_floor_check(
+    table: &str,
+    entity_id: &EntityId,
+    previous: EventSequence,
+) -> Result<TransactWriteItem, Error> {
+    let check = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(entity_id.as_str()))
+        .key("sk", n(wire::SNAPSHOT_SORT_KEY))
+        .condition_expression(wire::PINNED_FLOOR_CONDITION)
+        .expression_attribute_values(":prev", n(previous.0))
+        .build()
+        .map_err(Error::backend)?;
+
+    Ok(TransactWriteItem::builder().condition_check(check).build())
+}
+
 /// Checks that a commit starting at `first` is above the entity's snapshot floor.
 fn floor_check(
     table: &str,
@@ -1659,7 +1793,7 @@ mod tests {
             let mut repository = offline_repository();
             repository.table = input["eventsTable"].as_str().unwrap().into();
             let actual = repository
-                .transaction_items(&commit, observed)
+                .transaction_items(&commit, observed, None)
                 .unwrap()
                 .iter()
                 .map(|action| {
@@ -1864,8 +1998,27 @@ mod tests {
                 commit.normalize().unwrap();
 
                 // The scenarios declare no features, so every writer validated an absent marker.
+                // Every transaction step continues from an existing head event (none of the
+                // recorded steps writes a compacted stream), so each stream above sequence 1 is
+                // pinned through its head event.
+                let pins: HashMap<EntityId, Continuation> = commit
+                    .streams
+                    .iter()
+                    .filter_map(|stream| {
+                        let first = stream.events.first()?.sequence;
+                        (first > EventSequence(1)).then(|| {
+                            (
+                                stream.entity_id.clone(),
+                                Continuation {
+                                    previous: EventSequence(first.0 - 1),
+                                    via_snapshot: false,
+                                },
+                            )
+                        })
+                    })
+                    .collect();
                 let (items, _) = offline_repository()
-                    .transaction_stream_items(&commit, ValidatedMarker::Absent)
+                    .transaction_stream_items(&commit, ValidatedMarker::Absent, &pins)
                     .unwrap();
                 let actual: Vec<_> = items.iter().map(action_summary).collect();
 

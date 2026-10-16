@@ -47,6 +47,19 @@ pub const EVENT_CONDITION: &str = "attribute_not_exists(sk)";
 /// a compacted sequence.
 pub const FLOOR_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq < :first";
 
+/// Condition for a written stream's continuation check: the event just before the commit's first
+/// still exists, so with [`EVENT_CONDITION`] the commit continues exactly from the stored head and
+/// skips no sequence.
+pub const CONTINUATION_CONDITION: &str = "attribute_exists(sk)";
+
+/// Condition for the snapshot-item check when compaction deleted the stream's head event: the
+/// snapshot's `eventSeq` is the head, so it must still equal the sequence before the commit's
+/// first (`:prev`).
+pub const PINNED_FLOOR_CONDITION: &str = "eventSeq = :prev";
+
+/// [`NEXT_SNAPSHOT_CONDITION`] for the same compacted-head case.
+pub const PINNED_NEXT_SNAPSHOT_CONDITION: &str = "seq = :seq AND eventSeq = :prev";
+
 /// Condition for the first snapshot put in a commit (snapshot sequence 1): no snapshot exists yet.
 pub const FIRST_SNAPSHOT_CONDITION: &str = "attribute_not_exists(seq)";
 
