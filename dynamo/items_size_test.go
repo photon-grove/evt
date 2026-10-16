@@ -209,3 +209,54 @@ func TestCommit_RefusesFencesForLocallyRetainedTypesWithoutAManifest(t *testing.
 	// A type outside the policy is still fenceable.
 	require.NoError(t, repo.Commit(ctx, fenced("plain")))
 }
+
+// A stream pins its head through the item compaction cannot delete: the head event when it lies
+// above the snapshot, the snapshot when it ends exactly at the head.
+func TestCommit_PinsTheStoredHeadThroughTheItemCompactionCannotDelete(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	repo := dynamo.NewRepository(fake, "events")
+
+	event := func(id string, sequence evt.EventSequence) evt.SerializedEvent {
+		return evt.SerializedEvent{
+			ID: evt.GetEventID(evt.EntityID(id), sequence), Sequence: sequence, Type: "t:created", Version: 1,
+			EntityID: evt.EntityID(id), EntityType: "t", Payload: []byte(`{}`),
+		}
+	}
+	conditions := func(call int, pk string) []string {
+		var out []string
+		for _, action := range fake.Transactions()[call] {
+			if action.PK == pk {
+				out = append(out, action.Condition)
+			}
+		}
+
+		return out
+	}
+
+	// Events 1 and 2 with no snapshot: appending 3 pins the head event.
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 1), event("pin-a", 2)}}))
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 3)}}))
+	require.Equal(t,
+		[]string{dynamo.ContinuationCondition, "attribute_not_exists(sk)", dynamo.FloorCondition},
+		conditions(len(fake.Transactions())-1, "pin-a"))
+
+	// A snapshot ending at the head (event 3) is the pin, so compaction deleting event 3 cannot
+	// fail the append: no event check, and the pinned floor.
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 4)}},
+		"t", "pin-a", []byte(`{}`), 1))
+	compactor, ok := evt.Repository(repo).(evt.Compactor)
+	require.True(t, ok)
+	_, err := compactor.CompactBelow(ctx, "pin-a", 4)
+	require.NoError(t, err)
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 5)}}))
+	require.Equal(t,
+		[]string{"attribute_not_exists(sk)", dynamo.PinnedFloorCondition},
+		conditions(len(fake.Transactions())-1, "pin-a"))
+
+	// A snapshot ahead of the writer's head is a conflict, not a gap.
+	err = repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 3)}})
+	require.ErrorIs(t, err, dynamo.ErrSnapshotRaceCondition)
+	require.NotErrorIs(t, err, evt.ErrSequenceGap)
+}

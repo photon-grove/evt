@@ -213,7 +213,7 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
    in this order:
    1. the **continuation check** (`ConditionCheck` on `(pk, sk = first - 1)` with
       `attribute_exists(sk)`), present when the stream's first new sequence is above 1 and the
-      stream's head event exists (see [Continuity](#continuity) for the compacted-head case);
+      snapshot does not end exactly at the head (see [Continuity](#continuity) for the pinned-snapshot case);
    2. one put per event, in ascending sequence;
    3. then either the stream's snapshot put or, when the commit writes no snapshot for it, the
       floor check on the stream's snapshot item (the group's last action).
@@ -380,19 +380,26 @@ sequence-gap error (`SequenceGapError` in Go, `Error::SequenceGap` in Rust), whi
 (reload and retry). A first sequence at or below the head is not a gap; the event put and floor
 check report it as an ordinary conflict.
 
-- **DynamoDB.** For each written stream whose first sequence is above 1 the repository reads, strongly
-  consistent, the event at `first - 1`. If it exists, the group carries the continuation check
-  (`attribute_exists(sk)` on `(pk, first - 1)`), which together with the event put's
-  `attribute_not_exists(sk)` makes the append atomic: a failed check is a conflict for that stream.
-  **Compaction can delete the head event itself** (`CompactBelow(through)` deletes `[1, through]`
-  and `through` may equal the snapshot's `eventSeq`), so an existence check alone would refuse a
-  valid append to a compacted stream. When the event is missing the repository reads the snapshot:
-  if its `eventSeq` equals `first - 1` the snapshot is the head, no continuation check is emitted,
-  and the stream's floor check (or snapshot put) uses the pinned condition `eventSeq = :prev`
-  (`seq = :seq AND eventSeq = :prev` for a later snapshot put) instead of the floor condition;
-  otherwise the commit is a gap. Whatever was observed is pinned by conditions in the transaction, so
-  a head that moves, or an event that vanishes to compaction, between the read and the write fails
-  the transaction as a conflict.
+- **DynamoDB.** For each written stream whose first sequence is above 1 the repository reads the
+  stream's snapshot, strongly consistent, and pins the head through the item compaction cannot
+  delete. **Compaction can delete the head event itself** (`CompactBelow(through)` deletes
+  `[1, through]`, and `through` may equal the snapshot's `eventSeq`), so an existence check on a head
+  the snapshot covers would fail a valid append that raced a compaction.
+  - If the snapshot's `eventSeq` equals `first - 1`, the snapshot is the pin: no continuation check
+    is emitted, and the stream's floor check (or snapshot put) uses `eventSeq = :prev`
+    (`seq = :seq AND eventSeq = :prev` for a later snapshot put) in place of the floor condition.
+    Compaction never changes the snapshot, so the pin survives it.
+  - If the snapshot is absent or ends below `first - 1`, the head event lies above the snapshot,
+    where compaction cannot delete it. The repository reads the event at `first - 1`; if it exists
+    the group carries the continuation check (`attribute_exists(sk)` on `(pk, first - 1)`), which
+    together with the event put's `attribute_not_exists(sk)` makes the append atomic. If it is missing
+    the commit is a gap.
+  - If the snapshot's `eventSeq` is above `first - 1`, the stream has moved past the writer and the
+    commit is a conflict (the floor check would refuse it).
+
+  A failed continuation check or pinned condition is a conflict for that stream: the head moved
+  between the read and the write.
+
 - **PostgreSQL.** Under the per-entity advisory locks the commit asserts that the larger of the
   stream's highest event sequence and its snapshot's `event_sequence` is at least `first - 1`.
 - **In-memory.** The same assertion, directly.

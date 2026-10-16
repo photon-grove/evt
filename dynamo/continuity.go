@@ -29,9 +29,9 @@ const PinnedNextSnapshotCondition = "seq = :seq AND eventSeq = :prev"
 type continuation struct {
 	// previous is the commit's first sequence minus one: the head the writer believes in.
 	previous evt.EventSequence
-	// viaSnapshot is true when the head event no longer exists because compaction deleted every
-	// event the snapshot covers, so the snapshot's eventSeq (equal to previous) pins the head
-	// instead of the event item.
+	// viaSnapshot is true when the snapshot ends exactly at the head, so compaction may delete the
+	// head event at any time; the snapshot's eventSeq (equal to previous) pins the head instead of
+	// the event item.
 	viaSnapshot bool
 }
 
@@ -57,13 +57,13 @@ func firstSequences(events []evt.SerializedEvent) ([]evt.EntityID, map[evt.Entit
 // above 1 continues from its stored head, and refuses a gap with *evt.SequenceGapError before any
 // write. A stream's head is its highest event or, once compaction deleted every covered event, its
 // snapshot's eventSeq. The commit then pins what was observed with conditions, so a head that moves
-// or an event that disappears between this read and the write fails the transaction as a conflict
-// instead of committing a gap.
+// between this read and the write fails the transaction as a conflict instead of committing a gap.
 //
-// Compaction deletes events [1, through] where through can equal the snapshot's eventSeq, so the
-// head event itself can be gone; an attribute_exists check alone would refuse a valid append to a
-// compacted stream. The head event exists exactly when the stream has events above its snapshot or
-// its snapshot is behind its events; otherwise the snapshot is the head.
+// Which item pins the head depends on the snapshot. Compaction deletes events [1, through] where
+// through can equal the snapshot's eventSeq, so a head event the snapshot covers can vanish at any
+// moment: a stream whose snapshot ends exactly at the head (eventSeq == first-1) is pinned through
+// the snapshot, which compaction never changes. Otherwise the head event lies above the snapshot,
+// compaction cannot touch it, and it is pinned by an existence check.
 func (repo *Repository) observeContinuations(
 	ctx context.Context,
 	events []evt.SerializedEvent,
@@ -79,32 +79,38 @@ func (repo *Repository) observeContinuations(
 
 		previous := first[entityID] - 1
 
-		head, err := repo.client.GetItem(ctx, &dynamodb.GetItemInput{
-			TableName:      &repo.EventsTable,
-			ConsistentRead: aws.Bool(true),
-			Key: map[string]types.AttributeValue{
-				"pk": &types.AttributeValueMemberS{Value: string(entityID)},
-				"sk": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(previous), 10)},
-			},
-			ProjectionExpression: aws.String("sk"),
-		})
+		snapshot, err := repo.getSnapshot(ctx, entityID, true)
 		if err != nil {
-			return nil, fmt.Errorf("dynamo: reading the head event of %s: %w", entityID, err)
+			return nil, fmt.Errorf("dynamo: reading the snapshot of %s: %w", entityID, err)
 		}
 
 		pin := continuation{previous: previous}
 
-		if len(head.Item) == 0 {
-			snapshot, serr := repo.getSnapshot(ctx, entityID, true)
-			if serr != nil {
-				return nil, fmt.Errorf("dynamo: reading the snapshot of %s: %w", entityID, serr)
+		switch {
+		case snapshot != nil && snapshot.EventSequence == previous:
+			pin.viaSnapshot = true
+
+		case snapshot != nil && snapshot.EventSequence > previous:
+			// The stream moved past the writer's head; the floor check would refuse the commit.
+			return nil, wrapClassifiedError(fmt.Errorf("stream %s: %w", entityID, ErrSnapshotRaceCondition))
+
+		default:
+			head, gerr := repo.client.GetItem(ctx, &dynamodb.GetItemInput{
+				TableName:      &repo.EventsTable,
+				ConsistentRead: aws.Bool(true),
+				Key: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: string(entityID)},
+					"sk": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(previous), 10)},
+				},
+				ProjectionExpression: aws.String("sk"),
+			})
+			if gerr != nil {
+				return nil, fmt.Errorf("dynamo: reading the head event of %s: %w", entityID, gerr)
 			}
 
-			if snapshot == nil || snapshot.EventSequence != previous {
+			if len(head.Item) == 0 {
 				return nil, repo.sequenceGap(ctx, entityID, first[entityID], snapshot)
 			}
-
-			pin.viaSnapshot = true
 		}
 
 		if pins == nil {

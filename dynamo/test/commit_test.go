@@ -142,8 +142,16 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 		},
 	}
 
-	// The commit continues from an existing head event, which the continuation check pins.
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.GetItemOutput{
+	// The stream has no snapshot, and the commit continues from an existing head event, which the
+	// continuation check pins.
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
+		return ok && sk.Value == "0"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
+		return ok && sk.Value == "1"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{
 		Item: map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: "test-id"},
 			"sk": &types.AttributeValueMemberN{Value: "1"},
@@ -174,8 +182,16 @@ func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
 		Payload: []byte{}, Metadata: evt.Metadata{Region: "us-east-1"},
 	}}
 
-	// The commit continues from an existing head event, which the continuation check pins.
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.GetItemOutput{
+	// The stream has no snapshot, and the commit continues from an existing head event, which the
+	// continuation check pins.
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
+		return ok && sk.Value == "0"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
+		return ok && sk.Value == "6"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{
 		Item: map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: "test-id"},
 			"sk": &types.AttributeValueMemberN{Value: "6"},
@@ -265,8 +281,16 @@ func (s *RepositorySuite) Test_CommitStream_OneFloorCheckPerStream() {
 		return true
 	})
 
-	// entity-1 continues from an existing head event (sequence 3); entity-2 starts at 1.
-	s.client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.GetItemOutput{
+	// entity-1 has no snapshot and continues from an existing head event (sequence 3); entity-2
+	// starts at 1.
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
+		return ok && sk.Value == "0"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil).Once()
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
+		return ok && sk.Value == "3"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{
 		Item: map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: "entity-1"},
 			"sk": &types.AttributeValueMemberN{Value: "3"},

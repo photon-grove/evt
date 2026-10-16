@@ -275,9 +275,9 @@ impl DynamoRepository {
     /// puts, then the snapshot put or floor check.
     ///
     /// Compaction can delete every event a snapshot covers, including the head, so a stream whose
-    /// head event is gone is pinned through its snapshot instead: the group then carries no
-    /// continuation check, and the snapshot put or floor check requires the snapshot's `eventSeq`
-    /// to still equal the sequence before the commit's first.
+    /// snapshot ends exactly at the head is pinned through the snapshot instead: the group then
+    /// carries no continuation check, and the snapshot put or floor check requires the snapshot's
+    /// `eventSeq` to still equal the sequence before the commit's first.
     fn stream_group(
         &self,
         stream: &Commit<TransactWriteItem>,
@@ -353,9 +353,14 @@ impl DynamoRepository {
 
     /// Reads, strongly consistent, how each written stream whose first sequence is above 1
     /// continues from its stored head, and refuses a gap with [`Error::SequenceGap`] before any
-    /// write. The returned pins are applied as conditions, so a head that moves or an event that
-    /// disappears between this read and the write fails the transaction as a conflict instead of
-    /// committing a gap. See [`stream_group`](Self::stream_group) for the compacted-head case.
+    /// write. The returned pins are applied as conditions, so a head that moves between this read
+    /// and the write fails the transaction as a conflict instead of committing a gap.
+    ///
+    /// Which item pins the head depends on the snapshot. Compaction deletes events `[1, through]`
+    /// where `through` can equal the snapshot's `eventSeq`, so a head event the snapshot covers
+    /// can vanish at any moment: a stream whose snapshot ends exactly at the head is pinned
+    /// through the snapshot, which compaction never changes. Otherwise the head event lies above
+    /// the snapshot, compaction cannot touch it, and an existence check pins it.
     async fn observe_continuations<'c>(
         &self,
         streams: impl IntoIterator<Item = &'c Commit<TransactWriteItem>>,
@@ -371,40 +376,45 @@ impl DynamoRepository {
             }
 
             let previous = EventSequence(first.0 - 1);
-            let head = self
-                .client
-                .get_item()
-                .table_name(&self.table)
-                .consistent_read(true)
-                .key("pk", s(stream.entity_id.as_str()))
-                .key("sk", n(previous.0))
-                .projection_expression("sk")
-                .send()
-                .await
-                .map_err(sdk_error)?;
+            let snapshot = self.read_snapshot(&stream.entity_id, true).await?;
+            let snapshot_head = snapshot.as_ref().map(|snapshot| snapshot.event_sequence);
 
-            let via_snapshot = if head.item.is_some_and(|item| !item.is_empty()) {
-                false
-            } else {
-                let snapshot = self.read_snapshot(&stream.entity_id, true).await?;
-                if snapshot
-                    .as_ref()
-                    .is_none_or(|snapshot| snapshot.event_sequence != previous)
-                {
-                    let stored = self.max_sequence(&stream.entity_id).await?;
-
-                    return Err(Error::SequenceGap {
+            let via_snapshot = match snapshot_head {
+                Some(head) if head == previous => true,
+                Some(head) if head > previous => {
+                    // The stream moved past the writer's head; the floor check would refuse the
+                    // commit.
+                    return Err(Error::Conflict {
                         entity_id: stream.entity_id.clone(),
-                        after: stored.max(
-                            snapshot
-                                .map(|snapshot| snapshot.event_sequence)
-                                .unwrap_or_default(),
-                        ),
-                        found: first,
+                        message: "the stream's snapshot is ahead of the commit's first sequence"
+                            .to_owned(),
                     });
                 }
+                _ => {
+                    let head = self
+                        .client
+                        .get_item()
+                        .table_name(&self.table)
+                        .consistent_read(true)
+                        .key("pk", s(stream.entity_id.as_str()))
+                        .key("sk", n(previous.0))
+                        .projection_expression("sk")
+                        .send()
+                        .await
+                        .map_err(sdk_error)?;
 
-                true
+                    if head.item.is_none_or(|item| item.is_empty()) {
+                        let stored = self.max_sequence(&stream.entity_id).await?;
+
+                        return Err(Error::SequenceGap {
+                            entity_id: stream.entity_id.clone(),
+                            after: stored.max(snapshot_head.unwrap_or_default()),
+                            found: first,
+                        });
+                    }
+
+                    false
+                }
             };
 
             pins.insert(
@@ -1291,8 +1301,8 @@ fn sdk_item_size(operation: &TransactWriteItem) -> usize {
 struct Continuation {
     /// The commit's first sequence minus one: the head the writer believes in.
     previous: EventSequence,
-    /// The head event was compacted away; the snapshot's `eventSeq` (equal to `previous`) pins the
-    /// head instead of the event item.
+    /// The snapshot ends exactly at the head, so compaction may delete the head event at any time;
+    /// the snapshot's `eventSeq` (equal to `previous`) pins the head instead of the event item.
     via_snapshot: bool,
 }
 
@@ -2208,6 +2218,73 @@ mod tests {
                 "{entry_point}: {result:?}"
             );
         }
+    }
+
+    /// A stream pins its head through the item compaction cannot delete: the head event when it
+    /// lies above the snapshot, the snapshot when it ends exactly at the head.
+    #[test]
+    fn a_stream_pins_its_head_through_the_item_compaction_cannot_delete() {
+        let repository = offline_repository();
+        let event = SerializedEvent {
+            id: "pin-a:5".into(),
+            entity_id: "pin-a".into(),
+            entity_type: "account".into(),
+            sequence: EventSequence(5),
+            event_type: "account:opened".into(),
+            version: crate::EventVersion(1),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        };
+        let commit: Commit<TransactWriteItem> = Commit::new("pin-a", vec![event]);
+        let conditions = |commit: &Commit<TransactWriteItem>, pin: Option<Continuation>| {
+            repository
+                .stream_group(commit, pin)
+                .unwrap()
+                .iter()
+                .map(|action| match (action.put(), action.condition_check()) {
+                    (Some(put), _) => put.condition_expression().unwrap().to_owned(),
+                    (_, Some(check)) => check.condition_expression().to_owned(),
+                    _ => unreachable!("only puts and checks"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let event_pin = Continuation {
+            previous: EventSequence(4),
+            via_snapshot: false,
+        };
+        assert_eq!(
+            conditions(&commit, Some(event_pin)),
+            vec![
+                wire::CONTINUATION_CONDITION,
+                wire::EVENT_CONDITION,
+                wire::FLOOR_CONDITION
+            ]
+        );
+
+        let snapshot_pin = Continuation {
+            previous: EventSequence(4),
+            via_snapshot: true,
+        };
+        assert_eq!(
+            conditions(&commit, Some(snapshot_pin)),
+            vec![wire::EVENT_CONDITION, wire::PINNED_FLOOR_CONDITION],
+            "no event check: compaction may delete the head event the snapshot covers"
+        );
+
+        // A stream creating itself carries neither.
+        assert_eq!(
+            conditions(&commit, None),
+            vec![wire::EVENT_CONDITION, wire::FLOOR_CONDITION]
+        );
+
+        // A later snapshot put pins through the snapshot too.
+        let with_snapshot = Commit::new("pin-a", commit.events.clone())
+            .with_snapshot(crate::NewSnapshot::new("account", EventSequence(2), "{}"));
+        assert_eq!(
+            conditions(&with_snapshot, Some(snapshot_pin)),
+            vec![wire::EVENT_CONDITION, wire::PINNED_NEXT_SNAPSHOT_CONDITION]
+        );
     }
 
     #[test]

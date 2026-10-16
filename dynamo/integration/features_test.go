@@ -154,7 +154,7 @@ func Test_FeatureMarker_CommitRefusesUnsupportedFeature(t *testing.T) {
 	enforcing := repo.WithFeatureMarker(marker)
 
 	id := evt.EntityID("acct-1")
-	commitOne(ctx, t, enforcing, id, 1)
+	commitOne(ctx, t, enforcing, id, 0)
 
 	// A Rust service declares the journal extension; this writer supports no extensions. The
 	// declaration runs through its own marker instance, the way an independent writer would.
@@ -166,7 +166,7 @@ func Test_FeatureMarker_CommitRefusesUnsupportedFeature(t *testing.T) {
 
 	other := evt.EntityID("acct-2")
 	serialized, serr := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: other, Value: "v"}},
-		1, other, evt.NewMetadata(ctx, aws.String("us-west-2")))
+		0, other, evt.NewMetadata(ctx, aws.String("us-west-2")))
 	require.NoError(t, serr)
 
 	err = enforcing.Commit(ctx, evt.SerializedResult{Events: serialized})
@@ -188,7 +188,7 @@ func Test_FeatureMarker_ChangedManifestRetries(t *testing.T) {
 		repo.FeatureMarker(evt.SupportedFeatures{"journal": 1}))
 
 	id := evt.EntityID("acct-1")
-	commitOne(ctx, t, enforcing, id, 1)
+	commitOne(ctx, t, enforcing, id, 0)
 
 	// A set change (no feature change) bumps the version the same way.
 	_, err := marker.Declare(ctx, func(m *evt.FeatureManifest) {
@@ -224,7 +224,7 @@ func Test_FeatureMarker_CompactBelowRefusesHistoryDependent(t *testing.T) {
 
 	id := evt.EntityID("acct-1")
 	metadata := evt.NewMetadata(ctx, aws.String("us-west-2"))
-	serialized, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 1, id, metadata)
+	serialized, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 0, id, metadata)
 	require.NoError(t, err)
 
 	payload := []byte(`{"id":"acct-1","value":"v"}`)
@@ -254,7 +254,7 @@ func Test_Namespaces_EnumerationSkipsEngineRows(t *testing.T) {
 	repo, marker := newIsolatedEventLog(ctx, t)
 
 	id := evt.EntityID("acct-1")
-	commitOne(ctx, t, repo, id, 1)
+	commitOne(ctx, t, repo, id, 0)
 
 	// The engine writes the feature marker into the reserved namespace.
 	_, err := marker.Declare(ctx, func(m *evt.FeatureManifest) {
@@ -312,7 +312,7 @@ func Test_Namespaces_ReservedWritePathsRefused(t *testing.T) {
 	for _, id := range reserved {
 		metadata := evt.NewMetadata(ctx, aws.String("us-west-2"))
 		serialized, serr := evt.SerializeEvents(
-			[]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 1, id, metadata)
+			[]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 0, id, metadata)
 		require.NoError(t, serr)
 
 		err := repo.Commit(ctx, evt.SerializedResult{Events: serialized})
