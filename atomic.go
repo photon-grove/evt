@@ -315,6 +315,7 @@ func CommitMetadata(metadata Metadata) Metadata {
 // commit's event puts, snapshot puts, floor checks, and fence checks. Backend projector groups
 // that carry operations must additionally supply their item sizes through
 // SizedTransactionGroup, because an opaque group cannot safely bypass commit preflight.
+// PreflightCommit adds those group sizes, so every backend budgets projector operations alike.
 func TransactionItemSizes(result SerializedResult) ([]int, error) {
 	return TransactionItemSizesWithTTL(result, nil)
 }
@@ -382,14 +383,55 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 	return sizes, nil
 }
 
+// SizedTransactionGroup is a TransactionGroup that reports the DynamoDB-encoded size of each of
+// its operations, so a backend's commit preflight budgets it exactly like DynamoDB does.
+type SizedTransactionGroup interface {
+	TransactionGroup
+
+	// OperationSizes returns one encoded size in bytes per operation, Len() entries in all.
+	OperationSizes() []int
+}
+
+// ProjectorOperationSizes returns one budget entry per projector operation the result carries:
+// the group's reported sizes when it is a SizedTransactionGroup, otherwise zero bytes per
+// operation. The action count is exact either way, which is what makes CommitTooLarge fire at the
+// same boundary on every backend.
+func ProjectorOperationSizes(result SerializedResult) []int {
+	var sizes []int
+
+	for _, group := range result.Transaction {
+		if group == nil {
+			continue
+		}
+
+		count := group.Len()
+		reported, sized := group.(SizedTransactionGroup)
+		var operationSizes []int
+		if sized {
+			operationSizes = reported.OperationSizes()
+		}
+
+		for i := range count {
+			size := 0
+			if i < len(operationSizes) {
+				size = operationSizes[i]
+			}
+			sizes = append(sizes, size)
+		}
+	}
+
+	return sizes
+}
+
 // PreflightCommit validates a commit's shared budget — the event puts, snapshot puts, floor
-// checks, fence checks, and control checks — before any backend write. Backends add the sizes of
-// the additional items they write (projector operations) before checking the total.
+// checks, fence checks, control checks, and projector operations — before any backend write. A
+// backend that writes projector operations itself (DynamoDB sizes its own items exactly) does not
+// call it; a backend that has none to write refuses them before this point.
 func PreflightCommit(result SerializedResult) error {
 	sizes, err := TransactionItemSizes(result)
 	if err != nil {
 		return err
 	}
 
-	return CommitBudget(sizes)
+	return CommitBudget(append(sizes, ProjectorOperationSizes(result)...))
 }

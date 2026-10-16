@@ -268,6 +268,10 @@ func (repo Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := evt.CheckProjectorOperations(result); err != nil {
+		return err
+	}
+
 	if len(result.Events) == 0 {
 		return fmt.Errorf("mem: commit with snapshot requires at least one event")
 	}

@@ -156,10 +156,21 @@ replaces the contracts that require them:
   (the built-in `policy.Classify` only recognizes `ClassifiedError`, so a custom classifier
   is the only supported way to mark raw backend errors transient)
 
-Two v0.9.0 changes are source-breaking without a deprecation window:
+Three v0.9.0 changes are source-breaking without a deprecation window:
 
 - `evt.Metadata` is no longer comparable with `==` — the new `Extensions` map (C6) makes the
   struct non-comparable. Use `evt.Metadata.Equal` instead; it treats nil and empty maps as equal.
+- `evt.SerializedResult` gained `Snapshots` and `Fences` (C1/C2), growing from two exported fields
+  to four, so an unkeyed struct literal such as `evt.SerializedResult{events, transaction}` no
+  longer compiles. Use keyed fields; the zero value of the new ones keeps the single-stream shape:
+
+  ```go
+  result := evt.SerializedResult{
+      Events:      events,
+      Transaction: transaction,
+  }
+  ```
+
 - `evt.Repository` now requires `GetRecentEvents(ctx context.Context, entityID evt.EntityID,
   limit int) ([]evt.SerializedEvent, error)` (C8). Add it to custom backends and mocks. Return
   a typed `*evt.InvalidArgumentError` for `limit < 1` before any I/O (match it with

@@ -343,8 +343,14 @@ func (repo *Repository) CommitStream(
 		}
 
 		// The batch path writes events and projector operations only. An entry carrying
-		// snapshots or read fences fails closed instead of having them silently dropped.
+		// snapshots or read fences fails closed instead of having them silently dropped, and
+		// projector operations need a backing event in the same entry (ADR-0012).
 		if err = evt.CheckBatchEntry(serializedResult); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		if err = evt.CheckProjectorOperations(serializedResult); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -421,6 +427,10 @@ func (repo *Repository) CommitWithSnapshot(
 	currentSnapshot evt.EventSequence,
 ) error {
 	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
+	if err := evt.CheckProjectorOperations(result); err != nil {
 		return err
 	}
 

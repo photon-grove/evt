@@ -18,6 +18,7 @@ func Test_RepositoryConformance(t *testing.T) {
 		SupportsSnapshots:             true,
 		EnforcesOptimisticConcurrency: false,
 		SupportsTransactions:          true,
+		ProjectorGroup:                func(operations int) evt.TransactionGroup { return projectorGroup{size: operations} },
 		DeclareRetention: func(ctx context.Context, repo evt.Repository, entityType evt.EntityType) error {
 			memRepo, ok := repo.(*mem.Repository)
 			if !ok {
@@ -31,4 +32,15 @@ func Test_RepositoryConformance(t *testing.T) {
 			return err
 		},
 	})
+}
+
+// projectorGroup is a backend-neutral projector group of a given number of operations.
+type projectorGroup struct{ size int }
+
+func (g projectorGroup) Len() int                           { return g.size }
+func (projectorGroup) StorageType() evt.StorageType         { return "conformance" }
+func (projectorGroup) TransactionType() evt.TransactionType { return "conformance" }
+func (projectorGroup) HandleError(err error, _ int) error   { return err }
+func (g projectorGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
+	return g, nil
 }

@@ -47,6 +47,13 @@ type SuiteOptions struct {
 	// types on every backend, so a missing hook fails the suite instead of skipping the case.
 	// The declaration refuses every later fence for that type.
 	DeclareRetention func(ctx context.Context, repo evt.Repository, entityType evt.EntityType) error
+
+	// ProjectorGroup, when non-nil, builds a projector transaction group of exactly the given
+	// number of operations that the backend under test accepts, enabling the projector-budget
+	// case: every backend that executes projector operations counts each one in the shared
+	// 100-action budget, so CommitTooLarge fires at the same boundary. A backend that refuses
+	// projector operations outright (Go PostgreSQL until E2.6) leaves it nil.
+	ProjectorGroup func(operations int) evt.TransactionGroup
 }
 
 // RunRepositorySuite runs the full backend-neutral contract suite against the repository produced by
@@ -141,6 +148,12 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		if opts.SupportsSnapshots {
 			t.Run("FenceCompactionABA", func(t *testing.T) {
 				testFenceCompactionABA(t, newRepo())
+			})
+		}
+
+		if opts.ProjectorGroup != nil {
+			t.Run("CountsProjectorOperationsInTheBudget", func(t *testing.T) {
+				testProjectorBudget(t, newRepo(), opts.ProjectorGroup)
 			})
 		}
 
@@ -1007,4 +1020,31 @@ func testRejectsFirstSnapshotAboveOne(t *testing.T, repo evt.Repository) {
 			EntityType: "test", EntityID: idA, Sequence: 1, EventSequence: 2, Payload: []byte(`{}`),
 		}},
 	}))
+}
+
+func testProjectorBudget(t *testing.T, repo evt.Repository, group func(int) evt.TransactionGroup) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	// The feature-marker check, one event put, and the floor check leave 97 actions for
+	// projector operations: 97 fit exactly and 98 do not.
+	idFits, idOver := evt.EntityID(ns+"-fits"), evt.EntityID(ns+"-over")
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events:      serialize(t, idFits, "test", 0, &test.EntityCreated{ID: idFits, Value: "fits"}),
+		Transaction: evt.Transaction{group(97)},
+	}))
+
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Events:      serialize(t, idOver, "test", 0, &test.EntityCreated{ID: idOver, Value: "over"}),
+		Transaction: evt.Transaction{group(98)},
+	})
+	var tooLarge *evt.CommitTooLargeError
+	require.ErrorAs(t, err, &tooLarge)
+	require.Equal(t, 101, tooLarge.Items)
+
+	stored, err := repo.GetEvents(ctx, idOver)
+	require.NoError(t, err)
+	require.Empty(t, stored, "an oversized commit is refused before any write")
 }

@@ -109,3 +109,57 @@ func TestPreflightCommit_BudgetsOnlyEmittedActions(t *testing.T) {
 	require.ErrorAs(t, evt.PreflightCommit(evt.SerializedResult{Events: events(99)}), &tooLarge)
 	require.Equal(t, 101, tooLarge.Items)
 }
+
+type sizedGroup struct{ sizes []int }
+
+func (g sizedGroup) Len() int                           { return len(g.sizes) }
+func (sizedGroup) StorageType() evt.StorageType         { return "test" }
+func (sizedGroup) TransactionType() evt.TransactionType { return "test" }
+func (sizedGroup) HandleError(err error, _ int) error   { return err }
+func (g sizedGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
+	return g, nil
+}
+func (g sizedGroup) OperationSizes() []int { return g.sizes }
+
+type opaqueGroup struct{ size int }
+
+func (g opaqueGroup) Len() int                           { return g.size }
+func (opaqueGroup) StorageType() evt.StorageType         { return "test" }
+func (opaqueGroup) TransactionType() evt.TransactionType { return "test" }
+func (opaqueGroup) HandleError(err error, _ int) error   { return err }
+func (g opaqueGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
+	return g, nil
+}
+
+func TestProjectorOperationSizes_OneEntryPerOperation(t *testing.T) {
+	result := evt.SerializedResult{Transaction: evt.Transaction{
+		sizedGroup{sizes: []int{10, 20}},
+		nil,
+		opaqueGroup{size: 3},
+	}}
+
+	require.Equal(t, []int{10, 20, 0, 0, 0}, evt.ProjectorOperationSizes(result))
+	require.Equal(t, 5, evt.ProjectorOperationCount(result))
+}
+
+func TestPreflightCommit_CountsProjectorOperations(t *testing.T) {
+	event := evt.SerializedEvent{
+		ID: "a:1", Sequence: 1, Type: "t:created", Version: 1, EntityID: "a", EntityType: "t", Payload: []byte(`{}`),
+	}
+
+	// Marker check, one event, and the floor check leave 97 actions for projector operations.
+	require.NoError(t, evt.PreflightCommit(evt.SerializedResult{
+		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{opaqueGroup{size: 97}},
+	}))
+
+	var tooLarge *evt.CommitTooLargeError
+	require.ErrorAs(t, evt.PreflightCommit(evt.SerializedResult{
+		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{opaqueGroup{size: 98}},
+	}), &tooLarge)
+	require.Equal(t, 101, tooLarge.Items)
+
+	// A sized group's bytes count too: one operation over the per-item limit is refused.
+	require.ErrorAs(t, evt.PreflightCommit(evt.SerializedResult{
+		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{sizedGroup{sizes: []int{400_000}}},
+	}), &tooLarge)
+}

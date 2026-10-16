@@ -505,6 +505,14 @@ func (repo *Repository) CommitWithSnapshot(
 		return err
 	}
 
+	if err := evt.CheckProjectorOperations(res); err != nil {
+		return err
+	}
+
+	if err := evt.CheckProjectorOperationsSupported("postgres", res); err != nil {
+		return err
+	}
+
 	if len(res.Events) == 0 {
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
 	}
