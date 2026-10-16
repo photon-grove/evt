@@ -225,6 +225,19 @@ enum Outcome<A> {
 // present → return it (same digest) or reject (different digest); absent → safe to retry.
 ```
 
+_Errata (E2.4/E3.4):_ the API shapes above are illustrative; the shipped ones keep the existing
+entry points compiling. Go adds `Store.ExecuteWithOutcome` (returning `*CommandOutcome`, with
+`Accepted`/`Rejected`/`NoOp`, `Response`, `Rejection`, and `Replayed`) rather than changing
+`Store.Execute`, which on an outcomes store reports a rejection as `*RejectionError`;
+`prior_outcome` is `IdempotencyKeyReuseError.Prior`, and multi-stream commands use
+`Store.BeginCommand` then `Transaction.Complete`/`Reject`. Rust adds
+`Store::execute_with_outcome`/`execute_with_response` and `Transaction::begin_command`
+→ `commit_with_outcome`/`reject`, returning `CommandOutcome<E>` rather than a bare enum. An
+outcome-only commit (a persisted rejection or an accepted no-op) is the feature-marker check plus,
+for a transaction, the fence checks of its reads, then the outcome put; the stale-fence
+rejection omits the failed fences. A failed outcome put outranks every other failed item except the
+feature-marker check. See the storage spec's Command Outcomes section.
+
 ### C4 — Rejections
 
 **Current state.** Go's command errors are ad-hoc sentinel types (`NotFoundError`,
