@@ -465,6 +465,7 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 			if serr != nil {
 				return fixtures, fmt.Errorf("%s: %w", scenario.Name, serr)
 			}
+			sibling.DynamoItems = []map[string]any{}
 			for _, item := range fake.Items(string(siblingID)) {
 				sibling.DynamoItems = append(sibling.DynamoItems, DynamoItemJSON(item))
 			}

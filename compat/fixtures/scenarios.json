@@ -2529,7 +2529,7 @@
           "sequence": 0,
           "events": [],
           "snapshot": null,
-          "dynamoItems": null
+          "dynamoItems": []
         },
         {
           "entityId": "compat-fixture-read-fences-watched",
