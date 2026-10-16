@@ -357,7 +357,11 @@ PostgreSQL the same classification applies to the feature-marker `SELECT` and th
 assertion.
 
 A failed outcome put is **not** one of these conflicts. It means another writer already recorded
-an outcome for this command ID, and re-preparing the command as a conflict can never resolve it:
+an outcome for this command ID, and re-preparing the command as a conflict can never resolve it.
+It **outranks every other failed item** except the feature-marker check: when the same
+cancellation also reports a failed event put, floor check, or fence, the commit is classified as an
+outcome conflict (`OutcomeConflict`), because the row is where the answer lives. PostgreSQL
+reports the same classification for a unique violation (`23505`) on the outcomes table:
 every attempt begins by reading the outcome row by command ID, and a commit whose outcome put
 failed resolves through that row — the winner of the race has by then written it, so the next
 attempt's read returns the stored outcome (same digest) or `IdempotencyKeyReuse` (different
@@ -666,7 +670,8 @@ there is no reserved-then-resolved intermediate state.
 
 The row has no snapshot, no `ttl`, and never compacts. `response` is base64 rather than raw text
 so a response of arbitrary bytes round-trips exactly in both languages; the decoded bytes are the
-stored response returned to a retried command. `events` is a JSON array of event IDs
+stored response returned to a retried command. An empty response is no response: the attribute is
+absent (PostgreSQL: `NULL`), and a reader returns no response bytes either way. `events` is a JSON array of event IDs
 (`{entityId}:{sequence}` strings) encoded with the shared JSON rules, in ascending order by
 stream ID bytewise, then by sequence — the same order as the transaction's event puts.
 
@@ -835,7 +840,19 @@ the rejected example above.
 
 A store with outcomes enabled **requires a command ID** on every command; a missing ID is a
 programmer error returned before the commit — no outcome row, no events. Stores built without
-outcomes keep the older behavior.
+outcomes keep the older behavior. The older load-time duplicate window still runs after the
+outcome read misses, and only for command IDs recorded by events with no outcome row (pre-v0.9
+commands); a command executed with outcomes enabled always has its row.
+
+**Outcome-only commits and their checks.** An accepted no-op, a persisted rejection, and an
+outcome-only command write no event, snapshot, or floor item. Their transaction is the
+feature-marker check, then — for a multi-stream transaction — the fence checks for the streams it
+read (engine-filled and caller-stamped, in the pinned order), then the outcome put, so a
+rejection or a no-op is recorded only if the state it was decided on still holds: a moved
+engine-filled fence is an ordinary retryable conflict and records nothing. The
+single-aggregate shortcut reads one stream without a fence (it never fenced a read), so its
+outcome-only commit is the marker check and the outcome put. The one exception is the
+stale-fence rejection ([Fence-Aware Retry](#fence-aware-retry)), which omits the failed fences.
 
 ### Ambiguous-write recovery
 
@@ -850,6 +867,17 @@ whether the transaction applied), re-read the outcome row by command ID (get
 
 The digest is the pre-execution digest defined above, computed from the command's identity alone,
 so recovery never re-prepares the command to compute it.
+
+The engine performs this recovery itself. An absent row is returned as an `AmbiguousWrite` error
+marked `not applied` (Go `*AmbiguousWriteError{NotApplied: true}`, Rust `Error::AmbiguousWrite {
+not_applied: true }`), which is retryable: the same command ID runs again from its outcome
+pre-check. If the recovery read itself fails, the error is returned `AmbiguousWrite` without the
+mark. The recovery read does not depend on the caller's cancellation: a context cancelled while the
+commit was in flight is the usual reason the result is unknown. Which failures are indeterminate:
+a commit that carries an outcome and fails with a timeout, a lost connection or response, a server
+fault, or a cancelled context; a definitive refusal (a cancelled transaction with known reasons,
+throttling, a client-side validation or authorization error, a database error at statement or
+`COMMIT` time) is not.
 
 `IdempotencyKeyReuse` is returned as an error and is **not stored**: the existing outcome row
 belongs to the first command that claimed the ID, and nothing overwrites it.
@@ -1694,14 +1722,21 @@ and the live interleaved runs (`scripts/compat-integration.sh dynamo|postgres`) 
 steps on real backends. **E2.8** (Go conformance suite + fixtures) and **E3.8** (Rust conformance
 suite + the live runs) must implement every scenario in this list; the names are the shared keys
 in `compat/scenarios.json`. The `metadata-extensions` case is implemented for C6 (E2.1/E3.1)
-in the current single-stream harness; it does not yet enable outcomes. Once C3 lands, both writers
-run these scenarios with outcomes enabled and a command ID on every step. Some scenarios need
-new ops in the harness (`declareFeature`, `acquireRebuildLock`,
-`releaseRebuildLock`, `forceReleaseRebuildLock`, `resolveOutcome`, `readLatest`, `rebuildViews`, a
-multi-stream execute, and `injectCommitFault`, which makes a commit apply but the caller observe an
-indeterminate error, so `outcomes-ambiguous` exercises the real ambiguous path rather than only
-the re-read branches); [`compat/README.md`](../../compat/README.md) grows the op table when they
-land.
+in the current single-stream harness; it does not enable outcomes. The four `outcomes-*` scenarios
+are implemented with C3/C4 (E2.4/E3.4): they set `"outcomes": true`, so both writers run them on
+stores with outcomes enabled and a command ID on every step, and the fixtures pin each stored
+outcome row and the `TransactWriteItems` request order of every step. The other scenarios are
+unchanged. The harness grew the ops and fields the outcomes scenarios need (`resolveOutcome`, an
+outcome-only commit, and `injectCommitFault`, which makes a commit apply — or drop — while the
+caller observes an indeterminate error, so `outcomes-ambiguous` exercises the real ambiguous path
+rather than only the re-read branches); the remaining scenarios need more (`declareFeature`,
+`acquireRebuildLock`, `releaseRebuildLock`, `forceReleaseRebuildLock`, `readLatest`,
+`rebuildViews`, a multi-stream execute). [`compat/README.md`](../../compat/README.md) holds the op
+table. The harness scopes command IDs to the run and scenario, because outcome rows are global to
+the table, and uses a digest that replaces the run name in the declared stream IDs, so a command
+digests the same in every run and the committed digests hold against live backends.
+`compat/fixtures/outcomes.json` pins the digest vectors (canonical bytes and digest) and the
+encodings of the outcome rows (DynamoDB item, its budgeted size, PostgreSQL row).
 
 | Scenario               | Covers | What it pins                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ---------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -41,6 +41,12 @@ lockstep with the Go types that read and write it:
   sequence is at or below the entity's snapshot `event_sequence`.
   An `entity_type` index backs `StreamFilter` narrowing.
 - `evt_snapshots` — one durable snapshot per entity, keyed by `entity_id`.
+- `evt_events__evt_command_outcomes` — one row per command (v0.9, C3), keyed by `command_id`:
+  `status`, the identity `digest`, the stored `response`, the `events` the commit wrote, and a
+  rejection's `rejection` and `code`. The row is inserted last in the commit transaction; a unique
+  violation means another writer recorded the command first and surfaces as
+  `*evt.OutcomeConflictError`, which the store resolves by reading the row. Its name derives from the
+  events table through the reserved `__evt_` infix. Use `Store.WithOutcomes` to record outcomes.
 
 Every `SerializedResult` is committed inside a single SQL transaction, so events
 and their snapshot are never observable apart.

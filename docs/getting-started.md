@@ -166,7 +166,8 @@ causation (`CausationID`), and application-specific `Extensions`. The command ID
 practical key to **idempotent retries**: set it from a request ID, job ID, or
 message ID, and a duplicate attempt fails as a
 [`DuplicateCommandError`](concepts.md#command) instead of recording the fact
-twice.
+twice. For durable, global idempotency that also stores the response, see
+[command outcomes](../README.md#command-outcomes-and-rejections-v09-c3c4).
 
 ```go
 md := evt.NewMetadata(ctx, nil,

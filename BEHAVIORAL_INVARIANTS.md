@@ -274,6 +274,58 @@ error before any write and is never split.
 - A written stream's event put at `head + 1` supersedes its own fence; no fence check is emitted
   for it
 
+### Command Outcomes (v0.9, C3)
+
+- A store with outcomes enabled requires a command ID on every command (a missing one is an
+  `ErrInvalidArgument` returned before any read or write) of at most 512 UTF-8 bytes
+  (`CommandIDTooLongError` / `Error::CommandIdTooLong`, before even the outcome key is built)
+- The outcome row `command-outcome#<id>` (`sk = 1`; PostgreSQL `{events}__evt_command_outcomes`) is
+  written once, in its final state, inside the commit transaction as its last action, conditioned
+  on `attribute_not_exists(pk)`. It has no snapshot and no `ttl`, never compacts, and is the one
+  engine-written row the reserved `command-outcome#` namespace exempts from the entity-write refusal
+- Every attempt reads the outcome row first with a strongly consistent read (DynamoDB
+  `ConsistentRead = true` whatever the repository's read-consistency setting): the same identity
+  digest returns the stored outcome (events, response, rejection) without running the handler; a
+  different digest is `IdempotencyKeyReuse` carrying the stored outcome, and is never stored. The
+  stored digest is computed before execution from the command's identity alone (SHA-256 over the
+  type, the sorted declared target streams, the canonical payload JSON, and the principal)
+- This check covers command IDs folded into snapshots and compacted away; on an upgraded log the
+  load-time event window remains the only guard for pre-v0.9 IDs
+- A lost outcome put is never a generic optimistic-concurrency conflict and is never resolved by
+  re-preparing the command: it is `OutcomeConflict`, and it outranks every other failed item in the
+  commit's classification, so the engine resolves it by re-reading the row. An ordinary conflict
+  of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
+  returns the winner's outcome
+- After an indeterminate commit failure (timeout, lost connection, server fault) the engine
+  re-reads the row: present with the same digest returns the stored outcome, a different digest is
+  `IdempotencyKeyReuse`, absent proves the commit did not apply and is returned as a retryable
+  `AmbiguousWrite` with `NotApplied`. The handler never re-runs during recovery, and the read does
+  not depend on the caller's cancelled context
+- The response (raw bytes, stored as padded base64) and the encoded rejection are each at most
+  65,536 bytes (`OutcomeTooLarge`, before any write); an empty response is stored as no response
+- The outcome item counts in the commit budget (one action and its encoded size); an outcome-only
+  commit is the feature-marker check plus the outcome put
+- Stores without outcomes keep today's behavior, and `CommitStream` / bare `Store.Commit` refuse
+  to carry or skip an outcome
+
+### Rejections and the Accepted No-Op (v0.9, C4)
+
+- A domain rejection is `Rejection { code, message, details }`, stored as the JSON
+  `{"code":…,"message":…,"details":…}` (`details` an object or `null`) with the code repeated in
+  the row's `code` attribute. Engine codes are `not-found`, `bad-command`, and `stale-fence`;
+  application codes are free-form. A rejected outcome is terminal for its digest and a retried
+  command replays it verbatim without running the handler
+- Only domain rejections are durable. Bad events, encoding errors, and storage failures are errors
+  that write no outcome, so a retry after the fix starts clean. An oversized rejection fails with
+  `OutcomeTooLarge` and writes nothing
+- A command that produces zero events is an accepted outcome with no events (still storing any
+  response), not an error. Outcome-only commits carry the feature-marker check and, for a
+  multi-stream transaction, the fence checks of its reads; the single-aggregate shortcut has no
+  fences to check
+- A failed caller-stamped fence is persisted as a `stale-fence` rejection by an outcome-only
+  transaction that omits the failed fences (the old ID stays terminal; the remedy is a new command
+  ID). Engine-filled fence conflicts and event, floor, or snapshot conflicts are never rejections
+
 ## Snapshot Logic
 
 ### Snapshot Timing
@@ -650,6 +702,6 @@ services can append to and load the same streams in DynamoDB or PostgreSQL. See
   - PostgreSQL `metadata` is `jsonb` and must be compared as JSON.
 
   The duplicate-command window (events after the latest snapshot) is the same in both languages.
-  In v0.9 it is superseded by command outcomes, but on an upgraded log the window is the only
+  In v0.9 it is superseded by command outcomes ([above](#command-outcomes-v09-c3)), but on an upgraded log the window is the only
   guard for pre-v0.9 command IDs, which have no outcome rows — a pre-v0.9 duplicate beyond the
   latest snapshot is not detected (a documented upgrade limitation; no backfill).

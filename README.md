@@ -133,7 +133,7 @@ replacement where one exists, and saying plainly where the feature is removed wi
 - `evt/publishers`, `BudgetController`, and `stream.SNSPublisher`/FIFO (K5) — removed without an
   in-library replacement: read the DynamoDB Stream directly (`projectors.NewLambdaHandler`) or
   publish with your own handler; the envelope format stays (it is the cross-language wire format).
-  Command outcomes are planned, not shipped
+  Command outcomes (C3/C4) replace the per-entity duplicate window and ship in v0.9.0, below
 - the `WithFactory` helpers (including `snapshots.Store`'s), `ByCommandID`, `dynamo.Delete`,
   `dynamo/mock`, the `do.go` DI providers, `dynamo.ExpressionStreamer` (and the concrete
   `*dynamo.Repository` `...ByExpression` methods), and handler-attached
@@ -160,9 +160,10 @@ Three v0.9.0 changes are source-breaking without a deprecation window:
 
 - `evt.Metadata` is no longer comparable with `==` — the new `Extensions` map (C6) makes the
   struct non-comparable. Use `evt.Metadata.Equal` instead; it treats nil and empty maps as equal.
-- `evt.SerializedResult` gained `Snapshots` and `Fences` (C1/C2), growing from two exported fields
-  to four, so an unkeyed struct literal such as `evt.SerializedResult{events, transaction}` no
-  longer compiles. Use keyed fields; the zero value of the new ones keeps the single-stream shape:
+- `evt.SerializedResult` gained `Snapshots` and `Fences` (C1/C2) and `Outcome` (C3), growing from two
+  exported fields to five, so an unkeyed struct literal such as
+  `evt.SerializedResult{events, transaction}` no longer compiles. (`evt.CommandResult` also gained
+  a `Response` field; use keyed literals there too.) Use keyed fields; the zero value of the new ones keeps the single-stream shape:
 
   ```go
   result := evt.SerializedResult{
@@ -194,6 +195,62 @@ continuation check on the stream's head); both drop by one when the rebuild-lock
 starts being emitted. A commit whose first sequence skips past the stream's stored head is refused
 with `*evt.SequenceGapError`. The exact contract is specified
 in the [storage format](docs/spec/storage-format.md#writes).
+
+### Command outcomes and rejections (v0.9, C3/C4)
+
+Enable durable command outcomes on a store with `WithOutcomes`. Every command then needs a command
+ID and is recorded in the same transaction as its events, on a reserved `command-outcome#<id>`
+row written once, in its final state. A retried command returns the original answer — including
+the response bytes your handler set in `CommandResult.Response` — instead of running twice, and
+the check covers IDs that were long since folded into a snapshot:
+
+```go
+store := snapshots.NewStore(repo, 5).WithOutcomes()
+
+outcome, err := store.ExecuteWithOutcome(ctx, account, id, &Deposit{Cents: 500},
+    evt.NewMetadata(ctx, nil, evt.WithCommandID("req-123")))
+switch {
+case errors.Is(err, evt.ErrIdempotencyKeyReuse):
+    // "req-123" already belongs to a different command (a different identity digest)
+case err != nil:
+    // an internal failure: nothing was recorded, so the same call can be retried
+case outcome.Rejected():
+    _ = outcome.Rejection // {Code, Message, Details}, replayed verbatim on a retry
+default:
+    _ = outcome.Response // the stored response, whether just produced or replayed
+    _ = outcome.Replayed // true when the stored outcome was returned and nothing ran
+}
+```
+
+- **Identity.** A command's identity digest (SHA-256 over its type, declared target streams,
+  canonical payload JSON, and principal) is computed before it runs; the same ID with the same
+  digest replays, a different digest is `*evt.IdempotencyKeyReuseError` (carrying the stored
+  outcome). Supply your own with `snapshots.WithDigester`.
+- **Rejections (C4).** A handler error that implements `evt.Rejectioner` (`NotFoundError` and
+  `BadCommandError` do, with the engine codes `not-found` and `bad-command`) is persisted as a
+  rejected outcome. Any other error — a bad event, an encoding or storage failure — is an internal
+  failure: returned, nothing recorded, so a retry after the fix starts clean. The error-returning
+  `Execute` reports a rejection as `*evt.RejectionError` (`errors.Is(err, evt.ErrRejected)`).
+- **Accepted no-op.** A command that produces no events (or returns `NoOpError`) is recorded as
+  accepted with no events — a durable, observable outcome rather than an error.
+- **Ambiguous writes.** If a commit's result is unknown (a timeout, a lost connection) the store
+  re-reads the outcome row instead of re-running the command: a stored outcome is returned; an
+  absent row is `*evt.AmbiguousWriteError` with `NotApplied` set (`errors.Is(err,
+  evt.ErrAmbiguousWrite)`), which is transient, so retrying the same command ID is safe. A lost
+  race on the outcome row is resolved the same way, never as a generic conflict.
+  `Store.ResolveCommand` runs the same read for a caller that lost the result entirely.
+- **Multi-stream commands** use `Store.BeginCommand`, which reads the outcome row first, then the
+  usual `Read`/`Append`/`Fence`, then `Transaction.Complete` (accepted, or a no-op when nothing was
+  appended) or `Transaction.Reject`. A failed caller-stamped fence is persisted as a `stale-fence`
+  rejection; the remedy is a new command ID.
+- Bounds checked before any write: a command ID is at most 512 UTF-8 bytes
+  (`*evt.CommandIDTooLongError`), and the response and the encoded rejection are each at most
+  64 KiB (`*evt.OutcomeTooLargeError`). The outcome row counts in the commit budget.
+- A repository opts in by implementing `evt.OutcomeRepository`; the in-memory, DynamoDB, and
+  PostgreSQL repositories do (PostgreSQL keeps the rows in `{events}__evt_command_outcomes`, created
+  by `EnsureSchema`). On an upgraded log, command IDs recorded before outcomes were enabled keep
+  only the old window check; see the [storage format](docs/spec/storage-format.md#command-outcomes).
+  `CommitStream` and the bare `Store.Commit` do not record outcomes and refuse them.
 
 A custom `Repository` written before v0.9 compiles unchanged but now receives
 `SerializedResult.Snapshots` and `.Fences`. An implementation that cannot honor them atomically

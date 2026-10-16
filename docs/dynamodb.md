@@ -57,11 +57,18 @@ The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C
 ```text
 items = Σ(events per written stream + 1 snapshot/floor + 1 continuation if first sequence > 1)
       + 2 × read-only fenced streams
-      + optional outcome put
+      + outcome put (when the store records command outcomes)
       + feature-marker check
       + rebuild-lock check (once C10 emits it)
       + projector operations
 ```
+
+With command outcomes enabled (C3), the outcome row is the last action of every commit and counts
+as one more item, so a single-stream commit that creates its stream leaves **97** event/projector
+operations (96 when it appends to an existing stream). The outcome is a `Put` on
+`(command-outcome#<id>, sk = 1)` conditioned on `attribute_not_exists(pk)`; it is read back with a
+strongly consistent `GetItem`, whatever the repository's read-consistency setting. An outcome-only
+commit (an accepted no-op or a persisted rejection) is the feature-marker check plus that put.
 
 The rebuild-lock check (C10) is **not implemented yet** and is not budgeted; when C10 starts
 emitting it, the two capacities above drop by one, to **97** and **96**.
