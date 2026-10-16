@@ -50,6 +50,7 @@ func Test_RepositoryConformance(t *testing.T) {
 		SupportsSnapshots:             true,
 		EnforcesOptimisticConcurrency: true,
 		SupportsTransactions:          true,
+		SupportsOutcomes:              true,
 		ProjectorGroup: func(operations int) evt.TransactionGroup {
 			items := make([]types.TransactWriteItem, 0, operations)
 			for i := range operations {

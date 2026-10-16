@@ -18,6 +18,7 @@ func Test_RepositoryConformance(t *testing.T) {
 		SupportsSnapshots:             true,
 		EnforcesOptimisticConcurrency: false,
 		SupportsTransactions:          true,
+		SupportsOutcomes:              true,
 		ProjectorGroup:                func(operations int) evt.TransactionGroup { return projectorGroup{size: operations} },
 		DeclareRetention: func(ctx context.Context, repo evt.Repository, entityType evt.EntityType) error {
 			memRepo, ok := repo.(*mem.Repository)
