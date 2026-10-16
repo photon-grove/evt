@@ -17,6 +17,7 @@ photon-evt = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+futures-core.workspace = true
 tokio.workspace = true
 aws-config = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }

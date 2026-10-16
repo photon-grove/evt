@@ -1025,6 +1025,8 @@ fn transient(err: &tokio_postgres::Error) -> bool {
     })
 }
 
+mod enumerate;
+
 #[cfg(test)]
 mod tests {
     use deadpool_postgres::Manager;
