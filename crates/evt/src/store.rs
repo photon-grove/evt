@@ -368,7 +368,7 @@ pub struct Loaded<A> {
 }
 
 impl<A: Aggregate> Loaded<A> {
-    fn new(entity_id: EntityId) -> Self {
+    pub(crate) fn new(entity_id: EntityId) -> Self {
         Self {
             entity_id,
             aggregate: A::default(),
@@ -379,7 +379,7 @@ impl<A: Aggregate> Loaded<A> {
     }
 
     /// Upcasts, decodes, and applies one stored event.
-    fn replay(&mut self, stored: SerializedEvent) -> Result<(), Error> {
+    pub(crate) fn replay(&mut self, stored: SerializedEvent) -> Result<(), Error> {
         if stored.sequence != self.sequence.next() {
             return Err(Error::SequenceGap {
                 entity_id: self.entity_id.clone(),

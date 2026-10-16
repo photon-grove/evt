@@ -4,10 +4,13 @@
 //	evt-compat steps
 //	evt-compat step   -backend dynamo|postgres -run RUN -index N
 //	evt-compat verify -backend dynamo|postgres -run RUN
+//	evt-compat enumerate -backend dynamo|postgres -run RUN
 //
 // step executes step N of every scenario whose writer is "go", against streams the Rust driver
 // also writes to. verify checks every stream against the golden fixtures: the raw stored items or
-// rows, the events and snapshot read through the repository, and the loaded state.
+// rows, the events and snapshot read through the repository, and the loaded state. enumerate prints
+// the run's events as StreamAllEvents yields them (unfiltered and filtered by entity type), one
+// sorted line each, for the integration script to compare with the Rust driver's output.
 package main
 
 import (
@@ -18,6 +21,8 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -83,6 +88,8 @@ func main() {
 		failures, err = step(ctx, b, *run, *index)
 	case "verify":
 		failures, err = verify(ctx, b, *run)
+	case "enumerate":
+		err = enumerate(ctx, b, *run)
 	default:
 		fail("unknown command " + command)
 	}
@@ -94,6 +101,43 @@ func main() {
 	if len(failures) > 0 {
 		os.Exit(1)
 	}
+}
+
+// enumerate prints every event of the run that StreamAllEvents yields, once with a zero filter
+// and once narrowed to the account entity type, as sorted "section entity sequence type" lines.
+func enumerate(ctx context.Context, b backend, run string) error {
+	var lines []string
+
+	for _, section := range []struct {
+		name   string
+		filter evt.StreamFilter
+	}{
+		{"all", evt.StreamFilter{}},
+		{"typed", evt.StreamFilter{EntityType: compat.AccountType}},
+	} {
+		for batch := range b.repo.StreamAllEvents(ctx, section.filter) {
+			events, err := batch.Unwrap()
+			if err != nil {
+				return fmt.Errorf("stream %s: %w", section.name, err)
+			}
+
+			for _, event := range events {
+				if !strings.Contains(string(event.EntityID), run) {
+					continue
+				}
+
+				lines = append(lines, fmt.Sprintf("%s %s %d %s", section.name, event.EntityID, event.Sequence, event.Type))
+			}
+		}
+	}
+
+	sort.Strings(lines)
+
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+
+	return nil
 }
 
 func connect(ctx context.Context, name string) (backend, error) {

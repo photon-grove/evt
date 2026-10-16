@@ -27,4 +27,13 @@ done
 "$go_driver" verify -backend "$backend" -run "$run"
 "$rust_driver" verify --backend "$backend" --run "$run"
 
-echo "run ${run}: Go and Rust agree on every ${backend} stream"
+# Event-log enumeration (P3): both languages must list the same events, unfiltered and by type.
+"$go_driver" enumerate -backend "$backend" -run "$run" >"target/compat/enumerate-go-${backend}.txt"
+"$rust_driver" enumerate --backend "$backend" --run "$run" >"target/compat/enumerate-rust-${backend}.txt"
+if [ ! -s "target/compat/enumerate-go-${backend}.txt" ]; then
+  echo "run ${run}: the Go enumeration of ${backend} was empty" >&2
+  exit 1
+fi
+diff -u "target/compat/enumerate-go-${backend}.txt" "target/compat/enumerate-rust-${backend}.txt"
+
+echo "run ${run}: Go and Rust agree on every ${backend} stream and on its enumeration"

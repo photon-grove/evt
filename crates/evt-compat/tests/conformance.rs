@@ -11,14 +11,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use deadpool_postgres::Pool;
 use evt_compat::drivers;
-use photon_evt::conformance::{Add, Ledger, LedgerEvent, Suite, ViewTarget, feature_marker_cases};
+use futures_core::Stream as _;
+use photon_evt::conformance::{
+    Add, Ledger, LedgerEvent, Suite, ViewTarget, enumeration_cases, feature_marker_cases,
+};
 use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository};
 use photon_evt::wire::dynamo::DEFAULT_VIEW_SORT_KEY;
 use photon_evt::wire::postgres::ENTITY_LOCK;
 use photon_evt::{
-    Aggregate, BoxError, Commit, EntityId, Error, EventId, EventSequence, EventType, EventVersion,
-    Metadata, Projector, Repository, RetryPolicy, SerializedEvent, SerializedSnapshot, Store, json,
+    Aggregate, BoxError, Commit, EntityId, Error, EventId, EventLog, EventSequence, EventType,
+    EventVersion, Metadata, Projector, Repository, RetryPolicy, SerializedEvent,
+    SerializedSnapshot, Store, StreamFilter, json,
 };
 
 /// Reads the single-item views `ViewProjector` writes.
@@ -161,6 +165,7 @@ async fn dynamo_conforms() {
     projector_condition_failure_is_not_a_conflict(&repository).await;
     dynamo_refuses_projector_only_transactions(&repository).await;
     dynamo_legacy_reserved_reads(&repository).await;
+    dynamo_enumeration(&repository).await;
 }
 
 /// Reads the marker row back through the raw client and asserts it is byte-for-byte the item the
@@ -651,6 +656,7 @@ async fn postgres_conforms() {
     postgres_features_text_matches_the_manifest(&repository, &events).await;
     postgres_refuses_projector_only_transactions(&repository).await;
     postgres_legacy_reserved_reads(&repository, &events, &snapshots).await;
+    postgres_enumeration(&repository, &events).await;
     repository
         .pool()
         .get()
@@ -872,4 +878,181 @@ async fn postgres_features_text_matches_the_manifest(
         "{}",
         "the cleared manifest stores an empty sorted JSON object"
     );
+}
+
+/// Collects every batch a stream yields, failing on an error.
+async fn batches<S>(stream: S) -> Vec<Vec<SerializedEvent>>
+where
+    S: futures_core::Stream<Item = Result<Vec<SerializedEvent>, Error>>,
+{
+    let mut stream = std::pin::pin!(stream);
+    let mut batches = Vec::new();
+    while let Some(batch) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+        batches.push(batch.expect("a batch"));
+    }
+
+    batches
+}
+
+fn assert_no_reserved(batches: &[Vec<SerializedEvent>]) {
+    for event in batches.iter().flatten() {
+        assert!(
+            !event.entity_id.as_str().starts_with("SYSTEM#")
+                && !event.entity_id.as_str().starts_with("command-outcome#"),
+            "a reserved-namespace event leaked into the enumeration: {}",
+            event.id
+        );
+    }
+}
+
+/// Enumeration over DynamoDB: the shared cases, reserved legacy rows and the marker row skipped by
+/// the Scan, and pagination with a one-item page.
+async fn dynamo_enumeration(repository: &DynamoRepository) {
+    use photon_evt::dynamodb::to_sdk_item;
+    use photon_evt::wire::dynamo::{event_item, snapshot_item};
+
+    // Seed legacy rows in both reserved namespaces, plus the feature-marker row.
+    let mut seeded = Vec::new();
+    for prefix in ["SYSTEM#", "command-outcome#"] {
+        let (events, snapshot) = legacy_stream(EntityId::new(format!("{prefix}enumerate-legacy")));
+        let mut items = events
+            .iter()
+            .map(|event| event_item(event, None).unwrap())
+            .collect::<Vec<_>>();
+        items.push(snapshot_item(&snapshot, None).unwrap());
+        for item in items {
+            repository
+                .client()
+                .put_item()
+                .table_name(repository.table())
+                .set_item(Some(to_sdk_item(&item)))
+                .send()
+                .await
+                .unwrap();
+        }
+        seeded.push(snapshot.entity_id.to_string());
+    }
+    repository
+        .update_manifest(|manifest| {
+            manifest.history_dependent.insert("enumerate-marker".into());
+        })
+        .await
+        .unwrap();
+
+    enumeration_cases(repository).await;
+    assert_no_reserved(&batches(repository.stream_all_events(StreamFilter::all())).await);
+
+    // A small Scan page forces pagination: 120 events cannot fit in one page of at most 50 items,
+    // so the stream must continue across pages without dropping or repeating one.
+    let paged = DynamoRepository::new(repository.client().clone(), repository.table())
+        .with_scan_page_size(50);
+    let ns = format!("page-{}", std::process::id());
+    let id = EntityId::new(format!("{ns}-stream"));
+    let entity_type = format!("{ns}-ledger");
+    let events: Vec<_> = (1..=120)
+        .map(|sequence| SerializedEvent {
+            id: EventId::for_event(&id, EventSequence(sequence)),
+            sequence: EventSequence(sequence),
+            event_type: EventType::new("ledger:added"),
+            version: EventVersion(1),
+            entity_id: id.clone(),
+            entity_type: entity_type.as_str().into(),
+            payload: br#"{"amount":1}"#.to_vec(),
+            metadata: Metadata::new("local"),
+        })
+        .collect();
+    for chunk in events.chunks(60) {
+        paged
+            .commit(Commit::new(id.clone(), chunk.to_vec()))
+            .await
+            .unwrap();
+    }
+
+    let pages = batches(paged.stream_all_events(StreamFilter::of_type(entity_type.as_str()))).await;
+    assert!(pages.len() >= 3, "120 events span at least three pages");
+    assert!(pages.iter().all(|page| page.len() <= 50));
+    let streamed: Vec<_> = pages.into_iter().flatten().collect();
+    let mut sorted = streamed.clone();
+    sorted.sort_by_key(|event| event.sequence);
+    assert_eq!(
+        sorted, events,
+        "pagination neither drops nor repeats an event"
+    );
+
+    // Entities fold from events spread over pages.
+    let mut entities = std::pin::pin!(
+        paged.stream_entities::<Ledger>(StreamFilter::of_type(entity_type.as_str()))
+    );
+    let loaded = std::future::poll_fn(|cx| entities.as_mut().poll_next(cx))
+        .await
+        .expect("an entity")
+        .expect("it folds");
+    assert_eq!(
+        (loaded.aggregate().total, loaded.sequence()),
+        (120, EventSequence(120))
+    );
+
+    // Clean up what this run seeded outside the namespaced cases.
+    for id in seeded {
+        for sequence in 0..=2 {
+            repository
+                .client()
+                .delete_item()
+                .table_name(repository.table())
+                .key("pk", AttributeValue::S(id.clone()))
+                .key("sk", AttributeValue::N(sequence.to_string()))
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+    for event in &events {
+        repository
+            .client()
+            .delete_item()
+            .table_name(repository.table())
+            .key("pk", AttributeValue::S(id.to_string()))
+            .key("sk", AttributeValue::N(event.sequence.0.to_string()))
+            .send()
+            .await
+            .unwrap();
+    }
+}
+
+/// Enumeration over PostgreSQL: the shared cases, with legacy rows in the reserved namespaces
+/// seeded out of band and skipped.
+async fn postgres_enumeration(repository: &PostgresRepository, events_table: &str) {
+    use photon_evt::wire::postgres::EventRow;
+
+    let client = repository.pool().get().await.unwrap();
+    for prefix in ["SYSTEM#", "command-outcome#"] {
+        let (events, _) = legacy_stream(EntityId::new(format!("{prefix}enumerate-legacy")));
+        for event in &events {
+            let row = EventRow::from_event(event).unwrap();
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO {events_table} \
+                         (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)"
+                    ),
+                    &[
+                        &row.entity_id,
+                        &row.sequence,
+                        &row.event_id,
+                        &row.event_type,
+                        &row.version,
+                        &row.entity_type,
+                        &row.payload,
+                        &row.metadata,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+    }
+    drop(client);
+
+    enumeration_cases(repository).await;
+    assert_no_reserved(&batches(repository.stream_all_events(StreamFilter::all())).await);
 }

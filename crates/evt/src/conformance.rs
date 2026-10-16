@@ -29,6 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::aggregate::{Aggregate, Projector};
+use crate::enumerate::{EventLog, StreamFilter};
 use crate::error::{BoxError, Error};
 use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{self, FeatureMarker};
@@ -1948,6 +1949,266 @@ async fn store_projector<R: Repository, V: ViewTarget<R>>(repo: &R, views: &V) -
             entries: 2
         }),
         "a rejected commit does not write its view"
+    );
+
+    Ok(())
+}
+
+/// Runs the enumeration cases (P3) against a repository that implements [`EventLog`]: filtering by
+/// entity type, ordering within and across batches, folding entities, reserved namespaces, and
+/// cancellation. Like [`Suite`], it tolerates a table that holds data from earlier runs: it filters
+/// to entity types unique to this run.
+///
+/// Reserved-namespace rows cannot be written through the [`Repository`], so a backend that can
+/// seed them out of band should do so before calling this and assert they are skipped; the cases
+/// here check that no yielded event is in a reserved namespace.
+pub async fn enumeration_cases<R>(repo: &R)
+where
+    R: Repository + EventLog,
+{
+    let mut failures = Vec::new();
+
+    let mut record = |name: &str, result: CaseResult| match result {
+        Ok(()) => println!("ok   {name}"),
+        Err(Failure(message)) => {
+            println!("FAIL {name}");
+            failures.push(format!("{name}: {message}"));
+        }
+    };
+
+    record(
+        "stream_all_events filters by entity type and orders each entity's events",
+        enumerate_events(repo).await,
+    );
+    record(
+        "stream_entities folds each entity and reports a gap without ending the stream",
+        enumerate_entities(repo).await,
+    );
+    record(
+        "dropping an enumeration stream releases its resources",
+        enumerate_cancellation(repo).await,
+    );
+
+    if !failures.is_empty() {
+        panic!(
+            "{} enumeration case(s) failed:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+}
+
+async fn drain<S: futures_core::Stream>(stream: S) -> Vec<S::Item> {
+    let mut stream = std::pin::pin!(stream);
+    let mut items = Vec::new();
+    while let Some(item) =
+        std::future::poll_fn(|cx| futures_core::Stream::poll_next(stream.as_mut(), cx)).await
+    {
+        items.push(item);
+    }
+
+    items
+}
+
+/// Groups streamed events by entity, however the backend batched them.
+fn by_entity(
+    batches: Vec<Result<Vec<SerializedEvent>, Error>>,
+) -> Result<BTreeMap<EntityId, Vec<SerializedEvent>>, Failure> {
+    let mut grouped = BTreeMap::<EntityId, Vec<SerializedEvent>>::new();
+    for batch in batches {
+        let batch = batch?;
+        ensure!(!batch.is_empty(), "a batch is never empty");
+        for event in batch {
+            ensure!(
+                event.sequence >= EventSequence(1),
+                "an inline snapshot leaked into the enumeration: {}",
+                event.id
+            );
+            ensure!(
+                !features::is_reserved(&event.entity_id),
+                "a reserved-namespace event leaked into the enumeration: {}",
+                event.id
+            );
+            grouped
+                .entry(event.entity_id.clone())
+                .or_default()
+                .push(event);
+        }
+    }
+
+    Ok(grouped)
+}
+
+async fn enumerate_events<R: Repository + EventLog>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a1 = Stream::new(&ns, "alpha-1", "alpha");
+    let a2 = Stream::new(&ns, "alpha-2", "alpha");
+    let b1 = Stream::new(&ns, "beta-1", "beta");
+
+    a1.commit(repo, a1.events(1..=3), None).await?;
+    // A snapshot item is not an event, and a compacted stream starts above sequence 1.
+    a2.commit(repo, a2.events(1..=4), Some(a2.new_snapshot(1, "{}")))
+        .await?;
+    repo.compact_below(&a2.id, EventSequence(2)).await?;
+    b1.commit(repo, b1.events(1..=2), None).await?;
+
+    let alpha = by_entity(
+        drain(repo.stream_all_events(StreamFilter::of_type(a1.entity_type.clone()))).await,
+    )?;
+    ensure_eq!(
+        alpha,
+        BTreeMap::from([
+            (a1.id.clone(), a1.events(1..=3)),
+            (a2.id.clone(), a2.events(3..=4)),
+        ]),
+        "events of one entity type, each entity ascending by sequence"
+    );
+
+    let unknown = EntityType::new(format!("{ns}-unknown"));
+    ensure!(
+        drain(repo.stream_all_events(StreamFilter::of_type(unknown)))
+            .await
+            .is_empty(),
+        "an unknown type streams nothing"
+    );
+
+    let all = by_entity(drain(repo.stream_all_events(StreamFilter::all())).await)?;
+    for (id, events) in [
+        (&a1.id, a1.events(1..=3)),
+        (&a2.id, a2.events(3..=4)),
+        (&b1.id, b1.events(1..=2)),
+    ] {
+        ensure_eq!(
+            all.get(id),
+            Some(&events),
+            format!("unfiltered events of {id}")
+        );
+    }
+
+    // Backends that batch whole entities yield them contiguously, one batch each.
+    if R::BATCHES_BY_ENTITY {
+        let batches =
+            drain(repo.stream_all_events(StreamFilter::of_type(a1.entity_type.clone()))).await;
+        let ids: Vec<_> = batches
+            .iter()
+            .map(|batch| batch.as_ref().map(|events| events[0].entity_id.clone()))
+            .collect::<Result<_, _>>()?;
+        ensure_eq!(
+            ids,
+            vec![a1.id.clone(), a2.id.clone()],
+            "one batch per entity, ascending by entity ID"
+        );
+    }
+
+    Ok(())
+}
+
+async fn enumerate_entities<R: Repository + EventLog>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let whole = Stream::new(&ns, "whole", "ledger");
+    let second = Stream::new(&ns, "second", "ledger");
+    let compacted = Stream::new(&ns, "compacted", "ledger");
+    let other = Stream::new(&ns, "other", "unrelated");
+
+    whole.commit(repo, whole.events(1..=3), None).await?;
+    second.commit(repo, second.events(1..=1), None).await?;
+    compacted
+        .commit(
+            repo,
+            compacted.events(1..=3),
+            Some(compacted.new_snapshot(1, "{}")),
+        )
+        .await?;
+    repo.compact_below(&compacted.id, EventSequence(3)).await?;
+    other.commit(repo, other.events(1..=2), None).await?;
+
+    // The ledger's entity type is namespaced, so name it: the filter would default to "ledger".
+    let entities =
+        drain(repo.stream_entities::<Ledger>(StreamFilter::of_type(whole.entity_type.clone())))
+            .await;
+
+    let mut folded = BTreeMap::new();
+    let mut gaps = Vec::new();
+    for entity in entities {
+        match entity {
+            Ok(loaded) => {
+                folded.insert(
+                    loaded.entity_id().clone(),
+                    (loaded.aggregate().total, loaded.sequence()),
+                );
+            }
+            Err(Error::SequenceGap { entity_id, .. }) => gaps.push(entity_id),
+            Err(err) => return Err(Failure(format!("unexpected entity error: {err}"))),
+        }
+    }
+
+    ensure_eq!(
+        folded,
+        BTreeMap::from([
+            (whole.id.clone(), (6, EventSequence(3))),
+            (second.id.clone(), (1, EventSequence(1))),
+        ]),
+        "folded entities (the payload amount is the sequence)"
+    );
+    ensure_eq!(
+        gaps,
+        Vec::<EntityId>::new(),
+        "a fully compacted stream has no events to fold"
+    );
+
+    // A stream compacted part-way has a gap at its start: the error does not end the stream.
+    let partial = Stream::new(&ns, "partial", "ledger");
+    partial
+        .commit(
+            repo,
+            partial.events(1..=4),
+            Some(partial.new_snapshot(1, "{}")),
+        )
+        .await?;
+    repo.compact_below(&partial.id, EventSequence(2)).await?;
+    let entities =
+        drain(repo.stream_entities::<Ledger>(StreamFilter::of_type(whole.entity_type.clone())))
+            .await;
+    let gap_ids: Vec<_> = entities
+        .iter()
+        .filter_map(|entity| match entity {
+            Err(Error::SequenceGap { entity_id, .. }) => Some(entity_id.clone()),
+            _ => None,
+        })
+        .collect();
+    ensure_eq!(
+        gap_ids,
+        vec![partial.id.clone()],
+        "the gap names the compacted entity"
+    );
+    ensure!(
+        entities.iter().filter(|entity| entity.is_ok()).count() >= 2,
+        "the other entities still stream after the gap"
+    );
+
+    Ok(())
+}
+
+async fn enumerate_cancellation<R: Repository + EventLog>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let stream = Stream::new(&ns, "cancel", "alpha");
+    stream.commit(repo, stream.events(1..=2), None).await?;
+
+    // A pooled backend has a handful of connections: leaking one per dropped stream would hang
+    // before the loop ends.
+    for _ in 0..16 {
+        let events = repo.stream_all_events(StreamFilter::of_type(stream.entity_type.clone()));
+        let mut events = std::pin::pin!(events);
+        let first =
+            std::future::poll_fn(|cx| futures_core::Stream::poll_next(events.as_mut(), cx)).await;
+        ensure!(first.is_some(), "the first batch arrives before the drop");
+    }
+
+    stream.commit(repo, stream.events(3..=3), None).await?;
+    ensure_eq!(
+        repo.events(&stream.id).await?.len(),
+        3,
+        "the repository works after dropped streams"
     );
 
     Ok(())
