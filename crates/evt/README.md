@@ -257,7 +257,7 @@ over the same data, and `events::<A>(id)` / `assert_events` / `load::<A>(id)` in
 stream. `Scenario::on(&fixture)` runs a single-stream scenario against it.
 
 [`examples/banking.rs`](examples/banking.rs) puts it together: `domain_events!` enums, two
-aggregates, an in-band projector, and a two-account transfer as a multi-stream transaction with a
+aggregates, a balance read model fed only from committed events, and a two-account transfer as a multi-stream transaction with a
 read-fenced `bank` stream. Run it with
 `cargo run -p photon-evt --example banking --features testing`; its tests run with
 `cargo test -p photon-evt --features testing --example banking`.

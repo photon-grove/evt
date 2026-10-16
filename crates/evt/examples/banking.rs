@@ -2,7 +2,8 @@
 //! multi-stream reshape surface.
 //!
 //! - `domain_events!` declares each aggregate's events.
-//! - `Account` and `Bank` are aggregates; `BalanceView` is an in-band projector.
+//! - `Account` and `Bank` are aggregates; `BalanceView` is a read model folded from committed
+//!   events (projectors are pure: never side-effect in `project`).
 //! - `transfer` moves money between two accounts as one multi-stream transaction. It also reads
 //!   the `bank` stream without writing it, so the commit is fenced on the bank not having been
 //!   frozen in the meantime.
@@ -14,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use photon_evt::{
-    Aggregate, BoxError, EntityId, Error, MemRepository, Metadata, Projector, Store, domain_events,
+    Aggregate, DomainEvent, Error, MemRepository, Metadata, SerializedEvent, Store, domain_events,
 };
 use serde::{Deserialize, Serialize};
 
@@ -277,37 +278,46 @@ impl Aggregate for Bank {
     }
 }
 
-// ---- Projector ----
+// ---- Balance view ----
 
-/// Keeps a balance per account. `MemRepository` has no view storage, so this updates a shared
-/// map as a side effect; on DynamoDB or PostgreSQL the same `project` would return the backend's
-/// write operations, which commit atomically with the events.
+/// A read model of balances, folded from committed events.
+///
+/// Projectors are pure: `Projector::project` returns operations that the repository applies only
+/// if the commit succeeds, so it must never side-effect. `MemRepository` has no view storage (its
+/// operation type is uninhabited), so this view is fed from the events a commit returns, after
+/// `commit` is `Ok`. A rejected, conflicted, or duplicate command therefore leaves it untouched.
+/// On DynamoDB or PostgreSQL, implement `Projector` and return the backend's write operations
+/// instead; they commit atomically with the events.
 #[derive(Clone, Debug, Default)]
-pub struct BalanceView(Arc<Mutex<BTreeMap<EntityId, i64>>>);
+pub struct BalanceView(Arc<Mutex<BTreeMap<String, i64>>>);
 
 impl BalanceView {
     pub fn balance(&self, account_id: &str) -> Option<i64> {
-        self.0
-            .lock()
-            .unwrap()
-            .get(&EntityId::new(account_id))
-            .copied()
+        self.0.lock().unwrap().get(account_id).copied()
     }
-}
 
-impl<Op> Projector<Account, Op> for BalanceView {
-    fn project(
-        &self,
-        entity_id: &EntityId,
-        account: &Account,
-        _: &[AccountEvent],
-    ) -> Result<Vec<Op>, BoxError> {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(entity_id.clone(), account.balance);
+    /// Folds committed account events into the view. Events of other aggregates are ignored.
+    pub fn record(&self, committed: &[SerializedEvent]) {
+        let mut balances = self.0.lock().unwrap();
 
-        Ok(Vec::new())
+        for stored in committed.iter().filter(|e| e.entity_type == Account::TYPE) {
+            let Ok(event) = AccountEvent::from_payload(
+                stored.event_type.as_str(),
+                stored.version,
+                &stored.payload,
+            ) else {
+                continue;
+            };
+            let balance = balances.entry(stored.entity_id.to_string()).or_insert(0);
+
+            match event {
+                AccountEvent::Opened(e) => *balance = e.balance,
+                AccountEvent::Deposited(e) => *balance += e.amount,
+                AccountEvent::Withdrawn(e) => *balance -= e.amount,
+                AccountEvent::TransferSent(e) => *balance -= e.amount,
+                AccountEvent::TransferReceived(e) => *balance += e.amount,
+            }
+        }
     }
 }
 
@@ -383,10 +393,23 @@ pub async fn stage_transfer<'a>(
     Ok(tx)
 }
 
+/// Commits a staged transfer and, only once the commit succeeds, folds its events into the view.
+pub async fn finish_transfer(
+    tx: photon_evt::Transaction<'_, MemRepository>,
+    view: &BalanceView,
+    metadata: &Metadata,
+) -> Result<(), Error> {
+    let committed = tx.commit(metadata).await?;
+    view.record(&committed);
+
+    Ok(())
+}
+
 /// Moves `amount` from one account to the other atomically, retrying when another writer moved
-/// one of the streams in between. A command ID makes a repeated request a no-op error.
+/// one of the streams in between. A command ID makes a repeated request a duplicate-command error.
 pub async fn transfer(
     accounts: &Accounts,
+    view: &BalanceView,
     from: &str,
     to: &str,
     amount: i64,
@@ -398,9 +421,9 @@ pub async fn transfer(
     loop {
         let tx = stage_transfer(accounts, from, to, amount).await?;
 
-        match tx.commit(&metadata).await {
+        match finish_transfer(tx, view, &metadata).await {
             Err(error) if error.is_retryable() && attempts < 3 => attempts += 1,
-            result => return result.map(|_| ()).map_err(TransferError::from),
+            result => return result.map_err(TransferError::from),
         }
     }
 }
@@ -408,10 +431,10 @@ pub async fn transfer(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let view = BalanceView::default();
-    let accounts: Accounts = Store::new(MemRepository::new(), ()).with_projector(view.clone());
+    let accounts: Accounts = Store::new(MemRepository::new(), ());
 
     for (id, initial_balance) in [("acct-1", 100), ("acct-2", 20)] {
-        accounts
+        let executed = accounts
             .execute(
                 id,
                 AccountCommand::Open {
@@ -421,16 +444,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Metadata::default(),
             )
             .await?;
+        view.record(&executed.events);
     }
-    accounts
+    let executed = accounts
         .execute(
             "acct-1",
             AccountCommand::Deposit { amount: 25 },
             Metadata::default(),
         )
         .await?;
+    view.record(&executed.events);
 
-    transfer(&accounts, "acct-1", "acct-2", 50, "transfer-1").await?;
+    transfer(&accounts, &view, "acct-1", "acct-2", 50, "transfer-1").await?;
 
     for id in ["acct-1", "acct-2"] {
         let loaded = accounts.load(id).await?;
@@ -442,13 +467,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let overdraft = transfer(&accounts, "acct-2", "acct-1", 1_000, "transfer-2").await;
+    let overdraft = transfer(&accounts, &view, "acct-2", "acct-1", 1_000, "transfer-2").await;
     println!("overdraft: {}", overdraft.unwrap_err());
 
     let bank: Store<Bank, MemRepository> = Store::new(accounts.repository().clone(), ());
     bank.execute(BANK_ID, BankCommand::Freeze, Metadata::default())
         .await?;
-    let frozen = transfer(&accounts, "acct-1", "acct-2", 1, "transfer-3").await;
+    let frozen = transfer(&accounts, &view, "acct-1", "acct-2", 1, "transfer-3").await;
     println!("frozen: {}", frozen.unwrap_err());
 
     Ok(())
@@ -457,6 +482,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use photon_evt::testing::{Fixture, Scenario};
+    use photon_evt::{EntityId, Repository};
 
     use super::*;
 
@@ -530,7 +556,16 @@ mod tests {
             .await;
 
         let view = BalanceView::default();
-        let accounts = fixture.store::<Account>(()).with_projector(view.clone());
+        let accounts = fixture.store::<Account>(());
+        for id in ["acct-1", "acct-2"] {
+            view.record(
+                &fixture
+                    .repository()
+                    .events(&EntityId::new(id))
+                    .await
+                    .unwrap(),
+            );
+        }
 
         (fixture, accounts, view)
     }
@@ -539,7 +574,7 @@ mod tests {
     async fn a_transfer_commits_both_sides_atomically() {
         let (fixture, accounts, view) = seeded().await;
 
-        transfer(&accounts, "acct-1", "acct-2", 30, "transfer-1")
+        transfer(&accounts, &view, "acct-1", "acct-2", 30, "transfer-1")
             .await
             .unwrap();
 
@@ -570,9 +605,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_leg_writes_nothing() {
-        let (fixture, accounts, _) = seeded().await;
+        let (fixture, accounts, view) = seeded().await;
 
-        let error = transfer(&accounts, "acct-2", "acct-1", 500, "transfer-1")
+        let error = transfer(&accounts, &view, "acct-2", "acct-1", 500, "transfer-1")
             .await
             .unwrap_err();
 
@@ -585,20 +620,29 @@ mod tests {
         ));
         assert_eq!(fixture.events::<Account>("acct-1").await.len(), 1);
         assert_eq!(fixture.events::<Account>("acct-2").await.len(), 1);
+        assert_eq!(
+            (view.balance("acct-1"), view.balance("acct-2")),
+            (Some(100), Some(20))
+        );
     }
 
     #[tokio::test]
     async fn a_repeated_command_id_does_not_transfer_twice() {
-        let (fixture, accounts, _) = seeded().await;
+        let (fixture, accounts, view) = seeded().await;
 
-        transfer(&accounts, "acct-1", "acct-2", 30, "transfer-1")
+        transfer(&accounts, &view, "acct-1", "acct-2", 30, "transfer-1")
             .await
             .unwrap();
-        let again = transfer(&accounts, "acct-1", "acct-2", 30, "transfer-1")
+        let again = transfer(&accounts, &view, "acct-1", "acct-2", 30, "transfer-1")
             .await
             .unwrap_err();
 
         assert!(matches!(again, TransferError::Store(e) if e.is_duplicate_command()));
+        // The duplicate left the view where the first transfer put it.
+        assert_eq!(
+            (view.balance("acct-1"), view.balance("acct-2")),
+            (Some(70), Some(50))
+        );
         assert_eq!(
             fixture.load::<Account>("acct-1").await.aggregate().balance,
             70
@@ -607,12 +651,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_frozen_bank_refuses_transfers() {
-        let (fixture, accounts, _) = seeded().await;
+        let (fixture, accounts, view) = seeded().await;
         fixture
             .given::<Bank>(BANK_ID, [BankEvent::Frozen(Marker {})])
             .await;
 
-        let error = transfer(&accounts, "acct-1", "acct-2", 1, "transfer-1")
+        let error = transfer(&accounts, &view, "acct-1", "acct-2", 1, "transfer-1")
             .await
             .unwrap_err();
 
@@ -621,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn freezing_the_bank_mid_transfer_fails_the_read_fence() {
-        let (fixture, accounts, _) = seeded().await;
+        let (fixture, accounts, view) = seeded().await;
 
         // The transfer reads the bank (unfrozen) and stages both legs...
         let tx = stage_transfer(&accounts, "acct-1", "acct-2", 30)
@@ -633,8 +677,15 @@ mod tests {
             .given::<Bank>(BANK_ID, [BankEvent::Frozen(Marker {})])
             .await;
 
-        let error = tx.commit(&Metadata::default()).await.unwrap_err();
+        let error = finish_transfer(tx, &view, &Metadata::default())
+            .await
+            .unwrap_err();
         assert!(error.is_conflict(), "{error:?}");
+        // The failed commit never reached the view.
+        assert_eq!(
+            (view.balance("acct-1"), view.balance("acct-2")),
+            (Some(100), Some(20))
+        );
         assert_eq!(
             fixture.load::<Account>("acct-1").await.aggregate().balance,
             100

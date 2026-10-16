@@ -40,7 +40,7 @@ use std::fmt::Debug;
 use crate::aggregate::Aggregate;
 use crate::error::{Error, ExecuteError};
 use crate::event::{DomainEvent, SerializedEvent};
-use crate::ids::{EntityId, EventSequence};
+use crate::ids::EntityId;
 use crate::mem::MemRepository;
 use crate::metadata::Metadata;
 use crate::repository::{Commit, Repository};
@@ -121,13 +121,12 @@ impl Fixture {
             return;
         }
 
-        let head = self
-            .repository
-            .events(&entity_id)
+        // Snapshot-aware head, via the Store's load path: after compaction the retained events
+        // may end below the snapshot, and seeding must continue from the snapshot's sequence.
+        let head = load_aggregate::<A, _>(&self.repository, entity_id.clone())
             .await
-            .unwrap_or_else(|error| panic!("reading {entity_id}: {error}"))
-            .last()
-            .map_or(EventSequence::ZERO, |event| event.sequence);
+            .unwrap_or_else(|error| panic!("loading {entity_id}: {error}"))
+            .sequence();
 
         let metadata = Metadata {
             commit_id: format!("given-{entity_id}-{}", head.next()),
@@ -478,6 +477,7 @@ mod tests {
     use crate::conformance::{
         Add, Added, AlreadyHeld, Claim, ClaimEvent, InvalidAmount, Ledger, LedgerEvent, Take, Taken,
     };
+    use crate::ids::EventSequence;
 
     fn added(amount: i64) -> LedgerEvent {
         Added { amount }.into()
@@ -634,6 +634,42 @@ mod tests {
         let error = tx.commit(&Metadata::default()).await.unwrap_err();
         assert!(error.is_conflict(), "{error:?}");
         assert!(fixture.events::<Claim>("claim-1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_continues_after_a_snapshot_and_compaction() {
+        let fixture = Fixture::new();
+        let store = fixture.store::<Ledger>(()).with_snapshot_interval(2);
+        for _ in 0..2 {
+            store
+                .execute("ledger-1", Add(1), Metadata::default())
+                .await
+                .unwrap();
+        }
+        let repository = fixture.repository();
+        assert_eq!(
+            repository
+                .compact_below(&"ledger-1".into(), EventSequence(2))
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            repository
+                .events(&"ledger-1".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        fixture.given::<Ledger>("ledger-1", [added(5)]).await;
+
+        let stored = repository.events(&"ledger-1".into()).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].sequence, EventSequence(3));
+        let loaded = fixture.load::<Ledger>("ledger-1").await;
+        assert_eq!(loaded.aggregate().total, 7);
+        assert_eq!(loaded.sequence(), EventSequence(3));
     }
 
     #[tokio::test]
