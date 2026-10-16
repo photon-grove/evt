@@ -10,6 +10,7 @@
 //! - Define events with [`domain_events!`] and state with [`Aggregate`].
 //! - Use [`MemRepository`] in tests, [`dynamodb::DynamoRepository`] (feature `dynamodb`), or
 //!   [`postgres::PostgresRepository`] (feature `postgres`).
+//! - Test command flows given/when/then with [`testing::Scenario`] (feature `testing`).
 //! - Migrate old payloads with [`Upcaster`]s such as [`JsonUpcaster`].
 //! - Walk the whole log lazily with [`EventLog`]: [`stream_all_events`](EventLog::stream_all_events)
 //!   and [`stream_entities`](EventLog::stream_entities) return [`futures_core::Stream`]s.
@@ -37,6 +38,9 @@ mod metadata;
 mod repository;
 mod retry;
 mod store;
+#[cfg(any(test, feature = "testing"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
+pub mod testing;
 mod transaction;
 mod upcast;
 pub mod wire;

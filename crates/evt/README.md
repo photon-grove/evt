@@ -14,6 +14,8 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
   concurrency and duplicate-command detection.
 - Backends: `MemRepository` for tests, DynamoDB (feature `dynamodb`), and PostgreSQL (feature
   `postgres`).
+- `testing` feature: given/when/then `Scenario` and multi-stream `Fixture` over `MemRepository`
+  (see [Testing your domain](#testing-your-domain)).
 - Upcasters migrate old payload versions on read. `compact_below` deletes only events a snapshot
   covers.
 - In-band projectors write views in the same transaction as the events.
@@ -230,6 +232,35 @@ let mut accounts = std::pin::pin!(repository.stream_entities::<Account>(StreamFi
   unknown event type, a failed upcast, a sequence gap from compaction) is yielded as an error and
   the stream continues. Entities fold from events only, as in Go, so a compacted stream reports
   `SequenceGap`: load it with `Store::load` instead.
+
+## Testing your domain
+
+The `testing` feature adds `photon_evt::testing`: given/when/then tests over `MemRepository`, the
+counterpart of Go's `test` package. `Scenario` seeds a stream, runs a command through a real
+`Store`, and asserts the emitted events, the rejection, a store error, or the resulting state:
+
+```rust,ignore
+use photon_evt::testing::Scenario;
+
+#[tokio::test]
+async fn withdrawing_more_than_the_balance_is_rejected() {
+    Scenario::<Account>::given([opened("acct-1", 10)])
+        .when(AccountCommand::Withdraw { amount: 11 })
+        .then_rejected(|error| matches!(error, AccountError::InsufficientFunds { .. }))
+        .await;
+}
+```
+
+`Fixture` is the multi-stream piece: `given::<A>(id, events)` seeds (or, on an existing stream,
+stands in for a concurrent writer), `transaction()` starts a `Store::transaction`-style commit
+over the same data, and `events::<A>(id)` / `assert_events` / `load::<A>(id)` inspect each
+stream. `Scenario::on(&fixture)` runs a single-stream scenario against it.
+
+[`examples/banking.rs`](examples/banking.rs) puts it together: `domain_events!` enums, two
+aggregates, an in-band projector, and a two-account transfer as a multi-stream transaction with a
+read-fenced `bank` stream. Run it with
+`cargo run -p photon-evt --example banking --features testing`; its tests run with
+`cargo test -p photon-evt --features testing --example banking`.
 
 ## Testing a backend
 
