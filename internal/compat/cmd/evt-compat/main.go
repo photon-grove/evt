@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -147,7 +148,7 @@ func step(ctx context.Context, b backend, run string, index int) ([]string, erro
 		}
 
 		s := scenario.Steps[index]
-		runner := compat.Runner{Store: snapshots.NewStore(b.repo, scenario.SnapshotInterval), Repo: b.repo}
+		runner := newRunner(b, scenario, run)
 
 		outcome, err := runner.Execute(ctx, compat.EntityID(run, scenario), s)
 		if err != nil {
@@ -190,7 +191,7 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 		}
 
 		before := len(failures)
-		runner := compat.Runner{Store: snapshots.NewStore(b.repo, scenario.SnapshotInterval), Repo: b.repo}
+		runner := newRunner(b, scenario, run)
 
 		observed, err := compat.Observe(ctx, runner, scenario.Name, expected.EntityID)
 		if err != nil {
@@ -279,12 +280,152 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 			}
 		}
 
+		if scenario.Outcomes {
+			outcomeFailures, err := verifyOutcomes(ctx, b, scenario, expected)
+			if err != nil {
+				return nil, err
+			}
+
+			failures = append(failures, outcomeFailures...)
+		}
+
 		if len(failures) == before {
 			fmt.Printf("go verified %s\n", scenario.Name)
 		}
 	}
 
 	return failures, nil
+}
+
+// newRunner builds the scenario's runner: a store with command outcomes for an outcomes scenario.
+func newRunner(b backend, scenario compat.Scenario, run string) compat.Runner {
+	if scenario.Outcomes {
+		return compat.NewOutcomeRunner(b.repo, scenario, run)
+	}
+
+	return compat.Runner{Store: snapshots.NewStore(b.repo, scenario.SnapshotInterval), Repo: b.repo}
+}
+
+// verifyOutcomes checks the command-outcome rows of an outcomes scenario against the fixtures:
+// the stored DynamoDB item, or the PostgreSQL row with its jsonb fields compared as JSON.
+func verifyOutcomes(
+	ctx context.Context,
+	b backend,
+	scenario compat.Scenario,
+	expected compat.ScenarioExpectation,
+) ([]string, error) {
+	var failures []string
+
+	for _, outcome := range expected.Outcomes {
+		switch {
+		case b.dynamo != nil:
+			items, err := partitionItems(ctx, b, evt.OutcomeKey(evt.CommandID(outcome.CommandID)))
+			if err != nil {
+				return nil, err
+			}
+
+			got, want := normalize(items), normalize([]map[string]any{outcome.DynamoItem})
+			if !reflect.DeepEqual(got, want) {
+				failures = append(failures, fmt.Sprintf("%s: outcome %s item\n  got:  %v\n  want: %v", scenario.Name, outcome.CommandID, got, want))
+			}
+
+		case b.postgres != nil:
+			got, err := postgresOutcome(ctx, b.postgres, outcome.CommandID)
+			if err != nil {
+				return nil, err
+			}
+
+			want, err := expectedOutcomeRow(outcome)
+			if err != nil {
+				return nil, err
+			}
+
+			if !reflect.DeepEqual(got, want) {
+				failures = append(failures, fmt.Sprintf("%s: outcome %s row\n  got:  %v\n  want: %v", scenario.Name, outcome.CommandID, got, want))
+			}
+		}
+	}
+
+	return failures, nil
+}
+
+// outcomeRow is a PostgreSQL outcome row with its jsonb columns parsed, since jsonb normalizes
+// formatting.
+type outcomeRow struct {
+	Status    string
+	Digest    string
+	Response  string
+	Events    any
+	Rejection any
+	Code      string
+}
+
+func postgresOutcome(ctx context.Context, pool *pgxpool.Pool, commandID string) (*outcomeRow, error) {
+	var (
+		row       outcomeRow
+		response  []byte
+		events    string
+		rejection *string
+		code      *string
+	)
+
+	err := pool.QueryRow(ctx, `SELECT status, digest, response, events::text, rejection::text, code
+		FROM evt_events__evt_command_outcomes WHERE command_id = $1`, commandID).
+		Scan(&row.Status, &row.Digest, &response, &events, &rejection, &code)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	row.Response = base64.StdEncoding.EncodeToString(response)
+	if err = json.Unmarshal([]byte(events), &row.Events); err != nil {
+		return nil, err
+	}
+
+	if rejection != nil {
+		if err = json.Unmarshal([]byte(*rejection), &row.Rejection); err != nil {
+			return nil, err
+		}
+	}
+
+	if code != nil {
+		row.Code = *code
+	}
+
+	if len(response) == 0 {
+		row.Response = ""
+	}
+
+	return &row, nil
+}
+
+// expectedOutcomeRow derives the PostgreSQL row from a fixture's DynamoDB item.
+func expectedOutcomeRow(outcome compat.OutcomeExpectation) (*outcomeRow, error) {
+	text := func(name string) string {
+		attribute, _ := outcome.DynamoItem[name].(map[string]any)
+		value, _ := attribute["S"].(string)
+
+		return value
+	}
+
+	row := outcomeRow{Status: text("status"), Digest: text("digest"), Response: text("response"), Events: []any{}, Code: text("code")}
+
+	if events := text("events"); events != "" {
+		if err := json.Unmarshal([]byte(events), &row.Events); err != nil {
+			return nil, err
+		}
+	}
+
+	if rejection := text("rejection"); rejection != "" {
+		if err := json.Unmarshal([]byte(rejection), &row.Rejection); err != nil {
+			return nil, err
+		}
+	}
+
+	return &row, nil
 }
 
 func partitionItems(ctx context.Context, b backend, pk string) ([]map[string]types.AttributeValue, error) {

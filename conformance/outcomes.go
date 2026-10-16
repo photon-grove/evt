@@ -14,6 +14,7 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/snapshots"
+	"github.com/photon-grove/evt/test"
 )
 
 // RunOutcomeSuite verifies command outcomes (ADR 0004, C3/C4) on a repository that implements
@@ -519,7 +520,7 @@ func testCommandIDRules(t *testing.T, repo evt.OutcomeRepository) {
 }
 
 func testAmbiguousRecovery(t *testing.T, repo evt.OutcomeRepository) {
-	faulty, err := NewFaultRepository(repo)
+	faulty, err := test.NewFaultRepository(repo)
 	require.NoError(t, err)
 
 	env := newOutcomeEnv(t, faulty, 0)
@@ -587,7 +588,7 @@ func testAmbiguousRecovery(t *testing.T, repo evt.OutcomeRepository) {
 }
 
 func testOutcomePutRace(t *testing.T, repo evt.OutcomeRepository) {
-	faulty, err := NewFaultRepository(repo)
+	faulty, err := test.NewFaultRepository(repo)
 	require.NoError(t, err)
 
 	env := newOutcomeEnv(t, faulty, 0)
@@ -633,7 +634,7 @@ func testOutcomePutRace(t *testing.T, repo evt.OutcomeRepository) {
 }
 
 func testConflictLeavesNoOutcome(t *testing.T, repo evt.OutcomeRepository) {
-	faulty, err := NewFaultRepository(repo)
+	faulty, err := test.NewFaultRepository(repo)
 	require.NoError(t, err)
 
 	env := newOutcomeEnv(t, faulty, 0)

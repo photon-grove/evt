@@ -1,0 +1,408 @@
+{
+  "limits": {
+    "maxCommandIdBytes": 512,
+    "maxOutcomeBytes": 65536
+  },
+  "digests": [
+    {
+      "name": "single stream",
+      "input": {
+        "commandType": "account:open",
+        "streams": [
+          "acct-1"
+        ],
+        "payload": "{\"owner\":\"Ada\"}",
+        "principal": "user:42"
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d7631000c0000006163636f756e743a6f70656e0100000006000000616363742d310f0000007b226f776e6572223a22416461227d07000000757365723a3432",
+      "digest": "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6"
+    },
+    {
+      "name": "multi stream, sorted",
+      "input": {
+        "commandType": "claim-username",
+        "streams": [
+          "profile#u-1",
+          "claim#ada"
+        ],
+        "payload": "{\"handle\":\"ada\"}",
+        "principal": ""
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d7631000e000000636c61696d2d757365726e616d650200000009000000636c61696d236164610b00000070726f66696c6523752d31100000007b2268616e646c65223a22616461227d00000000",
+      "digest": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79"
+    },
+    {
+      "name": "multi stream with principal",
+      "input": {
+        "commandType": "claim-username",
+        "streams": [
+          "claim#ada",
+          "profile#u-1"
+        ],
+        "payload": "{\"handle\":\"ada\"}",
+        "principal": "user:42"
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d7631000e000000636c61696d2d757365726e616d650200000009000000636c61696d236164610b00000070726f66696c6523752d31100000007b2268616e646c65223a22616461227d07000000757365723a3432",
+      "digest": "56d01f5b9788b60e12a686e40807c28d9dfde802d82faf46888adda0acee7050"
+    },
+    {
+      "name": "absent payload",
+      "input": {
+        "commandType": "account:ping",
+        "streams": [
+          "acct-1"
+        ],
+        "payload": null,
+        "principal": "user:42"
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d7631000c0000006163636f756e743a70696e670100000006000000616363742d310000000007000000757365723a3432",
+      "digest": "d24c7d5ce955a76c936a83e6eca2c3bc277d936c88a76460ed2d221e285a215a"
+    },
+    {
+      "name": "stale fence",
+      "input": {
+        "commandType": "account:rename",
+        "streams": [
+          "acct-1"
+        ],
+        "payload": "{\"name\":\"Grace\"}",
+        "principal": "user:42"
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d7631000e0000006163636f756e743a72656e616d650100000006000000616363742d31100000007b226e616d65223a224772616365227d07000000757365723a3432",
+      "digest": "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b"
+    },
+    {
+      "name": "duplicate streams collapse",
+      "input": {
+        "commandType": "t",
+        "streams": [
+          "b",
+          "a",
+          "b"
+        ],
+        "payload": "null",
+        "principal": ""
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d76310001000000740200000001000000610100000062040000006e756c6c00000000",
+      "digest": "610ee94c37b14f26e16952e121bb44c204e713025b994374878acfbeb58a69a2"
+    },
+    {
+      "name": "outcome-only, no streams",
+      "input": {
+        "commandType": "account:audit",
+        "streams": [],
+        "payload": "{\"note\":\"checked\"}",
+        "principal": ""
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d7631000d0000006163636f756e743a617564697400000000120000007b226e6f7465223a22636865636b6564227d00000000",
+      "digest": "2649fe4f67c4e2a0fa1ae79dacf8776c0cef2745130579f4922680e12c96e9de"
+    },
+    {
+      "name": "non-ASCII and HTML-sensitive payload",
+      "input": {
+        "commandType": "note:add",
+        "streams": [
+          "naïve#1"
+        ],
+        "payload": "{\"text\":\"a<b> & é\"}",
+        "principal": "user:é"
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d763100080000006e6f74653a61646401000000080000006e61c3af76652331140000007b2274657874223a22613c623e202620c3a9227d07000000757365723ac3a9",
+      "digest": "5e20fb2dcc4b14a7dfa8794217cbdff41f637537928c4e113e1e6dadb76cfd54"
+    }
+  ],
+  "rows": [
+    {
+      "name": "accepted with events and response",
+      "input": {
+        "commandId": "cmd-0001",
+        "status": "accepted",
+        "digest": "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6",
+        "response": "{\"accountId\":\"acct-1\",\"balanceCents\":0}",
+        "eventIds": [
+          "acct-1:1"
+        ],
+        "rejection": null
+      },
+      "eventsJson": "[\"acct-1:1\"]",
+      "dynamoItem": {
+        "digest": {
+          "S": "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6"
+        },
+        "events": {
+          "S": "[\"acct-1:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0001"
+        },
+        "response": {
+          "S": "eyJhY2NvdW50SWQiOiJhY2N0LTEiLCJiYWxhbmNlQ2VudHMiOjB9"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      },
+      "itemSize": 191,
+      "postgresRow": {
+        "code": null,
+        "command_id": "cmd-0001",
+        "digest": "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6",
+        "events": "[\"acct-1:1\"]",
+        "rejection": null,
+        "response": "eyJhY2NvdW50SWQiOiJhY2N0LTEiLCJiYWxhbmNlQ2VudHMiOjB9",
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "accepted multi-stream",
+      "input": {
+        "commandId": "cmd-0004",
+        "status": "accepted",
+        "digest": "56d01f5b9788b60e12a686e40807c28d9dfde802d82faf46888adda0acee7050",
+        "response": null,
+        "eventIds": [
+          "claim#ada:1",
+          "profile#u-1:1"
+        ],
+        "rejection": null
+      },
+      "eventsJson": "[\"claim#ada:1\",\"profile#u-1:1\"]",
+      "dynamoItem": {
+        "digest": {
+          "S": "56d01f5b9788b60e12a686e40807c28d9dfde802d82faf46888adda0acee7050"
+        },
+        "events": {
+          "S": "[\"claim#ada:1\",\"profile#u-1:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0004"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      },
+      "itemSize": 150,
+      "postgresRow": {
+        "code": null,
+        "command_id": "cmd-0004",
+        "digest": "56d01f5b9788b60e12a686e40807c28d9dfde802d82faf46888adda0acee7050",
+        "events": "[\"claim#ada:1\",\"profile#u-1:1\"]",
+        "rejection": null,
+        "response": null,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "accepted no-op",
+      "input": {
+        "commandId": "cmd-0003",
+        "status": "accepted",
+        "digest": "d24c7d5ce955a76c936a83e6eca2c3bc277d936c88a76460ed2d221e285a215a",
+        "response": null,
+        "eventIds": [],
+        "rejection": null
+      },
+      "dynamoItem": {
+        "digest": {
+          "S": "d24c7d5ce955a76c936a83e6eca2c3bc277d936c88a76460ed2d221e285a215a"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0003"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      },
+      "itemSize": 113,
+      "postgresRow": {
+        "code": null,
+        "command_id": "cmd-0003",
+        "digest": "d24c7d5ce955a76c936a83e6eca2c3bc277d936c88a76460ed2d221e285a215a",
+        "events": "[]",
+        "rejection": null,
+        "response": null,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "accepted binary response",
+      "input": {
+        "commandId": "cmd-0006",
+        "status": "accepted",
+        "digest": "d",
+        "response": "\u0000\u0001\u0002\ufffd\ufffd\ufffd",
+        "eventIds": [
+          "a:1",
+          "a:2"
+        ],
+        "rejection": null
+      },
+      "eventsJson": "[\"a:1\",\"a:2\"]",
+      "dynamoItem": {
+        "digest": {
+          "S": "d"
+        },
+        "events": {
+          "S": "[\"a:1\",\"a:2\"]"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0006"
+        },
+        "response": {
+          "S": "AAEC/f7/"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      },
+      "itemSize": 85,
+      "postgresRow": {
+        "code": null,
+        "command_id": "cmd-0006",
+        "digest": "d",
+        "events": "[\"a:1\",\"a:2\"]",
+        "rejection": null,
+        "response": "AAEC/f7/",
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "rejected",
+      "input": {
+        "commandId": "cmd-0002",
+        "status": "rejected",
+        "digest": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+        "response": null,
+        "eventIds": [],
+        "rejection": "{\"code\":\"username-taken\",\"message\":\"handle ada is taken\",\"details\":{\"handle\":\"ada\"}}"
+      },
+      "rejectionJson": "{\"code\":\"username-taken\",\"message\":\"handle ada is taken\",\"details\":{\"handle\":\"ada\"}}",
+      "dynamoItem": {
+        "code": {
+          "S": "username-taken"
+        },
+        "digest": {
+          "S": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0002"
+        },
+        "rejection": {
+          "S": "{\"code\":\"username-taken\",\"message\":\"handle ada is taken\",\"details\":{\"handle\":\"ada\"}}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      },
+      "itemSize": 224,
+      "postgresRow": {
+        "code": "username-taken",
+        "command_id": "cmd-0002",
+        "digest": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+        "events": "[]",
+        "rejection": "{\"code\":\"username-taken\",\"message\":\"handle ada is taken\",\"details\":{\"handle\":\"ada\"}}",
+        "response": null,
+        "status": "rejected"
+      }
+    },
+    {
+      "name": "rejected stale fence",
+      "input": {
+        "commandId": "cmd-0005",
+        "status": "rejected",
+        "digest": "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b",
+        "response": null,
+        "eventIds": [],
+        "rejection": "{\"code\":\"stale-fence\",\"message\":\"a caller-stamped fence went stale\",\"details\":null}"
+      },
+      "rejectionJson": "{\"code\":\"stale-fence\",\"message\":\"a caller-stamped fence went stale\",\"details\":null}",
+      "dynamoItem": {
+        "code": {
+          "S": "stale-fence"
+        },
+        "digest": {
+          "S": "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0005"
+        },
+        "rejection": {
+          "S": "{\"code\":\"stale-fence\",\"message\":\"a caller-stamped fence went stale\",\"details\":null}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      },
+      "itemSize": 220,
+      "postgresRow": {
+        "code": "stale-fence",
+        "command_id": "cmd-0005",
+        "digest": "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b",
+        "events": "[]",
+        "rejection": "{\"code\":\"stale-fence\",\"message\":\"a caller-stamped fence went stale\",\"details\":null}",
+        "response": null,
+        "status": "rejected"
+      }
+    },
+    {
+      "name": "rejected with escaped and nested details",
+      "input": {
+        "commandId": "cmd-0007",
+        "status": "rejected",
+        "digest": "d",
+        "response": null,
+        "eventIds": [],
+        "rejection": "{\"code\":\"invalid\",\"message\":\"a\\u003cb\\u003e\\u0026c é \\u2028\",\"details\":{\"a\":{\"m\":2,\"n\":10},\"z\":[1,\"two\",null]}}"
+      },
+      "rejectionJson": "{\"code\":\"invalid\",\"message\":\"a\\u003cb\\u003e\\u0026c é \\u2028\",\"details\":{\"a\":{\"m\":2,\"n\":10},\"z\":[1,\"two\",null]}}",
+      "dynamoItem": {
+        "code": {
+          "S": "invalid"
+        },
+        "digest": {
+          "S": "d"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0007"
+        },
+        "rejection": {
+          "S": "{\"code\":\"invalid\",\"message\":\"a\\u003cb\\u003e\\u0026c é \\u2028\",\"details\":{\"a\":{\"m\":2,\"n\":10},\"z\":[1,\"two\",null]}}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      },
+      "itemSize": 182,
+      "postgresRow": {
+        "code": "invalid",
+        "command_id": "cmd-0007",
+        "digest": "d",
+        "events": "[]",
+        "rejection": "{\"code\":\"invalid\",\"message\":\"a\\u003cb\\u003e\\u0026c é \\u2028\",\"details\":{\"a\":{\"m\":2,\"n\":10},\"z\":[1,\"two\",null]}}",
+        "response": null,
+        "status": "rejected"
+      }
+    }
+  ]
+}

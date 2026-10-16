@@ -84,6 +84,21 @@ func (store *Store) outcomeRepository() (evt.OutcomeRepository, error) {
 	return evt.RequireOutcomes(store.repo)
 }
 
+// ResolveCommand reads a command's outcome row and answers it for the given identity, without
+// running or writing anything: the stored outcome (Replayed) when the digests match,
+// *evt.IdempotencyKeyReuseError when they differ, and nil, nil when the command has no outcome.
+// It is ambiguous-write recovery as a public call, for a caller that lost the result of a command
+// it issued (a crash, a timeout it could not settle) and wants to learn what happened.
+func (store *Store) ResolveCommand(
+	ctx context.Context,
+	identity evt.CommandIdentity,
+	metadata evt.Metadata,
+) (*evt.CommandOutcome, error) {
+	_, replayed, err := store.beginCommand(ctx, identity, metadata)
+
+	return replayed, err
+}
+
 // executed is the result of running a command through the outcome path: the outcome, plus the
 // handler's own domain error when this call produced a rejection.
 type executed struct {

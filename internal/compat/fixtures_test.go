@@ -36,6 +36,13 @@ func TestFixturesFeatureMarker(t *testing.T) {
 	assertFixture(t, FeatureMarkerFixtureFile, fixtures)
 }
 
+func TestFixturesOutcomes(t *testing.T) {
+	fixtures, err := GenerateOutcomeFixtures()
+	require.NoError(t, err)
+
+	assertFixture(t, OutcomeFixtureFile, fixtures)
+}
+
 func assertFixture(t *testing.T, name string, value any) {
 	t.Helper()
 
