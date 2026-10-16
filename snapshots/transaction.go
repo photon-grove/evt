@@ -16,7 +16,12 @@ import (
 // The single-aggregate shortcut stays: Store.Execute remains a load, handle, and commit of one
 // entity, implemented over the same repository commit path.
 //
-// A Transaction is single-use: any error consumes it, and a new one must be built.
+// A Transaction commits at most once: Commit consumes it whether it succeeds or fails, and a
+// consumed Transaction refuses every later call. Errors from the staging calls split in two.
+// Input validation errors leave the Transaction unchanged and usable: a nil entity or a duplicate
+// stream passed to Read, and an Append to a stream that was not read. Errors that can leave the
+// staged state inconsistent consume it: a failed load in Read, and an event of the wrong entity
+// type or one the entity cannot apply in Append. Build a new Transaction after those.
 type Transaction struct {
 	store   *Store
 	streams map[evt.EntityID]*transactionStream

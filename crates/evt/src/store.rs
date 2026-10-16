@@ -486,13 +486,17 @@ pub fn serialize_events<A: Aggregate>(
 /// The single-aggregate shortcut stays: [`Store::execute`] remains a load, handle, and commit of
 /// one entity, over the same repository commit path.
 ///
-/// A transaction is single-use: any error consumes it, and a new one must be built.
+/// A transaction commits at most once: [`commit`](Transaction::commit) takes it by value, so any
+/// commit attempt, successful or failed, consumes it, and a new transaction must be built to try
+/// again. The staging calls validate their input before changing anything, so their errors are
+/// recoverable and leave the transaction unchanged: a duplicate [`read`](Transaction::read) or an
+/// [`append`](Transaction::append) to a stream that was not read returns [`Error::InvalidCommit`],
+/// and the caller can carry on and commit.
 pub struct Transaction<'a, A: Aggregate, R: Repository> {
     store: &'a Store<A, R>,
     streams: Vec<Loaded<A>>,
     appended: Vec<Vec<A::Event>>,
     fences: Vec<ReadFence>,
-    used: bool,
 }
 
 impl<A: Aggregate, R: Repository> Store<A, R> {
@@ -505,7 +509,6 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             streams: Vec::new(),
             appended: Vec::new(),
             fences: Vec::new(),
-            used: false,
         }
     }
 }
@@ -520,11 +523,6 @@ where
     /// commit captures reflects them; a read that is never appended to is fenced at the head it
     /// was loaded at.
     pub fn read(&mut self, loaded: Loaded<A>) -> Result<&mut Self, Error> {
-        if self.used {
-            return Err(Error::InvalidCommit(
-                "the transaction is already consumed".to_owned(),
-            ));
-        }
         if self
             .streams
             .iter()
@@ -549,12 +547,6 @@ where
         entity_id: &EntityId,
         events: Vec<A::Event>,
     ) -> Result<&mut Self, Error> {
-        if self.used {
-            return Err(Error::InvalidCommit(
-                "the transaction is already consumed".to_owned(),
-            ));
-        }
-
         let index = self
             .streams
             .iter()
@@ -577,11 +569,6 @@ where
     /// `fence` is called before or after `read`: the engine's own fence provenance supersedes
     /// it.
     pub fn fence(&mut self, mut fence: ReadFence) -> Result<&mut Self, Error> {
-        if self.used {
-            return Err(Error::InvalidCommit(
-                "the transaction is already consumed".to_owned(),
-            ));
-        }
         if self
             .streams
             .iter()
@@ -600,13 +587,6 @@ where
     /// and snapshot, fences every unwritten read, and persists exactly one atomic repository
     /// commit. On failure nothing is written.
     pub async fn commit(mut self, metadata: &Metadata) -> Result<Vec<SerializedEvent>, Error> {
-        if self.used {
-            return Err(Error::InvalidCommit(
-                "the transaction is already consumed".to_owned(),
-            ));
-        }
-        self.used = true;
-
         let metadata = stamp_commit_id(metadata, &*self.store.commit_ids);
 
         // A caller-stamped fence for a stream this transaction read is superseded by the
@@ -919,8 +899,8 @@ mod tests {
             Err(Error::InvalidCommit(_))
         ));
 
-        // commit() takes the transaction by value, so a consumed transaction cannot be reused:
-        // the single-use contract is enforced by the type system rather than a runtime check.
+        // Both errors were recoverable: the transaction is unchanged and still commits. Only
+        // commit() consumes it, by taking it by value.
         tx.commit(&Metadata::default()).await.unwrap();
     }
 

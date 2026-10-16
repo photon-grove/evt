@@ -269,6 +269,28 @@ func TestTransaction_IsSingleUse(t *testing.T) {
 	require.ErrorContains(t, err, "already consumed")
 }
 
+func TestTransaction_ValidationErrorsAreRecoverableAndStateErrorsConsume(t *testing.T) {
+	setup := newTransactionSetup(0)
+	ctx := context.Background()
+
+	// A nil entity, a duplicate read, and an append to an unread stream leave it usable.
+	tx := setup.store.Transaction()
+	setup.read(t, tx, "tx-known")
+	require.Error(t, tx.Read(ctx, nil, "tx-nil"))
+	require.Error(t, tx.Read(ctx, test.NewEntity("tx-known"), "tx-known"))
+	require.Error(t, tx.Append("tx-unread", created("tx-unread")))
+	require.NoError(t, tx.Append("tx-known", created("tx-known")))
+	_, err := tx.Commit(ctx, newTestMetadata())
+	require.NoError(t, err)
+	require.Len(t, getEvents(t, setup.repo, "tx-known"), 1)
+
+	// An event the entity cannot take consumes the transaction.
+	broken := setup.store.Transaction()
+	setup.read(t, broken, "tx-broken")
+	require.Error(t, broken.Append("tx-broken", &foreignEvent{}))
+	require.ErrorContains(t, broken.Append("tx-broken", created("tx-broken")), "already consumed")
+}
+
 func TestTransaction_StampsOneCommitIDAcrossEveryStream(t *testing.T) {
 	ctx := context.Background()
 
@@ -309,3 +331,11 @@ func TestTransaction_StampsOneCommitIDAcrossEveryStream(t *testing.T) {
 		}
 	})
 }
+
+// foreignEvent belongs to a different entity type than the test entity.
+type foreignEvent struct{}
+
+func (foreignEvent) EntityType() evt.EntityType { return "foreign" }
+func (foreignEvent) EntityID() evt.EntityID     { return "tx-broken" }
+func (foreignEvent) Type() evt.EventType        { return "foreign:happened" }
+func (foreignEvent) Version() evt.EventVersion  { return 1 }
