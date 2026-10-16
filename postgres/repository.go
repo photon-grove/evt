@@ -345,54 +345,11 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 		return err
 	}
 
-	if err := evt.PreflightCommit(normalized); err != nil {
+	if err = evt.PreflightCommit(normalized); err != nil {
 		return err
 	}
 
-	err = repo.inTx(ctx, func(tx pgx.Tx) error {
-		// Every touched stream — written and fenced — takes its advisory lock in canonical
-		// (sorted) order, so concurrent multi-stream commits cannot deadlock.
-		if err := repo.lockTransactionEntities(ctx, tx, normalized); err != nil {
-			return err
-		}
-
-		manifest, err := repo.checkFeaturesManifest(ctx, tx)
-		if err != nil {
-			return err
-		}
-
-		// Fences are refused for entity types durably declared with retention: TTL deletes reopen
-		// fenced slots without leaving a successor snapshot. The refusal consults the manifest in
-		// this transaction, not this instance's configuration.
-		if err := evt.CheckFenceRetention(normalized.Fences, manifest); err != nil {
-			return err
-		}
-
-		// Under the streams' advisory locks, every written stream must continue exactly from its
-		// stored head: a gap is refused before anything is inserted.
-		if err := repo.checkContinuations(ctx, tx, normalized.Events); err != nil {
-			return err
-		}
-
-		if err := repo.insertEvents(ctx, tx, normalized.Events); err != nil {
-			return err
-		}
-
-		if err := repo.checkFloor(ctx, tx, normalized.Events); err != nil {
-			return err
-		}
-
-		if err := repo.commitSnapshots(ctx, tx, normalized); err != nil {
-			return err
-		}
-
-		if err := repo.checkFences(ctx, tx, normalized.Fences); err != nil {
-			return err
-		}
-
-		// The outcome insert runs last, after the snapshot upserts (storage spec, PostgreSQL).
-		return repo.insertOutcome(ctx, tx, normalized.Outcome)
-	})
+	err = repo.inTx(ctx, func(tx pgx.Tx) error { return repo.commitInTx(ctx, tx, normalized) })
 	if err == nil {
 		return nil
 	}
@@ -405,6 +362,54 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 	}
 
 	return err
+}
+
+// commitInTx writes one normalized commit inside an open transaction: the entity locks, the
+// feature-marker check, the continuity, event, floor, snapshot, and fence checks, and last the
+// outcome insert.
+func (repo *Repository) commitInTx(ctx context.Context, tx pgx.Tx, normalized evt.SerializedResult) error {
+	// Every touched stream — written and fenced — takes its advisory lock in canonical
+	// (sorted) order, so concurrent multi-stream commits cannot deadlock.
+	if err := repo.lockTransactionEntities(ctx, tx, normalized); err != nil {
+		return err
+	}
+
+	manifest, err := repo.checkFeaturesManifest(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	// Fences are refused for entity types durably declared with retention: TTL deletes reopen
+	// fenced slots without leaving a successor snapshot. The refusal consults the manifest in
+	// this transaction, not this instance's configuration.
+	if err = evt.CheckFenceRetention(normalized.Fences, manifest); err != nil {
+		return err
+	}
+
+	// Under the streams' advisory locks, every written stream must continue exactly from its
+	// stored head: a gap is refused before anything is inserted.
+	if err = repo.checkContinuations(ctx, tx, normalized.Events); err != nil {
+		return err
+	}
+
+	if err = repo.insertEvents(ctx, tx, normalized.Events); err != nil {
+		return err
+	}
+
+	if err = repo.checkFloor(ctx, tx, normalized.Events); err != nil {
+		return err
+	}
+
+	if err = repo.commitSnapshots(ctx, tx, normalized); err != nil {
+		return err
+	}
+
+	if err = repo.checkFences(ctx, tx, normalized.Fences); err != nil {
+		return err
+	}
+
+	// The outcome insert runs last, after the snapshot upserts (storage spec, PostgreSQL).
+	return repo.insertOutcome(ctx, tx, normalized.Outcome)
 }
 
 // checkContinuations asserts, for each written stream whose first sequence is above 1, that the

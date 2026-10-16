@@ -490,9 +490,9 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 		expectation.Transactions = transactions
 
 		if scenario.Outcomes {
-			expectation.Outcomes, err = observeOutcomes(fake, scenario)
-			if err != nil {
-				return fixtures, fmt.Errorf("%s: %w", scenario.Name, err)
+			var oerr error
+			if expectation.Outcomes, oerr = observeOutcomes(fake, scenario); oerr != nil {
+				return fixtures, fmt.Errorf("%s: %w", scenario.Name, oerr)
 			}
 		}
 

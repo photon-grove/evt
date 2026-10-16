@@ -326,20 +326,20 @@ func testKeyReuse(t *testing.T, repo evt.OutcomeRepository) {
 		run  func() error
 	}{
 		{"payload", func() error {
-			_, err := env.run(t, &ledgerCommand{Kind: "deposit", Amount: 6, ran: ran}, id)
-			return err
+			_, rerr := env.run(t, &ledgerCommand{Kind: "deposit", Amount: 6, ran: ran}, id)
+			return rerr
 		}},
 		{"type", func() error {
-			_, err := env.run(t, &ledgerCommand{Kind: "withdraw", Amount: 1, ran: ran}, id)
-			return err
+			_, rerr := env.run(t, &ledgerCommand{Kind: "withdraw", Amount: 1, ran: ran}, id)
+			return rerr
 		}},
 		{"principal", func() error {
 			principal := evt.PrincipalID("user:other")
 			metadata := withCommand(id)
 			metadata.PrincipalID = &principal
-			_, err := env.store.ExecuteWithOutcome(context.Background(), newLedger(env.id), env.id,
+			_, rerr := env.store.ExecuteWithOutcome(context.Background(), newLedger(env.id), env.id,
 				&ledgerCommand{Kind: "deposit", Amount: 5, ran: ran}, metadata)
-			return err
+			return rerr
 		}},
 	}
 

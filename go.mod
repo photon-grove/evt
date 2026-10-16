@@ -13,6 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression v1.9.11
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.70.3
 	github.com/aws/aws-sdk-go-v2/service/sns v1.47.5
+	github.com/aws/smithy-go v1.28.5
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/samber/do/v2 v2.1.0
 	github.com/stretchr/testify v1.12.1
@@ -32,7 +33,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.38.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.4 // indirect
-	github.com/aws/smithy-go v1.28.5 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect

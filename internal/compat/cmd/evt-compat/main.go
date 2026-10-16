@@ -405,10 +405,16 @@ func postgresOutcome(ctx context.Context, pool *pgxpool.Pool, commandID string) 
 // expectedOutcomeRow derives the PostgreSQL row from a fixture's DynamoDB item.
 func expectedOutcomeRow(outcome compat.OutcomeExpectation) (*outcomeRow, error) {
 	text := func(name string) string {
-		attribute, _ := outcome.DynamoItem[name].(map[string]any)
-		value, _ := attribute["S"].(string)
+		attribute, ok := outcome.DynamoItem[name].(map[string]any)
+		if !ok {
+			return ""
+		}
 
-		return value
+		if value, isString := attribute["S"].(string); isString {
+			return value
+		}
+
+		return ""
 	}
 
 	row := outcomeRow{Status: text("status"), Digest: text("digest"), Response: text("response"), Events: []any{}, Code: text("code")}
