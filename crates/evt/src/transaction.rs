@@ -48,8 +48,7 @@ struct StreamState<Op> {
 /// A stream read into a [`Transaction`]: the loaded aggregate, typed by its own `A`. Pass it to
 /// [`Transaction::append`] to stage events for the stream; a read that is never appended to is
 /// fenced at the head it saw.
-#[derive(Debug)]
-pub struct Read<A: Aggregate> {
+pub struct Read<A: Aggregate, Op> {
     transaction: u64,
     index: usize,
     loaded: Loaded<A>,
@@ -57,9 +56,21 @@ pub struct Read<A: Aggregate> {
     base_sequence: EventSequence,
     /// Every event appended through this handle so far, so projectors see the cumulative set.
     appended: Vec<A::Event>,
+    /// The stream's projector set, fixed by its first projector-bearing append and reused by later
+    /// appends that name none.
+    projectors: Option<Vec<Arc<dyn Projector<A, Op>>>>,
 }
 
-impl<A: Aggregate> Read<A> {
+impl<A: Aggregate, Op> std::fmt::Debug for Read<A, Op> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Read")
+            .field("entity_id", &self.loaded.entity_id)
+            .field("sequence", &self.loaded.sequence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<A: Aggregate, Op> Read<A, Op> {
     /// The entity ID.
     pub fn entity_id(&self) -> &EntityId {
         self.loaded.entity_id()
@@ -128,7 +139,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     pub fn append_to(
         &self,
         transaction: &mut Transaction<'_, R>,
-        read: &mut Read<A>,
+        read: &mut Read<A, R::Operation>,
         events: Vec<A::Event>,
     ) -> Result<(), Error> {
         transaction.stage(read, events, &self.projectors, self.snapshot_interval)
@@ -177,7 +188,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
     pub async fn read<A: Aggregate>(
         &mut self,
         entity_id: impl Into<EntityId>,
-    ) -> Result<Read<A>, Error> {
+    ) -> Result<Read<A, R::Operation>, Error> {
         let entity_id = entity_id.into();
         self.check_unread(&entity_id)?;
 
@@ -187,7 +198,10 @@ impl<'a, R: Repository> Transaction<'a, R> {
     }
 
     /// Adds an already loaded aggregate to the read set. See [`read`](Transaction::read).
-    pub fn read_loaded<A: Aggregate>(&mut self, loaded: Loaded<A>) -> Result<Read<A>, Error> {
+    pub fn read_loaded<A: Aggregate>(
+        &mut self,
+        loaded: Loaded<A>,
+    ) -> Result<Read<A, R::Operation>, Error> {
         self.check_unread(loaded.entity_id())?;
 
         self.streams.push(StreamState {
@@ -205,6 +219,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             index: self.streams.len() - 1,
             base_sequence: loaded.sequence,
             appended: Vec::new(),
+            projectors: None,
             loaded,
         })
     }
@@ -225,24 +240,28 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
     /// Stages decided events for a stream read by this transaction. The events are applied to the
     /// handle's aggregate, so its state and the snapshot the commit captures reflect them, and
-    /// serialized by `A`. Calling it again for the same handle continues the sequence. No
-    /// projectors run; use [`append_with`](Transaction::append_with) or [`Store::append_to`] to
-    /// add them.
+    /// serialized by `A`. Calling it again for the same handle continues the sequence. It runs the
+    /// stream's projectors only if an earlier [`append_with`](Transaction::append_with) or
+    /// [`Store::append_to`] fixed them; otherwise none run.
     pub fn append<A: Aggregate>(
         &mut self,
-        read: &mut Read<A>,
+        read: &mut Read<A, R::Operation>,
         events: Vec<A::Event>,
     ) -> Result<&mut Self, Error> {
         self.append_with(read, events, &[])
     }
 
-    /// Like [`append`](Transaction::append), running `projectors` for the staged events. Their
+    /// Like [`append`](Transaction::append), running `projectors` for the staged events. The first
+    /// call that names projectors fixes the stream's projector set; later calls, with or without
+    /// projectors, derive the stream's operations with that set, and naming a different set returns
+    /// [`Error::ProjectorSetConflict`] without changing anything. Sets are compared by projector
+    /// identity (the `Arc` allocation), so pass clones of the same `Arc`s. Their
     /// operations commit atomically with the transaction's events. Projectors run on the
     /// post-event state, so when one fails the handle's aggregate already reflects the events:
     /// discard the transaction.
     pub fn append_with<A: Aggregate>(
         &mut self,
-        read: &mut Read<A>,
+        read: &mut Read<A, R::Operation>,
         events: Vec<A::Event>,
         projectors: &[Arc<dyn Projector<A, R::Operation>>],
     ) -> Result<&mut Self, Error> {
@@ -254,7 +273,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
     fn stage<A: Aggregate>(
         &mut self,
-        read: &mut Read<A>,
+        read: &mut Read<A, R::Operation>,
         events: Vec<A::Event>,
         projectors: &[Arc<dyn Projector<A, R::Operation>>],
         snapshot_interval: usize,
@@ -268,6 +287,32 @@ impl<'a, R: Repository> Transaction<'a, R> {
         if self.poisoned {
             return Err(Error::TransactionPoisoned);
         }
+
+        // The stream's projector set is fixed by its first projector-bearing append. An append
+        // that names none reuses it, so a stream first staged with projectors keeps its view
+        // update.
+        let remembered;
+        let named = projectors;
+        let projectors = if projectors.is_empty() {
+            remembered = read.projectors.clone().unwrap_or_default();
+            &remembered[..]
+        } else {
+            projectors
+        };
+        let identity = |set: &[Arc<dyn Projector<A, R::Operation>>]| -> Vec<usize> {
+            set.iter()
+                .map(|projector| Arc::as_ptr(projector) as *const () as usize)
+                .collect()
+        };
+        if let Some(existing) = &read.projectors
+            && !named.is_empty()
+            && identity(existing) != identity(projectors)
+        {
+            return Err(Error::ProjectorSetConflict {
+                entity_id: read.loaded.entity_id.clone(),
+            });
+        }
+
         if events.is_empty() {
             return Ok(());
         }
@@ -299,6 +344,9 @@ impl<'a, R: Repository> Transaction<'a, R> {
             }
         };
 
+        if read.projectors.is_none() && !named.is_empty() {
+            read.projectors = Some(projectors.to_vec());
+        }
         read.appended.extend(events);
         read.loaded.sequence = serialized
             .last()
@@ -317,7 +365,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
     #[allow(clippy::type_complexity)]
     fn stage_derived<A: Aggregate>(
         &self,
-        read: &Read<A>,
+        read: &Read<A, R::Operation>,
         serialized: &[SerializedEvent],
         projected: Option<Vec<A::Event>>,
         projectors: &[Arc<dyn Projector<A, R::Operation>>],
@@ -1136,5 +1184,93 @@ mod tests {
         tx.append(&mut ledger, added(1)).unwrap();
         tx.commit(&Metadata::default()).await.unwrap();
         assert_eq!(stored_events(&store, "usable").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_plain_append_keeps_the_streams_remembered_projectors() {
+        let repository = Recording::default();
+        let projectors: Vec<Arc<dyn Projector<Ledger, String>>> = vec![Arc::new(ViewRow)];
+
+        let mut tx = Transaction::new(&repository).with_snapshot_interval(0);
+        let mut ledger = tx.read::<Ledger>("remembered").await.unwrap();
+        tx.append_with(&mut ledger, added(1), &projectors).unwrap();
+        // A plain append, and an append_with that names none, both reuse the fixed set.
+        tx.append(&mut ledger, added(2)).unwrap();
+        tx.append_with(&mut ledger, added(3), &[]).unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+
+        let committed = repository.committed.lock().unwrap();
+        assert_eq!(
+            committed[0].operations,
+            vec!["put remembered total=6 events=3".to_owned()],
+            "the view update survives the later plain appends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_first_staged_plain_adopts_the_first_named_set() {
+        let repository = Recording::default();
+        let projectors: Vec<Arc<dyn Projector<Ledger, String>>> = vec![Arc::new(ViewRow)];
+
+        let mut tx = Transaction::new(&repository).with_snapshot_interval(0);
+        let mut ledger = tx.read::<Ledger>("late").await.unwrap();
+        tx.append(&mut ledger, added(1)).unwrap();
+        tx.append_with(&mut ledger, added(2), &projectors).unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+
+        let committed = repository.committed.lock().unwrap();
+        assert_eq!(
+            committed[0].operations,
+            vec!["put late total=3 events=2".to_owned()],
+            "the set named later covers the cumulative events"
+        );
+    }
+
+    #[tokio::test]
+    async fn naming_a_different_projector_set_for_a_stream_is_a_typed_error() {
+        struct Other;
+        impl Projector<Ledger, String> for Other {
+            fn project(
+                &self,
+                _: &EntityId,
+                _: &Ledger,
+                _: &[crate::conformance::LedgerEvent],
+            ) -> Result<Vec<String>, crate::BoxError> {
+                Ok(vec!["other".to_owned()])
+            }
+        }
+
+        let repository = Recording::default();
+        let first: Vec<Arc<dyn Projector<Ledger, String>>> = vec![Arc::new(ViewRow)];
+        let different: Vec<Arc<dyn Projector<Ledger, String>>> = vec![Arc::new(Other)];
+        let same_again: Vec<Arc<dyn Projector<Ledger, String>>> = first.clone();
+
+        let mut tx = Transaction::new(&repository).with_snapshot_interval(0);
+        let mut ledger = tx.read::<Ledger>("fixed").await.unwrap();
+        tx.append_with(&mut ledger, added(1), &first).unwrap();
+
+        let error = tx
+            .append_with(&mut ledger, added(2), &different)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::ProjectorSetConflict { entity_id } if entity_id.as_str() == "fixed"),
+            "{error:?}"
+        );
+        assert_eq!(
+            ledger.sequence(),
+            EventSequence(1),
+            "the refused append changed nothing"
+        );
+
+        // The same projectors again are accepted, and the transaction is not poisoned.
+        tx.append_with(&mut ledger, added(2), &same_again).unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+
+        let committed = repository.committed.lock().unwrap();
+        assert_eq!(
+            committed[0].operations,
+            vec!["put fixed total=3 events=2".to_owned()]
+        );
     }
 }
