@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 
@@ -193,4 +194,45 @@ func TestCommitRefusesProjectorOperationsBeforeAnyWrite(t *testing.T) {
 
 	// The capability is still declared for event, fence, and snapshot-only commits.
 	require.NoError(t, evt.RequireTransactions(repo))
+}
+
+// commitStubTx is a pgx.Tx whose Commit fails with a scripted error; every other method panics via
+// the nil embedded interface, because inTx only commits and rolls back.
+type commitStubTx struct {
+	pgx.Tx
+
+	commitErr error
+}
+
+func (tx commitStubTx) Commit(context.Context) error   { return tx.commitErr }
+func (tx commitStubTx) Rollback(context.Context) error { return nil }
+
+type commitStubDB struct {
+	DB
+
+	tx commitStubTx
+}
+
+func (db commitStubDB) Begin(context.Context) (pgx.Tx, error) { return db.tx, nil }
+
+func TestInTxMarksOnlyNonDatabaseCommitFailuresIndeterminate(t *testing.T) {
+	run := func(commitErr error) error {
+		repo := NewRepository(commitStubDB{tx: commitStubTx{commitErr: commitErr}})
+
+		return repo.inTx(context.Background(), func(pgx.Tx) error { return nil })
+	}
+
+	// A lost connection at COMMIT leaves the caller unable to know whether the transaction applied.
+	var indeterminate *indeterminateCommitError
+	require.ErrorAs(t, run(errors.New("conn closed")), &indeterminate)
+	require.ErrorAs(t, run(context.Canceled), &indeterminate)
+	require.ErrorIs(t, run(context.DeadlineExceeded), context.DeadlineExceeded, "the cause stays matchable")
+
+	// A database error at COMMIT is a definitive refusal.
+	require.NotErrorAs(t, run(&pgconn.PgError{Code: "40001"}), &indeterminate)
+
+	// A unique violation at COMMIT keeps its optimistic-concurrency classification.
+	require.True(t, evt.IsConflictErr(run(&pgconn.PgError{Code: uniqueViolation})))
+
+	require.NoError(t, run(nil))
 }
