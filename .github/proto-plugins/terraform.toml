@@ -15,5 +15,9 @@ download-url = "https://releases.hashicorp.com/terraform/{version}/{download_fil
 checksum-url = "https://releases.hashicorp.com/terraform/{version}/terraform_{version}_SHA256SUMS"
 unpack = true
 
+[install.arch]
+aarch64 = "arm64"
+x86_64 = "amd64"
+
 [resolve]
 git-url = "https://github.com/hashicorp/terraform"
