@@ -1,8 +1,11 @@
 package mem_test
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
+	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/conformance"
 	"github.com/photon-grove/evt/mem"
 )
@@ -15,5 +18,17 @@ func Test_RepositoryConformance(t *testing.T) {
 		SupportsSnapshots:             true,
 		EnforcesOptimisticConcurrency: false,
 		SupportsTransactions:          true,
+		DeclareRetention: func(ctx context.Context, repo evt.Repository, entityType evt.EntityType) error {
+			memRepo, ok := repo.(*mem.Repository)
+			if !ok {
+				return fmt.Errorf("unexpected repository type %T", repo)
+			}
+
+			_, err := memRepo.Declare(ctx, func(manifest *evt.FeatureManifest) {
+				manifest.Retention = append(manifest.Retention, entityType)
+			})
+
+			return err
+		},
 	})
 }

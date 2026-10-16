@@ -257,7 +257,7 @@ impl Repository for MemRepository {
             }
         }
 
-        for (index, fence) in commit.fences.iter().enumerate() {
+        for fence in &commit.fences {
             if commit
                 .streams
                 .iter()
@@ -285,7 +285,7 @@ impl Repository for MemRepository {
             if event_head > fence.head || snapshot_head > fence.head {
                 return Err(Error::FenceConflict {
                     entity_id: fence.entity_id.clone(),
-                    index,
+                    head: fence.head,
                     provenance: fence.provenance,
                 });
             }

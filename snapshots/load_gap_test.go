@@ -31,6 +31,8 @@ func TestLoadEntityRejectsSequenceGap(t *testing.T) {
 
 	_, err = store.LoadEntity(ctx, test.NewEntity(id), id)
 	require.True(t, evt.IsConflictErr(err), "want a conflict, got %v", err)
+	require.ErrorIs(t, err, evt.ErrSequenceGap)
+
 }
 
 // gapOnce drops the first event of the first post-snapshot read, the way a compaction that lands

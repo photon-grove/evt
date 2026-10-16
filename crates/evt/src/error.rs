@@ -21,6 +21,22 @@ pub enum Error {
         message: String,
     },
 
+    /// A loaded stream skips a sequence: another writer snapshotted and compacted it between the
+    /// snapshot read and the event read, or events expired. Reloading resolves it, so it is a
+    /// retryable conflict.
+    #[error(
+        "conflict on entity {entity_id}: the stream skips from sequence {after} to {found}: it \
+         was compacted during the load, or events expired"
+    )]
+    SequenceGap {
+        /// The entity whose stream skips.
+        entity_id: EntityId,
+        /// The last sequence applied before the gap.
+        after: EventSequence,
+        /// The next stored sequence, which is not `after + 1`.
+        found: EventSequence,
+    },
+
     /// The command ID was already recorded by an event replayed since the latest snapshot.
     /// Treat it as an idempotent success.
     #[error("duplicate command: {0}")]
@@ -80,13 +96,15 @@ pub enum Error {
         largest_item: usize,
     },
 
-    /// A read-only input moved. The index is the pinned transaction action index.
-    #[error("read fence failed for {entity_id} at action {index} ({provenance:?})")]
+    /// A read-only input moved: another writer advanced the fenced stream past the head the
+    /// transaction observed. Engine-filled fences are retryable; caller-stamped fences are a
+    /// stale-fence rejection the caller must handle.
+    #[error("read fence failed for {entity_id} at head {head} ({provenance:?})")]
     FenceConflict {
         /// Fenced stream.
         entity_id: EntityId,
-        /// Failing action's zero-based index.
-        index: usize,
+        /// The head the transaction fenced the stream at.
+        head: EventSequence,
         /// Origin of the fenced head.
         provenance: crate::repository::FenceProvenance,
     },
@@ -181,7 +199,10 @@ impl Error {
     /// Reports whether the error is an optimistic-concurrency conflict. A fence conflict is one:
     /// another writer moved the fenced stream, like a competing sequence put.
     pub fn is_conflict(&self) -> bool {
-        matches!(self, Self::Conflict { .. } | Self::FenceConflict { .. })
+        matches!(
+            self,
+            Self::Conflict { .. } | Self::SequenceGap { .. } | Self::FenceConflict { .. }
+        )
     }
 
     /// Reports whether the error is a duplicate command (an idempotent success).
@@ -195,6 +216,7 @@ impl Error {
         matches!(
             self,
             Self::Conflict { .. }
+                | Self::SequenceGap { .. }
                 | Self::Transient(_)
                 | Self::FenceConflict {
                     provenance: crate::repository::FenceProvenance::Engine,

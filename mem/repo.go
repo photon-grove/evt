@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 
@@ -64,10 +65,21 @@ func (repo Repository) Commit(
 		return err
 	}
 
+	// The manifest lock is held through the write, so a declaration cannot slip between the
+	// marker checks and the events, mirroring the durable backends' transaction condition.
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	// A manifest that declares a feature this writer does not model refuses the commit, as the
+	// durable backends' marker check does. The in-memory double models no extensions.
+	if err := repo.features.validate(); err != nil {
+		return err
+	}
+
 	// Fences are refused outright for entity types durably declared with retention, exactly as
 	// the durable backends refuse them: TTL deletes reopen fenced slots without leaving a
 	// successor snapshot, so the two checks cannot protect them.
-	if err := repo.refuseRetention(normalized.Fences); err != nil {
+	if err := evt.CheckFenceRetention(normalized.Fences, repo.features.manifest); err != nil {
 		return err
 	}
 
@@ -136,6 +148,16 @@ func (repo Repository) checkFences(fences []evt.ReadFence) error {
 	return nil
 }
 
+// validate refuses a manifest that declares a feature this build does not model. The in-memory
+// repository models no extensions, like the default Go writer. The caller holds mu.
+func (f *memFeatures) validate() error {
+	if f.manifest == nil {
+		return nil
+	}
+
+	return f.manifest.Validate(nil)
+}
+
 // Manifest reads the stored feature manifest, or nil when nothing is declared. The returned
 // manifest is a copy; declaring is the only way to change it.
 func (repo Repository) Manifest(_ context.Context) (*evt.FeatureManifest, error) {
@@ -146,39 +168,42 @@ func (repo Repository) Manifest(_ context.Context) (*evt.FeatureManifest, error)
 		return nil, nil
 	}
 
-	manifest := *repo.features.manifest
+	manifest := cloneManifest(*repo.features.manifest)
 
 	return &manifest, nil
 }
 
-// Declare applies a change to the stored manifest in one read-modify-write and bumps its
-// version, like the durable backends' declarations. Declaring does not grant support: the
-// resulting manifest may declare features this build does not model.
-func (repo Repository) Declare(_ context.Context, change func(*evt.FeatureManifest)) error {
+// Declare applies a change to the stored manifest in one read-modify-write and bumps its version
+// by exactly one, like the durable backends' declarations, and returns the resulting manifest.
+// Declaring does not grant support: the resulting manifest may declare features this build does
+// not model, which then refuses later commits.
+func (repo Repository) Declare(
+	_ context.Context,
+	change func(*evt.FeatureManifest),
+) (evt.FeatureManifest, error) {
 	repo.features.mu.Lock()
 	defer repo.features.mu.Unlock()
 
-	manifest := repo.features.manifest
-	if manifest == nil {
-		manifest = &evt.FeatureManifest{}
+	next := evt.FeatureManifest{Features: map[string]evt.FeatureFormat{}}
+	if repo.features.manifest != nil {
+		next = cloneManifest(*repo.features.manifest)
 	}
-	change(manifest)
-	manifest.Version++
-	repo.features.manifest = manifest
 
-	return nil
+	version := next.Version
+	change(&next)
+	next.Version = version + 1
+	repo.features.manifest = &next
+
+	return cloneManifest(next), nil
 }
 
-// refuseRetention refuses fences whose entity type is in the stored manifest's retention set.
-func (repo Repository) refuseRetention(fences []evt.ReadFence) error {
-	if len(fences) == 0 {
-		return nil
-	}
+// cloneManifest copies a manifest so callers never alias the stored one.
+func cloneManifest(manifest evt.FeatureManifest) evt.FeatureManifest {
+	manifest.Features = maps.Clone(manifest.Features)
+	manifest.HistoryDependent = slices.Clone(manifest.HistoryDependent)
+	manifest.Retention = slices.Clone(manifest.Retention)
 
-	repo.features.mu.Lock()
-	defer repo.features.mu.Unlock()
-
-	return evt.CheckFenceRetention(fences, repo.features.manifest)
+	return manifest
 }
 
 // CommitStream streams Events to memory
@@ -453,6 +478,13 @@ func (repo Repository) CompactBelow(
 
 	id := string(entityID)
 
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	if err := repo.features.validate(); err != nil {
+		return 0, err
+	}
+
 	snapshot, ok := repo.snapshots[id]
 	if !ok {
 		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
@@ -462,6 +494,11 @@ func (repo Repository) CompactBelow(
 			"%w: entity %s snapshot covers through event %d but compaction was requested through %d",
 			evt.ErrCompactionUncovered, entityID, snapshot.EventSequence, throughSequence,
 		)
+	}
+
+	// A history-dependent type's rebuild replays the commits compaction would delete.
+	if repo.features.manifest != nil && slices.Contains(repo.features.manifest.HistoryDependent, snapshot.EntityType) {
+		return 0, evt.NewHistoryDependentProjectionError(snapshot.EntityType)
 	}
 
 	events := repo.events[id]

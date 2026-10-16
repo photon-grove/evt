@@ -29,7 +29,7 @@ func Test_RepositoryConformance(t *testing.T) {
 		SupportsSnapshots:             true,
 		EnforcesOptimisticConcurrency: true,
 		SupportsTransactions:          true,
-		DeclareRetention: func(ctx context.Context, entityType evt.EntityType) error {
+		DeclareRetention: func(ctx context.Context, _ evt.Repository, entityType evt.EntityType) error {
 			_, err := marker.Declare(ctx, func(manifest *evt.FeatureManifest) {
 				manifest.Retention = append(manifest.Retention, entityType)
 			})

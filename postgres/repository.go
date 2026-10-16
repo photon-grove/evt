@@ -15,6 +15,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/internal/eventjson"
+	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -416,7 +417,7 @@ func (repo *Repository) commitSnapshots(ctx context.Context, tx pgx.Tx, result e
 // (ADR 0004, C2). The locks above hold the stream steady through the assertions. A failed
 // assertion is a typed fence conflict carrying the fence's provenance.
 func (repo *Repository) checkFences(ctx context.Context, tx pgx.Tx, fences []evt.ReadFence) error {
-	for i, fence := range fences {
+	for _, fence := range fences {
 		var eventHead, snapshotHead int64
 		err := tx.QueryRow(ctx, fmt.Sprintf(
 			`SELECT COALESCE((SELECT MAX(sequence) FROM %s WHERE entity_id = $1), 0),
@@ -428,7 +429,7 @@ func (repo *Repository) checkFences(ctx context.Context, tx pgx.Tx, fences []evt
 		}
 
 		if eventHead > int64(fence.Head) || snapshotHead > int64(fence.Head) {
-			return &evt.FenceConflictError{Fence: fence, Index: i}
+			return policy.FenceConflict(fence)
 		}
 	}
 

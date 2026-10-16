@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
@@ -40,10 +41,12 @@ type SuiteOptions struct {
 	// double and every durable backend support it; a minimal backend may leave it false.
 	SupportsTransactions bool
 
-	// DeclareRetention, when non-nil, durably adds the given entity type to the feature manifest's
-	// retention set, enabling the fence-retention-refusal case. It must run last: the declaration
-	// refuses every later fence for that type.
-	DeclareRetention func(context.Context, evt.EntityType) error
+	// DeclareRetention durably adds the given entity type to the feature manifest's retention set
+	// of the repository under test, so the fence-retention-refusal case can run. It is mandatory
+	// for a backend that sets SupportsTransactions: the spec refuses read fences for retained
+	// types on every backend, so a missing hook fails the suite instead of skipping the case.
+	// The declaration refuses every later fence for that type.
+	DeclareRetention func(ctx context.Context, repo evt.Repository, entityType evt.EntityType) error
 }
 
 // RunRepositorySuite runs the full backend-neutral contract suite against the repository produced by
@@ -132,11 +135,12 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 			})
 		}
 
-		if opts.DeclareRetention != nil {
-			t.Run("RejectsFencesForRetention", func(t *testing.T) {
-				testRejectsFencesForRetention(t, newRepo(), opts.DeclareRetention)
-			})
-		}
+		t.Run("RejectsFencesForRetention", func(t *testing.T) {
+			require.NotNil(t, opts.DeclareRetention,
+				"a backend claiming transactions must supply SuiteOptions.DeclareRetention")
+
+			testRejectsFencesForRetention(t, newRepo(), opts.DeclareRetention)
+		})
 	}
 
 	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
@@ -811,6 +815,21 @@ func testReadFence(t *testing.T, repo evt.Repository) {
 	require.Equal(t, evt.EventSequence(2), conflict.Fence.Head)
 	var conflictError *evt.ConflictError
 	require.ErrorAs(t, err, &conflictError, "a fence conflict is an optimistic-concurrency conflict")
+	require.False(t, conflict.Fence.CallerStamped)
+	require.True(t, policy.IsTransient(err), "an engine-filled fence conflict retries like an event-put conflict")
+
+	// The same stale fence stamped by a caller is a stale-fence rejection, not a retryable
+	// conflict.
+	stamped := fenced
+	stamped.CallerStamped = true
+	err = repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", evt.EventSequence(before),
+			&test.EntityUpdated{ID: idC, Value: "later"}),
+		Fences: []evt.ReadFence{stamped},
+	})
+	require.ErrorAs(t, err, &conflict)
+	require.True(t, conflict.Fence.CallerStamped)
+	require.False(t, policy.IsTransient(err), "a caller-stamped fence conflict is not retried")
 
 	// Nothing from the failed commit was written.
 	events, err = repo.GetEvents(ctx, idC)
@@ -873,7 +892,11 @@ func testFenceCompactionABA(t *testing.T, repo evt.Repository) {
 	require.ErrorAs(t, err, &conflict)
 }
 
-func testRejectsFencesForRetention(t *testing.T, repo evt.Repository, declare func(context.Context, evt.EntityType) error) {
+func testRejectsFencesForRetention(
+	t *testing.T,
+	repo evt.Repository,
+	declare func(context.Context, evt.Repository, evt.EntityType) error,
+) {
 	t.Helper()
 	ctx := context.Background()
 	ns := newNamespace()
@@ -882,7 +905,7 @@ func testRejectsFencesForRetention(t *testing.T, repo evt.Repository, declare fu
 	// tests never collide.
 	entityType := evt.EntityType(ns + "-retained")
 	idA := evt.EntityID(ns + "-a")
-	require.NoError(t, declare(ctx, entityType))
+	require.NoError(t, declare(ctx, repo, entityType))
 
 	err := repo.Commit(ctx, evt.SerializedResult{
 		Fences: []evt.ReadFence{{EntityID: idA, EntityType: entityType, Head: 0}},

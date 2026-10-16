@@ -43,6 +43,14 @@ impl PgStatement {
             params,
         }
     }
+
+    /// The statement's size in the shared commit budget: one action, sized by its SQL text. The
+    /// bound parameters are opaque, so the estimate is a lower bound; the action count, which
+    /// the budget checks exactly, is what makes `CommitTooLarge` fire at the same point as on
+    /// DynamoDB.
+    fn budget_size(&self) -> usize {
+        self.sql.len()
+    }
 }
 
 impl fmt::Debug for PgStatement {
@@ -423,9 +431,10 @@ impl Repository for PostgresRepository {
         };
 
         // The budget is backend-neutral, so an oversized commit is refused before any write,
-        // identically to the other backends. Projector statements are opaque here and skipped,
-        // like in `commit_transaction`.
-        crate::repository::check_budget(commit.sizes(|_| None)?)?;
+        // identically to the other backends. Each projector statement counts as one action.
+        let mut sizes = commit.sizes(|_| None)?;
+        sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
+        crate::repository::check_budget(sizes)?;
 
         let rows = commit
             .events
@@ -537,7 +546,10 @@ impl Repository for PostgresRepository {
         }
 
         // Budget parity: an oversized commit fails identically on every backend, before any write.
-        crate::repository::check_budget(commit.sizes(|_| None)?)?;
+        // Each projector statement counts as one action.
+        let mut sizes = commit.sizes(|_| None)?;
+        sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
+        crate::repository::check_budget(sizes)?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
@@ -664,7 +676,7 @@ impl Repository for PostgresRepository {
         // Fenced read-only streams: assert that no stored event and no snapshot covers past the
         // fenced head — the SQL form of the slot check plus the snapshot companion (ADR 0004, C2).
         // The locks above hold the streams steady through the assertions.
-        for (index, fence) in commit.fences.iter().enumerate() {
+        for fence in &commit.fences {
             let sql = format!(
                 "SELECT COALESCE((SELECT MAX(sequence) FROM {} WHERE entity_id = $1), 0),
                         COALESCE((SELECT MAX(event_sequence) FROM {} WHERE entity_id = $1), 0)",
@@ -680,7 +692,7 @@ impl Repository for PostgresRepository {
             if event_head > fence.head.0 || snapshot_head > fence.head.0 {
                 return Err(Error::FenceConflict {
                     entity_id: fence.entity_id.clone(),
-                    index,
+                    head: fence.head,
                     provenance: fence.provenance,
                 });
             }

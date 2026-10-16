@@ -102,6 +102,35 @@ func (e *ConflictError) Error() string {
 	return e.msg
 }
 
+// ErrSequenceGap identifies a stream whose stored events skip a sequence while loading: another
+// writer snapshotted and compacted the stream between the snapshot read and the event read, or
+// events expired. Match it with errors.Is; the same error also matches IsConflictErr.
+var ErrSequenceGap = errors.New("stream sequence gap")
+
+// SequenceGapError reports the sequences a loaded stream skipped. It is a conflict (reloading
+// resolves it) and matches ErrSequenceGap.
+type SequenceGapError struct {
+	EntityID EntityID
+	// After is the last sequence applied before the gap.
+	After EventSequence
+	// Found is the next stored sequence, which is not After + 1.
+	Found EventSequence
+}
+
+// Error returns the error message string.
+func (e *SequenceGapError) Error() string {
+	return fmt.Sprintf(
+		"stream %s skips from sequence %d to %d: it was compacted during the load, or events expired",
+		e.EntityID, e.After, e.Found,
+	)
+}
+
+// Unwrap keeps the gap matchable as a conflict (IsConflictErr).
+func (e *SequenceGapError) Unwrap() error { return NewConflictError(e.Error()) }
+
+// Is makes errors.Is(err, ErrSequenceGap) match.
+func (e *SequenceGapError) Is(target error) bool { return target == ErrSequenceGap }
+
 // NoOpError indicates a command would produce no changes.
 type NoOpError struct {
 	msg string

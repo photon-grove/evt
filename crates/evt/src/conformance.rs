@@ -1023,14 +1023,18 @@ async fn read_fences<R: Repository>(repo: &R) -> CaseResult {
     ensure!(
         matches!(
             &err,
-            Error::FenceConflict { entity_id, provenance: FenceProvenance::Engine, .. }
+            Error::FenceConflict { entity_id, head: EventSequence(2), provenance: FenceProvenance::Engine }
                 if *entity_id == a.id
         ),
-        "a stale fence fails with a fence conflict naming the fenced stream"
+        "a stale fence fails with a fence conflict naming the fenced stream and its fenced head"
     );
     ensure!(
         err.is_conflict(),
         "a fence conflict is an optimistic-concurrency conflict"
+    );
+    ensure!(
+        err.is_retryable(),
+        "an engine-filled fence conflict retries like an event-put conflict"
     );
 
     // Nothing from the failed commit was written.

@@ -3,7 +3,6 @@ package snapshots
 import (
 	"context"
 	"fmt"
-	"slices"
 
 	"github.com/photon-grove/evt"
 )
@@ -107,7 +106,8 @@ func (tx *Transaction) Append(entityID evt.EntityID, events ...evt.Event) error 
 
 // Fence adds a caller-stamped read fence for a stream the engine did not load. The fence fails
 // the commit when another writer moved the stream past the given head. A fence for a stream
-// this transaction read is dropped at Commit: the engine's own fence provenance supersedes it.
+// this transaction read is dropped, whether Fence is called before or after Read: the engine's
+// own fence provenance supersedes it.
 func (tx *Transaction) Fence(fence evt.ReadFence) error {
 	if tx.used {
 		return fmt.Errorf("snapshots: transaction is already consumed")
@@ -133,7 +133,14 @@ func (tx *Transaction) Commit(ctx context.Context, metadata evt.Metadata) ([]evt
 
 	metadata = evt.CommitMetadata(metadata)
 
-	result := evt.SerializedResult{Fences: slices.Clone(tx.fences)}
+	// A caller-stamped fence for a stream this transaction read is superseded by the engine's own
+	// fence (or by the write), whichever order Fence and Read were called in.
+	result := evt.SerializedResult{}
+	for _, fence := range tx.fences {
+		if _, read := tx.streams[fence.EntityID]; !read {
+			result.Fences = append(result.Fences, fence)
+		}
+	}
 
 	for _, entityID := range tx.order {
 		stream := tx.streams[entityID]
@@ -200,16 +207,14 @@ func (tx *Transaction) Commit(ctx context.Context, metadata evt.Metadata) ([]evt
 	return normalized.Events, nil
 }
 
-// streamHead returns the larger of a loaded context's highest event sequence and its snapshot's
-// event sequence: the head a fenced read observed.
+// streamHead returns the head a fenced read observed: the loaded context's current event
+// sequence. LoadEntity seeds it from the snapshot's event sequence and advances it over later
+// events, so it is already the larger of the stream's highest event sequence and its snapshot's
+// event sequence — including a compacted stream, whose events a snapshot covers.
 func streamHead(context evt.Context) evt.EventSequence {
-	head := evt.EventSequence(0)
-	if context.CurrentSequence != nil {
-		head = *context.CurrentSequence
-	}
-	if context.CurrentSnapshot != nil && *context.CurrentSnapshot > head {
-		head = *context.CurrentSnapshot
+	if context.CurrentSequence == nil {
+		return 0
 	}
 
-	return head
+	return *context.CurrentSequence
 }
