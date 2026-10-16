@@ -10,9 +10,12 @@
 //! - Define events with [`domain_events!`] and state with [`Aggregate`].
 //! - Use [`MemRepository`] in tests, [`dynamodb::DynamoRepository`] (feature `dynamodb`), or
 //!   [`postgres::PostgresRepository`] (feature `postgres`).
+//! - Test command flows given/when/then with [`testing::Scenario`] (feature `testing`).
 //! - Migrate old payloads with [`Upcaster`]s such as [`JsonUpcaster`].
 //! - Record every command as a durable, replayable [`Outcome`] with [`Store::with_outcomes`]:
 //!   idempotent retries, persisted domain [`Rejection`]s, and accepted no-ops.
+//! - Walk the whole log lazily with [`EventLog`]: [`stream_all_events`](EventLog::stream_all_events)
+//!   and [`stream_entities`](EventLog::stream_entities) return [`futures_core::Stream`]s.
 //! - Bound log growth with [`Repository::compact_below`], which only deletes events a durable
 //!   snapshot covers.
 //!
@@ -26,6 +29,7 @@ mod commit_id;
 #[cfg(any(test, feature = "conformance"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "conformance")))]
 pub mod conformance;
+mod enumerate;
 mod error;
 mod event;
 mod features;
@@ -38,6 +42,9 @@ mod repository;
 mod retry;
 mod sha256;
 mod store;
+#[cfg(any(test, feature = "testing"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
+pub mod testing;
 mod transaction;
 mod upcast;
 pub mod wire;
@@ -52,6 +59,7 @@ pub mod postgres;
 
 pub use aggregate::{Aggregate, Projector};
 pub use commit_id::CommitIdGenerator;
+pub use enumerate::{EventBatch, EventLog, StreamFilter};
 pub use error::{BoxError, Error, ExecuteError, ReplayPhase};
 pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
 pub use features::{

@@ -15,6 +15,7 @@ photon-evt = { path = "crates/evt" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
+futures-core = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = { version = "1", default-features = false }

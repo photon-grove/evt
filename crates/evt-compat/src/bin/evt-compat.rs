@@ -4,22 +4,28 @@
 //! evt-compat steps
 //! evt-compat step   --backend dynamo|postgres --run RUN --index N
 //! evt-compat verify --backend dynamo|postgres --run RUN
+//! evt-compat enumerate --backend dynamo|postgres --run RUN
 //! ```
 //!
 //! `step` executes step N of every scenario whose writer is `rust`, against streams the Go driver
 //! also writes to. `verify` checks every stream against the golden fixtures: the raw stored items
-//! or rows, the events and snapshot read through the repository, and the loaded state.
+//! or rows, the events and snapshot read through the repository, and the loaded state. `enumerate`
+//! prints the run's events as `stream_all_events` yields them (unfiltered and filtered by entity
+//! type), one sorted line each, for the integration script to compare with the Go driver's output.
 
 use std::process::ExitCode;
 
 use evt_compat::drivers;
 use evt_compat::scenario::{Expectation, WRITER};
 use evt_compat::{Runner, ScenarioFixtures, Scenarios};
+use futures_core::Stream;
 use photon_evt::dynamodb::DynamoRepository;
 use photon_evt::postgres::PostgresRepository;
 use photon_evt::wire::dynamo;
 use photon_evt::wire::postgres::{EventRow, OutcomeRow, SnapshotRow};
-use photon_evt::{CommandId, EntityId, Repository, SerializedEvent, SerializedSnapshot};
+use photon_evt::{
+    CommandId, EntityId, EventLog, Repository, SerializedEvent, SerializedSnapshot, StreamFilter,
+};
 
 type Failures = Vec<String>;
 type BoxError = Box<dyn std::error::Error>;
@@ -404,6 +410,38 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
     Ok(failures)
 }
 
+/// Prints every event of the run that `stream_all_events` yields, once unfiltered and once
+/// narrowed to the account entity type, as sorted `section entity sequence type` lines.
+async fn enumerate<R: EventLog>(repository: &R, run: &str) -> Result<Failures, BoxError> {
+    let mut lines = Vec::new();
+
+    for (section, filter) in [
+        ("all", StreamFilter::all()),
+        ("typed", StreamFilter::of_type("account")),
+    ] {
+        let stream = repository.stream_all_events(filter);
+        let mut stream = std::pin::pin!(stream);
+
+        while let Some(batch) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            for event in batch? {
+                if event.entity_id.as_str().contains(run) {
+                    lines.push(format!(
+                        "{section} {} {} {}",
+                        event.entity_id, event.sequence, event.event_type
+                    ));
+                }
+            }
+        }
+    }
+
+    lines.sort();
+    for line in lines {
+        println!("{line}");
+    }
+
+    Ok(Vec::new())
+}
+
 async fn run(args: Args) -> Result<Failures, BoxError> {
     if args.command == "steps" {
         println!("{}", Scenarios::load()?.max_steps());
@@ -420,6 +458,8 @@ async fn run(args: Args) -> Result<Failures, BoxError> {
         ("step", Backend::Dynamo(repository)) => step(repository, &args.run, args.index).await,
         ("step", Backend::Postgres(repository)) => step(repository, &args.run, args.index).await,
         ("verify", backend) => verify(backend, &args.run).await,
+        ("enumerate", Backend::Dynamo(repository)) => enumerate(&repository, &args.run).await,
+        ("enumerate", Backend::Postgres(repository)) => enumerate(&repository, &args.run).await,
         (other, _) => Err(format!("unknown command {other}").into()),
     }
 }

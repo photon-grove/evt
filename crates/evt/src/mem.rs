@@ -554,6 +554,8 @@ impl FeatureMarker for MemRepository {
     }
 }
 
+mod enumerate;
+
 #[cfg(test)]
 mod tests {
     use super::*;

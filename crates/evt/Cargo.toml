@@ -10,7 +10,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
+include = ["src/**", "examples/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [features]
 default = []
@@ -21,17 +21,26 @@ dynamodb = ["dep:aws-sdk-dynamodb"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 # The backend conformance suite (`photon_evt::conformance`), for testing Repository implementations.
 conformance = []
+# Given/when/then test utilities over `MemRepository` (`photon_evt::testing`). The conformance
+# fixtures back its doc examples, so it enables them.
+testing = ["conformance"]
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+futures-core.workspace = true
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
+
+[[example]]
+name = "banking"
+required-features = ["testing"]
+test = true
 
 [package.metadata.docs.rs]
 all-features = true

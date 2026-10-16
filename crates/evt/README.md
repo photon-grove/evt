@@ -14,6 +14,8 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
   concurrency and duplicate-command detection.
 - Backends: `MemRepository` for tests, DynamoDB (feature `dynamodb`), and PostgreSQL (feature
   `postgres`).
+- `testing` feature: given/when/then `Scenario` and multi-stream `Fixture` over `MemRepository`
+  (see [Testing your domain](#testing-your-domain)).
 - Upcasters migrate old payload versions on read. `compact_below` deletes only events a snapshot
   covers.
 - In-band projectors write views in the same transaction as the events.
@@ -26,6 +28,9 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
   one transaction lock (PostgreSQL). DynamoDB has no whole-operation lease: a declaration racing
   multi-batch compaction can leave a partially compacted stream, whose history-dependent rebuild
   reports `CompactionUncovered`. Declare history dependence before writing data of that type.
+- `EventLog` walks the whole log lazily as a `futures_core::Stream`: `stream_all_events` yields
+  batches of events and `stream_entities` yields folded aggregates, both optionally filtered by
+  entity type (see [Enumerating the log](#enumerating-the-log)).
 - `Store::transaction` loads several aggregates, appends decided events to any of them, and
   commits once: all streams land or none does. Reads that were not written are fenced at the head
   they saw, and every event of the commit carries one `commitId` (the command ID when present,
@@ -319,6 +324,76 @@ repository.ensure_schema().await?;
 let store = Store::<Account, _>::new(repository, ());
 ```
 
+## Enumerating the log
+
+`EventLog`, implemented by all three backends, is the Rust counterpart of Go's `StreamAllEvents`
+and `StreamEntities`. Rebuilds and diagnostic tools use it to walk the log without loading it:
+
+```rust,ignore
+use futures_util::StreamExt; // any `futures_core::Stream` consumer works
+use photon_evt::{EventLog, StreamFilter};
+
+// Batches of events, narrowed to one entity type.
+let mut batches = std::pin::pin!(repository.stream_all_events(StreamFilter::of_type("account")));
+while let Some(batch) = batches.next().await {
+    for event in batch? {
+        // ...
+    }
+}
+
+// Aggregates folded from their events, one `Loaded<Account>` at a time.
+let mut accounts = std::pin::pin!(repository.stream_entities::<Account>(StreamFilter::all()));
+```
+
+- **Lazy and cancellable.** Nothing is read until the stream is polled, and dropping it cancels the
+  read. A PostgreSQL stream returns its pooled connection when dropped.
+- **Ordering.** PostgreSQL and the in-memory repository yield one batch per entity, entities
+  ascending by ID and each entity's events ascending by sequence. DynamoDB yields one batch per
+  Scan page: no order, and an entity's events can span pages. `stream_entities` yields entities in
+  the order their first event was seen and folds each in sequence order.
+- **Memory.** One entity (PostgreSQL, in memory) or one page (DynamoDB) for `stream_all_events`.
+  On DynamoDB `stream_entities` buffers every matched event until the Scan completes, as Go does,
+  because a Scan does not group an entity's events. `DynamoRepository::with_scan_page_size` caps
+  the page.
+- **Filter.** `StreamFilter::all()` matches everything (Go's zero filter). `of_type("")` matches
+  only entities stored with an empty type. `stream_entities::<A>` narrows to `A::TYPE` unless the
+  filter names a type.
+- **Skipped.** Entities in the reserved `SYSTEM#` and `command-outcome#` namespaces, and snapshot
+  items, are never yielded.
+- **Errors.** A backend error ends the stream as its last item. An entity that fails to fold (an
+  unknown event type, a failed upcast, a sequence gap from compaction) is yielded as an error and
+  the stream continues. Entities fold from events only, as in Go, so a compacted stream reports
+  `SequenceGap`: load it with `Store::load` instead.
+
+## Testing your domain
+
+The `testing` feature adds `photon_evt::testing`: given/when/then tests over `MemRepository`, the
+counterpart of Go's `test` package. `Scenario` seeds a stream, runs a command through a real
+`Store`, and asserts the emitted events, the rejection, a store error, or the resulting state:
+
+```rust,ignore
+use photon_evt::testing::Scenario;
+
+#[tokio::test]
+async fn withdrawing_more_than_the_balance_is_rejected() {
+    Scenario::<Account>::given([opened("acct-1", 10)])
+        .when(AccountCommand::Withdraw { amount: 11 })
+        .then_rejected(|error| matches!(error, AccountError::InsufficientFunds { .. }))
+        .await;
+}
+```
+
+`Fixture` is the multi-stream piece: `given::<A>(id, events)` seeds (or, on an existing stream,
+stands in for a concurrent writer), `transaction()` starts a `Store::transaction`-style commit
+over the same data, and `events::<A>(id)` / `assert_events` / `load::<A>(id)` inspect each
+stream. `Scenario::on(&fixture)` runs a single-stream scenario against it.
+
+[`examples/banking.rs`](examples/banking.rs) puts it together: `domain_events!` enums, two
+aggregates, a balance read model fed only from committed events, and a two-account transfer as a multi-stream transaction with a
+read-fenced `bank` stream. Run it with
+`cargo run -p photon-evt --example banking --features testing`; its tests run with
+`cargo test -p photon-evt --features testing --example banking`.
+
 ## Testing a backend
 
 The `conformance` feature adds the backend conformance suite that this crate runs against its own
@@ -327,6 +402,8 @@ backends:
 ```rust,ignore
 photon_evt::conformance::Suite::new(&my_repository).run().await;
 photon_evt::conformance::outcome_cases(&my_repository, &second_handle).await;
+// For a backend that implements `EventLog`:
+photon_evt::conformance::enumeration_cases(&my_repository).await;
 ```
 
 ## Compatibility with Go

@@ -52,6 +52,7 @@ pub struct DynamoRepository {
     client: Client,
     table: String,
     consistent_read: bool,
+    scan_page_size: Option<i32>,
     retention: BTreeMap<EntityType, Duration>,
     clock: fn() -> SystemTime,
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
@@ -65,6 +66,7 @@ impl Clone for DynamoRepository {
             client: self.client.clone(),
             table: self.table.clone(),
             consistent_read: self.consistent_read,
+            scan_page_size: self.scan_page_size,
             retention: self.retention.clone(),
             clock: self.clock,
             validated_marker: Mutex::new(*self.validated_marker()),
@@ -80,6 +82,7 @@ impl DynamoRepository {
             client,
             table: table.into(),
             consistent_read: true,
+            scan_page_size: None,
             retention: BTreeMap::new(),
             clock: SystemTime::now,
             validated_marker: Mutex::new(None),
@@ -97,6 +100,17 @@ impl DynamoRepository {
     #[must_use]
     pub fn with_consistent_read(mut self, consistent: bool) -> Self {
         self.consistent_read = consistent;
+        self
+    }
+
+    /// Caps the items a Scan evaluates per page in [`EventLog::stream_all_events`], so a batch
+    /// holds at most `limit` events. By default a page is DynamoDB's 1 MB. For bounding memory and
+    /// for exercising pagination.
+    ///
+    /// [`EventLog::stream_all_events`]: crate::EventLog::stream_all_events
+    #[must_use]
+    pub fn with_scan_page_size(mut self, limit: i32) -> Self {
+        self.scan_page_size = Some(limit.max(1));
         self
     }
 
@@ -1687,6 +1701,8 @@ fn from_sdk(value: &sdk::AttributeValue) -> AttributeValue {
         _ => AttributeValue::Null(true),
     }
 }
+
+mod enumerate;
 
 #[cfg(test)]
 mod tests {
