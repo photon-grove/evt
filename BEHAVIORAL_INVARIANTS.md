@@ -231,6 +231,49 @@ and the feature-marker and rebuild-lock checks — with a pinned item ordering a
 the [storage format](docs/spec/storage-format.md#writes). An over-budget commit fails with a typed
 error before any write and is never split.
 
+### Multi-Stream Commits (v0.9, C1)
+
+- One `Repository.Commit` may append to several streams at once (`SerializedResult.Events` and
+  `.Snapshots` for more than one entity ID), plus projector operations, in a single transaction:
+  all streams land or none does
+- The engine pins the write order bytewise by stream ID regardless of declaration order; each
+  stream keeps its own ascending sequences and its own snapshot-put-or-floor-check suffix
+- Every event of the commit carries one `commitId` (see Metadata Structure)
+- Each written stream continues exactly from its stored head (the larger of its highest event and
+  its snapshot's event sequence): a first sequence that skips ahead is refused with
+  `*SequenceGapError` / `Error::SequenceGap` before any write, and on DynamoDB the observed head is
+  pinned in the transaction (a continuation check on the head event, or the snapshot's `eventSeq`
+  once compaction deleted it)
+- Multi-stream transactions require a repository that declares `evt.TransactionalRepository`;
+  `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
+  before dispatching anything
+- Go PostgreSQL refuses a commit carrying projector operations with
+  `*ProjectorOperationsUnsupportedError` before any write until E2.6 lands; it never drops them
+- A commit that carries projector operations but writes no event is refused before any write
+  (`ProjectorOnlyCommitError` / `Error::ProjectorWithoutEvents`): views are projections of
+  committed events (ADR-0012). An empty command ID is treated as absent when deriving the commit ID
+  in both languages
+- The shared budget counts the whole commit — every stream's events, snapshot/floor items, fence
+  checks, projector operations, and the control checks — and a commit over any limit fails with
+  `CommitTooLargeError` before any write, identically on every backend and in both languages
+
+### Read Fences (v0.9, C2)
+
+- A read-only stream observed during a transaction is fenced with a `ConditionCheck` on
+  `(pk, sk = head + 1)` plus a mandatory snapshot companion on `(pk, sk = 0)`, so a compaction
+  that deletes the checked slot (the append → snapshot → compact ABA) still fails a stale fence
+- A fence conflict fails the whole commit and surfaces as `*FenceConflictError` carrying the
+  fenced stream ID, its fenced head, and the fence's provenance — never a transaction item
+  index, which is internal and differs by backend. It unwraps to a conflict. An engine-filled
+  fence conflict is classified transient (`policy.Classify`, so `policy.ExecuteWithRetry`
+  retries it exactly like an event-put conflict); a caller-stamped one is a stale-fence
+  rejection and is not retried
+- Fences for entity types in the feature manifest's durable `retention` set are refused with
+  `*RetentionConflictError` — the refusal consults the manifest, so it binds writers that
+  configured no retention themselves
+- A written stream's event put at `head + 1` supersedes its own fence; no fence check is emitted
+  for it
+
 ## Snapshot Logic
 
 ### Snapshot Timing

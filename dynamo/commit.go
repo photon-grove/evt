@@ -1,11 +1,14 @@
 package dynamo
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -13,10 +16,14 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/internal/eventjson"
+	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
-// Commit writes serialized events to the events table.
+// Commit writes serialized events to the events table. A multi-stream commit (ADR 0004, C1)
+// appends to any number of streams in one transaction: every written stream keeps its event-put
+// and snapshot-floor protections, and read-only streams are fenced (ADR 0004, C2). The whole
+// commit is validated and budgeted before any write; it is never split.
 func (repo *Repository) Commit(
 	ctx context.Context,
 	result evt.SerializedResult,
@@ -25,28 +32,67 @@ func (repo *Repository) Commit(
 		return err
 	}
 
-	if len(result.Events) == 0 {
+	// Projector operations need a backing event in the same commit (ADR-0012); refuse them even
+	// when nothing else would be written.
+	if err := evt.CheckProjectorOperations(result); err != nil {
+		return err
+	}
+
+	if len(result.Events) == 0 && len(result.Snapshots) == 0 && len(result.Fences) == 0 {
 		return nil
 	}
 
-	if err := evt.CheckReservedEntityIDs(result.Events); err != nil {
-		return err
-	}
-
-	if err := checkContiguous(result.Events); err != nil {
-		return err
-	}
-
-	// Generate Put transactions
-	writeItems, _, err := repo.buildEventPutTransactions(result.Events)
+	normalized, err := evt.NormalizeCommit(result)
 	if err != nil {
 		return err
 	}
 
-	writeItems = append(writeItems, repo.buildFloorChecks(result.Events)...)
+	// Fences are refused outright for entity types with retention: TTL deletes reopen fenced
+	// slots without leaving a successor snapshot, so the two checks cannot protect them. The
+	// refusal is the union of this repository's own WithRetention configuration, which needs no
+	// I/O, and the durable manifest read from the table, which binds writers configured
+	// differently. Declare retained types in the marker too, so other processes refuse them.
+	if len(normalized.Fences) > 0 {
+		retained := func(entityType evt.EntityType) bool { return repo.retention[entityType] > 0 }
+		if ferr := evt.CheckFenceRetentionWith(normalized.Fences, nil, retained); ferr != nil {
+			return ferr
+		}
 
-	// Commit the transactions to DynamoDB
-	return repo.commitEventsWithTransaction(ctx, writeItems, result.Transaction)
+		manifest, merr := repo.features.Manifest(ctx)
+		if merr != nil {
+			return merr
+		}
+		if ferr := evt.CheckFenceRetentionWith(normalized.Fences, manifest, retained); ferr != nil {
+			return ferr
+		}
+	}
+
+	// Each written stream must continue exactly from its stored head: a gap is refused here, and
+	// what was observed is pinned in the transaction (see observeContinuations).
+	pins, err := repo.observeContinuations(ctx, normalized.Events)
+	if err != nil {
+		return err
+	}
+
+	streamItems, layout, err := repo.buildStreamItems(normalized, pins)
+	if err != nil {
+		return err
+	}
+
+	return repo.commitStreamItems(ctx, normalized, streamItems, layout)
+}
+
+// AtomicTransactions declares that Commit writes every stream, snapshot, and fence of a result in
+// one TransactWriteItems call (evt.TransactionalRepository).
+func (repo *Repository) AtomicTransactions() {}
+
+// commitLayout records where each kind of item sits in the built transaction, so a failed commit
+// is classified by the item that failed (the cancellation reason index).
+type commitLayout struct {
+	// streamIndexes maps each event, floor-check, and snapshot item index to its stream.
+	streamIndexes map[int]evt.EntityID
+	// fenceIndexes maps each fence-check item index (slot and companion) to its fence.
+	fenceIndexes map[int]evt.ReadFence
 }
 
 // FloorCondition rejects a commit whose first event is at or below the stored snapshot's
@@ -87,7 +133,13 @@ func checkContiguous(events []evt.SerializedEvent) error {
 
 // buildFloorChecks returns one ConditionCheck on each entity's snapshot item (sk = 0) that the
 // commit starts above the snapshot's eventSeq.
-func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.TransactWriteItem {
+//
+// A stream pinned through its snapshot (the head event was compacted away) carries the pinned floor
+// instead: its snapshot's eventSeq must still equal the sequence before the commit's first.
+func (repo *Repository) buildFloorChecks(
+	events []evt.SerializedEvent,
+	pins map[evt.EntityID]continuation,
+) []types.TransactWriteItem {
 	first := make(map[evt.EntityID]evt.EventSequence)
 	order := make([]evt.EntityID, 0, 1)
 
@@ -103,7 +155,7 @@ func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.T
 
 	checks := make([]types.TransactWriteItem, 0, len(order))
 	for _, entityID := range order {
-		checks = append(checks, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+		condition := &types.ConditionCheck{
 			TableName: &repo.EventsTable,
 			Key: map[string]types.AttributeValue{
 				"pk": &types.AttributeValueMemberS{Value: string(entityID)},
@@ -113,14 +165,177 @@ func (repo *Repository) buildFloorChecks(events []evt.SerializedEvent) []types.T
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(first[entityID]), 10)},
 			},
-		}})
+		}
+
+		if pin, pinned := pins[entityID]; pinned && pin.viaSnapshot {
+			condition.ConditionExpression = aws.String(PinnedFloorCondition)
+			condition.ExpressionAttributeValues = map[string]types.AttributeValue{
+				":prev": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(pin.previous), 10)},
+			}
+		}
+
+		checks = append(checks, types.TransactWriteItem{ConditionCheck: condition})
 	}
 
 	return checks
 }
 
-// CommitStream commits a stream of events using batches under the 100-item limit. Each batch
-// carries one floor check per entity (see FloorCondition), built when the batch is flushed: a
+// buildStreamItems builds the transaction items for every written stream and every read fence,
+// in the pinned order: per written stream in bytewise stream-ID order its continuation check (when
+// its first sequence is above 1 and the head event exists), its event puts (ascending sequence),
+// then its snapshot put or floor check; then per fenced read-only stream its slot check and
+// snapshot companion. The layout records each item's index for classification.
+func (repo *Repository) buildStreamItems(
+	result evt.SerializedResult,
+	pins map[evt.EntityID]continuation,
+) ([]types.TransactWriteItem, commitLayout, error) {
+	layout := commitLayout{
+		streamIndexes: make(map[int]evt.EntityID),
+		fenceIndexes:  make(map[int]evt.ReadFence),
+	}
+
+	// Events arrive normalized: grouped per stream, sorted bytewise by stream ID, ascending
+	// sequence within each stream.
+	snapshotByStream := make(map[evt.EntityID]evt.SerializedSnapshot, len(result.Snapshots))
+	for _, snapshot := range result.Snapshots {
+		snapshotByStream[snapshot.EntityID] = snapshot
+	}
+
+	var items []types.TransactWriteItem
+
+	position := 0
+	for position < len(result.Events) {
+		streamID := result.Events[position].EntityID
+		end := position
+		for end < len(result.Events) && result.Events[end].EntityID == streamID {
+			end++
+		}
+		stream := result.Events[position:end]
+
+		if pin, pinned := pins[streamID]; pinned && !pin.viaSnapshot {
+			layout.streamIndexes[len(items)] = streamID
+			items = append(items, repo.buildContinuationCheck(streamID, pin.previous))
+		}
+
+		puts, _, err := repo.buildEventPutTransactions(stream)
+		if err != nil {
+			return nil, layout, err
+		}
+		for _, put := range puts {
+			layout.streamIndexes[len(items)] = streamID
+			items = append(items, put)
+		}
+
+		if snapshot, ok := snapshotByStream[streamID]; ok {
+			snapshotPut, err := repo.buildSnapshotPut(stream, snapshot, pins[streamID])
+			if err != nil {
+				return nil, layout, err
+			}
+			layout.streamIndexes[len(items)] = streamID
+			items = append(items, snapshotPut)
+		} else {
+			floor := repo.buildFloorChecks(stream, pins)
+			layout.streamIndexes[len(items)] = streamID
+			items = append(items, floor...)
+		}
+
+		position = end
+	}
+
+	for _, fence := range result.Fences {
+		slot, companion, err := repo.buildFenceChecks(fence)
+		if err != nil {
+			return nil, layout, err
+		}
+		layout.fenceIndexes[len(items)] = fence
+		items = append(items, slot)
+		layout.fenceIndexes[len(items)] = fence
+		items = append(items, companion)
+	}
+
+	return items, layout, nil
+}
+
+// buildFenceChecks returns a fenced stream's two ConditionChecks: the slot check on
+// (pk, sk = head + 1), and the snapshot companion on (pk, sk = 0). The companion is always
+// included — any store instance can snapshot the stream and compaction deletes whatever a
+// durable snapshot covers, so no interval configuration durably disables compaction.
+func (repo *Repository) buildFenceChecks(fence evt.ReadFence) (types.TransactWriteItem, types.TransactWriteItem, error) {
+	slot := types.ConditionCheck{
+		TableName: &repo.EventsTable,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: string(fence.EntityID)},
+			"sk": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(fence.Head)+1, 10)},
+		},
+		ConditionExpression: aws.String("attribute_not_exists(sk)"),
+	}
+
+	companion := types.ConditionCheck{
+		TableName: &repo.EventsTable,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: string(fence.EntityID)},
+			"sk": &types.AttributeValueMemberN{Value: "0"},
+		},
+		ConditionExpression: aws.String("attribute_not_exists(sk) OR eventSeq <= :head"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":head": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(fence.Head), 10)},
+		},
+	}
+
+	slotItem := types.TransactWriteItem{ConditionCheck: &slot}
+	companionItem := types.TransactWriteItem{ConditionCheck: &companion}
+
+	return slotItem, companionItem, nil
+}
+
+// buildSnapshotPut builds the snapshot Put for one stream of a multi-stream commit, carrying the
+// floor condition in its own condition: a transaction cannot touch sk = 0 twice.
+func (repo *Repository) buildSnapshotPut(
+	stream []evt.SerializedEvent,
+	snapshot evt.SerializedSnapshot,
+	pin continuation,
+) (types.TransactWriteItem, error) {
+	item, err := repo.marshalMap(Snapshot{
+		PK:            snapshot.EntityID,
+		SK:            0,
+		Sequence:      snapshot.Sequence,
+		EventSequence: snapshot.EventSequence,
+		EntityType:    snapshot.EntityType,
+		Payload:       string(snapshot.Payload),
+		TTL:           repo.ttlFor(snapshot.EntityType),
+	})
+	if err != nil {
+		return types.TransactWriteItem{}, fmt.Errorf("error marshalling item to map: %w", err)
+	}
+
+	put := types.Put{
+		TableName:           &repo.EventsTable,
+		Item:                item,
+		ConditionExpression: aws.String(FirstSnapshotCondition),
+	}
+	// A snapshot sequence below 1 has no valid predecessor: the second branch applies with a
+	// negative :seq, and NextSnapshotCondition fails.
+	if expected := snapshot.Sequence - 1; expected != 0 {
+		put.ConditionExpression = aws.String(NextSnapshotCondition)
+		put.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":seq":   &types.AttributeValueMemberN{Value: strconv.Itoa(int(expected))},
+			":first": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(stream[0].Sequence), 10)},
+		}
+
+		if pin.viaSnapshot {
+			put.ConditionExpression = aws.String(PinnedNextSnapshotCondition)
+			put.ExpressionAttributeValues = map[string]types.AttributeValue{
+				":seq":  &types.AttributeValueMemberN{Value: strconv.Itoa(int(expected))},
+				":prev": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(pin.previous), 10)},
+			}
+		}
+	}
+
+	return types.TransactWriteItem{Put: &put}, nil
+}
+
+// CommitStream drains a channel of serialized results, committing each batch as one transaction.
+// It carries one floor check per entity (see FloorCondition), built when the batch is flushed: a
 // transaction cannot touch an entity's snapshot item twice.
 //
 // Deprecated: Cut in ADR-0006 (K1). Commit batched commands through the normal commit path
@@ -153,17 +368,63 @@ func (repo *Repository) CommitStream(
 			return
 		}
 
-		items := append(batch, repo.buildFloorChecks(batchEvents)...)
+		pending, pendingEvents := batch, batchEvents
+		batch, batchEvents = nil, nil
+
+		// The batch's events for one entity must continue without a gap, and each entity must
+		// continue exactly from its stored head, pinned like Commit does.
+		ordered := slices.Clone(pendingEvents)
+		slices.SortStableFunc(ordered, func(a, b evt.SerializedEvent) int {
+			if a.EntityID != b.EntityID {
+				return strings.Compare(string(a.EntityID), string(b.EntityID))
+			}
+
+			return cmp.Compare(a.Sequence, b.Sequence)
+		})
+		if err := checkContiguous(ordered); err != nil {
+			errs = append(errs, err)
+
+			return
+		}
+
+		pins, err := repo.observeContinuations(ctx, pendingEvents)
+		if err != nil {
+			errs = append(errs, err)
+
+			return
+		}
+
+		order, _ := firstSequences(pendingEvents)
+		items := make([]types.TransactWriteItem, 0, len(pending)+2*len(order))
+		for _, entityID := range order {
+			if pin, pinned := pins[entityID]; pinned && !pin.viaSnapshot {
+				items = append(items, repo.buildContinuationCheck(entityID, pin.previous))
+			}
+		}
+		items = append(items, pending...)
+		items = append(items, repo.buildFloorChecks(pendingEvents, pins)...)
+
 		if err := repo.commitEventsWithTransaction(ctx, items, nil); err != nil {
 			errs = append(errs, err)
 		}
-
-		batch, batchEvents = nil, nil
 	}
 
 	for result := range channel {
 		serializedResult, err := result.Unwrap()
 		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		// The batch path writes events and projector operations only. An entry carrying
+		// snapshots or read fences fails closed instead of having them silently dropped, and
+		// projector operations need a backing event in the same entry (ADR-0012).
+		if err = evt.CheckBatchEntry(serializedResult); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		if err = evt.CheckProjectorOperations(serializedResult); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -195,7 +456,7 @@ func (repo *Repository) CommitStream(
 		combined := append(transactItems, items...)
 
 		// Guard against a single result that already exceeds the 100-item transaction limit
-		if size := len(combined) + countEntities(serializedResult.Events) + markerItems; size > 100 {
+		if size := len(combined) + 2*countEntities(serializedResult.Events) + markerItems; size > 100 {
 			errs = append(errs, fmt.Errorf(
 				"single result produces %d items, exceeding DynamoDB 100-item transaction limit",
 				size,
@@ -205,7 +466,7 @@ func (repo *Repository) CommitStream(
 
 		// Flush first if adding this result, and its floor checks, would overrun the limit
 		merged := append(append([]evt.SerializedEvent{}, batchEvents...), serializedResult.Events...)
-		if len(batch)+len(combined)+countEntities(merged)+markerItems > 100 {
+		if len(batch)+len(combined)+2*countEntities(merged)+markerItems > 100 {
 			flush()
 		}
 
@@ -220,7 +481,8 @@ func (repo *Repository) CommitStream(
 }
 
 // countEntities returns the number of distinct entities, which is the number of floor checks a
-// batch of these events needs.
+// batch of these events needs. A batch reserves a second slot per entity for the continuation
+// check of an entity whose first sequence is above 1.
 func countEntities(events []evt.SerializedEvent) int {
 	seen := make(map[evt.EntityID]struct{}, len(events))
 	for _, event := range events {
@@ -243,26 +505,29 @@ func (repo *Repository) CommitWithSnapshot(
 		return err
 	}
 
+	if err := evt.CheckProjectorOperations(result); err != nil {
+		return err
+	}
+
+	if len(result.Events) == 0 {
+		return errors.New("dynamo: commit with snapshot requires at least one event")
+	}
+
 	if err := evt.CheckReservedEntityID(entityID); err != nil {
 		return err
 	}
 
-	if err := evt.CheckReservedEntityIDs(result.Events); err != nil {
-		return err
-	}
+	// Route through the multi-stream commit path: the snapshot is written in the same transaction
+	// as its events, carrying the floor condition in its own condition.
+	result.Snapshots = append(result.Snapshots, evt.SerializedSnapshot{
+		EntityType:    entityType,
+		EntityID:      entityID,
+		Sequence:      currentSnapshot,
+		EventSequence: result.Events[len(result.Events)-1].Sequence,
+		Payload:       payload,
+	})
 
-	if err := checkContiguous(result.Events); err != nil {
-		return err
-	}
-
-	// Generate both the regular Put transactions, and a Put for the Snapshot
-	writeItems, err := repo.buildSnapshotPutTransactions(result.Events, entityType, entityID, payload, currentSnapshot)
-	if err != nil {
-		return err
-	}
-
-	// Commit the transactions to DynamoDB
-	return repo.commitEventsWithTransaction(ctx, writeItems, result.Transaction)
+	return repo.Commit(ctx, result)
 }
 
 // Generate the TransactWriteItems needed to Put new Events to the DynamoDB table
@@ -382,6 +647,47 @@ func (repo *Repository) commitEventsWithTransaction(
 	writeItems []types.TransactWriteItem,
 	transaction evt.Transaction,
 ) error {
+	return repo.commitTransactionItems(ctx, transaction, writeItems, commitLayout{})
+}
+
+// commitStreamItems sends one multi-stream commit: the feature-marker check, the projector
+// operations, then the stream and fence items, budgeted as a whole and never split.
+func (repo *Repository) commitStreamItems(
+	ctx context.Context,
+	result evt.SerializedResult,
+	streamItems []types.TransactWriteItem,
+	layout commitLayout,
+) error {
+	transactItems, err := toDynamoItems(result.Transaction)
+	if err != nil {
+		return err
+	}
+
+	// The preflight covers every item the transaction carries, with the projector operations
+	// sized exactly from the items this backend will write.
+	sizes, serr := evt.TransactionItemSizesWithTTL(result, repo.ttlFor)
+	if serr != nil {
+		return serr
+	}
+	for _, item := range transactItems {
+		sizes = append(sizes, transactItemSize(item))
+	}
+	if berr := evt.CommitBudget(sizes); berr != nil {
+		return berr
+	}
+
+	return repo.commitTransactionItems(ctx, result.Transaction, streamItems, layout)
+}
+
+// commitTransactionItems assembles the final transaction — feature-marker check first, then the
+// projector operations, then the stream and fence items — checks the full budget, sends it, and
+// classifies a failure by the item that failed.
+func (repo *Repository) commitTransactionItems(
+	ctx context.Context,
+	transaction evt.Transaction,
+	streamItems []types.TransactWriteItem,
+	layout commitLayout,
+) error {
 	transactItems, err := toDynamoItems(transaction)
 	if err != nil {
 		return err
@@ -396,23 +702,22 @@ func (repo *Repository) commitEventsWithTransaction(
 
 	control := []types.TransactWriteItem{check}
 
-	// Combine the two, with included transaction items first
-	combined := make([]types.TransactWriteItem, 0, len(control)+len(transactItems)+len(writeItems))
+	combined := make([]types.TransactWriteItem, 0, len(control)+len(transactItems)+len(streamItems))
 	combined = append(combined, control...)
 	combined = append(combined, transactItems...)
-	combined = append(combined, writeItems...)
+	combined = append(combined, streamItems...)
 
 	count := len(combined)
 	if count > 100 {
 		// Limit increased from 25 to 100:
 		// https://aws.amazon.com/about-aws/whats-new/2022/09/amazon-dynamodb-supports-100-actions-per-transaction/
-		return fmt.Errorf("too many operations: %d, DynamoDb supports only up to 100 operations per transactions", count)
+		return &evt.CommitTooLargeError{Items: count, Bytes: math.MaxInt, LargestItem: math.MaxInt}
 	}
 
 	input := dynamodb.TransactWriteItemsInput{TransactItems: combined}
 	_, err = repo.client.TransactWriteItems(ctx, &input)
 	if err != nil {
-		return repo.classifyCommitFailure(ctx, transaction, transactItems, len(control), err)
+		return repo.classifyCommitFailure(ctx, transaction, transactItems, layout, err)
 	}
 
 	return nil
@@ -425,12 +730,43 @@ func (repo *Repository) classifyCommitFailure(
 	ctx context.Context,
 	transaction evt.Transaction,
 	transactItems []types.TransactWriteItem,
-	controlCount int,
+	layout commitLayout,
 	err error,
 ) error {
-	if ok, i := HasConditionalCheckFailure(err); ok && i < controlCount {
+	ok, i := HasConditionalCheckFailure(err)
+	if !ok {
+		return wrapClassifiedError(err)
+	}
+
+	if i == 0 {
 		return repo.features.handleCheckFailure(ctx, err)
 	}
 
-	return repo.handleConditionalCheckFailure(ctx, transaction, transactItems, controlCount, err)
+	// The layout's indexes are relative to the stream items, which sit after the control items
+	// and the projector operations in the combined transaction.
+	streamIndex := i - len(transactItems) - 1
+	if fence, failed := layout.fenceIndexes[streamIndex]; failed {
+		return policy.FenceConflict(fence)
+	}
+
+	// A failed condition on a written stream's own items is an ordinary conflict.
+	if streamID, written := layout.streamIndexes[streamIndex]; written {
+		// Name the stream whose own item failed, not just the commit: a multi-stream commit can
+		// collide on any of its streams. errors.Is(err, ErrSnapshotRaceCondition) still matches.
+		return wrapClassifiedError(fmt.Errorf("stream %s: %w", streamID, ErrSnapshotRaceCondition))
+	}
+
+	// Projector items sit between the control items and the stream items.
+	offset := 1
+	if i-offset < len(transactItems) {
+		for _, group := range transaction {
+			if i-offset < group.Len() {
+				return group.HandleError(err, i-offset)
+			}
+			offset += group.Len()
+		}
+		return wrapClassifiedError(err)
+	}
+
+	return wrapClassifiedError(ErrSnapshotRaceCondition)
 }

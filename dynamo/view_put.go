@@ -30,6 +30,21 @@ func (g *ViewPutGroup) ToWriteItems() []types.TransactWriteItem {
 	return g.items
 }
 
+// OperationSizes reports the DynamoDB-encoded size of each operation (evt.SizedTransactionGroup),
+// so a backend that does not write the group budgets it exactly as DynamoDB does.
+func (g *ViewPutGroup) OperationSizes() []int {
+	if g == nil {
+		return nil
+	}
+
+	sizes := make([]int, 0, len(g.items))
+	for _, item := range g.items {
+		sizes = append(sizes, transactItemSize(item))
+	}
+
+	return sizes
+}
+
 // Merge implements the generic evt.TransactionGroup interface.
 func (g *ViewPutGroup) Merge(with evt.TransactionGroup) (evt.TransactionGroup, error) {
 	if with == nil {

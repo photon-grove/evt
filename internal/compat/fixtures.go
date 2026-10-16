@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,6 +51,30 @@ type ScenarioExpectation struct {
 	Snapshot         *string          `json:"snapshot"`
 	DynamoItems      []map[string]any `json:"dynamoItems"`
 	SNSMessages      []string         `json:"snsMessages"`
+
+	// Siblings records every other stream a scenario touches outside its primary partition
+	// (transactional sibling streams, fenced read-only streams), ordered by suffix. A stream a
+	// scenario fences but never writes is recorded too, as empty.
+	Siblings []SiblingExpectation `json:"siblings,omitempty"`
+
+	// Transactions pins the TransactWriteItems action order of each transaction step, so an
+	// implementation that reorders actions fails even when the stored state is identical.
+	Transactions []TransactionExpectation `json:"transactions,omitempty"`
+}
+
+// TransactionExpectation is the ordered TransactWriteItems actions one transaction step sent.
+type TransactionExpectation struct {
+	Step    int                 `json:"step"`
+	Actions []TransactionAction `json:"actions"`
+}
+
+// SiblingExpectation is the stored state of a scenario's sibling stream.
+type SiblingExpectation struct {
+	EntityID    evt.EntityID     `json:"entityId"`
+	Sequence    int64            `json:"sequence"`
+	Events      []string         `json:"events"`
+	Snapshot    *string          `json:"snapshot"`
+	DynamoItems []map[string]any `json:"dynamoItems"`
 }
 
 // ForRun rewrites the expectation's entity IDs from the fixture run to another run.
@@ -293,8 +318,14 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 
 	entity := NewAccount(entityID)
 	eventContext, err := runner.Store.LoadEntity(ctx, entity, entityID)
-	if err != nil {
+	if err != nil && !errors.Is(err, evt.ErrSequenceGap) {
 		return expectation, err
+	}
+
+	// A compacted sibling stream (the read-fences scenario) has no coherent aggregate view; its
+	// stored rows are still compared by the Rust side.
+	if err != nil {
+		return expectation, nil
 	}
 
 	state, err := json.Marshal(entity)
@@ -307,6 +338,36 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 	expectation.SnapshotSequence = int64(*eventContext.CurrentSnapshot)
 
 	return expectation, nil
+}
+
+// ObserveSibling records the stored state of a scenario's sibling stream (transactional sibling
+// streams, fenced read-only streams).
+func ObserveSibling(ctx context.Context, runner Runner, entityID evt.EntityID) (*SiblingExpectation, error) {
+	events, err := runner.Repo.GetEvents(ctx, entityID)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshot, err := runner.Repo.GetSnapshot(ctx, entityID)
+	if err != nil {
+		return nil, err
+	}
+
+	encoded, err := encodeEvents(events)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshotJSON, err := encodeSnapshot(snapshot)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SiblingExpectation{
+		EntityID: entityID,
+		Events:   encoded,
+		Snapshot: snapshotJSON,
+	}, nil
 }
 
 // encodeEvents renders stored events in their canonical JSON form. It never returns nil, so an empty
@@ -349,7 +410,11 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 		runner, fake, _ := newFakeRunner(scenario.SnapshotInterval)
 		entityID := EntityID(FixtureRun, scenario)
 
+		var transactions []TransactionExpectation
+
 		for index, step := range scenario.Steps {
+			sent := len(fake.Transactions())
+
 			outcome, err := runner.Execute(ctx, entityID, step)
 			if err != nil {
 				return fixtures, fmt.Errorf("%s step %d: %w", scenario.Name, index, err)
@@ -357,6 +422,16 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 			if outcome != step.Expect {
 				return fixtures, fmt.Errorf("%s step %d: got %s, want %s", scenario.Name, index, outcome, step.Expect)
 			}
+
+			if step.Op != "transaction" {
+				continue
+			}
+
+			calls := fake.Transactions()[sent:]
+			if len(calls) != 1 {
+				return fixtures, fmt.Errorf("%s step %d: transaction sent %d requests, want 1", scenario.Name, index, len(calls))
+			}
+			transactions = append(transactions, TransactionExpectation{Step: index, Actions: calls[0]})
 		}
 
 		expectation, err := Observe(ctx, runner, scenario.Name, entityID)
@@ -379,6 +454,22 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 				return fixtures, fmt.Errorf("%s: %w", scenario.Name, err)
 			}
 			expectation.SNSMessages = append(expectation.SNSMessages, message)
+		}
+
+		expectation.Transactions = transactions
+
+		for _, suffix := range scenario.SiblingSuffixes() {
+			siblingID := transactionID(entityID, suffix)
+
+			sibling, serr := ObserveSibling(ctx, runner, siblingID)
+			if serr != nil {
+				return fixtures, fmt.Errorf("%s: %w", scenario.Name, serr)
+			}
+			sibling.DynamoItems = []map[string]any{}
+			for _, item := range fake.Items(string(siblingID)) {
+				sibling.DynamoItems = append(sibling.DynamoItems, DynamoItemJSON(item))
+			}
+			expectation.Siblings = append(expectation.Siblings, *sibling)
 		}
 
 		fixtures.Scenarios = append(fixtures.Scenarios, expectation)

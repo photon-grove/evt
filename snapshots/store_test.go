@@ -284,7 +284,7 @@ func TestUpdateSnapshotSequence_NilSnapshot(t *testing.T) {
 	eventContext := evt.Context{
 		Entity:          setup.entity,
 		EntityID:        setup.entityID,
-		CurrentSequence: intPtr(1),
+		CurrentSequence: intPtr(0),
 		CurrentSnapshot: nil,
 	}
 
@@ -319,6 +319,10 @@ func Test_EventStore_CommitSimpleEvents_Success(t *testing.T) {
 
 	commitEvents(t, setup.store, result, setup.eventContext, metadata)
 	committedEvents := getEvents(t, setup.repo, setup.entityID)
+
+	// The engine assigns the commit ID, which is a fresh ULID for a command without one.
+	require.NotEmpty(t, committedEvents[0].Metadata.CommitID)
+	expected[0].Metadata.CommitID = committedEvents[0].Metadata.CommitID
 	require.Equal(t, expected, committedEvents)
 }
 

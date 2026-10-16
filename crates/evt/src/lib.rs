@@ -20,6 +20,7 @@
 #![warn(missing_docs)]
 
 mod aggregate;
+mod commit_id;
 #[cfg(any(test, feature = "conformance"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "conformance")))]
 pub mod conformance;
@@ -33,6 +34,7 @@ mod metadata;
 mod repository;
 mod retry;
 mod store;
+mod transaction;
 mod upcast;
 pub mod wire;
 
@@ -45,6 +47,7 @@ pub mod dynamodb;
 pub mod postgres;
 
 pub use aggregate::{Aggregate, Projector};
+pub use commit_id::CommitIdGenerator;
 pub use error::{BoxError, Error, ExecuteError, ReplayPhase};
 pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
 pub use features::{
@@ -56,9 +59,13 @@ pub use ids::{
 };
 pub use mem::MemRepository;
 pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};
-pub use repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
+pub use repository::{
+    Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
+    snapshot_events_due,
+};
 pub use retry::RetryPolicy;
 pub use store::{DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, serialize_events};
+pub use transaction::{Read, Transaction};
 pub use upcast::{JsonUpcaster, Upcaster};
 
 #[cfg(doctest)]

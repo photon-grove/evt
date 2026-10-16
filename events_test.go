@@ -383,3 +383,15 @@ func Test_Context_RecordCommandID_MultipleIDs(t *testing.T) {
 	require.True(t, ctx.HasCommandID("c"))
 	require.False(t, ctx.HasCommandID("d"))
 }
+
+func Test_Context_EmptyCommandIDIsAbsent(t *testing.T) {
+	var ctx Context
+	ctx.RecordCommandID("")
+	require.Empty(t, ctx.SeenCommandIDs, "an empty CommandID is not recorded")
+	require.False(t, ctx.HasCommandID(""))
+
+	// Even a seen set that somehow holds the empty ID never reports it as a duplicate.
+	ctx.SeenCommandIDs = map[CommandID]struct{}{"": {}, "cmd-1": {}}
+	require.False(t, ctx.HasCommandID(""))
+	require.True(t, ctx.HasCommandID("cmd-1"))
+}

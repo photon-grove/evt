@@ -47,6 +47,19 @@ pub const EVENT_CONDITION: &str = "attribute_not_exists(sk)";
 /// a compacted sequence.
 pub const FLOOR_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq < :first";
 
+/// Condition for a written stream's continuation check: the event just before the commit's first
+/// still exists, so with [`EVENT_CONDITION`] the commit continues exactly from the stored head and
+/// skips no sequence.
+pub const CONTINUATION_CONDITION: &str = "attribute_exists(sk)";
+
+/// Condition for the snapshot-item check when compaction deleted the stream's head event: the
+/// snapshot's `eventSeq` is the head, so it must still equal the sequence before the commit's
+/// first (`:prev`).
+pub const PINNED_FLOOR_CONDITION: &str = "eventSeq = :prev";
+
+/// [`NEXT_SNAPSHOT_CONDITION`] for the same compacted-head case.
+pub const PINNED_NEXT_SNAPSHOT_CONDITION: &str = "seq = :seq AND eventSeq = :prev";
+
 /// Condition for the first snapshot put in a commit (snapshot sequence 1): no snapshot exists yet.
 pub const FIRST_SNAPSHOT_CONDITION: &str = "attribute_not_exists(seq)";
 
@@ -54,6 +67,16 @@ pub const FIRST_SNAPSHOT_CONDITION: &str = "attribute_not_exists(seq)";
 /// writer loaded (`:seq`), and the commit starts above its floor (`:first`). It folds in
 /// [`FLOOR_CONDITION`] because a transaction cannot touch the snapshot item twice.
 pub const NEXT_SNAPSHOT_CONDITION: &str = "seq = :seq AND eventSeq < :first";
+
+/// Condition for a fenced read-only stream's slot check: `(pk, sk = head + 1)` must be free, so
+/// no writer has appended past the head the reader saw (ADR 0004, C2).
+pub const FENCE_SLOT_CONDITION: &str = "attribute_not_exists(sk)";
+
+/// Condition for a fenced read-only stream's snapshot companion on `(pk, sk = 0)`: the stored
+/// snapshot must not cover past the fenced head (`:head`), which closes the compaction ABA. It
+/// passes on a stream with no snapshot item. Always included — any store instance can snapshot
+/// the stream and compaction deletes whatever a durable snapshot covers.
+pub const FENCE_COMPANION_CONDITION: &str = "attribute_not_exists(sk) OR eventSeq <= :head";
 
 /// Condition for out-of-band snapshot puts: never lower the stored `eventSeq` (`:new`).
 pub const PUT_SNAPSHOT_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq <= :new";

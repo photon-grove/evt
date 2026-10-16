@@ -477,5 +477,37 @@ async fn scenarios_match_go_byte_for_byte() {
             "{}: sns messages",
             scenario.name
         );
+
+        // Every other stream the scenario touches, written or only fenced, must match too: a
+        // regression that drops or partially writes a sibling must not pass.
+        let siblings = runner
+            .observe_siblings(&scenario.sibling_ids(FIXTURE_RUN))
+            .await
+            .unwrap();
+        assert_eq!(
+            siblings, expected.siblings,
+            "{}: sibling streams",
+            scenario.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn sibling_fixtures_pin_the_streams_scenarios_write() {
+    let fixtures = ScenarioFixtures::load().unwrap();
+
+    // The multi-stream scenario writes a `-ledger` sibling and the read-fences scenario a
+    // `-watched` one; an empty or missing recording would let a dropped write pass.
+    for (scenario, suffix, events) in [("multi-stream", "ledger", 2), ("read-fences", "watched", 1)]
+    {
+        let expected = fixtures.for_run(scenario, FIXTURE_RUN).unwrap();
+        let id = format!("compat-{FIXTURE_RUN}-{scenario}-{suffix}");
+        let sibling = expected
+            .siblings
+            .iter()
+            .find(|sibling| sibling.entity_id == id)
+            .unwrap_or_else(|| panic!("{scenario}: no recording for {id}"));
+
+        assert_eq!(sibling.events.len(), events, "{scenario}: {id} events");
     }
 }

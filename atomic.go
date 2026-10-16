@@ -1,0 +1,456 @@
+package evt
+
+import (
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"math"
+	"math/big"
+	"slices"
+	"strconv"
+	"time"
+
+	"github.com/photon-grove/evt/internal/jsondefaults"
+)
+
+// ReadFence pins a read-only stream to a head. The snapshot companion is mandatory even when
+// the reader disables snapshots. CallerStamped records provenance for conflict handling only;
+// it is in-memory commit metadata and is never stored.
+type ReadFence struct {
+	EntityID      EntityID
+	EntityType    EntityType
+	Head          EventSequence
+	CallerStamped bool
+}
+
+// FenceConflictError identifies the read-only stream whose fence failed. Another writer moved
+// the stream past the fenced head. A conflict on an engine-filled fence is retryable (the engine
+// can reload and re-decide, and backends classify it transient like an event-put conflict); a
+// conflict on a caller-stamped fence is a stale-fence rejection the caller must handle, because
+// the engine cannot know the caller's decision is still valid.
+type FenceConflictError struct {
+	Fence ReadFence
+}
+
+func (e *FenceConflictError) Error() string {
+	return fmt.Sprintf("read fence conflict on %s at head %d", e.Fence.EntityID, e.Fence.Head)
+}
+
+// Unwrap keeps a fence failure matchable as optimistic concurrency without losing provenance.
+func (e *FenceConflictError) Unwrap() error { return NewConflictError(e.Error()) }
+
+// RetentionConflictError refuses fences whose type is durably declared to expire by TTL.
+type RetentionConflictError struct{ EntityType EntityType }
+
+func (e *RetentionConflictError) Error() string {
+	return fmt.Sprintf("read fences are unsafe for entity type %q declared with retention", e.EntityType)
+}
+
+// CommitTooLargeError reports a failed preflight. No part of an oversized commit is written.
+type CommitTooLargeError struct {
+	Items       int
+	Bytes       int
+	LargestItem int
+}
+
+func (e *CommitTooLargeError) Error() string {
+	return fmt.Sprintf("commit too large: %d items, %d bytes, largest item %d bytes", e.Items, e.Bytes, e.LargestItem)
+}
+
+// CommitBudget checks DynamoDB's transaction limits — 100 items, 4 MB per request, 400 KB per
+// item — against 95% of each limit, a 5% safety margin for key-encoding and rounding
+// differences. The budgets apply on every backend, so an oversized commit fails identically
+// everywhere instead of committing on one and raising a validation error on another.
+func CommitBudget(itemSizes []int) error {
+	total, largest := 0, 0
+	for _, size := range itemSizes {
+		if size < 0 || size > math.MaxInt-total {
+			return &CommitTooLargeError{Items: len(itemSizes), Bytes: math.MaxInt, LargestItem: math.MaxInt}
+		}
+
+		total += size
+		largest = max(largest, size)
+	}
+
+	if len(itemSizes) > 100 || total > 3_800_000 || largest > 380_000 {
+		return &CommitTooLargeError{Items: len(itemSizes), Bytes: total, LargestItem: largest}
+	}
+
+	return nil
+}
+
+// ProjectorOnlyCommitError refuses a commit that carries projector operations but writes no
+// event. Views are derived state: every view row must be a projection of a committed event, so
+// operations without a backing event in the same commit could never be rebuilt by replay
+// (ADR-0012). Nothing is written.
+type ProjectorOnlyCommitError struct {
+	// Operations is the number of projector operations the commit carried.
+	Operations int
+}
+
+func (e *ProjectorOnlyCommitError) Error() string {
+	return fmt.Sprintf("commit carries %d projector operations but no events; views must be projections of committed events", e.Operations)
+}
+
+// ProjectorOperationCount returns the number of projector operations the result carries across all
+// of its transaction groups.
+func ProjectorOperationCount(result SerializedResult) int {
+	operations := 0
+	for _, group := range result.Transaction {
+		if group != nil {
+			operations += group.Len()
+		}
+	}
+
+	return operations
+}
+
+// CheckProjectorOperations returns a *ProjectorOnlyCommitError when the result carries projector
+// operations but no events. Backends call it before any other work; NormalizeCommit calls it too.
+func CheckProjectorOperations(result SerializedResult) error {
+	if len(result.Events) > 0 {
+		return nil
+	}
+
+	operations := ProjectorOperationCount(result)
+	if operations == 0 {
+		return nil
+	}
+
+	return &ProjectorOnlyCommitError{Operations: operations}
+}
+
+// ProjectorOperationsUnsupportedError refuses a commit that carries projector operations to a
+// backend that cannot execute them in the commit's transaction. Dropping them would commit the
+// events without the view writes that were meant to be atomic with them, so the backend fails
+// closed before any write.
+type ProjectorOperationsUnsupportedError struct {
+	// Backend names the refusing backend.
+	Backend string
+	// Operations is the number of projector operations the commit carried.
+	Operations int
+}
+
+func (e *ProjectorOperationsUnsupportedError) Error() string {
+	return fmt.Sprintf(
+		"%s cannot execute projector operations in the commit transaction; refusing %d operations instead of dropping them",
+		e.Backend, e.Operations,
+	)
+}
+
+// CheckProjectorOperationsSupported returns *ProjectorOperationsUnsupportedError when the result
+// carries any projector operation. A backend without projector support calls it before writing.
+func CheckProjectorOperationsSupported(backend string, result SerializedResult) error {
+	if operations := ProjectorOperationCount(result); operations > 0 {
+		return &ProjectorOperationsUnsupportedError{Backend: backend, Operations: operations}
+	}
+
+	return nil
+}
+
+// UnsupportedBatchEntryError refuses a SerializedResult sent through the deprecated CommitStream
+// batch path that carries Snapshots or Fences. The batch path writes events (and projector
+// operations) only, so it would drop them silently; commit such a result with Repository.Commit
+// instead. Nothing from the entry was written.
+type UnsupportedBatchEntryError struct {
+	Snapshots int
+	Fences    int
+}
+
+func (e *UnsupportedBatchEntryError) Error() string {
+	return fmt.Sprintf(
+		"CommitStream entry carries %d snapshots and %d read fences, which the batch path cannot honor; use Repository.Commit",
+		e.Snapshots, e.Fences,
+	)
+}
+
+// CheckBatchEntry returns *UnsupportedBatchEntryError for a result with Snapshots or Fences. A
+// legacy batch path that does not route each entry through Repository.Commit calls it before
+// batching, so it fails closed instead of dropping the new fields.
+func CheckBatchEntry(result SerializedResult) error {
+	if len(result.Snapshots) == 0 && len(result.Fences) == 0 {
+		return nil
+	}
+
+	return &UnsupportedBatchEntryError{Snapshots: len(result.Snapshots), Fences: len(result.Fences)}
+}
+
+// NormalizeCommit validates a transactional commit and returns a normalized copy: events sorted
+// bytewise by stream ID (the pinned transaction order), snapshots and fences likewise, fences
+// for written streams dropped (the event put at head + 1 supersedes them), and stream-local
+// event order preserved. Noncontiguous input fails rather than being repaired by sorting.
+func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
+	if err := CheckProjectorOperations(result); err != nil {
+		return result, err
+	}
+
+	result.Events = slices.Clone(result.Events)
+	result.Snapshots = slices.Clone(result.Snapshots)
+	result.Fences = slices.Clone(result.Fences)
+	slices.SortStableFunc(result.Events, func(a, b SerializedEvent) int { return compareID(a.EntityID, b.EntityID) })
+	slices.SortFunc(result.Snapshots, func(a, b SerializedSnapshot) int { return compareID(a.EntityID, b.EntityID) })
+	slices.SortFunc(result.Fences, func(a, b ReadFence) int { return compareID(a.EntityID, b.EntityID) })
+
+	first, last := map[EntityID]SerializedEvent{}, map[EntityID]SerializedEvent{}
+	for _, event := range result.Events {
+		if err := CheckReservedEntityID(event.EntityID); err != nil {
+			return result, err
+		}
+
+		previous, seen := last[event.EntityID]
+		if event.Sequence < 1 || (seen && (previous.Sequence == math.MaxInt || event.Sequence != previous.Sequence+1)) {
+			return result, fmt.Errorf("event %s: sequences must be contiguous and start at 1", event.ID)
+		}
+		if seen && previous.EntityType != event.EntityType {
+			return result, fmt.Errorf("stream %s mixes entity types", event.EntityID)
+		}
+		if !seen {
+			first[event.EntityID] = event
+		}
+		last[event.EntityID] = event
+	}
+
+	for i, snapshot := range result.Snapshots {
+		event, written := last[snapshot.EntityID]
+		if !written || snapshot.EventSequence != event.Sequence || snapshot.EntityType != event.EntityType || snapshot.Sequence < 1 {
+			return result, fmt.Errorf("snapshot for %s must cover this commit's last event with a positive sequence", snapshot.EntityID)
+		}
+		if i > 0 && result.Snapshots[i-1].EntityID == snapshot.EntityID {
+			return result, fmt.Errorf("duplicate snapshot for %s", snapshot.EntityID)
+		}
+	}
+
+	fences := result.Fences[:0]
+	for i, fence := range result.Fences {
+		if err := CheckReservedEntityID(fence.EntityID); err != nil {
+			return result, err
+		}
+		if fence.Head < 0 || fence.Head == math.MaxInt {
+			return result, fmt.Errorf("invalid fence head for %s", fence.EntityID)
+		}
+		if i > 0 && result.Fences[i-1].EntityID == fence.EntityID {
+			return result, fmt.Errorf("duplicate read fence for %s", fence.EntityID)
+		}
+		if _, written := first[fence.EntityID]; !written {
+			fences = append(fences, fence)
+		}
+	}
+	result.Fences = fences
+
+	return result, nil
+}
+
+func compareID(a, b EntityID) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// CheckFenceRetention refuses fences for entity types in the durable manifest's retention set.
+// The set is read from the manifest, so the refusal binds writers that configured no retention
+// themselves. A nil manifest declares nothing and refuses nothing. Use CheckFenceRetentionWith to
+// also refuse the types a repository was locally configured to expire.
+func CheckFenceRetention(fences []ReadFence, manifest *FeatureManifest) error {
+	return CheckFenceRetentionWith(fences, manifest, nil)
+}
+
+// CheckFenceRetentionWith refuses fences whose entity type is in the durable manifest's retention
+// set or reports true from locallyRetained, the repository's own retention configuration. The two
+// are a union: local configuration protects a writer whose types were never declared in the
+// manifest, and the manifest protects against writers configured differently. A nil
+// locallyRetained consults the manifest only.
+func CheckFenceRetentionWith(fences []ReadFence, manifest *FeatureManifest, locallyRetained func(EntityType) bool) error {
+	for _, fence := range fences {
+		durable := manifest != nil && slices.Contains(manifest.Retention, fence.EntityType)
+		if durable || (locallyRetained != nil && locallyRetained(fence.EntityType)) {
+			return &RetentionConflictError{EntityType: fence.EntityType}
+		}
+	}
+
+	return nil
+}
+
+// CommitMetadata returns a copy stamped once for the entire engine commit. The commit ID is the
+// command ID when present — overriding any caller-supplied commit ID; otherwise a caller-supplied
+// commit ID is preserved; otherwise a cryptographically random ULID is generated. Callers must
+// stamp one metadata value and use it for every stream of a commit.
+func CommitMetadata(metadata Metadata) Metadata {
+	if metadata.CommandID != nil && *metadata.CommandID != "" {
+		metadata.CommitID = string(*metadata.CommandID)
+
+		return metadata
+	}
+
+	if metadata.CommitID != "" {
+		return metadata
+	}
+
+	var entropy [16]byte
+	_, _ = rand.Read(entropy[:]) // crypto/rand.Read cannot fail on supported Go platforms.
+	milliseconds := uint64(time.Now().UnixMilli())
+	for i := 5; i >= 0; i-- {
+		entropy[i] = byte(milliseconds)
+		milliseconds >>= 8
+	}
+	value := new(big.Int).SetBytes(entropy[:])
+	base := big.NewInt(32)
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	encoded := make([]byte, 26)
+	for i := 25; i >= 0; i-- {
+		var remainder big.Int
+		value.QuoRem(value, base, &remainder)
+		encoded[i] = alphabet[remainder.Int64()]
+	}
+	metadata.CommitID = string(encoded)
+
+	return metadata
+}
+
+// TransactionItemSizes supplies the shared, backend-neutral DynamoDB-shaped estimate for a
+// commit's event puts, snapshot puts, floor checks, and fence checks. Backend projector groups
+// that carry operations must additionally supply their item sizes through
+// SizedTransactionGroup, because an opaque group cannot safely bypass commit preflight.
+// PreflightCommit adds those group sizes, so every backend budgets projector operations alike.
+func TransactionItemSizes(result SerializedResult) ([]int, error) {
+	return TransactionItemSizesWithTTL(result, nil)
+}
+
+// TransactionItemSizesWithTTL is TransactionItemSizes with the ttl attribute the items of
+// retained entity types carry, so a backend with retention policies estimates the same bytes its
+// items encode. A ttlFor that returns 0 sizes items as the retention-free TransactionItemSizes
+// does.
+func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType) int64) ([]int, error) {
+	ttlSize := func(entityType EntityType) int {
+		if ttlFor == nil {
+			return 0
+		}
+		if ttl := ttlFor(entityType); ttl != 0 {
+			return len("ttl") + len(strconv.FormatInt(ttl, 10))
+		}
+
+		return 0
+	}
+
+	keySize := func(id EntityID, sequence EventSequence) int {
+		return len("pk") + len("sk") + len(id) + len(strconv.Itoa(int(sequence)))
+	}
+	// Only actions a commit actually emits are budgeted: the feature-marker check today. The
+	// rebuild-lock check (C10) joins this list in the change that starts emitting it.
+	sizes := []int{keySize(SystemNamespacePrefix+"FEATURES", 0)}
+
+	written := map[EntityID]bool{}
+	firstSequence := map[EntityID]EventSequence{}
+	for _, event := range result.Events {
+		if _, seen := firstSequence[event.EntityID]; !seen {
+			firstSequence[event.EntityID] = event.Sequence
+		}
+
+		metadata := event.Metadata
+		metadata.CausationID, metadata.Extensions = jsondefaults.Metadata(
+			metadata.CommandID, metadata.CausationID, metadata.Extensions,
+		)
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return nil, err
+		}
+		sizes = append(sizes, keySize(event.EntityID, event.Sequence)+
+			len("type")+len(event.Type)+len("version")+len(strconv.Itoa(int(event.Version)))+
+			len("entityType")+len(event.EntityType)+len("payload")+len(event.Payload)+len("metadata")+len(encoded)+
+			ttlSize(event.EntityType))
+		written[event.EntityID] = true
+	}
+	for _, snapshot := range result.Snapshots {
+		sizes = append(sizes, keySize(snapshot.EntityID, 0)+
+			len("seq")+len(strconv.Itoa(int(snapshot.Sequence)))+
+			len("eventSeq")+len(strconv.Itoa(int(snapshot.EventSequence)))+
+			len("entityType")+len(snapshot.EntityType)+len("payload")+len(snapshot.Payload)+
+			ttlSize(snapshot.EntityType))
+		delete(written, snapshot.EntityID)
+	}
+	// A written stream whose first sequence is above 1 contributes a continuation check on the
+	// event just before it. It is budgeted for every such stream, also on the rare compacted-head
+	// path that pins the snapshot instead, so CommitTooLarge fires identically everywhere.
+	continued := make([]EntityID, 0, len(firstSequence))
+	for id, first := range firstSequence {
+		if first > 1 {
+			continued = append(continued, id)
+		}
+	}
+	slices.Sort(continued)
+	for _, id := range continued {
+		sizes = append(sizes, keySize(id, firstSequence[id]-1))
+	}
+
+	// A written stream without a snapshot contributes a floor check on its snapshot item.
+	ids := make([]EntityID, 0, len(written))
+	for id := range written {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		sizes = append(sizes, keySize(id, 0))
+	}
+	for _, fence := range result.Fences {
+		sizes = append(sizes, keySize(fence.EntityID, fence.Head+1), keySize(fence.EntityID, 0))
+	}
+
+	return sizes, nil
+}
+
+// SizedTransactionGroup is a TransactionGroup that reports the DynamoDB-encoded size of each of
+// its operations, so a backend's commit preflight budgets it exactly like DynamoDB does.
+type SizedTransactionGroup interface {
+	TransactionGroup
+
+	// OperationSizes returns one encoded size in bytes per operation, Len() entries in all.
+	OperationSizes() []int
+}
+
+// ProjectorOperationSizes returns one budget entry per projector operation the result carries:
+// the group's reported sizes when it is a SizedTransactionGroup, otherwise zero bytes per
+// operation. The action count is exact either way, which is what makes CommitTooLarge fire at the
+// same boundary on every backend.
+func ProjectorOperationSizes(result SerializedResult) []int {
+	var sizes []int
+
+	for _, group := range result.Transaction {
+		if group == nil {
+			continue
+		}
+
+		count := group.Len()
+		reported, sized := group.(SizedTransactionGroup)
+		var operationSizes []int
+		if sized {
+			operationSizes = reported.OperationSizes()
+		}
+
+		for i := range count {
+			size := 0
+			if i < len(operationSizes) {
+				size = operationSizes[i]
+			}
+			sizes = append(sizes, size)
+		}
+	}
+
+	return sizes
+}
+
+// PreflightCommit validates a commit's shared budget — the event puts, snapshot puts, floor
+// checks, fence checks, control checks, and projector operations — before any backend write. A
+// backend that writes projector operations itself (DynamoDB sizes its own items exactly) does not
+// call it; a backend that has none to write refuses them before this point.
+func PreflightCommit(result SerializedResult) error {
+	sizes, err := TransactionItemSizes(result)
+	if err != nil {
+		return err
+	}
+
+	return CommitBudget(append(sizes, ProjectorOperationSizes(result)...))
+}

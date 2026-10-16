@@ -7,6 +7,7 @@ package conformance
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
@@ -33,6 +35,25 @@ type SuiteOptions struct {
 	// Both the in-memory and DynamoDB backends do; a minimal backend may leave it false to skip the
 	// snapshot assertions.
 	SupportsSnapshots bool
+
+	// SupportsTransactions indicates the backend commits a multi-stream SerializedResult — events
+	// for several streams, per-stream snapshots, and read fences — atomically. The in-memory
+	// double and every durable backend support it; a minimal backend may leave it false.
+	SupportsTransactions bool
+
+	// DeclareRetention durably adds the given entity type to the feature manifest's retention set
+	// of the repository under test, so the fence-retention-refusal case can run. It is mandatory
+	// for a backend that sets SupportsTransactions: the spec refuses read fences for retained
+	// types on every backend, so a missing hook fails the suite instead of skipping the case.
+	// The declaration refuses every later fence for that type.
+	DeclareRetention func(ctx context.Context, repo evt.Repository, entityType evt.EntityType) error
+
+	// ProjectorGroup, when non-nil, builds a projector transaction group of exactly the given
+	// number of operations that the backend under test accepts, enabling the projector-budget
+	// case: every backend that executes projector operations counts each one in the shared
+	// 100-action budget, so CommitTooLarge fires at the same boundary. A backend that refuses
+	// projector operations outright (Go PostgreSQL until E2.6) leaves it nil.
+	ProjectorGroup func(operations int) evt.TransactionGroup
 }
 
 // RunRepositorySuite runs the full backend-neutral contract suite against the repository produced by
@@ -93,6 +114,62 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 	if opts.SupportsSnapshots {
 		t.Run("RejectsCommitsBelowCompactedFloor", func(t *testing.T) {
 			testCompactedFloor(t, newRepo())
+		})
+
+		t.Run("RejectsFirstSnapshotAboveOne", func(t *testing.T) {
+			testRejectsFirstSnapshotAboveOne(t, newRepo())
+		})
+	}
+
+	if opts.SupportsTransactions {
+		t.Run("DeclaresTransactionalRepository", func(t *testing.T) {
+			require.NoError(t, evt.RequireTransactions(newRepo()),
+				"a backend claiming transactions must implement evt.TransactionalRepository")
+		})
+
+		t.Run("MultiStreamCommit", func(t *testing.T) {
+			testMultiStreamCommit(t, newRepo())
+		})
+
+		if opts.EnforcesOptimisticConcurrency {
+			t.Run("MultiStreamAtomicity", func(t *testing.T) {
+				testMultiStreamAtomicity(t, newRepo())
+			})
+		}
+
+		t.Run("ReadFence", func(t *testing.T) {
+			testReadFence(t, newRepo())
+		})
+
+		t.Run("CommitTooLarge", func(t *testing.T) {
+			testCommitTooLarge(t, newRepo())
+		})
+
+		if opts.SupportsSnapshots {
+			t.Run("FenceCompactionABA", func(t *testing.T) {
+				testFenceCompactionABA(t, newRepo())
+			})
+		}
+
+		if opts.ProjectorGroup != nil {
+			t.Run("CountsProjectorOperationsInTheBudget", func(t *testing.T) {
+				testProjectorBudget(t, newRepo(), opts.ProjectorGroup)
+			})
+		}
+
+		t.Run("RejectsSequenceGaps", func(t *testing.T) {
+			testRejectsSequenceGaps(t, newRepo(), opts.SupportsSnapshots)
+		})
+
+		t.Run("RejectsProjectorOnlyCommits", func(t *testing.T) {
+			testRejectsProjectorOnlyCommits(t, newRepo())
+		})
+
+		t.Run("RejectsFencesForRetention", func(t *testing.T) {
+			require.NotNil(t, opts.DeclareRetention,
+				"a backend claiming transactions must supply SuiteOptions.DeclareRetention")
+
+			testRejectsFencesForRetention(t, newRepo(), opts.DeclareRetention)
 		})
 	}
 
@@ -538,6 +615,22 @@ func newNamespace() string {
 	return fmt.Sprintf("conf-%d-%d", time.Now().UnixNano(), nsCounter.Add(1))
 }
 
+// NewNamespaceForTest exposes namespace generation to integration test doubles that reproduce a
+// suite case in isolation.
+func NewNamespaceForTest() string { return newNamespace() }
+
+// SerializeForTest exposes event serialization to integration test doubles that reproduce a suite
+// case in isolation.
+func SerializeForTest(
+	t *testing.T,
+	id evt.EntityID,
+	entityType evt.EntityType,
+	fromSequence evt.EventSequence,
+	events ...evt.Event,
+) []evt.SerializedEvent {
+	return serialize(t, id, entityType, fromSequence, events...)
+}
+
 // serialize prepares events for an entity and overrides the serialized EntityType so a single Go
 // event type can stand in for multiple logical entity types in filter tests.
 func serialize(
@@ -659,4 +752,394 @@ func requireAscendingSequences(t *testing.T, events []evt.SerializedEvent) {
 		require.Greater(t, events[i].Sequence, events[i-1].Sequence,
 			"events must be returned in ascending sequence order")
 	}
+}
+
+// --- transactional contract cases (C1/C2) ---
+
+func testMultiStreamCommit(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA, idB := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-b")
+	eventsA := serialize(t, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+	)
+	eventsB := serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "sibling"})
+
+	// Deliberately declared out of bytewise stream order: the commit pins the order itself.
+	err := repo.Commit(ctx, evt.SerializedResult{Events: append(eventsB, eventsA...)})
+	require.NoError(t, err)
+
+	storedA, err := repo.GetEvents(ctx, idA)
+	require.NoError(t, err)
+	require.Len(t, storedA, 2)
+	require.Equal(t, evt.EventSequence(1), eventsA[0].Sequence)
+	require.Equal(t, evt.EventSequence(2), eventsA[1].Sequence)
+
+	storedB, err := repo.GetEvents(ctx, idB)
+	require.NoError(t, err)
+	require.Len(t, storedB, 1)
+}
+
+func testMultiStreamAtomicity(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA, idB := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-b")
+	commitEvents(t, repo, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+	)
+
+	eventsB := serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "sibling"})
+	colliding := serialize(t, idA, "test", 1, &test.EntityUpdated{ID: idA, Value: "reused"})
+	err := repo.Commit(ctx, evt.SerializedResult{Events: append(eventsB, colliding...)})
+	require.Error(t, err, "a commit that collides on one stream must fail")
+
+	// All-or-nothing: the sibling stream that shared the failed commit must be untouched.
+	events, err := repo.GetEvents(ctx, idB)
+	require.NoError(t, err)
+	require.Empty(t, events)
+}
+
+func testReadFence(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA, idC := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-c")
+	commitEvents(t, repo, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+	)
+
+	// A fence at the observed head passes while the transaction writes another stream. A fence
+	// on an absent stream (head 0) passes too.
+	fenced := evt.ReadFence{EntityID: idA, EntityType: "test", Head: 2}
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", 0, &test.EntityCreated{ID: idC, Value: "writer"}),
+		Fences: []evt.ReadFence{fenced, {EntityID: evt.EntityID(ns + "-absent"), EntityType: "test"}},
+	})
+	require.NoError(t, err)
+
+	// Another writer moves the fenced stream past the head.
+	commitEvents(t, repo, idA, "test", 2, &test.EntityUpdated{ID: idA, Value: "moved"})
+
+	// A stale fence now fails the whole commit, and the failing item carries the fence.
+	events, err := repo.GetEvents(ctx, idC)
+	require.NoError(t, err)
+	before := len(events)
+	err = repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", evt.EventSequence(before),
+			&test.EntityUpdated{ID: idC, Value: "later"}),
+		Fences: []evt.ReadFence{fenced},
+	})
+	require.Error(t, err)
+
+	var conflict *evt.FenceConflictError
+	require.ErrorAs(t, err, &conflict)
+	require.Equal(t, idA, conflict.Fence.EntityID)
+	require.Equal(t, evt.EventSequence(2), conflict.Fence.Head)
+	var conflictError *evt.ConflictError
+	require.ErrorAs(t, err, &conflictError, "a fence conflict is an optimistic-concurrency conflict")
+	require.False(t, conflict.Fence.CallerStamped)
+	require.True(t, policy.IsTransient(err), "an engine-filled fence conflict retries like an event-put conflict")
+
+	// The same stale fence stamped by a caller is a stale-fence rejection, not a retryable
+	// conflict.
+	stamped := fenced
+	stamped.CallerStamped = true
+	err = repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", evt.EventSequence(before),
+			&test.EntityUpdated{ID: idC, Value: "later"}),
+		Fences: []evt.ReadFence{stamped},
+	})
+	require.ErrorAs(t, err, &conflict)
+	require.True(t, conflict.Fence.CallerStamped)
+	require.False(t, policy.IsTransient(err), "a caller-stamped fence conflict is not retried")
+
+	// Nothing from the failed commit was written.
+	events, err = repo.GetEvents(ctx, idC)
+	require.NoError(t, err)
+	require.Len(t, events, before)
+}
+
+func testCommitTooLarge(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	// The feature-marker check, 98 event puts, and the floor check are exactly 100 actions, so a
+	// 98-event commit fits on every backend. Only emitted actions count against the budget.
+	idFits := evt.EntityID(ns + "-fits")
+	fitting := make([]evt.Event, 0, 98)
+	for i := range 98 {
+		fitting = append(fitting, &test.EntityUpdated{ID: idFits, Value: fmt.Sprintf("value-%d", i)})
+	}
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idFits, "test", 0, fitting...)}))
+
+	// Appending to an existing stream adds a continuation check on its head event, so the marker
+	// check, that check, 97 event puts, and the floor check fill the 100 actions: 97 fit, 98 do not.
+	idGrows := evt.EntityID(ns + "-grows")
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idGrows, "test", 0, &test.EntityCreated{ID: idGrows, Value: "first"}),
+	}))
+
+	growing := func(count int) []evt.Event {
+		out := make([]evt.Event, 0, count)
+		for i := range count {
+			out = append(out, &test.EntityUpdated{ID: idGrows, Value: fmt.Sprintf("value-%d", i)})
+		}
+
+		return out
+	}
+
+	tooMany := repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(98)...)})
+	var tooLargeAppend *evt.CommitTooLargeError
+	require.ErrorAs(t, tooMany, &tooLargeAppend)
+	require.Equal(t, 101, tooLargeAppend.Items)
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(97)...)}))
+
+	idA := evt.EntityID(ns + "-a")
+	// 101 event puts plus the control checks and the floor check exceed the 100-item budget.
+	events := make([]evt.Event, 0, 101)
+	for i := range 101 {
+		events = append(events, &test.EntityUpdated{ID: idA, Value: fmt.Sprintf("value-%d", i)})
+	}
+	serialized := serialize(t, idA, "test", 0, events...)
+
+	err := repo.Commit(ctx, evt.SerializedResult{Events: serialized})
+	var tooLarge *evt.CommitTooLargeError
+	require.ErrorAs(t, err, &tooLarge)
+
+	stored, err := repo.GetEvents(ctx, idA)
+	require.NoError(t, err)
+	require.Empty(t, stored, "an oversized commit is refused before any write")
+}
+
+func testFenceCompactionABA(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	compactor, ok := repo.(evt.Compactor)
+	if !ok {
+		t.Skip("repository does not compact")
+	}
+
+	idA, idC := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-c")
+	events := serialize(t, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+		&test.EntityUpdated{ID: idA, Value: "three"},
+	)
+	payload, err := json.Marshal(test.NewEntity(idA))
+	require.NoError(t, err)
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "test", idA, payload, 1))
+
+	// Compaction deletes the events the snapshot covers, which empties the slot a stale fence
+	// checks — the companion on the snapshot item must catch the move.
+	_, err = compactor.CompactBelow(ctx, idA, 3)
+	require.NoError(t, err)
+
+	err = repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", 0, &test.EntityCreated{ID: idC, Value: "writer"}),
+		Fences: []evt.ReadFence{{EntityID: idA, EntityType: "test", Head: 1}},
+	})
+	var conflict *evt.FenceConflictError
+	require.ErrorAs(t, err, &conflict)
+}
+
+func testRejectsFencesForRetention(
+	t *testing.T,
+	repo evt.Repository,
+	declare func(context.Context, evt.Repository, evt.EntityType) error,
+) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	// The retention type is namespaced to this run so a shared manifest's declarations from other
+	// tests never collide.
+	entityType := evt.EntityType(ns + "-retained")
+	idA := evt.EntityID(ns + "-a")
+	require.NoError(t, declare(ctx, repo, entityType))
+
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Fences: []evt.ReadFence{{EntityID: idA, EntityType: entityType, Head: 0}},
+	})
+	var refused *evt.RetentionConflictError
+	require.ErrorAs(t, err, &refused)
+	require.Equal(t, entityType, refused.EntityType)
+}
+
+// projectorOnlyGroup is a backend-neutral stand-in for a projector's operations. A repository
+// must refuse the commit before it ever interprets the group.
+type projectorOnlyGroup struct{}
+
+func (projectorOnlyGroup) Len() int                             { return 1 }
+func (projectorOnlyGroup) StorageType() evt.StorageType         { return "conformance" }
+func (projectorOnlyGroup) TransactionType() evt.TransactionType { return "conformance" }
+func (projectorOnlyGroup) HandleError(err error, _ int) error   { return err }
+func (g projectorOnlyGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
+	return g, nil
+}
+
+func testRejectsProjectorOnlyCommits(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA := evt.EntityID(ns + "-a")
+
+	// Projector operations without a written event would leave view state no replay can rebuild.
+	for name, result := range map[string]evt.SerializedResult{
+		"operations only": {Transaction: evt.Transaction{projectorOnlyGroup{}}},
+		"operations with a fence": {
+			Transaction: evt.Transaction{projectorOnlyGroup{}},
+			Fences:      []evt.ReadFence{{EntityID: idA, EntityType: "test"}},
+		},
+	} {
+		err := repo.Commit(ctx, result)
+
+		var refused *evt.ProjectorOnlyCommitError
+		require.ErrorAs(t, err, &refused, name)
+		require.Equal(t, 1, refused.Operations, name)
+	}
+}
+
+func testRejectsFirstSnapshotAboveOne(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA := evt.EntityID(ns + "-a")
+	events := serialize(t, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+	)
+
+	// A stream's first snapshot must have sequence 1: every backend refuses one that skips ahead.
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Events: events,
+		Snapshots: []evt.SerializedSnapshot{{
+			EntityType: "test", EntityID: idA, Sequence: 3, EventSequence: 2, Payload: []byte(`{}`),
+		}},
+	})
+	require.Error(t, err)
+
+	stored, err := repo.GetEvents(ctx, idA)
+	require.NoError(t, err)
+	require.Empty(t, stored, "a refused commit writes nothing")
+
+	snapshot, err := repo.GetSnapshot(ctx, idA)
+	require.NoError(t, err)
+	require.Nil(t, snapshot)
+
+	// The same commit with snapshot sequence 1 is accepted.
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events: events,
+		Snapshots: []evt.SerializedSnapshot{{
+			EntityType: "test", EntityID: idA, Sequence: 1, EventSequence: 2, Payload: []byte(`{}`),
+		}},
+	}))
+}
+
+func testProjectorBudget(t *testing.T, repo evt.Repository, group func(int) evt.TransactionGroup) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	// The feature-marker check, one event put, and the floor check leave 97 actions for
+	// projector operations: 97 fit exactly and 98 do not.
+	idFits, idOver := evt.EntityID(ns+"-fits"), evt.EntityID(ns+"-over")
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events:      serialize(t, idFits, "test", 0, &test.EntityCreated{ID: idFits, Value: "fits"}),
+		Transaction: evt.Transaction{group(97)},
+	}))
+
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Events:      serialize(t, idOver, "test", 0, &test.EntityCreated{ID: idOver, Value: "over"}),
+		Transaction: evt.Transaction{group(98)},
+	})
+	var tooLarge *evt.CommitTooLargeError
+	require.ErrorAs(t, err, &tooLarge)
+	require.Equal(t, 101, tooLarge.Items)
+
+	stored, err := repo.GetEvents(ctx, idOver)
+	require.NoError(t, err)
+	require.Empty(t, stored, "an oversized commit is refused before any write")
+}
+
+func testRejectsSequenceGaps(t *testing.T, repo evt.Repository, supportsSnapshots bool) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	created := func(id evt.EntityID) evt.Event { return &test.EntityCreated{ID: id, Value: "one"} }
+	updated := func(id evt.EntityID) evt.Event { return &test.EntityUpdated{ID: id, Value: "next"} }
+
+	// A first event above sequence 1 on a stream with no events is a gap.
+	idNew := evt.EntityID(ns + "-new")
+	err := repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idNew, "test", 2, created(idNew))})
+	require.ErrorIs(t, err, evt.ErrSequenceGap)
+	var gap *evt.SequenceGapError
+	require.ErrorAs(t, err, &gap)
+	require.Equal(t, idNew, gap.EntityID)
+	require.Equal(t, evt.EventSequence(0), gap.After)
+	require.Equal(t, evt.EventSequence(3), gap.Found)
+	stored, err := repo.GetEvents(ctx, idNew)
+	require.NoError(t, err)
+	require.Empty(t, stored, "a refused gap writes nothing")
+
+	// Skipping a sequence on an existing stream is a gap; continuing from the head is not.
+	idA := evt.EntityID(ns + "-a")
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idA, "test", 0, created(idA))}))
+
+	err = repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idA, "test", 2, updated(idA))})
+	require.ErrorAs(t, err, &gap)
+	require.Equal(t, evt.EventSequence(1), gap.After)
+	require.Equal(t, evt.EventSequence(3), gap.Found)
+
+	// One stream of a multi-stream commit with a gap fails the whole commit.
+	idB := evt.EntityID(ns + "-b")
+	err = repo.Commit(ctx, evt.SerializedResult{Events: append(
+		serialize(t, idB, "test", 0, created(idB)),
+		serialize(t, idA, "test", 2, updated(idA))...,
+	)})
+	require.ErrorIs(t, err, evt.ErrSequenceGap)
+	stored, err = repo.GetEvents(ctx, idB)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the clean stream of the failed commit is untouched")
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idA, "test", 1, updated(idA))}))
+
+	// Compaction can delete every event a snapshot covers, including the head: the snapshot's
+	// event sequence is then the head, so the stream still continues from it and still refuses a gap.
+	compactor, compacts := repo.(evt.Compactor)
+	if !supportsSnapshots || !compacts {
+		return
+	}
+
+	idC := evt.EntityID(ns + "-c")
+	payload, err := json.Marshal(test.NewEntity(idC))
+	require.NoError(t, err)
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{
+		Events: serialize(t, idC, "test", 0, created(idC), updated(idC), updated(idC)),
+	}, "test", idC, payload, 1))
+
+	deleted, err := compactor.CompactBelow(ctx, idC, 3)
+	require.NoError(t, err)
+	require.Equal(t, 3, deleted, "the head event is compacted away")
+
+	err = repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idC, "test", 4, updated(idC))})
+	require.ErrorIs(t, err, evt.ErrSequenceGap, "a gap above the snapshot's head is still refused")
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idC, "test", 3, updated(idC))}),
+		"the stream continues from the snapshot's head")
 }

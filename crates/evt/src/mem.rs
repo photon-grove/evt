@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{self, CachedMarker, FeatureManifest, FeatureMarker};
 use crate::ids::{EntityId, EntityType, EventSequence};
-use crate::repository::{Commit, Repository};
+use crate::repository::{Commit, Repository, TransactionCommit};
 
 /// An in-memory [`Repository`]. Clones share the same storage.
 ///
@@ -61,6 +61,26 @@ impl Stream {
 
         last_event.max(snapshot)
     }
+}
+
+/// Refuses a first sequence that skips past the stored head. The head is the stream's highest
+/// event or, once compaction deleted every covered event, its snapshot's event sequence. A first
+/// sequence at or below the head is left to the event and floor checks, which report it as an
+/// ordinary conflict.
+fn check_continuation(
+    entity_id: &EntityId,
+    head: EventSequence,
+    first: EventSequence,
+) -> Result<(), Error> {
+    if first > head.next() {
+        return Err(Error::SequenceGap {
+            entity_id: entity_id.clone(),
+            after: head,
+            found: first,
+        });
+    }
+
+    Ok(())
 }
 
 impl MemRepository {
@@ -115,12 +135,26 @@ impl Repository for MemRepository {
             return Ok(());
         }
 
+        // Budget parity: an oversized commit fails identically on every backend, before any
+        // write.
+        crate::repository::check_budget(commit.sizes(|_| None)?)?;
+
         // Both locks are held through the write, so a manifest change cannot slip between the
         // version check and the events, mirroring the live backends' transaction condition.
         let stored_manifest = self.manifest_lock();
         self.check_manifest(stored_manifest.as_ref())?;
 
         let mut streams = self.lock();
+
+        // The stream must continue from its stored head; a gap is refused before anything is
+        // created or written.
+        if let Some(first) = commit.events.first() {
+            let head = streams
+                .get(&commit.entity_id)
+                .map_or(EventSequence::ZERO, Stream::head);
+            check_continuation(&commit.entity_id, head, first.sequence)?;
+        }
+
         let stream = streams.entry(commit.entity_id.clone()).or_default();
 
         for (index, event) in commit.events.iter().enumerate() {
@@ -178,6 +212,137 @@ impl Repository for MemRepository {
                 event_sequence,
                 payload: snapshot.payload,
             });
+        }
+
+        Ok(())
+    }
+
+    async fn commit_transaction(&self, commit: TransactionCommit<Infallible>) -> Result<(), Error> {
+        let mut commit = commit;
+        commit.normalize()?;
+
+        if commit.is_empty() {
+            return Ok(());
+        }
+
+        // Budget parity: an oversized commit fails identically on every backend.
+        crate::repository::check_budget(commit.sizes(|_| None)?)?;
+
+        // Both locks are held through the write, so a manifest change cannot slip between the
+        // version check and the events, mirroring the live backends' transaction condition.
+        let stored_manifest = self.manifest_lock();
+        self.check_manifest(stored_manifest.as_ref())?;
+
+        // Fences are refused for entity types durably declared with retention.
+        commit.check_retention(stored_manifest.as_ref(), |_| false)?;
+
+        let mut streams = self.lock();
+
+        // Validate every stream, snapshot, and fence before writing anything, so a failure leaves
+        // every stream unchanged. Reads use get: a failed commit must not create empty streams.
+        // A stream with no stored rows validates against an empty one, so a first snapshot must
+        // be sequence 1, as on DynamoDB and PostgreSQL.
+        let absent = Stream::default();
+        for stream in &commit.streams {
+            let stored = streams.get(&stream.entity_id).unwrap_or(&absent);
+
+            if let Some(first) = stream.events.first() {
+                check_continuation(&stream.entity_id, stored.head(), first.sequence)?;
+            }
+
+            for (index, event) in stream.events.iter().enumerate() {
+                let reused = stream.events[..index]
+                    .iter()
+                    .any(|e| e.sequence == event.sequence);
+                if reused || stored.events.contains_key(&event.sequence) {
+                    return Err(Error::Conflict {
+                        entity_id: stream.entity_id.clone(),
+                        message: format!("event sequence {} already exists", event.sequence),
+                    });
+                }
+            }
+
+            if let (Some(first), Some(existing)) = (stream.events.first(), &stored.snapshot)
+                && first.sequence <= existing.event_sequence
+            {
+                return Err(Error::Conflict {
+                    entity_id: stream.entity_id.clone(),
+                    message: format!(
+                        "event sequence {} is at or below the snapshot floor {}",
+                        first.sequence, existing.event_sequence
+                    ),
+                });
+            }
+
+            if let Some(new) = &stream.snapshot {
+                let stored_sequence = stored
+                    .snapshot
+                    .as_ref()
+                    .map_or(EventSequence::ZERO, |existing| existing.sequence);
+
+                if stored_sequence.next() != new.sequence {
+                    return Err(Error::Conflict {
+                        entity_id: stream.entity_id.clone(),
+                        message: format!(
+                            "snapshot sequence moved: stored {stored_sequence}, commit writes {}",
+                            new.sequence
+                        ),
+                    });
+                }
+            }
+        }
+
+        for fence in &commit.fences {
+            if commit
+                .streams
+                .iter()
+                .any(|stream| stream.entity_id == fence.entity_id)
+            {
+                // A written stream's event put supersedes its fence.
+                continue;
+            }
+
+            let Some(stored) = streams.get(&fence.entity_id) else {
+                continue;
+            };
+
+            let event_head = stored
+                .events
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(EventSequence::ZERO);
+            let snapshot_head = stored
+                .snapshot
+                .as_ref()
+                .map_or(EventSequence::ZERO, |snapshot| snapshot.event_sequence);
+
+            if event_head > fence.head || snapshot_head > fence.head {
+                return Err(Error::FenceConflict {
+                    entity_id: fence.entity_id.clone(),
+                    head: fence.head,
+                    provenance: fence.provenance,
+                });
+            }
+        }
+
+        for stream in commit.streams {
+            let last_sequence = stream.events.last().map(|event| event.sequence);
+            let stored = streams.entry(stream.entity_id.clone()).or_default();
+
+            for event in stream.events {
+                stored.events.insert(event.sequence, event);
+            }
+
+            if let (Some(snapshot), Some(event_sequence)) = (stream.snapshot, last_sequence) {
+                stored.snapshot = Some(SerializedSnapshot {
+                    entity_type: snapshot.entity_type,
+                    entity_id: stream.entity_id,
+                    sequence: snapshot.sequence,
+                    event_sequence,
+                    payload: snapshot.payload,
+                });
+            }
         }
 
         Ok(())

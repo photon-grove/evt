@@ -34,7 +34,9 @@ use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{self, FeatureMarker};
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::metadata::Metadata;
-use crate::repository::{Commit, NewSnapshot, Repository};
+use crate::repository::{
+    Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
+};
 use crate::retry::RetryPolicy;
 use crate::store::Store;
 
@@ -95,6 +97,63 @@ impl Aggregate for Ledger {
                 self.total += added.amount;
                 self.entries += 1;
             }
+        }
+    }
+}
+
+/// A second aggregate type for transactions that mix entity types: a claim on a unique name,
+/// held by at most one holder.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Claim {
+    /// Who holds the claim, once taken.
+    pub holder: Option<String>,
+}
+
+/// The payload of `claim:taken`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Taken {
+    /// The new holder.
+    pub holder: String,
+}
+
+crate::domain_events! {
+    /// The [`Claim`] events.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum ClaimEvent {
+        /// The claim was taken.
+        Taken(Taken) => ("claim:taken", 1),
+    }
+}
+
+/// The [`Claim`] command: take the claim for a holder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Take(pub String);
+
+/// The [`Claim`] rejection when it is already held.
+#[derive(Debug, thiserror::Error)]
+#[error("the claim is already held")]
+pub struct AlreadyHeld;
+
+impl Aggregate for Claim {
+    const TYPE: &'static str = "claim";
+
+    type Command = Take;
+    type Event = ClaimEvent;
+    type Error = AlreadyHeld;
+    type Services = ();
+
+    async fn handle(&self, Take(holder): Take, _: &()) -> Result<Vec<ClaimEvent>, AlreadyHeld> {
+        if self.holder.is_some() {
+            return Err(AlreadyHeld);
+        }
+
+        Ok(vec![Taken { holder }.into()])
+    }
+
+    fn apply(&mut self, event: ClaimEvent) {
+        match event {
+            ClaimEvent::Taken(taken) => self.holder = Some(taken.holder),
         }
     }
 }
@@ -218,6 +277,38 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             "reject a commit below the compacted floor",
             compacted_floor(repo).await,
         );
+        record(
+            "a multi-stream commit appends to every stream in pinned order",
+            multi_stream_commit(repo).await,
+        );
+        record(
+            "a transactional first snapshot must have sequence 1",
+            transaction_first_snapshot(repo).await,
+        );
+        record(
+            "a transaction mixes aggregate types and fences read-only streams of any type",
+            mixed_type_transaction(repo).await,
+        );
+        record(
+            "a commit must continue from the stored head without a sequence gap",
+            sequence_gaps(repo).await,
+        );
+        record(
+            "a multi-stream commit is all-or-nothing",
+            multi_stream_atomicity(repo).await,
+        );
+        record(
+            "read fences pass at the head and fail once another writer moves the stream",
+            read_fences(repo).await,
+        );
+        record(
+            "an oversized commit is refused with CommitTooLarge before any write",
+            commit_too_large(repo).await,
+        );
+        record(
+            "append, snapshot, compact must fail a stale fence",
+            fence_compaction_aba(repo).await,
+        );
         record("entity heads", entity_heads(repo).await);
         record(
             "latest(n) reads the newest events first",
@@ -241,6 +332,10 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             record(
                 "projector operations commit with events",
                 store_projector(repo, views).await,
+            );
+            record(
+                "a transaction projects each stream once from its final state",
+                transaction_projector(repo, views).await,
             );
         }
 
@@ -904,6 +999,396 @@ async fn compacted_floor<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+/// A one-stream write, for transactions that append to a single stream.
+fn write<Op>(entity: &Stream, sequences: RangeInclusive<i64>) -> Commit<Op> {
+    Commit {
+        entity_id: entity.id.clone(),
+        events: entity.events(sequences),
+        snapshot: None,
+        operations: Vec::new(),
+    }
+}
+
+async fn multi_stream_commit<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+
+    // Deliberately declared out of bytewise stream order: the commit pins the order itself, and
+    // each stream keeps its own ascending sequences.
+    let commit = TransactionCommit::new(vec![write(&b, 1..=1), write(&a, 1..=2)]);
+    repo.commit_transaction(commit).await?;
+
+    ensure_eq!(repo.events(&a.id).await?, a.events(1..=2), "events(a)");
+    ensure_eq!(repo.events(&b.id).await?, b.events(1..=1), "events(b)");
+
+    Ok(())
+}
+
+async fn transaction_first_snapshot<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+
+    // A stream's first snapshot is sequence 1 on every backend, also in a multi-stream commit
+    // that creates the stream.
+    let skipping = Commit {
+        snapshot: Some(a.new_snapshot(3, "{}")),
+        ..write(&a, 1..=2)
+    };
+    expect_conflict(
+        repo.commit_transaction(TransactionCommit::new(vec![write(&b, 1..=1), skipping]))
+            .await,
+        "a first snapshot whose sequence is not 1",
+    )?;
+    ensure!(
+        repo.events(&a.id).await?.is_empty()
+            && repo.events(&b.id).await?.is_empty()
+            && repo.snapshot(&a.id).await?.is_none(),
+        "the rejected commit writes nothing, in any stream"
+    );
+
+    let accepted = Commit {
+        snapshot: Some(a.new_snapshot(1, "{}")),
+        ..write(&a, 1..=2)
+    };
+    repo.commit_transaction(TransactionCommit::new(vec![write(&b, 1..=1), accepted]))
+        .await?;
+    ensure_eq!(
+        repo.snapshot(&a.id).await?,
+        Some(a.snapshot(1, 2, "{}")),
+        "sequence 1 is accepted"
+    );
+
+    Ok(())
+}
+
+async fn mixed_type_transaction<R: Repository>(repo: &R) -> CaseResult {
+    use crate::Transaction;
+
+    let ns = namespace();
+    let ledger_id = EntityId::new(format!("{ns}-ledger"));
+    let claim_id = EntityId::new(format!("{ns}-claim"));
+    let metadata = Metadata::new("conformance");
+
+    // One commit appends to a ledger and to a claim, two different aggregate types.
+    let mut tx = Transaction::new(repo).with_snapshot_interval(0);
+    let mut ledger = tx.read::<Ledger>(ledger_id.clone()).await?;
+    let mut claim = tx.read::<Claim>(claim_id.clone()).await?;
+    tx.append(&mut ledger, vec![Added { amount: 5 }.into()])?;
+    tx.append(
+        &mut claim,
+        vec![
+            Taken {
+                holder: "ada".to_owned(),
+            }
+            .into(),
+        ],
+    )?;
+    let committed = tx.commit(&metadata).await?;
+
+    ensure_eq!(committed.len(), 2, "both streams are committed");
+    let ledger_events = repo.events(&ledger_id).await?;
+    let claim_events = repo.events(&claim_id).await?;
+    ensure!(
+        ledger_events.len() == 1
+            && ledger_events[0].entity_type == EntityType::new(Ledger::TYPE)
+            && claim_events.len() == 1
+            && claim_events[0].entity_type == EntityType::new(Claim::TYPE),
+        "each stream is stored under its own aggregate type"
+    );
+    ensure_eq!(
+        ledger_events[0].metadata.commit_id,
+        claim_events[0].metadata.commit_id,
+        "one commit ID across both aggregate types"
+    );
+
+    // A read-only stream of another type is fenced with engine provenance: once another writer
+    // moves the claim, the transaction that read it fails with a retryable fence conflict.
+    let mut tx = Transaction::new(repo).with_snapshot_interval(0);
+    let mut ledger = tx.read::<Ledger>(ledger_id.clone()).await?;
+    tx.read::<Claim>(claim_id.clone()).await?;
+    tx.append(&mut ledger, vec![Added { amount: 1 }.into()])?;
+
+    // Another writer appends to the claim at its next sequence.
+    let stream = Stream::new(&ns, "claim", "claim");
+    stream.commit(repo, vec![stream.event(2, 1)], None).await?;
+
+    let result = tx.commit(&metadata).await;
+    ensure!(
+        matches!(
+            &result,
+            Err(Error::FenceConflict { entity_id, head: EventSequence(1), provenance: FenceProvenance::Engine })
+                if *entity_id == claim_id
+        ),
+        "the claim moved under a transaction that read it: {result:?}"
+    );
+    ensure_eq!(
+        repo.events(&ledger_id).await?.len(),
+        1,
+        "the fenced transaction wrote nothing"
+    );
+
+    Ok(())
+}
+
+async fn sequence_gaps<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let gap = |result: Result<(), Error>, id: &EntityId, after: i64, found: i64| match result {
+        Err(Error::SequenceGap {
+            entity_id,
+            after: stored,
+            found: first,
+        }) if entity_id == *id
+            && stored == EventSequence(after)
+            && first == EventSequence(found) =>
+        {
+            Ok(())
+        }
+        other => Err(Failure(format!(
+            "want a sequence gap on {id} after {after} found {found}, got {other:?}"
+        ))),
+    };
+
+    // A first event above sequence 1 on a stream with no events is a gap.
+    let new = Stream::new(&ns, "new", "ledger");
+    gap(
+        new.commit(repo, new.events(3..=3), None).await,
+        &new.id,
+        0,
+        3,
+    )?;
+    ensure!(
+        repo.events(&new.id).await?.is_empty(),
+        "a refused gap writes nothing"
+    );
+
+    // Skipping a sequence on an existing stream is a gap; continuing from the head is not.
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+    a.commit(repo, a.events(1..=1), None).await?;
+    gap(a.commit(repo, a.events(3..=3), None).await, &a.id, 1, 3)?;
+
+    // One stream of a multi-stream commit with a gap fails the whole commit.
+    let mixed = TransactionCommit::new(vec![write(&b, 1..=1), write(&a, 3..=3)]);
+    gap(repo.commit_transaction(mixed).await, &a.id, 1, 3)?;
+    ensure!(
+        repo.events(&b.id).await?.is_empty(),
+        "the clean stream of the failed commit is untouched"
+    );
+
+    a.commit(repo, a.events(2..=2), None).await?;
+
+    // Compaction can delete every event a snapshot covers, including the head: the snapshot's
+    // event sequence is then the head, so the stream still continues from it and still refuses a
+    // gap.
+    let c = Stream::new(&ns, "c", "ledger");
+    c.commit(repo, c.events(1..=3), Some(c.new_snapshot(1, "{}")))
+        .await?;
+    ensure_eq!(
+        repo.compact_below(&c.id, EventSequence(3)).await?,
+        3,
+        "the head event is compacted away"
+    );
+    gap(c.commit(repo, c.events(5..=5), None).await, &c.id, 3, 5)?;
+    c.commit(repo, c.events(4..=4), None).await?;
+
+    Ok(())
+}
+
+async fn multi_stream_atomicity<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+
+    a.commit(repo, a.events(1..=2), None).await?;
+
+    // The sibling stream's event collides with nothing; stream a's reuses sequence 1.
+    let collision = Commit {
+        events: vec![a.event(1, 99)],
+        ..write(&a, 1..=1)
+    };
+    let commit = TransactionCommit::new(vec![write(&b, 1..=1), collision]);
+    let result = repo.commit_transaction(commit).await;
+
+    ensure!(
+        matches!(&result, Err(Error::Conflict { entity_id, .. }) if *entity_id == a.id),
+        "a commit that collides on one stream must fail with a conflict"
+    );
+
+    // All-or-nothing: the sibling stream that shared the failed commit must be untouched.
+    ensure!(
+        repo.events(&b.id).await?.is_empty(),
+        "the sibling stream of a failed commit is untouched"
+    );
+
+    // The conflict names the stream whose action failed, not the first stream of the commit: the
+    // collision here is on `d`, which sorts after the clean streams `c` and `e`.
+    let c = Stream::new(&ns, "c", "ledger");
+    let d = Stream::new(&ns, "d", "ledger");
+    let e = Stream::new(&ns, "e", "ledger");
+    d.commit(repo, d.events(1..=1), None).await?;
+
+    let collision = Commit {
+        events: vec![d.event(1, 99)],
+        ..write(&d, 1..=1)
+    };
+    let commit = TransactionCommit::new(vec![write(&c, 1..=1), collision, write(&e, 1..=1)]);
+    let result = repo.commit_transaction(commit).await;
+
+    ensure!(
+        matches!(&result, Err(Error::Conflict { entity_id, .. }) if *entity_id == d.id),
+        "a conflict on a later stream is attributed to that stream, got {result:?}"
+    );
+    ensure!(
+        repo.events(&c.id).await?.is_empty() && repo.events(&e.id).await?.is_empty(),
+        "the clean streams of the failed commit are untouched"
+    );
+
+    Ok(())
+}
+
+async fn read_fences<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let c = Stream::new(&ns, "c", "ledger");
+    let absent = Stream::new(&ns, "absent", "ledger");
+
+    a.commit(repo, a.events(1..=2), None).await?;
+
+    // A fence at the observed head passes while the transaction writes another stream. A fence
+    // on an absent stream (head 0) passes too.
+    let fence = ReadFence::new(
+        a.id.clone(),
+        a.entity_type.clone(),
+        EventSequence(2),
+        FenceProvenance::Engine,
+    );
+    let mut commit = TransactionCommit::new(vec![write(&c, 1..=1)]);
+    commit.fences = vec![
+        fence.clone(),
+        ReadFence::new(
+            absent.id.clone(),
+            absent.entity_type.clone(),
+            EventSequence::ZERO,
+            FenceProvenance::Engine,
+        ),
+    ];
+    repo.commit_transaction(commit).await?;
+
+    // Another writer moves the fenced stream past the head.
+    a.commit(repo, vec![a.event(3, 3)], None).await?;
+
+    // A stale fence now fails the whole commit, and the conflict names the fenced stream.
+    let before = repo.events(&c.id).await?.len();
+    let mut commit = TransactionCommit::new(vec![write(&c, 2..=2)]);
+    commit.fences = vec![fence];
+    let Err(err) = repo.commit_transaction(commit).await else {
+        return Err(Failure("a stale fence must fail the commit".into()));
+    };
+
+    ensure!(
+        matches!(
+            &err,
+            Error::FenceConflict { entity_id, head: EventSequence(2), provenance: FenceProvenance::Engine }
+                if *entity_id == a.id
+        ),
+        "a stale fence fails with a fence conflict naming the fenced stream and its fenced head"
+    );
+    ensure!(
+        err.is_conflict(),
+        "a fence conflict is an optimistic-concurrency conflict"
+    );
+    ensure!(
+        err.is_retryable(),
+        "an engine-filled fence conflict retries like an event-put conflict"
+    );
+
+    // Nothing from the failed commit was written.
+    ensure_eq!(
+        repo.events(&c.id).await?.len(),
+        before,
+        "a failed fenced commit writes nothing"
+    );
+
+    Ok(())
+}
+
+async fn commit_too_large<R: Repository>(repo: &R) -> CaseResult {
+    let stream = Stream::new(&namespace(), "large", "ledger");
+
+    // Appending to an existing stream adds a continuation check on its head event, so the marker
+    // check, that check, 97 event puts, and the floor check fill the 100 actions exactly.
+    let grows = Stream::new(&namespace(), "grows", "ledger");
+    grows.commit(repo, grows.events(1..=1), None).await?;
+    let result = grows.commit(repo, grows.events(2..=99), None).await;
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
+        "98 appended events are one action too many: {result:?}"
+    );
+    grows.commit(repo, grows.events(2..=98), None).await?;
+    ensure_eq!(
+        repo.events(&grows.id).await?.len(),
+        98,
+        "97 appended events fit"
+    );
+
+    // The feature-marker check, 98 event puts, and the floor check are exactly 100 actions, so a
+    // 98-event commit fits on every backend. Only emitted actions count against the budget.
+    let fits = Stream::new(&namespace(), "fits", "ledger");
+    fits.commit(repo, fits.events(1..=98), None).await?;
+    ensure_eq!(
+        repo.events(&fits.id).await?.len(),
+        98,
+        "a commit that fills the budget exactly is accepted"
+    );
+
+    // 101 event puts plus the control rows and the floor check exceed the 100-item budget.
+    let result = stream.commit(repo, stream.events(1..=101), None).await;
+
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { .. })),
+        "an oversized commit is refused with CommitTooLarge"
+    );
+    ensure!(
+        repo.events(&stream.id).await?.is_empty(),
+        "an oversized commit is refused before any write"
+    );
+
+    Ok(())
+}
+
+async fn fence_compaction_aba<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let c = Stream::new(&ns, "c", "ledger");
+
+    a.commit(repo, a.events(1..=3), Some(a.new_snapshot(1, "{}")))
+        .await?;
+
+    // Compaction deletes the events the snapshot covers, which empties the slot a stale fence
+    // checks — the companion on the snapshot item must catch the move.
+    repo.compact_below(&a.id, EventSequence(3)).await?;
+
+    let mut commit = TransactionCommit::new(vec![write(&c, 1..=1)]);
+    commit.fences = vec![ReadFence::new(
+        a.id.clone(),
+        a.entity_type.clone(),
+        EventSequence(1),
+        FenceProvenance::Engine,
+    )];
+
+    ensure!(
+        matches!(
+            repo.commit_transaction(commit).await,
+            Err(Error::FenceConflict { .. })
+        ),
+        "append, snapshot, compact must fail a stale fence"
+    );
+
+    Ok(())
+}
+
 async fn entity_heads<R: Repository>(repo: &R) -> CaseResult {
     let ns = namespace();
     let a1 = Stream::new(&ns, "alpha-1", "alpha");
@@ -1389,6 +1874,42 @@ async fn store_retry<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+async fn transaction_projector<R: Repository, V: ViewTarget<R>>(repo: &R, views: &V) -> CaseResult {
+    use crate::Transaction;
+    use std::sync::Arc;
+
+    let id = ledger_id();
+    let projectors: Vec<Arc<dyn Projector<Ledger, R::Operation>>> =
+        vec![Arc::new(views.projector())];
+
+    // Two appends to one handle write the stream's view row once, from the final state. Writing
+    // the row per append would touch one item twice in the transaction, which DynamoDB refuses.
+    let mut tx = Transaction::new(repo).with_snapshot_interval(0);
+    let mut ledger = tx.read::<Ledger>(id.clone()).await?;
+    tx.append_with(&mut ledger, vec![Added { amount: 1 }.into()], &projectors)?;
+    tx.append_with(&mut ledger, vec![Added { amount: 2 }.into()], &projectors)?;
+    tx.commit(&metadata()).await?;
+
+    ensure_eq!(
+        views
+            .view(&id)
+            .await
+            .map_err(|err| Failure(err.to_string()))?,
+        Some(Ledger {
+            total: 3,
+            entries: 2
+        }),
+        "the view reflects both appends"
+    );
+    ensure_eq!(
+        repo.events(&id).await?.len(),
+        2,
+        "both appends are committed"
+    );
+
+    Ok(())
+}
+
 async fn store_projector<R: Repository, V: ViewTarget<R>>(repo: &R, views: &V) -> CaseResult {
     let store = Store::<Ledger, _>::new(repo, ()).with_projector(views.projector());
     let id = ledger_id();
@@ -1472,6 +1993,10 @@ where
     record(
         "the retention set round-trips and entity heads skip the marker row",
         retention_and_heads(repo, other).await,
+    );
+    record(
+        "the durable retention set refuses transaction fences",
+        fence_retention_refusal(repo, other).await,
     );
     record(
         "one declaration transaction bumps the version once",
@@ -1756,6 +2281,42 @@ where
         manifest.version,
         before + 1,
         "the version after a two-feature declaration"
+    );
+
+    Ok(())
+}
+
+/// The refusal must consult the manifest, not the calling instance's configuration: retention is
+/// declared on one writer and the fenced transaction is committed by the other. This case runs
+/// before the unsupported-feature declaration case, whose leftover manifest would refuse every
+/// later commit, and the suite's final cleanup clears the retention entry.
+async fn fence_retention_refusal<R>(repo: &R, other: &R) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+{
+    let ns = namespace();
+    let retained = format!("{ns}-retained");
+
+    other
+        .update_manifest(|manifest| {
+            manifest.retention.insert(retained.clone());
+        })
+        .await?;
+
+    let mut commit = TransactionCommit::<R::Operation>::new(Vec::new());
+    commit.fences = vec![ReadFence::new(
+        EntityId::new(format!("{ns}-a")),
+        EntityType::new(&retained),
+        EventSequence::ZERO,
+        FenceProvenance::Engine,
+    )];
+
+    ensure!(
+        matches!(
+            repo.commit_transaction(commit).await,
+            Err(Error::RetentionConflict { .. })
+        ),
+        "a fence for a retention-enabled type is refused with RetentionConflict"
     );
 
     Ok(())

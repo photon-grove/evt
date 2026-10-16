@@ -133,6 +133,10 @@ func (store *Store) Commit(
 
 	entityType := eventContext.Entity.Type()
 
+	// The engine stamps the commit ID once per commit: every event of this commit — and of every
+	// stream a multi-stream commit touches — carries the same value.
+	metadata = evt.CommitMetadata(metadata)
+
 	serializedEvents, err := evt.SerializeEventsWithContext(result.Events, &eventContext, metadata)
 	if err != nil {
 		return nil, err

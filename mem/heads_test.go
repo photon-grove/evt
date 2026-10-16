@@ -20,6 +20,16 @@ func headEvent(entityID evt.EntityID, entityType evt.EntityType, seq evt.EventSe
 	}
 }
 
+// headEvents returns the events 1..head of a stream, so a commit continues from nothing.
+func headEvents(entityID evt.EntityID, entityType evt.EntityType, head evt.EventSequence) []evt.SerializedEvent {
+	events := make([]evt.SerializedEvent, 0, head)
+	for sequence := evt.EventSequence(1); sequence <= head; sequence++ {
+		events = append(events, headEvent(entityID, entityType, sequence))
+	}
+
+	return events
+}
+
 func commitEvents(t *testing.T, repo evt.Repository, events ...evt.SerializedEvent) {
 	t.Helper()
 	require.NoError(t, repo.Commit(context.Background(), evt.SerializedResult{Events: events}))
@@ -62,8 +72,8 @@ func TestStreamEntityHeads_MaxSequencePerEntity(t *testing.T) {
 func TestStreamEntityHeads_FiltersByType(t *testing.T) {
 	repo := NewRepository()
 
-	commitEvents(t, repo, headEvent("widget-1", "widget", 2))
-	commitEvents(t, repo, headEvent("gadget-1", "gadget", 5))
+	commitEvents(t, repo, headEvent("widget-1", "widget", 1), headEvent("widget-1", "widget", 2))
+	commitEvents(t, repo, headEvents("gadget-1", "gadget", 5)...)
 
 	heads, err := asHeadStreamer(t, repo).StreamEntityHeads(context.Background(), "widget")
 	require.NoError(t, err)
@@ -104,13 +114,12 @@ func TestStreamEntityHeadsFunc_VisitsEachEntityOnce(t *testing.T) {
 	repo := NewRepository()
 
 	commitEvents(t, repo, headEvent("widget-1", "widget", 1), headEvent("widget-1", "widget", 2))
-	commitEvents(t, repo, headEvent("gadget-1", "gadget", 4))
+	commitEvents(t, repo, headEvents("gadget-1", "gadget", 4)...)
 
 	// A compacted, snapshot-only entity: events deleted, snapshot floor at 7.
-	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{
-		headEvent("widget-2", "widget", 6),
-		headEvent("widget-2", "widget", 7),
-	}}, "widget", "widget-2", []byte("{}"), 1))
+	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{
+		Events: headEvents("widget-2", "widget", 7),
+	}, "widget", "widget-2", []byte("{}"), 1))
 	compactor, ok := repo.(evt.Compactor)
 	require.True(t, ok)
 	_, err := compactor.CompactBelow(ctx, "widget-2", 7)
@@ -139,8 +148,8 @@ func TestStreamEntityHeadsFunc_VisitsEachEntityOnce(t *testing.T) {
 func TestStreamEntityHeadsFunc_FiltersByType(t *testing.T) {
 	repo := NewRepository()
 
-	commitEvents(t, repo, headEvent("widget-1", "widget", 2))
-	commitEvents(t, repo, headEvent("gadget-1", "gadget", 5))
+	commitEvents(t, repo, headEvent("widget-1", "widget", 1), headEvent("widget-1", "widget", 2))
+	commitEvents(t, repo, headEvents("gadget-1", "gadget", 5)...)
 
 	collected := map[evt.EntityID]evt.EventSequence{}
 	err := asHeadVisitor(t, repo).StreamEntityHeadsFunc(context.Background(), "widget", func(id evt.EntityID, head evt.EventSequence) error {

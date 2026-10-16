@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/photon-grove/evt"
@@ -249,12 +252,30 @@ func eventVector(ctx context.Context, c namedEvent) (EventVector, error) {
 
 	fake := NewFakeDynamo()
 	repo := dynamo.NewRepository(fake, fakeTable)
+
+	// A commit must continue from the stored head, so a vector above sequence 1 is committed onto
+	// a stream whose previous event is already stored.
+	if c.event.Sequence > 1 {
+		_, err = fake.PutItem(ctx, &dynamodb.PutItemInput{Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: string(c.event.EntityID)},
+			"sk": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(c.event.Sequence)-1, 10)},
+		}})
+		if err != nil {
+			return EventVector{}, err
+		}
+	}
+
 	err = repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{c.event}})
 	if err != nil {
 		return EventVector{}, err
 	}
 
-	items := fake.Items(string(c.event.EntityID))
+	var items []map[string]types.AttributeValue
+	for _, item := range fake.Items(string(c.event.EntityID)) {
+		if sk, ok := item["sk"].(*types.AttributeValueMemberN); ok && sk.Value == strconv.FormatInt(int64(c.event.Sequence), 10) {
+			items = append(items, item)
+		}
+	}
 	if len(items) != 1 {
 		return EventVector{}, fmt.Errorf("expected one stored item, got %d", len(items))
 	}

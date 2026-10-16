@@ -6,9 +6,12 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"slices"
+	"sync"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -16,6 +19,17 @@ import (
 type Repository struct {
 	events    map[string][]evt.SerializedEvent
 	snapshots map[string]evt.SerializedSnapshot
+
+	// features holds the durable feature manifest. Shared through a pointer, like the maps
+	// above, so copies of the handle (and clones of it) see one manifest.
+	features *memFeatures
+}
+
+// memFeatures is the in-memory form of the feature-marker row: the manifest plus the lock that
+// keeps a declaration and a commit's retention check from interleaving.
+type memFeatures struct {
+	mu       sync.Mutex
+	manifest *evt.FeatureManifest
 }
 
 // NewRepository creates a new instance of the Repository
@@ -23,6 +37,7 @@ func NewRepository() evt.Repository {
 	return &Repository{
 		make(map[string][]evt.SerializedEvent),
 		make(map[string]evt.SerializedSnapshot),
+		&memFeatures{},
 	}
 }
 
@@ -31,23 +46,66 @@ var (
 	_ evt.SnapshotStreamer   = (*Repository)(nil)
 	_ evt.EntityHeadStreamer = (*Repository)(nil)
 	_ evt.EntityHeadVisitor  = (*Repository)(nil)
+
+	_ evt.TransactionalRepository = (*Repository)(nil)
 )
+
+// AtomicTransactions declares that Commit writes every stream, snapshot, and fence of a result
+// all or nothing (evt.TransactionalRepository).
+func (Repository) AtomicTransactions() {}
 
 // Commit Events to memory. It does not reject reused sequences, but like the durable backends it
 // rejects a commit at or below the entity's snapshot, which compaction may have deleted below.
+// A multi-stream commit validates every stream, snapshot, and read fence before writing
+// anything, so a failure leaves every stream unchanged.
 func (repo Repository) Commit(
 	_ context.Context,
 	result evt.SerializedResult,
 ) error {
-	if err := evt.CheckReservedEntityIDs(result.Events); err != nil {
+	normalized, err := evt.NormalizeCommit(result)
+	if err != nil {
 		return err
 	}
 
-	if err := repo.checkFloor(result.Events); err != nil {
+	if err := evt.PreflightCommit(normalized); err != nil {
 		return err
 	}
 
-	for _, event := range result.Events {
+	// The manifest lock is held through the write, so a declaration cannot slip between the
+	// marker checks and the events, mirroring the durable backends' transaction condition.
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	// A manifest that declares a feature this writer does not model refuses the commit, as the
+	// durable backends' marker check does. The in-memory double models no extensions.
+	if err := repo.features.validate(); err != nil {
+		return err
+	}
+
+	// Fences are refused outright for entity types durably declared with retention, exactly as
+	// the durable backends refuse them: TTL deletes reopen fenced slots without leaving a
+	// successor snapshot, so the two checks cannot protect them.
+	if err := evt.CheckFenceRetention(normalized.Fences, repo.features.manifest); err != nil {
+		return err
+	}
+
+	if err := repo.checkFloor(normalized.Events); err != nil {
+		return err
+	}
+
+	if err := repo.checkContinuation(normalized.Events); err != nil {
+		return err
+	}
+
+	if err := repo.checkSnapshots(normalized.Snapshots); err != nil {
+		return err
+	}
+
+	if err := repo.checkFences(normalized.Fences); err != nil {
+		return err
+	}
+
+	for _, event := range normalized.Events {
 		id := string(event.EntityID)
 
 		if repo.events[id] == nil {
@@ -58,7 +116,140 @@ func (repo Repository) Commit(
 		repo.events[id] = append(repo.events[id], event)
 	}
 
-	return repo.applyTransactions(result.Transaction)
+	for _, snapshot := range normalized.Snapshots {
+		repo.snapshots[string(snapshot.EntityID)] = snapshot
+	}
+
+	return repo.applyTransactions(normalized.Transaction)
+}
+
+// checkContinuation refuses a written stream whose first sequence skips past the stored head. The
+// head is the stream's highest event or, once compaction deleted every covered event, its
+// snapshot's event sequence. Like the durable backends it leaves a first sequence at or below the
+// head to the event-put and floor checks. This is the in-memory form of the continuation check
+// (spec, Writes).
+func (repo Repository) checkContinuation(events []evt.SerializedEvent) error {
+	seen := map[evt.EntityID]bool{}
+
+	for _, event := range events {
+		if seen[event.EntityID] {
+			continue
+		}
+		seen[event.EntityID] = true
+
+		var head evt.EventSequence
+		for _, stored := range repo.events[string(event.EntityID)] {
+			head = max(head, stored.Sequence)
+		}
+		if snapshot, ok := repo.snapshots[string(event.EntityID)]; ok {
+			head = max(head, snapshot.EventSequence)
+		}
+
+		if event.Sequence > head+1 {
+			return &evt.SequenceGapError{EntityID: event.EntityID, After: head, Found: event.Sequence}
+		}
+	}
+
+	return nil
+}
+
+// checkSnapshots rejects a snapshot whose sequence does not follow the stored one, or whose
+// event sequence is not above the events it summarizes.
+func (repo Repository) checkSnapshots(snapshots []evt.SerializedSnapshot) error {
+	for _, snapshot := range snapshots {
+		// A stream with no stored snapshot is at sequence 0, so its first snapshot must be 1,
+		// as on DynamoDB and PostgreSQL.
+		var storedSequence evt.EventSequence
+		if stored, ok := repo.snapshots[string(snapshot.EntityID)]; ok {
+			storedSequence = stored.Sequence
+		}
+
+		if storedSequence+1 != snapshot.Sequence {
+			return evt.NewConflictError(fmt.Sprintf(
+				"mem: snapshot sequence moved: stored %d, commit writes %d",
+				storedSequence, snapshot.Sequence,
+			))
+		}
+	}
+
+	return nil
+}
+
+// checkFences rejects a fence whose stream has moved past the fenced head: any event above the
+// head, or any snapshot covering it, means another writer advanced the stream. This is the
+// in-memory form of the slot check plus the snapshot companion (ADR 0004, C2).
+func (repo Repository) checkFences(fences []evt.ReadFence) error {
+	for _, fence := range fences {
+		for _, event := range repo.events[string(fence.EntityID)] {
+			if event.Sequence > fence.Head {
+				return policy.FenceConflict(fence)
+			}
+		}
+
+		if snapshot, ok := repo.snapshots[string(fence.EntityID)]; ok && snapshot.EventSequence > fence.Head {
+			return policy.FenceConflict(fence)
+		}
+	}
+
+	return nil
+}
+
+// validate refuses a manifest that declares a feature this build does not model. The in-memory
+// repository models no extensions, like the default Go writer. The caller holds mu.
+func (f *memFeatures) validate() error {
+	if f.manifest == nil {
+		return nil
+	}
+
+	return f.manifest.Validate(nil)
+}
+
+// Manifest reads the stored feature manifest, or nil when nothing is declared. The returned
+// manifest is a copy; declaring is the only way to change it.
+func (repo Repository) Manifest(_ context.Context) (*evt.FeatureManifest, error) {
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	if repo.features.manifest == nil {
+		return nil, nil
+	}
+
+	manifest := cloneManifest(*repo.features.manifest)
+
+	return &manifest, nil
+}
+
+// Declare applies a change to the stored manifest in one read-modify-write and bumps its version
+// by exactly one, like the durable backends' declarations, and returns the resulting manifest.
+// Declaring does not grant support: the resulting manifest may declare features this build does
+// not model, which then refuses later commits.
+func (repo Repository) Declare(
+	_ context.Context,
+	change func(*evt.FeatureManifest),
+) (evt.FeatureManifest, error) {
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	next := evt.FeatureManifest{Features: map[string]evt.FeatureFormat{}}
+	if repo.features.manifest != nil {
+		next = cloneManifest(*repo.features.manifest)
+	}
+
+	version := next.Version
+	change(&next)
+	next.Version = version + 1
+	repo.features.manifest = &next
+
+	return cloneManifest(next), nil
+}
+
+// cloneManifest copies a manifest so callers never alias the stored one.
+func cloneManifest(manifest evt.FeatureManifest) evt.FeatureManifest {
+	manifest.Features = maps.Clone(manifest.Features)
+	manifest.HistoryDependent = slices.Clone(manifest.HistoryDependent)
+	manifest.Retention = slices.Clone(manifest.Retention)
+
+	return manifest
 }
 
 // CommitStream streams Events to memory
@@ -66,7 +257,7 @@ func (repo Repository) Commit(
 // Deprecated: Cut in ADR-0006 (K1). Commit batched commands through the normal commit path
 // instead. It will be removed in the next minor release.
 func (repo Repository) CommitStream(
-	_ context.Context,
+	ctx context.Context,
 	channel <-chan result.Result[evt.SerializedResult],
 ) []error {
 	var errors []error
@@ -78,28 +269,7 @@ func (repo Repository) CommitStream(
 			continue
 		}
 
-		if err := evt.CheckReservedEntityIDs(serializedResult.Events); err != nil {
-			errors = append(errors, err)
-			continue
-		}
-
-		if err := repo.checkFloor(serializedResult.Events); err != nil {
-			errors = append(errors, err)
-			continue
-		}
-
-		for _, event := range serializedResult.Events {
-			id := string(event.EntityID)
-
-			if repo.events[id] == nil {
-				var empty []evt.SerializedEvent
-				repo.events[id] = empty
-			}
-
-			repo.events[id] = append(repo.events[id], event)
-		}
-
-		if err := repo.applyTransactions(serializedResult.Transaction); err != nil {
+		if err := repo.Commit(ctx, serializedResult); err != nil {
 			errors = append(errors, err)
 		}
 	}
@@ -122,7 +292,8 @@ func (repo Repository) checkFloor(events []evt.SerializedEvent) error {
 	return nil
 }
 
-// CommitWithSnapshot commits Events with a Snapshot
+// CommitWithSnapshot commits Events with a Snapshot. It routes through the multi-stream commit
+// path, writing the snapshot in the same logical commit as its events.
 func (repo Repository) CommitWithSnapshot(
 	ctx context.Context,
 	result evt.SerializedResult,
@@ -131,29 +302,27 @@ func (repo Repository) CommitWithSnapshot(
 	payload []byte,
 	currentSnapshot evt.EventSequence,
 ) error {
+	if err := evt.CheckProjectorOperations(result); err != nil {
+		return err
+	}
+
+	if len(result.Events) == 0 {
+		return fmt.Errorf("mem: commit with snapshot requires at least one event")
+	}
+
 	if err := evt.CheckReservedEntityID(entityID); err != nil {
 		return err
 	}
 
-	if err := repo.Commit(ctx, result); err != nil {
-		return err
-	}
-
-	currentSequence := result.Events[len(result.Events)-1].Sequence
-
-	id := string(entityID)
-
-	snapshot := evt.SerializedSnapshot{
+	result.Snapshots = append(result.Snapshots, evt.SerializedSnapshot{
 		EntityType:    entityType,
 		EntityID:      entityID,
 		Sequence:      currentSnapshot,
-		EventSequence: currentSequence,
+		EventSequence: result.Events[len(result.Events)-1].Sequence,
 		Payload:       payload,
-	}
+	})
 
-	repo.snapshots[id] = snapshot
-
-	return nil
+	return repo.Commit(ctx, result)
 }
 
 // GetEvents gets all Events
@@ -359,6 +528,13 @@ func (repo Repository) CompactBelow(
 
 	id := string(entityID)
 
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	if err := repo.features.validate(); err != nil {
+		return 0, err
+	}
+
 	snapshot, ok := repo.snapshots[id]
 	if !ok {
 		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
@@ -368,6 +544,11 @@ func (repo Repository) CompactBelow(
 			"%w: entity %s snapshot covers through event %d but compaction was requested through %d",
 			evt.ErrCompactionUncovered, entityID, snapshot.EventSequence, throughSequence,
 		)
+	}
+
+	// A history-dependent type's rebuild replays the commits compaction would delete.
+	if repo.features.manifest != nil && slices.Contains(repo.features.manifest.HistoryDependent, snapshot.EntityType) {
+		return 0, evt.NewHistoryDependentProjectionError(snapshot.EntityType)
 	}
 
 	events := repo.events[id]

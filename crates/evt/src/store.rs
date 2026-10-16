@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::aggregate::{Aggregate, Projector};
+use crate::commit_id::{self, CommitIdGenerator};
 use crate::error::{Error, ExecuteError, ReplayPhase};
 use crate::event::{DomainEvent, SerializedEvent};
 use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
@@ -29,10 +30,11 @@ pub const DEFAULT_SNAPSHOT_INTERVAL: usize = 5;
 /// tasks behind an `Arc`. It is `Clone` when the repository and services are `Clone`; projectors
 /// are shared between clones.
 pub struct Store<A: Aggregate, R: Repository> {
-    repository: R,
+    pub(crate) repository: R,
     services: A::Services,
-    snapshot_interval: usize,
-    projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
+    pub(crate) snapshot_interval: usize,
+    pub(crate) projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
+    pub(crate) commit_ids: CommitIdGenerator,
 }
 
 impl<A, R> Clone for Store<A, R>
@@ -47,6 +49,7 @@ where
             services: self.services.clone(),
             snapshot_interval: self.snapshot_interval,
             projectors: self.projectors.clone(),
+            commit_ids: self.commit_ids.clone(),
         }
     }
 }
@@ -70,7 +73,20 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             services,
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             projectors: Vec::new(),
+            commit_ids: commit_id::default_generator(),
         }
+    }
+
+    /// Replaces the generator that stamps a commit ID on commits whose metadata carries neither
+    /// a command ID nor a commit ID. The default produces ULID-format IDs from the system clock;
+    /// inject one for deterministic IDs in tests or to follow an existing ID scheme.
+    #[must_use]
+    pub fn with_commit_id_generator(
+        mut self,
+        generator: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.commit_ids = Arc::new(generator);
+        self
     }
 
     /// Sets the number of events between snapshots. 0 disables snapshots.
@@ -107,7 +123,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     ///
     /// Event sequences must be contiguous. A gap means the stream was compacted between reading
     /// the snapshot and the events, so the load starts over, up to three times. A gap that
-    /// persists, for example from expired events, fails with [`Error::Conflict`].
+    /// persists, for example from expired events, fails with [`Error::SequenceGap`].
     ///
     /// Like any read, a load can be one compaction behind: if another writer snapshots and compacts
     /// during the load, the event read can stop short without a gap (it is empty, or a paginated
@@ -117,56 +133,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     ///
     /// [`execute_with_retry`]: Store::execute_with_retry
     pub async fn load(&self, entity_id: impl Into<EntityId>) -> Result<Loaded<A>, Error> {
-        let entity_id = entity_id.into();
-        let mut attempt = 1;
-
-        // A sequence gap means another writer snapshotted and compacted the stream between the
-        // snapshot read and the event read. Loading again starts from the newer snapshot.
-        loop {
-            match self.load_once(entity_id.clone()).await {
-                Err(err) if err.is_conflict() && attempt < LOAD_ATTEMPTS => attempt += 1,
-                result => return result,
-            }
-        }
-    }
-
-    async fn load_once(&self, entity_id: EntityId) -> Result<Loaded<A>, Error> {
-        let snapshot = self.repository.snapshot(&entity_id).await?;
-        let has_snapshot = snapshot.is_some();
-
-        let mut loaded = match snapshot {
-            Some(snapshot) => {
-                let aggregate = serde_json::from_slice(&snapshot.payload).map_err(|source| {
-                    Error::Snapshot {
-                        entity_id: entity_id.clone(),
-                        source,
-                    }
-                })?;
-
-                Loaded {
-                    entity_id,
-                    aggregate,
-                    sequence: snapshot.event_sequence,
-                    snapshot_sequence: snapshot.sequence,
-                    seen_command_ids: HashSet::new(),
-                }
-            }
-            None => Loaded::new(entity_id),
-        };
-
-        let events = if has_snapshot {
-            self.repository
-                .events_after(&loaded.entity_id, loaded.sequence)
-                .await?
-        } else {
-            self.repository.events(&loaded.entity_id).await?
-        };
-
-        for event in events {
-            loaded.replay(event)?;
-        }
-
-        Ok(loaded)
+        load_aggregate(&self.repository, entity_id.into()).await
     }
 
     /// Loads the aggregate, handles the command, and commits the resulting events.
@@ -259,8 +226,10 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             return Ok((loaded, Vec::new()));
         }
 
+        // The engine stamps the commit ID once per commit; every event of this commit carries it.
+        let stamped = stamp_commit_id(metadata, &*self.commit_ids);
         let serialized =
-            serialize_events::<A>(&loaded.entity_id, loaded.sequence, &events, metadata)?;
+            serialize_events::<A>(&loaded.entity_id, loaded.sequence, &events, &stamped)?;
         let snapshot_due =
             snapshot_events_due(loaded.sequence, events.len(), self.snapshot_interval) > 0;
         let projected_events = (!self.projectors.is_empty()).then(|| events.clone());
@@ -306,7 +275,11 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         if let Some(sequence) = snapshot_sequence {
             loaded.snapshot_sequence = sequence;
         }
-        if let Some(command_id) = &metadata.command_id {
+        if let Some(command_id) = metadata
+            .command_id
+            .as_ref()
+            .filter(|id| !id.as_str().is_empty())
+        {
             loaded.seen_command_ids.insert(command_id.clone());
         }
 
@@ -325,14 +298,73 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     }
 }
 
+/// Loads any aggregate type from a repository, retrying when a sequence gap shows a compaction
+/// raced the read. [`Store::load`] and [`Transaction::read`](crate::Transaction::read) share it.
+pub(crate) async fn load_aggregate<A: Aggregate, R: Repository>(
+    repository: &R,
+    entity_id: EntityId,
+) -> Result<Loaded<A>, Error> {
+    let mut attempt = 1;
+
+    // A sequence gap means another writer snapshotted and compacted the stream between the
+    // snapshot read and the event read. Loading again starts from the newer snapshot.
+    loop {
+        match load_once(repository, entity_id.clone()).await {
+            Err(err) if err.is_conflict() && attempt < LOAD_ATTEMPTS => attempt += 1,
+            result => return result,
+        }
+    }
+}
+
+async fn load_once<A: Aggregate, R: Repository>(
+    repository: &R,
+    entity_id: EntityId,
+) -> Result<Loaded<A>, Error> {
+    let snapshot = repository.snapshot(&entity_id).await?;
+    let has_snapshot = snapshot.is_some();
+
+    let mut loaded = match snapshot {
+        Some(snapshot) => {
+            let aggregate =
+                serde_json::from_slice(&snapshot.payload).map_err(|source| Error::Snapshot {
+                    entity_id: entity_id.clone(),
+                    source,
+                })?;
+
+            Loaded {
+                entity_id,
+                aggregate,
+                sequence: snapshot.event_sequence,
+                snapshot_sequence: snapshot.sequence,
+                seen_command_ids: HashSet::new(),
+            }
+        }
+        None => Loaded::new(entity_id),
+    };
+
+    let events = if has_snapshot {
+        repository
+            .events_after(&loaded.entity_id, loaded.sequence)
+            .await?
+    } else {
+        repository.events(&loaded.entity_id).await?
+    };
+
+    for event in events {
+        loaded.replay(event)?;
+    }
+
+    Ok(loaded)
+}
+
 /// An aggregate loaded from the event log, with the stream position it was loaded at.
 #[derive(Debug)]
 pub struct Loaded<A> {
-    entity_id: EntityId,
-    aggregate: A,
-    sequence: EventSequence,
-    snapshot_sequence: EventSequence,
-    seen_command_ids: HashSet<CommandId>,
+    pub(crate) entity_id: EntityId,
+    pub(crate) aggregate: A,
+    pub(crate) sequence: EventSequence,
+    pub(crate) snapshot_sequence: EventSequence,
+    pub(crate) seen_command_ids: HashSet<CommandId>,
 }
 
 impl<A: Aggregate> Loaded<A> {
@@ -349,13 +381,10 @@ impl<A: Aggregate> Loaded<A> {
     /// Upcasts, decodes, and applies one stored event.
     fn replay(&mut self, stored: SerializedEvent) -> Result<(), Error> {
         if stored.sequence != self.sequence.next() {
-            return Err(Error::Conflict {
+            return Err(Error::SequenceGap {
                 entity_id: self.entity_id.clone(),
-                message: format!(
-                    "the stream skips from sequence {} to {}: it was compacted during the load, \
-                     or events expired",
-                    self.sequence, stored.sequence
-                ),
+                after: self.sequence,
+                found: stored.sequence,
             });
         }
 
@@ -376,7 +405,11 @@ impl<A: Aggregate> Loaded<A> {
                 })?;
 
         self.sequence = stored.sequence;
-        if let Some(command_id) = stored.metadata.command_id {
+        if let Some(command_id) = stored
+            .metadata
+            .command_id
+            .filter(|id| !id.as_str().is_empty())
+        {
             self.seen_command_ids.insert(command_id);
         }
 
@@ -412,7 +445,8 @@ impl<A: Aggregate> Loaded<A> {
 
     /// Reports whether a command ID was recorded by an event replayed since the latest snapshot.
     pub fn has_seen(&self, command_id: &CommandId) -> bool {
-        self.seen_command_ids.contains(command_id)
+        // An empty command ID is absent, never a duplicate, as when stamping the commit ID.
+        !command_id.as_str().is_empty() && self.seen_command_ids.contains(command_id)
     }
 }
 
@@ -458,6 +492,31 @@ pub fn serialize_events<A: Aggregate>(
         .collect()
 }
 
+/// Stamps the engine's commit identity: the command ID when present and non-empty, a
+/// caller-supplied commit ID otherwise, else a generated ULID-format ID. An empty command ID is
+/// absent, as in Go's `CommitMetadata`, so both languages derive the same commit ID.
+pub(crate) fn stamp_commit_id(
+    metadata: &Metadata,
+    generate: &(dyn Fn() -> String + Send + Sync),
+) -> Metadata {
+    let mut metadata = metadata.clone();
+    if let Some(command_id) = metadata
+        .command_id
+        .as_ref()
+        .filter(|command_id| !command_id.as_str().is_empty())
+    {
+        metadata.commit_id = command_id.to_string();
+
+        return metadata;
+    }
+
+    if metadata.commit_id.is_empty() {
+        metadata.commit_id = generate();
+    }
+
+    metadata
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +531,59 @@ mod tests {
             serialize_events::<Ledger>(&id, EventSequence(i64::MAX), &events, &Metadata::default());
 
         assert!(matches!(result, Err(Error::InvalidCommit(_))), "{result:?}");
+    }
+
+    #[test]
+    fn an_empty_command_id_is_absent_when_stamping_the_commit_id() {
+        let generated = || "GENERATED".to_owned();
+
+        let empty = Metadata::default().with_command_id("");
+        assert_eq!(stamp_commit_id(&empty, &generated).commit_id, "GENERATED");
+
+        let mut pinned = Metadata::default().with_command_id("");
+        pinned.commit_id = "caller-commit".to_owned();
+        assert_eq!(
+            stamp_commit_id(&pinned, &generated).commit_id,
+            "caller-commit"
+        );
+
+        // A non-empty command ID still wins over a caller-supplied commit ID.
+        let mut derived = Metadata::default().with_command_id("cmd-1");
+        derived.commit_id = "caller-commit".to_owned();
+        assert_eq!(stamp_commit_id(&derived, &generated).commit_id, "cmd-1");
+    }
+
+    #[tokio::test]
+    async fn an_empty_command_id_is_never_a_duplicate() {
+        let store = crate::Store::<Ledger, _>::new(crate::MemRepository::new(), ());
+        let empty = Metadata::default().with_command_id("");
+
+        // The same empty command ID twice: absent both times, so neither is a duplicate.
+        store
+            .execute("ledger-1", crate::conformance::Add(1), empty.clone())
+            .await
+            .unwrap();
+        store
+            .execute("ledger-1", crate::conformance::Add(1), empty.clone())
+            .await
+            .unwrap();
+
+        let loaded = store.load("ledger-1").await.unwrap();
+        assert_eq!(loaded.aggregate().entries, 2);
+        assert!(!loaded.has_seen(&CommandId::new("")));
+
+        // A real command ID is still deduplicated.
+        let real = Metadata::default().with_command_id("cmd-1");
+        store
+            .execute("ledger-1", crate::conformance::Add(1), real.clone())
+            .await
+            .unwrap();
+        let duplicate = store
+            .execute("ledger-1", crate::conformance::Add(1), real)
+            .await;
+        assert!(matches!(
+            duplicate.unwrap_err().as_store_error(),
+            Some(Error::DuplicateCommand(_))
+        ));
     }
 }

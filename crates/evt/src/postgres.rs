@@ -18,7 +18,7 @@ use crate::features::{
     self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
 };
 use crate::ids::{EntityId, EntityType, EventSequence};
-use crate::repository::{Commit, Repository};
+use crate::repository::{Commit, Repository, TransactionCommit};
 use crate::wire::postgres::{
     DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, FEATURES_LOCK_EXCLUSIVE,
     FEATURES_LOCK_SHARED, SnapshotRow, check_table_names, features_lock_key, features_table,
@@ -42,6 +42,14 @@ impl PgStatement {
             sql: sql.into(),
             params,
         }
+    }
+
+    /// The statement's size in the shared commit budget: one action, sized by its SQL text. The
+    /// bound parameters are opaque, so the estimate is a lower bound; the action count, which
+    /// the budget checks exactly, is what makes `CommitTooLarge` fire at the same point as on
+    /// DynamoDB.
+    fn budget_size(&self) -> usize {
+        self.sql.len()
     }
 }
 
@@ -342,6 +350,41 @@ impl PostgresRepository {
             .collect())
     }
 
+    /// Checks, under the stream's advisory lock, the conditions the DynamoDB snapshot put
+    /// expresses: the stored snapshot is this one's predecessor, and a first snapshot has
+    /// sequence 1.
+    async fn check_snapshot_predecessor(
+        &self,
+        client: &impl GenericClient,
+        entity_id: &EntityId,
+        sequence: i64,
+    ) -> Result<(), Error> {
+        let sql = format!(
+            "SELECT sequence FROM {} WHERE entity_id = $1",
+            self.snapshots_table
+        );
+        let stored: Option<i64> = client
+            .query_opt(&sql, &[&entity_id.as_str()])
+            .await
+            .map_err(statement_error)?
+            .map(|row| row.get(0));
+
+        match stored {
+            None if sequence != 1 => Err(Error::Conflict {
+                entity_id: entity_id.clone(),
+                message: format!("snapshot sequence {sequence} has no stored predecessor"),
+            }),
+            None => Ok(()),
+            Some(stored) if stored != sequence - 1 => Err(Error::Conflict {
+                entity_id: entity_id.clone(),
+                message: format!(
+                    "snapshot sequence moved: stored {stored}, commit writes {sequence}"
+                ),
+            }),
+            Some(_) => Ok(()),
+        }
+    }
+
     async fn upsert_snapshot(
         &self,
         client: &impl GenericClient,
@@ -376,6 +419,46 @@ impl PostgresRepository {
     }
 }
 
+impl PostgresRepository {
+    /// Asserts, under the stream's advisory lock, that a commit whose first sequence is above 1
+    /// continues from the stored head. The head is the larger of the stream's highest event and
+    /// its snapshot's event sequence, because compaction can delete every covered event. A first
+    /// sequence at or below the head is left to the primary key and the floor check, which report
+    /// it as an ordinary conflict.
+    async fn check_continuation(
+        &self,
+        tx: &deadpool_postgres::Transaction<'_>,
+        entity_id: &EntityId,
+        first: EventSequence,
+    ) -> Result<(), Error> {
+        if first <= EventSequence(1) {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "SELECT GREATEST(
+                 COALESCE((SELECT MAX(sequence) FROM {} WHERE entity_id = $1), 0),
+                 COALESCE((SELECT MAX(event_sequence) FROM {} WHERE entity_id = $1), 0))",
+            self.events_table, self.snapshots_table
+        );
+        let row = tx
+            .query_one(&sql, &[&entity_id.as_str()])
+            .await
+            .map_err(statement_error)?;
+        let head: i64 = row.get(0);
+
+        if first.0 > head + 1 {
+            return Err(Error::SequenceGap {
+                entity_id: entity_id.clone(),
+                after: EventSequence(head),
+                found: first,
+            });
+        }
+
+        Ok(())
+    }
+}
+
 impl Repository for PostgresRepository {
     type Operation = PgStatement;
 
@@ -386,6 +469,12 @@ impl Repository for PostgresRepository {
         let Some(last_sequence) = commit.events.last().map(|event| event.sequence) else {
             return Ok(());
         };
+
+        // The budget is backend-neutral, so an oversized commit is refused before any write,
+        // identically to the other backends. Each projector statement counts as one action.
+        let mut sizes = commit.sizes(|_| None)?;
+        sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
+        crate::repository::check_budget(sizes)?;
 
         let rows = commit
             .events
@@ -408,6 +497,12 @@ impl Repository for PostgresRepository {
             .map_err(statement_error)?;
         let manifest = self.read_manifest_in(&tx).await?;
         self.check_manifest(manifest.as_ref())?;
+
+        // Under the stream's advisory lock the commit must continue exactly from the stored head.
+        if let Some(first) = commit.events.first() {
+            self.check_continuation(&tx, &commit.entity_id, first.sequence)
+                .await?;
+        }
 
         let insert = format!(
             "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
@@ -470,6 +565,8 @@ impl Repository for PostgresRepository {
         }
 
         if let Some(snapshot) = commit.snapshot {
+            self.check_snapshot_predecessor(&tx, &commit.entity_id, snapshot.sequence.0)
+                .await?;
             let row = SnapshotRow {
                 entity_id: commit.entity_id.to_string(),
                 entity_type: snapshot.entity_type.to_string(),
@@ -478,6 +575,182 @@ impl Repository for PostgresRepository {
                 payload: snapshot.payload,
             };
             self.upsert_snapshot(&tx, &row).await?;
+        }
+
+        tx.commit().await.map_err(commit_error)
+    }
+
+    async fn commit_transaction(
+        &self,
+        commit: TransactionCommit<PgStatement>,
+    ) -> Result<(), Error> {
+        let mut commit = commit;
+        commit.normalize()?;
+
+        if commit.is_empty() {
+            return Ok(());
+        }
+
+        // Budget parity: an oversized commit fails identically on every backend, before any write.
+        // Each projector statement counts as one action.
+        let mut sizes = commit.sizes(|_| None)?;
+        sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
+        crate::repository::check_budget(sizes)?;
+
+        let mut client = self.pool.get().await.map_err(pool_error)?;
+        let tx = client.transaction().await.map_err(Error::backend)?;
+
+        // Every touched stream — written and fenced — takes its advisory lock in canonical
+        // (sorted) order, so concurrent multi-stream commits cannot deadlock.
+        let mut ids: Vec<&str> = commit
+            .streams
+            .iter()
+            .map(|stream| stream.entity_id.as_str())
+            .chain(commit.fences.iter().map(|fence| fence.entity_id.as_str()))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in &ids {
+            tx.execute(ENTITY_LOCK, &[id])
+                .await
+                .map_err(statement_error)?;
+        }
+
+        // The feature-marker check is the first action of every v0.9 commit (spec Writes step 1).
+        // The shared advisory lock is held to COMMIT, so a declaration cannot slip between the
+        // version check and the commit.
+        let lock_key = features_lock_key(&self.events_table);
+        tx.execute(FEATURES_LOCK_SHARED, &[&lock_key])
+            .await
+            .map_err(statement_error)?;
+        let manifest = self.read_manifest_in(&tx).await?;
+        self.check_manifest(manifest.as_ref())?;
+
+        // Fences are refused for entity types durably declared with retention: TTL deletes reopen
+        // fenced slots without leaving a successor snapshot. The refusal consults the manifest in
+        // this transaction, not this instance's configuration.
+        commit.check_retention(manifest.as_ref(), |_| false)?;
+
+        // Under the streams' advisory locks every written stream must continue exactly from its
+        // stored head; a gap is refused before anything is inserted.
+        for stream in &commit.streams {
+            if let Some(first) = stream.events.first() {
+                self.check_continuation(&tx, &stream.entity_id, first.sequence)
+                    .await?;
+            }
+        }
+
+        let insert = format!(
+            "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)",
+            self.events_table
+        );
+
+        for stream in &commit.streams {
+            let rows = stream
+                .events
+                .iter()
+                .map(EventRow::from_event)
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for row in &rows {
+                tx.execute(
+                    &insert,
+                    &[
+                        &row.entity_id,
+                        &row.sequence,
+                        &row.event_id,
+                        &row.event_type,
+                        &row.version,
+                        &row.entity_type,
+                        &row.payload,
+                        &row.metadata,
+                    ],
+                )
+                .await
+                .map_err(|err| classify(&stream.entity_id, err))?;
+            }
+
+            // Per-stream floor check, as after the inserts: race-free under the stream's lock.
+            let first = rows.first().map_or(0, |row| row.sequence);
+            let floor = format!(
+                "SELECT event_sequence FROM {} WHERE entity_id = $1 AND event_sequence >= $2",
+                self.snapshots_table
+            );
+            if let Some(row) = tx
+                .query_opt(&floor, &[&stream.entity_id.as_str(), &first])
+                .await
+                .map_err(statement_error)?
+            {
+                return Err(Error::Conflict {
+                    entity_id: stream.entity_id.clone(),
+                    message: format!(
+                        "event sequence {first} is at or below the snapshot floor {}",
+                        row.get::<_, i64>(0)
+                    ),
+                });
+            }
+        }
+
+        // Projector statements run after the events, so a writer that lost a race fails on the
+        // event key (a conflict) rather than on a view row (a projector error).
+        for statement in &commit.operations {
+            let params: Vec<&(dyn ToSql + Sync)> = statement
+                .params
+                .iter()
+                .map(|param| param.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            tx.execute(&statement.sql, &params)
+                .await
+                .map_err(projector_error)?;
+        }
+
+        // Commit snapshots are written in the same transaction as their events, under the same
+        // conditions the DynamoDB snapshot put expresses.
+        for stream in &commit.streams {
+            if let Some(snapshot) = &stream.snapshot {
+                self.check_snapshot_predecessor(&tx, &stream.entity_id, snapshot.sequence.0)
+                    .await?;
+
+                let last_sequence = stream
+                    .events
+                    .last()
+                    .expect("normalized stream has events")
+                    .sequence;
+                let row = SnapshotRow {
+                    entity_id: stream.entity_id.to_string(),
+                    entity_type: snapshot.entity_type.to_string(),
+                    sequence: snapshot.sequence.0,
+                    event_sequence: last_sequence.0,
+                    payload: snapshot.payload.clone(),
+                };
+                self.upsert_snapshot(&tx, &row).await?;
+            }
+        }
+
+        // Fenced read-only streams: assert that no stored event and no snapshot covers past the
+        // fenced head — the SQL form of the slot check plus the snapshot companion (ADR 0004, C2).
+        // The locks above hold the streams steady through the assertions.
+        for fence in &commit.fences {
+            let sql = format!(
+                "SELECT COALESCE((SELECT MAX(sequence) FROM {} WHERE entity_id = $1), 0),
+                        COALESCE((SELECT MAX(event_sequence) FROM {} WHERE entity_id = $1), 0)",
+                self.events_table, self.snapshots_table
+            );
+            let row = tx
+                .query_one(&sql, &[&fence.entity_id.as_str()])
+                .await
+                .map_err(statement_error)?;
+            let event_head: i64 = row.get(0);
+            let snapshot_head: i64 = row.get(1);
+
+            if event_head > fence.head.0 || snapshot_head > fence.head.0 {
+                return Err(Error::FenceConflict {
+                    entity_id: fence.entity_id.clone(),
+                    head: fence.head,
+                    provenance: fence.provenance,
+                });
+            }
         }
 
         tx.commit().await.map_err(commit_error)

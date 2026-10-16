@@ -55,20 +55,24 @@ type Scenario struct {
 
 // Step is one operation against the scenario's stream.
 type Step struct {
-	By          string            `json:"by"`
-	Op          string            `json:"op"`
-	CommandID   string            `json:"commandId,omitempty"`
-	PrincipalID string            `json:"principalId,omitempty"`
-	CausationID string            `json:"causationId,omitempty"`
-	Extensions  map[string]string `json:"extensions,omitempty"`
-	Command     *Command          `json:"command,omitempty"`
-	Event       *RawEvent         `json:"event,omitempty"`
-	Through     int64             `json:"through,omitempty"`
-	Sequence    int64             `json:"sequence,omitempty"`
-	Trace       map[string]string `json:"trace,omitempty"`
-	Address     string            `json:"address,omitempty"`
-	Timestamp   string            `json:"timestamp,omitempty"`
-	Expect      Outcome           `json:"expect"`
+	By          string              `json:"by"`
+	Op          string              `json:"op"`
+	CommandID   string              `json:"commandId,omitempty"`
+	CommitID    string              `json:"commitId,omitempty"`
+	PrincipalID string              `json:"principalId,omitempty"`
+	CausationID string              `json:"causationId,omitempty"`
+	Extensions  map[string]string   `json:"extensions,omitempty"`
+	Command     *Command            `json:"command,omitempty"`
+	Event       *RawEvent           `json:"event,omitempty"`
+	Through     int64               `json:"through,omitempty"`
+	Sequence    int64               `json:"sequence,omitempty"`
+	Trace       map[string]string   `json:"trace,omitempty"`
+	Address     string              `json:"address,omitempty"`
+	Timestamp   string              `json:"timestamp,omitempty"`
+	Expect      Outcome             `json:"expect"`
+	Streams     []TransactionStream `json:"streams,omitempty"`
+	Fences      []TransactionFence  `json:"fences,omitempty"`
+	Suffix      string              `json:"suffix,omitempty"`
 }
 
 // RawEvent is an event appended directly to the log, bypassing the aggregate (legacy versions).
@@ -135,6 +139,15 @@ func StepMetadata(step Step) evt.Metadata {
 		id := evt.CommandID(step.CausationID)
 		metadata.CausationID = &id
 	}
+	// The engine derives the commit ID from the command ID, preserves a caller-stamped one,
+	// or generates an unpredictable ULID. Scenarios pin an explicit commit ID for steps
+	// without a command so the golden fixtures stay byte-for-byte reproducible.
+	switch {
+	case step.CommandID != "":
+		metadata.CommitID = "compat-" + step.By + "-" + step.CommandID
+	case step.CommitID != "":
+		metadata.CommitID = step.CommitID
+	}
 	metadata.Extensions = step.Extensions
 
 	if step.Trace != nil {
@@ -165,6 +178,8 @@ type Runner struct {
 // Execute runs one step and classifies its outcome. Unexpected errors are returned as errors.
 func (r Runner) Execute(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
 	switch step.Op {
+	case "transaction":
+		return r.transaction(ctx, entityID, step)
 	case "execute":
 		return r.execute(ctx, entityID, step)
 	case "appendRaw":
@@ -219,6 +234,7 @@ func (r Runner) appendRaw(ctx context.Context, entityID evt.EntityID, step Step)
 		return Outcome{}, errors.New("appendRaw step has no event")
 	}
 
+	entityID = transactionID(entityID, step.Suffix)
 	current, err := r.sequence(ctx, entityID)
 	if err != nil {
 		return Outcome{}, err
@@ -267,6 +283,8 @@ func (r Runner) compact(ctx context.Context, entityID evt.EntityID, step Step) (
 	if !ok {
 		return Outcome{}, errors.New("repository does not support compaction")
 	}
+
+	entityID = transactionID(entityID, step.Suffix)
 
 	deleted, err := compactor.CompactBelow(ctx, entityID, evt.EventSequence(step.Through))
 	if errors.Is(err, evt.ErrCompactionUncovered) {

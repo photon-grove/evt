@@ -2,7 +2,6 @@ package snapshots
 
 import (
 	"encoding/json"
-	"fmt"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/policy"
@@ -41,10 +40,11 @@ func applyEventsToEntity(serializedEvents []evt.SerializedEvent, eventContext *e
 			current = *eventContext.CurrentSequence
 		}
 		if serializedEvent.Sequence != current+1 {
-			return &policy.ClassifiedError{Class: policy.ClassTransient, Err: evt.NewConflictError(fmt.Sprintf(
-				"stream %s skips from sequence %d to %d: it was compacted during the load, or events expired",
-				eventContext.EntityID, current, serializedEvent.Sequence,
-			))}
+			return &policy.ClassifiedError{Class: policy.ClassTransient, Err: &evt.SequenceGapError{
+				EntityID: eventContext.EntityID,
+				After:    current,
+				Found:    serializedEvent.Sequence,
+			}}
 		}
 
 		event, err := evt.DeserializeEvent(serializedEvent, eventContext.Entity)

@@ -26,6 +26,11 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
   one transaction lock (PostgreSQL). DynamoDB has no whole-operation lease: a declaration racing
   multi-batch compaction can leave a partially compacted stream, whose history-dependent rebuild
   reports `CompactionUncovered`. Declare history dependence before writing data of that type.
+- `Store::transaction` loads several aggregates, appends decided events to any of them, and
+  commits once: all streams land or none does. Reads that were not written are fenced at the head
+  they saw, and every event of the commit carries one `commitId` (the command ID when present,
+  else a generated ULID). The shared 100-item / 3.8 MB / 380 KB budget fails an oversized commit
+  with `CommitTooLarge` before any write, identically across backends and languages.
 
 ## Example
 

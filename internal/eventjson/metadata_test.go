@@ -12,9 +12,9 @@ import (
 )
 
 func Test_Metadata_V09FieldsEncode(t *testing.T) {
-	// The storage format's metadata example (docs/spec/storage-format.md#metadata), minus the
-	// engine-written commitId: causationId is unset and defaults to the commandId, extensions is
-	// set, principalId is the caller's identity.
+	// The storage format's metadata example (docs/spec/storage-format.md#metadata): causationId is
+	// unset and defaults to the commandId, extensions is set, principalId is the caller's
+	// identity, and the engine-assigned commitId defaults to the commandId.
 	metadata := evt.NewMetadata(context.Background(), ptr("us-west-2"),
 		evt.WithCommandID("cmd-0001"),
 		evt.WithOrigin(evt.Origin{Source: "billing-api", Endpoint: "POST /accounts"}),
@@ -28,6 +28,9 @@ func Test_Metadata_V09FieldsEncode(t *testing.T) {
 		"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
 		"tracestate":  "vendor=value",
 	}
+	// The engine stamps the commit ID before encoding; with a command ID present it is the
+	// command ID itself.
+	metadata = evt.CommitMetadata(metadata)
 
 	data, err := MarshalMetadata(metadata)
 	require.NoError(t, err)
@@ -41,7 +44,8 @@ func Test_Metadata_V09FieldsEncode(t *testing.T) {
 		"timestamp": "2026-10-12T00:00:00Z",
 		"principalId": "user:42",
 		"causationId": "cmd-0001",
-		"extensions": {"requestSource": "cli"}
+		"extensions": {"requestSource": "cli"},
+		"commitId": "cmd-0001"
 	}`, string(data))
 }
 
@@ -95,6 +99,17 @@ func Test_Metadata_ExtensionsAlwaysWritten(t *testing.T) {
 			require.Contains(t, string(data), tc.expected)
 		})
 	}
+}
+
+func Test_Metadata_CommitIDAlwaysWritten(t *testing.T) {
+	data, err := MarshalMetadata(evt.Metadata{})
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"commitId":""`)
+
+	// A pre-v0.9 row without the key decodes with an empty commit ID.
+	var decoded evt.Metadata
+	require.NoError(t, UnmarshalMetadata([]byte(`{"region":"us-west-2"}`), &decoded))
+	require.Empty(t, decoded.CommitID)
 }
 
 func Test_Metadata_EqualRoundTrip(t *testing.T) {

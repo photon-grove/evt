@@ -501,6 +501,65 @@ async fn maintenance_writes_are_fenced_by_the_durable_manifest() {
         );
     }
 
+    // A retention declaration that races a fenced commit's marker revalidation must still refuse
+    // the fence: the commit re-checks retention against the revalidated manifest on every
+    // iteration instead of only before the first attempt.
+    seed(&repository, "fence-target", 1).await;
+    {
+        let gate = TransactionGate::new("\"Put\"");
+        let writer = Arc::new(gate.repository(&repository).await);
+        let task = tokio::spawn({
+            let writer = Arc::clone(&writer);
+            async move {
+                let event = SerializedEvent {
+                    id: "fence-writer:1".into(),
+                    entity_id: "fence-writer".into(),
+                    entity_type: "account".into(),
+                    sequence: EventSequence(1),
+                    event_type: "account:opened".into(),
+                    version: photon_evt::EventVersion(1),
+                    payload: b"{}".to_vec(),
+                    ..Default::default()
+                };
+                let mut commit = photon_evt::TransactionCommit::new(vec![photon_evt::Commit::new(
+                    "fence-writer",
+                    vec![event],
+                )]);
+                commit.fences = vec![photon_evt::ReadFence::new(
+                    "fence-target",
+                    "account",
+                    EventSequence(1),
+                    photon_evt::FenceProvenance::Engine,
+                )];
+                writer.commit_transaction(commit).await
+            }
+        });
+        gate.wait();
+        repository
+            .update_manifest(|manifest| {
+                manifest.retention.insert("account".into());
+            })
+            .await
+            .unwrap();
+        gate.release.send(()).unwrap();
+        assert!(
+            matches!(task.await.unwrap(), Err(Error::RetentionConflict { .. })),
+            "the revalidated manifest refuses the fence"
+        );
+        assert!(
+            repository
+                .events(&"fence-writer".into())
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is written"
+        );
+    }
+    repository
+        .update_manifest(|manifest| manifest.retention.clear())
+        .await
+        .unwrap();
+
     client
         .delete_table()
         .table_name(&table)

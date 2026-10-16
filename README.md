@@ -156,16 +156,65 @@ replaces the contracts that require them:
   (the built-in `policy.Classify` only recognizes `ClassifiedError`, so a custom classifier
   is the only supported way to mark raw backend errors transient)
 
-Two v0.9.0 changes are source-breaking without a deprecation window:
+Three v0.9.0 changes are source-breaking without a deprecation window:
 
 - `evt.Metadata` is no longer comparable with `==` — the new `Extensions` map (C6) makes the
   struct non-comparable. Use `evt.Metadata.Equal` instead; it treats nil and empty maps as equal.
+- `evt.SerializedResult` gained `Snapshots` and `Fences` (C1/C2), growing from two exported fields
+  to four, so an unkeyed struct literal such as `evt.SerializedResult{events, transaction}` no
+  longer compiles. Use keyed fields; the zero value of the new ones keeps the single-stream shape:
+
+  ```go
+  result := evt.SerializedResult{
+      Events:      events,
+      Transaction: transaction,
+  }
+  ```
+
 - `evt.Repository` now requires `GetRecentEvents(ctx context.Context, entityID evt.EntityID,
   limit int) ([]evt.SerializedEvent, error)` (C8). Add it to custom backends and mocks. Return
   a typed `*evt.InvalidArgumentError` for `limit < 1` before any I/O (match it with
   `errors.Is(err, evt.ErrInvalidArgument)`); return at most `limit` events newest-first by
   sequence, regardless of insertion order, excluding snapshot rows. Bound the storage query
   itself — do not call `GetEvents` and slice a full replay.
+
+Multi-stream transactions and read fences (C1/C2) land in v0.9.0 without a new interface method:
+`Repository.Commit` already accepts a `SerializedResult`, so a commit may append to several
+streams and snapshots at once and the engine pins their order bytewise by stream ID. A
+`SerializedResult.Fences` entry pins a read-only stream to the head it was observed at — the
+commit fails with `*evt.FenceConflictError` when another writer (or a compaction) moves it —
+and fences for entity types with retention are refused (the union of the repository's own
+`WithRetention` configuration and the feature marker's durable retention set; declare retained
+types in the marker so every process refuses them). Every commit, single
+or multi-stream, is checked against the shared 100-item / 3.8 MB / 380 KB budget and fails with
+`*evt.CommitTooLargeError` before any write, on every backend. The budget counts the actions a
+commit actually emits, so a single-stream commit leaves room for 98 events and projector
+operations when it creates its stream and 97 when it appends to one (the append adds a
+continuation check on the stream's head); both drop by one when the rebuild-lock check (C10)
+starts being emitted. A commit whose first sequence skips past the stream's stored head is refused
+with `*evt.SequenceGapError`. The exact contract is specified
+in the [storage format](docs/spec/storage-format.md#writes).
+
+A custom `Repository` written before v0.9 compiles unchanged but now receives
+`SerializedResult.Snapshots` and `.Fences`. An implementation that cannot honor them atomically
+**must return an error** rather than ignore them: ignoring a fence commits a decision made on a
+stale read with no isolation guarantee, and ignoring a snapshot loses one the engine believes is
+durable. See the contract on `evt.Repository.Commit`; `evt.NormalizeCommit` and
+`evt.PreflightCommit` give a backend the shared validation and budget checks.
+
+Atomic multi-stream support is also an explicit capability. A repository declares it by
+implementing `evt.TransactionalRepository` (a marker method, `AtomicTransactions()`), and does so
+only once its `Commit` honors the full contract above. `snapshots.Store.Transaction` fails closed:
+`Read` and `Commit` refuse a repository without the capability with
+`*evt.TransactionsUnsupportedError` (`errors.Is(err, evt.ErrTransactionsUnsupported)`) before
+anything is loaded or written. The in-memory, DynamoDB, and PostgreSQL repositories declare it.
+The Go PostgreSQL repository does not yet execute projector transaction groups (E2.6), so it
+declares the capability for event, snapshot, and fence commits but refuses a commit that carries
+any projector operation with `*evt.ProjectorOperationsUnsupportedError` before writing, instead of
+dropping the view writes. Use DynamoDB projectors, or no projectors, with Go PostgreSQL until then.
+To use transactions on a custom backend, make `Commit` atomic over every stream, snapshot, and
+fence, then add the marker method. Wrapping a repository in a decorator type hides the capability
+unless the wrapper declares it too.
 
 For example, a SQL backend with a separate events table can implement the method below.
 Here `queryEvents` is the backend's existing query-and-decode helper; it executes the supplied

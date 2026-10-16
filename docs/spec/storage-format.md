@@ -151,11 +151,6 @@ always written:
   default is the command ID when the store records outcomes (outcomes require a command ID),
   otherwise a generated ULID, unique per commit.
 
-> **Interim (until C7 lands):** neither implementation writes `commitId` yet — commit grouping
-> ([Views](#views)) ships with C7. Events written before C7 carry no `commitId` key, decode with
-> an empty one, and replay as single-event commits per the rule below. The examples above show
-> the target v0.9 format.
-
 A metadata object without the four keys (an event written before v0.9) decodes with `principalId`
 and `causationId` `null`, `extensions` empty, and `commitId` empty; such events replay as
 single-event commits ([Views](#views)).
@@ -204,33 +199,71 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
 
 1. The feature-marker check (`SYSTEM#FEATURES`), present in every v0.9 commit
    ([Feature Marker](#feature-marker)).
-2. The rebuild-lock check (`SYSTEM#REBUILD`), present in every v0.9 commit
-   ([Rebuild Fence](#rebuild-fence)).
+2. The rebuild-lock check (`SYSTEM#REBUILD`), when the store carries one
+   ([Rebuild Fence](#rebuild-fence)). The position is pinned, but an implementation that does not
+   yet implement the rebuild fence (C10) emits no action here, every later action moves up by
+   one, and the commit budget below does not count it. The budget counts exactly the actions
+   emitted.
 3. Projector operations, in projector declaration order; within one projector, in emission order.
-4. One put per event. Streams are grouped by entity ID in ascending byte order, and each stream's
-   events are in ascending sequence.
-5. Per written stream, in the same order: either the snapshot put or the floor check on the
-   stream's snapshot item.
-6. The fence checks for each read-only fenced stream in the read set, in ascending entity-ID
-   order: the slot check, then the snapshot companion ([Read Fences](#read-fences)). A stream that
-   is both fenced and written contributes no fence checks.
-7. The outcome row put, when the store records command outcomes
+   A commit that carries projector operations must also write at least one event: views are
+   projections of committed events, so operations with no backing event are refused with a typed
+   error (`ProjectorOnlyCommit` in Go, `ProjectorWithoutEvents` in Rust) before any write, on
+   every backend.
+4. The written streams, in ascending entity-ID byte order. Each stream is one contiguous group,
+   in this order:
+   1. the **continuation check** (`ConditionCheck` on `(pk, sk = first - 1)` with
+      `attribute_exists(sk)`), present when the stream's first new sequence is above 1 and the
+      snapshot does not end exactly at the head (see [Continuity](#continuity) for the pinned-snapshot case);
+   2. one put per event, in ascending sequence;
+   3. then either the stream's snapshot put or, when the commit writes no snapshot for it, the
+      floor check on the stream's snapshot item (the group's last action).
+
+   The layout is **interleaved by stream**, not two phases: stream A's snapshot put or floor
+   check comes before stream B's first event put. Streams are never split across groups.
+
+5. The fence checks for each read-only fenced stream in the read set, in ascending entity-ID
+   byte order: the slot check, then the snapshot companion ([Read Fences](#read-fences)). A
+   stream that is both fenced and written contributes no fence checks. The fence checks come
+   after every written stream's group.
+6. The outcome row put, when the store records command outcomes
    ([Command Outcomes](#command-outcomes)).
 
-Steps 6 and 7 apply only when the corresponding capability is enabled for the store. The
-feature-marker and rebuild-lock checks (steps 1 and 2) are not optional: every commit in a v0.9
-store carries both, and a store that never declares features still validates the marker against
-`attribute_not_exists(pk)`. A store built without the v0.9 capabilities writes exactly the actions
-the older paragraphs describe. The order is pinned so fixtures byte-match across implementations.
+Steps 5 and 6 apply only when the corresponding capability is enabled for the store. The
+feature-marker check (step 1) is not optional: every commit in a v0.9 store carries it, and a
+store that never declares features still validates the marker against `attribute_not_exists(pk)`.
+The rebuild-lock check (step 2) is part of the target layout once C10 lands. A
+store built without the v0.9 capabilities writes exactly the actions the older paragraphs
+describe. The order is pinned so fixtures byte-match across implementations: the shared
+compatibility scenarios record the action order of every multi-stream and fenced transaction,
+and both languages assert it ([Compat Scenarios to Add](#compat-scenarios-to-add)).
+
+For example, a commit that appends to streams `b` and `a` (declared in that order, `a` carrying
+a snapshot) and fences the read-only streams `z` and `m` sends, with no outcome and no rebuild
+check:
+
+```text
+1.  ConditionCheck (SYSTEM#FEATURES, sk = 0)
+2.  ConditionCheck (a, sk = n - 1)      a's continuation check (a's first new sequence is n > 1)
+3.  Put            (a, sk = n)          event puts for a, ascending sequence
+4.  Put            (a, sk = 0)          a's snapshot put (carries the floor condition)
+5.  Put            (b, sk = 1)          event puts for b (b is new: no continuation check)
+6.  ConditionCheck (b, sk = 0)          b's floor check (b writes no snapshot)
+7.  ConditionCheck (m, sk = head + 1)   m's slot check
+8.  ConditionCheck (m, sk = 0)          m's snapshot companion
+9.  ConditionCheck (z, sk = head + 1)   z's slot check
+10. ConditionCheck (z, sk = 0)          z's snapshot companion
+```
 
 **Pre-v0.9 capacity:** the floor check counts toward the 100 actions and is billed as a write,
 so a commit without a snapshot costs one more write unit than its events and projector puts,
 and holds at most 99 of them. `CommitStream` adds one check per entity in each batch. This is
-not the v0.9 capacity: the current Go C9 implementation reserves a marker check as well,
-leaving 98 event/projector operations for a single-stream commit, with or without a snapshot
-(the snapshot put replaces the floor check). The full v0.9 target below adds the C10 rebuild
-check and leaves 97 for a basic single-stream commit with no read fences or outcome. C10 is
-not implemented by the Go C9 change.
+not the v0.9 capacity: every v0.9 commit also carries the feature-marker check, and a commit that
+appends to an existing stream (first sequence above 1) carries a continuation check. A
+single-stream commit therefore holds at most **98** event/projector operations when it creates
+its stream and **97** when it appends to one, with or without a snapshot (the snapshot put
+replaces the floor check). The budget counts only the actions a commit actually emits. The
+rebuild-lock check (C10) is not emitted yet, so it is not budgeted; the change that starts
+emitting it adds it to the budget, and the two numbers then drop to 97 and 96.
 
 **Multi-stream commits (v0.9, C1).** A commit may append to any number of streams. Each written
 stream keeps its existing protections — `attribute_not_exists(sk)` on every event put and the
@@ -241,10 +274,11 @@ The item budget is the same for the single-aggregate shortcut and a multi-stream
 
 ```text
 items = Σ over written streams (events_s + 1)     event puts + snapshot put or floor check
+      + written streams with first sequence > 1   continuation check
       + fenced read-only streams × 2              slot check + snapshot companion
       + 1                                         outcome put, when outcomes are enabled
       + 1                                         feature-marker check, always in v0.9 stores
-      + 1                                         rebuild-lock check, always in v0.9 stores
+      + 1                                         rebuild-lock check, once C10 emits it (not yet)
       + projector puts and deletes
 ```
 
@@ -264,8 +298,19 @@ items' sizes. The preflight compares the estimates against 95% of the backend li
 **3,800,000 bytes** in aggregate and **380,000 bytes** for any single item, a 5% safety margin
 for key-encoding and rounding differences. It covers every item the transaction carries: the
 event puts, the snapshot and floor items, the projector operations, the fenced checks, the
-outcome row, and the two control checks. A commit over either byte budget fails with the same
+outcome row, and the control checks the commit emits (the feature-marker check today). A commit over either byte budget fails with the same
 typed `CommitTooLarge` error before any write, and is never split.
+
+The preflight counts projector operations **on every backend that writes them**. DynamoDB sizes
+each projector item exactly: a put counts its item, and an update, delete, or condition check
+counts its key attributes plus its expression strings, attribute-name placeholders (both the
+placeholder and the name), and attribute values. A PostgreSQL repository that executes projector statements counts
+each statement as one action sized by its SQL text; the bound parameters are opaque, so the byte
+estimate is a lower bound while the action count is exact. Rust's PostgreSQL repository does this
+today. Go's PostgreSQL repository executes no projector operations until commit-wide projector
+support lands (E2.6): a commit carrying any projector operation is refused before any write with
+`ProjectorOperationsUnsupported`, never silently dropped, so there is nothing to count. When that
+support lands it must count its statements the same way.
 
 | Write                                  | Condition                                             |
 | -------------------------------------- | ----------------------------------------------------- |
@@ -322,10 +367,46 @@ Both implementations reject a commit whose sequences are not contiguous for each
 more than the last), or start below 1, before writing anything. Sequence 0 is the DynamoDB snapshot
 slot. Rust also rejects an event whose ID is not `{entityId}:{sequence}`, because DynamoDB does not
 store the ID and rebuilds it from the key on read. The floor check reads the first event and the snapshot
-records the last, so both depend on that order, and loads reject a stream with a gap. Repositories
-do not check that a commit's first sequence follows the stored head: DynamoDB cannot express it in
-one transaction once compaction has deleted the previous event. Stores always continue from the head
-they loaded.
+records the last, so both depend on that order, and loads reject a stream with a gap. Every backend
+also enforces that a written stream **continues from its stored head** (next section).
+
+#### Continuity
+
+A commit's first sequence for a stream must be the stream's stored head plus one, so no sequence is
+ever skipped. The head is the stream's highest event or, once compaction has deleted every event a
+snapshot covers, the snapshot's `eventSeq`. A first sequence above head plus one, including any
+first sequence above 1 on a stream with no events, is refused before any write with a typed
+sequence-gap error (`SequenceGapError` in Go, `Error::SequenceGap` in Rust), which is a conflict
+(reload and retry). A first sequence at or below the head is not a gap; the event put and floor
+check report it as an ordinary conflict.
+
+- **DynamoDB.** For each written stream whose first sequence is above 1 the repository reads the
+  stream's snapshot, strongly consistent, and pins the head through the item compaction cannot
+  delete. **Compaction can delete the head event itself** (`CompactBelow(through)` deletes
+  `[1, through]`, and `through` may equal the snapshot's `eventSeq`), so an existence check on a head
+  the snapshot covers would fail a valid append that raced a compaction.
+  - If the snapshot's `eventSeq` equals `first - 1`, the snapshot is the pin: no continuation check
+    is emitted, and the stream's floor check (or snapshot put) uses `eventSeq = :prev`
+    (`seq = :seq AND eventSeq = :prev` for a later snapshot put) in place of the floor condition.
+    Compaction never changes the snapshot, so the pin survives it.
+  - If the snapshot is absent or ends below `first - 1`, the head event lies above the snapshot,
+    where compaction cannot delete it. The repository reads the event at `first - 1`; if it exists
+    the group carries the continuation check (`attribute_exists(sk)` on `(pk, first - 1)`), which
+    together with the event put's `attribute_not_exists(sk)` makes the append atomic. If it is missing
+    the commit is a gap.
+  - If the snapshot's `eventSeq` is above `first - 1`, the stream has moved past the writer and the
+    commit is a conflict (the floor check would refuse it).
+
+  A failed continuation check or pinned condition is a conflict for that stream: the head moved
+  between the read and the write.
+
+- **PostgreSQL.** Under the per-entity advisory locks the commit asserts that the larger of the
+  stream's highest event sequence and its snapshot's `event_sequence` is at least `first - 1`.
+- **In-memory.** The same assertion, directly.
+
+The continuation check is budgeted for every written stream whose first sequence is above 1, also on
+the pinned-snapshot path that emits no such action, so `CommitTooLarge` fires identically on every
+backend.
 
 A transaction cancelled with a `ConditionalCheckFailed` reason on an event put, the floor check, or
 the snapshot put is an optimistic-concurrency conflict: another writer committed the same sequence,
@@ -511,11 +592,14 @@ the same commit**, both checks are omitted: the event put at `head + 1` and that
 or snapshot condition supersede them.
 
 **Retention conflicts with fences (v0.9, C2, C9).** Fences are refused outright for entity types
-in the feature manifest's durable `retention` set ([Feature Marker](#feature-marker)), with a
-typed `RetentionConflict` error returned before any write — in both languages, regardless of
-backend. The set is **durable**, not the calling instance's configuration: an instance that
-configured no retention still refuses fences for a type another instance declared, so the
-refusal does not depend on every writer being configured alike. Retention deletes event items by
+that have retention, with a typed `RetentionConflict` error returned before any write — in both
+languages, regardless of backend. The refusal is the **union** of two sources: the feature
+manifest's durable `retention` set ([Feature Marker](#feature-marker)), and the repository's own
+retention configuration (`WithRetention` in Go, `with_retention` in Rust), which needs no I/O. The
+durable set binds writers configured differently: an instance that configured no retention still
+refuses fences for a type another instance declared. The local configuration protects a writer
+whose retained types were never declared; it cannot protect any other process, so declare every
+retained type in the marker as well. Retention deletes event items by
 TTL — possibly the item at `head + 1`, possibly an event and its TTL-bearing snapshot together —
 without a newer snapshot ever covering them, and the deletion reopens the fenced slot: both
 checks can pass while the stream has in fact moved. The snapshot companion closes the compaction
@@ -526,6 +610,15 @@ input; a caller that needs a fenced read uses a stream without retention.
 A `ConditionalCheckFailed` on either check is an optimistic-concurrency conflict — another writer
 moved the stream — classified and retried like an event-put conflict. Whether the engine may
 re-prepare the command depends on fence provenance; see [Fence-Aware Retry](#fence-aware-retry).
+
+The conflict error carries the fenced stream ID, the head the transaction fenced it at, and the
+fence's provenance (engine-filled or caller-stamped). It does **not** carry the transaction item
+index: backends classify a failure internally by the cancellation reason's position (or the
+failing statement), which is neither stable nor comparable across backends. In Go an
+engine-filled fence conflict is classified transient (`policy.Classify` reports
+`ClassTransient`), so `policy.ExecuteWithRetry` retries it exactly like an event-put conflict; a
+caller-stamped one is not classified retryable. In Rust the same split is
+`Error::is_retryable`.
 
 Worked example. A transaction loads `claim#ada` at head 3 and fences it. The two items are:
 
@@ -1340,11 +1433,14 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_rebuild_generation (
 - Commits and out-of-band snapshot writes first take a per-entity transaction lock,
   `SELECT pg_advisory_xact_lock(1702261760, hashtext($1))` with the entity ID. Both languages run
   this exact statement, so a snapshot write cannot raise the floor while a commit below it is in
-  flight. Both languages deduplicate the computed key pairs and acquire the locks in ascending
-  order of the pair `(1702261760, hashtext($entity))` — ascending `hashtext` value, ties broken
-  by ascending entity ID bytes — so concurrent multi-stream commits cannot deadlock against each
-  other: the acquisition order is a total order over the keys themselves, not over the IDs that
-  hash to them.
+  flight. A multi-stream commit locks every stream in its read set, written and fenced, once
+  each, in **ascending entity-ID byte order** (the bytewise order that also pins the transaction
+  layout, never a locale collation). Byte order is a total order over the IDs, so two commits
+  that lock overlapping sets always acquire the shared streams in the same sequence and cannot
+  wait on each other in a cycle. The one cycle the order cannot exclude runs through two
+  distinct IDs whose `hashtext` values collide, which share one advisory lock; PostgreSQL's
+  deadlock detector aborts one of the transactions (`40P01`), which Rust retries as
+  `Error::Transient` and Go returns as the database error.
 - After the inserts, the commit checks the floor in the same transaction: a snapshot row with
   `event_sequence >= ` the commit's first sequence is a conflict.
 - The snapshot upsert only replaces a snapshot whose `event_sequence` is lower or equal
@@ -1392,8 +1488,7 @@ the configured events table name, so two logs never block each other's engine ro
 name.)
 
 - A multi-stream commit takes the per-entity lock for **every stream in its read set** — written
-  and fenced — in the order pinned above (ascending advisory key pair, ties by entity ID bytes,
-  duplicate key pairs deduplicated since one lock covers every ID that hashes to it), then runs
+  and fenced — in the order pinned above (ascending entity-ID bytes, each ID once), then runs
   the fence assertions below, then the inserts. A concurrent writer blocks on the lock instead of
   slipping `head + 1` past a fenced read.
 - **Fence assertions** (v0.9, C2) run inside the commit transaction after the locks:
@@ -1560,6 +1655,9 @@ never rewritten. A failed upcast or decode fails the load.
 - On DynamoDB, the snapshot read and the key query are strongly consistent even when the repository
   is configured for eventually consistent reads, so compaction cannot miss recent events.
 - A compacted stream must be loaded or rebuilt from its snapshot, never by replaying from sequence 1.
+- Compaction may delete the stream's head event (when `through` equals the snapshot's
+  `eventSequence`). The snapshot's `eventSequence` is then the stream's head, and commits continue
+  from it ([Continuity](#continuity)).
 - A commit whose first event is at or below the snapshot's `eventSequence` is a conflict in both
   backends (see the floor checks above), so a writer that loaded before compaction cannot recreate
   compacted events.
@@ -1612,8 +1710,8 @@ land.
 | `outcomes-rejection`   | C3, C4 | A domain rejection is persisted once in final state; the retried command replays it verbatim, cross-language.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `outcomes-ambiguous`   | C3     | After an indeterminate commit error — injected with `injectCommitFault` so the commit really applied — the re-read by command ID returns the stored outcome (same digest), `IdempotencyKeyReuse` (different digest), or absence (safe retry).                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `commit-too-large`     | C1     | A commit whose item budget exceeds 100, or whose estimated request exceeds the byte budgets (3,800,000 bytes in aggregate, 380,000 bytes for any single item), fails with `CommitTooLarge` before any write, in both languages and on both backends; nothing is stored and the commit is never split.                                                                                                                                                                                                                                                                                                                                                                                          |
-| `multi-stream-commit`  | C1     | One commit appends to two streams atomically; the other language interleaves and must see both streams or neither. Per-stream floor checks apply.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `read-fences`          | C2     | A fenced read fails when the other language appends past the head; the compaction ABA (append, snapshot, compact past the head) still fails the fence; the snapshot companion is present on every fenced read, including one whose aggregate has snapshots disabled; a fenced-and-written stream emits no fence checks; a fence on a stream whose type is in the manifest's durable `retention` set is refused with `RetentionConflict` — including by a writer that configured no retention itself.                                                                                                                                                                                           |
+| `multi-stream-commit`  | C1     | One commit appends to two streams atomically; the other language interleaves and must see both streams or neither. Per-stream floor checks apply. Every touched stream is observed, and the fixture pins the transaction's `TransactWriteItems` action order, which the Rust builder asserts.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `read-fences`          | C2     | A fenced read fails when the other language appends past the head; the compaction ABA (append, snapshot, compact past the head) still fails the fence; the snapshot companion is present on every fenced read, including one whose aggregate has snapshots disabled; a fenced-and-written stream emits no fence checks; the fixture pins every fenced transaction's action order (fence checks after the written streams' groups); a fence on a stream whose type is in the manifest's durable `retention` set is refused with `RetentionConflict` — including by a writer that configured no retention itself.                                                                                |
 | `fence-aware-retry`    | C2, C5 | Classification is per failing item: an event-put or floor failure in a commit that also carries caller-stamped fences still re-prepares and succeeds; a failed caller-stamped fence produces the persisted `stale-fence` rejection, whose only remedy is a new command ID — the old ID replays the rejection.                                                                                                                                                                                                                                                                                                                                                                                  |
 | `metadata-extensions`  | C6     | `principalId`, `causationId`, and `extensions` round-trip in both directions, including the defaults: `causationId` written as the command ID when unset, `extensions` written as `{}`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `commit-grouping`      | C6, C7 | A multi-stream commit's events carry one `commitId` across all its streams. A rebuild of a **history-dependent** projector replays every commit grouped by `commitId`, each group's events in the pinned (stream ID, sequence) order, and pre-v0.9 events without `commitId` replay as single-event commits; a rebuild of a **current-state** projector never replays — it loads every aggregate's final state and derives the complete row set through the state entry point, producing the same rows over a compacted prefix as over a full log. `CompactBelow` refuses an entity type in the durable `historyDependent` set — including from a process that never registered the projector. |

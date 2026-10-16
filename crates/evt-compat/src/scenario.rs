@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Commit, EntityId, EntityType, Error, EventId, EventSequence, EventType, EventVersion,
-    ExecuteError, Metadata, Repository, SerializedEvent, Store, json,
+    ExecuteError, FenceProvenance, Metadata, NewSnapshot, ReadFence, Repository, SerializedEvent,
+    Store, TransactionCommit, json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,32 @@ impl Scenario {
     pub fn entity_id(&self, run: &str) -> EntityId {
         EntityId::new(format!("compat-{run}-{}", self.name))
     }
+
+    /// Every non-empty stream suffix the scenario writes, fences, appends to, or compacts, in
+    /// ascending order: each is a stream beside the primary one that the fixtures and both
+    /// languages' verification observe.
+    pub fn sibling_suffixes(&self) -> Vec<String> {
+        let mut suffixes = std::collections::BTreeSet::new();
+
+        for step in &self.steps {
+            suffixes.extend(step.suffix.clone());
+            suffixes.extend(step.streams.iter().map(|stream| stream.suffix.clone()));
+            suffixes.extend(step.fences.iter().map(|fence| fence.suffix.clone()));
+        }
+        suffixes.remove("");
+
+        suffixes.into_iter().collect()
+    }
+
+    /// The stream IDs of [`Scenario::sibling_suffixes`] within a run.
+    pub fn sibling_ids(&self, run: &str) -> Vec<EntityId> {
+        let entity_id = self.entity_id(run);
+
+        self.sibling_suffixes()
+            .iter()
+            .map(|suffix| transaction_id(&entity_id, suffix))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -97,6 +124,16 @@ pub struct Step {
     #[serde(default)]
     pub timestamp: Option<String>,
     pub expect: Outcome,
+    #[serde(default)]
+    pub streams: Vec<TransactionStream>,
+    #[serde(default)]
+    pub fences: Vec<TransactionFence>,
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// An explicit commit ID for steps without a command, pinning what the engine would
+    /// otherwise generate unpredictably so fixtures stay byte-for-byte reproducible.
+    #[serde(default)]
+    pub commit_id: Option<String>,
 }
 
 impl Step {
@@ -118,6 +155,15 @@ impl Step {
             .clone()
             .filter(|id| !id.is_empty())
             .map(Into::into);
+        // Mirror Go's StepMetadata: the commit ID follows the command ID, or an explicit one
+        // pinned for steps without a command (a raw commit writes it as-is; the store derives it
+        // from the command ID either way).
+        metadata.commit_id = match &self.command_id {
+            Some(command_id) if !command_id.is_empty() => {
+                format!("compat-{}-{command_id}", self.by)
+            }
+            _ => self.commit_id.clone().unwrap_or_default(),
+        };
         metadata.principal_id = self
             .principal_id
             .clone()
@@ -134,6 +180,34 @@ impl Step {
 
         metadata
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionStream {
+    #[serde(default)]
+    pub suffix: String,
+    pub sequence: i64,
+    pub events: Vec<RawEvent>,
+    #[serde(default)]
+    pub snapshot: Option<TransactionSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionSnapshot {
+    pub sequence: i64,
+    pub payload: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionFence {
+    #[serde(default)]
+    pub suffix: String,
+    pub head: i64,
+    #[serde(default)]
+    pub caller_stamped: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -201,10 +275,44 @@ pub struct Expectation {
     pub state: String,
     pub events: Vec<String>,
     pub snapshot: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty")]
     pub dynamo_items: Vec<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty")]
     pub sns_messages: Vec<String>,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub siblings: Vec<SiblingExpectation>,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub transactions: Vec<TransactionExpectation>,
+}
+
+/// The ordered `TransactWriteItems` actions one transaction step sent, as the Go implementation
+/// recorded them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TransactionExpectation {
+    pub step: usize,
+    pub actions: Vec<serde_json::Value>,
+}
+
+/// The stored state of one of a scenario's sibling streams (transactional siblings, fenced
+/// streams).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiblingExpectation {
+    pub entity_id: String,
+    pub events: Vec<String>,
+    pub snapshot: Option<String>,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub dynamo_items: Vec<serde_json::Value>,
+}
+
+/// Decodes a Go-emitted sequence the way Go means it: a missing key or an explicit `null` (a nil
+/// slice) is empty, so fixtures round-trip without Go having to distinguish nil from empty.
+fn null_to_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Unexpected failures while running a step.
@@ -242,8 +350,9 @@ impl<R: Repository> Runner<R> {
             "execute" => self.execute_command(entity_id, step).await,
             "appendRaw" => {
                 let raw = step.event.as_ref().ok_or(StepError::Missing("event"))?;
-                let sequence = self.store.load(entity_id).await?.sequence().next();
-                self.commit_raw(entity_id, sequence, raw, step).await
+                let id = transaction_id(entity_id, step.suffix.as_deref().unwrap_or(""));
+                let sequence = self.store.load(&id).await?.sequence().next();
+                self.commit_raw(&id, sequence, raw, step).await
             }
             "conflictProbe" => {
                 let probe = RawEvent {
@@ -254,21 +363,119 @@ impl<R: Repository> Runner<R> {
                 self.commit_raw(entity_id, EventSequence(step.sequence), &probe, step)
                     .await
             }
-            "compact" => match self
-                .store
-                .repository()
-                .compact_below(entity_id, EventSequence(step.through))
-                .await
-            {
-                Ok(deleted) => Ok(Outcome {
-                    deleted,
-                    ..Outcome::of("compacted")
-                }),
-                Err(Error::CompactionUncovered { .. }) => Ok(Outcome::of("uncovered")),
-                Err(err) => Err(err.into()),
-            },
+            "transaction" => self.transaction(entity_id, step).await,
+            "compact" => {
+                let id = transaction_id(entity_id, step.suffix.as_deref().unwrap_or(""));
+                match self
+                    .store
+                    .repository()
+                    .compact_below(&id, EventSequence(step.through))
+                    .await
+                {
+                    Ok(deleted) => Ok(Outcome {
+                        deleted,
+                        ..Outcome::of("compacted")
+                    }),
+                    Err(Error::CompactionUncovered { .. }) => Ok(Outcome::of("uncovered")),
+                    Err(err) => Err(err.into()),
+                }
+            }
             other => Err(StepError::UnknownOp(other.to_owned())),
         }
+    }
+
+    /// Runs one transaction step: appends to several streams and fences read-only streams in
+    /// one atomic commit.
+    async fn transaction(&self, entity_id: &EntityId, step: &Step) -> Result<Outcome, StepError> {
+        let metadata = step.metadata();
+
+        let mut streams = Vec::new();
+        for stream in &step.streams {
+            let id = transaction_id(entity_id, &stream.suffix);
+            let mut events = Vec::new();
+            for (index, raw) in stream.events.iter().enumerate() {
+                let sequence = EventSequence(stream.sequence + index as i64);
+                let event = raw_event(&id, sequence, raw, &metadata);
+                events.push(event);
+            }
+            let mut commit = Commit::new(id, events);
+            if let Some(snapshot) = &stream.snapshot {
+                commit = commit.with_snapshot(NewSnapshot::new(
+                    "account",
+                    EventSequence(snapshot.sequence),
+                    snapshot.payload.as_bytes(),
+                ));
+            }
+            streams.push(commit);
+        }
+
+        let mut commit = TransactionCommit::new(streams);
+        commit.fences = step
+            .fences
+            .iter()
+            .map(|fence| ReadFence {
+                entity_id: transaction_id(entity_id, &fence.suffix),
+                entity_type: EntityType::new("account"),
+                head: EventSequence(fence.head),
+                provenance: if fence.caller_stamped {
+                    FenceProvenance::Caller
+                } else {
+                    FenceProvenance::Engine
+                },
+            })
+            .collect();
+
+        if let Err(error) = commit.normalize() {
+            return Err(error.into());
+        }
+
+        // Every stream the transaction touches: a failed transaction must leave all of them
+        // unchanged, not just one watched sibling.
+        let touched: Vec<EntityId> = step
+            .streams
+            .iter()
+            .map(|stream| transaction_id(entity_id, &stream.suffix))
+            .chain(
+                step.fences
+                    .iter()
+                    .map(|fence| transaction_id(entity_id, &fence.suffix)),
+            )
+            .collect();
+
+        let before = self.observe_stored(&touched).await?;
+        match self.store.repository().commit_transaction(commit).await {
+            Ok(()) => Ok(Outcome {
+                events: step.streams.iter().map(|stream| stream.events.len()).sum(),
+                ..Outcome::of("ok")
+            }),
+            Err(error) => {
+                let after = self.observe_stored(&touched).await?;
+                if before != after {
+                    return Err(StepError::Unexpected(format!(
+                        "failed transaction left partial events: {error}"
+                    )));
+                }
+                if error.is_conflict() {
+                    return Ok(Outcome::of("conflict"));
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Reads the stored events and snapshot of each stream, so a failed transaction can be
+    /// checked to have left every touched stream unchanged.
+    async fn observe_stored(&self, entity_ids: &[EntityId]) -> Result<String, StepError> {
+        let repository = self.store.repository();
+        let mut states = Vec::new();
+
+        for entity_id in entity_ids {
+            let events = repository.events(entity_id).await?;
+            let snapshot = repository.snapshot(entity_id).await?;
+            states.push((events, snapshot));
+        }
+
+        serde_json::to_string(&states).map_err(|error| StepError::Unexpected(error.to_string()))
     }
 
     async fn execute_command(
@@ -332,7 +539,23 @@ impl<R: Repository> Runner<R> {
         let repository = self.store.repository();
         let events = repository.events(entity_id).await?;
         let snapshot = repository.snapshot(entity_id).await?;
-        let loaded = self.store.load(entity_id).await?;
+
+        // A stream with a sequence gap — a failed transaction burned a sequence, or compaction
+        // landed mid-load — has no coherent aggregate view. Mirroring Go's Observe, its stored
+        // rows are still compared while the loaded state is recorded as absent.
+        let loaded = match self.store.load(entity_id).await {
+            Ok(loaded) => Some(loaded),
+            Err(Error::SequenceGap { .. }) => None,
+            Err(err) => return Err(err),
+        };
+        let (state, sequence, snapshot_sequence) = match &loaded {
+            Some(loaded) => (
+                json::to_string(loaded.aggregate())?,
+                loaded.sequence().0,
+                loaded.snapshot_sequence().0,
+            ),
+            None => (String::new(), 0, 0),
+        };
 
         let mut dynamo_items = Vec::new();
         if let Some(snapshot) = &snapshot {
@@ -352,14 +575,82 @@ impl<R: Repository> Runner<R> {
         Ok(Expectation {
             name: name.to_owned(),
             entity_id: entity_id.to_string(),
-            sequence: loaded.sequence().0,
-            snapshot_sequence: loaded.snapshot_sequence().0,
-            state: json::to_string(loaded.aggregate())?,
+            sequence,
+            snapshot_sequence,
+            state,
             events: encoded_events,
             snapshot: snapshot.map(|s| s.to_json()).transpose()?.map(utf8),
             dynamo_items,
             sns_messages,
+            siblings: Vec::new(),
+            transactions: Vec::new(),
         })
+    }
+
+    /// Reads the stored events, snapshot, and DynamoDB items of each sibling stream, in the order
+    /// given. A stream a scenario fences but never writes reads back as empty.
+    pub async fn observe_siblings(
+        &self,
+        entity_ids: &[EntityId],
+    ) -> Result<Vec<SiblingExpectation>, Error> {
+        let repository = self.store.repository();
+        let mut siblings = Vec::with_capacity(entity_ids.len());
+
+        for entity_id in entity_ids {
+            let events = repository.events(entity_id).await?;
+            let snapshot = repository.snapshot(entity_id).await?;
+
+            let mut dynamo_items = Vec::new();
+            if let Some(snapshot) = &snapshot {
+                dynamo_items.push(serde_json::to_value(dynamo::snapshot_item(
+                    snapshot, None,
+                )?)?);
+            }
+            for event in &events {
+                dynamo_items.push(serde_json::to_value(dynamo::event_item(event, None)?)?);
+            }
+
+            siblings.push(SiblingExpectation {
+                entity_id: entity_id.to_string(),
+                events: events
+                    .iter()
+                    .map(|event| event.to_json().map(utf8))
+                    .collect::<Result<Vec<_>, _>>()?,
+                snapshot: snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.to_json().map(utf8))
+                    .transpose()?,
+                dynamo_items,
+            });
+        }
+
+        Ok(siblings)
+    }
+}
+
+fn transaction_id(base: &EntityId, suffix: &str) -> EntityId {
+    if suffix.is_empty() {
+        base.clone()
+    } else {
+        EntityId::new(format!("{base}-{suffix}"))
+    }
+}
+
+fn raw_event(
+    entity_id: &EntityId,
+    sequence: EventSequence,
+    raw: &RawEvent,
+    metadata: &Metadata,
+) -> SerializedEvent {
+    SerializedEvent {
+        id: EventId::for_event(entity_id, sequence),
+        sequence,
+        event_type: EventType::new(&raw.event_type),
+        version: EventVersion(raw.version),
+        entity_id: entity_id.clone(),
+        entity_type: EntityType::new("account"),
+        payload: raw.payload.as_bytes().to_vec(),
+        metadata: metadata.clone(),
     }
 }
 

@@ -43,26 +43,28 @@ Event rows are **append-only and protected by conditional writes** — a commit 
 succeeds if the next sequence is unclaimed, which is how concurrent writers on one
 entity stay correctly ordered. Each commit also checks the `sk = 0` snapshot row: a
 commit that starts at or below the snapshot's `eventSequence` is rejected, so a writer
-that loaded before a compaction cannot recreate the deleted events. The current Go C9
-implementation also includes a mandatory feature-marker check. Of the 100 transaction
-items, a single-stream commit without a snapshot reserves two (floor + marker), leaving
-**98 event/projector operations**. A commit with a snapshot also leaves **98**: the
-snapshot put replaces the floor check, and the marker check remains. These checks are
-billed as writes.
+that loaded before a compaction cannot recreate the deleted events. Every v0.9 commit also carries a
+feature-marker check, and a commit that appends to an existing stream also pins the stream's head
+with a continuation check, so no sequence is ever skipped ([Continuity](spec/storage-format.md#continuity)).
+Of the 100 transaction items, a single-stream commit that creates its stream reserves two (floor +
+marker), leaving **98 event/projector operations**, and one that appends to an existing stream
+reserves three (continuation + floor + marker), leaving **97**. A commit with a snapshot leaves
+the same numbers: the snapshot put replaces the floor check. These checks are billed as writes. The
+commit budget counts only the actions a commit actually emits.
 
 The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C2/C3/C10) is:
 
 ```text
-items = Σ(events per written stream + 1 snapshot/floor)
+items = Σ(events per written stream + 1 snapshot/floor + 1 continuation if first sequence > 1)
       + 2 × read-only fenced streams
       + optional outcome put
-      + feature-marker check + rebuild-lock check
+      + feature-marker check
+      + rebuild-lock check (once C10 emits it)
       + projector operations
 ```
 
-A basic single-stream commit with no read fences or outcome then leaves **97**
-event/projector operations. The rebuild-lock check (C10) is a target, **not implemented
-by this Go C9 change**; do not count it as a current transaction item.
+The rebuild-lock check (C10) is **not implemented yet** and is not budgeted; when C10 starts
+emitting it, the two capacities above drop by one, to **97** and **96**.
 
 The `sk = 0` snapshot row records the entity's serialized state plus the
 `eventSequence` it covers, and snapshot writes are monotonic: a write that would move
@@ -127,6 +129,14 @@ Only policed types receive `ttl`; durable types never expire. TTL expires items
 individually, so an older prefix can disappear while newer events remain. Use
 retention only for streams never replayed and never appended after becoming
 terminal. For accumulating streams, keep a snapshot and use [compaction](#compaction).
+
+**Read fences refuse retained types.** TTL deletion reopens a fenced slot without leaving a
+successor snapshot, so a fence on a retained entity type is refused with a retention conflict.
+The refusal is the union of two sources: this repository's own `WithRetention` configuration
+(checked without any I/O) and the retention set in the durable feature marker. Local
+configuration alone protects only this process. Also declare each retained type in the marker
+(`FeatureMarker.Declare`, adding it to `Retention`) so every other writer refuses fences on it too;
+the Rust crate's `with_retention` follows the same rule.
 
 ## Entity-views table
 

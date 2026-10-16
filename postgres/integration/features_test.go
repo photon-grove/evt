@@ -153,7 +153,7 @@ func Test_FeatureMarker(t *testing.T) {
 
 		// The retry commits against the freshly cached version.
 		require.NoError(t, enforcing.Commit(ctx, evt.SerializedResult{
-			Events: serializeAs(t, id, entityType, 2, &test.EntityUpdated{ID: id, Value: "three"}),
+			Events: serializeAs(t, id, entityType, 1, &test.EntityUpdated{ID: id, Value: "three"}),
 		}))
 
 		stored, gerr := repo.GetEvents(ctx, id)

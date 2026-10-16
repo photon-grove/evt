@@ -16,8 +16,9 @@ import (
 // The Repository satisfies the backend-neutral streaming contract and the DynamoDB-specific
 // raw-expression extension.
 var (
-	_ evt.Repository     = (*Repository)(nil)
-	_ ExpressionStreamer = (*Repository)(nil)
+	_ evt.Repository              = (*Repository)(nil)
+	_ evt.TransactionalRepository = (*Repository)(nil)
+	_ ExpressionStreamer          = (*Repository)(nil)
 )
 
 // ExpressionStreamer is the DynamoDB-specific streaming capability for callers that need richer

@@ -15,6 +15,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/internal/eventjson"
+	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -96,26 +97,6 @@ func sharedRelationName(eventsTable, snapshotsTable string) string {
 	return ""
 }
 
-// lockEntities takes the entity lock for every entity in events, in sorted order so concurrent
-// multi-entity commits cannot deadlock.
-func (repo *Repository) lockEntities(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
-	ids := make([]string, 0, 1)
-	for _, event := range events {
-		if !slices.Contains(ids, string(event.EntityID)) {
-			ids = append(ids, string(event.EntityID))
-		}
-	}
-	slices.Sort(ids)
-
-	for _, id := range ids {
-		if _, err := tx.Exec(ctx, entityLockQuery, id); err != nil {
-			return classifyWriteError(fmt.Errorf("postgres: lock entity %s: %w", id, err))
-		}
-	}
-
-	return nil
-}
-
 // DB is the minimal subset of the pgx API the Repository depends on. Both *pgxpool.Pool and pgx.Tx
 // satisfy it, so callers can pass a pool (the common case) or an ambient transaction. It is the
 // abstraction point for the backend, mirroring dynamo.Client.
@@ -137,11 +118,12 @@ type Repository struct {
 // Compile-time checks that the Repository satisfies the core contract and every optional capability
 // the framework detects by type assertion.
 var (
-	_ evt.Repository         = (*Repository)(nil)
-	_ evt.Compactor          = (*Repository)(nil)
-	_ evt.SnapshotStreamer   = (*Repository)(nil)
-	_ evt.EntityHeadStreamer = (*Repository)(nil)
-	_ evt.EntityHeadVisitor  = (*Repository)(nil)
+	_ evt.Repository              = (*Repository)(nil)
+	_ evt.TransactionalRepository = (*Repository)(nil)
+	_ evt.Compactor               = (*Repository)(nil)
+	_ evt.SnapshotStreamer        = (*Repository)(nil)
+	_ evt.EntityHeadStreamer      = (*Repository)(nil)
+	_ evt.EntityHeadVisitor       = (*Repository)(nil)
 )
 
 // Option configures a Repository at construction time.
@@ -317,39 +299,208 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
 // (entity_id, sequence) pair violates the primary key and is returned as an evt.ConflictError,
 // giving the optimistic-concurrency guarantee the contract requires.
 //
-// This backend is an event log only: it does not interpret res.Transaction, since projector view
+// This backend is an event log only: it does not execute res.Transaction, since projector view
 // writes are backend-specific (the only TransactionGroup implementation today is DynamoDB's) and no
-// PostgreSQL view store exists yet. Adding one later would extend this to write the view rows in the
-// same transaction as the events, preserving atomicity.
+// PostgreSQL view store exists yet. A result carrying any projector operation is refused with
+// *evt.ProjectorOperationsUnsupportedError before any write instead of dropping the operations.
+// Adding view support later would extend this to write the view rows in the same transaction as
+// the events, preserving atomicity.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
 	if err := repo.checkFeatureMarkerTable(); err != nil {
 		return err
 	}
 
-	if err := evt.CheckReservedEntityIDs(res.Events); err != nil {
+	// Projector operations need a backing event in the same commit (ADR-0012); refuse them even
+	// when nothing else would be written.
+	if err := evt.CheckProjectorOperations(res); err != nil {
 		return err
 	}
 
-	if err := checkContiguous(res.Events); err != nil {
+	// This backend executes no projector groups until commit-wide projector support lands (E2.6).
+	// Fail closed rather than commit the events and silently drop the view writes.
+	if err := evt.CheckProjectorOperationsSupported("postgres", res); err != nil {
+		return err
+	}
+
+	if len(res.Events) == 0 && len(res.Snapshots) == 0 && len(res.Fences) == 0 {
+		return nil
+	}
+
+	normalized, err := evt.NormalizeCommit(res)
+	if err != nil {
+		return err
+	}
+
+	if err := evt.PreflightCommit(normalized); err != nil {
 		return err
 	}
 
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
-		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
+		// Every touched stream — written and fenced — takes its advisory lock in canonical
+		// (sorted) order, so concurrent multi-stream commits cannot deadlock.
+		if err := repo.lockTransactionEntities(ctx, tx, normalized); err != nil {
 			return err
 		}
 
-		if err := repo.checkFeatures(ctx, tx); err != nil {
+		manifest, err := repo.checkFeaturesManifest(ctx, tx)
+		if err != nil {
 			return err
 		}
 
-		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
+		// Fences are refused for entity types durably declared with retention: TTL deletes reopen
+		// fenced slots without leaving a successor snapshot. The refusal consults the manifest in
+		// this transaction, not this instance's configuration.
+		if err := evt.CheckFenceRetention(normalized.Fences, manifest); err != nil {
 			return err
 		}
 
-		return repo.checkFloor(ctx, tx, res.Events)
+		// Under the streams' advisory locks, every written stream must continue exactly from its
+		// stored head: a gap is refused before anything is inserted.
+		if err := repo.checkContinuations(ctx, tx, normalized.Events); err != nil {
+			return err
+		}
+
+		if err := repo.insertEvents(ctx, tx, normalized.Events); err != nil {
+			return err
+		}
+
+		if err := repo.checkFloor(ctx, tx, normalized.Events); err != nil {
+			return err
+		}
+
+		if err := repo.commitSnapshots(ctx, tx, normalized); err != nil {
+			return err
+		}
+
+		return repo.checkFences(ctx, tx, normalized.Fences)
 	})
 }
+
+// checkContinuations asserts, for each written stream whose first sequence is above 1, that the
+// stored head is the sequence just before it. The head is the larger of the stream's highest event
+// and its snapshot's event sequence, because compaction can delete every covered event. The
+// per-entity advisory lock holds the stream steady through the assertion, so no writer can move
+// the head between this check and the insert. A first sequence at or below the head is left to the
+// primary key and the floor check, which report it as an ordinary conflict.
+func (repo *Repository) checkContinuations(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
+	seen := make(map[evt.EntityID]bool)
+
+	for _, event := range events {
+		if seen[event.EntityID] {
+			continue
+		}
+		seen[event.EntityID] = true
+
+		if event.Sequence <= 1 {
+			continue
+		}
+
+		var head int64
+		err := tx.QueryRow(ctx, fmt.Sprintf(
+			`SELECT GREATEST(
+			         COALESCE((SELECT MAX(sequence) FROM %s WHERE entity_id = $1), 0),
+			         COALESCE((SELECT MAX(event_sequence) FROM %s WHERE entity_id = $1), 0))`,
+			repo.eventsTable, repo.snapshotsTable,
+		), string(event.EntityID)).Scan(&head)
+		if err != nil {
+			return fmt.Errorf("postgres: check continuation %s: %w", event.EntityID, err)
+		}
+
+		if int64(event.Sequence) > head+1 {
+			return &policy.ClassifiedError{
+				Class: policy.ClassTransient,
+				Err:   &evt.SequenceGapError{EntityID: event.EntityID, After: evt.EventSequence(head), Found: event.Sequence},
+			}
+		}
+	}
+
+	return nil
+}
+
+// lockTransactionEntities takes the advisory lock for every stream a transactional commit
+// touches: the written streams' event IDs and the fenced read-only streams.
+func (repo *Repository) lockTransactionEntities(ctx context.Context, tx pgx.Tx, result evt.SerializedResult) error {
+	ids := make([]string, 0, len(result.Events)+len(result.Fences))
+	for _, event := range result.Events {
+		if !slices.Contains(ids, string(event.EntityID)) {
+			ids = append(ids, string(event.EntityID))
+		}
+	}
+	for _, fence := range result.Fences {
+		if !slices.Contains(ids, string(fence.EntityID)) {
+			ids = append(ids, string(fence.EntityID))
+		}
+	}
+	slices.Sort(ids)
+
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx, entityLockQuery, id); err != nil {
+			return classifyWriteError(fmt.Errorf("postgres: lock entity %s: %w", id, err))
+		}
+	}
+
+	return nil
+}
+
+// commitSnapshots upserts each commit snapshot under its stream's lock, checking the same
+// conditions the DynamoDB snapshot put expresses: the stored snapshot is this one's predecessor
+// and the commit starts above its floor.
+func (repo *Repository) commitSnapshots(ctx context.Context, tx pgx.Tx, result evt.SerializedResult) error {
+	for _, snapshot := range result.Snapshots {
+		var stored struct{ sequence, eventSequence int64 }
+		err := tx.QueryRow(ctx,
+			fmt.Sprintf(`SELECT sequence, event_sequence FROM %s WHERE entity_id = $1`, repo.snapshotsTable),
+			string(snapshot.EntityID),
+		).Scan(&stored.sequence, &stored.eventSequence)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if snapshot.Sequence != 1 {
+				return transientConflict(fmt.Sprintf(
+					"postgres: snapshot sequence %d for %s has no stored predecessor",
+					snapshot.Sequence, snapshot.EntityID))
+			}
+		} else if err != nil {
+			return fmt.Errorf("postgres: read snapshot: %w", err)
+		} else if stored.sequence != int64(snapshot.Sequence)-1 {
+			return transientConflict(fmt.Sprintf(
+				"postgres: snapshot sequence moved: stored %d, commit writes %d",
+				stored.sequence, snapshot.Sequence))
+		}
+
+		if err := repo.upsertSnapshot(ctx, tx, snapshot); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// checkFences asserts, for each fenced read-only stream, that no stored event and no snapshot
+// covers past the fenced head — the SQL form of the slot check plus the snapshot companion
+// (ADR 0004, C2). The locks above hold the stream steady through the assertions. A failed
+// assertion is a typed fence conflict carrying the fence's provenance.
+func (repo *Repository) checkFences(ctx context.Context, tx pgx.Tx, fences []evt.ReadFence) error {
+	for _, fence := range fences {
+		var eventHead, snapshotHead int64
+		err := tx.QueryRow(ctx, fmt.Sprintf(
+			`SELECT COALESCE((SELECT MAX(sequence) FROM %s WHERE entity_id = $1), 0),
+			       COALESCE((SELECT MAX(event_sequence) FROM %s WHERE entity_id = $1), 0)`,
+			repo.eventsTable, repo.snapshotsTable,
+		), string(fence.EntityID)).Scan(&eventHead, &snapshotHead)
+		if err != nil {
+			return fmt.Errorf("postgres: check fence %s: %w", fence.EntityID, err)
+		}
+
+		if eventHead > int64(fence.Head) || snapshotHead > int64(fence.Head) {
+			return policy.FenceConflict(fence)
+		}
+	}
+
+	return nil
+}
+
+// AtomicTransactions declares that Commit writes every stream, snapshot, and fence of a result in
+// one database transaction (evt.TransactionalRepository).
+func (repo *Repository) AtomicTransactions() {}
 
 // CommitStream commits each SerializedResult from the channel in its own transaction, collecting
 // per-result errors without aborting the stream. The batch size is one result, which keeps each
@@ -401,6 +552,14 @@ func (repo *Repository) CommitWithSnapshot(
 		return err
 	}
 
+	if err := evt.CheckProjectorOperations(res); err != nil {
+		return err
+	}
+
+	if err := evt.CheckProjectorOperationsSupported("postgres", res); err != nil {
+		return err
+	}
+
 	if len(res.Events) == 0 {
 		return fmt.Errorf("postgres: commit with snapshot requires at least one event")
 	}
@@ -417,33 +576,17 @@ func (repo *Repository) CommitWithSnapshot(
 		return err
 	}
 
-	eventSequence := res.Events[len(res.Events)-1].Sequence
-
-	return repo.inTx(ctx, func(tx pgx.Tx) error {
-		if err := repo.lockEntities(ctx, tx, res.Events); err != nil {
-			return err
-		}
-
-		if err := repo.checkFeatures(ctx, tx); err != nil {
-			return err
-		}
-
-		if err := repo.insertEvents(ctx, tx, res.Events); err != nil {
-			return err
-		}
-
-		if err := repo.checkFloor(ctx, tx, res.Events); err != nil {
-			return err
-		}
-
-		return repo.upsertSnapshot(ctx, tx, evt.SerializedSnapshot{
-			EntityType:    entityType,
-			EntityID:      entityID,
-			Sequence:      currentSnapshot,
-			EventSequence: eventSequence,
-			Payload:       payload,
-		})
+	// Route through the multi-stream commit path: the snapshot is written in the same
+	// transaction as its events, under the same conditions.
+	res.Snapshots = append(res.Snapshots, evt.SerializedSnapshot{
+		EntityType:    entityType,
+		EntityID:      entityID,
+		Sequence:      currentSnapshot,
+		EventSequence: res.Events[len(res.Events)-1].Sequence,
+		Payload:       payload,
 	})
+
+	return repo.Commit(ctx, res)
 }
 
 // GetEvents returns every event for an entity in ascending sequence order.
@@ -551,6 +694,12 @@ func (repo *Repository) GetSnapshot(
 // the DynamoDB transaction pins.
 func (repo *Repository) checkFeatures(ctx context.Context, tx pgx.Tx) error {
 	return repo.features.checkInTx(ctx, tx)
+}
+
+// checkFeaturesManifest is checkFeatures, returning the manifest it validated against so callers
+// can consult durable declarations this instance did not configure.
+func (repo *Repository) checkFeaturesManifest(ctx context.Context, tx pgx.Tx) (*evt.FeatureManifest, error) {
+	return repo.features.checkManifestTx(ctx, tx)
 }
 
 // inTx runs fn inside a transaction, committing on success and rolling back on error or panic.

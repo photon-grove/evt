@@ -51,7 +51,7 @@
         { "by": "go", "op": "execute", "commandId": "c5", "timestamp": "2026-10-12T01:02:03Z", "command": { "type": "withdraw", "amountCents": 600 }, "expect": { "result": "ok", "events": 1 } },
         { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "tag", "tags": ["café", "naïve", "漢字"] }, "expect": { "result": "ok", "events": 1 } },
         { "by": "go", "op": "execute", "commandId": "c7", "command": { "type": "setLabels", "labels": { "z": "last", "a": "first", "m": "middle" } }, "expect": { "result": "ok", "events": 1 } },
-        { "by": "rust", "op": "execute", "command": { "type": "setLabels", "labels": { "b": "second" } }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commitId": "compat-rust-manual", "command": { "type": "setLabels", "labels": { "b": "second" } }, "expect": { "result": "ok", "events": 1 } },
         { "by": "go", "op": "execute", "commandId": "c9", "command": { "type": "close", "reason": "customer request" }, "expect": { "result": "ok", "events": 1 } },
         { "by": "rust", "op": "execute", "commandId": "c10", "command": { "type": "deposit", "amountCents": 5 }, "expect": { "result": "rejected" } }
       ]
@@ -143,6 +143,64 @@
         { "by": "rust", "op": "execute", "commandId": "c4", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
         { "by": "go", "op": "execute", "commandId": "c5", "command": { "type": "withdraw", "amountCents": 250 }, "expect": { "result": "ok", "events": 1 } },
         { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "tag", "tags": ["no-snapshots"] }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
+      "name": "multi-stream",
+      "description": "Both writers atomically append to several streams in one commit. A collision in one stream leaves every other stream and snapshot unchanged, and a transactional snapshot covers its stream's last event.",
+      "snapshotInterval": 0,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Grace Hopper" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "transaction", "commandId": "c2", "streams": [
+            { "suffix": "", "sequence": 2, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":500,\"memo\":\"primary\"}" }] },
+            { "suffix": "ledger", "sequence": 1, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":50,\"memo\":\"sibling\"}" }] }
+          ], "expect": { "result": "ok", "events": 2 } },
+        { "by": "go", "op": "transaction", "commandId": "c3", "streams": [
+            { "suffix": "ledger", "sequence": 2, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":60}" }] },
+            { "suffix": "", "sequence": 3, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":600}" }] }
+          ], "expect": { "result": "ok", "events": 2 } },
+        { "by": "rust", "op": "transaction", "commandId": "c4", "streams": [
+            { "suffix": "", "sequence": 4, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":700}" }] },
+            { "suffix": "ledger", "sequence": 1, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":70,\"memo\":\"collides\"}" }] }
+          ], "expect": { "result": "conflict" } },
+        { "by": "go", "op": "execute", "commandId": "c5", "command": { "type": "deposit", "amountCents": 800, "memo": "after-failure" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "transaction", "commandId": "c6", "streams": [
+            { "suffix": "", "sequence": 5, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":900,\"memo\":\"snapshotted\"}" }], "snapshot": { "sequence": 1, "payload": "{\"owner\":\"Grace Hopper\",\"status\":\"open\",\"balanceCents\":3050,\"deposits\":5,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":\"snapshotted\"}" } }
+          ], "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
+      "name": "read-fences",
+      "description": "Fences protect read-only streams: an engine fence at the head passes, a stale slot fails, and the compaction ABA (append, snapshot, compact) fails a stale fence through the snapshot companion.",
+      "snapshotInterval": 0,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Katherine Johnson" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "transaction", "commandId": "c2", "streams": [
+            { "suffix": "", "sequence": 2, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":100}" }] },
+            { "suffix": "watched", "sequence": 1, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":10,\"memo\":\"watched\"}" }] }
+          ], "expect": { "result": "ok", "events": 2 } },
+        { "by": "go", "op": "transaction", "commandId": "c3", "streams": [
+            { "suffix": "", "sequence": 3, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":200}" }] }
+          ], "fences": [
+            { "suffix": "watched", "head": 1, "callerStamped": true },
+            { "suffix": "absent", "head": 0 }
+          ], "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "transaction", "commandId": "c4", "streams": [
+            { "suffix": "", "sequence": 4, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":300}" }] }
+          ], "fences": [
+            { "suffix": "watched", "head": 0, "callerStamped": true }
+          ], "expect": { "result": "conflict" } },
+        { "by": "go", "op": "transaction", "commandId": "c5", "streams": [
+            { "suffix": "", "sequence": 4, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":400}" }] },
+            { "suffix": "watched", "sequence": 2, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":20,\"memo\":\"appended\"}" }], "snapshot": { "sequence": 1, "payload": "{\"owner\":\"Katherine Johnson\",\"status\":\"open\",\"balanceCents\":30,\"deposits\":2,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":\"appended\"}" } }
+          ], "expect": { "result": "ok", "events": 2 } },
+        { "by": "go", "op": "compact", "through": 2, "suffix": "watched", "expect": { "result": "compacted", "deleted": 2 } },
+        { "by": "rust", "op": "transaction", "commandId": "c6", "streams": [
+            { "suffix": "", "sequence": 5, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":500}" }] }
+          ], "fences": [
+            { "suffix": "watched", "head": 1, "callerStamped": true }
+          ], "expect": { "result": "conflict" } },
+        { "by": "rust", "op": "appendRaw", "commandId": "c7", "suffix": "watched", "event": { "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":20,\"memo\":\"after-aba\"}" }, "expect": { "result": "ok", "events": 1 } }
       ]
     }
   ]

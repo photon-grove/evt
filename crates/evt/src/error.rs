@@ -21,6 +21,22 @@ pub enum Error {
         message: String,
     },
 
+    /// A loaded stream skips a sequence: another writer snapshotted and compacted it between the
+    /// snapshot read and the event read, or events expired. Reloading resolves it, so it is a
+    /// retryable conflict.
+    #[error(
+        "conflict on entity {entity_id}: the stream skips from sequence {after} to {found}: it \
+         was compacted during the load, or events expired"
+    )]
+    SequenceGap {
+        /// The entity whose stream skips.
+        entity_id: EntityId,
+        /// The last sequence applied before the gap.
+        after: EventSequence,
+        /// The next stored sequence, which is not `after + 1`.
+        found: EventSequence,
+    },
+
     /// The command ID was already recorded by an event replayed since the latest snapshot.
     /// Treat it as an idempotent success.
     #[error("duplicate command: {0}")]
@@ -67,14 +83,68 @@ pub enum Error {
     #[error("invalid stored record: {0}")]
     InvalidRecord(String),
 
-    /// A commit would exceed the backend's transaction size limit.
-    #[error("too many operations: {count}, the backend supports at most {limit} per transaction")]
-    TooManyOperations {
-        /// Operations in the commit.
-        count: usize,
-        /// The backend limit.
-        limit: usize,
+    /// Shared DynamoDB-compatible transaction budget exceeded.
+    #[error(
+        "commit exceeds transaction budget: {actions} actions, {bytes} bytes, largest item {largest_item}"
+    )]
+    CommitTooLarge {
+        /// Number of actions.
+        actions: usize,
+        /// Total encoded item bytes.
+        bytes: usize,
+        /// Largest encoded item.
+        largest_item: usize,
     },
+
+    /// A read-only input moved: another writer advanced the fenced stream past the head the
+    /// transaction observed. Engine-filled fences are retryable; caller-stamped fences are a
+    /// stale-fence rejection the caller must handle.
+    #[error("read fence failed for {entity_id} at head {head} ({provenance:?})")]
+    FenceConflict {
+        /// Fenced stream.
+        entity_id: EntityId,
+        /// The head the transaction fenced the stream at.
+        head: EventSequence,
+        /// Origin of the fenced head.
+        provenance: crate::repository::FenceProvenance,
+    },
+
+    /// A transaction carried projector operations but wrote no event. Views are derived state, so
+    /// operations without a backing event in the same commit could never be rebuilt by replay.
+    /// Nothing was written.
+    #[error(
+        "commit carries {operations} projector operations but no events; views must be projections of committed events"
+    )]
+    ProjectorWithoutEvents {
+        /// The number of projector operations the commit carried.
+        operations: usize,
+    },
+
+    /// An append named a different projector set than the one already fixed for the stream by its
+    /// first projector-bearing append. The stream's operations are derived with one set, so the
+    /// append was refused and nothing changed.
+    #[error("stream {entity_id} already has a different projector set in this transaction")]
+    ProjectorSetConflict {
+        /// The stream whose projector set conflicts.
+        entity_id: EntityId,
+    },
+
+    /// A transaction's append failed after it had already changed a handle's aggregate, leaving
+    /// the handle ahead of the staged events. A half-applied handle can never reach a commit, so
+    /// every later append and the commit are refused. Discard the transaction and build a new one.
+    #[error("the transaction is poisoned by an earlier failed append; discard it")]
+    TransactionPoisoned,
+
+    /// TTL retention cannot protect a read fence.
+    #[error("read fences refused for retention-enabled entity type {entity_type}")]
+    RetentionConflict {
+        /// Durable retention-enabled type.
+        entity_type: EntityType,
+    },
+
+    /// A durable rebuild lock blocks writes, including when its lease expired.
+    #[error("a projection rebuild is in progress")]
+    RebuildInProgress,
 
     /// Encoding a payload, metadata, or snapshot failed.
     #[error(transparent)]
@@ -152,9 +222,13 @@ impl Error {
         Self::Backend(err.into())
     }
 
-    /// Reports whether the error is an optimistic-concurrency conflict.
+    /// Reports whether the error is an optimistic-concurrency conflict. A fence conflict is one:
+    /// another writer moved the fenced stream, like a competing sequence put.
     pub fn is_conflict(&self) -> bool {
-        matches!(self, Self::Conflict { .. })
+        matches!(
+            self,
+            Self::Conflict { .. } | Self::SequenceGap { .. } | Self::FenceConflict { .. }
+        )
     }
 
     /// Reports whether the error is a duplicate command (an idempotent success).
@@ -165,7 +239,16 @@ impl Error {
     /// Reports whether reloading and running the command again may succeed: a conflict or a
     /// transient backend failure.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Conflict { .. } | Self::Transient(_))
+        matches!(
+            self,
+            Self::Conflict { .. }
+                | Self::SequenceGap { .. }
+                | Self::Transient(_)
+                | Self::FenceConflict {
+                    provenance: crate::repository::FenceProvenance::Engine,
+                    ..
+                }
+        )
     }
 }
 

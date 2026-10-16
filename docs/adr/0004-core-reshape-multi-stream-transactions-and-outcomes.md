@@ -94,15 +94,15 @@ outcome, err := store.Execute(ctx, store.Txn().
 ```
 
 ```rust
-// Rust: the same shape through a builder.
-let outcome = store
-    .transaction()
-    .read(load::<Account>(&id).await?)   // read + write
-    .read(load::<Claim>(&handle).await?) // read-only, fenced
-    .fence(load::<Username>(&handle).await?)
-    .command(cmd)
-    .execute(metadata)
-    .await?;
+// Rust: the same shape through a builder. Each read is typed by its own aggregate, so one
+// transaction mixes aggregate types.
+let mut tx = store.transaction();
+let mut account = tx.read::<Account>(&id).await?;       // read + write
+let mut claim = tx.read::<Claim>(&claim_id).await?;       // written with the account
+tx.read::<Username>(&username_id).await?;                    // read-only: engine-filled fence
+tx.append(&mut account, account_events)?;
+tx.append(&mut claim, claim_events)?;
+let committed = tx.commit(&metadata).await?;            // one atomic commit, one commitId
 ```
 
 ### C2 — Read fences

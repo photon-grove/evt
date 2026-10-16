@@ -25,7 +25,7 @@ use crate::features::{
 };
 use crate::ids::{EntityId, EntityType, EventSequence};
 use crate::json;
-use crate::repository::{Commit, Repository};
+use crate::repository::{Commit, Repository, TransactionCommit};
 use crate::wire::dynamo::{self as wire, AttributeValue, Item};
 
 /// DynamoDB's limit on actions per transaction.
@@ -120,6 +120,13 @@ impl DynamoRepository {
     /// The event-log table name.
     pub fn table(&self) -> &str {
         &self.table
+    }
+
+    /// Reports whether this repository was configured to expire the entity type's rows.
+    fn retains(&self, entity_type: &EntityType) -> bool {
+        self.retention
+            .get(entity_type)
+            .is_some_and(|duration| !duration.is_zero())
     }
 
     fn ttl_for(&self, entity_type: &EntityType) -> Option<i64> {
@@ -244,34 +251,68 @@ impl DynamoRepository {
     }
 
     /// Builds the commit's transaction items in the pinned order: the feature-marker check, the
-    /// projector operations, the event puts, then the snapshot put or floor check.
+    /// projector operations, then the stream's group (see [`stream_group`](Self::stream_group)).
     fn transaction_items(
         &self,
         commit: &Commit<TransactWriteItem>,
         validated: ValidatedMarker,
+        pin: Option<Continuation>,
+    ) -> Result<Vec<TransactWriteItem>, Error> {
+        if commit.events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 3);
+        items.push(self.marker_check(validated)?);
+        items.extend(commit.operations.iter().cloned());
+        items.extend(self.stream_group(commit, pin)?);
+
+        Ok(items)
+    }
+
+    /// Builds one written stream's contiguous group: the continuation check on the event just
+    /// before its first (when the first sequence is above 1 and the head event exists), the event
+    /// puts, then the snapshot put or floor check.
+    ///
+    /// Compaction can delete every event a snapshot covers, including the head, so a stream whose
+    /// snapshot ends exactly at the head is pinned through the snapshot instead: the group then
+    /// carries no continuation check, and the snapshot put or floor check requires the snapshot's
+    /// `eventSeq` to still equal the sequence before the commit's first.
+    fn stream_group(
+        &self,
+        stream: &Commit<TransactWriteItem>,
+        pin: Option<Continuation>,
     ) -> Result<Vec<TransactWriteItem>, Error> {
         let (Some(first), Some(last_sequence)) = (
-            commit.events.first().map(|event| n(event.sequence.0)),
-            commit.events.last().map(|event| event.sequence),
+            stream.events.first().map(|event| n(event.sequence.0)),
+            stream.events.last().map(|event| event.sequence),
         ) else {
             return Ok(Vec::new());
         };
 
-        let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 2);
-        items.push(self.marker_check(validated)?);
-        items.extend(commit.operations.iter().cloned());
+        let mut items = Vec::with_capacity(stream.events.len() + 2);
 
-        for event in &commit.events {
+        if let Some(pin) = pin.filter(|pin| !pin.via_snapshot) {
+            items.push(continuation_check(
+                &self.table,
+                &stream.entity_id,
+                pin.previous,
+            )?);
+        }
+
+        for event in &stream.events {
             let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
             items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
         }
 
-        if let Some(snapshot) = &commit.snapshot {
+        let via_snapshot = pin.filter(|pin| pin.via_snapshot);
+
+        if let Some(snapshot) = &stream.snapshot {
             let ttl = self.ttl_for(&snapshot.entity_type);
             let item = wire::snapshot_item(
                 &SerializedSnapshot {
                     entity_type: snapshot.entity_type.clone(),
-                    entity_id: commit.entity_id.clone(),
+                    entity_id: stream.entity_id.clone(),
                     sequence: snapshot.sequence,
                     event_sequence: last_sequence,
                     payload: snapshot.payload.clone(),
@@ -282,6 +323,13 @@ impl DynamoRepository {
             let expected = snapshot.sequence.0 - 1;
             items.push(if expected == 0 {
                 put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
+            } else if let Some(pin) = via_snapshot {
+                put(
+                    &self.table,
+                    item,
+                    Some(wire::PINNED_NEXT_SNAPSHOT_CONDITION),
+                    &[(":seq", n(expected)), (":prev", n(pin.previous.0))],
+                )?
             } else {
                 put(
                     &self.table,
@@ -290,11 +338,136 @@ impl DynamoRepository {
                     &[(":seq", n(expected)), (":first", first)],
                 )?
             });
+        } else if let Some(pin) = via_snapshot {
+            items.push(pinned_floor_check(
+                &self.table,
+                &stream.entity_id,
+                pin.previous,
+            )?);
         } else {
-            items.push(floor_check(&self.table, &commit.entity_id, first)?);
+            items.push(floor_check(&self.table, &stream.entity_id, first)?);
         }
 
         Ok(items)
+    }
+
+    /// Reads, strongly consistent, how each written stream whose first sequence is above 1
+    /// continues from its stored head, and refuses a gap with [`Error::SequenceGap`] before any
+    /// write. The returned pins are applied as conditions, so a head that moves between this read
+    /// and the write fails the transaction as a conflict instead of committing a gap.
+    ///
+    /// Which item pins the head depends on the snapshot. Compaction deletes events `[1, through]`
+    /// where `through` can equal the snapshot's `eventSeq`, so a head event the snapshot covers
+    /// can vanish at any moment: a stream whose snapshot ends exactly at the head is pinned
+    /// through the snapshot, which compaction never changes. Otherwise the head event lies above
+    /// the snapshot, compaction cannot touch it, and an existence check pins it.
+    async fn observe_continuations<'c>(
+        &self,
+        streams: impl IntoIterator<Item = &'c Commit<TransactWriteItem>>,
+    ) -> Result<HashMap<EntityId, Continuation>, Error> {
+        let mut pins = HashMap::new();
+
+        for stream in streams {
+            let Some(first) = stream.events.first().map(|event| event.sequence) else {
+                continue;
+            };
+            if first <= EventSequence(1) {
+                continue;
+            }
+
+            let previous = EventSequence(first.0 - 1);
+            let snapshot = self.read_snapshot(&stream.entity_id, true).await?;
+            let snapshot_head = snapshot.as_ref().map(|snapshot| snapshot.event_sequence);
+
+            let via_snapshot = match snapshot_head {
+                Some(head) if head == previous => true,
+                Some(head) if head > previous => {
+                    // The stream moved past the writer's head; the floor check would refuse the
+                    // commit.
+                    return Err(Error::Conflict {
+                        entity_id: stream.entity_id.clone(),
+                        message: "the stream's snapshot is ahead of the commit's first sequence"
+                            .to_owned(),
+                    });
+                }
+                _ => {
+                    let head = self
+                        .client
+                        .get_item()
+                        .table_name(&self.table)
+                        .consistent_read(true)
+                        .key("pk", s(stream.entity_id.as_str()))
+                        .key("sk", n(previous.0))
+                        .projection_expression("sk")
+                        .send()
+                        .await
+                        .map_err(sdk_error)?;
+
+                    if head.item.is_none_or(|item| item.is_empty()) {
+                        let stored = self.max_sequence(&stream.entity_id).await?;
+
+                        return Err(Error::SequenceGap {
+                            entity_id: stream.entity_id.clone(),
+                            after: stored.max(snapshot_head.unwrap_or_default()),
+                            found: first,
+                        });
+                    }
+
+                    false
+                }
+            };
+
+            pins.insert(
+                stream.entity_id.clone(),
+                Continuation {
+                    previous,
+                    via_snapshot,
+                },
+            );
+        }
+
+        Ok(pins)
+    }
+
+    /// Builds a multi-stream commit's transaction items in the pinned order: the feature-marker
+    /// check, the projector operations, then per written stream in bytewise stream-ID order its
+    /// group (continuation check, event puts, snapshot put or floor check), then per fenced
+    /// read-only stream its slot check and snapshot companion. The layout records each item's index so a failed
+    /// commit is classified by the item that failed.
+    fn transaction_stream_items(
+        &self,
+        commit: &TransactionCommit<TransactWriteItem>,
+        validated: ValidatedMarker,
+        pins: &HashMap<EntityId, Continuation>,
+    ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
+        let mut items = Vec::new();
+        let mut layout = TransactionLayout::default();
+
+        items.push(self.marker_check(validated)?);
+        items.extend(commit.operations.iter().cloned());
+        layout.operations = items.len() - 1;
+
+        for stream in &commit.streams {
+            if stream.events.is_empty() {
+                continue;
+            }
+
+            let group_start = items.len();
+            items.extend(self.stream_group(stream, pins.get(&stream.entity_id).copied())?);
+
+            layout
+                .streams
+                .push((group_start..items.len(), stream.entity_id.clone()));
+        }
+
+        for fence in &commit.fences {
+            items.extend(fence_checks(&self.table, fence)?);
+            let base = items.len() - 2;
+            layout.fences.push((base, fence.clone()));
+            layout.fences.push((base + 1, fence.clone()));
+        }
+
+        Ok((items, layout))
     }
 
     /// Returns every item in an entity's partition, including the snapshot at `sk = 0`, in sort
@@ -562,16 +735,23 @@ impl Repository for DynamoRepository {
         let operations = commit.operations.len();
         let mut revalidations = 0;
 
+        // The shared budget covers every item the transaction carries, with the projector
+        // operations sized exactly from the items this backend will write. It fails with
+        // CommitTooLarge before any write, identically on every backend.
+        let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
+        for operation in &commit.operations {
+            sizes.push(sdk_item_size(operation));
+        }
+        crate::repository::check_budget(sizes)?;
+
+        // The stream must continue exactly from its stored head; a gap is refused before any
+        // write, and what was observed is pinned in the transaction.
+        let pins = self.observe_continuations([&commit]).await?;
+        let pin = pins.get(&commit.entity_id).copied();
+
         loop {
             let cached = self.ensure_manifest_validated().await?;
-            let items = self.transaction_items(&commit, cached)?;
-
-            if items.len() > MAX_TRANSACTION_ITEMS {
-                return Err(Error::TooManyOperations {
-                    count: items.len(),
-                    limit: MAX_TRANSACTION_ITEMS,
-                });
-            }
+            let items = self.transaction_items(&commit, cached, pin)?;
 
             match self
                 .client
@@ -598,6 +778,126 @@ impl Repository for DynamoRepository {
                     return Err(classify_transaction_error(
                         &commit.entity_id,
                         operations,
+                        err,
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn commit_transaction(
+        &self,
+        commit: TransactionCommit<TransactWriteItem>,
+    ) -> Result<(), Error> {
+        let mut commit = commit;
+        commit.normalize()?;
+
+        if commit.is_empty() {
+            return Ok(());
+        }
+
+        // Fences are refused for entity types this repository was configured to expire: it needs
+        // no I/O, so it runs first. The durable manifest's retention set is checked in the loop,
+        // and the refusal is the union of the two.
+        commit.check_retention(None, |entity_type| self.retains(entity_type))?;
+
+        // Each written stream must continue exactly from its stored head; a gap is refused before
+        // any write, and what was observed is pinned in the transaction.
+        let pins = self.observe_continuations(&commit.streams).await?;
+
+        let mut revalidations = 0;
+
+        loop {
+            let cached = self.ensure_manifest_validated().await?;
+
+            // Fences are refused for entity types durably declared with retention: TTL deletes
+            // reopen fenced slots without leaving a successor snapshot. The refusal consults the
+            // stored manifest, not this instance's configuration, and runs again on every
+            // iteration: a declaration that races the marker revalidation bumps the version, the
+            // marker check fails, and the retry must see the type it now declares.
+            if !commit.fences.is_empty() {
+                let manifest = self.read_manifest().await?;
+                commit
+                    .check_retention(manifest.as_ref(), |entity_type| self.retains(entity_type))?;
+            }
+
+            let (items, layout) = self.transaction_stream_items(&commit, cached, &pins)?;
+
+            let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
+            for operation in &commit.operations {
+                sizes.push(sdk_item_size(operation));
+            }
+            crate::repository::check_budget(sizes)?;
+
+            match self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    let codes = cancellation_reasons(&err);
+
+                    let failed_check = failed_items(&codes, "ConditionalCheckFailed").next();
+                    let fence_conflict =
+                        failed_check.and_then(|index| layout.fence_at(index).cloned());
+
+                    if failed_check == Some(0) {
+                        // The feature set changed under this writer: re-validate it, then
+                        // retry. Re-validating refuses a feature this writer does not support.
+                        if revalidations >= MAX_MARKER_REVALIDATIONS {
+                            return Err(Error::Backend(Box::new(err)));
+                        }
+                        revalidations += 1;
+                        self.invalidate_manifest();
+
+                        continue;
+                    }
+
+                    // The stream whose action failed, when the cancellation index maps back to
+                    // one; the first stream is only a fallback for an index that does not.
+                    let fallback_entity = || {
+                        commit.streams.first().map_or_else(
+                            || EntityId::new("unknown"),
+                            |stream| stream.entity_id.clone(),
+                        )
+                    };
+                    let entity_at = |index: Option<usize>| {
+                        index
+                            .and_then(|index| layout.stream_at(index).cloned())
+                            .unwrap_or_else(fallback_entity)
+                    };
+
+                    if let Some(fence) = fence_conflict {
+                        return Err(Error::FenceConflict {
+                            entity_id: fence.entity_id,
+                            head: fence.head,
+                            provenance: fence.provenance,
+                        });
+                    }
+
+                    if let Some(index) = failed_check {
+                        if index > 0 && index <= layout.operations {
+                            // Projector conditions are not retried by reloading.
+                            return Err(Error::Projector(Box::new(err)));
+                        }
+
+                        return Err(Error::Conflict {
+                            entity_id: entity_at(Some(index)),
+                            message:
+                                "conditional check failed: the sequence or snapshot changed since it was read"
+                                    .to_owned(),
+                        });
+                    }
+
+                    // A concurrent transaction is reported on the item it collided with.
+                    let colliding = failed_items(&codes, "TransactionConflict").next();
+
+                    return Err(classify_transaction_error(
+                        &entity_at(colliding),
+                        layout.operations,
                         err,
                     ));
                 }
@@ -872,6 +1172,173 @@ fn put(
     Ok(TransactWriteItem::builder()
         .put(put.build().map_err(Error::backend)?)
         .build())
+}
+
+/// Where each kind of item sits in a multi-stream transaction, for failure classification.
+#[derive(Default)]
+struct TransactionLayout {
+    /// Number of projector operations, which start at index 1 after the marker check.
+    operations: usize,
+    /// Fences by their slot-check and companion-check item indexes.
+    fences: Vec<(usize, crate::repository::ReadFence)>,
+    /// Each written stream's contiguous run of action indexes (event puts and the snapshot put or
+    /// floor check), so a failed action maps back to the stream that owns it.
+    streams: Vec<(std::ops::Range<usize>, EntityId)>,
+}
+
+impl TransactionLayout {
+    fn fence_at(&self, index: usize) -> Option<&crate::repository::ReadFence> {
+        self.fences
+            .iter()
+            .find(|(item_index, _)| *item_index == index)
+            .map(|(_, fence)| fence)
+    }
+
+    /// The written stream whose action sits at `index`, if the index is one of a stream's.
+    fn stream_at(&self, index: usize) -> Option<&EntityId> {
+        self.streams
+            .iter()
+            .find(|(range, _)| range.contains(&index))
+            .map(|(_, entity_id)| entity_id)
+    }
+}
+
+/// Builds a fenced read-only stream's two ConditionChecks: the slot check on
+/// `(pk, sk = head + 1)` and the snapshot companion on `(pk, sk = 0)`, which is always included.
+fn fence_checks(
+    table: &str,
+    fence: &crate::repository::ReadFence,
+) -> Result<[TransactWriteItem; 2], Error> {
+    let slot = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(fence.entity_id.as_str()))
+        .key("sk", n(fence.head.next().0))
+        .condition_expression(wire::FENCE_SLOT_CONDITION)
+        .build()
+        .map_err(Error::backend)?;
+
+    let companion = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(fence.entity_id.as_str()))
+        .key("sk", n(wire::SNAPSHOT_SORT_KEY))
+        .condition_expression(wire::FENCE_COMPANION_CONDITION)
+        .expression_attribute_values(":head", n(fence.head.0))
+        .build()
+        .map_err(Error::backend)?;
+
+    Ok([
+        TransactWriteItem::builder().condition_check(slot).build(),
+        TransactWriteItem::builder()
+            .condition_check(companion)
+            .build(),
+    ])
+}
+
+/// A projector operation's DynamoDB-encoded request size. A put counts its item. An update,
+/// delete, or condition check counts its key attributes plus its expression strings,
+/// attribute-name placeholders (both sides), and attribute values: DynamoDB applies the 4 MB
+/// aggregate request limit to every action type, so a large expression value must not bypass the
+/// `CommitTooLarge` preflight. Names count their UTF-8 bytes and values their encoded bytes.
+fn sdk_item_size(operation: &TransactWriteItem) -> usize {
+    fn values_size(values: Option<&HashMap<String, sdk::AttributeValue>>) -> usize {
+        values.map_or(0, |values| {
+            crate::repository::item_size(&from_sdk_item(values))
+        })
+    }
+
+    fn expression_size(
+        expressions: &[Option<&str>],
+        names: Option<&HashMap<String, String>>,
+        values: Option<&HashMap<String, sdk::AttributeValue>>,
+    ) -> usize {
+        let text: usize = expressions.iter().flatten().map(|text| text.len()).sum();
+        let placeholders: usize = names.map_or(0, |names| {
+            names
+                .iter()
+                .map(|(placeholder, name)| placeholder.len() + name.len())
+                .sum()
+        });
+
+        text + placeholders + values_size(values)
+    }
+
+    if let Some(put) = operation.put() {
+        return crate::repository::item_size(&from_sdk_item(put.item()));
+    }
+    if let Some(update) = operation.update() {
+        return values_size(Some(update.key()))
+            + expression_size(
+                &[
+                    Some(update.update_expression()),
+                    update.condition_expression(),
+                ],
+                update.expression_attribute_names(),
+                update.expression_attribute_values(),
+            );
+    }
+    if let Some(delete) = operation.delete() {
+        return values_size(Some(delete.key()))
+            + expression_size(
+                &[delete.condition_expression()],
+                delete.expression_attribute_names(),
+                delete.expression_attribute_values(),
+            );
+    }
+    if let Some(check) = operation.condition_check() {
+        return values_size(Some(check.key()))
+            + expression_size(
+                &[Some(check.condition_expression())],
+                check.expression_attribute_names(),
+                check.expression_attribute_values(),
+            );
+    }
+
+    0
+}
+
+/// How a written stream's first sequence was tied to its stored head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Continuation {
+    /// The commit's first sequence minus one: the head the writer believes in.
+    previous: EventSequence,
+    /// The snapshot ends exactly at the head, so compaction may delete the head event at any time;
+    /// the snapshot's `eventSeq` (equal to `previous`) pins the head instead of the event item.
+    via_snapshot: bool,
+}
+
+/// Checks that the event just before a stream's first new event still exists.
+fn continuation_check(
+    table: &str,
+    entity_id: &EntityId,
+    previous: EventSequence,
+) -> Result<TransactWriteItem, Error> {
+    let check = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(entity_id.as_str()))
+        .key("sk", n(previous.0))
+        .condition_expression(wire::CONTINUATION_CONDITION)
+        .build()
+        .map_err(Error::backend)?;
+
+    Ok(TransactWriteItem::builder().condition_check(check).build())
+}
+
+/// Checks that a compacted stream's snapshot still ends exactly at the sequence before the commit.
+fn pinned_floor_check(
+    table: &str,
+    entity_id: &EntityId,
+    previous: EventSequence,
+) -> Result<TransactWriteItem, Error> {
+    let check = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", s(entity_id.as_str()))
+        .key("sk", n(wire::SNAPSHOT_SORT_KEY))
+        .condition_expression(wire::PINNED_FLOOR_CONDITION)
+        .expression_attribute_values(":prev", n(previous.0))
+        .build()
+        .map_err(Error::backend)?;
+
+    Ok(TransactWriteItem::builder().condition_check(check).build())
 }
 
 /// Checks that a commit starting at `first` is above the entity's snapshot floor.
@@ -1336,7 +1803,7 @@ mod tests {
             let mut repository = offline_repository();
             repository.table = input["eventsTable"].as_str().unwrap().into();
             let actual = repository
-                .transaction_items(&commit, observed)
+                .transaction_items(&commit, observed, None)
                 .unwrap()
                 .iter()
                 .map(|action| {
@@ -1375,6 +1842,449 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(json!(actual), case["output"], "{}", case["name"]);
         }
+    }
+
+    /// Summarizes a transaction action the way the Go fixtures record it: operation, key, and
+    /// the condition with its expression values.
+    fn action_summary(action: &TransactWriteItem) -> serde_json::Value {
+        use serde_json::json;
+
+        let key_number = |item: &HashMap<String, sdk::AttributeValue>| {
+            item["sk"].as_n().unwrap().parse::<i64>().unwrap()
+        };
+
+        let (operation, key, condition, values) = if let Some(put) = action.put() {
+            (
+                "Put",
+                (
+                    put.item()["pk"].as_s().unwrap().clone(),
+                    key_number(put.item()),
+                ),
+                put.condition_expression(),
+                put.expression_attribute_values(),
+            )
+        } else {
+            let check = action.condition_check().expect("only puts and checks");
+
+            (
+                "ConditionCheck",
+                (
+                    check.key()["pk"].as_s().unwrap().clone(),
+                    key_number(check.key()),
+                ),
+                Some(check.condition_expression()),
+                check.expression_attribute_values(),
+            )
+        };
+
+        let mut summary = json!({"operation": operation, "pk": key.0, "sk": key.1});
+        if let Some(condition) = condition {
+            summary["condition"] = json!(condition);
+        }
+        if let Some(values) = values.filter(|values| !values.is_empty()) {
+            summary["values"] = json!(from_sdk_item(values));
+        }
+
+        summary
+    }
+
+    /// The shared scenarios' transaction steps build the same `TransactWriteItems` action order
+    /// the Go generator recorded from its repository: a divergence fails here even when both
+    /// languages store identical state.
+    #[test]
+    fn transaction_action_order_matches_the_go_fixtures() {
+        use serde_json::Value;
+
+        let compat = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compat");
+        let read = |path: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(compat.join(path)).unwrap()).unwrap()
+        };
+        let scenarios = read("scenarios.json");
+        let fixtures = read("fixtures/scenarios.json");
+        let run = fixtures["run"].as_str().unwrap();
+
+        let id_of = |base: &str, suffix: &str| {
+            if suffix.is_empty() {
+                EntityId::new(base)
+            } else {
+                EntityId::new(format!("{base}-{suffix}"))
+            }
+        };
+
+        let mut transactions = 0;
+        for scenario in scenarios["scenarios"].as_array().unwrap() {
+            let name = scenario["name"].as_str().unwrap();
+            let base = format!("compat-{run}-{name}");
+            let expected = fixtures["scenarios"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|fixture| fixture["name"] == name)
+                .unwrap_or_else(|| panic!("no fixture for {name}"));
+            let recorded = expected["transactions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+
+            let steps = scenario["steps"].as_array().unwrap();
+            let planned: Vec<_> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| step["op"] == "transaction")
+                .collect();
+            assert_eq!(
+                planned.len(),
+                recorded.len(),
+                "{name}: one recorded order per transaction step"
+            );
+
+            for ((index, step), recorded) in planned.into_iter().zip(&recorded) {
+                assert_eq!(recorded["step"], index, "{name}: recorded step");
+
+                let streams = step["streams"]
+                    .as_array()
+                    .map(|streams| {
+                        streams
+                            .iter()
+                            .map(|stream| {
+                                let id = id_of(&base, stream["suffix"].as_str().unwrap_or(""));
+                                let first = stream["sequence"].as_i64().unwrap();
+                                let events = stream["events"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(offset, raw)| SerializedEvent {
+                                        id: crate::EventId::for_event(
+                                            &id,
+                                            EventSequence(first + offset as i64),
+                                        ),
+                                        sequence: EventSequence(first + offset as i64),
+                                        event_type: raw["type"].as_str().unwrap().into(),
+                                        version: crate::EventVersion(
+                                            raw["version"].as_i64().unwrap(),
+                                        ),
+                                        entity_id: id.clone(),
+                                        entity_type: "account".into(),
+                                        payload: raw["payload"].as_str().unwrap().into(),
+                                        metadata: crate::Metadata::default(),
+                                    })
+                                    .collect();
+                                let mut commit = Commit::new(id, events);
+                                if let Some(snapshot) = stream.get("snapshot") {
+                                    commit = commit.with_snapshot(crate::NewSnapshot::new(
+                                        "account",
+                                        EventSequence(snapshot["sequence"].as_i64().unwrap()),
+                                        snapshot["payload"].as_str().unwrap(),
+                                    ));
+                                }
+
+                                commit
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut commit = TransactionCommit::new(streams);
+                commit.fences = step["fences"]
+                    .as_array()
+                    .map(|fences| {
+                        fences
+                            .iter()
+                            .map(|fence| {
+                                crate::ReadFence::new(
+                                    id_of(&base, fence["suffix"].as_str().unwrap_or("")),
+                                    "account",
+                                    EventSequence(fence["head"].as_i64().unwrap()),
+                                    if fence["callerStamped"].as_bool().unwrap_or(false) {
+                                        crate::FenceProvenance::Caller
+                                    } else {
+                                        crate::FenceProvenance::Engine
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                commit.normalize().unwrap();
+
+                // The scenarios declare no features, so every writer validated an absent marker.
+                // Every transaction step continues from an existing head event (none of the
+                // recorded steps writes a compacted stream), so each stream above sequence 1 is
+                // pinned through its head event.
+                let pins: HashMap<EntityId, Continuation> = commit
+                    .streams
+                    .iter()
+                    .filter_map(|stream| {
+                        let first = stream.events.first()?.sequence;
+                        (first > EventSequence(1)).then(|| {
+                            (
+                                stream.entity_id.clone(),
+                                Continuation {
+                                    previous: EventSequence(first.0 - 1),
+                                    via_snapshot: false,
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                let (items, _) = offline_repository()
+                    .transaction_stream_items(&commit, ValidatedMarker::Absent, &pins)
+                    .unwrap();
+                let actual: Vec<_> = items.iter().map(action_summary).collect();
+
+                assert_eq!(
+                    Value::Array(actual),
+                    recorded["actions"],
+                    "{name} step {index}: TransactWriteItems action order"
+                );
+                transactions += 1;
+            }
+        }
+
+        assert!(
+            transactions >= 8,
+            "the scenarios cover multi-stream and fenced commits"
+        );
+    }
+
+    #[test]
+    fn projector_item_sizes_cover_keys_expressions_names_and_values() {
+        let key_map = HashMap::from([("pk".to_owned(), s("view#1")), ("sk".to_owned(), n(0))]);
+        // "pk" + "view#1" + "sk" + "0"
+        let key_bytes = 2 + 6 + 2 + 1;
+        // "#n" + "name" + ":v" + "value"
+        let placeholder_bytes = 2 + 4 + 2 + 5;
+
+        let update = TransactWriteItem::builder()
+            .update(
+                sdk::Update::builder()
+                    .table_name("views")
+                    .set_key(Some(key_map.clone()))
+                    .update_expression("SET #n = :v")
+                    .condition_expression("attribute_exists(pk)")
+                    .expression_attribute_names("#n", "name")
+                    .expression_attribute_values(":v", s("value"))
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+        assert_eq!(
+            sdk_item_size(&update),
+            key_bytes + "SET #n = :v".len() + "attribute_exists(pk)".len() + placeholder_bytes
+        );
+
+        let delete = TransactWriteItem::builder()
+            .delete(
+                Delete::builder()
+                    .table_name("views")
+                    .set_key(Some(key_map.clone()))
+                    .condition_expression("#n = :v")
+                    .expression_attribute_names("#n", "name")
+                    .expression_attribute_values(":v", s("value"))
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+        assert_eq!(
+            sdk_item_size(&delete),
+            key_bytes + "#n = :v".len() + placeholder_bytes
+        );
+
+        let check = TransactWriteItem::builder()
+            .condition_check(
+                ConditionCheck::builder()
+                    .table_name("views")
+                    .set_key(Some(key_map.clone()))
+                    .condition_expression("#n = :v")
+                    .expression_attribute_names("#n", "name")
+                    .expression_attribute_values(":v", s("value"))
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+        assert_eq!(
+            sdk_item_size(&check),
+            key_bytes + "#n = :v".len() + placeholder_bytes
+        );
+
+        let put = put(
+            "views",
+            Item::from([("pk".into(), AttributeValue::S("view#1".into()))]),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(sdk_item_size(&put), 2 + 6);
+    }
+
+    #[test]
+    fn a_large_non_put_projector_value_exceeds_the_commit_budget() {
+        let large = "x".repeat(3_900_000);
+        let operation = TransactWriteItem::builder()
+            .update(
+                sdk::Update::builder()
+                    .table_name("views")
+                    .key("pk", s("view#1"))
+                    .update_expression("SET v = :v")
+                    .expression_attribute_values(":v", s(&large))
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+
+        let mut sizes = vec![sdk_item_size(&operation)];
+        sizes.push(10);
+
+        assert!(matches!(
+            crate::repository::check_budget(sizes),
+            Err(Error::CommitTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fences_for_locally_retained_types_are_refused_without_a_manifest() {
+        let repository = offline_repository()
+            .with_retention("scratch", Duration::from_secs(60))
+            .with_retention("disabled", Duration::ZERO);
+
+        let fenced = |entity_type: &str| {
+            let mut commit = crate::TransactionCommit::<TransactWriteItem>::new(Vec::new());
+            commit.fences = vec![crate::ReadFence::new(
+                "watched",
+                entity_type,
+                EventSequence(0),
+                crate::FenceProvenance::Engine,
+            )];
+
+            commit
+        };
+
+        // The refusal needs no manifest read: the offline client could not make one.
+        let error = repository
+            .commit_transaction(fenced("scratch"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::RetentionConflict { entity_type } if entity_type.as_str() == "scratch"),
+            "{error:?}"
+        );
+
+        // A zero duration disables retention, so it is not refused here (the commit then needs
+        // the table, which this offline repository lacks).
+        assert!(!matches!(
+            repository.commit_transaction(fenced("disabled")).await,
+            Err(Error::RetentionConflict { .. })
+        ));
+    }
+
+    /// Every public write entry point refuses projector operations that have no backing event
+    /// (ADR-0012) before it touches the network: the offline client could not have served it.
+    #[tokio::test]
+    async fn every_write_entry_point_refuses_projector_only_input() {
+        let repository = offline_repository();
+        let operation = || {
+            put(
+                "views",
+                Item::from([("pk".into(), AttributeValue::S("view".into()))]),
+                None,
+                &[],
+            )
+            .unwrap()
+        };
+
+        let single = Commit::new("a", Vec::new()).with_operations([operation()]);
+        let mut transaction = crate::TransactionCommit::new(Vec::new());
+        transaction.operations = vec![operation()];
+        let mut eventless_stream = crate::TransactionCommit::new(vec![
+            Commit::new("a", Vec::new()).with_operations([operation()]),
+        ]);
+        eventless_stream.operations = Vec::new();
+
+        let results = [
+            ("commit", repository.commit(single).await),
+            (
+                "commit_transaction (top-level operations)",
+                repository.commit_transaction(transaction).await,
+            ),
+            (
+                "commit_transaction (eventless stream operations)",
+                repository.commit_transaction(eventless_stream).await,
+            ),
+        ];
+
+        for (entry_point, result) in results {
+            assert!(
+                matches!(result, Err(Error::ProjectorWithoutEvents { operations: 1 })),
+                "{entry_point}: {result:?}"
+            );
+        }
+    }
+
+    /// A stream pins its head through the item compaction cannot delete: the head event when it
+    /// lies above the snapshot, the snapshot when it ends exactly at the head.
+    #[test]
+    fn a_stream_pins_its_head_through_the_item_compaction_cannot_delete() {
+        let repository = offline_repository();
+        let event = SerializedEvent {
+            id: "pin-a:5".into(),
+            entity_id: "pin-a".into(),
+            entity_type: "account".into(),
+            sequence: EventSequence(5),
+            event_type: "account:opened".into(),
+            version: crate::EventVersion(1),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        };
+        let commit: Commit<TransactWriteItem> = Commit::new("pin-a", vec![event]);
+        let conditions = |commit: &Commit<TransactWriteItem>, pin: Option<Continuation>| {
+            repository
+                .stream_group(commit, pin)
+                .unwrap()
+                .iter()
+                .map(|action| match (action.put(), action.condition_check()) {
+                    (Some(put), _) => put.condition_expression().unwrap().to_owned(),
+                    (_, Some(check)) => check.condition_expression().to_owned(),
+                    _ => unreachable!("only puts and checks"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let event_pin = Continuation {
+            previous: EventSequence(4),
+            via_snapshot: false,
+        };
+        assert_eq!(
+            conditions(&commit, Some(event_pin)),
+            vec![
+                wire::CONTINUATION_CONDITION,
+                wire::EVENT_CONDITION,
+                wire::FLOOR_CONDITION
+            ]
+        );
+
+        let snapshot_pin = Continuation {
+            previous: EventSequence(4),
+            via_snapshot: true,
+        };
+        assert_eq!(
+            conditions(&commit, Some(snapshot_pin)),
+            vec![wire::EVENT_CONDITION, wire::PINNED_FLOOR_CONDITION],
+            "no event check: compaction may delete the head event the snapshot covers"
+        );
+
+        // A stream creating itself carries neither.
+        assert_eq!(
+            conditions(&commit, None),
+            vec![wire::EVENT_CONDITION, wire::FLOOR_CONDITION]
+        );
+
+        // A later snapshot put pins through the snapshot too.
+        let with_snapshot = Commit::new("pin-a", commit.events.clone())
+            .with_snapshot(crate::NewSnapshot::new("account", EventSequence(2), "{}"));
+        assert_eq!(
+            conditions(&with_snapshot, Some(snapshot_pin)),
+            vec![wire::EVENT_CONDITION, wire::PINNED_NEXT_SNAPSHOT_CONDITION]
+        );
     }
 
     #[test]
