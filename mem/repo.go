@@ -117,11 +117,17 @@ func (repo Repository) Commit(
 // event sequence is not above the events it summarizes.
 func (repo Repository) checkSnapshots(snapshots []evt.SerializedSnapshot) error {
 	for _, snapshot := range snapshots {
-		stored, ok := repo.snapshots[string(snapshot.EntityID)]
-		if ok && stored.Sequence+1 != snapshot.Sequence {
+		// A stream with no stored snapshot is at sequence 0, so its first snapshot must be 1,
+		// as on DynamoDB and PostgreSQL.
+		var storedSequence evt.EventSequence
+		if stored, ok := repo.snapshots[string(snapshot.EntityID)]; ok {
+			storedSequence = stored.Sequence
+		}
+
+		if storedSequence+1 != snapshot.Sequence {
 			return evt.NewConflictError(fmt.Sprintf(
 				"mem: snapshot sequence moved: stored %d, commit writes %d",
-				stored.Sequence, snapshot.Sequence,
+				storedSequence, snapshot.Sequence,
 			))
 		}
 	}

@@ -159,6 +159,7 @@ async fn dynamo_conforms() {
     feature_marker_cases(&repository, &second).await;
     dynamo_marker_row_matches_the_wire_format(&repository).await;
     projector_condition_failure_is_not_a_conflict(&repository).await;
+    dynamo_refuses_projector_only_transactions(&repository).await;
     dynamo_legacy_reserved_reads(&repository).await;
 }
 
@@ -247,6 +248,41 @@ async fn projector_condition_failure_is_not_a_conflict(repository: &DynamoReposi
         "want a projector error, got {err:?}"
     );
     assert!(repository.events(&id).await.unwrap().is_empty());
+}
+
+/// A transaction with projector operations and no written event is refused before any write:
+/// views are projections of committed events (ADR-0012).
+async fn dynamo_refuses_projector_only_transactions(repository: &DynamoRepository) {
+    let view = TransactWriteItem::builder()
+        .put(
+            Put::builder()
+                .table_name(drivers::views_table())
+                .item("pk", AttributeValue::S("projector-only".into()))
+                .item("sk", AttributeValue::N("0".into()))
+                .build()
+                .unwrap(),
+        )
+        .build();
+    let mut commit = photon_evt::TransactionCommit::new(Vec::new());
+    commit.operations = vec![view];
+
+    let err = repository.commit_transaction(commit).await.unwrap_err();
+
+    assert!(
+        matches!(err, Error::ProjectorWithoutEvents { operations: 1 }),
+        "{err:?}"
+    );
+    let stored = repository
+        .client()
+        .get_item()
+        .table_name(drivers::views_table())
+        .key("pk", AttributeValue::S("projector-only".into()))
+        .key("sk", AttributeValue::N("0".into()))
+        .consistent_read(true)
+        .send()
+        .await
+        .unwrap();
+    assert!(stored.item().is_none(), "no view row was written");
 }
 
 /// Fails the first commit with a deadlock (`40P01`), the way PostgreSQL aborts a deadlock victim.
@@ -605,6 +641,7 @@ async fn postgres_conforms() {
         .unwrap();
     feature_marker_cases(&repository, &second).await;
     postgres_features_text_matches_the_manifest(&repository, &events).await;
+    postgres_refuses_projector_only_transactions(&repository).await;
     postgres_legacy_reserved_reads(&repository, &events, &snapshots).await;
     repository
         .pool()
@@ -616,6 +653,19 @@ async fn postgres_conforms() {
         ))
         .await
         .expect("drop the isolated event log");
+}
+
+/// A transaction with a projector statement and no written event is refused before any write.
+async fn postgres_refuses_projector_only_transactions(repository: &PostgresRepository) {
+    let mut commit = photon_evt::TransactionCommit::new(Vec::new());
+    commit.operations = vec![PgStatement::new("SELECT 1/0", Vec::new())];
+
+    let err = repository.commit_transaction(commit).await.unwrap_err();
+
+    assert!(
+        matches!(err, Error::ProjectorWithoutEvents { operations: 1 }),
+        "refused before the statement ever runs: {err:?}"
+    );
 }
 
 fn legacy_stream(id: EntityId) -> (Vec<SerializedEvent>, SerializedSnapshot) {

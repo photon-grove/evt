@@ -204,6 +204,10 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
    counts the item, but an implementation that does not yet implement the rebuild fence (C10)
    emits no action here, and every later action then moves up by one.
 3. Projector operations, in projector declaration order; within one projector, in emission order.
+   A commit that carries projector operations must also write at least one event: views are
+   projections of committed events, so operations with no backing event are refused with a typed
+   error (`ProjectorOnlyCommit` in Go, `ProjectorWithoutEvents` in Rust) before any write, on
+   every backend.
 4. The written streams, in ascending entity-ID byte order. Each stream is one contiguous group,
    in this order:
    1. one put per event, in ascending sequence;
@@ -290,7 +294,9 @@ outcome row, and the two control checks. A commit over either byte budget fails 
 typed `CommitTooLarge` error before any write, and is never split.
 
 The preflight counts projector operations **on every backend that writes them**. DynamoDB sizes
-each projector item exactly. A PostgreSQL repository that executes projector statements counts
+each projector item exactly: a put counts its item, and an update, delete, or condition check
+counts its key attributes plus its expression strings, attribute-name placeholders (both the
+placeholder and the name), and attribute values. A PostgreSQL repository that executes projector statements counts
 each statement as one action sized by its SQL text; the bound parameters are opaque, so the byte
 estimate is a lower bound while the action count is exact. Rust's PostgreSQL repository does this
 today. Go's PostgreSQL repository writes no projector operations until commit-wide projector

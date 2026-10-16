@@ -239,6 +239,10 @@ error before any write and is never split.
 - The engine pins the write order bytewise by stream ID regardless of declaration order; each
   stream keeps its own ascending sequences and its own snapshot-put-or-floor-check suffix
 - Every event of the commit carries one `commitId` (see Metadata Structure)
+- A commit that carries projector operations but writes no event is refused before any write
+  (`ProjectorOnlyCommitError` / `Error::ProjectorWithoutEvents`): views are projections of
+  committed events (ADR-0012). An empty command ID is treated as absent when deriving the commit ID
+  in both languages
 - The shared budget counts the whole commit — every stream's events, snapshot/floor items, fence
   checks, projector operations, and the control checks — and a commit over any limit fails with
   `CommitTooLargeError` before any write, identically on every backend and in both languages

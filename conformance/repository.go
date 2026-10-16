@@ -108,6 +108,10 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		t.Run("RejectsCommitsBelowCompactedFloor", func(t *testing.T) {
 			testCompactedFloor(t, newRepo())
 		})
+
+		t.Run("RejectsFirstSnapshotAboveOne", func(t *testing.T) {
+			testRejectsFirstSnapshotAboveOne(t, newRepo())
+		})
 	}
 
 	if opts.SupportsTransactions {
@@ -134,6 +138,10 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 				testFenceCompactionABA(t, newRepo())
 			})
 		}
+
+		t.Run("RejectsProjectorOnlyCommits", func(t *testing.T) {
+			testRejectsProjectorOnlyCommits(t, newRepo())
+		})
 
 		t.Run("RejectsFencesForRetention", func(t *testing.T) {
 			require.NotNil(t, opts.DeclareRetention,
@@ -913,4 +921,76 @@ func testRejectsFencesForRetention(
 	var refused *evt.RetentionConflictError
 	require.ErrorAs(t, err, &refused)
 	require.Equal(t, entityType, refused.EntityType)
+}
+
+// projectorOnlyGroup is a backend-neutral stand-in for a projector's operations. A repository
+// must refuse the commit before it ever interprets the group.
+type projectorOnlyGroup struct{}
+
+func (projectorOnlyGroup) Len() int                             { return 1 }
+func (projectorOnlyGroup) StorageType() evt.StorageType         { return "conformance" }
+func (projectorOnlyGroup) TransactionType() evt.TransactionType { return "conformance" }
+func (projectorOnlyGroup) HandleError(err error, _ int) error   { return err }
+func (g projectorOnlyGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
+	return g, nil
+}
+
+func testRejectsProjectorOnlyCommits(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA := evt.EntityID(ns + "-a")
+
+	// Projector operations without a written event would leave view state no replay can rebuild.
+	for name, result := range map[string]evt.SerializedResult{
+		"operations only": {Transaction: evt.Transaction{projectorOnlyGroup{}}},
+		"operations with a fence": {
+			Transaction: evt.Transaction{projectorOnlyGroup{}},
+			Fences:      []evt.ReadFence{{EntityID: idA, EntityType: "test"}},
+		},
+	} {
+		err := repo.Commit(ctx, result)
+
+		var refused *evt.ProjectorOnlyCommitError
+		require.ErrorAs(t, err, &refused, name)
+		require.Equal(t, 1, refused.Operations, name)
+	}
+}
+
+func testRejectsFirstSnapshotAboveOne(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	idA := evt.EntityID(ns + "-a")
+	events := serialize(t, idA, "test", 0,
+		&test.EntityCreated{ID: idA, Value: "one"},
+		&test.EntityUpdated{ID: idA, Value: "two"},
+	)
+
+	// A stream's first snapshot must have sequence 1: every backend refuses one that skips ahead.
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Events: events,
+		Snapshots: []evt.SerializedSnapshot{{
+			EntityType: "test", EntityID: idA, Sequence: 3, EventSequence: 2, Payload: []byte(`{}`),
+		}},
+	})
+	require.Error(t, err)
+
+	stored, err := repo.GetEvents(ctx, idA)
+	require.NoError(t, err)
+	require.Empty(t, stored, "a refused commit writes nothing")
+
+	snapshot, err := repo.GetSnapshot(ctx, idA)
+	require.NoError(t, err)
+	require.Nil(t, snapshot)
+
+	// The same commit with snapshot sequence 1 is accepted.
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events: events,
+		Snapshots: []evt.SerializedSnapshot{{
+			EntityType: "test", EntityID: idA, Sequence: 1, EventSequence: 2, Payload: []byte(`{}`),
+		}},
+	}))
 }

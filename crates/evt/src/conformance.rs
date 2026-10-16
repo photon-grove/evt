@@ -225,6 +225,10 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             multi_stream_commit(repo).await,
         );
         record(
+            "a transactional first snapshot must have sequence 1",
+            transaction_first_snapshot(repo).await,
+        );
+        record(
             "a multi-stream commit is all-or-nothing",
             multi_stream_atomicity(repo).await,
         );
@@ -948,6 +952,44 @@ async fn multi_stream_commit<R: Repository>(repo: &R) -> CaseResult {
 
     ensure_eq!(repo.events(&a.id).await?, a.events(1..=2), "events(a)");
     ensure_eq!(repo.events(&b.id).await?, b.events(1..=1), "events(b)");
+
+    Ok(())
+}
+
+async fn transaction_first_snapshot<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let b = Stream::new(&ns, "b", "ledger");
+
+    // A stream's first snapshot is sequence 1 on every backend, also in a multi-stream commit
+    // that creates the stream.
+    let skipping = Commit {
+        snapshot: Some(a.new_snapshot(3, "{}")),
+        ..write(&a, 1..=2)
+    };
+    expect_conflict(
+        repo.commit_transaction(TransactionCommit::new(vec![write(&b, 1..=1), skipping]))
+            .await,
+        "a first snapshot whose sequence is not 1",
+    )?;
+    ensure!(
+        repo.events(&a.id).await?.is_empty()
+            && repo.events(&b.id).await?.is_empty()
+            && repo.snapshot(&a.id).await?.is_none(),
+        "the rejected commit writes nothing, in any stream"
+    );
+
+    let accepted = Commit {
+        snapshot: Some(a.new_snapshot(1, "{}")),
+        ..write(&a, 1..=2)
+    };
+    repo.commit_transaction(TransactionCommit::new(vec![write(&b, 1..=1), accepted]))
+        .await?;
+    ensure_eq!(
+        repo.snapshot(&a.id).await?,
+        Some(a.snapshot(1, 2, "{}")),
+        "sequence 1 is accepted"
+    );
 
     Ok(())
 }

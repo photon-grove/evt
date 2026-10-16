@@ -210,10 +210,11 @@ impl Repository for MemRepository {
 
         // Validate every stream, snapshot, and fence before writing anything, so a failure leaves
         // every stream unchanged. Reads use get: a failed commit must not create empty streams.
+        // A stream with no stored rows validates against an empty one, so a first snapshot must
+        // be sequence 1, as on DynamoDB and PostgreSQL.
+        let absent = Stream::default();
         for stream in &commit.streams {
-            let Some(stored) = streams.get(&stream.entity_id) else {
-                continue;
-            };
+            let stored = streams.get(&stream.entity_id).unwrap_or(&absent);
 
             for (index, event) in stream.events.iter().enumerate() {
                 let reused = stream.events[..index]

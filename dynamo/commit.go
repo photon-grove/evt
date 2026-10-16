@@ -29,6 +29,12 @@ func (repo *Repository) Commit(
 		return err
 	}
 
+	// Projector operations need a backing event in the same commit (ADR-0012); refuse them even
+	// when nothing else would be written.
+	if err := evt.CheckProjectorOperations(result); err != nil {
+		return err
+	}
+
 	if len(result.Events) == 0 && len(result.Snapshots) == 0 && len(result.Fences) == 0 {
 		return nil
 	}

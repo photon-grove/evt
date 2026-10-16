@@ -307,6 +307,12 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 		return err
 	}
 
+	// Projector operations need a backing event in the same commit (ADR-0012); refuse them even
+	// when nothing else would be written.
+	if err := evt.CheckProjectorOperations(res); err != nil {
+		return err
+	}
+
 	if len(res.Events) == 0 && len(res.Snapshots) == 0 && len(res.Fences) == 0 {
 		return nil
 	}

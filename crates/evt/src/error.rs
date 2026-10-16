@@ -109,6 +109,17 @@ pub enum Error {
         provenance: crate::repository::FenceProvenance,
     },
 
+    /// A transaction carried projector operations but wrote no event. Views are derived state, so
+    /// operations without a backing event in the same commit could never be rebuilt by replay.
+    /// Nothing was written.
+    #[error(
+        "commit carries {operations} projector operations but no events; views must be projections of committed events"
+    )]
+    ProjectorWithoutEvents {
+        /// The number of projector operations the commit carried.
+        operations: usize,
+    },
+
     /// TTL retention cannot protect a read fence.
     #[error("read fences refused for retention-enabled entity type {entity_type}")]
     RetentionConflict {

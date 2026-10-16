@@ -79,11 +79,48 @@ func CommitBudget(itemSizes []int) error {
 	return nil
 }
 
+// ProjectorOnlyCommitError refuses a commit that carries projector operations but writes no
+// event. Views are derived state: every view row must be a projection of a committed event, so
+// operations without a backing event in the same commit could never be rebuilt by replay
+// (ADR-0012). Nothing is written.
+type ProjectorOnlyCommitError struct {
+	// Operations is the number of projector operations the commit carried.
+	Operations int
+}
+
+func (e *ProjectorOnlyCommitError) Error() string {
+	return fmt.Sprintf("commit carries %d projector operations but no events; views must be projections of committed events", e.Operations)
+}
+
+// CheckProjectorOperations returns a *ProjectorOnlyCommitError when the result carries projector
+// operations but no events. Backends call it before any other work; NormalizeCommit calls it too.
+func CheckProjectorOperations(result SerializedResult) error {
+	if len(result.Events) > 0 {
+		return nil
+	}
+
+	operations := 0
+	for _, group := range result.Transaction {
+		if group != nil {
+			operations += group.Len()
+		}
+	}
+	if operations == 0 {
+		return nil
+	}
+
+	return &ProjectorOnlyCommitError{Operations: operations}
+}
+
 // NormalizeCommit validates a transactional commit and returns a normalized copy: events sorted
 // bytewise by stream ID (the pinned transaction order), snapshots and fences likewise, fences
 // for written streams dropped (the event put at head + 1 supersedes them), and stream-local
 // event order preserved. Noncontiguous input fails rather than being repaired by sorting.
 func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
+	if err := CheckProjectorOperations(result); err != nil {
+		return result, err
+	}
+
 	result.Events = slices.Clone(result.Events)
 	result.Snapshots = slices.Clone(result.Snapshots)
 	result.Fences = slices.Clone(result.Fences)

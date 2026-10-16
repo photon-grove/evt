@@ -313,6 +313,19 @@ impl<Op> TransactionCommit<Op> {
                 )));
             }
         }
+        // Views are derived state: projector operations need a backing event in the same
+        // commit, or no replay could rebuild what they wrote (ADR-0012).
+        let carried = self.operations.len()
+            + self
+                .streams
+                .iter()
+                .map(|stream| stream.operations.len())
+                .sum::<usize>();
+        if carried > 0 && self.streams.iter().all(|stream| stream.events.is_empty()) {
+            return Err(Error::ProjectorWithoutEvents {
+                operations: carried,
+            });
+        }
         // Preserve declaration/emission order before sorting the write set.
         let mut operations = Vec::new();
         for stream in &mut self.streams {
@@ -646,4 +659,76 @@ pub fn snapshot_events_due(current: EventSequence, events: usize, interval: usiz
     }
 
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::SerializedEvent;
+
+    fn event(entity: &str, sequence: i64) -> SerializedEvent {
+        SerializedEvent {
+            id: format!("{entity}:{sequence}").into(),
+            sequence: EventSequence(sequence),
+            event_type: "t:created".into(),
+            version: crate::EventVersion(1),
+            entity_id: entity.into(),
+            entity_type: "t".into(),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn projector_operations_without_a_written_event_are_refused() {
+        // Top-level operations and nothing written.
+        let mut commit = TransactionCommit::<u8>::new(Vec::new());
+        commit.operations = vec![1, 2];
+        assert!(matches!(
+            commit.normalize(),
+            Err(Error::ProjectorWithoutEvents { operations: 2 })
+        ));
+
+        // Top-level operations beside a fence, still nothing written.
+        let mut commit = TransactionCommit::<u8>::new(Vec::new());
+        commit.operations = vec![1];
+        commit.fences = vec![ReadFence::new(
+            "a",
+            "t",
+            EventSequence(0),
+            FenceProvenance::Engine,
+        )];
+        assert!(matches!(
+            commit.normalize(),
+            Err(Error::ProjectorWithoutEvents { operations: 1 })
+        ));
+
+        // Operations attached to a stream that wrote no event.
+        let eventless = Commit::new("a", Vec::new()).with_operations([3u8]);
+        let mut commit = TransactionCommit::new(vec![eventless]);
+        assert!(matches!(
+            commit.normalize(),
+            Err(Error::ProjectorWithoutEvents { operations: 1 })
+        ));
+    }
+
+    #[test]
+    fn projector_operations_with_a_written_event_are_kept_in_order() {
+        let written = Commit::new("a", vec![event("a", 1)]).with_operations([1u8]);
+        let mut commit = TransactionCommit::new(vec![written]);
+        commit.operations = vec![2];
+
+        commit.normalize().unwrap();
+
+        assert_eq!(commit.operations, vec![1, 2]);
+    }
+
+    #[test]
+    fn an_empty_commit_is_still_a_no_op() {
+        let mut commit = TransactionCommit::<u8>::new(Vec::new());
+
+        commit.normalize().unwrap();
+
+        assert!(commit.is_empty());
+    }
 }

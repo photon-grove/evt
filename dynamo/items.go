@@ -35,15 +35,52 @@ func toDynamoItems(transactions evt.Transaction) ([]types.TransactWriteItem, err
 	return items, nil
 }
 
-// transactItemSize returns a projector operation's DynamoDB-encoded item size: the sum over its
-// Put item's attributes of the attribute name's UTF-8 byte length plus the value's encoded byte
-// length. Non-put operations carry no bytes.
+// transactItemSize returns a projector operation's DynamoDB-encoded request size. A Put counts its
+// item. An Update, Delete, or ConditionCheck counts its key attributes plus its expression
+// strings, attribute-name placeholders, and attribute values, because DynamoDB applies the
+// 4 MB aggregate request limit to every action type and a large expression value would otherwise
+// bypass the CommitTooLarge preflight. Each size follows the item-size rules: attribute names
+// count their UTF-8 bytes and values their encoded bytes.
 func transactItemSize(item types.TransactWriteItem) int {
-	if item.Put == nil {
-		return 0
+	switch {
+	case item.Put != nil:
+		return itemSize(item.Put.Item)
+	case item.Update != nil:
+		return itemSize(item.Update.Key) +
+			expressionSize(item.Update.UpdateExpression, item.Update.ConditionExpression,
+				item.Update.ExpressionAttributeNames, item.Update.ExpressionAttributeValues)
+	case item.Delete != nil:
+		return itemSize(item.Delete.Key) +
+			expressionSize(nil, item.Delete.ConditionExpression,
+				item.Delete.ExpressionAttributeNames, item.Delete.ExpressionAttributeValues)
+	case item.ConditionCheck != nil:
+		return itemSize(item.ConditionCheck.Key) +
+			expressionSize(nil, item.ConditionCheck.ConditionExpression,
+				item.ConditionCheck.ExpressionAttributeNames, item.ConditionCheck.ExpressionAttributeValues)
 	}
 
-	return itemSize(item.Put.Item)
+	return 0
+}
+
+// expressionSize counts an action's expression text, name placeholders (both sides), and
+// expression attribute values.
+func expressionSize(
+	update, condition *string,
+	names map[string]string,
+	values map[string]types.AttributeValue,
+) int {
+	total := 0
+	if update != nil {
+		total += len(*update)
+	}
+	if condition != nil {
+		total += len(*condition)
+	}
+	for placeholder, name := range names {
+		total += len(placeholder) + len(name)
+	}
+
+	return total + itemSize(values)
 }
 
 // itemSize computes the DynamoDB item size of an attribute map, mirroring the service's rules:

@@ -1095,15 +1095,66 @@ fn fence_checks(
     ])
 }
 
-/// A projector operation's DynamoDB-encoded item size: the sum over its Put item's attributes of
-/// the attribute name's byte length plus the value's encoded byte length. Non-put operations
-/// carry no bytes.
+/// A projector operation's DynamoDB-encoded request size. A put counts its item. An update,
+/// delete, or condition check counts its key attributes plus its expression strings,
+/// attribute-name placeholders (both sides), and attribute values: DynamoDB applies the 4 MB
+/// aggregate request limit to every action type, so a large expression value must not bypass the
+/// `CommitTooLarge` preflight. Names count their UTF-8 bytes and values their encoded bytes.
 fn sdk_item_size(operation: &TransactWriteItem) -> usize {
-    let Some(put) = &operation.put else {
-        return 0;
-    };
+    fn values_size(values: Option<&HashMap<String, sdk::AttributeValue>>) -> usize {
+        values.map_or(0, |values| {
+            crate::repository::item_size(&from_sdk_item(values))
+        })
+    }
 
-    crate::repository::item_size(&from_sdk_item(&put.item))
+    fn expression_size(
+        expressions: &[Option<&str>],
+        names: Option<&HashMap<String, String>>,
+        values: Option<&HashMap<String, sdk::AttributeValue>>,
+    ) -> usize {
+        let text: usize = expressions.iter().flatten().map(|text| text.len()).sum();
+        let placeholders: usize = names.map_or(0, |names| {
+            names
+                .iter()
+                .map(|(placeholder, name)| placeholder.len() + name.len())
+                .sum()
+        });
+
+        text + placeholders + values_size(values)
+    }
+
+    if let Some(put) = operation.put() {
+        return crate::repository::item_size(&from_sdk_item(put.item()));
+    }
+    if let Some(update) = operation.update() {
+        return values_size(Some(update.key()))
+            + expression_size(
+                &[
+                    Some(update.update_expression()),
+                    update.condition_expression(),
+                ],
+                update.expression_attribute_names(),
+                update.expression_attribute_values(),
+            );
+    }
+    if let Some(delete) = operation.delete() {
+        return values_size(Some(delete.key()))
+            + expression_size(
+                &[delete.condition_expression()],
+                delete.expression_attribute_names(),
+                delete.expression_attribute_values(),
+            );
+    }
+    if let Some(check) = operation.condition_check() {
+        return values_size(Some(check.key()))
+            + expression_size(
+                &[Some(check.condition_expression())],
+                check.expression_attribute_names(),
+                check.expression_attribute_values(),
+            );
+    }
+
+    0
 }
 
 /// Checks that a commit starting at `first` is above the entity's snapshot floor.
@@ -1791,6 +1842,100 @@ mod tests {
             transactions >= 8,
             "the scenarios cover multi-stream and fenced commits"
         );
+    }
+
+    #[test]
+    fn projector_item_sizes_cover_keys_expressions_names_and_values() {
+        let key_map = HashMap::from([("pk".to_owned(), s("view#1")), ("sk".to_owned(), n(0))]);
+        // "pk" + "view#1" + "sk" + "0"
+        let key_bytes = 2 + 6 + 2 + 1;
+        // "#n" + "name" + ":v" + "value"
+        let placeholder_bytes = 2 + 4 + 2 + 5;
+
+        let update = TransactWriteItem::builder()
+            .update(
+                sdk::Update::builder()
+                    .table_name("views")
+                    .set_key(Some(key_map.clone()))
+                    .update_expression("SET #n = :v")
+                    .condition_expression("attribute_exists(pk)")
+                    .expression_attribute_names("#n", "name")
+                    .expression_attribute_values(":v", s("value"))
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+        assert_eq!(
+            sdk_item_size(&update),
+            key_bytes + "SET #n = :v".len() + "attribute_exists(pk)".len() + placeholder_bytes
+        );
+
+        let delete = TransactWriteItem::builder()
+            .delete(
+                Delete::builder()
+                    .table_name("views")
+                    .set_key(Some(key_map.clone()))
+                    .condition_expression("#n = :v")
+                    .expression_attribute_names("#n", "name")
+                    .expression_attribute_values(":v", s("value"))
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+        assert_eq!(
+            sdk_item_size(&delete),
+            key_bytes + "#n = :v".len() + placeholder_bytes
+        );
+
+        let check = TransactWriteItem::builder()
+            .condition_check(
+                ConditionCheck::builder()
+                    .table_name("views")
+                    .set_key(Some(key_map.clone()))
+                    .condition_expression("#n = :v")
+                    .expression_attribute_names("#n", "name")
+                    .expression_attribute_values(":v", s("value"))
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+        assert_eq!(
+            sdk_item_size(&check),
+            key_bytes + "#n = :v".len() + placeholder_bytes
+        );
+
+        let put = put(
+            "views",
+            Item::from([("pk".into(), AttributeValue::S("view#1".into()))]),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(sdk_item_size(&put), 2 + 6);
+    }
+
+    #[test]
+    fn a_large_non_put_projector_value_exceeds_the_commit_budget() {
+        let large = "x".repeat(3_900_000);
+        let operation = TransactWriteItem::builder()
+            .update(
+                sdk::Update::builder()
+                    .table_name("views")
+                    .key("pk", s("view#1"))
+                    .update_expression("SET v = :v")
+                    .expression_attribute_values(":v", s(&large))
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+
+        let mut sizes = vec![sdk_item_size(&operation)];
+        sizes.push(10);
+
+        assert!(matches!(
+            crate::repository::check_budget(sizes),
+            Err(Error::CommitTooLarge { .. })
+        ));
     }
 
     #[test]
