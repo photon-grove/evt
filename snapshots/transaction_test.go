@@ -6,6 +6,8 @@ package snapshots_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -368,4 +370,115 @@ func TestTransaction_RefusesARepositoryWithoutTheTransactionCapability(t *testin
 
 	// The repositories this module ships declare the capability.
 	require.NoError(t, evt.RequireTransactions(mem.NewRepository()))
+}
+
+// claimEntity is a second aggregate type for transactions that mix entity types.
+type claimEntity struct {
+	evt.BaseEntity
+	Holder string `json:"holder"`
+}
+
+const (
+	claimType  evt.EntityType = "claim"
+	claimTaken evt.EventType  = "claim:taken"
+)
+
+type claimTakenEvent struct {
+	ID     evt.EntityID `json:"id"`
+	Holder string       `json:"holder"`
+}
+
+func (claimTakenEvent) EntityType() evt.EntityType { return claimType }
+func (e claimTakenEvent) EntityID() evt.EntityID   { return e.ID }
+func (claimTakenEvent) Type() evt.EventType        { return claimTaken }
+func (claimTakenEvent) Version() evt.EventVersion  { return 1 }
+
+func newClaim(id evt.EntityID) *claimEntity {
+	return &claimEntity{BaseEntity: evt.NewEntity(id)} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+}
+
+func (c *claimEntity) Type() evt.EntityType { return claimType }
+func (c *claimEntity) GetID() evt.EntityID  { return c.ID }
+func (c *claimEntity) Base() evt.BaseEntity { return c.BaseEntity } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+func (c *claimEntity) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
+	return evt.CommandResult{}, fmt.Errorf("claim handles no commands in this test")
+}
+
+func (c *claimEntity) Apply(event evt.Event) error {
+	taken, ok := event.(*claimTakenEvent)
+	if !ok {
+		return evt.NewBadEventError(event)
+	}
+	c.Holder = taken.Holder
+
+	return nil
+}
+
+func (c *claimEntity) DeserializeEvent(serialized evt.SerializedEvent) (evt.Event, error) {
+	var event claimTakenEvent
+	if err := json.Unmarshal(serialized.Payload, &event); err != nil {
+		return nil, err
+	}
+
+	return &event, nil
+}
+func (c *claimEntity) EventUpcasters() []evt.EventUpcaster { return nil }
+func (c *claimEntity) Projectors() []evt.EventProjector    { return nil }
+
+func TestTransaction_MixesEntityTypesAndFencesReadOnlyStreamsOfAnyType(t *testing.T) {
+	setup := newTransactionSetup(0)
+	ctx := context.Background()
+	metadata := newTestMetadata()
+
+	setup.seed(t, "tx-ledger", 1, metadata)
+
+	// One commit appends to a "test" entity and to a "claim" entity.
+	tx := setup.store.Transaction()
+	setup.read(t, tx, "tx-ledger")
+	claim := newClaim("tx-claim")
+	require.NoError(t, tx.Read(ctx, claim, "tx-claim"))
+	require.NoError(t, tx.Append("tx-ledger", updated("tx-ledger")))
+	require.NoError(t, tx.Append("tx-claim", &claimTakenEvent{ID: "tx-claim", Holder: "ada"}))
+	require.Equal(t, "ada", claim.Holder)
+
+	events, err := tx.Commit(ctx, metadata)
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	require.Equal(t, evt.EntityID("tx-claim"), events[0].EntityID, "events are in persisted stream order")
+	require.Equal(t, claimType, events[0].EntityType)
+	require.Equal(t, test.EntityType, events[1].EntityType)
+	require.Equal(t, events[0].Metadata.CommitID, events[1].Metadata.CommitID)
+	require.Len(t, getEvents(t, setup.repo, "tx-claim"), 1)
+	require.Len(t, getEvents(t, setup.repo, "tx-ledger"), 3, "the seeded created and updated events plus the transaction's")
+
+	// A read-only stream of the other type is fenced with engine provenance.
+	setup.repo.committed = nil
+	tx = setup.store.Transaction()
+	setup.read(t, tx, "tx-ledger")
+	require.NoError(t, tx.Read(ctx, newClaim("tx-claim"), "tx-claim"))
+	require.NoError(t, tx.Append("tx-ledger", updated("tx-ledger")))
+
+	require.NoError(t, setup.repo.Repository.Commit(ctx, serializedClaimEvent(t, 2)))
+
+	_, err = tx.Commit(ctx, metadata)
+	var conflict *evt.FenceConflictError
+	require.ErrorAs(t, err, &conflict)
+	require.Equal(t, evt.EntityID("tx-claim"), conflict.Fence.EntityID)
+	require.Equal(t, claimType, conflict.Fence.EntityType)
+	require.Equal(t, evt.EventSequence(1), conflict.Fence.Head)
+	require.False(t, conflict.Fence.CallerStamped)
+	require.True(t, policy.IsTransient(err))
+}
+
+func serializedClaimEvent(t *testing.T, sequence evt.EventSequence) evt.SerializedResult {
+	t.Helper()
+
+	payload, err := json.Marshal(claimTakenEvent{ID: "tx-claim", Holder: "grace"})
+	require.NoError(t, err)
+
+	return evt.SerializedResult{Events: []evt.SerializedEvent{{
+		ID: evt.GetEventID("tx-claim", sequence), Sequence: sequence, Type: claimTaken, Version: 1,
+		EntityID: "tx-claim", EntityType: claimType, Payload: payload,
+		Metadata: evt.Metadata{Region: "us-east-1", Origin: &evt.Origin{Source: "test", Endpoint: "test"}},
+	}}}
 }

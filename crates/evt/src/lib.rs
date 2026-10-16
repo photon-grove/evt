@@ -34,6 +34,7 @@ mod metadata;
 mod repository;
 mod retry;
 mod store;
+mod transaction;
 mod upcast;
 pub mod wire;
 
@@ -63,9 +64,8 @@ pub use repository::{
     snapshot_events_due,
 };
 pub use retry::RetryPolicy;
-pub use store::{
-    DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, Transaction, serialize_events,
-};
+pub use store::{DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, serialize_events};
+pub use transaction::{Read, Transaction};
 pub use upcast::{JsonUpcaster, Upcaster};
 
 #[cfg(doctest)]

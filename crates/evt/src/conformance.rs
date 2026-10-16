@@ -101,6 +101,63 @@ impl Aggregate for Ledger {
     }
 }
 
+/// A second aggregate type for transactions that mix entity types: a claim on a unique name,
+/// held by at most one holder.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Claim {
+    /// Who holds the claim, once taken.
+    pub holder: Option<String>,
+}
+
+/// The payload of `claim:taken`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Taken {
+    /// The new holder.
+    pub holder: String,
+}
+
+crate::domain_events! {
+    /// The [`Claim`] events.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum ClaimEvent {
+        /// The claim was taken.
+        Taken(Taken) => ("claim:taken", 1),
+    }
+}
+
+/// The [`Claim`] command: take the claim for a holder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Take(pub String);
+
+/// The [`Claim`] rejection when it is already held.
+#[derive(Debug, thiserror::Error)]
+#[error("the claim is already held")]
+pub struct AlreadyHeld;
+
+impl Aggregate for Claim {
+    const TYPE: &'static str = "claim";
+
+    type Command = Take;
+    type Event = ClaimEvent;
+    type Error = AlreadyHeld;
+    type Services = ();
+
+    async fn handle(&self, Take(holder): Take, _: &()) -> Result<Vec<ClaimEvent>, AlreadyHeld> {
+        if self.holder.is_some() {
+            return Err(AlreadyHeld);
+        }
+
+        Ok(vec![Taken { holder }.into()])
+    }
+
+    fn apply(&mut self, event: ClaimEvent) {
+        match event {
+            ClaimEvent::Taken(taken) => self.holder = Some(taken.holder),
+        }
+    }
+}
+
 /// A backend's view storage, for the case that checks projector operations commit atomically
 /// with events.
 pub trait ViewTarget<R: Repository>: Send + Sync {
@@ -227,6 +284,10 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
         record(
             "a transactional first snapshot must have sequence 1",
             transaction_first_snapshot(repo).await,
+        );
+        record(
+            "a transaction mixes aggregate types and fences read-only streams of any type",
+            mixed_type_transaction(repo).await,
         );
         record(
             "a multi-stream commit is all-or-nothing",
@@ -989,6 +1050,75 @@ async fn transaction_first_snapshot<R: Repository>(repo: &R) -> CaseResult {
         repo.snapshot(&a.id).await?,
         Some(a.snapshot(1, 2, "{}")),
         "sequence 1 is accepted"
+    );
+
+    Ok(())
+}
+
+async fn mixed_type_transaction<R: Repository>(repo: &R) -> CaseResult {
+    use crate::Transaction;
+
+    let ns = namespace();
+    let ledger_id = EntityId::new(format!("{ns}-ledger"));
+    let claim_id = EntityId::new(format!("{ns}-claim"));
+    let metadata = Metadata::new("conformance");
+
+    // One commit appends to a ledger and to a claim, two different aggregate types.
+    let mut tx = Transaction::new(repo).with_snapshot_interval(0);
+    let mut ledger = tx.read::<Ledger>(ledger_id.clone()).await?;
+    let mut claim = tx.read::<Claim>(claim_id.clone()).await?;
+    tx.append(&mut ledger, vec![Added { amount: 5 }.into()])?;
+    tx.append(
+        &mut claim,
+        vec![
+            Taken {
+                holder: "ada".to_owned(),
+            }
+            .into(),
+        ],
+    )?;
+    let committed = tx.commit(&metadata).await?;
+
+    ensure_eq!(committed.len(), 2, "both streams are committed");
+    let ledger_events = repo.events(&ledger_id).await?;
+    let claim_events = repo.events(&claim_id).await?;
+    ensure!(
+        ledger_events.len() == 1
+            && ledger_events[0].entity_type == EntityType::new(Ledger::TYPE)
+            && claim_events.len() == 1
+            && claim_events[0].entity_type == EntityType::new(Claim::TYPE),
+        "each stream is stored under its own aggregate type"
+    );
+    ensure_eq!(
+        ledger_events[0].metadata.commit_id,
+        claim_events[0].metadata.commit_id,
+        "one commit ID across both aggregate types"
+    );
+
+    // A read-only stream of another type is fenced with engine provenance: once another writer
+    // moves the claim, the transaction that read it fails with a retryable fence conflict.
+    let mut tx = Transaction::new(repo).with_snapshot_interval(0);
+    let mut ledger = tx.read::<Ledger>(ledger_id.clone()).await?;
+    tx.read::<Claim>(claim_id.clone()).await?;
+    tx.append(&mut ledger, vec![Added { amount: 1 }.into()])?;
+
+    // Another writer appends to the claim at its next sequence.
+    let stream = Stream::new(&ns, "claim", "claim");
+    stream.commit(repo, vec![stream.event(2, 1)], None).await?;
+
+    let result = tx.commit(&metadata).await;
+    ensure!(
+        matches!(
+            &result,
+            Err(Error::FenceConflict { entity_id, head: EventSequence(1), provenance: FenceProvenance::Engine })
+                if *entity_id == claim_id
+        ),
+        "the claim moved under a transaction that read it: {result:?}"
+    );
+    ensure_eq!(
+        repo.events(&ledger_id).await?.len(),
+        1,
+        "the fenced transaction wrote nothing"
     );
 
     Ok(())

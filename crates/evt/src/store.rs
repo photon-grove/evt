@@ -13,10 +13,7 @@ use crate::event::{DomainEvent, SerializedEvent};
 use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
-use crate::repository::{
-    Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
-    snapshot_events_due,
-};
+use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
 use crate::retry::RetryPolicy;
 use crate::upcast::upcast_event;
 
@@ -33,11 +30,11 @@ pub const DEFAULT_SNAPSHOT_INTERVAL: usize = 5;
 /// tasks behind an `Arc`. It is `Clone` when the repository and services are `Clone`; projectors
 /// are shared between clones.
 pub struct Store<A: Aggregate, R: Repository> {
-    repository: R,
+    pub(crate) repository: R,
     services: A::Services,
-    snapshot_interval: usize,
-    projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
-    commit_ids: CommitIdGenerator,
+    pub(crate) snapshot_interval: usize,
+    pub(crate) projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
+    pub(crate) commit_ids: CommitIdGenerator,
 }
 
 impl<A, R> Clone for Store<A, R>
@@ -136,56 +133,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     ///
     /// [`execute_with_retry`]: Store::execute_with_retry
     pub async fn load(&self, entity_id: impl Into<EntityId>) -> Result<Loaded<A>, Error> {
-        let entity_id = entity_id.into();
-        let mut attempt = 1;
-
-        // A sequence gap means another writer snapshotted and compacted the stream between the
-        // snapshot read and the event read. Loading again starts from the newer snapshot.
-        loop {
-            match self.load_once(entity_id.clone()).await {
-                Err(err) if err.is_conflict() && attempt < LOAD_ATTEMPTS => attempt += 1,
-                result => return result,
-            }
-        }
-    }
-
-    async fn load_once(&self, entity_id: EntityId) -> Result<Loaded<A>, Error> {
-        let snapshot = self.repository.snapshot(&entity_id).await?;
-        let has_snapshot = snapshot.is_some();
-
-        let mut loaded = match snapshot {
-            Some(snapshot) => {
-                let aggregate = serde_json::from_slice(&snapshot.payload).map_err(|source| {
-                    Error::Snapshot {
-                        entity_id: entity_id.clone(),
-                        source,
-                    }
-                })?;
-
-                Loaded {
-                    entity_id,
-                    aggregate,
-                    sequence: snapshot.event_sequence,
-                    snapshot_sequence: snapshot.sequence,
-                    seen_command_ids: HashSet::new(),
-                }
-            }
-            None => Loaded::new(entity_id),
-        };
-
-        let events = if has_snapshot {
-            self.repository
-                .events_after(&loaded.entity_id, loaded.sequence)
-                .await?
-        } else {
-            self.repository.events(&loaded.entity_id).await?
-        };
-
-        for event in events {
-            loaded.replay(event)?;
-        }
-
-        Ok(loaded)
+        load_aggregate(&self.repository, entity_id.into()).await
     }
 
     /// Loads the aggregate, handles the command, and commits the resulting events.
@@ -346,14 +294,73 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     }
 }
 
+/// Loads any aggregate type from a repository, retrying when a sequence gap shows a compaction
+/// raced the read. [`Store::load`] and [`Transaction::read`](crate::Transaction::read) share it.
+pub(crate) async fn load_aggregate<A: Aggregate, R: Repository>(
+    repository: &R,
+    entity_id: EntityId,
+) -> Result<Loaded<A>, Error> {
+    let mut attempt = 1;
+
+    // A sequence gap means another writer snapshotted and compacted the stream between the
+    // snapshot read and the event read. Loading again starts from the newer snapshot.
+    loop {
+        match load_once(repository, entity_id.clone()).await {
+            Err(err) if err.is_conflict() && attempt < LOAD_ATTEMPTS => attempt += 1,
+            result => return result,
+        }
+    }
+}
+
+async fn load_once<A: Aggregate, R: Repository>(
+    repository: &R,
+    entity_id: EntityId,
+) -> Result<Loaded<A>, Error> {
+    let snapshot = repository.snapshot(&entity_id).await?;
+    let has_snapshot = snapshot.is_some();
+
+    let mut loaded = match snapshot {
+        Some(snapshot) => {
+            let aggregate =
+                serde_json::from_slice(&snapshot.payload).map_err(|source| Error::Snapshot {
+                    entity_id: entity_id.clone(),
+                    source,
+                })?;
+
+            Loaded {
+                entity_id,
+                aggregate,
+                sequence: snapshot.event_sequence,
+                snapshot_sequence: snapshot.sequence,
+                seen_command_ids: HashSet::new(),
+            }
+        }
+        None => Loaded::new(entity_id),
+    };
+
+    let events = if has_snapshot {
+        repository
+            .events_after(&loaded.entity_id, loaded.sequence)
+            .await?
+    } else {
+        repository.events(&loaded.entity_id).await?
+    };
+
+    for event in events {
+        loaded.replay(event)?;
+    }
+
+    Ok(loaded)
+}
+
 /// An aggregate loaded from the event log, with the stream position it was loaded at.
 #[derive(Debug)]
 pub struct Loaded<A> {
-    entity_id: EntityId,
-    aggregate: A,
-    sequence: EventSequence,
-    snapshot_sequence: EventSequence,
-    seen_command_ids: HashSet<CommandId>,
+    pub(crate) entity_id: EntityId,
+    pub(crate) aggregate: A,
+    pub(crate) sequence: EventSequence,
+    pub(crate) snapshot_sequence: EventSequence,
+    pub(crate) seen_command_ids: HashSet<CommandId>,
 }
 
 impl<A: Aggregate> Loaded<A> {
@@ -476,204 +483,6 @@ pub fn serialize_events<A: Aggregate>(
         .collect()
 }
 
-/// One multi-stream transaction (ADR 0004, C1/C2). A caller loads aggregates with
-/// [`Store::load`], hands them to [`read`](Transaction::read), appends decided events to any
-/// subset with [`append`](Transaction::append), adds caller-stamped fences with
-/// [`fence`](Transaction::fence), and commits once with [`commit`](Transaction::commit). A stream
-/// that was read but never appended to contributes an engine-filled [read fence](ReadFence), so
-/// the commit fails when another writer moved the stream past the head the reader saw.
-///
-/// The single-aggregate shortcut stays: [`Store::execute`] remains a load, handle, and commit of
-/// one entity, over the same repository commit path.
-///
-/// A transaction commits at most once: [`commit`](Transaction::commit) takes it by value, so any
-/// commit attempt, successful or failed, consumes it, and a new transaction must be built to try
-/// again. The staging calls validate their input before changing anything, so their errors are
-/// recoverable and leave the transaction unchanged: a duplicate [`read`](Transaction::read) or an
-/// [`append`](Transaction::append) to a stream that was not read returns [`Error::InvalidCommit`],
-/// and the caller can carry on and commit.
-pub struct Transaction<'a, A: Aggregate, R: Repository> {
-    store: &'a Store<A, R>,
-    streams: Vec<Loaded<A>>,
-    appended: Vec<Vec<A::Event>>,
-    fences: Vec<ReadFence>,
-}
-
-impl<A: Aggregate, R: Repository> Store<A, R> {
-    /// Begins a multi-stream transaction on this store's repository. The aggregate type is the
-    /// store's; streams of other aggregate types can only be fenced (a caller-stamped
-    /// [`ReadFence`] with the head they were read at).
-    pub fn transaction(&self) -> Transaction<'_, A, R> {
-        Transaction {
-            store: self,
-            streams: Vec::new(),
-            appended: Vec::new(),
-            fences: Vec::new(),
-        }
-    }
-}
-
-impl<A, R> Transaction<'_, A, R>
-where
-    A: Aggregate,
-    R: Repository,
-{
-    /// Hands a loaded aggregate to the transaction's read set, consuming it. Appending events
-    /// with [`append`](Transaction::append) applies them to this copy, so the snapshot the
-    /// commit captures reflects them; a read that is never appended to is fenced at the head it
-    /// was loaded at.
-    pub fn read(&mut self, loaded: Loaded<A>) -> Result<&mut Self, Error> {
-        if self
-            .streams
-            .iter()
-            .any(|existing| existing.entity_id == loaded.entity_id)
-        {
-            return Err(Error::InvalidCommit(format!(
-                "duplicate read of {}",
-                loaded.entity_id
-            )));
-        }
-
-        self.appended.push(Vec::new());
-        self.streams.push(loaded);
-
-        Ok(self)
-    }
-
-    /// Appends decided events to a stream that was read. The events are applied to the
-    /// transaction's copy of the aggregate, so the snapshot it captures reflects them.
-    pub fn append(
-        &mut self,
-        entity_id: &EntityId,
-        events: Vec<A::Event>,
-    ) -> Result<&mut Self, Error> {
-        let index = self
-            .streams
-            .iter()
-            .position(|loaded| loaded.entity_id == *entity_id)
-            .ok_or_else(|| {
-                Error::InvalidCommit(format!(
-                    "stream {entity_id} was not read by this transaction"
-                ))
-            })?;
-
-        // The builder is typed to A, so every appended event belongs to its streams by
-        // construction; serialize_events stamps A's entity type.
-        self.appended[index].extend(events);
-
-        Ok(self)
-    }
-
-    /// Adds a caller-stamped read fence for a stream this engine did not load — typically a
-    /// stream of another aggregate type. A fence for a stream that was read is dropped, whether
-    /// `fence` is called before or after `read`: the engine's own fence provenance supersedes
-    /// it.
-    pub fn fence(&mut self, mut fence: ReadFence) -> Result<&mut Self, Error> {
-        if self
-            .streams
-            .iter()
-            .any(|loaded| loaded.entity_id == fence.entity_id)
-        {
-            return Ok(self);
-        }
-
-        fence.provenance = FenceProvenance::Caller;
-        self.fences.push(fence);
-
-        Ok(self)
-    }
-
-    /// Stamps the commit ID once, prepares every written stream's events, projector operations,
-    /// and snapshot, fences every unwritten read, and persists exactly one atomic repository
-    /// commit. On failure nothing is written.
-    pub async fn commit(mut self, metadata: &Metadata) -> Result<Vec<SerializedEvent>, Error> {
-        let metadata = stamp_commit_id(metadata, &*self.store.commit_ids);
-
-        // A caller-stamped fence for a stream this transaction read is superseded by the
-        // engine's own fence (or by the write), whichever order `fence` and `read` were called in.
-        let read_ids: Vec<EntityId> = self
-            .streams
-            .iter()
-            .map(|loaded| loaded.entity_id.clone())
-            .collect();
-        self.fences
-            .retain(|fence| !read_ids.contains(&fence.entity_id));
-
-        let mut streams = Vec::new();
-        let mut operations = Vec::new();
-        let mut committed = Vec::new();
-
-        let streams_taken = std::mem::take(&mut self.streams);
-        let appended_taken = std::mem::take(&mut self.appended);
-
-        for (mut loaded, events) in streams_taken.into_iter().zip(appended_taken) {
-            if let Some(command_id) = &metadata.command_id
-                && loaded.has_seen(command_id)
-            {
-                return Err(Error::DuplicateCommand(command_id.clone()));
-            }
-
-            if events.is_empty() {
-                // An unwritten read is fenced at the head it saw. The load seeds `sequence` from
-                // the snapshot's event sequence and advances it over later events, so it already
-                // is the larger of the stream's highest event sequence and its snapshot's —
-                // including a compacted stream, whose events a snapshot covers.
-                self.fences.push(ReadFence {
-                    entity_id: loaded.entity_id.clone(),
-                    entity_type: EntityType::new(A::TYPE),
-                    head: loaded.sequence,
-                    provenance: FenceProvenance::Engine,
-                });
-
-                continue;
-            }
-
-            let serialized =
-                serialize_events::<A>(&loaded.entity_id, loaded.sequence, &events, &metadata)?;
-
-            for event in &events {
-                loaded.aggregate.apply(event.clone());
-            }
-
-            for projector in &self.store.projectors {
-                let ops = projector
-                    .project(&loaded.entity_id, &loaded.aggregate, &events)
-                    .map_err(Error::Projector)?;
-                operations.extend(ops);
-            }
-
-            let snapshot =
-                if snapshot_events_due(loaded.sequence, events.len(), self.store.snapshot_interval)
-                    > 0
-                {
-                    Some(NewSnapshot {
-                        entity_type: EntityType::new(A::TYPE),
-                        sequence: loaded.snapshot_sequence.next(),
-                        payload: json::to_vec(&loaded.aggregate)?,
-                    })
-                } else {
-                    None
-                };
-
-            committed.extend(serialized.iter().cloned());
-            streams.push(Commit {
-                entity_id: loaded.entity_id,
-                events: serialized,
-                snapshot,
-                operations: Vec::new(),
-            });
-        }
-
-        let mut commit = TransactionCommit::new(streams);
-        commit.fences = self.fences;
-        commit.operations = operations;
-
-        self.store.repository.commit_transaction(commit).await?;
-
-        Ok(committed)
-    }
-}
-
 /// Stamps the engine's commit identity: the command ID when present and non-empty, a
 /// caller-supplied commit ID otherwise, else a generated ULID-format ID. An empty command ID is
 /// absent, as in Go's `CommitMetadata`, so both languages derive the same commit ID.
@@ -702,8 +511,7 @@ pub(crate) fn stamp_commit_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conformance::{Add, Added, Ledger};
-    use crate::mem::MemRepository;
+    use crate::conformance::{Added, Ledger};
 
     #[test]
     fn serializing_past_the_maximum_sequence_fails() {
@@ -714,227 +522,6 @@ mod tests {
             serialize_events::<Ledger>(&id, EventSequence(i64::MAX), &events, &Metadata::default());
 
         assert!(matches!(result, Err(Error::InvalidCommit(_))), "{result:?}");
-    }
-
-    fn store(interval: usize) -> Store<Ledger, MemRepository> {
-        Store::new(MemRepository::new(), ()).with_snapshot_interval(interval)
-    }
-
-    async fn seed(store: &Store<Ledger, MemRepository>, id: &str, additions: usize) {
-        for _ in 0..additions {
-            store
-                .execute(id, Add(1), Metadata::default())
-                .await
-                .expect("seed");
-        }
-    }
-
-    fn added(amount: i64) -> Vec<<Ledger as Aggregate>::Event> {
-        vec![Added { amount }.into()]
-    }
-
-    async fn stored_events(store: &Store<Ledger, MemRepository>, id: &str) -> usize {
-        store.repository().events(&id.into()).await.unwrap().len()
-    }
-
-    #[tokio::test]
-    async fn an_unwritten_read_is_fenced_at_the_head_it_saw_with_engine_provenance() {
-        let store = store(0);
-        seed(&store, "read-only", 2).await;
-        seed(&store, "written", 1).await;
-
-        // Without interference the transaction commits and leaves the fenced stream alone.
-        let mut tx = store.transaction();
-        tx.read(store.load("read-only").await.unwrap()).unwrap();
-        tx.read(store.load("written").await.unwrap()).unwrap();
-        tx.append(&"written".into(), added(5)).unwrap();
-        let committed = tx.commit(&Metadata::default()).await.unwrap();
-        assert_eq!(committed.len(), 1);
-        assert_eq!(stored_events(&store, "read-only").await, 2);
-        assert_eq!(stored_events(&store, "written").await, 2);
-
-        // Another writer moves the fenced stream past the head the transaction read.
-        let mut tx = store.transaction();
-        tx.read(store.load("read-only").await.unwrap()).unwrap();
-        tx.read(store.load("written").await.unwrap()).unwrap();
-        tx.append(&"written".into(), added(5)).unwrap();
-        seed(&store, "read-only", 1).await;
-
-        let error = tx.commit(&Metadata::default()).await.unwrap_err();
-        match &error {
-            Error::FenceConflict {
-                entity_id,
-                head,
-                provenance,
-            } => {
-                assert_eq!(entity_id.as_str(), "read-only");
-                assert_eq!(*head, EventSequence(2), "the head the transaction read");
-                assert_eq!(*provenance, FenceProvenance::Engine);
-            }
-            other => panic!("expected a fence conflict, got {other:?}"),
-        }
-        assert!(error.is_conflict());
-        assert!(error.is_retryable(), "an engine-filled fence retries");
-        assert_eq!(stored_events(&store, "written").await, 2, "nothing written");
-    }
-
-    #[tokio::test]
-    async fn a_fenced_read_of_a_compacted_stream_keeps_the_snapshots_head() {
-        let store = store(2);
-        seed(&store, "compacted", 2).await;
-        store
-            .repository()
-            .compact_below(&"compacted".into(), EventSequence(2))
-            .await
-            .unwrap();
-        assert_eq!(stored_events(&store, "compacted").await, 0);
-
-        let mut tx = store.transaction();
-        tx.read(store.load("compacted").await.unwrap()).unwrap();
-        tx.read(store.load("target").await.unwrap()).unwrap();
-        tx.append(&"target".into(), added(1)).unwrap();
-        seed(&store, "compacted", 1).await;
-
-        match tx.commit(&Metadata::default()).await.unwrap_err() {
-            Error::FenceConflict { head, .. } => assert_eq!(head, EventSequence(2)),
-            other => panic!("expected a fence conflict, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_caller_stamped_fence_is_not_retryable() {
-        let store = store(0);
-        seed(&store, "external", 2).await;
-
-        let mut tx = store.transaction();
-        tx.read(store.load("target").await.unwrap()).unwrap();
-        tx.append(&"target".into(), added(1)).unwrap();
-        tx.fence(ReadFence::new(
-            "external",
-            "ledger",
-            EventSequence(1),
-            FenceProvenance::Engine,
-        ))
-        .unwrap();
-
-        let error = tx.commit(&Metadata::default()).await.unwrap_err();
-        assert!(
-            matches!(
-                error,
-                Error::FenceConflict {
-                    provenance: FenceProvenance::Caller,
-                    head: EventSequence(1),
-                    ..
-                }
-            ),
-            "fence() stamps caller provenance whatever the input says: {error:?}"
-        );
-        assert!(!error.is_retryable());
-        assert_eq!(stored_events(&store, "target").await, 0);
-    }
-
-    #[tokio::test]
-    async fn a_caller_fence_for_an_already_read_stream_is_dropped_in_either_order() {
-        for fence_first in [false, true] {
-            let store = store(0);
-            seed(&store, "read", 2).await;
-
-            // Head 99 would fail the commit if the caller's fence survived.
-            let stale =
-                ReadFence::new("read", "ledger", EventSequence(99), FenceProvenance::Caller);
-
-            let mut tx = store.transaction();
-            if fence_first {
-                tx.fence(stale.clone()).unwrap();
-            }
-            tx.read(store.load("read").await.unwrap()).unwrap();
-            if !fence_first {
-                tx.fence(stale).unwrap();
-            }
-            tx.read(store.load("target").await.unwrap()).unwrap();
-            tx.append(&"target".into(), added(1)).unwrap();
-
-            tx.commit(&Metadata::default())
-                .await
-                .unwrap_or_else(|error| panic!("fence_first={fence_first}: {error:?}"));
-            assert_eq!(stored_events(&store, "target").await, 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn a_duplicate_command_in_any_stream_fails_the_whole_transaction() {
-        let store = store(0);
-        let metadata = Metadata::default().with_command_id("cmd-1");
-
-        // The command already ran against the first stream of the read set.
-        store
-            .execute("earlier", Add(1), metadata.clone())
-            .await
-            .unwrap();
-
-        let mut tx = store.transaction();
-        tx.read(store.load("earlier").await.unwrap()).unwrap();
-        tx.read(store.load("later").await.unwrap()).unwrap();
-        tx.append(&"later".into(), added(1)).unwrap();
-
-        let error = tx.commit(&metadata).await.unwrap_err();
-        assert!(error.is_duplicate_command(), "{error:?}");
-        assert_eq!(stored_events(&store, "later").await, 0, "nothing written");
-    }
-
-    #[tokio::test]
-    async fn the_builder_rejects_unread_appends_and_duplicate_reads() {
-        let store = store(0);
-        seed(&store, "known", 1).await;
-
-        let mut tx = store.transaction();
-        tx.read(store.load("known").await.unwrap()).unwrap();
-
-        assert!(matches!(
-            tx.read(store.load("known").await.unwrap()),
-            Err(Error::InvalidCommit(_))
-        ));
-        assert!(matches!(
-            tx.append(&"unread".into(), added(1)),
-            Err(Error::InvalidCommit(_))
-        ));
-
-        // Both errors were recoverable: the transaction is unchanged and still commits. Only
-        // commit() consumes it, by taking it by value.
-        tx.commit(&Metadata::default()).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn one_commit_id_is_stamped_across_every_stream() {
-        let store = store(0);
-
-        let mut tx = store.transaction();
-        tx.read(store.load("first").await.unwrap()).unwrap();
-        tx.read(store.load("second").await.unwrap()).unwrap();
-        tx.append(&"second".into(), added(1)).unwrap();
-        tx.append(&"first".into(), added(2)).unwrap();
-        let committed = tx.commit(&Metadata::default()).await.unwrap();
-
-        assert_eq!(committed.len(), 2);
-        let commit_id = committed[0].metadata.commit_id.clone();
-        assert!(!commit_id.is_empty(), "the engine generates a commit ID");
-        assert!(committed.iter().all(|e| e.metadata.commit_id == commit_id));
-
-        // The stored copies carry it too.
-        for id in ["first", "second"] {
-            let stored = store.repository().events(&id.into()).await.unwrap();
-            assert_eq!(stored[0].metadata.commit_id, commit_id);
-        }
-
-        // With a command ID the commit ID derives from it.
-        let metadata = Metadata::default().with_command_id("cmd-9");
-        let mut tx = store.transaction();
-        tx.read(store.load("first").await.unwrap()).unwrap();
-        tx.read(store.load("second").await.unwrap()).unwrap();
-        tx.append(&"first".into(), added(3)).unwrap();
-        tx.append(&"second".into(), added(4)).unwrap();
-        let committed = tx.commit(&metadata).await.unwrap();
-        assert!(committed.iter().all(|e| e.metadata.commit_id == "cmd-9"));
     }
 
     #[test]
@@ -955,34 +542,5 @@ mod tests {
         let mut derived = Metadata::default().with_command_id("cmd-1");
         derived.commit_id = "caller-commit".to_owned();
         assert_eq!(stamp_commit_id(&derived, &generated).commit_id, "cmd-1");
-    }
-
-    #[tokio::test]
-    async fn an_injected_generator_stamps_every_stream_of_a_commit() {
-        let store = Store::<Ledger, _>::new(MemRepository::new(), ())
-            .with_snapshot_interval(0)
-            .with_commit_id_generator(|| "injected-commit".to_owned());
-
-        let mut tx = store.transaction();
-        tx.read(store.load("first").await.unwrap()).unwrap();
-        tx.read(store.load("second").await.unwrap()).unwrap();
-        tx.append(&"first".into(), added(1)).unwrap();
-        tx.append(&"second".into(), added(1)).unwrap();
-        // An empty command ID must not blank the commit ID.
-        let committed = tx
-            .commit(&Metadata::default().with_command_id(""))
-            .await
-            .unwrap();
-        assert!(
-            committed
-                .iter()
-                .all(|event| event.metadata.commit_id == "injected-commit")
-        );
-
-        let executed = store
-            .execute("third", Add(1), Metadata::default())
-            .await
-            .unwrap();
-        assert_eq!(executed.events[0].metadata.commit_id, "injected-commit");
     }
 }
