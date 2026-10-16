@@ -41,6 +41,11 @@ type SuiteOptions struct {
 	// double and every durable backend support it; a minimal backend may leave it false.
 	SupportsTransactions bool
 
+	// SupportsOutcomes indicates the backend implements evt.OutcomeRepository: command outcomes
+	// (ADR 0004, C3/C4) are written inside the commit transaction and read back strongly
+	// consistently. The in-memory double and every durable backend support it.
+	SupportsOutcomes bool
+
 	// DeclareRetention durably adds the given entity type to the feature manifest's retention set
 	// of the repository under test, so the fence-retention-refusal case can run. It is mandatory
 	// for a backend that sets SupportsTransactions: the spec refuses read fences for retained
@@ -176,6 +181,12 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
 		t.Run("RejectsOutOfOrderEvents", func(t *testing.T) {
 			testOutOfOrderEvents(t, newRepo())
+		})
+	}
+
+	if opts.SupportsOutcomes {
+		t.Run("Outcomes", func(t *testing.T) {
+			RunOutcomeSuite(t, newRepo, opts.EnforcesOptimisticConcurrency)
 		})
 	}
 }
