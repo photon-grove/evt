@@ -982,6 +982,19 @@ impl Repository for DynamoRepository {
         }
     }
 
+    fn deadline(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        // The SDK's own timer. A client with no timer never fires, so its reads are bounded only
+        // by the SDK's operation timeouts.
+        let sleeper = self.client.config().sleep_impl();
+
+        async move {
+            match sleeper {
+                Some(sleeper) => sleeper.sleep(duration).await,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
         crate::outcome::check_command_id(command_id)?;
 
@@ -1571,7 +1584,7 @@ fn classify_transaction_error<R>(
     err: SdkError<TransactWriteItemsError, R>,
 ) -> Error
 where
-    R: std::fmt::Debug + Send + Sync + 'static,
+    R: HttpStatus + std::fmt::Debug + Send + Sync + 'static,
 {
     let codes = cancellation_reasons(&err);
 
@@ -1607,22 +1620,48 @@ where
 /// (validation, a missing table, authorization, a cancelled transaction with known reasons) is not.
 fn commit_result_unknown<R>(err: &SdkError<TransactWriteItemsError, R>) -> bool
 where
-    R: std::fmt::Debug + Send + Sync + 'static,
+    R: HttpStatus + std::fmt::Debug + Send + Sync + 'static,
 {
     match err {
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
             true
         }
-        SdkError::ServiceError(service) => matches!(
-            service.err().code(),
-            Some(
-                "InternalServerError"
-                    | "ServiceUnavailable"
-                    | "TransactionInProgressException"
-                    | "IdempotentParameterMismatchException"
-            )
-        ),
+        // Any 5xx is a server or gateway fault, whatever its error code: a proxy's 502 or 504 can
+        // arrive after the transaction applied.
+        SdkError::ServiceError(service) => {
+            service
+                .raw()
+                .http_status()
+                .is_some_and(|status| status >= 500)
+                || matches!(
+                    service.err().code(),
+                    Some(
+                        "InternalServerError"
+                            | "ServiceUnavailable"
+                            | "TransactionInProgressException"
+                            | "IdempotentParameterMismatchException"
+                    )
+                )
+        }
         _ => false,
+    }
+}
+
+/// The HTTP status of a raw SDK response, when it has one.
+trait HttpStatus {
+    fn http_status(&self) -> Option<u16>;
+}
+
+impl HttpStatus for aws_sdk_dynamodb::config::http::HttpResponse {
+    fn http_status(&self) -> Option<u16> {
+        Some(self.status().as_u16())
+    }
+}
+
+#[cfg(test)]
+impl HttpStatus for () {
+    fn http_status(&self) -> Option<u16> {
+        None
     }
 }
 
@@ -2513,6 +2552,43 @@ mod tests {
                 "{definitive} is definitive: {classified:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_gateway_fault_with_an_unknown_code_is_an_unknown_result() {
+        use aws_sdk_dynamodb::error::ErrorMetadata;
+
+        #[derive(Debug)]
+        struct Status(u16);
+
+        impl HttpStatus for Status {
+            fn http_status(&self) -> Option<u16> {
+                Some(self.0)
+            }
+        }
+
+        let entity = EntityId::new("acct-1");
+        let service = |status: u16| {
+            SdkError::<TransactWriteItemsError, Status>::service_error(
+                TransactWriteItemsError::generic(
+                    ErrorMetadata::builder().code("SomeGatewayCode").build(),
+                ),
+                Status(status),
+            )
+        };
+
+        for status in [500, 502, 503, 504] {
+            assert!(
+                matches!(
+                    classify_transaction_error(&entity, 0, true, service(status)),
+                    Error::Indeterminate(_)
+                ),
+                "{status} may have arrived after the transaction applied"
+            );
+        }
+
+        let classified = classify_transaction_error(&entity, 0, true, service(400));
+        assert!(matches!(classified, Error::Backend(_)), "{classified:?}");
     }
 
     #[test]

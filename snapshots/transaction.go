@@ -108,6 +108,17 @@ func (tx *Transaction) Append(entityID evt.EntityID, events ...evt.Event) error 
 		return fmt.Errorf("snapshots: stream %s was not read by this transaction", entityID)
 	}
 
+	// A command records the identity digest of the streams it declared. Writing any other stream
+	// would commit an effect that digest omits, so a later call with the declared identity would
+	// replay an outcome for it. Nothing is changed, so the transaction stays usable.
+	if tx.command != nil && len(events) > 0 {
+		if _, declared := tx.command.declared[entityID]; !declared {
+			return &evt.InvalidCommitError{Reason: fmt.Sprintf(
+				"stream %s is written but was not declared by the command's identity", entityID,
+			)}
+		}
+	}
+
 	for _, event := range events {
 		if event.EntityType() != stream.entity.Type() {
 			tx.used = true

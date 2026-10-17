@@ -839,6 +839,10 @@ impl Repository for PostgresRepository {
         tokio::time::sleep(duration)
     }
 
+    fn deadline(&self, duration: std::time::Duration) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(duration)
+    }
+
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
         crate::outcome::check_command_id(command_id)?;
 

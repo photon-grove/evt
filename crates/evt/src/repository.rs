@@ -176,6 +176,11 @@ impl<Op> Commit<Op> {
 
         if let Some(outcome) = &self.outcome {
             check_outcome(outcome)?;
+            crate::outcome::check_commit_text(
+                &self.events,
+                self.snapshot.iter().map(|snapshot| &snapshot.entity_type),
+                [&self.entity_id],
+            )?;
 
             if outcome.is_rejected() && !self.events.is_empty() {
                 return invalid(format!(
@@ -365,6 +370,19 @@ impl<Op> TransactionCommit<Op> {
     pub fn normalize(&mut self) -> Result<(), Error> {
         if let Some(outcome) = &self.outcome {
             check_outcome(outcome)?;
+            crate::outcome::check_commit_text(
+                self.streams.iter().flat_map(|stream| &stream.events),
+                self.fences.iter().map(|fence| &fence.entity_type).chain(
+                    self.streams
+                        .iter()
+                        .filter_map(|stream| stream.snapshot.as_ref())
+                        .map(|snapshot| &snapshot.entity_type),
+                ),
+                self.fences
+                    .iter()
+                    .map(|fence| &fence.entity_id)
+                    .chain(self.streams.iter().map(|stream| &stream.entity_id)),
+            )?;
         }
 
         let mut ids = std::collections::BTreeSet::new();
@@ -645,6 +663,16 @@ pub trait Repository: Send + Sync {
         async {}
     }
 
+    /// Resolves after `duration` on the repository's runtime timer, to bound a read: ambiguous-write
+    /// recovery races each outcome read against it, so a read that never resolves ends recovery at
+    /// its window instead of hanging it. The default never resolves, so a backend with no timer
+    /// must bound its own reads (the SDK and database clients here do, and override this).
+    fn deadline(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        let _ = duration;
+
+        std::future::pending()
+    }
+
     /// Reads the command outcome row for a command ID, or `None` when none exists. The read must
     /// be strongly consistent regardless of the repository's read-consistency setting: an
     /// eventually consistent miss would re-execute a committed command. The default refuses with
@@ -750,6 +778,10 @@ macro_rules! forward_repository {
 
             fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {
                 (**self).backoff(duration)
+            }
+
+            fn deadline(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+                (**self).deadline(duration)
             }
 
             fn outcome(

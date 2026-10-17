@@ -382,3 +382,60 @@ func TestNormalizeCommitRefusesNonCanonicalEventIDs(t *testing.T) {
 	var invalid *evt.InvalidCommitError
 	require.ErrorAs(t, err, &invalid)
 }
+
+func TestNormalizeCommitRefusesNULAndInvalidTextInAnOutcomeCommit(t *testing.T) {
+	t.Parallel()
+
+	outcome := &evt.Outcome{CommandID: "cmd", Status: evt.OutcomeAccepted, Digest: "d"}
+	event := func(mutate func(*evt.SerializedEvent)) evt.SerializedEvent {
+		e := evt.SerializedEvent{ID: "a:1", Sequence: 1, EntityID: "a", EntityType: "t", Type: "t:e", Version: 1}
+		mutate(&e)
+
+		return e
+	}
+
+	for name, bad := range map[string]evt.SerializedEvent{
+		"event type":  event(func(e *evt.SerializedEvent) { e.Type = "t:\x00" }),
+		"entity type": event(func(e *evt.SerializedEvent) { e.EntityType = "t\x00" }),
+		"invalid":     event(func(e *evt.SerializedEvent) { e.Type = "t:\xff" }),
+		"metadata": event(func(e *evt.SerializedEvent) {
+			e.Metadata.Extensions = map[string]string{"k": "v\x00"}
+		}),
+	} {
+		_, err := evt.NormalizeCommit(evt.SerializedResult{Events: []evt.SerializedEvent{bad}, Outcome: outcome})
+		require.ErrorIs(t, err, evt.ErrInvalidArgument, name)
+	}
+
+	// Without an outcome the commit is unchanged: the rule belongs to the outcome feature.
+	_, err := evt.NormalizeCommit(evt.SerializedResult{Events: []evt.SerializedEvent{
+		event(func(e *evt.SerializedEvent) { e.Type = "t:\x00" }),
+	}})
+	require.NoError(t, err)
+}
+
+func TestCheckOutcomeInspectsTheEncodingOfTypedRejectionDetails(t *testing.T) {
+	t.Parallel()
+
+	type payload struct {
+		Name string `json:"name"`
+	}
+
+	for name, details := range map[string]map[string]any{
+		"typed slice": {"tags": []string{"bad\x00value"}},
+		"typed map":   {"m": map[string]int{"ke\x00y": 1}},
+		"struct":      {"s": payload{Name: "n\x00"}},
+		"pointer":     {"p": &payload{Name: "n\x00"}},
+		"array":       {"a": [1]string{"x\x00"}},
+	} {
+		err := evt.CheckOutcome(&evt.Outcome{
+			CommandID: "cmd", Status: evt.OutcomeRejected, Digest: "d",
+			Rejection: &evt.Rejection{Code: "c", Message: "m", Details: details},
+		})
+		require.ErrorIs(t, err, evt.ErrInvalidArgument, name)
+	}
+
+	require.NoError(t, evt.CheckOutcome(&evt.Outcome{
+		CommandID: "cmd", Status: evt.OutcomeRejected, Digest: "d",
+		Rejection: &evt.Rejection{Code: "c", Message: "m", Details: map[string]any{"s": payload{Name: "fine"}}},
+	}))
+}

@@ -153,8 +153,9 @@ implements `ToRejection`:
   (timeout, lost connection or response, server fault, a dropped `COMMIT`) must fail with
   `Error::Indeterminate`, the only error the store recovers by re-reading the outcome row; a
   definitive failure (validation, missing table, authorization, a constraint error) must stay
-  `Error::Backend`. `Repository::backoff` is the timer recovery polling sleeps on (override it if your
-  runtime has one). Decoded outcome rows must pass `Outcome::validate_stored`.
+  `Error::Backend`. `Repository::backoff` is the timer recovery polling sleeps on and `Repository::deadline` the timer
+  that bounds each recovery read (override both if your runtime has one; a backend with no timer must
+  bound its own reads). Decoded outcome rows must pass `Outcome::validate_stored`.
 - `Store::transaction` records multi-stream commands with `Transaction::begin_command`, which must
   be the first call on the transaction (`Error::CommandOrder` after any read, append, or fence; a
   replayed result finishes the transaction), then

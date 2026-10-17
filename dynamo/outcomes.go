@@ -124,6 +124,13 @@ func indeterminateCommit(err error) bool {
 		return false
 	}
 
+	// Any 5xx is a server or gateway fault whatever its error code: a proxy's 502 or 504 can arrive
+	// after the transaction applied.
+	var response *awshttp.ResponseError
+	if errors.As(err, &response) && response.HTTPStatusCode() >= http.StatusInternalServerError {
+		return true
+	}
+
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
@@ -135,11 +142,6 @@ func indeterminateCommit(err error) bool {
 		// Client faults (validation, access, throttling, a missing table) are refused before
 		// anything is written.
 		return apiErr.ErrorFault() == smithy.FaultServer
-	}
-
-	var response *awshttp.ResponseError
-	if errors.As(err, &response) && response.HTTPStatusCode() >= http.StatusInternalServerError {
-		return true
 	}
 
 	var send *smithyhttp.RequestSendError

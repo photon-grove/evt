@@ -793,7 +793,10 @@ lp(x)  = uint32 little-endian byte length of x, followed by x
 - The declared target stream IDs are the streams the command declares it will write events to —
   fixed before execution, deduplicated and sorted by byte order. The executed commit may write a
   subset of them (state can change under it); the digest is unchanged either way, which is what
-  makes retries and recovery compare equal. Fenced (read-only) streams are not part of the
+  makes retries and recovery compare equal. It may **not** write a stream outside them: the digest
+  would omit that effect, and a later call with the declared identity would replay an outcome for
+  it. Appending to an undeclared stream is refused (Go `*InvalidCommitError`, Rust
+  `Error::InvalidCommit`) before anything is staged, and the transaction stays usable. Fenced (read-only) streams are not part of the
   digest; a fenced conflict is caught by the fence checks themselves. An outcome-only commit
   declares an empty list.
 - `canonical payload JSON` is the command payload encoded by the shared JSON rules (the same
@@ -923,11 +926,21 @@ outcome or the aggregate is read and before the handler runs.
 **U+0000 is refused everywhere it cannot be stored.** PostgreSQL `text` and `jsonb` cannot hold a
 NUL character, DynamoDB and the in-memory repository can; so that the same call has the same result
 on every backend, a command ID, a digest, and a rejection's `code`, `message`, and `details` (every
-string and every object key, at any depth) must not contain U+0000. Violations are the typed
-invalid-argument error (Go `ErrInvalidArgument`, Rust `Error::InvalidArgument`), returned before
-the outcome or the aggregate is read, before the handler runs for a command ID or digest, and
-before any write for a rejection. The recovery window bounds the whole recovery, including a read
-that hangs: no per-read timeout extends it past the window plus one second for the last poll.
+string and every object key, at any depth, whatever Go or Rust type the details hold: the encoded
+JSON is what is checked) must not contain U+0000. The same holds for every other caller-supplied
+string the engine persists on the command's events: the principal, causation, and commit IDs, the
+trace carrier, the origin, the address, the region, the timestamp, the extension keys and values,
+and, for a commit that records an outcome, the event IDs and types and the entity IDs and types of
+its events, snapshots, and fences. Go also requires valid UTF-8 for all of them. Violations are the
+typed invalid-argument error (Go `ErrInvalidArgument`, Rust `Error::InvalidArgument`), returned
+before the outcome or the aggregate is read, before the handler runs for a command ID, a digest, or
+metadata, and before any write for a rejection or an event. The recovery window bounds the whole
+recovery, including a read that hangs: no read extends it past the window plus one second for the
+last poll. Go derives each read's timeout from the recovery context; Rust races every read against
+`Repository::deadline`, so a read that never resolves ends recovery as a retryable ambiguous write.
+A malformed row found during recovery is corruption (Go `*CorruptOutcomeError`, Rust
+`Error::InvalidRecord`), never masked as an ambiguous write. The response bytes in a returned
+outcome are a copy: a caller that reuses its buffer cannot change them.
 
 A stored accepted outcome that carries a `code` attribute at all, even an empty one, is corrupt: the
 attribute exists exactly when the outcome carries a rejection.

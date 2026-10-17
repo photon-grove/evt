@@ -1,6 +1,7 @@
 package snapshots
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -363,7 +364,7 @@ func (store *Store) executeOutcome(
 		return executed{}, err
 	}
 
-	serialized, snapshots, err := store.stage(entity, &eventContext, entityID, result.Events, evt.CommitMetadata(metadata))
+	serialized, snapshots, err := store.stage(entity, &eventContext, entityID, result.Events, evt.CommitMetadata(cmd.metadata))
 	if err != nil {
 		return executed{}, err
 	}
@@ -444,6 +445,11 @@ type command struct {
 	id     evt.CommandID
 	digest string
 
+	// declared is the set of streams the command's identity declares it will write. The digest
+	// covers exactly these, so a write to any other stream would record an outcome whose identity
+	// omits it.
+	declared map[evt.EntityID]struct{}
+
 	metadata evt.Metadata
 }
 
@@ -486,7 +492,19 @@ func (store *Store) beginCommand(
 	// The command's metadata is snapshotted here: the ID and digest are frozen, so a caller that
 	// changes its metadata (or anything it points to) before Complete or Reject must not change what
 	// they write.
-	cmd := &command{store: store, repo: repo, id: *metadata.CommandID, digest: digest, metadata: metadata.Clone()}
+	declared := make(map[evt.EntityID]struct{}, len(identity.Streams))
+	for _, stream := range identity.Streams {
+		declared[stream] = struct{}{}
+	}
+
+	cmd := &command{
+		store:    store,
+		repo:     repo,
+		id:       *metadata.CommandID,
+		digest:   digest,
+		declared: declared,
+		metadata: metadata.Clone(),
+	}
 
 	stored, err := repo.GetOutcome(ctx, cmd.id)
 	if err != nil {
@@ -533,11 +551,13 @@ func (c *command) commit(
 		rejection = &canonical
 	}
 
+	// The response is copied: the caller (or a handler) may keep and reuse its buffer, and neither
+	// the stored row nor the returned outcome may change with it.
 	result.Outcome = &evt.Outcome{
 		CommandID: c.id,
 		Status:    status,
 		Digest:    c.digest,
-		Response:  response,
+		Response:  bytes.Clone(response),
 		Rejection: rejection,
 	}
 
@@ -550,7 +570,14 @@ func (c *command) commit(
 		return c.settle(ctx, err)
 	}
 
-	return &evt.CommandOutcome{Outcome: *normalized.Outcome, Events: normalized.Events}, nil
+	return &evt.CommandOutcome{Outcome: cloneOutcome(*normalized.Outcome), Events: normalized.Events}, nil
+}
+
+// cloneOutcome copies the byte slice an outcome shares with the commit that produced it.
+func cloneOutcome(outcome evt.Outcome) evt.Outcome {
+	outcome.Response = bytes.Clone(outcome.Response)
+
+	return outcome
 }
 
 // settle resolves a failed commit that carried the outcome.
@@ -578,7 +605,7 @@ func (c *command) settle(ctx context.Context, commitErr error) (*evt.CommandOutc
 		// row exists, it answers the command; if not, this is an ordinary conflict (or transient
 		// refusal) to retry.
 		resolved, err := c.reread(context.WithoutCancel(ctx))
-		if errors.Is(err, evt.ErrIdempotencyKeyReuse) {
+		if errors.Is(err, evt.ErrIdempotencyKeyReuse) || errors.Is(err, evt.ErrCorruptOutcome) {
 			return nil, err
 		}
 
@@ -658,7 +685,9 @@ func (c *command) recover(ctx context.Context, commitErr error) (*evt.CommandOut
 func (c *command) reread(ctx context.Context) (*evt.CommandOutcome, error) {
 	// ctx is already detached from the caller's cancellation (and, during recovery, bounded by the
 	// recovery window): the per-read timeout derives from it, so a read can never outlive the window.
-	readCtx, cancel := context.WithTimeout(ctx, readTimeout)
+	// A read is also never given longer than the configured recovery window plus its grace, so a
+	// short WithRecoveryWait bounds the conflict rereads as well.
+	readCtx, cancel := context.WithTimeout(ctx, min(readTimeout, c.store.outcomes.recoveryWait+recoveryMaxDelay))
 	defer cancel()
 
 	stored, err := c.repo.GetOutcome(readCtx, c.id)

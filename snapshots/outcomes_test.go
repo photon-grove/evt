@@ -471,3 +471,40 @@ func TestOutcomes_RecoveryNeverOutlivesItsWindowEvenWhenAReadHangs(t *testing.T)
 	require.ErrorIs(t, err, evt.ErrAmbiguousWrite)
 	require.Less(t, elapsed, 2*time.Second, "a hung read must be cut at the recovery window, not the 10 s per-read timeout")
 }
+
+func TestOutcomes_EventsDoNotShareTheCallersMetadata(t *testing.T) {
+	store, repo := newOutcomeStore(t)
+	ctx := context.Background()
+
+	metadata := commandMetadata("cmd-1")
+	metadata.Extensions = map[string]string{"tenant": "acme"}
+
+	outcome, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), metadata)
+	require.NoError(t, err)
+	require.Len(t, outcome.Events, 1)
+
+	// The caller reuses its metadata for the next command.
+	*metadata.CommandID = "cmd-2"
+	metadata.Extensions["tenant"] = "other"
+
+	require.Equal(t, evt.CommandID("cmd-1"), *outcome.Events[0].Metadata.CommandID)
+	require.Equal(t, "acme", outcome.Events[0].Metadata.Extensions["tenant"])
+
+	stored, err := repo.GetEvents(ctx, "e-1")
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	require.Equal(t, evt.CommandID("cmd-1"), *stored[0].Metadata.CommandID)
+	require.Equal(t, "acme", stored[0].Metadata.Extensions["tenant"])
+}
+
+func TestOutcomes_ARejectionWithInvalidUTF8CodeOrMessageIsRefused(t *testing.T) {
+	for name, rejection := range map[string]evt.Rejection{
+		"code":    {Code: "bad\xff", Message: "m"},
+		"message": {Code: "c", Message: "bad\xff"},
+	} {
+		err := evt.CheckOutcome(&evt.Outcome{
+			CommandID: "cmd", Status: evt.OutcomeRejected, Digest: "d", Rejection: &rejection,
+		})
+		require.ErrorIs(t, err, evt.ErrInvalidArgument, name)
+	}
+}

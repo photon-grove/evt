@@ -247,14 +247,20 @@ func CheckCommandID(id CommandID) error {
 	return nil
 }
 
-// rejectionHasNUL reports whether the code, message, or any string or key in details contains
-// U+0000.
-func rejectionHasNUL(rejection Rejection) bool {
-	return strings.ContainsRune(string(rejection.Code), 0) ||
-		strings.ContainsRune(rejection.Message, 0) ||
-		valueHasNUL(rejection.Details)
+// jsonHasNUL reports whether encoded JSON holds U+0000 in any string or object key, at any depth.
+// It inspects the encoding rather than the Go values, so it is exact for every marshalable type
+// (typed maps, slices, arrays, pointers, structs, and types with their own MarshalJSON).
+func jsonHasNUL(encoded []byte) (bool, error) {
+	var decoded any
+
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return false, err
+	}
+
+	return valueHasNUL(decoded), nil
 }
 
+// valueHasNUL walks a generically decoded JSON value.
 func valueHasNUL(value any) bool {
 	switch v := value.(type) {
 	case string:
@@ -274,6 +280,108 @@ func valueHasNUL(value any) bool {
 	}
 
 	return false
+}
+
+// checkText refuses a caller-supplied string that cannot be stored identically on every backend:
+// it must be valid UTF-8 and must not contain U+0000, which PostgreSQL text and jsonb cannot hold.
+func checkText(argument, value string) error {
+	if !utf8.ValidString(value) {
+		return &InvalidArgumentError{Argument: argument, Message: "must be valid UTF-8"}
+	}
+
+	if strings.ContainsRune(value, 0) {
+		return &InvalidArgumentError{Argument: argument, Message: "must not contain U+0000"}
+	}
+
+	return nil
+}
+
+// CheckMetadata validates every caller-supplied string of the command metadata that the engine
+// persists on the command's events: the command, causation, and principal IDs, the trace carrier,
+// the origin, the address, the region, the timestamp, the extension keys and values, and the commit
+// ID. Each must be valid UTF-8 and free of U+0000, which PostgreSQL cannot store, so the same
+// command has the same result on every backend. It runs before the outcome pre-check and the
+// handler.
+func CheckMetadata(metadata Metadata) error {
+	optional := func(argument string, value *string) error {
+		if value == nil {
+			return nil
+		}
+
+		return checkText(argument, *value)
+	}
+
+	var commandID, causationID, principal *string
+
+	if metadata.CommandID != nil {
+		commandID = (*string)(metadata.CommandID)
+	}
+
+	if metadata.CausationID != nil {
+		causationID = (*string)(metadata.CausationID)
+	}
+
+	if metadata.PrincipalID != nil {
+		principal = (*string)(metadata.PrincipalID)
+	}
+
+	for _, field := range []struct {
+		name  string
+		value *string
+	}{
+		{"commandId", commandID},
+		{"causationId", causationID},
+		{"principalId", principal},
+		{"address", metadata.Address},
+	} {
+		if err := optional(field.name, field.value); err != nil {
+			return err
+		}
+	}
+
+	for _, field := range []struct{ name, value string }{
+		{"region", metadata.Region},
+		{"timestamp", metadata.Timestamp},
+		{"commitId", metadata.CommitID},
+	} {
+		if err := checkText(field.name, field.value); err != nil {
+			return err
+		}
+	}
+
+	if metadata.Origin != nil {
+		if err := checkText("origin.source", string(metadata.Origin.Source)); err != nil {
+			return err
+		}
+
+		if err := checkText("origin.endpoint", string(metadata.Origin.Endpoint)); err != nil {
+			return err
+		}
+	}
+
+	if metadata.Trace != nil {
+		for key, value := range *metadata.Trace {
+			if err := checkText("trace", key); err != nil {
+				return err
+			}
+
+			if err := checkText("trace", value); err != nil {
+				return err
+			}
+		}
+	}
+
+	for key, value := range metadata.Extensions {
+		if err := checkText("extensions", key); err != nil {
+			return err
+		}
+
+		if err := checkText("extensions", value); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // CheckDigest validates an identity digest — the output of the default or a custom Digester —
@@ -388,15 +496,28 @@ func CheckOutcome(outcome *Outcome) error {
 	}
 
 	if outcome.Rejection != nil {
-		// U+0000 cannot be stored by PostgreSQL (text, jsonb), so a rejection that carries it in its
-		// code, message, or details is refused on every backend alike, before any write.
-		if rejectionHasNUL(*outcome.Rejection) {
-			return &InvalidArgumentError{Argument: "rejection", Message: "a rejection must not contain U+0000 in its code, message, or details"}
-		}
-
 		encoded, err := EncodeRejection(*outcome.Rejection)
 		if err != nil {
 			return fmt.Errorf("encode rejection: %w", err)
+		}
+
+		// The code and message are stored as plain text as well as inside the JSON, where invalid
+		// bytes would silently become U+FFFD: require valid UTF-8 so both copies agree.
+		if err := checkText("rejection.code", string(outcome.Rejection.Code)); err != nil {
+			return err
+		}
+
+		if err := checkText("rejection.message", outcome.Rejection.Message); err != nil {
+			return err
+		}
+
+		// U+0000 cannot be stored by PostgreSQL (text, jsonb), so a rejection that carries it in its
+		// code, message, or details (whatever Go types the details hold) is refused on every
+		// backend alike, before any write. The encoding is checked, so the test is exact.
+		if hasNUL, err := jsonHasNUL(encoded); err != nil {
+			return fmt.Errorf("encode rejection: %w", err)
+		} else if hasNUL {
+			return &InvalidArgumentError{Argument: "rejection", Message: "a rejection must not contain U+0000 in its code, message, or details"}
 		}
 
 		if len(encoded) > MaxOutcomeBytes {
@@ -640,13 +761,13 @@ func (identity CommandIdentity) DigestInput(metadata Metadata) (DigestInput, err
 
 	// The identity strings are hashed as bytes, but a command's type, streams, and principal that
 	// are not valid UTF-8 cannot be stored or compared identically on every backend.
-	if !utf8.ValidString(string(identity.Type)) {
-		return DigestInput{}, &InvalidArgumentError{Argument: "commandType", Message: "must be valid UTF-8"}
+	if err := checkText("commandType", string(identity.Type)); err != nil {
+		return DigestInput{}, err
 	}
 
 	for _, stream := range identity.Streams {
-		if !utf8.ValidString(string(stream)) {
-			return DigestInput{}, &InvalidArgumentError{Argument: "streams", Message: "stream IDs must be valid UTF-8"}
+		if err := checkText("streams", string(stream)); err != nil {
+			return DigestInput{}, err
 		}
 
 		// A command may not declare a reserved target stream: no outcome is read or recorded for
@@ -665,12 +786,14 @@ func (identity CommandIdentity) DigestInput(metadata Metadata) (DigestInput, err
 		input.Payload = payload
 	}
 
+	// Every persisted metadata string, the principal included, is validated before the pre-check
+	// and the handler: the event metadata is JSON, and PostgreSQL's jsonb cannot hold U+0000.
+	if err := CheckMetadata(metadata); err != nil {
+		return DigestInput{}, err
+	}
+
 	if metadata.PrincipalID != nil {
 		input.Principal = string(*metadata.PrincipalID)
-
-		if !utf8.ValidString(input.Principal) {
-			return DigestInput{}, &InvalidArgumentError{Argument: "principalId", Message: "must be valid UTF-8"}
-		}
 	}
 
 	return input, nil

@@ -189,6 +189,49 @@ type InvalidCommitError struct {
 
 func (e *InvalidCommitError) Error() string { return "invalid commit: " + e.Reason }
 
+// checkCommitText validates the identifier strings and metadata of the events, snapshots, and fences
+// of a commit that records an outcome.
+func checkCommitText(result SerializedResult) error {
+	for _, event := range result.Events {
+		for _, field := range []struct{ name, value string }{
+			{"event.id", string(event.ID)},
+			{"event.type", string(event.Type)},
+			{"event.entityId", string(event.EntityID)},
+			{"event.entityType", string(event.EntityType)},
+		} {
+			if err := checkText(field.name, field.value); err != nil {
+				return err
+			}
+		}
+
+		if err := CheckMetadata(event.Metadata); err != nil {
+			return err
+		}
+	}
+
+	for _, snapshot := range result.Snapshots {
+		if err := checkText("snapshot.entityId", string(snapshot.EntityID)); err != nil {
+			return err
+		}
+
+		if err := checkText("snapshot.entityType", string(snapshot.EntityType)); err != nil {
+			return err
+		}
+	}
+
+	for _, fence := range result.Fences {
+		if err := checkText("fence.entityId", string(fence.EntityID)); err != nil {
+			return err
+		}
+
+		if err := checkText("fence.entityType", string(fence.EntityType)); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // NormalizeCommit validates a transactional commit and returns a normalized copy: events sorted
 // bytewise by stream ID (the pinned transaction order), snapshots and fences likewise, fences
 // for written streams dropped (the event put at head + 1 supersedes them), and stream-local
@@ -207,6 +250,13 @@ func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
 
 		if result.Outcome.Rejected() && len(result.Events) > 0 {
 			return result, &InvalidArgumentError{Argument: "outcome", Message: "a rejected outcome cannot be committed with events"}
+		}
+
+		// Everything else this commit persists as text is held to the same rule as the metadata
+		// and the outcome: valid UTF-8 and no U+0000 (PostgreSQL cannot store it), so the commit
+		// has the same result on every backend and fails before any write.
+		if err := checkCommitText(result); err != nil {
+			return result, err
 		}
 	}
 

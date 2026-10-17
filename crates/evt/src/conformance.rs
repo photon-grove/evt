@@ -2703,7 +2703,9 @@ where
 /// - [fail the next outcome-carrying commit without applying it](Self::arm_before_apply);
 /// - [commit a rival commit first](Self::race_with), as another writer winning a race between a
 ///   command's outcome pre-check and its commit;
-/// - [fail an outcome read](Self::fail_outcome_read_after).
+/// - [fail an outcome read](Self::fail_outcome_read_after), [return a malformed row for
+///   one](Self::corrupt_outcome_read_after), or [stall one forever](Self::stall_outcome_read_after)
+///   (its read deadline then fires at once, standing in for the passage of time).
 ///
 /// Each arming fires once, on the next commit that carries an outcome (or, for the read, on the
 /// chosen outcome read).
@@ -2717,7 +2719,16 @@ struct FaultState<Op> {
     /// A held commit that lands after a number of outcome reads (see `arm_land_after_reads`).
     delayed: Option<(Commit<Op>, usize)>,
     rival: Option<Commit<Op>>,
-    reads_before_failure: Option<usize>,
+    reads_before_failure: Option<(usize, ReadFault)>,
+    /// A stalled read is armed or running: the read deadline fires at once.
+    stalling: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ReadFault {
+    Backend,
+    Corrupt,
+    Stall,
 }
 
 #[derive(Clone, Copy)]
@@ -2738,6 +2749,7 @@ impl<R: Repository> FaultInjectingRepository<R> {
                 delayed: None,
                 rival: None,
                 reads_before_failure: None,
+                stalling: false,
             }),
         }
     }
@@ -2786,7 +2798,22 @@ impl<R: Repository> FaultInjectingRepository<R> {
 
     /// Fails an outcome read with [`Error::Backend`]: the read after `reads` successful ones.
     pub fn fail_outcome_read_after(&self, reads: usize) {
-        self.state().reads_before_failure = Some(reads);
+        self.state().reads_before_failure = Some((reads, ReadFault::Backend));
+    }
+
+    /// Makes an outcome read fail with [`Error::InvalidRecord`], as a malformed stored row does:
+    /// the read after `reads` successful ones.
+    pub fn corrupt_outcome_read_after(&self, reads: usize) {
+        self.state().reads_before_failure = Some((reads, ReadFault::Corrupt));
+    }
+
+    /// Makes an outcome read never resolve, the way a backend waiting forever for a connection
+    /// does: the read after `reads` successful ones. The read deadline fires at once from now.
+    pub fn stall_outcome_read_after(&self, reads: usize) {
+        let mut state = self.state();
+
+        state.reads_before_failure = Some((reads, ReadFault::Stall));
+        state.stalling = true;
     }
 
     fn take_armed(&self) -> (Option<Commit<R::Operation>>, Option<Fault>) {
@@ -2868,6 +2895,17 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
         self.inner.backoff(duration)
     }
 
+    fn deadline(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        let stalling = self.state().stalling;
+        let inner = self.inner.deadline(duration);
+
+        async move {
+            if !stalling {
+                inner.await;
+            }
+        }
+    }
+
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
         // A held commit lands just before the read it was waiting for.
         let landing = {
@@ -2891,22 +2929,32 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
             let mut state = self.state();
 
             match state.reads_before_failure {
-                Some(0) => {
+                Some((0, fault)) => {
                     state.reads_before_failure = None;
+                    state.stalling = false;
 
-                    true
+                    Some(fault)
                 }
-                Some(remaining) => {
-                    state.reads_before_failure = Some(remaining - 1);
+                Some((remaining, fault)) => {
+                    state.reads_before_failure = Some((remaining - 1, fault));
 
-                    false
+                    None
                 }
-                None => false,
+                None => None,
             }
         };
 
-        if fail {
-            return Err(Error::backend("injected fault: the outcome read failed"));
+        match fail {
+            Some(ReadFault::Backend) => {
+                return Err(Error::backend("injected fault: the outcome read failed"));
+            }
+            Some(ReadFault::Corrupt) => {
+                return Err(Error::InvalidRecord(
+                    "injected fault: the stored outcome row is malformed".into(),
+                ));
+            }
+            Some(ReadFault::Stall) => std::future::pending().await,
+            None => {}
         }
 
         self.inner.outcome(command_id).await
@@ -2969,71 +3017,71 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
 
     record(
         "a repeated command returns its stored outcome, across writers and snapshots",
-        outcome_replay(repo, other).await,
+        Box::pin(outcome_replay(repo, other)).await,
     );
     record(
         "a reused command ID with another identity is IdempotencyKeyReuse",
-        outcome_key_reuse(repo).await,
+        Box::pin(outcome_key_reuse(repo)).await,
     );
     record(
         "a domain rejection is persisted once and replayed verbatim",
-        outcome_rejection(repo).await,
+        Box::pin(outcome_rejection(repo)).await,
     );
     record(
         "a pre-outcome command ID is a duplicate, never a recorded rejection",
-        outcome_legacy_duplicate(repo).await,
+        Box::pin(outcome_legacy_duplicate(repo)).await,
     );
     record(
         "an internal handler failure is an error and writes no outcome",
-        outcome_internal_failure(repo).await,
+        Box::pin(outcome_internal_failure(repo)).await,
     );
     record(
         "a zero-event command is an accepted no-op that stores its response",
-        outcome_noop(repo).await,
+        Box::pin(outcome_noop(repo)).await,
     );
     record(
         "a transaction persists a rejection after checking its fences",
-        outcome_transaction_reject(repo).await,
+        Box::pin(outcome_transaction_reject(repo)).await,
     );
     record(
         "command ID and outcome bounds are refused before any write",
-        outcome_limits(repo).await,
+        Box::pin(outcome_limits(repo)).await,
     );
     record(
         "ambiguous writes are settled by re-reading the outcome row",
-        outcome_ambiguous(repo).await,
+        Box::pin(outcome_ambiguous(repo)).await,
     );
     record(
         "a lost outcome put resolves through the winner's row and writes nothing",
-        outcome_race(repo).await,
+        Box::pin(outcome_race(repo)).await,
     );
     record(
         "an outcome read validates the command ID like a write",
-        outcome_read_validation(repo).await,
+        Box::pin(outcome_read_validation(repo)).await,
     );
     record(
         "U+0000 is refused in digests, command IDs, and rejections before any write",
-        outcome_nul_refused(repo).await,
+        Box::pin(outcome_nul_refused(repo)).await,
     );
     record(
         "a command may not declare a reserved target stream",
-        outcome_reserved_targets(repo).await,
+        Box::pin(outcome_reserved_targets(repo)).await,
     );
     record(
         "a winner of the same command that moved a fenced stream resolves to its outcome",
-        outcome_fence_race(repo).await,
+        Box::pin(outcome_fence_race(repo)).await,
     );
     record(
         "a failed caller-stamped fence persists a stale-fence rejection",
-        outcome_stale_fence(repo).await,
+        Box::pin(outcome_stale_fence(repo)).await,
     );
     record(
         "a failed commit leaves no outcome row",
-        outcome_atomicity(repo).await,
+        Box::pin(outcome_atomicity(repo)).await,
     );
     record(
         "the outcome row counts against the commit budget",
-        outcome_budget(repo).await,
+        Box::pin(outcome_budget(repo)).await,
     );
 
     if !failures.is_empty() {
@@ -3848,6 +3896,34 @@ async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
         .await?;
     ensure!(later.replayed, "a later attempt finds the row");
 
+    // A recovery read that never resolves ends at its deadline: still a retryable ambiguous write.
+    let id = ledger_id();
+    let command = command_id();
+    fault.arm_after_apply();
+    fault.stall_outcome_read_after(1);
+    let error = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await
+        .err();
+    ensure!(
+        matches!(&error, Some(err @ Error::AmbiguousWrite { .. }) if err.is_retryable()),
+        "a stalled recovery read is a retryable AmbiguousWrite: {error:?}"
+    );
+
+    // A malformed row found during recovery is corruption, never masked as an ambiguous write.
+    let id = ledger_id();
+    let command = command_id();
+    fault.arm_after_apply();
+    fault.corrupt_outcome_read_after(1);
+    let error = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await
+        .err();
+    ensure!(
+        matches!(&error, Some(Error::InvalidRecord(_))),
+        "a malformed row during recovery is corruption: {error:?}"
+    );
+
     Ok(())
 }
 
@@ -3980,6 +4056,40 @@ async fn outcome_nul_refused<R: Repository>(repo: &R) -> CaseResult {
         "a command ID with U+0000 is refused: {result:?}"
     );
 
+    // Every other persisted metadata string is held to the same rule, before the handler runs.
+    type Tweak = fn(&mut Metadata);
+    let tweaks: [(&str, Tweak); 6] = [
+        ("principal", |m| m.principal_id = Some("who\0".into())),
+        ("causation", |m| {
+            m.causation_id = Some(CommandId::new("cause\0"))
+        }),
+        ("extension key", |m| {
+            m.extensions.insert("k\0".into(), "v".into());
+        }),
+        ("extension value", |m| {
+            m.extensions.insert("k".into(), "v\0".into());
+        }),
+        ("region", |m| m.region = "us\0".into()),
+        ("origin", |m| {
+            m.origin = Some(crate::Origin::new("s\0", "e"))
+        }),
+    ];
+    for (name, tweak) in tweaks {
+        let command = CommandId::new(format!("{}-{}", namespace(), name.replace(' ', "-")));
+        let mut metadata = command_metadata(&command);
+        tweak(&mut metadata);
+
+        let result = store.execute_with_outcome(&ext, Add(1), metadata).await;
+        ensure!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{name} with U+0000 is refused: {result:?}"
+        );
+        ensure!(
+            repo.outcome(&command).await?.is_none(),
+            "{name}: nothing was recorded"
+        );
+    }
+
     let rejections = [
         Rejection::new("c\0", "m"),
         Rejection::new("c", "m\0"),
@@ -4084,7 +4194,9 @@ async fn outcome_fence_race<R: Repository>(repo: &R) -> CaseResult {
         plain.execute(&watched, Add(1), metadata()).await?;
 
         let command = command_id();
-        let identity = CommandIdentity::new("ledger:copy").with_streams([target.clone()]);
+        // Both writers declare both streams: the winner writes the watched one.
+        let identity =
+            CommandIdentity::new("ledger:copy").with_streams([target.clone(), watched.clone()]);
         let metadata = command_metadata(&command);
 
         // The loser reads the watched stream (an engine fence at head 1) and writes the target.
@@ -4099,7 +4211,7 @@ async fn outcome_fence_race<R: Repository>(repo: &R) -> CaseResult {
         let winner_identity = if same_identity {
             identity.clone()
         } else {
-            CommandIdentity::new("ledger:other").with_streams([target.clone()])
+            CommandIdentity::new("ledger:other").with_streams([target.clone(), watched.clone()])
         };
         let digest = default_digest(&winner_identity.digest_input(&metadata))
             .map_err(|err| Failure(err.to_string()))?;

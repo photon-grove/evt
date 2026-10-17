@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{BoxError, Error};
 use crate::event::SerializedEvent;
-use crate::ids::{CommandId, EntityId, EventId};
+use crate::ids::{CommandId, EntityId, EntityType, EventId, PrincipalId};
 use crate::json;
 use crate::metadata::Metadata;
 use crate::repository::Repository;
@@ -685,9 +685,11 @@ impl CommandIdentity {
 pub(crate) fn check_declared_streams<'a>(
     streams: impl IntoIterator<Item = &'a EntityId>,
 ) -> Result<(), Error> {
-    streams
-        .into_iter()
-        .try_for_each(crate::features::check_not_reserved)
+    streams.into_iter().try_for_each(|stream| {
+        check_text("a declared stream ID", stream.as_str())?;
+
+        crate::features::check_not_reserved(stream)
+    })
 }
 
 /// The metadata's principal as the digest sees it: `""` when unset.
@@ -753,6 +755,9 @@ impl OutcomeConfig {
     }
 
     pub(crate) fn digest(&self, input: &DigestInput) -> Result<String, Error> {
+        check_text("the command type", &input.command_type)?;
+        check_text("the principal", &input.principal)?;
+
         let digest = (self.digester)(input)
             .map_err(|err| Error::InvalidArgument(format!("the command digester failed: {err}")))?;
 
@@ -771,6 +776,94 @@ impl OutcomeConfig {
 
         Ok(digest)
     }
+}
+
+/// Refuses a string that PostgreSQL text and jsonb cannot hold (U+0000), so a command has the same
+/// result on every backend. Rust strings are valid UTF-8 by construction, so unlike Go there is no
+/// encoding case.
+fn check_text(what: &str, value: &str) -> Result<(), Error> {
+    if value.contains('\0') {
+        return Err(Error::InvalidArgument(format!(
+            "{what} must not contain U+0000"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validates every caller-supplied string of the command metadata that is persisted on the
+/// command's events: the command, causation, and principal IDs, the trace carrier, the origin, the
+/// address, the region, the timestamp, the extension keys and values, and the commit ID. None may
+/// contain U+0000, which PostgreSQL cannot store. It runs before the outcome pre-check and the
+/// handler.
+pub fn check_metadata(metadata: &Metadata) -> Result<(), Error> {
+    let optional = [
+        (
+            "commandId",
+            metadata.command_id.as_ref().map(CommandId::as_str),
+        ),
+        (
+            "causationId",
+            metadata.causation_id.as_ref().map(CommandId::as_str),
+        ),
+        (
+            "principalId",
+            metadata.principal_id.as_ref().map(PrincipalId::as_str),
+        ),
+        ("address", metadata.address.as_deref()),
+    ];
+    for (what, value) in optional {
+        if let Some(value) = value {
+            check_text(what, value)?;
+        }
+    }
+
+    check_text("region", &metadata.region)?;
+    check_text("timestamp", &metadata.timestamp)?;
+    check_text("commitId", &metadata.commit_id)?;
+
+    if let Some(origin) = &metadata.origin {
+        check_text("origin.source", &origin.source)?;
+        check_text("origin.endpoint", &origin.endpoint)?;
+    }
+
+    for (key, value) in metadata.trace.iter().flatten() {
+        check_text("trace", key)?;
+        check_text("trace", value)?;
+    }
+
+    for (key, value) in &metadata.extensions {
+        check_text("extensions", key)?;
+        check_text("extensions", value)?;
+    }
+
+    Ok(())
+}
+
+/// Validates the identifier strings and metadata of the events and fences of a commit that records
+/// an outcome (see [`check_metadata`]).
+pub(crate) fn check_commit_text<'a>(
+    events: impl IntoIterator<Item = &'a SerializedEvent>,
+    entity_types: impl IntoIterator<Item = &'a EntityType>,
+    entity_ids: impl IntoIterator<Item = &'a EntityId>,
+) -> Result<(), Error> {
+    for event in events {
+        check_text("event.id", event.id.as_str())?;
+        check_text("event.type", event.event_type.as_str())?;
+        check_text("event.entityId", event.entity_id.as_str())?;
+        check_text("event.entityType", event.entity_type.as_str())?;
+        check_metadata(&event.metadata)?;
+    }
+
+    for entity_type in entity_types {
+        check_text("entityType", entity_type.as_str())?;
+    }
+
+    for entity_id in entity_ids {
+        check_text("entityId", entity_id.as_str())?;
+    }
+
+    Ok(())
 }
 
 /// Whether a JSON value holds U+0000 in any string or object key, at any depth.
@@ -824,6 +917,7 @@ pub(crate) fn require_command_id(metadata: &Metadata) -> Result<CommandId, Error
         })?;
 
     check_command_id(&command_id)?;
+    check_metadata(metadata)?;
 
     Ok(command_id)
 }
@@ -838,6 +932,7 @@ pub fn check_outcome(outcome: &Outcome) -> Result<(), Error> {
             "an outcome needs an identity digest".into(),
         ));
     }
+    check_text("an identity digest", &outcome.digest)?;
 
     match outcome.status {
         OutcomeStatus::Accepted => {
@@ -908,19 +1003,107 @@ pub(crate) enum Polled {
     Found(Box<Outcome>),
     /// The window passed without a row.
     Absent,
-    /// The row could not be read, so nothing can be said.
-    Unreadable,
+    /// The row could not be read, so nothing can be said: the read failed (carrying its error), or
+    /// recovery ran out of time (`None`) because a read stalled or the reads were slow.
+    Unreadable(Option<Error>),
+    /// The row exists but is malformed: a corruption error, never masked as an ambiguous write.
+    Corrupt(Error),
+}
+
+/// An indeterminate commit whose recovery read also failed.
+#[derive(Debug)]
+struct RecoveryReadFailed {
+    commit: BoxError,
+    read: Error,
+}
+
+impl fmt::Display for RecoveryReadFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}; reading the outcome row to recover also failed: {}",
+            self.commit, self.read
+        )
+    }
+}
+
+impl std::error::Error for RecoveryReadFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.commit)
+    }
+}
+
+/// How long past the recovery window the last read may still take to answer.
+pub(crate) const RECOVERY_GRACE: Duration = Duration::from_secs(1);
+
+/// Races `work` against `deadline`: `None` when the deadline fires first. `work` is polled first,
+/// so a read that is ready immediately always wins.
+pub(crate) async fn within<T>(
+    work: impl Future<Output = T>,
+    deadline: impl Future<Output = ()>,
+) -> Option<T> {
+    let mut work = std::pin::pin!(work);
+    let mut deadline = std::pin::pin!(deadline);
+
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(value) = work.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(value));
+        }
+
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// Reads the outcome row, giving up after `limit` plus the grace period on the repository's
+/// [`Repository::deadline`]. A read that stalls (a backend waiting forever for a connection) can
+/// therefore never hold recovery past its window; `None` means it did.
+pub(crate) async fn read_bounded<R: Repository>(
+    repository: &R,
+    command_id: &CommandId,
+    limit: Duration,
+) -> Option<Result<Option<Outcome>, Error>> {
+    within(
+        repository.outcome(command_id),
+        repository.deadline(limit + RECOVERY_GRACE),
+    )
+    .await
 }
 
 /// Polls `read` for an outcome row with exponential backoff (50 ms, doubling to 1 s) until it
 /// appears or `window` has been slept through. `sleep` is the repository's timer
-/// ([`Repository::backoff`]), so the core stays runtime-agnostic; the elapsed time is the sum of
-/// the delays, which keeps the wait deterministic.
-pub(crate) async fn poll_for_row<R, RF, S, SF>(
-    mut read: R,
-    mut sleep: S,
+/// ([`Repository::backoff`]), so the core stays runtime-agnostic; the backoff itself is the sum of
+/// the delays, which keeps it deterministic. The whole poll, reads included, is raced against
+/// `deadline` (the repository's [`Repository::deadline`]) for the window plus a grace period, so
+/// neither a read that never resolves nor a run of slow reads can hold recovery past it: running
+/// out of time is [`Polled::Unreadable`] with no error.
+pub(crate) async fn poll_for_row<R, RF, S, SF, D, DF>(
+    read: R,
+    sleep: S,
+    deadline: D,
     window: Duration,
 ) -> Polled
+where
+    R: FnMut() -> RF,
+    RF: Future<Output = Result<Option<Outcome>, Error>>,
+    S: FnMut(Duration) -> SF,
+    SF: Future<Output = ()>,
+    D: FnOnce(Duration) -> DF,
+    DF: Future<Output = ()>,
+{
+    within(
+        poll_loop(read, sleep, window),
+        deadline(window + RECOVERY_GRACE),
+    )
+    .await
+    .unwrap_or(Polled::Unreadable(None))
+}
+
+async fn poll_loop<R, RF, S, SF>(mut read: R, mut sleep: S, window: Duration) -> Polled
 where
     R: FnMut() -> RF,
     RF: Future<Output = Result<Option<Outcome>, Error>>,
@@ -934,7 +1117,8 @@ where
         match read().await {
             Ok(Some(outcome)) => return Polled::Found(Box::new(outcome)),
             Ok(None) => {}
-            Err(_) => return Polled::Unreadable,
+            Err(err @ Error::InvalidRecord(_)) => return Polled::Corrupt(err),
+            Err(err) => return Polled::Unreadable(Some(err)),
         }
 
         if waited >= window {
@@ -994,9 +1178,12 @@ pub(crate) async fn settle<R: Repository>(
     match result {
         Ok(()) => Ok(Settled::Committed),
         Err(conflict @ Error::OutcomeConflict { .. }) => {
-            match repository.outcome(command_id).await? {
-                Some(stored) => Ok(Settled::Replayed(same_command(stored, digest)?)),
+            match read_bounded(repository, command_id, window).await {
+                Some(Ok(Some(stored))) => Ok(Settled::Replayed(same_command(stored, digest)?)),
                 // The row that won the race is gone again; nothing can be said about the command.
+                Some(Ok(None)) => Err(conflict),
+                Some(Err(err)) => Err(err),
+                // The read stalled past the window: the command is unresolved, and retryable.
                 None => Err(conflict),
             }
         }
@@ -1004,15 +1191,26 @@ pub(crate) async fn settle<R: Repository>(
             let polled = poll_for_row(
                 || repository.outcome(command_id),
                 |step| repository.backoff(step),
+                |limit| repository.deadline(limit),
                 window,
             )
             .await;
 
             match polled {
                 Polled::Found(stored) => Ok(Settled::Replayed(same_command(*stored, digest)?)),
-                Polled::Absent | Polled::Unreadable => Err(Error::AmbiguousWrite {
+                Polled::Corrupt(err) => Err(err),
+                Polled::Absent | Polled::Unreadable(None) => Err(Error::AmbiguousWrite {
                     command_id: command_id.clone(),
                     source,
+                }),
+                // The read failure is kept beside the commit failure, so an access or schema
+                // problem is not hidden behind "may or may not have been applied".
+                Polled::Unreadable(Some(read)) => Err(Error::AmbiguousWrite {
+                    command_id: command_id.clone(),
+                    source: Box::new(RecoveryReadFailed {
+                        commit: source,
+                        read,
+                    }),
                 }),
             }
         }
@@ -1026,8 +1224,10 @@ pub(crate) async fn settle<R: Repository>(
             conflict @ (Error::Conflict { .. }
             | Error::SequenceGap { .. }
             | Error::FenceConflict { .. }),
-        ) => match repository.outcome(command_id).await {
-            Ok(Some(stored)) => Ok(Settled::Replayed(same_command(stored, digest)?)),
+        ) => match read_bounded(repository, command_id, window).await {
+            Some(Ok(Some(stored))) => Ok(Settled::Replayed(same_command(stored, digest)?)),
+            // A malformed row is corruption, not a conflict to retry past.
+            Some(Err(err @ Error::InvalidRecord(_))) => Err(err),
             _ => Err(conflict),
         },
         Err(other) => Err(other),
@@ -1053,6 +1253,7 @@ mod tests {
                 slept.set(slept.get() + step);
                 async {}
             },
+            |_| std::future::pending(),
             Duration::from_secs(10),
         )
         .await;
@@ -1073,6 +1274,7 @@ mod tests {
                 slept.set(slept.get() + step);
                 async {}
             },
+            |_| std::future::pending(),
             Duration::from_secs(10),
         )
         .await;
@@ -1082,15 +1284,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_row_ends_polling_without_a_verdict() {
+    async fn a_read_that_never_resolves_ends_polling_at_its_deadline() {
+        let limits = std::cell::RefCell::new(Vec::new());
+
         let polled = poll_for_row(
-            || async { Err(Error::backend("table unavailable")) },
+            std::future::pending::<Result<Option<Outcome>, Error>>,
             |_| async {},
+            |limit| {
+                limits.borrow_mut().push(limit);
+                async {}
+            },
             Duration::from_secs(10),
         )
         .await;
 
-        assert!(matches!(polled, Polled::Unreadable), "{polled:?}");
+        assert!(matches!(polled, Polled::Unreadable(_)), "{polled:?}");
+        // The whole poll gets the window plus the grace period, and no more.
+        assert_eq!(*limits.borrow(), vec![Duration::from_secs(11)]);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_row_ends_polling_as_corruption_not_ambiguity() {
+        let polled = poll_for_row(
+            || async { Err(Error::InvalidRecord("bad row".into())) },
+            |_| async {},
+            |_| std::future::pending(),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(
+            matches!(polled, Polled::Corrupt(Error::InvalidRecord(_))),
+            "{polled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_row_ends_polling_without_a_verdict() {
+        let polled = poll_for_row(
+            || async { Err(Error::backend("table unavailable")) },
+            |_| async {},
+            |_| std::future::pending(),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(matches!(polled, Polled::Unreadable(_)), "{polled:?}");
     }
 
     #[test]
@@ -1425,6 +1664,11 @@ mod tests {
             Rejection::new("c", "m").with_details(serde_json::json!({ "ke\0y": "value" })),
             Rejection::new("c", "m").with_details(serde_json::json!({ "n": [{ "deep": "x\0" }] })),
         ];
+        assert!(matches!(
+            check_outcome(&Outcome::accepted("cmd", "d\0")),
+            Err(Error::InvalidArgument(_))
+        ));
+
         for rejection in rejections {
             assert!(
                 matches!(rejection.encode(), Err(Error::InvalidArgument(_))),

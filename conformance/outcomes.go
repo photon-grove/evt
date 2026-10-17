@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/policy"
@@ -50,6 +51,8 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("TransactionOutcomes", func(t *testing.T) { testTransactionOutcomes(t, outcomes(t)) })
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
+	t.Run("UndeclaredStreamWriteIsRefused", func(t *testing.T) { testUndeclaredStream(t, outcomes(t)) })
+	t.Run("ResponseIsCopied", func(t *testing.T) { testResponseCopied(t, outcomes(t)) })
 	t.Run("NULIsRefusedBeforeAnyWrite", func(t *testing.T) { testNULRefused(t, outcomes(t)) })
 	t.Run("ReservedTargetStreams", func(t *testing.T) { testReservedTargets(t, outcomes(t)) })
 	t.Run("OutcomeReadValidatesCommandIDs", func(t *testing.T) { testOutcomeReadValidation(t, outcomes(t)) })
@@ -996,7 +999,9 @@ func testFenceRace(t *testing.T, repo evt.OutcomeRepository) {
 		require.NoError(t, err)
 
 		id := env.commandID(fmt.Sprintf("fence-race-%t-%s", sameIdentity, watched))
-		identity := evt.CommandIdentity{Type: "ledger:copy", Streams: []evt.EntityID{target}}
+		// Both writers declare both streams: the winner writes the watched one, and a command
+		// may only write streams its identity declares.
+		identity := evt.CommandIdentity{Type: "ledger:copy", Streams: []evt.EntityID{target, watched}}
 
 		// The loser reads the watched stream (an engine fence at head 1) and writes the target.
 		tx, replayed, berr := env.store.BeginCommand(ctx, identity, withCommand(id))
@@ -1041,6 +1046,67 @@ func testFenceRace(t *testing.T, repo evt.OutcomeRepository) {
 	}
 }
 
+// A command's identity digest covers the streams it declares, so it may only write those: a write
+// to any other stream would be an effect the digest omits, replayed for a different identity.
+func testUndeclaredStream(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newOutcomeEnv(t, repo, 0)
+
+	declared := env.id
+	other := evt.EntityID(string(env.id) + "-other")
+	id := env.commandID("undeclared")
+	identity := evt.CommandIdentity{Type: "ledger:copy", Streams: []evt.EntityID{declared}}
+
+	tx, replayed, err := env.store.BeginCommand(ctx, identity, withCommand(id))
+	require.NoError(t, err)
+	require.Nil(t, replayed)
+	require.NoError(t, tx.Read(ctx, newLedger(declared), declared))
+	require.NoError(t, tx.Read(ctx, newLedger(other), other))
+
+	err = tx.Append(other, &ledgerEvent{Kind: "deposited", Amount: 1})
+	require.Error(t, err)
+
+	var invalid *evt.InvalidCommitError
+	require.ErrorAs(t, err, &invalid)
+
+	// The refusal changed nothing: the declared stream can still be written and the command completes.
+	require.NoError(t, tx.Append(declared, &ledgerEvent{Kind: "deposited", Amount: 1}))
+
+	outcome, err := tx.Complete(ctx, nil)
+	require.NoError(t, err)
+	require.True(t, outcome.Accepted())
+	require.Empty(t, env.events(t, other), "the undeclared stream was never written")
+	require.Len(t, env.events(t, declared), 1)
+}
+
+// The returned outcome owns its response bytes: a caller that reuses its buffer after the commit
+// changes neither the stored row nor the outcome it was handed.
+func testResponseCopied(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newOutcomeEnv(t, repo, 0)
+
+	id := env.commandID("response-copy")
+	identity := evt.CommandIdentity{Type: "ledger:respond", Streams: []evt.EntityID{env.id}}
+
+	tx, _, err := env.store.BeginCommand(ctx, identity, withCommand(id))
+	require.NoError(t, err)
+	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
+	require.NoError(t, tx.Append(env.id, &ledgerEvent{Kind: "deposited", Amount: 1}))
+
+	buffer := []byte("original")
+
+	outcome, err := tx.Complete(ctx, buffer)
+	require.NoError(t, err)
+
+	copy(buffer, "MUTATED!")
+
+	require.Equal(t, []byte("original"), outcome.Response, "the returned outcome does not alias the caller's buffer")
+
+	stored, err := repo.GetOutcome(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, []byte("original"), stored.Response)
+}
+
 // PostgreSQL text and jsonb cannot hold U+0000, so every backend refuses it alike, before any
 // handler side effect or write: in a custom digest, a command ID, and a rejection's code, message,
 // details strings, and details keys.
@@ -1064,6 +1130,29 @@ func testNULRefused(t *testing.T, repo evt.OutcomeRepository) {
 	require.ErrorIs(t, err, evt.ErrInvalidArgument)
 	require.EqualValues(t, 0, ran.Load())
 
+	// Every other persisted metadata string is held to the same rule, before the handler runs: the
+	// principal, the causation ID, the extension keys and values, and the rest.
+	for name, mutate := range map[string]func(*evt.Metadata){
+		"principal":     func(m *evt.Metadata) { p := evt.PrincipalID("who\x00"); m.PrincipalID = &p },
+		"causation":     func(m *evt.Metadata) { c := evt.CommandID("cause\x00"); m.CausationID = &c },
+		"extension key": func(m *evt.Metadata) { m.Extensions = map[string]string{"k\x00": "v"} },
+		"extension val": func(m *evt.Metadata) { m.Extensions = map[string]string{"k": "v\x00"} },
+		"region":        func(m *evt.Metadata) { m.Region = "us\x00" },
+		"origin":        func(m *evt.Metadata) { m.Origin = &evt.Origin{Source: "s\x00", Endpoint: "e"} },
+		"address":       func(m *evt.Metadata) { a := "addr\x00"; m.Address = &a },
+		"trace":         func(m *evt.Metadata) { m.Trace = &propagation.MapCarrier{"traceparent": "x\x00"} },
+		"invalid UTF-8": func(m *evt.Metadata) { p := evt.PrincipalID("who\xff"); m.PrincipalID = &p },
+	} {
+		metadata := withCommand(env.commandID("metadata-nul-" + strings.ReplaceAll(name, " ", "-")))
+		mutate(&metadata)
+
+		_, err = env.store.ExecuteWithOutcome(ctx, newLedger(env.id), env.id,
+			&ledgerCommand{Kind: "deposit", Amount: 1, ran: ran}, metadata)
+		require.ErrorIs(t, err, evt.ErrInvalidArgument, name)
+		require.EqualValues(t, 0, ran.Load(), "%s: the handler never ran", name)
+		env.requireNoOutcome(t, *metadata.CommandID)
+	}
+
 	// A rejection with U+0000 anywhere in its code, message, or details (strings and keys).
 	for index, rejection := range []evt.Rejection{
 		{Code: "c\x00", Message: "m"},
@@ -1071,6 +1160,12 @@ func testNULRefused(t *testing.T, repo evt.OutcomeRepository) {
 		{Code: "c", Message: "m", Details: map[string]any{"key": "va\x00lue"}},
 		{Code: "c", Message: "m", Details: map[string]any{"ke\x00y": "value"}},
 		{Code: "c", Message: "m", Details: map[string]any{"nested": []any{map[string]any{"deep": "x\x00"}}}},
+		// Typed values reach the encoder too: the check inspects the encoding, not the Go types.
+		{Code: "c", Message: "m", Details: map[string]any{"tags": []string{"bad\x00value"}}},
+		{Code: "c", Message: "m", Details: map[string]any{"m": map[string][]string{"ke\x00y": {"v"}}}},
+		{Code: "c", Message: "m", Details: map[string]any{"s": struct {
+			Name string `json:"name"`
+		}{Name: "n\x00"}}},
 	} {
 		id := env.commandID(fmt.Sprintf("reject-nul-%d", index))
 

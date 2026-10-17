@@ -38,6 +38,8 @@ static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
 struct PendingCommand {
     command_id: CommandId,
     digest: String,
+    /// The streams the command's identity declares it will write. The digest covers exactly these.
+    declared: HashSet<EntityId>,
     metadata: Metadata,
 }
 
@@ -270,6 +272,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         self.command = Some(PendingCommand {
             command_id,
             digest,
+            declared: identity.declared_streams().iter().cloned().collect(),
             metadata: metadata.clone(),
         });
 
@@ -432,6 +435,19 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
         if events.is_empty() {
             return Ok(());
+        }
+
+        // A command records the identity digest of the streams it declared. Writing any other
+        // stream would commit an effect that digest omits, so a later call with the declared
+        // identity would replay an outcome for it. Nothing has changed yet, so the transaction
+        // stays usable.
+        if let Some(command) = &self.command
+            && !command.declared.contains(&read.loaded.entity_id)
+        {
+            return Err(Error::InvalidCommit(format!(
+                "stream {} is written but was not declared by the command's identity",
+                read.loaded.entity_id
+            )));
         }
 
         // Serialization changes nothing, so its failure leaves the transaction usable.
@@ -1621,6 +1637,33 @@ mod tests {
         CommandIdentity::new("ledger:test").with_streams([stream])
     }
 
+    fn two_streams() -> CommandIdentity {
+        CommandIdentity::new("ledger:test").with_streams(["a", "b"])
+    }
+
+    #[tokio::test]
+    async fn a_command_may_only_write_the_streams_it_declared() {
+        let store = outcome_store();
+
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("a"), &command("cmd"))
+            .await
+            .unwrap();
+        let mut a = tx.read::<Ledger>("a").await.unwrap();
+        let mut b = tx.read::<Ledger>("b").await.unwrap();
+
+        // A stream outside the declared identity is refused, without changing the transaction.
+        let refused = tx.append(&mut b, added(1)).err();
+        assert!(
+            matches!(refused, Some(Error::InvalidCommit(_))),
+            "{refused:?}"
+        );
+
+        tx.append(&mut a, added(2)).unwrap();
+        let done = tx.commit_with_outcome(None).await.unwrap();
+        assert_eq!(done.outcome.event_ids, vec![crate::EventId::new("a:1")]);
+    }
+
     #[tokio::test]
     async fn a_transaction_with_outcomes_refuses_the_plain_commit() {
         let store = outcome_store();
@@ -1710,7 +1753,7 @@ mod tests {
 
         let mut tx = store.transaction();
         assert!(matches!(
-            tx.begin_command(&identity("b"), &command("cmd"))
+            tx.begin_command(&two_streams(), &command("cmd"))
                 .await
                 .unwrap(),
             Begin::Proceed
@@ -1738,7 +1781,7 @@ mod tests {
         // A repeat replays it.
         let mut again = store.transaction();
         match again
-            .begin_command(&identity("b"), &command("cmd"))
+            .begin_command(&two_streams(), &command("cmd"))
             .await
             .unwrap()
         {
