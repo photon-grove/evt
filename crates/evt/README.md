@@ -129,7 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 A store built with `with_outcomes` writes one `command-outcome#<commandId>` row per command,
 once and in its final state, inside the commit transaction. Every command needs a command ID
-(at most 512 UTF-8 bytes) and a type that implements `OutcomeCommand`, and `Aggregate::Error`
+(at most 512 UTF-8 bytes, no U+0000, which PostgreSQL cannot store; the same goes for digests and
+rejection codes, messages, and details) and a type that implements `OutcomeCommand`, and `Aggregate::Error`
 implements `ToRejection`:
 
 - A repeat of a command (same ID, same identity digest) returns the stored outcome and does not

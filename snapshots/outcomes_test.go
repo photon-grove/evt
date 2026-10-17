@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/propagation"
@@ -298,7 +299,7 @@ func TestOutcomes_ANoOpCarryingProjectorOperationsIsRefusedNotRecordedAsAccepted
 func TestOutcomes_ABadCustomDigestIsAProgrammerErrorBeforeAnyReadOrHandler(t *testing.T) {
 	ctx := context.Background()
 
-	for name, digest := range map[string]string{"empty": "", "not UTF-8": "bad\xff"} {
+	for name, digest := range map[string]string{"empty": "", "not UTF-8": "bad\xff", "NUL": "bad\x00digest"} {
 		t.Run(name, func(t *testing.T) {
 			store, repo := newOutcomeStore(t, snapshots.WithDigester(func(evt.DigestInput) (string, error) { return digest, nil }))
 			entity := &MockEntity{}
@@ -432,4 +433,41 @@ func TestOutcomes_NonUTF8IdentityStringsAreRefusedBeforeAnyReadOrHandler(t *test
 	stored, err := repo.GetOutcome(ctx, "cmd-1")
 	require.NoError(t, err)
 	require.Nil(t, stored)
+}
+
+// slowReadRepository blocks every outcome read after the first until its context is done.
+type slowReadRepository struct {
+	evt.OutcomeRepository
+
+	reads int
+}
+
+func (r *slowReadRepository) Commit(_ context.Context, result evt.SerializedResult) error {
+	return &evt.AmbiguousWriteError{CommandID: result.Outcome.CommandID, Cause: errors.New("lost")}
+}
+
+func (r *slowReadRepository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.Outcome, error) {
+	r.reads++
+	if r.reads == 1 {
+		return r.OutcomeRepository.GetOutcome(ctx, id)
+	}
+
+	<-ctx.Done()
+
+	return nil, ctx.Err()
+}
+
+func TestOutcomes_RecoveryNeverOutlivesItsWindowEvenWhenAReadHangs(t *testing.T) {
+	repo := &slowReadRepository{OutcomeRepository: memOutcomes(t)}
+	store := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(150 * time.Millisecond))
+
+	entity := &MockEntity{}
+	entity.ID = "e-1"
+
+	started := time.Now()
+	_, err := store.ExecuteWithOutcome(context.Background(), entity, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
+	elapsed := time.Since(started)
+
+	require.ErrorIs(t, err, evt.ErrAmbiguousWrite)
+	require.Less(t, elapsed, 2*time.Second, "a hung read must be cut at the recovery window, not the 10 s per-read timeout")
 }

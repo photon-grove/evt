@@ -3012,6 +3012,10 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         outcome_read_validation(repo).await,
     );
     record(
+        "U+0000 is refused in digests, command IDs, and rejections before any write",
+        outcome_nul_refused(repo).await,
+    );
+    record(
         "a command may not declare a reserved target stream",
         outcome_reserved_targets(repo).await,
     );
@@ -3941,6 +3945,64 @@ async fn outcome_race<R: Repository>(repo: &R) -> CaseResult {
         repo.events(&other.id).await?.is_empty(),
         "the failed commit's events were not written"
     );
+
+    Ok(())
+}
+
+/// PostgreSQL text and jsonb cannot hold U+0000, so every backend refuses it alike, before any
+/// write: in a custom digest, a command ID, and a rejection's code, message, and details.
+async fn outcome_nul_refused<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let ext = ledger_id();
+
+    let digested = Store::<Ledger, _>::new(repo, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(outcome_config().with_digester(|_| Ok("digest\0nul".into())));
+    let command = command_id();
+    let result = digested
+        .execute_with_outcome(&ext, Add(1), command_metadata(&command))
+        .await;
+    ensure!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "a digest with U+0000 is refused: {result:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "the refused digest recorded nothing"
+    );
+
+    let nul_id = CommandId::new(format!("{}\0nul", namespace()));
+    let result = store
+        .execute_with_outcome(&ext, Add(1), command_metadata(&nul_id))
+        .await;
+    ensure!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "a command ID with U+0000 is refused: {result:?}"
+    );
+
+    let rejections = [
+        Rejection::new("c\0", "m"),
+        Rejection::new("c", "m\0"),
+        Rejection::new("c", "m").with_details(serde_json::json!({ "key": "va\0lue" })),
+        Rejection::new("c", "m").with_details(serde_json::json!({ "ke\0y": "value" })),
+        Rejection::new("c", "m").with_details(serde_json::json!({ "n": [{ "deep": "x\0" }] })),
+    ];
+    let identity = CommandIdentity::new("ledger:nul").with_streams([ext.clone()]);
+    for rejection in rejections {
+        let command = command_id();
+        let mut tx = store.transaction();
+        tx.begin_command(&identity, &command_metadata(&command))
+            .await?;
+        let result = tx.reject(rejection.clone()).await;
+        ensure!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{rejection:?} is refused: {result:?}"
+        );
+        ensure!(
+            repo.outcome(&command).await?.is_none(),
+            "{rejection:?} recorded nothing"
+        );
+    }
 
     Ok(())
 }

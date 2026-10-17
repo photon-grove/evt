@@ -319,6 +319,9 @@ error before any write and is never split.
   a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust
   `Error::Indeterminate`). A definitive failure (validation, a missing table or relation,
   authorization, a constraint error other than the outcome-row conflict) is returned as is
+- U+0000 in a command ID, a digest, or a rejection's code, message, details strings, or details
+  keys is `ErrInvalidArgument` / `Error::InvalidArgument` on every backend (PostgreSQL cannot store
+  it), before any handler side effect or write
 - Recovery polls the outcome row with bounded backoff (50 ms doubling to 1 s, 10 s by default) on a
   context detached from the caller's cancellation, for every indeterminate failure (including
   DynamoDB's `TransactionInProgressException`): a row that appears is resolved, and one still

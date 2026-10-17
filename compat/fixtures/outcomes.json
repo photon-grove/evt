@@ -848,6 +848,29 @@
       }
     },
     {
+      "name": "accepted with an empty code attribute",
+      "dynamoItem": {
+        "code": {
+          "S": ""
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
       "name": "rejection details that are an array",
       "dynamoItem": {
         "code": {

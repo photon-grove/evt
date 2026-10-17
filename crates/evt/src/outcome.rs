@@ -218,6 +218,16 @@ impl Rejection {
             ));
         }
 
+        // PostgreSQL text and jsonb cannot hold U+0000, so every backend refuses it alike.
+        if self.code.as_str().contains('\0')
+            || self.message.contains('\0')
+            || self.details.as_ref().is_some_and(value_has_nul)
+        {
+            return Err(Error::InvalidArgument(
+                "a rejection must not contain U+0000 in its code, message, or details".into(),
+            ));
+        }
+
         Ok(json::to_string(self)?)
     }
 
@@ -752,7 +762,26 @@ impl OutcomeConfig {
             ));
         }
 
+        // U+0000 cannot be stored by PostgreSQL text columns, so no backend accepts it.
+        if digest.contains('\0') {
+            return Err(Error::InvalidArgument(
+                "the command digester returned a digest containing U+0000".into(),
+            ));
+        }
+
         Ok(digest)
+    }
+}
+
+/// Whether a JSON value holds U+0000 in any string or object key, at any depth.
+fn value_has_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(value_has_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key.contains('\0') || value_has_nul(value)),
+        _ => false,
     }
 }
 
@@ -764,6 +793,12 @@ pub fn check_command_id(command_id: &CommandId) -> Result<(), Error> {
     if command_id.is_empty() {
         return Err(Error::InvalidArgument(
             "a command ID is required when command outcomes are enabled".into(),
+        ));
+    }
+
+    if command_id.as_str().contains('\0') {
+        return Err(Error::InvalidArgument(
+            "a command ID must not contain U+0000".into(),
         ));
     }
 
@@ -1368,6 +1403,38 @@ mod tests {
             check_outcome(&accepted("")),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn u0000_is_refused_everywhere_it_cannot_be_stored() {
+        let config = OutcomeConfig::new().with_digester(|_| Ok("a\0b".into()));
+        assert!(matches!(
+            config.digest(&DigestInput::default()),
+            Err(Error::InvalidArgument(_))
+        ));
+
+        assert!(matches!(
+            check_command_id(&CommandId::from("id\0nul")),
+            Err(Error::InvalidArgument(_))
+        ));
+
+        let rejections = [
+            Rejection::new("c\0", "m"),
+            Rejection::new("c", "m\0"),
+            Rejection::new("c", "m").with_details(serde_json::json!({ "key": "va\0lue" })),
+            Rejection::new("c", "m").with_details(serde_json::json!({ "ke\0y": "value" })),
+            Rejection::new("c", "m").with_details(serde_json::json!({ "n": [{ "deep": "x\0" }] })),
+        ];
+        for rejection in rejections {
+            assert!(
+                matches!(rejection.encode(), Err(Error::InvalidArgument(_))),
+                "{rejection:?}"
+            );
+            assert!(matches!(
+                check_outcome(&Outcome::rejected("cmd", "d", rejection)),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
     }
 
     #[test]

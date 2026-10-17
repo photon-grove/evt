@@ -242,7 +242,8 @@ default:
   race on the outcome row is resolved the same way, never as a generic conflict, and the loser
   returns only the winner's stored outcome. A first execution returns its rejection in the stored
   (decoded) form, so its `Details` equal a replay's. A command ID, principal, and command type must
-  be valid UTF-8, and a custom digest must be non-empty: both are refused before anything is read.
+  be valid UTF-8, and a custom digest must be non-empty: both are refused before anything is read. U+0000 is refused
+  alike on every backend in a command ID, a digest, and a rejection's code, message, and details.
   `Store.ResolveCommand` runs the same read for a caller that lost the result entirely.
 - **Multi-stream commands** use `Store.BeginCommand`, which reads the outcome row first, then the
   usual `Read`/`Append`/`Fence`, then `Transaction.Complete` (accepted, or a no-op when nothing was

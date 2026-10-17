@@ -246,6 +246,7 @@ func malformedRows() []MalformedRow {
 			"status": text("rejected"), "events": nil, "code": text("c"), "rejection": map[string]any{"B": "eA=="},
 		})},
 		{"accepted with a stray code attribute", accepted(map[string]any{"code": text("c")})},
+		{"accepted with an empty code attribute", accepted(map[string]any{"code": text("")})},
 		{"rejection details that are an array", rejectedRow(text(`{"code":"c","message":"m","details":["x"]}`))},
 		{"rejection details that are a string", rejectedRow(text(`{"code":"c","message":"m","details":"x"}`))},
 		{"rejection details that are a number", rejectedRow(text(`{"code":"c","message":"m","details":1}`))},

@@ -920,6 +920,18 @@ A digest returned by a digester — the default or a custom one — must be non-
 UTF-8, since it is stored as a string): anything else is a programmer error returned before the
 outcome or the aggregate is read and before the handler runs.
 
+**U+0000 is refused everywhere it cannot be stored.** PostgreSQL `text` and `jsonb` cannot hold a
+NUL character, DynamoDB and the in-memory repository can; so that the same call has the same result
+on every backend, a command ID, a digest, and a rejection's `code`, `message`, and `details` (every
+string and every object key, at any depth) must not contain U+0000. Violations are the typed
+invalid-argument error (Go `ErrInvalidArgument`, Rust `Error::InvalidArgument`), returned before
+the outcome or the aggregate is read, before the handler runs for a command ID or digest, and
+before any write for a rejection. The recovery window bounds the whole recovery, including a read
+that hangs: no per-read timeout extends it past the window plus one second for the last poll.
+
+A stored accepted outcome that carries a `code` attribute at all, even an empty one, is corrupt: the
+attribute exists exactly when the outcome carries a rejection.
+
 `IdempotencyKeyReuse` is returned as an error and is **not stored**: the existing outcome row
 belongs to the first command that claimed the ID, and nothing overwrites it.
 

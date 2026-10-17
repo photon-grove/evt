@@ -50,6 +50,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("TransactionOutcomes", func(t *testing.T) { testTransactionOutcomes(t, outcomes(t)) })
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
+	t.Run("NULIsRefusedBeforeAnyWrite", func(t *testing.T) { testNULRefused(t, outcomes(t)) })
 	t.Run("ReservedTargetStreams", func(t *testing.T) { testReservedTargets(t, outcomes(t)) })
 	t.Run("OutcomeReadValidatesCommandIDs", func(t *testing.T) { testOutcomeReadValidation(t, outcomes(t)) })
 	t.Run("ReplayRehydratesTheEntity", func(t *testing.T) { testReplayRehydrates(t, outcomes(t)) })
@@ -72,9 +73,13 @@ const ledgerType evt.EntityType = "conformance-ledger"
 type ledger struct {
 	id    evt.EntityID
 	Total int `json:"total"`
+
+	// Seen counts the events applied by kind. The constructor initializes the map, like an
+	// aggregate that keeps labels or per-key counters, so a replay must not leave it dirty.
+	Seen map[string]int `json:"seen"`
 }
 
-func newLedger(id evt.EntityID) *ledger { return &ledger{id: id} }
+func newLedger(id evt.EntityID) *ledger { return &ledger{id: id, Seen: map[string]int{}} }
 
 func (l *ledger) Type() evt.EntityType { return ledgerType }
 func (l *ledger) GetID() evt.EntityID  { return l.id }
@@ -101,6 +106,12 @@ func (l *ledger) Apply(event evt.Event) error {
 	if !ok {
 		return evt.NewBadEventError(event)
 	}
+
+	if l.Seen == nil {
+		l.Seen = map[string]int{}
+	}
+
+	l.Seen[changed.Kind]++
 
 	if changed.Kind == "withdrawn" {
 		l.Total -= changed.Amount
@@ -1030,6 +1041,49 @@ func testFenceRace(t *testing.T, repo evt.OutcomeRepository) {
 	}
 }
 
+// PostgreSQL text and jsonb cannot hold U+0000, so every backend refuses it alike, before any
+// handler side effect or write: in a custom digest, a command ID, and a rejection's code, message,
+// details strings, and details keys.
+func testNULRefused(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newOutcomeEnv(t, repo, 0)
+
+	// A digest with U+0000: refused before the pre-check and the handler.
+	ran := counter()
+	digested := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithDigester(func(evt.DigestInput) (string, error) {
+		return "digest\x00with-nul", nil
+	}))
+
+	_, err := digested.ExecuteWithOutcome(ctx, newLedger(env.id), env.id,
+		&ledgerCommand{Kind: "deposit", Amount: 1, ran: ran}, withCommand(env.commandID("digest-nul")))
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+	require.EqualValues(t, 0, ran.Load(), "the handler never ran")
+
+	// A command ID with U+0000.
+	_, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 1, ran: ran}, evt.CommandID("id\x00nul"))
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+	require.EqualValues(t, 0, ran.Load())
+
+	// A rejection with U+0000 anywhere in its code, message, or details (strings and keys).
+	for index, rejection := range []evt.Rejection{
+		{Code: "c\x00", Message: "m"},
+		{Code: "c", Message: "m\x00"},
+		{Code: "c", Message: "m", Details: map[string]any{"key": "va\x00lue"}},
+		{Code: "c", Message: "m", Details: map[string]any{"ke\x00y": "value"}},
+		{Code: "c", Message: "m", Details: map[string]any{"nested": []any{map[string]any{"deep": "x\x00"}}}},
+	} {
+		id := env.commandID(fmt.Sprintf("reject-nul-%d", index))
+
+		tx, replayed, berr := env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Streams: []evt.EntityID{env.id}}, withCommand(id))
+		require.NoError(t, berr)
+		require.Nil(t, replayed)
+
+		_, err = tx.Reject(ctx, rejection)
+		require.ErrorIs(t, err, evt.ErrInvalidArgument, "%+v", rejection)
+		env.requireNoOutcome(t, id)
+	}
+}
+
 func testReservedTargets(t *testing.T, repo evt.OutcomeRepository) {
 	env := newOutcomeEnv(t, repo, 0)
 	ctx := context.Background()
@@ -1120,6 +1174,8 @@ func testReplayRehydrates(t *testing.T, repo evt.OutcomeRepository) {
 	loser := newLedger(env.id)
 	require.NoError(t, env.store.Execute(ctx, loser, env.id, &ledgerCommand{Kind: "withdraw", Amount: 1}, withCommand(raced)))
 	require.Equal(t, 16, loser.Total, "7 + 10 - 1: the durable state, not the loser's local 6")
+	require.Equal(t, map[string]int{"deposited": 3, "withdrawn": 1}, loser.Seen,
+		"a map the constructor initialized must not keep the loser's own applied events")
 }
 
 func testNonCanonicalEventIDs(t *testing.T, repo evt.OutcomeRepository) {

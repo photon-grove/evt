@@ -235,6 +235,11 @@ func CheckCommandID(id CommandID) error {
 		return &InvalidArgumentError{Argument: "commandId", Message: "a command ID must be valid UTF-8"}
 	}
 
+	// PostgreSQL text cannot hold U+0000, so it is refused on every backend alike.
+	if strings.ContainsRune(string(id), 0) {
+		return &InvalidArgumentError{Argument: "commandId", Message: "a command ID must not contain U+0000"}
+	}
+
 	if len(id) > MaxCommandIDBytes {
 		return &CommandIDTooLongError{Length: len(id)}
 	}
@@ -242,9 +247,39 @@ func CheckCommandID(id CommandID) error {
 	return nil
 }
 
+// rejectionHasNUL reports whether the code, message, or any string or key in details contains
+// U+0000.
+func rejectionHasNUL(rejection Rejection) bool {
+	return strings.ContainsRune(string(rejection.Code), 0) ||
+		strings.ContainsRune(rejection.Message, 0) ||
+		valueHasNUL(rejection.Details)
+}
+
+func valueHasNUL(value any) bool {
+	switch v := value.(type) {
+	case string:
+		return strings.ContainsRune(v, 0)
+	case map[string]any:
+		for key, nested := range v {
+			if strings.ContainsRune(key, 0) || valueHasNUL(nested) {
+				return true
+			}
+		}
+	case []any:
+		for _, nested := range v {
+			if valueHasNUL(nested) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // CheckDigest validates an identity digest — the output of the default or a custom Digester —
 // before anything is read, run, or written: it must be non-empty valid UTF-8, because it is stored
-// verbatim as a string. A digester that returns anything else is a programmer error.
+// verbatim as a string, and must not contain U+0000, which PostgreSQL text cannot hold (refused on
+// every backend alike). A digester that returns anything else is a programmer error.
 func CheckDigest(digest string) error {
 	if digest == "" {
 		return &InvalidArgumentError{Argument: "digest", Message: "the digester returned an empty digest"}
@@ -252,6 +287,10 @@ func CheckDigest(digest string) error {
 
 	if !utf8.ValidString(digest) {
 		return &InvalidArgumentError{Argument: "digest", Message: "the digester returned a digest that is not valid UTF-8"}
+	}
+
+	if strings.ContainsRune(digest, 0) {
+		return &InvalidArgumentError{Argument: "digest", Message: "the digester returned a digest containing U+0000"}
 	}
 
 	return nil
@@ -349,6 +388,12 @@ func CheckOutcome(outcome *Outcome) error {
 	}
 
 	if outcome.Rejection != nil {
+		// U+0000 cannot be stored by PostgreSQL (text, jsonb), so a rejection that carries it in its
+		// code, message, or details is refused on every backend alike, before any write.
+		if rejectionHasNUL(*outcome.Rejection) {
+			return &InvalidArgumentError{Argument: "rejection", Message: "a rejection must not contain U+0000 in its code, message, or details"}
+		}
+
 		encoded, err := EncodeRejection(*outcome.Rejection)
 		if err != nil {
 			return fmt.Errorf("encode rejection: %w", err)

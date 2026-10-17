@@ -206,18 +206,97 @@ func (store *Store) run(
 }
 
 // captureEntity remembers a pointer-to-struct entity's value so a later restore puts back what the
-// caller supplied, discarding events applied locally. It is shallow: it covers the entity's own
-// fields, which is what a freshly constructed aggregate holds. Any other entity kind is left as is.
+// caller supplied, discarding events applied locally. The copy is deep over the entity's exported
+// fields — every map, slice, pointer, and nested struct — because those are exactly the state a
+// snapshot persists, so state a constructor initialized (a labels map, say) cannot be aliased and
+// kept dirty by Apply. Unexported fields are copied shallowly. Any other entity kind is left as is.
 func captureEntity(entity evt.Entity) func() {
 	value := reflect.ValueOf(entity)
 	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() || value.Elem().Kind() != reflect.Struct {
 		return func() {}
 	}
 
-	saved := reflect.New(value.Elem().Type()).Elem()
-	saved.Set(value.Elem())
+	saved := deepCopy(value.Elem(), map[uintptr]reflect.Value{})
 
 	return func() { value.Elem().Set(saved) }
+}
+
+// deepCopy returns a copy of v that shares no map, slice, or pointer storage with it, through its
+// exported fields. seen breaks pointer cycles.
+func deepCopy(v reflect.Value, seen map[uintptr]reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+
+		if copied, ok := seen[v.Pointer()]; ok {
+			return copied
+		}
+
+		fresh := reflect.New(v.Type().Elem())
+		seen[v.Pointer()] = fresh
+		fresh.Elem().Set(deepCopy(v.Elem(), seen))
+
+		return fresh
+
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+
+		fresh := reflect.MakeMapWithSize(v.Type(), v.Len())
+		for iterator := v.MapRange(); iterator.Next(); {
+			fresh.SetMapIndex(deepCopy(iterator.Key(), seen), deepCopy(iterator.Value(), seen))
+		}
+
+		return fresh
+
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+
+		fresh := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := range v.Len() {
+			fresh.Index(i).Set(deepCopy(v.Index(i), seen))
+		}
+
+		return fresh
+
+	case reflect.Array:
+		fresh := reflect.New(v.Type()).Elem()
+		for i := range v.Len() {
+			fresh.Index(i).Set(deepCopy(v.Index(i), seen))
+		}
+
+		return fresh
+
+	case reflect.Interface:
+		if v.IsNil() {
+			return v
+		}
+
+		fresh := reflect.New(v.Type()).Elem()
+		fresh.Set(deepCopy(v.Elem(), seen))
+
+		return fresh
+
+	case reflect.Struct:
+		fresh := reflect.New(v.Type()).Elem()
+		fresh.Set(v) // unexported fields, and every field's shallow value, first
+
+		for i := range v.NumField() {
+			if field := fresh.Field(i); field.CanSet() {
+				field.Set(deepCopy(v.Field(i), seen))
+			}
+		}
+
+		return fresh
+
+	default:
+		return v
+	}
 }
 
 func (store *Store) executeOutcome(
@@ -480,7 +559,7 @@ func (c *command) settle(ctx context.Context, commitErr error) (*evt.CommandOutc
 	case errors.Is(commitErr, evt.ErrOutcomeConflict):
 		// Another writer recorded this command ID first. Re-preparing can never resolve it; the
 		// winner's row does.
-		resolved, err := c.reread(ctx)
+		resolved, err := c.reread(context.WithoutCancel(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -498,7 +577,7 @@ func (c *command) settle(ctx context.Context, commitErr error) (*evt.CommandOutc
 		// A concurrent writer of this same command may have won with its events and outcome. If a
 		// row exists, it answers the command; if not, this is an ordinary conflict (or transient
 		// refusal) to retry.
-		resolved, err := c.reread(ctx)
+		resolved, err := c.reread(context.WithoutCancel(ctx))
 		if errors.Is(err, evt.ErrIdempotencyKeyReuse) {
 			return nil, err
 		}
@@ -535,7 +614,9 @@ func (c *command) recover(ctx context.Context, commitErr error) (*evt.CommandOut
 		}
 	}
 
-	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.store.outcomes.recoveryWait+readTimeout)
+	// The whole recovery, including a read that hangs, ends one grace period after the window: the
+	// last poll gets recoveryMaxDelay to answer, and no per-read timeout can extend past it.
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.store.outcomes.recoveryWait+recoveryMaxDelay)
 	defer cancel()
 
 	delay, waited := recoveryFirstDelay, time.Duration(0)
@@ -571,11 +652,13 @@ func (c *command) recover(ctx context.Context, commitErr error) (*evt.CommandOut
 	}
 }
 
-// reread reads the command's outcome row on a context detached from the caller's cancellation and
-// resolves it against the command's digest. It returns nil, nil when the row is absent, and
+// reread reads the command's outcome row on ctx, which the caller has detached from cancellation,
+// and resolves it against the command's digest. It returns nil, nil when the row is absent, and
 // *evt.IdempotencyKeyReuseError when the stored digest differs.
 func (c *command) reread(ctx context.Context) (*evt.CommandOutcome, error) {
-	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readTimeout)
+	// ctx is already detached from the caller's cancellation (and, during recovery, bounded by the
+	// recovery window): the per-read timeout derives from it, so a read can never outlive the window.
+	readCtx, cancel := context.WithTimeout(ctx, readTimeout)
 	defer cancel()
 
 	stored, err := c.repo.GetOutcome(readCtx, c.id)
