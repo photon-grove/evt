@@ -16,6 +16,8 @@
 //!
 //! Floating-point numbers are not normalized: Go and Rust format some floats differently. Prefer
 //! integers (for example, cents) in event payloads that must be byte-identical across languages.
+//! A stored rejection's details are the exception: their numbers are rewritten into a canonical
+//! text by [`canonical_numbers`](crate::canonical_numbers).
 
 use std::io;
 

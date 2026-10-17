@@ -9,11 +9,11 @@ use evt_compat::{Account, Runner, ScenarioFixtures, Scenarios};
 use photon_evt::wire::postgres::OutcomeRow;
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
-    Aggregate, CommandIdentity, DigestInput, EntityId, EntityType, EventId, EventSequence,
+    Aggregate, CommandIdentity, DigestInput, EntityId, EntityType, Error, EventId, EventSequence,
     EventType, EventVersion, FeatureManifest, FeatureMarker, MAX_COMMAND_ID_BYTES,
     MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, Rejection, RejectionCode, RetryPolicy,
-    SerializedEvent, SerializedSnapshot, canonical_digest_bytes, default_digest, json,
-    snapshot_events_due,
+    SerializedEvent, SerializedSnapshot, canonical_digest_bytes, canonical_numbers, default_digest,
+    json, snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -542,6 +542,19 @@ struct OutcomeFixtures {
     rows: Vec<RowVector>,
     #[serde(default)]
     malformed_rows: Vec<MalformedRow>,
+    #[serde(default)]
+    rejection_numbers: Vec<RejectionNumberVector>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RejectionNumberVector {
+    name: String,
+    input: String,
+    #[serde(default)]
+    stored: String,
+    #[serde(default)]
+    error: String,
 }
 
 #[derive(Deserialize)]
@@ -827,6 +840,38 @@ fn outcome_rows_match_go_byte_for_byte() {
         });
         assert_eq!(pg, vector.postgres_row, "{name}: postgres row");
         assert_eq!(row.into_outcome().unwrap(), outcome, "{name}: decode row");
+    }
+}
+
+#[test]
+fn rejection_numbers_take_the_canonical_text_like_go() {
+    let vectors = outcome_fixtures().rejection_numbers;
+    assert!(!vectors.is_empty());
+
+    // The literal text matters (serde_json would parse 0.0010e2 to 0.1), so the vectors go
+    // through the text-level rewrite that `Rejection::encode` ends with.
+    for vector in vectors {
+        let name = &vector.name;
+        let result = canonical_numbers(&vector.input);
+
+        match vector.error.as_str() {
+            "" => assert_eq!(result.unwrap(), vector.stored, "{name}"),
+            "invalid-argument" => assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "{name}: {result:?}"
+            ),
+            "outcome-too-large" => assert!(
+                matches!(
+                    result,
+                    Err(Error::OutcomeTooLarge {
+                        what: "rejection",
+                        ..
+                    })
+                ),
+                "{name}: {result:?}"
+            ),
+            other => panic!("{name}: unknown fixture error {other}"),
+        }
     }
 }
 

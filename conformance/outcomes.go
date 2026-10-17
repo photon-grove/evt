@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -42,6 +43,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("DedupeAcrossSnapshots", func(t *testing.T) { testDedupeAcrossSnapshots(t, outcomes(t)) })
 	t.Run("KeyReuse", func(t *testing.T) { testKeyReuse(t, outcomes(t)) })
 	t.Run("RejectionPersistence", func(t *testing.T) { testRejectionPersistence(t, outcomes(t)) })
+	t.Run("RejectionNumbersReplayVerbatim", func(t *testing.T) { testRejectionNumbers(t, outcomes(t)) })
 	t.Run("InternalFailuresWriteNoOutcome", func(t *testing.T) { testInternalFailures(t, outcomes(t)) })
 	t.Run("AcceptedNoOp", func(t *testing.T) { testAcceptedNoOp(t, outcomes(t)) })
 	t.Run("OutcomeTooLarge", func(t *testing.T) { testOutcomeTooLarge(t, outcomes(t)) })
@@ -239,6 +241,18 @@ func (l *ledger) Handle(_ context.Context, command evt.Command) (evt.CommandResu
 			Events:   []evt.Event{&ledgerEvent{Kind: "deposited", Amount: 1}},
 			Response: make([]byte, c.Size),
 		}, nil
+
+	case "numbers":
+		return evt.CommandResult{}, &domainRejection{evt.Rejection{
+			Code: "numbers", Message: "numbers in every form",
+			Details: map[string]any{
+				"big":     1e21,
+				"tiny":    1.5e-7,
+				"negzero": math.Copysign(0, -1),
+				"scaled":  json.Number("1.50e1"),
+				"nested":  []any{1e2, map[string]any{"zero": json.Number("-0.0")}},
+			},
+		}}
 
 	case "bigreject":
 		return evt.CommandResult{}, &domainRejection{evt.Rejection{Code: "too-big", Message: strings.Repeat("x", c.Size)}}
@@ -472,6 +486,33 @@ func testRejectionPersistence(t *testing.T, repo evt.OutcomeRepository) {
 	require.NoError(t, err)
 	require.Equal(t, evt.RejectionNotFound, missing.Rejection.Code)
 	require.Equal(t, "ledger not found", missing.Rejection.Message)
+}
+
+// A rejection's numbers read back the same on every backend, so a first execution equals a replay
+// even where the backend rewrites the stored text (PostgreSQL's jsonb prints numbers without an
+// exponent and drops the sign of zero).
+func testRejectionNumbers(t *testing.T, repo evt.OutcomeRepository) {
+	env := newOutcomeEnv(t, repo, 0)
+	id := env.commandID("numbers")
+
+	first, err := env.run(t, &ledgerCommand{Kind: "numbers"}, id)
+	require.NoError(t, err)
+	require.True(t, first.Rejected())
+	require.False(t, first.Replayed)
+
+	replayed, err := env.run(t, &ledgerCommand{Kind: "numbers"}, id)
+	require.NoError(t, err)
+	require.True(t, replayed.Replayed)
+	require.Equal(t, first.Rejection, replayed.Rejection, "a first execution equals a replay")
+
+	stored, err := env.repo.GetOutcome(context.Background(), id)
+	require.NoError(t, err)
+
+	encoded, err := evt.EncodeRejection(*stored.Rejection)
+	require.NoError(t, err)
+	require.Equal(t,
+		`{"code":"numbers","message":"numbers in every form","details":{"big":1000000000000000000000,"negzero":0,"nested":[100,{"zero":0.0}],"scaled":15.0,"tiny":0.00000015}}`,
+		string(encoded), "every backend stores and returns the same numeric text")
 }
 
 func testInternalFailures(t *testing.T, repo evt.OutcomeRepository) {

@@ -356,6 +356,10 @@ error before any write and is never split.
   the row's `code` attribute. Engine codes are `not-found`, `bad-command`, and `stale-fence`;
   application codes are free-form. A rejected outcome is terminal for its digest and a retried
   command replays it verbatim without running the handler
+- Numbers in `details` are stored in the canonical text PostgreSQL's `jsonb` prints (no exponent,
+  the literal's scale less its exponent, no sign on zero), so every backend stores and returns the
+  same bytes and a first execution equals a replay; a number PostgreSQL's numeric type cannot hold
+  is an invalid-argument error before any write
 - Only domain rejections are durable. Bad events, encoding errors, and storage failures are errors
   that write no outcome, so a retry after the fix starts clean. An oversized rejection fails with
   `OutcomeTooLarge` and writes nothing
