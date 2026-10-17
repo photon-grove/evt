@@ -22,6 +22,10 @@ type Command interface {
 type CommandResult struct {
 	Events []Event `json:"events"`
 
+	// Response is stored with the command's outcome on a store with outcomes enabled (ADR 0004,
+	// C3), so a retried command returns the original answer. Nil means the command returned none.
+	Response []byte `json:"response,omitempty"`
+
 	// Deprecated: Cut in ADR-0006 (K7): handlers no longer attach a Transaction to a
 	// CommandResult; commits go through the repository commit path. It will be removed in the
 	// next minor release.

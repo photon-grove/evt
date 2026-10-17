@@ -6,11 +6,13 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use evt_compat::scenario::{FIXTURE_RUN, ORIGIN_SOURCE, compat_dir};
 use evt_compat::{Account, Runner, ScenarioFixtures, Scenarios};
+use photon_evt::wire::postgres::OutcomeRow;
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
-    Aggregate, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion,
-    FeatureManifest, FeatureMarker, MemRepository, Metadata, SerializedEvent, SerializedSnapshot,
-    json, snapshot_events_due,
+    Aggregate, DigestInput, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion,
+    FeatureManifest, FeatureMarker, MAX_COMMAND_ID_BYTES, MAX_OUTCOME_BYTES, MemRepository,
+    Metadata, Outcome, Rejection, SerializedEvent, SerializedSnapshot, canonical_digest_bytes,
+    default_digest, json, snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -433,7 +435,7 @@ async fn scenarios_match_go_byte_for_byte() {
     );
 
     for scenario in &scenarios.scenarios {
-        let runner = Runner::new(MemRepository::new(), scenario.snapshot_interval);
+        let runner = Runner::for_scenario(MemRepository::new(), scenario, FIXTURE_RUN);
         let entity_id = scenario.entity_id(FIXTURE_RUN);
 
         for (index, step) in scenario.steps.iter().enumerate() {
@@ -489,6 +491,24 @@ async fn scenarios_match_go_byte_for_byte() {
             "{}: sibling streams",
             scenario.name
         );
+
+        // The outcome rows of an outcomes scenario: digests, event IDs, responses, and rejections
+        // are the bytes Go stored.
+        let outcomes = runner
+            .observe_outcomes(scenario, FIXTURE_RUN)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes, expected.outcomes,
+            "{}: command outcome rows",
+            scenario.name
+        );
+        assert_eq!(
+            !outcomes.is_empty(),
+            scenario.outcomes,
+            "{}: an outcomes scenario records rows",
+            scenario.name
+        );
     }
 }
 
@@ -509,5 +529,205 @@ async fn sibling_fixtures_pin_the_streams_scenarios_write() {
             .unwrap_or_else(|| panic!("{scenario}: no recording for {id}"));
 
         assert_eq!(sibling.events.len(), events, "{scenario}: {id} events");
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OutcomeFixtures {
+    limits: OutcomeLimits,
+    digests: Vec<DigestVector>,
+    rows: Vec<RowVector>,
+    #[serde(default)]
+    malformed_rows: Vec<MalformedRow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OutcomeLimits {
+    max_command_id_bytes: usize,
+    max_outcome_bytes: usize,
+}
+
+#[derive(Deserialize)]
+struct DigestVector {
+    name: String,
+    input: DigestInputVector,
+    #[serde(rename = "canonicalHex")]
+    canonical_hex: String,
+    digest: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DigestInputVector {
+    command_type: String,
+    streams: Vec<String>,
+    payload: Option<String>,
+    principal: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RowVector {
+    name: String,
+    input: OutcomeInputVector,
+    #[serde(default)]
+    events_json: String,
+    #[serde(default, rename = "rejectionJson")]
+    rejection_json: String,
+    dynamo_item: Value,
+    item_size: usize,
+    postgres_row: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MalformedRow {
+    name: String,
+    dynamo_item: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OutcomeInputVector {
+    command_id: String,
+    status: String,
+    digest: String,
+    response: Option<String>,
+    event_ids: Vec<String>,
+    rejection: Option<String>,
+}
+
+fn outcome_fixtures() -> OutcomeFixtures {
+    let data =
+        std::fs::read(compat_dir().join("fixtures/outcomes.json")).expect("read outcome fixtures");
+
+    serde_json::from_slice(&data).expect("parse outcome fixtures")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn outcome_limits_match_go() {
+    let limits = outcome_fixtures().limits;
+
+    assert_eq!(MAX_COMMAND_ID_BYTES, limits.max_command_id_bytes);
+    assert_eq!(MAX_OUTCOME_BYTES, limits.max_outcome_bytes);
+}
+
+#[test]
+fn command_identity_digests_match_go_byte_for_byte() {
+    for vector in outcome_fixtures().digests {
+        let name = &vector.name;
+        let input = DigestInput {
+            command_type: vector.input.command_type,
+            streams: vector.input.streams.iter().map(EntityId::new).collect(),
+            payload: vector.input.payload.unwrap_or_default().into_bytes(),
+            principal: vector.input.principal,
+        };
+
+        assert_eq!(
+            hex(&canonical_digest_bytes(&input)),
+            vector.canonical_hex,
+            "{name}: canonical bytes"
+        );
+        assert_eq!(
+            default_digest(&input).unwrap(),
+            vector.digest,
+            "{name}: digest"
+        );
+    }
+}
+
+#[test]
+fn outcome_rows_match_go_byte_for_byte() {
+    for vector in outcome_fixtures().rows {
+        let name = &vector.name;
+        let input = vector.input;
+
+        let mut outcome = match input.status.as_str() {
+            "accepted" => Outcome::accepted(input.command_id.clone(), input.digest.clone()),
+            "rejected" => Outcome::rejected(
+                input.command_id.clone(),
+                input.digest.clone(),
+                Rejection::decode(input.rejection.as_deref().expect("a rejection")).unwrap(),
+            ),
+            other => panic!("{name}: unknown status {other}"),
+        };
+        // The response's raw text is lossy for binary bytes; the PostgreSQL row has its base64.
+        if let Some(response) = vector.postgres_row["response"].as_str() {
+            outcome = outcome.with_response(json::base64_bytes::decode(response).unwrap());
+            if let (Some(text), Ok(bytes)) = (
+                &input.response,
+                std::str::from_utf8(outcome.response.as_deref().unwrap_or_default()),
+            ) {
+                assert_eq!(bytes, text, "{name}");
+            }
+        }
+        outcome.event_ids = input.event_ids.iter().map(EventId::new).collect();
+
+        // The DynamoDB item, byte for byte, and its budget size.
+        let item = dynamo::outcome_item(&outcome).unwrap();
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            vector.dynamo_item,
+            "{name}: dynamo item"
+        );
+        assert_eq!(
+            dynamo::outcome_item_size(&outcome).unwrap(),
+            vector.item_size,
+            "{name}: item size"
+        );
+        let go_item: dynamo::Item = serde_json::from_value(vector.dynamo_item).unwrap();
+        assert_eq!(
+            dynamo::outcome_from_item(&go_item).unwrap(),
+            outcome,
+            "{name}: decode Go item"
+        );
+
+        // The PostgreSQL row fields.
+        let row = OutcomeRow::from_outcome(&outcome).unwrap();
+        let expected_events = if vector.events_json.is_empty() {
+            "[]"
+        } else {
+            vector.events_json.as_str()
+        };
+        assert_eq!(row.events, expected_events, "{name}: events text");
+        assert_eq!(
+            row.rejection.as_deref().unwrap_or_default(),
+            vector.rejection_json,
+            "{name}: rejection text"
+        );
+        let pg = serde_json::json!({
+            "command_id": row.command_id,
+            "status": row.status,
+            "digest": row.digest,
+            "response": row.response.as_ref().map(|response| json::base64_bytes::encode(response)),
+            "events": row.events,
+            "rejection": row.rejection,
+            "code": row.code,
+        });
+        assert_eq!(pg, vector.postgres_row, "{name}: postgres row");
+        assert_eq!(row.into_outcome().unwrap(), outcome, "{name}: decode row");
+    }
+}
+
+#[test]
+fn malformed_outcome_rows_are_refused_as_corrupt_like_go() {
+    let rows = outcome_fixtures().malformed_rows;
+    assert!(!rows.is_empty());
+
+    for row in rows {
+        let item: dynamo::Item = serde_json::from_value(row.dynamo_item).unwrap();
+        let decoded = dynamo::outcome_from_item(&item);
+
+        assert!(
+            matches!(decoded, Err(photon_evt::Error::InvalidRecord(_))),
+            "{}: a malformed row must be refused, never replayed: {decoded:?}",
+            row.name
+        );
     }
 }

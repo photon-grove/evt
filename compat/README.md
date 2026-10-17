@@ -9,6 +9,7 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 | ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes the C6 `metadata-extensions` handoff; remaining v0.9 scenarios (C1–C10) for E2.8/E3.8 are listed in the [storage format](../docs/spec/storage-format.md#compat-scenarios-to-add). |
 | `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
+| `fixtures/outcomes.json`  | Go generator | C3/C4 identity-digest vectors (canonical bytes and SHA-256) and the encodings of outcome rows: DynamoDB item, budgeted item size, PostgreSQL row, rejection and event-ID JSON. |
 | `fixtures/feature-marker.json` | Go generator | C9 canonical manifest JSON, complete DynamoDB marker items, PostgreSQL declaration rows, ordered commit requests, and schema-upgrade DDL. |
 | `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items, SNS messages, sequences, and loaded state.                                                                                             |
 
@@ -57,7 +58,18 @@ changed, and update the spec.
    | `appendRaw`     | `event` (`type`, `version`, `payload`), optional metadata as above     | `ok` (with `events`) or `conflict`                           |
    | `compact`       | `through`                                                        | `compacted` (with `deleted`) or `uncovered`                  |
    | `conflictProbe` | `sequence`                                                       | `conflict`, or `ok` when the sequence is free                |
+   | `outcomeOnly`   | `identity` (`type`, `payload` object), `response`, `commandId`   | outcomes scenarios: an accepted outcome with no events       |
+   | `resolveOutcome`| `command`, `commandId`                                           | outcomes scenarios: `absent`, a replayed outcome, or `reuse` |
 
+   A scenario with `"outcomes": true` runs on stores with command outcomes enabled (C3/C4): every
+   step needs a `commandId`, and `execute` steps record and replay outcomes. Outcomes steps
+   expect `ok` (with `events`, 0 for a no-op), `rejected` (with `code`), `reuse`, `idTooLong`,
+   `ambiguous` (a row still absent after the recovery window), or `absent`, plus `"replayed": true` when the stored outcome is returned. An
+   `execute` step may set `injectCommitFault` (`applyThenFail` or `failWithoutApplying`) to make
+   its commit apply, or drop, while the caller observes an indeterminate error. The harness scopes
+   command IDs to the run and scenario (`compat-<run>-<scenario>-<id>`) and uses a digest that
+   maps the run name in the declared stream IDs to the fixture run's, so digests are run
+   independent; the digested payload is the step's `command` object with sorted keys.
 2. If the scenario needs a new command or event, add it to both account domains.
 3. Regenerate the fixtures and run both test suites and both live runs.
 

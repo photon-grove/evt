@@ -25,6 +25,15 @@ an `evt.DuplicateCommandError` (test with `evt.IsDuplicateCommandErr`) instead o
 appending the same fact twice. This prevents duplicate submissions and
 at-least-once retry duplicates.
 
+For retries that must return the original answer, and that must keep working after the first
+attempt's events were folded into a snapshot, enable
+[command outcomes](../README.md#command-outcomes-and-rejections-v09-c3c4) with
+`store.WithOutcomes()` and call `ExecuteWithOutcome`: a retry with the same ID and the same
+command returns the stored outcome (`Replayed`), a different command under the same ID is
+`evt.ErrIdempotencyKeyReuse`, and a command whose result was lost to a timeout is resolved by
+re-reading the outcome row rather than re-running it. Use a stable idempotency key per logical
+request, never one per attempt.
+
 ## Upcast historical shapes, always
 
 Never assume a stored payload has the latest struct shape. When an event's JSON

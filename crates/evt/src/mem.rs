@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{self, CachedMarker, FeatureManifest, FeatureMarker};
-use crate::ids::{EntityId, EntityType, EventSequence};
+use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
+use crate::outcome::Outcome;
 use crate::repository::{Commit, Repository, TransactionCommit};
 
 /// An in-memory [`Repository`]. Clones share the same storage.
@@ -20,6 +21,8 @@ use crate::repository::{Commit, Repository, TransactionCommit};
 #[derive(Debug, Default)]
 pub struct MemRepository {
     streams: Arc<Mutex<BTreeMap<EntityId, Stream>>>,
+    /// The command-outcome rows, keyed by command ID. Shared with clones, like the streams.
+    outcomes: Arc<Mutex<BTreeMap<CommandId, Outcome>>>,
     manifest: Arc<Mutex<Option<FeatureManifest>>>,
     /// The feature-marker version this handle validated, if it has written yet. Per handle, not
     /// shared with clones.
@@ -30,6 +33,7 @@ impl Clone for MemRepository {
     fn clone(&self) -> Self {
         Self {
             streams: self.streams.clone(),
+            outcomes: self.outcomes.clone(),
             manifest: self.manifest.clone(),
             validated: Mutex::new(*self.validated()),
         }
@@ -97,6 +101,12 @@ impl MemRepository {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn outcomes_lock(&self) -> MutexGuard<'_, BTreeMap<CommandId, Outcome>> {
+        self.outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn manifest_lock(&self) -> MutexGuard<'_, Option<FeatureManifest>> {
         self.manifest
             .lock()
@@ -131,7 +141,7 @@ impl Repository for MemRepository {
     async fn commit(&self, commit: Commit<Infallible>) -> Result<(), Error> {
         commit.validate()?;
         features::check_not_reserved(&commit.entity_id)?;
-        if commit.events.is_empty() {
+        if commit.events.is_empty() && commit.outcome.is_none() {
             return Ok(());
         }
 
@@ -145,6 +155,24 @@ impl Repository for MemRepository {
         self.check_manifest(stored_manifest.as_ref())?;
 
         let mut streams = self.lock();
+        let mut outcomes = self.outcomes_lock();
+
+        // A recorded outcome outranks every other failure: the command already ran.
+        let outcome = commit.stored_outcome();
+        if let Some(outcome) = &outcome
+            && outcomes.contains_key(&outcome.command_id)
+        {
+            return Err(Error::OutcomeConflict {
+                command_id: outcome.command_id.clone(),
+            });
+        }
+
+        // An outcome-only commit writes the outcome row and nothing else.
+        if commit.events.is_empty() {
+            outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
+
+            return Ok(());
+        }
 
         // The stream must continue from its stored head; a gap is refused before anything is
         // created or written.
@@ -214,6 +242,8 @@ impl Repository for MemRepository {
             });
         }
 
+        outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
+
         Ok(())
     }
 
@@ -237,6 +267,17 @@ impl Repository for MemRepository {
         commit.check_retention(stored_manifest.as_ref(), |_| false)?;
 
         let mut streams = self.lock();
+        let mut outcomes = self.outcomes_lock();
+
+        // A recorded outcome outranks every other failure: the command already ran.
+        let outcome = commit.stored_outcome();
+        if let Some(outcome) = &outcome
+            && outcomes.contains_key(&outcome.command_id)
+        {
+            return Err(Error::OutcomeConflict {
+                command_id: outcome.command_id.clone(),
+            });
+        }
 
         // Validate every stream, snapshot, and fence before writing anything, so a failure leaves
         // every stream unchanged. Reads use get: a failed commit must not create empty streams.
@@ -345,7 +386,17 @@ impl Repository for MemRepository {
             }
         }
 
+        outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
+
         Ok(())
+    }
+
+    async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        // The same validation as the durable backends: a bad ID is a programmer error, not an
+        // absent row.
+        crate::outcome::check_command_id(command_id)?;
+
+        Ok(self.outcomes_lock().get(command_id).cloned())
     }
 
     async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
@@ -512,11 +563,19 @@ mod enumerate;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conformance::{Suite, feature_marker_cases};
+    use crate::conformance::{Suite, feature_marker_cases, outcome_cases};
 
     #[tokio::test]
     async fn conforms() {
         Suite::new(&MemRepository::new()).run().await;
+    }
+
+    #[tokio::test]
+    async fn conforms_to_command_outcomes() {
+        let first = MemRepository::new();
+
+        // The clone is a second writer over the same storage.
+        outcome_cases(&first, &first.clone()).await;
     }
 
     #[tokio::test]

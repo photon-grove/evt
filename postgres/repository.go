@@ -120,6 +120,7 @@ type Repository struct {
 var (
 	_ evt.Repository              = (*Repository)(nil)
 	_ evt.TransactionalRepository = (*Repository)(nil)
+	_ evt.OutcomeRepository       = (*Repository)(nil)
 	_ evt.Compactor               = (*Repository)(nil)
 	_ evt.SnapshotStreamer        = (*Repository)(nil)
 	_ evt.EntityHeadStreamer      = (*Repository)(nil)
@@ -285,6 +286,19 @@ CREATE TABLE IF NOT EXISTS %[2]s (
     updated_at     timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS %[1]s__evt_command_outcomes (
+    command_id text        PRIMARY KEY,
+    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),
+    digest     text        NOT NULL,
+    response   bytea,
+    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    rejection  jsonb,
+    code       text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)
+           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))
+);
+
 CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
     id                integer PRIMARY KEY,
     version           bigint NOT NULL,
@@ -322,7 +336,7 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 		return err
 	}
 
-	if len(res.Events) == 0 && len(res.Snapshots) == 0 && len(res.Fences) == 0 {
+	if len(res.Events) == 0 && len(res.Snapshots) == 0 && len(res.Fences) == 0 && res.Outcome == nil {
 		return nil
 	}
 
@@ -331,49 +345,71 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 		return err
 	}
 
-	if err := evt.PreflightCommit(normalized); err != nil {
+	if err = evt.PreflightCommit(normalized); err != nil {
 		return err
 	}
 
-	return repo.inTx(ctx, func(tx pgx.Tx) error {
-		// Every touched stream — written and fenced — takes its advisory lock in canonical
-		// (sorted) order, so concurrent multi-stream commits cannot deadlock.
-		if err := repo.lockTransactionEntities(ctx, tx, normalized); err != nil {
-			return err
-		}
+	err = repo.inTx(ctx, func(tx pgx.Tx) error { return repo.commitInTx(ctx, tx, normalized) })
+	if err == nil {
+		return nil
+	}
 
-		manifest, err := repo.checkFeaturesManifest(ctx, tx)
-		if err != nil {
-			return err
-		}
+	// A failed COMMIT with an unknown result of a commit that carries an outcome is an ambiguous
+	// write the engine resolves by re-reading the outcome row.
+	var indeterminate *indeterminateCommitError
+	if errors.As(err, &indeterminate) && normalized.Outcome != nil {
+		return &evt.AmbiguousWriteError{CommandID: normalized.Outcome.CommandID, Cause: indeterminate.err}
+	}
 
-		// Fences are refused for entity types durably declared with retention: TTL deletes reopen
-		// fenced slots without leaving a successor snapshot. The refusal consults the manifest in
-		// this transaction, not this instance's configuration.
-		if err := evt.CheckFenceRetention(normalized.Fences, manifest); err != nil {
-			return err
-		}
+	return err
+}
 
-		// Under the streams' advisory locks, every written stream must continue exactly from its
-		// stored head: a gap is refused before anything is inserted.
-		if err := repo.checkContinuations(ctx, tx, normalized.Events); err != nil {
-			return err
-		}
+// commitInTx writes one normalized commit inside an open transaction: the entity locks, the
+// feature-marker check, the continuity, event, floor, snapshot, and fence checks, and last the
+// outcome insert.
+func (repo *Repository) commitInTx(ctx context.Context, tx pgx.Tx, normalized evt.SerializedResult) error {
+	// Every touched stream — written and fenced — takes its advisory lock in canonical
+	// (sorted) order, so concurrent multi-stream commits cannot deadlock.
+	if err := repo.lockTransactionEntities(ctx, tx, normalized); err != nil {
+		return err
+	}
 
-		if err := repo.insertEvents(ctx, tx, normalized.Events); err != nil {
-			return err
-		}
+	manifest, err := repo.checkFeaturesManifest(ctx, tx)
+	if err != nil {
+		return err
+	}
 
-		if err := repo.checkFloor(ctx, tx, normalized.Events); err != nil {
-			return err
-		}
+	// Fences are refused for entity types durably declared with retention: TTL deletes reopen
+	// fenced slots without leaving a successor snapshot. The refusal consults the manifest in
+	// this transaction, not this instance's configuration.
+	if err = evt.CheckFenceRetention(normalized.Fences, manifest); err != nil {
+		return err
+	}
 
-		if err := repo.commitSnapshots(ctx, tx, normalized); err != nil {
-			return err
-		}
+	// Under the streams' advisory locks, every written stream must continue exactly from its
+	// stored head: a gap is refused before anything is inserted.
+	if err = repo.checkContinuations(ctx, tx, normalized.Events); err != nil {
+		return err
+	}
 
-		return repo.checkFences(ctx, tx, normalized.Fences)
-	})
+	if err = repo.insertEvents(ctx, tx, normalized.Events); err != nil {
+		return err
+	}
+
+	if err = repo.checkFloor(ctx, tx, normalized.Events); err != nil {
+		return err
+	}
+
+	if err = repo.commitSnapshots(ctx, tx, normalized); err != nil {
+		return err
+	}
+
+	if err = repo.checkFences(ctx, tx, normalized.Fences); err != nil {
+		return err
+	}
+
+	// The outcome insert runs last, after the snapshot upserts (storage spec, PostgreSQL).
+	return repo.insertOutcome(ctx, tx, normalized.Outcome)
 }
 
 // checkContinuations asserts, for each written stream whose first sequence is above 1, that the
@@ -718,11 +754,28 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return classifyWriteError(fmt.Errorf("postgres: commit: %w", err))
+		failure := classifyWriteError(fmt.Errorf("postgres: commit: %w", err))
+
+		// A database error at COMMIT is a definitive refusal. Anything else — a lost connection, a
+		// cancelled context — leaves the caller unable to know whether the transaction applied.
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			return &indeterminateCommitError{err: failure}
+		}
+
+		return failure
 	}
 
 	return nil
 }
+
+// indeterminateCommitError marks a COMMIT whose result the caller cannot know. It is transparent
+// to errors.Is and errors.As; Commit converts it to evt.AmbiguousWriteError when the commit
+// carries an outcome.
+type indeterminateCommitError struct{ err error }
+
+func (e *indeterminateCommitError) Error() string { return e.err.Error() }
+func (e *indeterminateCommitError) Unwrap() error { return e.err }
 
 // checkContiguous rejects events whose sequences are not contiguous (each one more than the last)
 // for each entity. The floor check reads the first event and the snapshot records the last, so a

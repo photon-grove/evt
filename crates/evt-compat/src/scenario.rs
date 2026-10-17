@@ -4,15 +4,17 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use photon_evt::conformance::FaultInjectingRepository;
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
-    Commit, EntityId, EntityType, Error, EventId, EventSequence, EventType, EventVersion,
-    ExecuteError, FenceProvenance, Metadata, NewSnapshot, ReadFence, Repository, SerializedEvent,
-    Store, TransactionCommit, json,
+    Begin, CommandIdentity, CommandOutcome, Commit, DigestInput, EntityId, EntityType, Error,
+    EventId, EventSequence, EventType, EventVersion, ExecuteError, FenceProvenance, Metadata,
+    NewSnapshot, OutcomeConfig, ReadFence, Repository, SerializedEvent, Store, TransactionCommit,
+    default_digest, json,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::account::{Account, AccountCommand};
+use crate::account::{Account, AccountCommand, AccountEvent, balance_response};
 
 /// The writer name of this implementation.
 pub const WRITER: &str = "rust";
@@ -60,6 +62,10 @@ pub struct Scenario {
     #[serde(default)]
     pub description: String,
     pub snapshot_interval: usize,
+    /// Runs the scenario on stores with command outcomes enabled (C3): every step carries a
+    /// command ID, and execute steps record and replay outcomes.
+    #[serde(default)]
+    pub outcomes: bool,
     pub steps: Vec<Step>,
 }
 
@@ -134,6 +140,25 @@ pub struct Step {
     /// otherwise generate unpredictably so fixtures stay byte-for-byte reproducible.
     #[serde(default)]
     pub commit_id: Option<String>,
+    /// Makes the step's commit fail indeterminately: `applyThenFail` (the commit applies, the
+    /// caller sees an error) or `failWithoutApplying` (execute steps of outcomes scenarios).
+    #[serde(default)]
+    pub inject_commit_fault: Option<String>,
+    /// The command identity of an `outcomeOnly` step.
+    #[serde(default)]
+    pub identity: Option<Identity>,
+    /// The response an `outcomeOnly` step stores.
+    #[serde(default)]
+    pub response: Option<String>,
+}
+
+/// The command identity of an `outcomeOnly` step: its type string and payload object.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Identity {
+    #[serde(rename = "type")]
+    pub command_type: String,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
 }
 
 impl Step {
@@ -226,6 +251,12 @@ pub struct Outcome {
     pub events: usize,
     #[serde(default)]
     pub deleted: usize,
+    /// The rejection code of a rejected outcome.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// The outcome was read back from a stored row rather than produced by the step.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 impl Outcome {
@@ -233,6 +264,24 @@ impl Outcome {
         Self {
             result: result.to_owned(),
             ..Self::default()
+        }
+    }
+
+    /// Classifies the result of a command on an outcomes store.
+    fn of_command<E>(command: &CommandOutcome<E>) -> Self {
+        let outcome = &command.outcome;
+
+        match &outcome.rejection {
+            Some(rejection) => Self {
+                code: rejection.code.to_string(),
+                replayed: command.replayed,
+                ..Self::of("rejected")
+            },
+            None => Self {
+                events: outcome.event_ids.len(),
+                replayed: command.replayed,
+                ..Self::of("ok")
+            },
         }
     }
 }
@@ -283,14 +332,29 @@ pub struct Expectation {
     pub siblings: Vec<SiblingExpectation>,
     #[serde(default, deserialize_with = "null_to_empty")]
     pub transactions: Vec<TransactionExpectation>,
+    /// The command-outcome rows an outcomes scenario leaves behind, ordered by command ID.
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub outcomes: Vec<OutcomeExpectation>,
 }
 
-/// The ordered `TransactWriteItems` actions one transaction step sent, as the Go implementation
-/// recorded them.
+/// One stored command-outcome row, as its DynamoDB item.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeExpectation {
+    pub command_id: String,
+    pub dynamo_item: serde_json::Value,
+}
+
+/// The ordered `TransactWriteItems` actions one step sent, as the Go implementation recorded
+/// them: `actions` is the one request of a transaction step, `calls` every request of a step of an
+/// outcomes scenario, in order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TransactionExpectation {
     pub step: usize,
+    #[serde(default, deserialize_with = "null_to_empty")]
     pub actions: Vec<serde_json::Value>,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub calls: Vec<Vec<serde_json::Value>>,
 }
 
 /// The stored state of one of a scenario's sibling streams (transactional siblings, fenced
@@ -328,20 +392,79 @@ pub enum StepError {
     Unexpected(String),
 }
 
+/// The settings of a scenario that runs on a store with command outcomes.
+struct OutcomeRun {
+    config: OutcomeConfig,
+    run: String,
+    scenario: String,
+}
+
 /// Executes steps against one repository through the Rust store.
 pub struct Runner<R: Repository> {
     store: Store<Account, R>,
+    snapshot_interval: usize,
+    outcomes: Option<OutcomeRun>,
 }
 
 impl<R: Repository> Runner<R> {
     pub fn new(repository: R, snapshot_interval: usize) -> Self {
         Self {
             store: Store::new(repository, ()).with_snapshot_interval(snapshot_interval),
+            snapshot_interval,
+            outcomes: None,
         }
+    }
+
+    /// A runner for a scenario in a run: a store with command outcomes for an outcomes scenario,
+    /// a plain one otherwise. The outcomes store's identity digest replaces the run name in each
+    /// declared stream ID with the fixture run's, so a command digests the same in every run and
+    /// the golden fixtures' digests hold against live backends. Command IDs are scoped to the run
+    /// and the scenario, because outcome rows are global to the table.
+    pub fn for_scenario(repository: R, scenario: &Scenario, run: &str) -> Self {
+        let mut runner = Self::new(repository, scenario.snapshot_interval);
+
+        if scenario.outcomes {
+            let (from, to) = (format!("compat-{run}-"), format!("compat-{FIXTURE_RUN}-"));
+            // A short recovery window keeps the dropped-commit step quick; it still ends in the retryable
+            // ambiguous result because the row never appears.
+            let config = OutcomeConfig::new()
+                .with_recovery_wait(std::time::Duration::from_millis(100))
+                .with_digester(move |input: &DigestInput| {
+                    let mut input = input.clone();
+                    for stream in &mut input.streams {
+                        *stream = EntityId::new(stream.as_str().replacen(&from, &to, 1));
+                    }
+
+                    default_digest(&input)
+                });
+
+            runner.store = runner.store.with_outcomes(config.clone());
+            runner.outcomes = Some(OutcomeRun {
+                config,
+                run: run.to_owned(),
+                scenario: scenario.name.clone(),
+            });
+        }
+
+        runner
     }
 
     pub fn store(&self) -> &Store<Account, R> {
         &self.store
+    }
+
+    /// The step's metadata, with the command ID scoped on an outcomes runner.
+    fn step_metadata(&self, step: &Step) -> Metadata {
+        let mut metadata = step.metadata();
+
+        if let (Some(outcomes), Some(command_id)) = (&self.outcomes, &step.command_id)
+            && !command_id.is_empty()
+        {
+            metadata.command_id =
+                Some(scoped_command_id(&outcomes.run, &outcomes.scenario, command_id).into());
+        }
+
+        metadata
     }
 
     /// Runs one step and classifies its outcome.
@@ -364,6 +487,8 @@ impl<R: Repository> Runner<R> {
                     .await
             }
             "transaction" => self.transaction(entity_id, step).await,
+            "outcomeOnly" => self.outcome_only(step).await,
+            "resolveOutcome" => self.resolve_outcome(entity_id, step).await,
             "compact" => {
                 let id = transaction_id(entity_id, step.suffix.as_deref().unwrap_or(""));
                 match self
@@ -483,6 +608,10 @@ impl<R: Repository> Runner<R> {
         entity_id: &EntityId,
         step: &Step,
     ) -> Result<Outcome, StepError> {
+        if let Some(outcomes) = &self.outcomes {
+            return self.execute_with_outcome(outcomes, entity_id, step).await;
+        }
+
         let command = step.command.clone().ok_or(StepError::Missing("command"))?;
         let before = self.store.load(entity_id).await?.sequence();
 
@@ -501,6 +630,127 @@ impl<R: Repository> Runner<R> {
             Err(ExecuteError::Store(err)) => Err(err.into()),
             Err(other) => Err(StepError::Unexpected(other.to_string())),
         }
+    }
+
+    /// Executes a command on the outcomes store. An injected commit fault runs it over a
+    /// decorated repository that applies or drops the commit and reports an indeterminate error.
+    async fn execute_with_outcome(
+        &self,
+        outcomes: &OutcomeRun,
+        entity_id: &EntityId,
+        step: &Step,
+    ) -> Result<Outcome, StepError> {
+        let metadata = self.step_metadata(step);
+
+        let result = match step.inject_commit_fault.as_deref() {
+            None => execute_on(&self.store, entity_id, step, metadata).await?,
+            Some(fault_kind) => {
+                let fault = FaultInjectingRepository::new(self.store.repository());
+                match fault_kind {
+                    "applyThenFail" => fault.arm_after_apply(),
+                    "failWithoutApplying" => fault.arm_before_apply(),
+                    other => {
+                        return Err(StepError::Unexpected(format!(
+                            "unknown injectCommitFault {other:?}"
+                        )));
+                    }
+                }
+
+                let store = Store::<Account, _>::new(&fault, ())
+                    .with_snapshot_interval(self.snapshot_interval)
+                    .with_outcomes(outcomes.config.clone());
+
+                execute_on(&store, entity_id, step, metadata).await?
+            }
+        };
+
+        classify(result)
+    }
+
+    /// Records a command that writes no events: an accepted outcome carrying the step's response,
+    /// from an outcome-only transaction that declares no streams.
+    async fn outcome_only(&self, step: &Step) -> Result<Outcome, StepError> {
+        let identity = step
+            .identity
+            .as_ref()
+            .ok_or(StepError::Missing("identity"))?;
+        let mut command = CommandIdentity::new(&identity.command_type);
+        if let Some(payload) = &identity.payload {
+            command = command.with_payload(payload)?;
+        }
+
+        let metadata = self.step_metadata(step);
+        let mut tx = self.store.transaction();
+
+        let result = match tx.begin_command(&command, &metadata).await {
+            Ok(Begin::Replayed(replayed)) => Ok(*replayed),
+            Ok(Begin::Proceed) => {
+                let response = step
+                    .response
+                    .as_ref()
+                    .filter(|response| !response.is_empty())
+                    .map(|response| response.clone().into_bytes());
+
+                tx.commit_with_outcome(response).await
+            }
+            Err(error) => Err(error),
+        };
+
+        classify(result)
+    }
+
+    /// Re-reads the outcome row for the step's command, as ambiguous-write recovery does,
+    /// without running or writing anything.
+    async fn resolve_outcome(
+        &self,
+        entity_id: &EntityId,
+        step: &Step,
+    ) -> Result<Outcome, StepError> {
+        let command = step.command.clone().ok_or(StepError::Missing("command"))?;
+
+        match self
+            .store
+            .resolve_outcome(entity_id, &command, &self.step_metadata(step))
+            .await
+        {
+            Ok(None) => Ok(Outcome::of("absent")),
+            Ok(Some(resolved)) => Ok(Outcome::of_command(&resolved)),
+            Err(error) => classify::<AccountEvent>(Err(error)),
+        }
+    }
+
+    /// Reads the outcome row of every command ID a scenario uses in `run`, ordered by ID, as the
+    /// DynamoDB items this implementation encodes for them. A command that left no row (a
+    /// rejected ID, a dropped commit) is simply absent.
+    pub async fn observe_outcomes(
+        &self,
+        scenario: &Scenario,
+        run: &str,
+    ) -> Result<Vec<OutcomeExpectation>, Error> {
+        let ids: std::collections::BTreeSet<String> = scenario
+            .steps
+            .iter()
+            .filter_map(|step| step.command_id.as_ref().filter(|id| !id.is_empty()))
+            .map(|id| scoped_command_id(run, &scenario.name, id))
+            .collect();
+
+        let mut outcomes = Vec::new();
+        for id in ids {
+            // An ID over the limit can never have a row (the step fails with CommandIdTooLong
+            // before any write), and reading one is refused.
+            if id.len() > photon_evt::MAX_COMMAND_ID_BYTES {
+                continue;
+            }
+
+            if let Some(outcome) = self.store.repository().outcome(&id.as_str().into()).await? {
+                outcomes.push(OutcomeExpectation {
+                    command_id: id,
+                    dynamo_item: serde_json::to_value(dynamo::outcome_item(&outcome)?)?,
+                });
+            }
+        }
+
+        Ok(outcomes)
     }
 
     async fn commit_raw(
@@ -584,6 +834,7 @@ impl<R: Repository> Runner<R> {
             sns_messages,
             siblings: Vec::new(),
             transactions: Vec::new(),
+            outcomes: Vec::new(),
         })
     }
 
@@ -625,6 +876,41 @@ impl<R: Repository> Runner<R> {
         }
 
         Ok(siblings)
+    }
+}
+
+/// The command ID of a step in an outcomes scenario: outcome rows are global to the table, so a
+/// bare `c1` would collide across scenarios and across runs.
+pub fn scoped_command_id(run: &str, scenario: &str, command_id: &str) -> String {
+    format!("compat-{run}-{scenario}-{command_id}")
+}
+
+async fn execute_on<S: Repository>(
+    store: &Store<Account, S>,
+    entity_id: &EntityId,
+    step: &Step,
+    metadata: Metadata,
+) -> Result<Result<CommandOutcome<AccountEvent>, Error>, StepError> {
+    let command = step.command.clone().ok_or(StepError::Missing("command"))?;
+    let balance = command.responds_with_balance();
+
+    Ok(store
+        .execute_with_response(entity_id, command, metadata, move |account, _| {
+            Ok(balance.then(|| balance_response(account)))
+        })
+        .await)
+}
+
+/// Maps the result of a command on an outcomes store to a step outcome.
+fn classify<E>(result: Result<CommandOutcome<E>, Error>) -> Result<Outcome, StepError> {
+    match result {
+        Ok(command) => Ok(Outcome::of_command(&command)),
+        Err(Error::IdempotencyKeyReuse { .. }) => Ok(Outcome::of("reuse")),
+        Err(Error::CommandIdTooLong { .. }) => Ok(Outcome::of("idTooLong")),
+        Err(Error::AmbiguousWrite { .. }) => Ok(Outcome::of("ambiguous")),
+        Err(Error::DuplicateCommand(_)) => Ok(Outcome::of("duplicate")),
+        Err(error) if error.is_conflict() => Ok(Outcome::of("conflict")),
+        Err(error) => Err(error.into()),
     }
 }
 

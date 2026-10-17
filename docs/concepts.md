@@ -55,6 +55,7 @@ type Command interface {
 ```go
 type CommandResult struct {
     Events      []Event     // the immutable facts to commit
+    Response    []byte      // stored with the command's outcome when outcomes are enabled
     Transaction Transaction // deprecated in v0.9.0 (K7); see [Transaction](#transaction)
 }
 ```
@@ -62,7 +63,11 @@ type CommandResult struct {
 Returning zero events is valid — a command can legitimately decide nothing
 happened. A command carries [metadata](#metadata); a stable `CommandID` makes a
 retried command fail as a `DuplicateCommandError` rather than recording the same
-fact twice.
+fact twice. A store with [command outcomes](../README.md#command-outcomes-and-rejections-v09-c3c4)
+enabled goes further: it records every command (accepted, accepted with no events, or rejected)
+on a durable `command-outcome#<id>` row and answers a retry with the stored outcome, even when
+the original events were folded into a snapshot long ago. A handler error that implements
+`evt.Rejectioner` (such as `NotFoundError`) becomes a persisted rejection.
 
 ## Event
 

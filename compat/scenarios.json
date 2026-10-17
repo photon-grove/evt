@@ -202,6 +202,81 @@
           ], "expect": { "result": "conflict" } },
         { "by": "rust", "op": "appendRaw", "commandId": "c7", "suffix": "watched", "event": { "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":20,\"memo\":\"after-aba\"}" }, "expect": { "result": "ok", "events": 1 } }
       ]
+    },
+    {
+      "name": "outcomes-idempotency",
+      "description": "A retry with the same identity digest returns the stored outcome and writes nothing, across languages and across snapshots; a different payload or principal under the same ID is IdempotencyKeyReuse; a command ID over 512 UTF-8 bytes fails with CommandIdTooLong before any write.",
+      "snapshotInterval": 3,
+      "outcomes": true,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Ada Lovelace", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 500, "memo": "first" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 500, "memo": "first" }, "expect": { "result": "ok", "events": 1, "replayed": true } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 600, "memo": "first" }, "expect": { "result": "reuse" } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "batchDeposit", "amounts": [100, 200] }, "expect": { "result": "ok", "events": 2 } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "principalId": "user:42", "command": { "type": "deposit", "amountCents": 50 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c4", "principalId": "user:43", "command": { "type": "deposit", "amountCents": 50 }, "expect": { "result": "reuse" } },
+        { "by": "go", "op": "execute", "commandId": "c4", "principalId": "user:42", "command": { "type": "deposit", "amountCents": 50 }, "expect": { "result": "ok", "events": 1, "replayed": true } },
+        { "by": "rust", "op": "execute", "commandId": "c5", "command": { "type": "deposit", "amountCents": 75 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 500, "memo": "first" }, "expect": { "result": "ok", "events": 1, "replayed": true } },
+        { "by": "rust", "op": "execute", "commandId": "c3", "command": { "type": "batchDeposit", "amounts": [100, 200] }, "expect": { "result": "ok", "events": 2, "replayed": true } },
+        { "by": "go", "op": "execute", "commandId": "long-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "command": { "type": "deposit", "amountCents": 1 }, "expect": { "result": "idTooLong" } },
+        { "by": "rust", "op": "execute", "commandId": "long-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "command": { "type": "deposit", "amountCents": 1 }, "expect": { "result": "idTooLong" } }
+      ]
+    },
+    {
+      "name": "outcomes-noop",
+      "description": "A zero-event command and an outcome-only commit are stored as accepted with no events attribute (the response is still stored); each language replays the other's.",
+      "snapshotInterval": 0,
+      "outcomes": true,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Ada Lovelace", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 300 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "balance" }, "expect": { "result": "ok", "events": 0 } },
+        { "by": "rust", "op": "execute", "commandId": "c3", "command": { "type": "balance" }, "expect": { "result": "ok", "events": 0, "replayed": true } },
+        { "by": "go", "op": "outcomeOnly", "commandId": "c4", "identity": { "type": "account:audit", "payload": { "note": "checked" } }, "response": "audited", "expect": { "result": "ok", "events": 0 } },
+        { "by": "rust", "op": "outcomeOnly", "commandId": "c4", "identity": { "type": "account:audit", "payload": { "note": "checked" } }, "response": "audited", "expect": { "result": "ok", "events": 0, "replayed": true } },
+        { "by": "rust", "op": "outcomeOnly", "commandId": "c4", "identity": { "type": "account:audit", "payload": { "note": "changed" } }, "response": "audited", "expect": { "result": "reuse" } },
+        { "by": "go", "op": "execute", "commandId": "c5", "command": { "type": "ping" }, "expect": { "result": "ok", "events": 0 } },
+        { "by": "rust", "op": "execute", "commandId": "c5", "command": { "type": "ping" }, "expect": { "result": "ok", "events": 0, "replayed": true } },
+        { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "deposit", "amountCents": 10 }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
+      "name": "outcomes-rejection",
+      "description": "A domain rejection is persisted once in final state; the retried command replays it verbatim in either language, even after the state changed; a reused ID is IdempotencyKeyReuse.",
+      "snapshotInterval": 0,
+      "outcomes": true,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Ada Lovelace", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "withdraw", "amountCents": 1000 }, "expect": { "result": "rejected", "code": "insufficient-funds" } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 5000 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c2", "command": { "type": "withdraw", "amountCents": 1000 }, "expect": { "result": "rejected", "code": "insufficient-funds", "replayed": true } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "withdraw", "amountCents": 1000 }, "expect": { "result": "rejected", "code": "insufficient-funds", "replayed": true } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "command": { "type": "deposit", "amountCents": 0 }, "expect": { "result": "rejected", "code": "amount-must-be-positive" } },
+        { "by": "go", "op": "execute", "commandId": "c4", "command": { "type": "deposit", "amountCents": 0 }, "expect": { "result": "rejected", "code": "amount-must-be-positive", "replayed": true } },
+        { "by": "go", "op": "execute", "commandId": "c5", "command": { "type": "open", "owner": "Ada Lovelace" }, "expect": { "result": "rejected", "code": "account-already-opened" } },
+        { "by": "rust", "op": "execute", "commandId": "c5", "command": { "type": "deposit", "amountCents": 1 }, "expect": { "result": "reuse" } },
+        { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "withdraw", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } }
+      ]
+    },
+    {
+      "name": "outcomes-ambiguous",
+      "description": "After an indeterminate commit error injected so the commit really applied, the re-read by command ID returns the stored outcome (same digest); a dropped commit leaves the row absent for the whole recovery window, so the result is a retryable ambiguous write (never \"not applied\") and the retry is safe; a different digest is IdempotencyKeyReuse; a recovered rejection is the stored rejection.",
+      "snapshotInterval": 0,
+      "outcomes": true,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Ada Lovelace", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "injectCommitFault": "applyThenFail", "command": { "type": "deposit", "amountCents": 200 }, "expect": { "result": "ok", "events": 1, "replayed": true } },
+        { "by": "go", "op": "execute", "commandId": "c3", "injectCommitFault": "failWithoutApplying", "command": { "type": "deposit", "amountCents": 300 }, "expect": { "result": "ambiguous" } },
+        { "by": "go", "op": "resolveOutcome", "commandId": "c3", "command": { "type": "deposit", "amountCents": 300 }, "expect": { "result": "absent" } },
+        { "by": "rust", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 300 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "resolveOutcome", "commandId": "c2", "command": { "type": "deposit", "amountCents": 200 }, "expect": { "result": "ok", "events": 1, "replayed": true } },
+        { "by": "rust", "op": "resolveOutcome", "commandId": "c2", "command": { "type": "deposit", "amountCents": 201 }, "expect": { "result": "reuse" } },
+        { "by": "go", "op": "execute", "commandId": "c4", "injectCommitFault": "applyThenFail", "command": { "type": "withdraw", "amountCents": 100000 }, "expect": { "result": "rejected", "code": "insufficient-funds", "replayed": true } },
+        { "by": "rust", "op": "resolveOutcome", "commandId": "c4", "command": { "type": "withdraw", "amountCents": 100000 }, "expect": { "result": "rejected", "code": "insufficient-funds", "replayed": true } },
+        { "by": "go", "op": "execute", "commandId": "c5", "injectCommitFault": "applyThenFail", "command": { "type": "deposit", "amountCents": 400 }, "expect": { "result": "ok", "events": 1, "replayed": true } }
+      ]
     }
   ]
 }

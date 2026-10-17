@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/photon-grove/evt"
@@ -153,7 +154,13 @@ func (AccountClosed) Type() evt.EventType { return ClosedEvent }
 func (AccountClosed) Version() evt.EventVersion { return 1 }
 
 // Command is the account command, decoded from a scenario step. Kind selects the operation.
+//
+// Its JSON encoding is the step's own command object, keys sorted and compact, so the identity
+// digest of a command (which hashes its payload JSON) is the same in both languages and does not
+// depend on which optional fields a struct happens to declare.
 type Command struct {
+	raw map[string]json.RawMessage
+
 	Kind        string            `json:"type"`
 	Owner       string            `json:"owner"`
 	OpenedAt    string            `json:"openedAt"`
@@ -165,6 +172,37 @@ type Command struct {
 	Reason      *string           `json:"reason"`
 }
 
+// UnmarshalJSON decodes the typed fields and remembers the step's own keys.
+func (c *Command) UnmarshalJSON(data []byte) error {
+	type fields Command
+
+	var typed fields
+	if err := json.Unmarshal(data, &typed); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*c = Command(typed)
+	c.raw = raw
+
+	return nil
+}
+
+// MarshalJSON encodes the step's command object with sorted keys.
+func (c *Command) MarshalJSON() ([]byte, error) {
+	if c.raw != nil {
+		return json.Marshal(c.raw)
+	}
+
+	type fields Command
+
+	return json.Marshal((*fields)(c))
+}
+
 // Type returns the command type.
 func (c *Command) Type() evt.CommandType { return evt.CommandType("account:" + c.Kind) }
 
@@ -173,10 +211,21 @@ func (c *Command) EntityType() evt.EntityType { return AccountType }
 
 // RejectedError is a business-rule rejection. Both languages reject the same commands.
 type RejectedError struct {
-	Reason string
+	Reason  string
+	Details map[string]any
 }
 
 func (e *RejectedError) Error() string { return "rejected: " + e.Reason }
+
+// Rejection maps the rule onto the standard persisted rejection: the code is the reason in
+// kebab-case ("insufficient funds" is "insufficient-funds"), the message the reason itself.
+func (e *RejectedError) Rejection() evt.Rejection {
+	return evt.Rejection{
+		Code:    evt.RejectionCode(strings.ReplaceAll(e.Reason, " ", "-")),
+		Message: e.Reason,
+		Details: e.Details,
+	}
+}
 
 func reject(reason string) (evt.CommandResult, error) {
 	return evt.CommandResult{}, &RejectedError{Reason: reason}
@@ -237,29 +286,42 @@ func (a *Account) Handle(_ context.Context, command evt.Command) (evt.CommandRes
 		if c.AmountCents <= 0 {
 			return reject("amount must be positive")
 		}
-		return emit(MoneyDeposited{AmountCents: c.AmountCents, Memo: c.Memo})
+		return emitWithBalance(a.BalanceCents+c.AmountCents, MoneyDeposited{AmountCents: c.AmountCents, Memo: c.Memo})
 
 	case "batchDeposit":
 		if len(c.Amounts) == 0 {
 			return reject("no amounts")
 		}
 		result := make([]evt.Event, 0, len(c.Amounts))
+		balance := a.BalanceCents
 		for _, amount := range c.Amounts {
 			if amount <= 0 {
 				return reject("amount must be positive")
 			}
 			result = append(result, MoneyDeposited{AmountCents: amount})
+			balance += amount
 		}
-		return evt.CommandResult{Events: result}, nil
+		return emitWithBalance(balance, result...)
 
 	case "withdraw":
 		if c.AmountCents <= 0 {
 			return reject("amount must be positive")
 		}
 		if c.AmountCents > a.BalanceCents {
-			return reject("insufficient funds")
+			return evt.CommandResult{}, &RejectedError{
+				Reason:  "insufficient funds",
+				Details: map[string]any{"balanceCents": a.BalanceCents, "requestedCents": c.AmountCents},
+			}
 		}
-		return emit(MoneyWithdrawn{AmountCents: c.AmountCents})
+		return emitWithBalance(a.BalanceCents-c.AmountCents, MoneyWithdrawn{AmountCents: c.AmountCents})
+
+	case "ping":
+		// Accepted with no events and no response.
+		return evt.CommandResult{}, nil
+
+	case "balance":
+		// Accepted with no events; the response is the balance.
+		return emitWithBalance(a.BalanceCents)
 
 	case "tag":
 		if len(c.Tags) == 0 {
@@ -288,6 +350,12 @@ func (a *Account) Handle(_ context.Context, command evt.Command) (evt.CommandRes
 
 func emit(list ...evt.Event) (evt.CommandResult, error) {
 	return evt.CommandResult{Events: list}, nil
+}
+
+// emitWithBalance returns the events and a response carrying the balance after them. Outcome
+// stores record the response; others ignore it.
+func emitWithBalance(balance int64, list ...evt.Event) (evt.CommandResult, error) {
+	return evt.CommandResult{Events: list, Response: fmt.Appendf(nil, `{"balanceCents":%d}`, balance)}, nil
 }
 
 // Apply folds an event into state.

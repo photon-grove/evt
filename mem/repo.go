@@ -30,6 +30,10 @@ type Repository struct {
 type memFeatures struct {
 	mu       sync.Mutex
 	manifest *evt.FeatureManifest
+
+	// outcomes holds the command-outcome rows (ADR 0004, C3), keyed by command ID. They share the
+	// lock with the manifest so an outcome is written in the same critical section as its events.
+	outcomes map[evt.CommandID]evt.Outcome
 }
 
 // NewRepository creates a new instance of the Repository
@@ -48,6 +52,7 @@ var (
 	_ evt.EntityHeadVisitor  = (*Repository)(nil)
 
 	_ evt.TransactionalRepository = (*Repository)(nil)
+	_ evt.OutcomeRepository       = (*Repository)(nil)
 )
 
 // AtomicTransactions declares that Commit writes every stream, snapshot, and fence of a result
@@ -105,6 +110,14 @@ func (repo Repository) Commit(
 		return err
 	}
 
+	// The outcome row is written once: an existing row means another writer recorded this command
+	// ID first. It is the last check, like the outcome put is the last transaction action.
+	if outcome := normalized.Outcome; outcome != nil {
+		if _, exists := repo.features.outcomes[outcome.CommandID]; exists {
+			return &evt.OutcomeConflictError{CommandID: outcome.CommandID}
+		}
+	}
+
 	for _, event := range normalized.Events {
 		id := string(event.EntityID)
 
@@ -120,7 +133,57 @@ func (repo Repository) Commit(
 		repo.snapshots[string(snapshot.EntityID)] = snapshot
 	}
 
+	if outcome := normalized.Outcome; outcome != nil {
+		if repo.features.outcomes == nil {
+			repo.features.outcomes = make(map[evt.CommandID]evt.Outcome)
+		}
+
+		repo.features.outcomes[outcome.CommandID] = cloneOutcome(*outcome)
+	}
+
 	return repo.applyTransactions(normalized.Transaction)
+}
+
+// GetOutcome reads a command's outcome row, or nil when none exists. The in-memory repository is
+// strongly consistent by construction. It implements evt.OutcomeRepository.
+func (repo Repository) GetOutcome(_ context.Context, id evt.CommandID) (*evt.Outcome, error) {
+	// The same typed validation as the durable backends: an empty, non-UTF-8, or oversized ID is a
+	// programmer error, not an absent row.
+	if err := evt.CheckCommandID(id); err != nil {
+		return nil, err
+	}
+
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	stored, ok := repo.features.outcomes[id]
+	if !ok {
+		return nil, nil
+	}
+
+	outcome := cloneOutcome(stored)
+
+	return &outcome, nil
+}
+
+// cloneOutcome copies an outcome so neither the stored row nor the caller's value aliases the other.
+func cloneOutcome(outcome evt.Outcome) evt.Outcome {
+	outcome.Response = slices.Clone(outcome.Response)
+	outcome.EventIDs = slices.Clone(outcome.EventIDs)
+
+	if outcome.Rejection != nil {
+		// A JSON round trip copies nested maps and slices too, and yields the form the durable
+		// backends return, so mutating a value the caller holds cannot change the stored row.
+		if canonical, err := evt.CanonicalRejection(*outcome.Rejection); err == nil {
+			outcome.Rejection = &canonical
+		} else {
+			rejection := *outcome.Rejection
+			rejection.Details = maps.Clone(rejection.Details)
+			outcome.Rejection = &rejection
+		}
+	}
+
+	return outcome
 }
 
 // checkContinuation refuses a written stream whose first sequence skips past the stored head. The

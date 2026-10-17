@@ -14,6 +14,7 @@ use evt_compat::drivers;
 use futures_core::Stream as _;
 use photon_evt::conformance::{
     Add, Ledger, LedgerEvent, Suite, ViewTarget, enumeration_cases, feature_marker_cases,
+    outcome_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository};
@@ -161,11 +162,114 @@ async fn dynamo_conforms() {
     // A second handle over the same table is a second writer with its own marker cache.
     let second = DynamoRepository::new(repository.client().clone(), repository.table());
     feature_marker_cases(&repository, &second).await;
+    outcome_cases(&repository, &second).await;
+    dynamo_outcome_row_matches_the_wire_format(&repository).await;
+    dynamo_outcome_reads_are_consistent_by_default_and_by_force(&repository).await;
     dynamo_marker_row_matches_the_wire_format(&repository).await;
     projector_condition_failure_is_not_a_conflict(&repository).await;
     dynamo_refuses_projector_only_transactions(&repository).await;
     dynamo_legacy_reserved_reads(&repository).await;
     dynamo_enumeration(&repository).await;
+}
+
+/// Reads an outcome row back through the raw client and asserts it is byte-for-byte the item the
+/// wire format pins, with the `sk` stored as a number.
+async fn dynamo_outcome_row_matches_the_wire_format(repository: &DynamoRepository) {
+    use photon_evt::wire::dynamo;
+    use photon_evt::{Outcome, Rejection};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let stream = EntityId::new(format!("conf-{nanos}-outcome-wire"));
+    let event = |sequence: i64| SerializedEvent {
+        id: EventId::for_event(&stream, EventSequence(sequence)),
+        sequence: EventSequence(sequence),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: stream.clone(),
+        entity_type: "ledger".into(),
+        payload: br#"{"amount":1}"#.to_vec(),
+        metadata: Metadata::default(),
+    };
+
+    let accepted = Outcome::accepted(format!("wire-{nanos}-accepted"), "digest")
+        .with_response(vec![0, 1, 2, 254, 255]);
+    repository
+        .commit(
+            Commit::new(stream.clone(), vec![event(1), event(2)]).with_outcome(accepted.clone()),
+        )
+        .await
+        .expect("commit with an outcome");
+    let rejected = Outcome::rejected(
+        format!("wire-{nanos}-rejected"),
+        "digest",
+        Rejection::new("taken", "a<b>").with_details(serde_json::json!({"k": 1})),
+    );
+    repository
+        .commit(Commit::new(stream.clone(), Vec::new()).with_outcome(rejected.clone()))
+        .await
+        .expect("outcome-only commit");
+
+    for (outcome, event_ids) in [(accepted, 2usize), (rejected, 0)] {
+        let output = repository
+            .client()
+            .get_item()
+            .table_name(repository.table())
+            .consistent_read(true)
+            .key(
+                "pk",
+                AttributeValue::S(dynamo::outcome_key(&outcome.command_id)),
+            )
+            .key("sk", AttributeValue::N("1".into()))
+            .send()
+            .await
+            .expect("read the outcome item");
+        let stored = photon_evt::dynamodb::from_sdk_item(&output.item.expect("the outcome item"));
+
+        let mut want = outcome.clone();
+        want.event_ids = (1..=event_ids as i64)
+            .map(|sequence| EventId::for_event(&stream, EventSequence(sequence)))
+            .collect();
+        assert_eq!(
+            stored,
+            dynamo::outcome_item(&want).expect("encode the outcome item"),
+            "the stored outcome item must match the wire format"
+        );
+        assert_eq!(dynamo::outcome_from_item(&stored).unwrap(), want);
+    }
+}
+
+/// The outcome pre-check is a strongly consistent read even when the repository is configured
+/// for eventually consistent reads, so a committed outcome is always found.
+async fn dynamo_outcome_reads_are_consistent_by_default_and_by_force(
+    repository: &DynamoRepository,
+) {
+    let eventual = DynamoRepository::new(repository.client().clone(), repository.table())
+        .with_consistent_read(false);
+    let store = Store::<Ledger, _>::new(&eventual, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(photon_evt::OutcomeConfig::new());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = EntityId::new(format!("conf-{nanos}-outcome-consistent"));
+
+    for round in 0..10 {
+        let metadata =
+            Metadata::new("local").with_command_id(format!("consistent-{nanos}-{round}"));
+        let first = store
+            .execute_with_outcome(&id, Add(1), metadata.clone())
+            .await
+            .expect("first execution");
+        let again = store
+            .execute_with_outcome(&id, Add(1), metadata)
+            .await
+            .expect("repeat");
+        assert!(!first.replayed && again.replayed, "round {round}");
+    }
 }
 
 /// Reads the marker row back through the raw client and asserts it is byte-for-byte the item the
@@ -653,6 +757,8 @@ async fn postgres_conforms() {
         .with_tables(&events, &snapshots)
         .unwrap();
     feature_marker_cases(&repository, &second).await;
+    outcome_cases(&repository, &second).await;
+    postgres_outcome_row_matches_the_wire_format(&repository, &events).await;
     postgres_features_text_matches_the_manifest(&repository, &events).await;
     postgres_refuses_projector_only_transactions(&repository).await;
     postgres_legacy_reserved_reads(&repository, &events, &snapshots).await;
@@ -663,10 +769,99 @@ async fn postgres_conforms() {
         .await
         .unwrap()
         .batch_execute(&format!(
-            "DROP TABLE {events}, {snapshots}, {events}__evt_features"
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes"
         ))
         .await
         .expect("drop the isolated event log");
+}
+
+/// Reads outcome rows back through raw SQL: bytea response, jsonb events and rejection, and the
+/// CHECK constraint that mirrors the once-in-final-state rule.
+async fn postgres_outcome_row_matches_the_wire_format(
+    repository: &PostgresRepository,
+    events: &str,
+) {
+    use photon_evt::{Outcome, Rejection};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let stream = EntityId::new(format!("conf-{nanos}-outcome-wire"));
+    let event = SerializedEvent {
+        id: EventId::for_event(&stream, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: stream.clone(),
+        entity_type: "ledger".into(),
+        payload: br#"{"amount":1}"#.to_vec(),
+        metadata: Metadata::default(),
+    };
+
+    let accepted = Outcome::accepted(format!("wire-{nanos}-accepted"), "digest")
+        .with_response(vec![0, 1, 255]);
+    repository
+        .commit(Commit::new(stream.clone(), vec![event]).with_outcome(accepted.clone()))
+        .await
+        .expect("commit with an outcome");
+    let rejected = Outcome::rejected(
+        format!("wire-{nanos}-rejected"),
+        "digest",
+        Rejection::new("taken", "a<b>").with_details(serde_json::json!({"k": 1})),
+    );
+    repository
+        .commit(Commit::new(stream.clone(), Vec::new()).with_outcome(rejected.clone()))
+        .await
+        .expect("outcome-only commit");
+
+    let client = repository.pool().get().await.expect("connect");
+    let sql = format!(
+        "SELECT status, digest, response, events::text, rejection::text, code \
+         FROM {events}__evt_command_outcomes WHERE command_id = $1"
+    );
+
+    let row = client
+        .query_one(&sql, &[&accepted.command_id.as_str()])
+        .await
+        .expect("accepted row");
+    assert_eq!(row.get::<_, String>(0), "accepted");
+    assert_eq!(row.get::<_, Option<Vec<u8>>>(2), Some(vec![0, 1, 255]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row.get(3)).unwrap(),
+        serde_json::json!([stream.as_str().to_owned() + ":1"])
+    );
+    assert_eq!(row.get::<_, Option<String>>(4), None);
+    assert_eq!(row.get::<_, Option<String>>(5), None);
+
+    let row = client
+        .query_one(&sql, &[&rejected.command_id.as_str()])
+        .await
+        .expect("rejected row");
+    assert_eq!(row.get::<_, String>(0), "rejected");
+    assert_eq!(row.get::<_, Option<Vec<u8>>>(2), None);
+    assert_eq!(row.get::<_, String>(3), "[]");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row.get(4)).unwrap(),
+        serde_json::json!({"code": "taken", "message": "a<b>", "details": {"k": 1}})
+    );
+    assert_eq!(row.get::<_, Option<String>>(5), Some("taken".into()));
+
+    // The CHECK constraints refuse a rejected row without its rejection.
+    let violation = client
+        .execute(
+            &format!(
+                "INSERT INTO {events}__evt_command_outcomes (command_id, status, digest) \
+                 VALUES ($1, 'rejected', 'd')"
+            ),
+            &[&format!("wire-{nanos}-bad")],
+        )
+        .await
+        .expect_err("a rejected row without a rejection violates the constraint");
+    assert_eq!(
+        violation.code(),
+        Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION)
+    );
 }
 
 /// A transaction with a projector statement and no written event is refused before any write.

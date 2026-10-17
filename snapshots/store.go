@@ -20,6 +20,9 @@ type Store struct {
 	replayBudgetEvents       int
 	catchUpSnapshotThreshold int
 	freshnessObserver        FreshnessObserver
+
+	// outcomes is non-nil when command outcomes are enabled (ADR 0004, C3); see WithOutcomes.
+	outcomes *outcomeConfig
 }
 
 // NewStore creates a new Store with the given Repository and Snapshot size
@@ -126,6 +129,11 @@ func (store *Store) Commit(
 	eventContext evt.Context,
 	metadata evt.Metadata,
 ) ([]evt.SerializedEvent, error) {
+	// A store with outcomes records every command; a bare Commit has no command identity to digest.
+	if store.outcomes != nil {
+		return nil, errOutcomesNeedCommand
+	}
+
 	// Dedupe guard: reject duplicate CommandIDs (reads from event log, never projections)
 	if metadata.CommandID != nil && eventContext.HasCommandID(*metadata.CommandID) {
 		return nil, evt.NewDuplicateCommandError(*metadata.CommandID)
@@ -190,6 +198,10 @@ func (store *Store) Commit(
 //
 // If the metadata carries a CommandID that was already processed, Execute returns a
 // DuplicateCommandError. Callers should treat this as an idempotent success.
+//
+// On a store with outcomes enabled (WithOutcomes) Execute records the command as ExecuteWithOutcome
+// does and reports only an error: nil for an accepted command, including a replay of one; a
+// *evt.RejectionError for a rejected one, on first execution and on every replay.
 func (store *Store) Execute(
 	ctx context.Context,
 	entity evt.Entity,
@@ -197,6 +209,10 @@ func (store *Store) Execute(
 	command evt.Command,
 	metadata evt.Metadata,
 ) error {
+	if store.outcomes != nil {
+		return store.executeForError(ctx, entity, entityID, command, metadata)
+	}
+
 	context, err := store.LoadEntity(ctx, entity, entityID)
 	if err != nil {
 		return err

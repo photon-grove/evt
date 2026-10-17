@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -60,12 +61,25 @@ type ScenarioExpectation struct {
 	// Transactions pins the TransactWriteItems action order of each transaction step, so an
 	// implementation that reorders actions fails even when the stored state is identical.
 	Transactions []TransactionExpectation `json:"transactions,omitempty"`
+
+	// Outcomes records the command-outcome rows an outcomes scenario leaves behind (C3), ordered
+	// by command ID. The digest in each row is the run-independent one (see NewOutcomeRunner).
+	Outcomes []OutcomeExpectation `json:"outcomes,omitempty"`
 }
 
-// TransactionExpectation is the ordered TransactWriteItems actions one transaction step sent.
+// OutcomeExpectation is one stored command-outcome row, as its DynamoDB item.
+type OutcomeExpectation struct {
+	CommandID  string         `json:"commandId"`
+	DynamoItem map[string]any `json:"dynamoItem"`
+}
+
+// TransactionExpectation is the ordered TransactWriteItems actions one step sent. A transaction
+// step sends exactly one request (Actions); a step of an outcomes scenario records every request
+// it sent in order (Calls), none for a replay.
 type TransactionExpectation struct {
-	Step    int                 `json:"step"`
-	Actions []TransactionAction `json:"actions"`
+	Step    int                   `json:"step"`
+	Actions []TransactionAction   `json:"actions,omitempty"`
+	Calls   [][]TransactionAction `json:"calls,omitempty"`
 }
 
 // SiblingExpectation is the stored state of a scenario's sibling stream.
@@ -283,12 +297,21 @@ func SNSMessage(ctx context.Context, item map[string]types.AttributeValue) (stri
 	return aws.ToString(entry.Message), attributes, nil
 }
 
-// newFakeRunner returns a runner over the real DynamoDB repository backed by a FakeDynamo.
-func newFakeRunner(interval int) (Runner, *FakeDynamo, *dynamo.Repository) {
+// newFakeRunner returns a runner over the real DynamoDB repository backed by a FakeDynamo. A
+// scenario with outcomes gets a store that records command outcomes.
+func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) {
 	fake := NewFakeDynamo()
 	repo := dynamo.NewRepository(fake, fakeTable)
 
-	return Runner{Store: snapshots.NewStore(repo, interval), Repo: repo, SnapshotInterval: interval}, fake, repo
+	if scenario.Outcomes {
+		return NewOutcomeRunner(repo, scenario, FixtureRun), fake, repo
+	}
+
+	return Runner{
+		Store:            snapshots.NewStore(repo, scenario.SnapshotInterval),
+		Repo:             repo,
+		SnapshotInterval: scenario.SnapshotInterval,
+	}, fake, repo
 }
 
 // Observe reads a stream back through the repository and store: the stored events and snapshot,
@@ -407,7 +430,7 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 	fixtures := ScenarioFixtures{Run: FixtureRun, Source: OriginSource}
 
 	for _, scenario := range scenarios.Scenarios {
-		runner, fake, _ := newFakeRunner(scenario.SnapshotInterval)
+		runner, fake, _ := newFakeRunner(scenario)
 		entityID := EntityID(FixtureRun, scenario)
 
 		var transactions []TransactionExpectation
@@ -421,6 +444,14 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 			}
 			if outcome != step.Expect {
 				return fixtures, fmt.Errorf("%s step %d: got %s, want %s", scenario.Name, index, outcome, step.Expect)
+			}
+
+			if scenario.Outcomes {
+				if calls := fake.Transactions()[sent:]; len(calls) > 0 {
+					transactions = append(transactions, TransactionExpectation{Step: index, Calls: calls})
+				}
+
+				continue
 			}
 
 			if step.Op != "transaction" {
@@ -458,6 +489,13 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 
 		expectation.Transactions = transactions
 
+		if scenario.Outcomes {
+			var oerr error
+			if expectation.Outcomes, oerr = observeOutcomes(fake, scenario); oerr != nil {
+				return fixtures, fmt.Errorf("%s: %w", scenario.Name, oerr)
+			}
+		}
+
 		for _, suffix := range scenario.SiblingSuffixes() {
 			siblingID := transactionID(entityID, suffix)
 
@@ -476,6 +514,39 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 	}
 
 	return fixtures, nil
+}
+
+// observeOutcomes records the outcome row of every command ID a scenario uses, ordered by ID.
+// A command that left no row (a rejected ID, a dropped commit) is simply absent.
+func observeOutcomes(fake *FakeDynamo, scenario Scenario) ([]OutcomeExpectation, error) {
+	seen := map[string]bool{}
+	for _, step := range scenario.Steps {
+		if step.CommandID != "" {
+			seen[fmt.Sprintf("compat-%s-%s-%s", FixtureRun, scenario.Name, step.CommandID)] = true
+		}
+	}
+
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+
+	slices.Sort(ids)
+
+	var outcomes []OutcomeExpectation
+
+	for _, id := range ids {
+		items := fake.Items(evt.OutcomeKey(evt.CommandID(id)))
+		if len(items) > 1 {
+			return nil, fmt.Errorf("command %s has %d outcome rows", id, len(items))
+		}
+
+		for _, item := range items {
+			outcomes = append(outcomes, OutcomeExpectation{CommandID: id, DynamoItem: DynamoItemJSON(item)})
+		}
+	}
+
+	return outcomes, nil
 }
 
 // MarshalFixture encodes a fixture file: two-space indent, no HTML escaping, trailing newline.

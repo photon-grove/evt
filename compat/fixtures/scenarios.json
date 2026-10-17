@@ -2890,6 +2890,1717 @@
           ]
         }
       ]
+    },
+    {
+      "name": "outcomes-idempotency",
+      "entityId": "compat-fixture-outcomes-idempotency",
+      "sequence": 6,
+      "snapshotSequence": 2,
+      "state": "{\"owner\":\"Ada Lovelace\",\"status\":\"open\",\"balanceCents\":925,\"deposits\":5,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":\"first\"}",
+      "events": [
+        "{\"id\":\"compat-fixture-outcomes-idempotency:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c1\"}}",
+        "{\"id\":\"compat-fixture-outcomes-idempotency:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAwLCJtZW1vIjoiZmlyc3QifQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c2\"}}",
+        "{\"id\":\"compat-fixture-outcomes-idempotency:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c3\"}}",
+        "{\"id\":\"compat-fixture-outcomes-idempotency:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c3\"}}",
+        "{\"id\":\"compat-fixture-outcomes-idempotency:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"compat-fixture-outcomes-idempotency-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c4\"}}",
+        "{\"id\":\"compat-fixture-outcomes-idempotency:6\",\"sequence\":6,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NzUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c5\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-outcomes-idempotency\",\"sequence\":2,\"eventSequence\":6,\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjkyNSwiZGVwb3NpdHMiOjUsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIiwidGFncyI6bnVsbCwibGFiZWxzIjpudWxsLCJsYXN0TWVtbyI6ImZpcnN0In0=\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "6"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"status\":\"open\",\"balanceCents\":925,\"deposits\":5,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":\"first\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-idempotency"
+          },
+          "seq": {
+            "N": "2"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-idempotency-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-idempotency"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-idempotency-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":500,\"memo\":\"first\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-idempotency"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-idempotency-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-idempotency"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-idempotency-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":200,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-idempotency"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-idempotency-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"compat-fixture-outcomes-idempotency-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c4\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":50,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-idempotency"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-idempotency-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c5\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":75,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-idempotency"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-idempotency:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-idempotency:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-idempotency:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-idempotency:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAwLCJtZW1vIjoiZmlyc3QifQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-idempotency:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-idempotency:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-idempotency:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-idempotency:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-idempotency:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-idempotency:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"compat-fixture-outcomes-idempotency-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c4\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-idempotency:6\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-idempotency:6\",\"sequence\":6,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NzUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c5\"}}}"
+      ],
+      "transactions": [
+        {
+          "step": 0,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 1,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-idempotency-c1",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 1,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 1,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 2,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "2"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-idempotency-c2",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 4,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 2,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 3,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 4,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 0,
+                "condition": "attribute_not_exists(seq)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-idempotency-c3",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 5,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 5,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 0,
+                "condition": "eventSeq = :prev",
+                "values": {
+                  ":prev": {
+                    "N": "4"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-idempotency-c4",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 8,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 5,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 6,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": 0,
+                "condition": "seq = :seq AND eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "6"
+                  },
+                  ":seq": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-idempotency-c5",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        }
+      ],
+      "outcomes": [
+        {
+          "commandId": "compat-fixture-outcomes-idempotency-c1",
+          "dynamoItem": {
+            "digest": {
+              "S": "305701838d819fc249c1e5836e7f74e074a56dc8d9cbc3b9d1276381ca438492"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-idempotency:1\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-idempotency-c1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-idempotency-c2",
+          "dynamoItem": {
+            "digest": {
+              "S": "b71d532099127a4838d124970e3d356da34722a1d1a492399f71f1fb3dd1de2c"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-idempotency:2\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-idempotency-c2"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjUwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-idempotency-c3",
+          "dynamoItem": {
+            "digest": {
+              "S": "4853b4a3c1c94fcb57a56c2722f4db86e61f8f576756cc86df4b9729c56dafeb"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-idempotency:3\",\"compat-fixture-outcomes-idempotency:4\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-idempotency-c3"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjgwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-idempotency-c4",
+          "dynamoItem": {
+            "digest": {
+              "S": "85c612ee1e8b0c585787cd4152f353d0a7848b3e7c1f14260e85240c987d42e7"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-idempotency:5\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-idempotency-c4"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjg1MH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-idempotency-c5",
+          "dynamoItem": {
+            "digest": {
+              "S": "ff044a0cea65ef1de1cf5baa6d68e1f049475744b5cbf6dd9b42949eb96c5a44"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-idempotency:6\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-idempotency-c5"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjkyNX0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "outcomes-noop",
+      "entityId": "compat-fixture-outcomes-noop",
+      "sequence": 3,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Ada Lovelace\",\"status\":\"open\",\"balanceCents\":310,\"deposits\":2,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-outcomes-noop:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-noop\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-noop-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c1\"}}",
+        "{\"id\":\"compat-fixture-outcomes-noop:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-noop\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-noop-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c2\"}}",
+        "{\"id\":\"compat-fixture-outcomes-noop:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-noop\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-noop-c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c6\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c6\"}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-noop-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-noop"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-noop-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":300,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-noop"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-noop-c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c6\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c6\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":10,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-noop"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-noop:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-noop:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-noop\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-noop-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-noop:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-noop:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-noop\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-noop-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-noop:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-noop:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-noop\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-noop-c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c6\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c6\"}}}"
+      ],
+      "transactions": [
+        {
+          "step": 0,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": 1,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-noop-c1",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 1,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": 1,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": 2,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "2"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-noop-c2",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 2,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-noop-c3",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 4,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-noop-c4",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 7,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-noop-c5",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 9,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": 2,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": 3,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "3"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-noop-c6",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        }
+      ],
+      "outcomes": [
+        {
+          "commandId": "compat-fixture-outcomes-noop-c1",
+          "dynamoItem": {
+            "digest": {
+              "S": "aa9f9bfc226cdab173a06506f0c3e34560b36ea9bb00bd7d466beea684472e60"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-noop:1\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-noop-c1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-noop-c2",
+          "dynamoItem": {
+            "digest": {
+              "S": "426f428b5bec579002f1570f4569c5ee880e92a7501c94accc2b4fb7b6861145"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-noop:2\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-noop-c2"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjMwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-noop-c3",
+          "dynamoItem": {
+            "digest": {
+              "S": "31381729cceeedba149cfee16f522e4b9985a7958c2b032c03baf1e37132edc3"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-noop-c3"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjMwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-noop-c4",
+          "dynamoItem": {
+            "digest": {
+              "S": "2649fe4f67c4e2a0fa1ae79dacf8776c0cef2745130579f4922680e12c96e9de"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-noop-c4"
+            },
+            "response": {
+              "S": "YXVkaXRlZA=="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-noop-c5",
+          "dynamoItem": {
+            "digest": {
+              "S": "6c6c040abacfdffc901cb59db9071ef2b890d1c03a0ed3b27de26fb197a95051"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-noop-c5"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-noop-c6",
+          "dynamoItem": {
+            "digest": {
+              "S": "6c3f1745c332b517c4783fa672fc006c2e8afce031a4e600d4ea405854285fc0"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-noop:3\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-noop-c6"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjMxMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "outcomes-rejection",
+      "entityId": "compat-fixture-outcomes-rejection",
+      "sequence": 3,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Ada Lovelace\",\"status\":\"open\",\"balanceCents\":4900,\"deposits\":1,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-outcomes-rejection:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c1\"}}",
+        "{\"id\":\"compat-fixture-outcomes-rejection:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAwMCwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c3\"}}",
+        "{\"id\":\"compat-fixture-outcomes-rejection:3\",\"sequence\":3,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c6\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c6\"}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-rejection-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-rejection-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":5000,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-rejection-c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c6\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c6\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:withdrawn"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAwMCwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection:3\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection:3\",\"sequence\":3,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c6\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c6\"}}}"
+      ],
+      "transactions": [
+        {
+          "step": 0,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": 1,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-c1",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 1,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-c2",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 2,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": 1,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": 2,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "2"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-c3",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 5,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-c4",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 7,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-c5",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 9,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": 2,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": 3,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "3"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-c6",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        }
+      ],
+      "outcomes": [
+        {
+          "commandId": "compat-fixture-outcomes-rejection-c1",
+          "dynamoItem": {
+            "digest": {
+              "S": "7616da42aa3ff73599e2cc4ab80aec94c70f04606592b432ddeea74a9cc69830"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-rejection:1\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-c1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-c2",
+          "dynamoItem": {
+            "code": {
+              "S": "insufficient-funds"
+            },
+            "digest": {
+              "S": "51090b753ac40624866e472733395b634bfcbcf0a1cef682db6f614d9a928a6f"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-c2"
+            },
+            "rejection": {
+              "S": "{\"code\":\"insufficient-funds\",\"message\":\"insufficient funds\",\"details\":{\"balanceCents\":0,\"requestedCents\":1000}}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-c3",
+          "dynamoItem": {
+            "digest": {
+              "S": "e0ff0202273cda8a62d24390039911528f2cdeee9bf7d00972f9704fba83c946"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-rejection:2\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-c3"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjUwMDB9"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-c4",
+          "dynamoItem": {
+            "code": {
+              "S": "amount-must-be-positive"
+            },
+            "digest": {
+              "S": "cb47bdf7cc1986a7573e5d878c96d5c18d16afb32de8b702629bf11f16dc4196"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-c4"
+            },
+            "rejection": {
+              "S": "{\"code\":\"amount-must-be-positive\",\"message\":\"amount must be positive\",\"details\":null}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-c5",
+          "dynamoItem": {
+            "code": {
+              "S": "account-already-opened"
+            },
+            "digest": {
+              "S": "36cd967144f2c9747b1338bb032f6b5bd5a3e3af8ee5a7e60bd208e87bc1cbd9"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-c5"
+            },
+            "rejection": {
+              "S": "{\"code\":\"account-already-opened\",\"message\":\"account already opened\",\"details\":null}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-c6",
+          "dynamoItem": {
+            "digest": {
+              "S": "dbe56cde2a98ccce5acfb3cb9cb572278abf50a6c1b38bc7340122d6d8ff32ba"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-rejection:3\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-c6"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjQ5MDB9"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "outcomes-ambiguous",
+      "entityId": "compat-fixture-outcomes-ambiguous",
+      "sequence": 4,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Ada Lovelace\",\"status\":\"open\",\"balanceCents\":900,\"deposits\":3,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-outcomes-ambiguous:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c1\"}}",
+        "{\"id\":\"compat-fixture-outcomes-ambiguous:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c2\"}}",
+        "{\"id\":\"compat-fixture-outcomes-ambiguous:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c3\"}}",
+        "{\"id\":\"compat-fixture-outcomes-ambiguous:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c5\"}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-ambiguous-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-ambiguous"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-ambiguous-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":200,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-ambiguous"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-ambiguous-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":300,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-ambiguous"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-ambiguous-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c5\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":400,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-ambiguous"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-ambiguous:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-ambiguous:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-ambiguous:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-ambiguous:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-ambiguous:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-ambiguous:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-ambiguous:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-ambiguous:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c5\"}}}"
+      ],
+      "transactions": [
+        {
+          "step": 0,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 1,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-ambiguous-c1",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 1,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 1,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 2,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "2"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-ambiguous-c2",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 4,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 2,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 3,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "3"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-ambiguous-c3",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 7,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-ambiguous-c4",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 9,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 3,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 4,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "4"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-ambiguous-c5",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        }
+      ],
+      "outcomes": [
+        {
+          "commandId": "compat-fixture-outcomes-ambiguous-c1",
+          "dynamoItem": {
+            "digest": {
+              "S": "c18ba91047dcee6483d42a31f38d1026e568d5e63f1dc308150c17bc8f32eead"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-ambiguous:1\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-ambiguous-c1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-ambiguous-c2",
+          "dynamoItem": {
+            "digest": {
+              "S": "ac28b36c99fa27ae9c62611750cf8e3c1a9fc021925a9988096a18f306b2646a"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-ambiguous:2\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-ambiguous-c2"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjIwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-ambiguous-c3",
+          "dynamoItem": {
+            "digest": {
+              "S": "54131323b1d0bbacdae8476f06a8a549125b6c9c753b412a64994b32786fa15d"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-ambiguous:3\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-ambiguous-c3"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjUwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-ambiguous-c4",
+          "dynamoItem": {
+            "code": {
+              "S": "insufficient-funds"
+            },
+            "digest": {
+              "S": "2500810bb95a6612b955616dd3baf43d70748767e52d865933d7ebc124a5c0b1"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-ambiguous-c4"
+            },
+            "rejection": {
+              "S": "{\"code\":\"insufficient-funds\",\"message\":\"insufficient funds\",\"details\":{\"balanceCents\":500,\"requestedCents\":100000}}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-ambiguous-c5",
+          "dynamoItem": {
+            "digest": {
+              "S": "e3b9ec76e58bdc598ea1e364af4ebff9a48bf7457efc74db8f5e4589b1d0d27a"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-ambiguous:4\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-ambiguous-c5"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjkwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        }
+      ]
     }
   ]
 }

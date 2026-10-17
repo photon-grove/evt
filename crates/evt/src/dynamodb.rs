@@ -10,6 +10,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::config::AsyncSleep;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
@@ -23,8 +24,9 @@ use crate::features::{
     self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
     ValidatedMarker,
 };
-use crate::ids::{EntityId, EntityType, EventSequence};
+use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::json;
+use crate::outcome::Outcome;
 use crate::repository::{Commit, Repository, TransactionCommit};
 use crate::wire::dynamo::{self as wire, AttributeValue, Item};
 
@@ -266,22 +268,27 @@ impl DynamoRepository {
 
     /// Builds the commit's transaction items in the pinned order: the feature-marker check, the
     /// projector operations, then the stream's group (see [`stream_group`](Self::stream_group)).
+    /// An outcome-only commit has no group; the outcome put is appended by the caller.
     fn transaction_items(
         &self,
         commit: &Commit<TransactWriteItem>,
         validated: ValidatedMarker,
         pin: Option<Continuation>,
     ) -> Result<Vec<TransactWriteItem>, Error> {
-        if commit.events.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 3);
         items.push(self.marker_check(validated)?);
         items.extend(commit.operations.iter().cloned());
         items.extend(self.stream_group(commit, pin)?);
 
         Ok(items)
+    }
+
+    /// Builds the command-outcome put: the last action of every commit that records one, written
+    /// once in its final state and conditioned on the row not existing.
+    fn outcome_put(&self, outcome: &Outcome) -> Result<TransactWriteItem, Error> {
+        let item = wire::outcome_item(outcome)?;
+
+        put(&self.table, item, Some(wire::OUTCOME_CONDITION), &[])
     }
 
     /// Builds one written stream's contiguous group: the continuation check on the event just
@@ -742,11 +749,12 @@ impl Repository for DynamoRepository {
         commit.validate()?;
         features::check_not_reserved(&commit.entity_id)?;
 
-        if commit.events.is_empty() {
+        if commit.events.is_empty() && commit.outcome.is_none() {
             return Ok(());
         }
 
         let operations = commit.operations.len();
+        let outcome = commit.stored_outcome();
         let mut revalidations = 0;
 
         // The shared budget covers every item the transaction carries, with the projector
@@ -765,7 +773,18 @@ impl Repository for DynamoRepository {
 
         loop {
             let cached = self.ensure_manifest_validated().await?;
-            let items = self.transaction_items(&commit, cached, pin)?;
+            let mut items = self.transaction_items(&commit, cached, pin)?;
+
+            // The outcome row is the last action. Its index is how a failed condition on it is
+            // told apart from a stream's.
+            let outcome_index = match &outcome {
+                Some(outcome) => {
+                    items.push(self.outcome_put(outcome)?);
+
+                    Some(items.len() - 1)
+                }
+                None => None,
+            };
 
             match self
                 .client
@@ -789,9 +808,20 @@ impl Repository for DynamoRepository {
                         continue;
                     }
 
+                    // A lost outcome put outranks every other failure: the command already ran, and
+                    // the writer resolves it through the winner's row. It is never a conflict.
+                    if let Some(outcome) = &outcome
+                        && outcome_failed(outcome_index, &codes)
+                    {
+                        return Err(Error::OutcomeConflict {
+                            command_id: outcome.command_id.clone(),
+                        });
+                    }
+
                     return Err(classify_transaction_error(
                         &commit.entity_id,
                         operations,
+                        outcome.is_some(),
                         err,
                     ));
                 }
@@ -809,6 +839,8 @@ impl Repository for DynamoRepository {
         if commit.is_empty() {
             return Ok(());
         }
+
+        let outcome = commit.stored_outcome();
 
         // Fences are refused for entity types this repository was configured to expire: it needs
         // no I/O, so it runs first. The durable manifest's retention set is checked in the loop,
@@ -835,7 +867,11 @@ impl Repository for DynamoRepository {
                     .check_retention(manifest.as_ref(), |entity_type| self.retains(entity_type))?;
             }
 
-            let (items, layout) = self.transaction_stream_items(&commit, cached, &pins)?;
+            let (mut items, mut layout) = self.transaction_stream_items(&commit, cached, &pins)?;
+            if let Some(outcome) = &outcome {
+                items.push(self.outcome_put(outcome)?);
+                layout.outcome = Some(items.len() - 1);
+            }
 
             let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
             for operation in &commit.operations {
@@ -868,6 +904,17 @@ impl Repository for DynamoRepository {
                         self.invalidate_manifest();
 
                         continue;
+                    }
+
+                    // A lost outcome put outranks every other failure, a failed fence included:
+                    // the command already ran, and the writer resolves it through the winner's
+                    // row. It is never a conflict.
+                    if let Some(outcome) = &outcome
+                        && outcome_failed(layout.outcome, &codes)
+                    {
+                        return Err(Error::OutcomeConflict {
+                            command_id: outcome.command_id.clone(),
+                        });
                     }
 
                     // The stream whose action failed, when the cancellation index maps back to
@@ -912,10 +959,61 @@ impl Repository for DynamoRepository {
                     return Err(classify_transaction_error(
                         &entity_at(colliding),
                         layout.operations,
+                        outcome.is_some(),
                         err,
                     ));
                 }
             }
+        }
+    }
+
+    /// Reads the outcome row with a strongly consistent `GetItem`, whatever
+    /// [`with_consistent_read`](DynamoRepository::with_consistent_read) says: an eventually
+    /// consistent miss would re-execute a command that already committed.
+    fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        // The SDK's own timer, so recovery polling works on whatever runtime the client was built
+        // for. A client with no timer returns at once: the polls then run back to back.
+        let sleeper = self.client.config().sleep_impl();
+
+        async move {
+            if let Some(sleeper) = sleeper {
+                sleeper.sleep(duration).await;
+            }
+        }
+    }
+
+    fn deadline(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        // The SDK's own timer. A client with no timer never fires, so its reads are bounded only
+        // by the SDK's operation timeouts.
+        let sleeper = self.client.config().sleep_impl();
+
+        async move {
+            match sleeper {
+                Some(sleeper) => sleeper.sleep(duration).await,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        crate::outcome::check_command_id(command_id)?;
+
+        let output = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .key("pk", s(&wire::outcome_key(command_id)))
+            .key("sk", n(wire::OUTCOME_SORT_KEY))
+            .send()
+            .await
+            .map_err(sdk_error)?;
+
+        match output.item {
+            Some(item) if !item.is_empty() => {
+                Ok(Some(wire::outcome_from_item(&from_sdk_item(&item))?))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1198,6 +1296,8 @@ struct TransactionLayout {
     /// Each written stream's contiguous run of action indexes (event puts and the snapshot put or
     /// floor check), so a failed action maps back to the stream that owns it.
     streams: Vec<(std::ops::Range<usize>, EntityId)>,
+    /// The index of the command-outcome put, the last action, when the commit records one.
+    outcome: Option<usize>,
 }
 
 impl TransactionLayout {
@@ -1436,6 +1536,13 @@ fn classify_cancellation(operations: usize, codes: &[Option<&str>]) -> Option<Ca
     None
 }
 
+/// Reports whether the command-outcome put (the action at `outcome_index`) failed its condition.
+fn outcome_failed(outcome_index: Option<usize>, codes: &[Option<&str>]) -> bool {
+    outcome_index.is_some_and(|index| {
+        failed_items(codes, "ConditionalCheckFailed").any(|failed| failed == index)
+    })
+}
+
 /// The cancellation reason codes of a failed commit, in transaction order.
 fn cancellation_reasons<R>(err: &SdkError<TransactWriteItemsError, R>) -> Vec<Option<&str>>
 where
@@ -1466,13 +1573,18 @@ fn failed_items<'a>(codes: &'a [Option<&str>], code: &'a str) -> impl Iterator<I
 /// Maps a failed commit to an error. A failed stream condition or a concurrent transaction is an
 /// optimistic-concurrency conflict, and throttling is transient: `execute_with_retry` retries
 /// both. A failed projector condition is a projector error, so the command is not rerun for it.
+///
+/// A commit that carries an outcome (`carries_outcome`) whose result is genuinely unknown (see
+/// [`commit_result_unknown`]) is [`Error::Indeterminate`], which the store settles by re-reading the
+/// outcome row; every other failure keeps its classification and is never recovered.
 fn classify_transaction_error<R>(
     entity_id: &EntityId,
     operations: usize,
+    carries_outcome: bool,
     err: SdkError<TransactWriteItemsError, R>,
 ) -> Error
 where
-    R: std::fmt::Debug + Send + Sync + 'static,
+    R: HttpStatus + std::fmt::Debug + Send + Sync + 'static,
 {
     let codes = cancellation_reasons(&err);
 
@@ -1496,7 +1608,60 @@ where
         // response the transaction may have been applied, and running the command again would
         // write its events twice.
         None if throttled(&err) => Error::Transient(Box::new(err)),
+        None if carries_outcome && commit_result_unknown(&err) => {
+            Error::Indeterminate(Box::new(err))
+        }
         None => Error::backend(err),
+    }
+}
+
+/// Reports whether a failed commit leaves it unknown whether the transaction applied: a timeout, a
+/// connection or dispatch failure, an unparseable response, or a server fault. A definitive refusal
+/// (validation, a missing table, authorization, a cancelled transaction with known reasons) is not.
+fn commit_result_unknown<R>(err: &SdkError<TransactWriteItemsError, R>) -> bool
+where
+    R: HttpStatus + std::fmt::Debug + Send + Sync + 'static,
+{
+    match err {
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
+            true
+        }
+        // Any 5xx is a server or gateway fault, whatever its error code: a proxy's 502 or 504 can
+        // arrive after the transaction applied.
+        SdkError::ServiceError(service) => {
+            service
+                .raw()
+                .http_status()
+                .is_some_and(|status| status >= 500)
+                || matches!(
+                    service.err().code(),
+                    Some(
+                        "InternalServerError"
+                            | "ServiceUnavailable"
+                            | "TransactionInProgressException"
+                            | "IdempotentParameterMismatchException"
+                    )
+                )
+        }
+        _ => false,
+    }
+}
+
+/// The HTTP status of a raw SDK response, when it has one.
+trait HttpStatus {
+    fn http_status(&self) -> Option<u16>;
+}
+
+impl HttpStatus for aws_sdk_dynamodb::config::http::HttpResponse {
+    fn http_status(&self) -> Option<u16> {
+        Some(self.status().as_u16())
+    }
+}
+
+#[cfg(test)]
+impl HttpStatus for () {
+    fn http_status(&self) -> Option<u16> {
+        None
     }
 }
 
@@ -1941,6 +2106,12 @@ mod tests {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
+            // Steps of outcomes scenarios record every request they sent (`calls`); those are
+            // asserted against a live run by the evt-compat tests.
+            let recorded: Vec<Value> = recorded
+                .into_iter()
+                .filter(|recorded| recorded.get("actions").is_some())
+                .collect();
 
             let steps = scenario["steps"].as_array().unwrap();
             let planned: Vec<_> = steps
@@ -2322,11 +2493,202 @@ mod tests {
     fn a_timed_out_commit_is_not_retryable() {
         let err = SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost");
 
-        let classified = classify_transaction_error(&EntityId::new("acct-1"), 0, err);
+        let classified = classify_transaction_error(&EntityId::new("acct-1"), 0, false, err);
 
         assert!(
             matches!(classified, Error::Backend(_)),
             "the commit may have landed, so retrying could apply it twice: {classified:?}"
         );
+    }
+
+    #[test]
+    fn only_a_genuinely_unknown_result_of_an_outcome_commit_is_indeterminate() {
+        use aws_sdk_dynamodb::error::ErrorMetadata;
+
+        let entity = EntityId::new("acct-1");
+        let service = |code: &str| {
+            SdkError::<TransactWriteItemsError, ()>::service_error(
+                TransactWriteItemsError::generic(ErrorMetadata::builder().code(code).build()),
+                (),
+            )
+        };
+
+        // Unknown results: a timeout, a server fault, and a transaction still in progress.
+        for unknown in [
+            SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost"),
+            service("InternalServerError"),
+            service("ServiceUnavailable"),
+            // Still running: it may yet commit, so the store polls for its row.
+            service("TransactionInProgressException"),
+        ] {
+            assert!(
+                matches!(
+                    classify_transaction_error(&entity, 0, true, unknown),
+                    Error::Indeterminate(_)
+                ),
+                "an unknown result of an outcome commit is indeterminate"
+            );
+        }
+
+        // Without an outcome there is nothing to recover from: the classification is unchanged.
+        let classified = classify_transaction_error(
+            &entity,
+            0,
+            false,
+            SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost"),
+        );
+        assert!(matches!(classified, Error::Backend(_)), "{classified:?}");
+
+        // Definitive refusals are plain errors, with or without an outcome: recovering them would
+        // turn a request that can never succeed into a retryable ambiguous write.
+        for definitive in [
+            "ValidationException",
+            "ResourceNotFoundException",
+            "AccessDeniedException",
+        ] {
+            let classified = classify_transaction_error(&entity, 0, true, service(definitive));
+            assert!(
+                matches!(classified, Error::Backend(_)),
+                "{definitive} is definitive: {classified:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gateway_fault_with_an_unknown_code_is_an_unknown_result() {
+        use aws_sdk_dynamodb::error::ErrorMetadata;
+
+        #[derive(Debug)]
+        struct Status(u16);
+
+        impl HttpStatus for Status {
+            fn http_status(&self) -> Option<u16> {
+                Some(self.0)
+            }
+        }
+
+        let entity = EntityId::new("acct-1");
+        let service = |status: u16| {
+            SdkError::<TransactWriteItemsError, Status>::service_error(
+                TransactWriteItemsError::generic(
+                    ErrorMetadata::builder().code("SomeGatewayCode").build(),
+                ),
+                Status(status),
+            )
+        };
+
+        for status in [500, 502, 503, 504] {
+            assert!(
+                matches!(
+                    classify_transaction_error(&entity, 0, true, service(status)),
+                    Error::Indeterminate(_)
+                ),
+                "{status} may have arrived after the transaction applied"
+            );
+        }
+
+        let classified = classify_transaction_error(&entity, 0, true, service(400));
+        assert!(matches!(classified, Error::Backend(_)), "{classified:?}");
+    }
+
+    #[test]
+    fn a_lost_outcome_put_is_told_apart_from_a_stream_condition() {
+        const CHECK: Option<&str> = Some("ConditionalCheckFailed");
+        const NONE: Option<&str> = Some("None");
+
+        // marker, event put, floor check, outcome put
+        assert!(outcome_failed(Some(3), &[NONE, NONE, NONE, CHECK]));
+        assert!(outcome_failed(Some(3), &[NONE, CHECK, NONE, CHECK]));
+        assert!(!outcome_failed(Some(3), &[NONE, CHECK, NONE, NONE]));
+        assert!(!outcome_failed(None, &[NONE, NONE, NONE, CHECK]));
+        assert!(!outcome_failed(Some(3), &[]));
+    }
+
+    #[test]
+    fn the_outcome_put_is_the_last_action_and_an_outcome_only_commit_is_marker_then_outcome() {
+        let repository = offline_repository();
+        let outcome = Outcome::accepted("cmd", "digest");
+
+        // Outcome-only, no fences: the marker check and the outcome put.
+        let mut commit = TransactionCommit::new(Vec::new()).with_outcome(outcome.clone());
+        commit.normalize().unwrap();
+        let (mut items, mut layout) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Absent, &HashMap::new())
+            .unwrap();
+        items.push(
+            repository
+                .outcome_put(&commit.stored_outcome().unwrap())
+                .unwrap(),
+        );
+        layout.outcome = Some(items.len() - 1);
+
+        let summary: Vec<_> = items.iter().map(action_summary).collect();
+        assert_eq!(
+            summary,
+            vec![
+                serde_json::json!({
+                    "operation": "ConditionCheck", "pk": "SYSTEM#FEATURES", "sk": 0,
+                    "condition": "attribute_not_exists(pk)"
+                }),
+                serde_json::json!({
+                    "operation": "Put", "pk": "command-outcome#cmd", "sk": 1,
+                    "condition": "attribute_not_exists(pk)"
+                }),
+            ]
+        );
+        assert_eq!(layout.outcome, Some(1));
+
+        // With events and a fence, the outcome stays last, after the fence checks.
+        let event = SerializedEvent {
+            id: "a:1".into(),
+            sequence: EventSequence(1),
+            event_type: "t:e".into(),
+            version: crate::EventVersion(1),
+            entity_id: "a".into(),
+            entity_type: "t".into(),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        };
+        let mut commit =
+            TransactionCommit::new(vec![Commit::new("a", vec![event])]).with_outcome(outcome);
+        commit.fences = vec![crate::ReadFence::new(
+            "f",
+            "t",
+            EventSequence(2),
+            crate::FenceProvenance::Engine,
+        )];
+        commit.normalize().unwrap();
+        let (mut items, _) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Absent, &HashMap::new())
+            .unwrap();
+        items.push(
+            repository
+                .outcome_put(&commit.stored_outcome().unwrap())
+                .unwrap(),
+        );
+
+        let keys: Vec<_> = items
+            .iter()
+            .map(|item| {
+                let summary = action_summary(item);
+                (
+                    summary["pk"].as_str().unwrap().to_owned(),
+                    summary["sk"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("SYSTEM#FEATURES".to_owned(), 0),
+                ("a".to_owned(), 1),
+                ("a".to_owned(), 0),
+                ("f".to_owned(), 3),
+                ("f".to_owned(), 0),
+                ("command-outcome#cmd".to_owned(), 1),
+            ]
+        );
+        let outcome_put = items.last().unwrap().put().unwrap();
+        assert_eq!(outcome_put.item()["events"].as_s().unwrap(), r#"["a:1"]"#);
     }
 }

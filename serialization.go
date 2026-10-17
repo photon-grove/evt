@@ -34,10 +34,16 @@ func (e *SerializedEvent) UnmarshalJSON(data []byte) error {
 // commit (ADR 0004, C1) appends to any number of streams in one result: Events carries every
 // written stream's events, Snapshots the per-stream snapshot puts, and Fences the read fences
 // for read-only streams (C2). The zero value keeps the single-stream shape.
+//
+// Outcome, when set (ADR 0004, C3), is the command outcome row written once, in its final state,
+// inside the same transaction. A commit may carry an Outcome and no Events: an accepted no-op or a
+// persisted rejection is an outcome-only commit. Only a Repository that implements
+// OutcomeRepository honors it; Outcome.EventIDs is derived from Events by NormalizeCommit.
 type SerializedResult struct {
 	Events      []SerializedEvent    `json:"events"`
 	Snapshots   []SerializedSnapshot `json:"snapshots,omitempty"`
 	Fences      []ReadFence          `json:"fences,omitempty"`
+	Outcome     *Outcome             `json:"outcome,omitempty"`
 	Transaction Transaction          `json:"transactions"`
 }
 

@@ -21,9 +21,10 @@ use evt_compat::{Runner, ScenarioFixtures, Scenarios};
 use futures_core::Stream;
 use photon_evt::dynamodb::DynamoRepository;
 use photon_evt::postgres::PostgresRepository;
-use photon_evt::wire::postgres::{EventRow, SnapshotRow};
+use photon_evt::wire::dynamo;
+use photon_evt::wire::postgres::{EventRow, OutcomeRow, SnapshotRow};
 use photon_evt::{
-    EntityId, EventLog, Repository, SerializedEvent, SerializedSnapshot, StreamFilter,
+    CommandId, EntityId, EventLog, Repository, SerializedEvent, SerializedSnapshot, StreamFilter,
 };
 
 type Failures = Vec<String>;
@@ -90,7 +91,7 @@ async fn step<R: Repository>(repository: R, run: &str, index: usize) -> Result<F
             continue;
         };
 
-        let runner = Runner::new(&repository, scenario.snapshot_interval);
+        let runner = Runner::for_scenario(&repository, scenario, run);
         let outcome = runner.execute(&scenario.entity_id(run), step).await?;
 
         if outcome == step.expect {
@@ -234,6 +235,33 @@ fn comparable(rows: Vec<EventRow>) -> Result<Vec<(EventRow, serde_json::Value)>,
         .collect()
 }
 
+/// Compares an outcome row with its JSON columns parsed: PostgreSQL stores `events` and
+/// `rejection` as jsonb, which normalizes whitespace and key order.
+type ComparableOutcome = (
+    String,
+    String,
+    String,
+    Option<Vec<u8>>,
+    serde_json::Value,
+    Option<serde_json::Value>,
+    Option<String>,
+);
+
+fn comparable_outcome(row: OutcomeRow) -> Result<ComparableOutcome, BoxError> {
+    Ok((
+        row.command_id,
+        row.status,
+        row.digest,
+        row.response,
+        serde_json::from_str(&row.events)?,
+        row.rejection
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        row.code,
+    ))
+}
+
 async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
     let scenarios = Scenarios::load()?;
     let fixtures = ScenarioFixtures::load()?;
@@ -269,6 +297,26 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
                     &items,
                     &expected.dynamo_items,
                 );
+
+                // Every outcome row the scenario leaves behind: the stored item must be the one Go
+                // stored, byte for byte.
+                for outcome in &expected.outcomes {
+                    let items = repository
+                        .partition_items(&EntityId::new(dynamo::outcome_key(&CommandId::new(
+                            &outcome.command_id,
+                        ))))
+                        .await?
+                        .into_iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    check(
+                        &mut failures,
+                        &scenario.name,
+                        &format!("outcome {} dynamo item", outcome.command_id),
+                        &items,
+                        &vec![outcome.dynamo_item.clone()],
+                    );
+                }
 
                 for sibling in &expected.siblings {
                     let items = repository
@@ -314,6 +362,23 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
                     snapshot,
                     want_snapshot,
                 );
+
+                // Every outcome row the scenario leaves behind, compared field by field with the
+                // row Go's item encodes (jsonb columns as parsed JSON).
+                for outcome in &expected.outcomes {
+                    let item: dynamo::Item = serde_json::from_value(outcome.dynamo_item.clone())?;
+                    let want = OutcomeRow::from_outcome(&dynamo::outcome_from_item(&item)?)?;
+                    let got = repository
+                        .outcome_row(&CommandId::new(&outcome.command_id))
+                        .await?;
+                    check(
+                        &mut failures,
+                        &scenario.name,
+                        &format!("outcome {} row", outcome.command_id),
+                        got.map(comparable_outcome).transpose()?,
+                        Some(comparable_outcome(want)?),
+                    );
+                }
 
                 for sibling in &expected.siblings {
                     let sibling_id = EntityId::new(&sibling.entity_id);

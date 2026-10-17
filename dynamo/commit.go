@@ -38,7 +38,7 @@ func (repo *Repository) Commit(
 		return err
 	}
 
-	if len(result.Events) == 0 && len(result.Snapshots) == 0 && len(result.Fences) == 0 {
+	if len(result.Events) == 0 && len(result.Snapshots) == 0 && len(result.Fences) == 0 && result.Outcome == nil {
 		return nil
 	}
 
@@ -93,6 +93,11 @@ type commitLayout struct {
 	streamIndexes map[int]evt.EntityID
 	// fenceIndexes maps each fence-check item index (slot and companion) to its fence.
 	fenceIndexes map[int]evt.ReadFence
+	// outcomeIndex is the outcome put's index among the stream items; outcomeID is its command.
+	// The outcome put is the last action of the transaction.
+	outcomeIndex int
+	hasOutcome   bool
+	outcomeID    evt.CommandID
 }
 
 // FloorCondition rejects a commit whose first event is at or below the stored snapshot's
@@ -251,6 +256,18 @@ func (repo *Repository) buildStreamItems(
 		items = append(items, slot)
 		layout.fenceIndexes[len(items)] = fence
 		items = append(items, companion)
+	}
+
+	// The outcome row is the last action: its condition fails only when another writer recorded
+	// this command ID first, which the engine resolves by reading the row.
+	if result.Outcome != nil {
+		put, err := repo.buildOutcomePut(*result.Outcome)
+		if err != nil {
+			return nil, layout, err
+		}
+
+		layout.outcomeIndex, layout.hasOutcome, layout.outcomeID = len(items), true, result.Outcome.CommandID
+		items = append(items, put)
 	}
 
 	return items, layout, nil
@@ -723,6 +740,19 @@ func (repo *Repository) commitTransactionItems(
 	return nil
 }
 
+// outcomeConditionFailed reports whether the transaction's cancellation reasons mark the item at
+// index as a failed condition.
+func outcomeConditionFailed(err error, index int) bool {
+	var canceled *types.TransactionCanceledException
+	if !errors.As(err, &canceled) || index >= len(canceled.CancellationReasons) {
+		return false
+	}
+
+	reason := canceled.CancellationReasons[index]
+
+	return reason.Code != nil && *reason.Code == "ConditionalCheckFailed"
+}
+
 // classifyCommitFailure routes a failed commit by the transaction item that failed. Control items
 // (the feature-marker check) are prepended to the transaction, so their failure is classified
 // separately and the remaining indices shift by their count.
@@ -735,6 +765,12 @@ func (repo *Repository) classifyCommitFailure(
 ) error {
 	ok, i := HasConditionalCheckFailure(err)
 	if !ok {
+		// A commit that carries an outcome and fails indeterminately is resolved by re-reading the
+		// outcome row (ambiguous-write recovery); other failures are definitive refusals.
+		if layout.hasOutcome && indeterminateCommit(err) {
+			return &evt.AmbiguousWriteError{CommandID: layout.outcomeID, Cause: err}
+		}
+
 		return wrapClassifiedError(err)
 	}
 
@@ -745,6 +781,13 @@ func (repo *Repository) classifyCommitFailure(
 	// The layout's indexes are relative to the stream items, which sit after the control items
 	// and the projector operations in the combined transaction.
 	streamIndex := i - len(transactItems) - 1
+
+	// A lost outcome put outranks every other item's failure: the command already has an outcome,
+	// and re-preparing it as a generic conflict can never resolve that. Reading the row does.
+	if layout.hasOutcome && outcomeConditionFailed(err, len(transactItems)+1+layout.outcomeIndex) {
+		return &evt.OutcomeConflictError{CommandID: layout.outcomeID}
+	}
+
 	if fence, failed := layout.fenceIndexes[streamIndex]; failed {
 		return policy.FenceConflict(fence)
 	}

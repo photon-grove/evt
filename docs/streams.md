@@ -77,9 +77,11 @@ The runtime adds:
 
 *Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K5):*
 `evt/publishers`, `BudgetController`, and the SNS/FIFO publisher are removed in the next minor
-release **without an in-library replacement**. Command outcomes are planned but are not a
-shipped replacement, and the envelope is only the wire format — it neither consumes the stream
-nor publishes to SNS. What to do today:
+release **without an in-library replacement**. Command outcomes ship in v0.9.0
+([C3/C4](../README.md#command-outcomes-and-rejections-v09-c3c4)), but they make commands
+idempotent and record their results; they are not a publisher replacement. They do not consume
+the stream or publish anything, and the envelope is only the wire format — it neither consumes
+the stream nor publishes to SNS. What to do today:
 
 - **Projector-style consumers** — switch to the direct-from-stream handler
   (`projectors.NewLambdaHandler`), which is shipped and skips the SNS hop entirely.

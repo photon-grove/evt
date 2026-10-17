@@ -8,11 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/snapshots"
+	"github.com/photon-grove/evt/test"
 )
 
 // Writer names used in scenario steps and recorded as the metadata origin endpoint.
@@ -38,6 +42,21 @@ const (
 	ResultConflict  = "conflict"
 	ResultCompacted = "compacted"
 	ResultUncovered = "uncovered"
+
+	// Outcome-store results (ADR 0004, C3/C4).
+	ResultReuse     = "reuse"     // IdempotencyKeyReuse
+	ResultIDTooLong = "idTooLong" // CommandIdTooLong, before any write
+	ResultAmbiguous = "ambiguous" // an ambiguous write proven not to have applied
+	ResultAbsent    = "absent"    // resolveOutcome found no outcome row
+)
+
+// Injected commit faults (the injectCommitFault step field).
+const (
+	// FaultApplyThenFail makes the commit apply while the caller observes an indeterminate error.
+	FaultApplyThenFail = "applyThenFail"
+
+	// FaultFailWithoutApplying drops the commit and reports an indeterminate error.
+	FaultFailWithoutApplying = "failWithoutApplying"
 )
 
 // Scenarios is the shared scenario file (compat/scenarios.json).
@@ -50,7 +69,11 @@ type Scenario struct {
 	Name             string `json:"name"`
 	Description      string `json:"description"`
 	SnapshotInterval int    `json:"snapshotInterval"`
-	Steps            []Step `json:"steps"`
+
+	// Outcomes runs the scenario on stores with command outcomes enabled: every step carries a
+	// command ID, and execute steps record and replay outcomes.
+	Outcomes bool   `json:"outcomes,omitempty"`
+	Steps    []Step `json:"steps"`
 }
 
 // Step is one operation against the scenario's stream.
@@ -73,6 +96,21 @@ type Step struct {
 	Streams     []TransactionStream `json:"streams,omitempty"`
 	Fences      []TransactionFence  `json:"fences,omitempty"`
 	Suffix      string              `json:"suffix,omitempty"`
+
+	// InjectCommitFault makes the step's commit fail indeterminately: FaultApplyThenFail or
+	// FaultFailWithoutApplying (execute steps of outcomes scenarios).
+	InjectCommitFault string `json:"injectCommitFault,omitempty"`
+
+	// Identity and Response drive outcomeOnly steps: a command with no events, recorded as an
+	// accepted outcome carrying Response.
+	Identity *Identity `json:"identity,omitempty"`
+	Response string    `json:"response,omitempty"`
+}
+
+// Identity is the command identity of an outcomeOnly step: its type string and payload object.
+type Identity struct {
+	Type    string         `json:"type"`
+	Payload map[string]any `json:"payload,omitempty"`
 }
 
 // RawEvent is an event appended directly to the log, bypassing the aggregate (legacy versions).
@@ -87,10 +125,15 @@ type Outcome struct {
 	Result  string `json:"result"`
 	Events  int    `json:"events,omitempty"`
 	Deleted int    `json:"deleted,omitempty"`
+
+	// Code is the rejection code of a rejected outcome, and Replayed reports that the outcome was
+	// read back from a stored row rather than produced by the step (outcomes scenarios).
+	Code     string `json:"code,omitempty"`
+	Replayed bool   `json:"replayed,omitempty"`
 }
 
 func (o Outcome) String() string {
-	return fmt.Sprintf("%s(events=%d, deleted=%d)", o.Result, o.Events, o.Deleted)
+	return fmt.Sprintf("%s(events=%d, deleted=%d, code=%q, replayed=%t)", o.Result, o.Events, o.Deleted, o.Code, o.Replayed)
 }
 
 // Dir returns the repository's compat/ directory.
@@ -173,6 +216,62 @@ type Runner struct {
 	Store            evt.Store
 	Repo             evt.Repository
 	SnapshotInterval int
+
+	// Outcomes is the store with command outcomes enabled; it is set for outcomes scenarios and
+	// nil otherwise.
+	Outcomes *snapshots.Store
+
+	// Run and Scenario name the run and the scenario of an outcomes runner. The outcome digest is
+	// independent of the run, and command IDs are scoped to both, because outcome rows are global
+	// to the table: a bare "c1" would collide across scenarios and across runs.
+	Run      string
+	Scenario string
+}
+
+// metadata builds a step's metadata. On an outcomes runner the command ID is scoped to the run and
+// the scenario.
+func (r Runner) metadata(step Step) evt.Metadata {
+	if r.Outcomes != nil && step.CommandID != "" {
+		step.CommandID = fmt.Sprintf("compat-%s-%s-%s", r.Run, r.Scenario, step.CommandID)
+	}
+
+	return StepMetadata(step)
+}
+
+// NewOutcomeRunner returns a runner whose store records command outcomes. Its identity digest
+// replaces the run name in the declared stream IDs with the fixture run's, so a command digests
+// the same in every run and the golden fixtures' digests hold against live backends.
+func NewOutcomeRunner(repo evt.Repository, scenario Scenario, run string) Runner {
+	interval := scenario.SnapshotInterval
+	store := outcomeStore(repo, interval, run)
+
+	return Runner{Store: store, Repo: repo, SnapshotInterval: interval, Outcomes: store, Run: run, Scenario: scenario.Name}
+}
+
+func outcomeStore(repo evt.Repository, interval int, run string) *snapshots.Store {
+	// A short recovery window keeps the dropped-commit step quick; the step still ends in the
+	// retryable ambiguous result because the row never appears.
+	return snapshots.NewStore(repo, interval).WithOutcomes(
+		snapshots.WithDigester(runIndependentDigest(run)),
+		snapshots.WithRecoveryWait(100*time.Millisecond),
+	)
+}
+
+// runIndependentDigest is the default digest with the run name in each declared stream ID replaced
+// by the fixture run's.
+func runIndependentDigest(run string) evt.Digester {
+	from, to := "compat-"+run+"-", "compat-"+FixtureRun+"-"
+
+	return func(input evt.DigestInput) (string, error) {
+		streams := make([]evt.EntityID, len(input.Streams))
+		for i, stream := range input.Streams {
+			streams[i] = evt.EntityID(strings.Replace(string(stream), from, to, 1))
+		}
+
+		input.Streams = streams
+
+		return evt.DefaultDigest(input)
+	}
 }
 
 // Execute runs one step and classifies its outcome. Unexpected errors are returned as errors.
@@ -188,6 +287,10 @@ func (r Runner) Execute(ctx context.Context, entityID evt.EntityID, step Step) (
 		return r.conflictProbe(ctx, entityID, step)
 	case "compact":
 		return r.compact(ctx, entityID, step)
+	case "outcomeOnly":
+		return r.outcomeOnly(ctx, entityID, step)
+	case "resolveOutcome":
+		return r.resolveOutcome(ctx, entityID, step)
 	}
 
 	return Outcome{}, fmt.Errorf("unknown op %q", step.Op)
@@ -205,6 +308,10 @@ func (r Runner) sequence(ctx context.Context, entityID evt.EntityID) (evt.EventS
 func (r Runner) execute(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
 	if step.Command == nil {
 		return Outcome{}, errors.New("execute step has no command")
+	}
+
+	if r.Outcomes != nil {
+		return r.executeWithOutcome(ctx, entityID, step)
 	}
 
 	before, err := r.sequence(ctx, entityID)
@@ -295,6 +402,109 @@ func (r Runner) compact(ctx context.Context, entityID evt.EntityID, step Step) (
 	}
 
 	return Outcome{Result: ResultCompacted, Deleted: deleted}, nil
+}
+
+// storeFor returns the outcomes store for a step, over a repository that injects the step's commit
+// fault when it asks for one.
+func (r Runner) storeFor(step Step) (*snapshots.Store, error) {
+	if step.InjectCommitFault == "" {
+		return r.Outcomes, nil
+	}
+
+	fault, err := test.NewFaultRepository(r.Repo)
+	if err != nil {
+		return nil, err
+	}
+
+	cause := errors.New("injected commit fault")
+
+	switch step.InjectCommitFault {
+	case FaultApplyThenFail:
+		fault.ApplyThenFail(cause)
+	case FaultFailWithoutApplying:
+		fault.FailWithoutApplying(cause)
+	default:
+		return nil, fmt.Errorf("unknown injectCommitFault %q", step.InjectCommitFault)
+	}
+
+	return outcomeStore(fault, r.SnapshotInterval, r.Run), nil
+}
+
+func (r Runner) executeWithOutcome(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
+	store, err := r.storeFor(step)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	command := *step.Command
+
+	outcome, err := store.ExecuteWithOutcome(ctx, NewAccount(entityID), entityID, &command, r.metadata(step))
+
+	return classifyCommand(outcome, err)
+}
+
+// outcomeOnly records a command that writes no events: the store reads the outcome row, and an
+// absent row is completed with an accepted outcome carrying the step's response.
+func (r Runner) outcomeOnly(ctx context.Context, _ evt.EntityID, step Step) (Outcome, error) {
+	if step.Identity == nil {
+		return Outcome{}, errors.New("outcomeOnly step has no identity")
+	}
+
+	identity := evt.CommandIdentity{Type: evt.CommandType(step.Identity.Type)}
+	if step.Identity.Payload != nil {
+		identity.Payload = step.Identity.Payload
+	}
+
+	tx, replayed, err := r.Outcomes.BeginCommand(ctx, identity, r.metadata(step))
+	if err != nil || replayed != nil {
+		return classifyCommand(replayed, err)
+	}
+
+	outcome, err := tx.Complete(ctx, []byte(step.Response))
+
+	return classifyCommand(outcome, err)
+}
+
+// resolveOutcome re-reads the outcome row for the step's command, as ambiguous-write recovery
+// does, without running or writing anything.
+func (r Runner) resolveOutcome(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
+	if step.Command == nil {
+		return Outcome{}, errors.New("resolveOutcome step has no command")
+	}
+
+	command := *step.Command
+	identity := evt.CommandIdentity{Type: command.Type(), Streams: []evt.EntityID{entityID}, Payload: &command}
+
+	outcome, err := r.Outcomes.ResolveCommand(ctx, identity, r.metadata(step))
+	if err == nil && outcome == nil {
+		return Outcome{Result: ResultAbsent}, nil
+	}
+
+	return classifyCommand(outcome, err)
+}
+
+// classifyCommand maps the result of a command on an outcomes store to a step outcome.
+func classifyCommand(outcome *evt.CommandOutcome, err error) (Outcome, error) {
+	var tooLong *evt.CommandIDTooLongError
+
+	switch {
+	case errors.Is(err, evt.ErrIdempotencyKeyReuse):
+		return Outcome{Result: ResultReuse}, nil
+	case errors.As(err, &tooLong):
+		return Outcome{Result: ResultIDTooLong}, nil
+	case errors.Is(err, evt.ErrAmbiguousWrite):
+		return Outcome{Result: ResultAmbiguous}, nil
+	case err != nil:
+		if classified, ok := classify(err); ok {
+			return classified, nil
+		}
+
+		return Outcome{}, err
+	case outcome.Rejected():
+		return Outcome{Result: ResultRejected, Code: string(outcome.Rejection.Code), Replayed: outcome.Replayed}, nil
+	}
+
+	return Outcome{Result: ResultOK, Events: len(outcome.EventIDs), Replayed: outcome.Replayed}, nil
 }
 
 // classify maps expected domain and concurrency errors to outcomes.

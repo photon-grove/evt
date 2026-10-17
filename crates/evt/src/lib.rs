@@ -12,6 +12,8 @@
 //!   [`postgres::PostgresRepository`] (feature `postgres`).
 //! - Test command flows given/when/then with [`testing::Scenario`] (feature `testing`).
 //! - Migrate old payloads with [`Upcaster`]s such as [`JsonUpcaster`].
+//! - Record every command as a durable, replayable [`Outcome`] with [`Store::with_outcomes`]:
+//!   idempotent retries, persisted domain [`Rejection`]s, and accepted no-ops.
 //! - Walk the whole log lazily with [`EventLog`]: [`stream_all_events`](EventLog::stream_all_events)
 //!   and [`stream_entities`](EventLog::stream_entities) return [`futures_core::Stream`]s.
 //! - Bound log growth with [`Repository::compact_below`], which only deletes events a durable
@@ -35,8 +37,10 @@ mod ids;
 pub mod json;
 mod mem;
 mod metadata;
+mod outcome;
 mod repository;
 mod retry;
+mod sha256;
 mod store;
 #[cfg(any(test, feature = "testing"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
@@ -67,13 +71,19 @@ pub use ids::{
 };
 pub use mem::MemRepository;
 pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};
+pub use outcome::{
+    CommandIdentity, CommandOutcome, DigestInput, Digester, MAX_COMMAND_ID_BYTES,
+    MAX_OUTCOME_BYTES, Outcome, OutcomeCommand, OutcomeConfig, OutcomeStatus, Rejection,
+    RejectionCode, ToRejection, canonical_digest_bytes, canonical_json, check_command_id,
+    check_outcome, decode_event_ids, default_digest, encode_event_ids,
+};
 pub use repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
     snapshot_events_due,
 };
 pub use retry::RetryPolicy;
 pub use store::{DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, serialize_events};
-pub use transaction::{Read, Transaction};
+pub use transaction::{Begin, Read, Transaction};
 pub use upcast::{JsonUpcaster, Upcaster};
 
 #[cfg(doctest)]

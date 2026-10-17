@@ -9,6 +9,7 @@ use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::json;
 use crate::metadata::Metadata;
+use crate::outcome::{Outcome, OutcomeStatus, Rejection};
 
 /// The default event table.
 pub const DEFAULT_EVENTS_TABLE: &str = "evt_events";
@@ -26,6 +27,12 @@ pub const RESERVED_INFIX: &str = "__evt_";
 /// `{events}__evt_rebuild_generation_pkey`, adds 29 bytes, and PostgreSQL truncates identifiers
 /// to 63 bytes (v0.9).
 pub const MAX_EVENTS_TABLE_NAME_LEN: usize = 63 - "__evt_rebuild_generation_pkey".len();
+
+/// The command-outcomes table for an events table (`evt_events` yields
+/// `evt_events__evt_command_outcomes`).
+pub fn outcomes_table(events_table: &str) -> String {
+    format!("{events_table}{RESERVED_INFIX}command_outcomes")
+}
 
 /// The feature-marker table for an events table (`evt_events` yields
 /// `evt_events__evt_features`).
@@ -71,6 +78,19 @@ CREATE TABLE IF NOT EXISTS {snapshots_table} (
     updated_at     timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS {outcomes} (
+    command_id text        PRIMARY KEY,
+    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),
+    digest     text        NOT NULL,
+    response   bytea,
+    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    rejection  jsonb,
+    code       text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)
+           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))
+);
+
 CREATE TABLE IF NOT EXISTS {features} (
     id                integer PRIMARY KEY,
     version           bigint NOT NULL,
@@ -79,6 +99,7 @@ CREATE TABLE IF NOT EXISTS {features} (
     retention         text   NOT NULL DEFAULT '[]'
 );
 "#,
+        outcomes = outcomes_table(events_table),
         features = features_table(events_table)
     )
 }
@@ -232,7 +253,7 @@ pub fn is_valid_identifier(name: &str, max_len: usize) -> bool {
 
 /// Checks a pair of table names: each must be a valid identifier within its length cap and must
 /// not contain the reserved infix, and no two relations the schema creates (the tables, the
-/// entity-type index, the feature-marker table, and each table's `{table}_pkey` index) may share
+/// entity-type index, the command-outcomes and feature-marker tables, and each table's `{table}_pkey` index) may share
 /// a name. Unquoted identifiers fold to lower case, so names are compared that way.
 /// `CREATE TABLE IF NOT EXISTS` would otherwise skip a table whose name an index already took.
 pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<(), String> {
@@ -254,10 +275,13 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
     let events = events_table.to_ascii_lowercase();
     let snapshots = snapshots_table.to_ascii_lowercase();
     let features = features_table(&events);
+    let outcomes = outcomes_table(&events);
     let relations = [
         events.clone(),
         format!("{events}_pkey"),
         format!("{events}{RESERVED_INFIX}entity_type_idx"),
+        outcomes.clone(),
+        format!("{outcomes}_pkey"),
         features.clone(),
         format!("{features}_pkey"),
         snapshots.clone(),
@@ -273,6 +297,110 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
     }
 
     Ok(())
+}
+
+/// The `INSERT` of a command outcome (v0.9, C3). It runs last in the commit transaction; a unique
+/// violation (`23505`) on it means another writer recorded the outcome first. `$4` is the
+/// response bytes, `$5` the JSON array of event IDs, `$6` the rejection JSON, `$7` its code.
+pub fn insert_outcome_sql(events_table: &str) -> String {
+    format!(
+        "INSERT INTO {} (command_id, status, digest, response, events, rejection, code) \
+         VALUES ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, $7)",
+        outcomes_table(events_table)
+    )
+}
+
+/// The `SELECT` of a command outcome by ID (`$1`). `events` and `rejection` come back as JSON text.
+pub fn select_outcome_sql(events_table: &str) -> String {
+    format!(
+        "SELECT status, digest, response, events::text, rejection::text, code FROM {} WHERE command_id = $1",
+        outcomes_table(events_table)
+    )
+}
+
+/// One row of the command-outcomes table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutcomeRow {
+    /// `command_id`.
+    pub command_id: String,
+    /// `status`.
+    pub status: String,
+    /// `digest`.
+    pub digest: String,
+    /// `response` (bytea), absent when the command returned none.
+    pub response: Option<Vec<u8>>,
+    /// `events` (jsonb), as JSON text: the array of event IDs, `[]` when none.
+    pub events: String,
+    /// `rejection` (jsonb), as JSON text; only when rejected.
+    pub rejection: Option<String>,
+    /// `code`; only when rejected.
+    pub code: Option<String>,
+}
+
+impl OutcomeRow {
+    /// Encodes an outcome as a row. An empty response is stored as `NULL`, and no events as `[]`.
+    pub fn from_outcome(outcome: &Outcome) -> Result<Self, Error> {
+        Ok(Self {
+            command_id: outcome.command_id.to_string(),
+            status: outcome.status.as_str().to_owned(),
+            digest: outcome.digest.clone(),
+            response: outcome
+                .response
+                .clone()
+                .filter(|response| !response.is_empty()),
+            events: crate::outcome::encode_event_ids(&outcome.event_ids)?,
+            rejection: outcome
+                .rejection
+                .as_ref()
+                .map(Rejection::encode)
+                .transpose()?,
+            code: outcome
+                .rejection
+                .as_ref()
+                .map(|rejection| rejection.code.to_string()),
+        })
+    }
+
+    /// Decodes a row into an outcome. `jsonb` normalizes whitespace and key order, so the JSON
+    /// columns are parsed, not compared as text.
+    pub fn into_outcome(self) -> Result<Outcome, Error> {
+        let status = OutcomeStatus::parse(&self.status).ok_or_else(|| {
+            Error::InvalidRecord(format!("unknown outcome status {:?}", self.status))
+        })?;
+
+        let outcome = Outcome {
+            command_id: self.command_id.into(),
+            status,
+            digest: self.digest,
+            response: self.response.filter(|response| !response.is_empty()),
+            event_ids: crate::outcome::decode_event_ids(&self.events)?,
+            rejection: self
+                .rejection
+                .as_deref()
+                .map(Rejection::decode)
+                .transpose()?,
+        };
+        outcome.validate_stored()?;
+
+        // The code column exists exactly with a rejection, and repeats its code.
+        if outcome.rejection.is_none() && self.code.is_some() {
+            return Err(Error::InvalidRecord(format!(
+                "stored outcome for command {} is corrupt: an accepted outcome carries a code",
+                outcome.command_id
+            )));
+        }
+
+        if let Some(rejection) = &outcome.rejection
+            && self.code.as_deref() != Some(rejection.code.as_str())
+        {
+            return Err(Error::InvalidRecord(format!(
+                "stored outcome for command {} is corrupt: the code column disagrees with the rejection",
+                outcome.command_id
+            )));
+        }
+
+        Ok(outcome)
+    }
 }
 
 /// One row of the event table.
@@ -378,6 +506,54 @@ impl SnapshotRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_rows_round_trip() {
+        let accepted = Outcome {
+            event_ids: vec!["a:1".into(), "b:2".into()],
+            ..Outcome::accepted("cmd-1", "d").with_response(vec![0, 255])
+        };
+        let row = OutcomeRow::from_outcome(&accepted).unwrap();
+        assert_eq!(row.events, r#"["a:1","b:2"]"#);
+        assert_eq!(
+            (row.rejection.as_deref(), row.code.as_deref()),
+            (None, None)
+        );
+        assert_eq!(row.into_outcome().unwrap(), accepted);
+
+        let noop = OutcomeRow::from_outcome(&Outcome::accepted("cmd-2", "d")).unwrap();
+        assert_eq!((noop.response.as_ref(), noop.events.as_str()), (None, "[]"));
+
+        let rejected = Outcome::rejected(
+            "cmd-3",
+            "d",
+            Rejection::new("c", "m").with_details(serde_json::json!({ "k": 1 })),
+        );
+        let row = OutcomeRow::from_outcome(&rejected).unwrap();
+        assert_eq!(row.code.as_deref(), Some("c"));
+        // jsonb re-spaces the text; the parsed value is what counts.
+        let respaced = OutcomeRow {
+            rejection: Some(r#"{"code": "c", "details": {"k": 1}, "message": "m"}"#.into()),
+            ..row
+        };
+        assert_eq!(respaced.into_outcome().unwrap(), rejected);
+    }
+
+    #[test]
+    fn the_outcomes_table_derives_from_the_events_table() {
+        assert_eq!(
+            outcomes_table("evt_events"),
+            "evt_events__evt_command_outcomes"
+        );
+        assert!(
+            insert_outcome_sql("orders").contains("orders__evt_command_outcomes"),
+            "{}",
+            insert_outcome_sql("orders")
+        );
+        // The longest derived name still fits PostgreSQL's identifier limit.
+        let events = "e".repeat(MAX_EVENTS_TABLE_NAME_LEN);
+        assert!(outcomes_table(&events).len() + "_pkey".len() <= 63);
+    }
 
     #[test]
     fn null_or_empty_metadata_decodes_to_the_default() {
