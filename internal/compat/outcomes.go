@@ -22,6 +22,16 @@ type OutcomeFixtures struct {
 
 	Digests []DigestVector `json:"digests"`
 	Rows    []RowVector    `json:"rows"`
+
+	// MalformedRows are outcome items no reader may replay: each must fail to decode in every
+	// language as a corrupt record.
+	MalformedRows []MalformedRow `json:"malformedRows"`
+}
+
+// MalformedRow is a stored outcome item that is not a valid outcome, with the reason.
+type MalformedRow struct {
+	Name       string         `json:"name"`
+	DynamoItem map[string]any `json:"dynamoItem"`
 }
 
 // OutcomeLimits mirrors evt.MaxCommandIDBytes and evt.MaxOutcomeBytes.
@@ -175,7 +185,56 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 		fixtures.Rows = append(fixtures.Rows, vector)
 	}
 
+	fixtures.MalformedRows = malformedRows()
+
 	return fixtures, nil
+}
+
+// malformedRows builds items that violate one rule of a valid outcome each, starting from a valid
+// accepted row and a valid rejected row.
+func malformedRows() []MalformedRow {
+	text := func(value string) map[string]any { return map[string]any{"S": value} }
+
+	accepted := func(overrides map[string]any) map[string]any {
+		item := map[string]any{
+			"pk": text("command-outcome#bad"), "sk": map[string]any{"N": "1"},
+			"status": text("accepted"), "digest": text("digest"), "events": text(`["a:1"]`),
+		}
+		for name, value := range overrides {
+			if value == nil {
+				delete(item, name)
+			} else {
+				item[name] = value
+			}
+		}
+
+		return item
+	}
+
+	rejection := text(`{"code":"c","message":"m","details":null}`)
+
+	return []MalformedRow{
+		{"unknown status", accepted(map[string]any{"status": text("pending")})},
+		{"missing status", accepted(map[string]any{"status": nil})},
+		{"missing digest", accepted(map[string]any{"digest": nil})},
+		{"empty digest", accepted(map[string]any{"digest": text("")})},
+		{"accepted with a rejection", accepted(map[string]any{"rejection": rejection, "code": text("c")})},
+		{"rejected without a rejection", accepted(map[string]any{"status": text("rejected"), "events": nil})},
+		{"rejected with an empty code", accepted(map[string]any{
+			"status": text("rejected"), "events": nil, "code": text(""),
+			"rejection": text(`{"code":"","message":"m","details":null}`),
+		})},
+		{"rejected with events", accepted(map[string]any{"status": text("rejected"), "rejection": rejection, "code": text("c")})},
+		{"rejected whose code attribute disagrees", accepted(map[string]any{
+			"status": text("rejected"), "events": nil, "rejection": rejection, "code": text("other"),
+		})},
+		{"event ID without a sequence", accepted(map[string]any{"events": text(`["a"]`)})},
+		{"event ID with a zero sequence", accepted(map[string]any{"events": text(`["a:0"]`)})},
+		{"event ID with a non-canonical sequence", accepted(map[string]any{"events": text(`["a:01"]`)})},
+		{"event ID without an entity", accepted(map[string]any{"events": text(`[":1"]`)})},
+		{"events that are not an array of strings", accepted(map[string]any{"events": text(`{"a":1}`)})},
+		{"response that is not base64", accepted(map[string]any{"response": text("not base64!")})},
+	}
 }
 
 func rowVector(name string, outcome evt.Outcome) (RowVector, error) {

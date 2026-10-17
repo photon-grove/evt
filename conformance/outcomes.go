@@ -618,6 +618,52 @@ func testOutcomePutRace(t *testing.T, repo evt.OutcomeRepository) {
 	require.False(t, errors.Is(err, evt.ErrOutcomeConflict))
 	require.Len(t, env.events(t, env.id), 1, "the command applied exactly once")
 
+	// The loser returns ONLY the winner's stored outcome. Its own decision — here a rejection with
+	// the balance it saw — is neither returned nor reachable through the error chain.
+	rejectedID := env.commandID("rejected-race")
+	_, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 3}, env.commandID("seed-race"))
+	require.NoError(t, err)
+
+	faulty.Intercept = func(_ context.Context, _ evt.SerializedResult, commit func() error) error {
+		faulty.Intercept = nil
+
+		// The state moves without changing the decision, so the rival records a rejection whose
+		// details differ from the loser's.
+		_, rerr := rival.run(t, &ledgerCommand{Kind: "deposit", Amount: 1}, env.commandID("mover-race"))
+		require.NoError(t, rerr)
+
+		_, rerr = rival.run(t, &ledgerCommand{Kind: "withdraw", Amount: 1000}, rejectedID)
+		require.NoError(t, rerr)
+
+		return commit()
+	}
+
+	loser, err := env.run(t, &ledgerCommand{Kind: "withdraw", Amount: 1000}, rejectedID)
+	require.NoError(t, err)
+	require.True(t, loser.Replayed)
+	require.True(t, loser.Rejected())
+	// Earlier in this case the ledger reached 2, then 5 with the seed: the loser decided at 5 and the
+	// winner at 6.
+	require.Equal(t, "6", fmt.Sprint(loser.Rejection.Details["balance"]), "the winner's balance, not the 5 the loser saw")
+
+	// The error-returning Execute attaches no local handler error to a replayed rejection.
+	faulty.Intercept = func(_ context.Context, _ evt.SerializedResult, commit func() error) error {
+		faulty.Intercept = nil
+
+		_, rerr := rival.run(t, &ledgerCommand{Kind: "withdraw", Amount: 1000}, env.commandID("rejected-race-2"))
+		require.NoError(t, rerr)
+
+		return commit()
+	}
+
+	err = env.store.Execute(context.Background(), newLedger(env.id), env.id,
+		&ledgerCommand{Kind: "withdraw", Amount: 1000}, withCommand(env.commandID("rejected-race-2")))
+
+	var rejected *evt.RejectionError
+	require.ErrorAs(t, err, &rejected)
+	require.NoError(t, rejected.Err, "the loser's own handler error must not leak")
+	require.Equal(t, evt.RejectionCode("insufficient-funds"), rejected.Rejection.Code)
+
 	// A rival with a different digest wins: the loser gets IdempotencyKeyReuse.
 	differing := env.commandID("differing")
 	faulty.Intercept = func(_ context.Context, _ evt.SerializedResult, commit func() error) error {
@@ -631,7 +677,7 @@ func testOutcomePutRace(t *testing.T, repo evt.OutcomeRepository) {
 
 	_, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 4}, differing)
 	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse)
-	require.Len(t, env.events(t, env.id), 2)
+	require.Len(t, env.events(t, env.id), 4, "the first race winner, the seed, the mover, and the rival; rejections write none")
 }
 
 func testConflictLeavesNoOutcome(t *testing.T, repo evt.OutcomeRepository) {

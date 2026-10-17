@@ -3827,6 +3827,26 @@ async fn outcome_race<R: Repository>(repo: &R) -> CaseResult {
         "the loser's events were rolled back with its outcome"
     );
 
+    // The loser returns ONLY the winner's stored outcome. Its own decision here is a rejection
+    // (`Add(0)` is refused), but the winner recorded an accepted outcome under the same digest: the
+    // result is the winner's accepted outcome, with nothing of the loser's local decision.
+    let id = ledger_id();
+    let command = command_id();
+    fault.race_with(rival_commit(&id, &command, 5, 0)?);
+    let result = store
+        .execute_with_outcome(&id, Add(0), command_metadata(&command))
+        .await?;
+    ensure!(
+        result.replayed && result.is_accepted() && result.rejection().is_none(),
+        "the loser returns the winner's accepted outcome, not its own rejection: {result:?}"
+    );
+    ensure_eq!(
+        result.outcome.event_ids,
+        vec![EventId::for_event(&id, EventSequence(1))],
+        "the winner's events"
+    );
+    ensure_eq!(repo.events(&id).await?.len(), 1, "only the winner wrote");
+
     // The repository reports the lost put as the typed error.
     let command = command_id();
     let accepted = Outcome::accepted(command.clone(), "digest");

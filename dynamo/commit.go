@@ -767,6 +767,12 @@ func (repo *Repository) classifyCommitFailure(
 	if !ok {
 		// A commit that carries an outcome and fails indeterminately is resolved by re-reading the
 		// outcome row (ambiguous-write recovery); other failures are definitive refusals.
+		if layout.hasOutcome && commitInProgress(err) {
+			// The transaction is still running and may yet commit: wait for its outcome row
+			// instead of letting a single early read call it "not applied".
+			return repo.awaitInProgress(ctx, layout.outcomeID, err)
+		}
+
 		if layout.hasOutcome && indeterminateCommit(err) {
 			return &evt.AmbiguousWriteError{CommandID: layout.outcomeID, Cause: err}
 		}

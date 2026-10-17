@@ -86,12 +86,13 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 		response       []byte
 		events         string
 		rejection      *string
+		code           *string
 	)
 
 	err := repo.db.QueryRow(ctx, fmt.Sprintf(
-		`SELECT status, digest, response, events::text, rejection::text FROM %s WHERE command_id = $1`,
+		`SELECT status, digest, response, events::text, rejection::text, code FROM %s WHERE command_id = $1`,
 		repo.outcomesTable(),
-	), string(id)).Scan(&status, &digest, &response, &events, &rejection)
+	), string(id)).Scan(&status, &digest, &response, &events, &rejection, &code)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -102,9 +103,11 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 
 	outcome := evt.Outcome{CommandID: id, Status: evt.OutcomeStatus(status), Digest: digest, Response: response}
 
+	corrupt := func(err error) error { return &evt.CorruptOutcomeError{CommandID: id, Reason: err.Error()} }
+
 	// jsonb normalizes the stored text; the decoded values are what round-trip.
 	if ids, derr := evt.DecodeEventIDs(events); derr != nil {
-		return nil, fmt.Errorf("postgres: outcome %s: %w", id, derr)
+		return nil, corrupt(derr)
 	} else if len(ids) > 0 {
 		outcome.EventIDs = ids
 	}
@@ -112,10 +115,19 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 	if rejection != nil {
 		decoded, derr := evt.DecodeRejection([]byte(*rejection))
 		if derr != nil {
-			return nil, fmt.Errorf("postgres: outcome %s: %w", id, derr)
+			return nil, corrupt(derr)
 		}
 
 		outcome.Rejection = &decoded
+	}
+
+	if err = evt.ValidateStoredOutcome(outcome); err != nil {
+		return nil, err
+	}
+
+	// The code column repeats the rejection's code.
+	if outcome.Rejection != nil && (code == nil || *code != string(outcome.Rejection.Code)) {
+		return nil, corrupt(errors.New("the code column disagrees with the rejection"))
 	}
 
 	return &outcome, nil

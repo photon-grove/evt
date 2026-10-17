@@ -368,7 +368,7 @@ impl OutcomeRow {
             Error::InvalidRecord(format!("unknown outcome status {:?}", self.status))
         })?;
 
-        Ok(Outcome {
+        let outcome = Outcome {
             command_id: self.command_id.into(),
             status,
             digest: self.digest,
@@ -379,7 +379,20 @@ impl OutcomeRow {
                 .as_deref()
                 .map(Rejection::decode)
                 .transpose()?,
-        })
+        };
+        outcome.validate_stored()?;
+
+        // The code column repeats the rejection's code.
+        if let Some(rejection) = &outcome.rejection
+            && self.code.as_deref() != Some(rejection.code.as_str())
+        {
+            return Err(Error::InvalidRecord(format!(
+                "stored outcome for command {} is corrupt: the code column disagrees with the rejection",
+                outcome.command_id
+            )));
+        }
+
+        Ok(outcome)
     }
 }
 

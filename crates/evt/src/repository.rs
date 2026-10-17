@@ -643,8 +643,21 @@ pub trait Repository: Send + Sync {
     /// A repository that supports outcomes also writes [`Commit::outcome`] and
     /// [`TransactionCommit::outcome`] as the commit transaction's last write, conditioned on the
     /// row not existing, and reports a lost condition as [`Error::OutcomeConflict`] (never a
-    /// generic conflict) and an indeterminate failure as [`Error::Backend`]. It counts the outcome
-    /// item in the commit budget.
+    /// generic conflict). It counts the outcome item in the commit budget.
+    ///
+    /// **Contract for backend authors.** A commit that carries an outcome and whose result is
+    /// genuinely unknown (a timeout, a lost connection or response, a dispatch failure, a server
+    /// fault, a connection dropped during `COMMIT`) **must** fail with [`Error::Indeterminate`]:
+    /// it is the only error that makes the store re-read the outcome row (ambiguous-write
+    /// recovery), so reporting such a failure as [`Error::Backend`] would skip the recovery and
+    /// leave a committed command reported as failed. The converse holds too: a definitive failure
+    /// (validation, a missing table or relation, authorization, a constraint error other than the
+    /// outcome-row conflict) **must** stay [`Error::Backend`] (or another definitive error),
+    /// because recovering it would turn a request that can never succeed into a retryable "did not
+    /// apply". A backend that knows a transaction is still running may poll for the row itself and
+    /// report [`Error::CommitInProgress`] if it never appears. Rows decoded from storage must pass
+    /// [`Outcome::validate_stored`] (a malformed row is [`Error::InvalidRecord`]). The store's
+    /// recovery behavior for both sides is pinned by [`conformance::outcome_cases`].
     fn outcome(
         &self,
         _command_id: &CommandId,

@@ -251,7 +251,13 @@ func (store *Store) handlerFailed(ctx context.Context, cmd *command, handlerErr 
 
 	outcome, err := cmd.commit(ctx, evt.SerializedResult{}, evt.OutcomeRejected, nil, &rejection)
 
-	return executed{outcome: outcome, handlerErr: handlerErr}, err
+	// The handler's own error belongs to the rejection only when this call committed it. A lost
+	// race returns the winner's stored outcome, and with it nothing of this call's decision.
+	if err != nil || outcome.Replayed {
+		return executed{outcome: outcome}, err
+	}
+
+	return executed{outcome: outcome, handlerErr: handlerErr}, nil
 }
 
 // stage serializes a stream's new events with the commit metadata and, when they reach the
@@ -328,6 +334,11 @@ func (store *Store) beginCommand(
 	digest, err := store.outcomes.digester(input)
 	if err != nil {
 		return nil, nil, fmt.Errorf("compute command digest: %w", err)
+	}
+
+	// A bad digest is a programmer error found before anything is read or run.
+	if err = evt.CheckDigest(digest); err != nil {
+		return nil, nil, err
 	}
 
 	cmd := &command{store: store, repo: repo, id: *metadata.CommandID, digest: digest, metadata: metadata}

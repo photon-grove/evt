@@ -23,6 +23,10 @@ type Repository struct {
 	now            func() time.Time // clock for TTL expiry; nil means time.Now
 	logger         *slog.Logger
 	features       *FeatureMarker // mandatory feature validation (C9)
+
+	// inProgressWait bounds how long a commit that DynamoDB reports as still in progress waits for
+	// its outcome row to appear before giving up with evt.CommitInProgressError.
+	inProgressWait time.Duration
 }
 
 // Retention maps entity types to TTL durations for events and inline snapshots. Other rows have no
@@ -45,7 +49,16 @@ func NewRepository(client Client, eventsTable string) *Repository {
 	})
 
 	return &Repository{EventsTable: eventsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true,
-		features: newFeatureMarker(client, eventsTable, nil)}
+		features: newFeatureMarker(client, eventsTable, nil), inProgressWait: defaultInProgressWait}
+}
+
+// WithCommitInProgressWait returns a shallow copy of the repository that waits up to d for the
+// outcome row of a commit DynamoDB reports as still in progress (TransactionInProgressException)
+// before returning evt.CommitInProgressError. The default is 10 seconds.
+func (repo *Repository) WithCommitInProgressWait(d time.Duration) *Repository {
+	r := *repo
+	r.inProgressWait = d
+	return &r
 }
 
 // WithLogger returns a shallow copy of the repository with the logger updated.

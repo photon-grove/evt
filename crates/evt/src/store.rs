@@ -969,6 +969,38 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_bad_custom_digest_is_a_programmer_error_before_anything_is_read() {
+            let store: Store<Counter, MemRepository> = Store::new(MemRepository::new(), ())
+                .with_outcomes(OutcomeConfig::new().with_digester(|_| Ok(String::new())));
+
+            let executed = store
+                .execute_with_outcome("c-1", Bump(1), command("bad"))
+                .await;
+            assert!(
+                matches!(executed, Err(Error::InvalidArgument(_))),
+                "{executed:?}"
+            );
+
+            let resolved = store
+                .resolve_outcome("c-1", &Bump(1), &command("bad"))
+                .await;
+            assert!(
+                matches!(resolved, Err(Error::InvalidArgument(_))),
+                "{resolved:?}"
+            );
+
+            let failing: Store<Counter, MemRepository> = Store::new(MemRepository::new(), ())
+                .with_outcomes(OutcomeConfig::new().with_digester(|_| Err("no digest".into())));
+            assert!(matches!(
+                failing
+                    .execute_with_outcome("c-1", Bump(1), command("bad"))
+                    .await,
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(store.load("c-1").await.unwrap().sequence().0 == 0);
+        }
+
+        #[tokio::test]
         async fn a_zero_event_command_is_an_accepted_no_op_with_its_response() {
             let store = store();
 

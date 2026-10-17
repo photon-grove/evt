@@ -133,7 +133,7 @@ replacement where one exists, and saying plainly where the feature is removed wi
 - `evt/publishers`, `BudgetController`, and `stream.SNSPublisher`/FIFO (K5) — removed without an
   in-library replacement: read the DynamoDB Stream directly (`projectors.NewLambdaHandler`) or
   publish with your own handler; the envelope format stays (it is the cross-language wire format).
-  Command outcomes (C3/C4) replace the per-entity duplicate window and ship in v0.9.0, below
+  Command outcomes (C3/C4) ship in v0.9.0 (below) but are not a publisher replacement
 - the `WithFactory` helpers (including `snapshots.Store`'s), `ByCommandID`, `dynamo.Delete`,
   `dynamo/mock`, the `do.go` DI providers, `dynamo.ExpressionStreamer` (and the concrete
   `*dynamo.Repository` `...ByExpression` methods), and handler-attached
@@ -237,7 +237,10 @@ default:
   re-reads the outcome row instead of re-running the command: a stored outcome is returned; an
   absent row is `*evt.AmbiguousWriteError` with `NotApplied` set (`errors.Is(err,
   evt.ErrAmbiguousWrite)`), which is transient, so retrying the same command ID is safe. A lost
-  race on the outcome row is resolved the same way, never as a generic conflict.
+  race on the outcome row is resolved the same way, never as a generic conflict, and the loser
+  returns only the winner's stored outcome. DynamoDB's `TransactionInProgressException` waits for
+  the row (`WithCommitInProgressWait`, 10 s) and then returns the transient
+  `*evt.CommitInProgressError`.
   `Store.ResolveCommand` runs the same read for a caller that lost the result entirely.
 - **Multi-stream commands** use `Store.BeginCommand`, which reads the outcome row first, then the
   usual `Read`/`Append`/`Fence`, then `Transaction.Complete` (accepted, or a no-op when nothing was

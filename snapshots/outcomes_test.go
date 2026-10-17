@@ -293,3 +293,33 @@ func TestOutcomes_ANoOpCarryingProjectorOperationsIsRefusedNotRecordedAsAccepted
 	require.NoError(t, err)
 	require.Nil(t, stored, "nothing is written, and no false accepted outcome is recorded")
 }
+
+func TestOutcomes_ABadCustomDigestIsAProgrammerErrorBeforeAnyReadOrHandler(t *testing.T) {
+	ctx := context.Background()
+
+	for name, digest := range map[string]string{"empty": "", "not UTF-8": "bad\xff"} {
+		t.Run(name, func(t *testing.T) {
+			store, repo := newOutcomeStore(t, snapshots.WithDigester(func(evt.DigestInput) (string, error) { return digest, nil }))
+			entity := &MockEntity{}
+			entity.ID = "e-1"
+
+			_, err := store.ExecuteWithOutcome(ctx, entity, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
+			require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+			var invalid *evt.InvalidArgumentError
+			require.ErrorAs(t, err, &invalid)
+			require.Equal(t, "digest", invalid.Argument)
+
+			// The same check guards the resolve and begin entry points.
+			_, err = store.ResolveCommand(ctx, evt.CommandIdentity{Type: "t"}, commandMetadata("cmd-1"))
+			require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+			_, _, err = store.BeginCommand(ctx, evt.CommandIdentity{Type: "t"}, commandMetadata("cmd-1"))
+			require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+			stored, err := repo.GetOutcome(ctx, "cmd-1")
+			require.NoError(t, err)
+			require.Nil(t, stored)
+		})
+	}
+}

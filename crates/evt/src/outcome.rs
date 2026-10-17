@@ -17,7 +17,9 @@
 use std::borrow::Cow;
 use std::convert::Infallible;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -297,6 +299,59 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    /// Checks an outcome decoded from storage: a digest, a rejection with a code exactly when the
+    /// status is rejected, no event IDs on a rejection, and well-formed event IDs
+    /// (`{entityId}:{sequence}` with a positive, canonical sequence). A malformed row is
+    /// [`Error::InvalidRecord`], never replayed as a result. Every backend runs it on the rows it
+    /// reads, with the same rules as Go's `ValidateStoredOutcome`.
+    pub fn validate_stored(&self) -> Result<(), Error> {
+        let corrupt = |reason: String| {
+            Err(Error::InvalidRecord(format!(
+                "stored outcome for command {} is corrupt: {reason}",
+                self.command_id
+            )))
+        };
+
+        if self.digest.is_empty() {
+            return corrupt("the digest is missing".into());
+        }
+
+        match self.status {
+            OutcomeStatus::Accepted if self.rejection.is_some() => {
+                return corrupt("an accepted outcome carries a rejection".into());
+            }
+            OutcomeStatus::Rejected => match &self.rejection {
+                Some(rejection) if !rejection.code.as_str().is_empty() => {
+                    if !self.event_ids.is_empty() {
+                        return corrupt("a rejected outcome lists events".into());
+                    }
+                }
+                _ => return corrupt("a rejected outcome has no rejection code".into()),
+            },
+            OutcomeStatus::Accepted => {}
+        }
+
+        for id in &self.event_ids {
+            let canonical = id
+                .as_str()
+                .rsplit_once(':')
+                .filter(|(entity, _)| !entity.is_empty())
+                .and_then(|(_, sequence)| {
+                    sequence
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|parsed| *parsed >= 1 && parsed.to_string() == sequence)
+                });
+            if canonical.is_none() {
+                return corrupt(format!(
+                    "event ID {id:?} is not {{entityId}}:{{sequence}} with a positive canonical sequence"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// An accepted outcome with no response. The commit fills the event IDs it writes.
     pub fn accepted(command_id: impl Into<CommandId>, digest: impl Into<String>) -> Self {
         Self {
@@ -763,6 +818,52 @@ pub(crate) enum Settled {
     Replayed(Outcome),
 }
 
+/// What waiting for the outcome row of an in-progress commit found.
+#[derive(Debug)]
+pub(crate) enum RowWait {
+    /// The row exists: the commit landed.
+    Appeared,
+    /// The window passed without a row.
+    Expired,
+    /// The row could not be read, so nothing can be said.
+    Unreadable,
+}
+
+/// Polls `read` for an outcome row with exponential backoff (50 ms, doubling to 1 s) until it
+/// appears or `window` has been slept through. `sleep` is the runtime's timer, so the core stays
+/// runtime-agnostic; the elapsed time is the sum of the delays, which keeps the wait deterministic.
+pub(crate) async fn wait_for_row<R, RF, S, SF>(
+    mut read: R,
+    mut sleep: S,
+    window: Duration,
+) -> RowWait
+where
+    R: FnMut() -> RF,
+    RF: Future<Output = Result<bool, Error>>,
+    S: FnMut(Duration) -> SF,
+    SF: Future<Output = ()>,
+{
+    let mut delay = Duration::from_millis(50);
+    let mut waited = Duration::ZERO;
+
+    loop {
+        match read().await {
+            Ok(true) => return RowWait::Appeared,
+            Ok(false) => {}
+            Err(_) => return RowWait::Unreadable,
+        }
+
+        if waited >= window {
+            return RowWait::Expired;
+        }
+
+        let step = delay.min(window - waited);
+        sleep(step).await;
+        waited += step;
+        delay = (delay * 2).min(Duration::from_secs(1));
+    }
+}
+
 /// Compares a stored outcome with the digest this attempt computed: the same digest returns the
 /// stored outcome, another is [`Error::IdempotencyKeyReuse`].
 pub(crate) fn same_command(stored: Outcome, digest: &str) -> Result<Outcome, Error> {
@@ -842,6 +943,95 @@ pub(crate) async fn settle<R: Repository>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn waiting_for_an_in_progress_commit_finds_a_row_that_appears_late() {
+        let reads = Cell::new(0);
+        let slept = Cell::new(Duration::ZERO);
+
+        let wait = wait_for_row(
+            || {
+                reads.set(reads.get() + 1);
+                let appeared = reads.get() >= 4;
+                async move { Ok(appeared) }
+            },
+            |step| {
+                slept.set(slept.get() + step);
+                async {}
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(matches!(wait, RowWait::Appeared), "{wait:?}");
+        assert_eq!(reads.get(), 4);
+        // 50 + 100 + 200 ms of backoff before the fourth read finds the row.
+        assert_eq!(slept.get(), Duration::from_millis(350));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_an_in_progress_commit_expires_at_the_window_and_never_overshoots_it() {
+        let slept = Cell::new(Duration::ZERO);
+
+        let wait = wait_for_row(
+            || async { Ok(false) },
+            |step| {
+                slept.set(slept.get() + step);
+                async {}
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(matches!(wait, RowWait::Expired), "{wait:?}");
+        assert_eq!(slept.get(), Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_row_ends_the_wait_without_a_verdict() {
+        let wait = wait_for_row(
+            || async { Err(Error::backend("table unavailable")) },
+            |_| async {},
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(matches!(wait, RowWait::Unreadable), "{wait:?}");
+    }
+
+    #[test]
+    fn stored_outcomes_are_validated_like_go() {
+        let accepted = Outcome::accepted("cmd", "digest");
+        assert!(accepted.validate_stored().is_ok());
+
+        let mut with_events = accepted.clone();
+        with_events.event_ids = vec!["a:1".into(), "b:12".into()];
+        assert!(with_events.validate_stored().is_ok());
+
+        for bad in ["a", "a:0", "a:01", ":1", "a:-1", "a:x", "a:+1"] {
+            let mut outcome = accepted.clone();
+            outcome.event_ids = vec![bad.into()];
+
+            assert!(
+                matches!(outcome.validate_stored(), Err(Error::InvalidRecord(_))),
+                "{bad:?}"
+            );
+        }
+
+        let mut no_digest = accepted.clone();
+        no_digest.digest.clear();
+        assert!(no_digest.validate_stored().is_err());
+
+        let mut rejected = Outcome::rejected("cmd", "digest", Rejection::new("c", "m"));
+        assert!(rejected.validate_stored().is_ok());
+        rejected.event_ids = vec!["a:1".into()];
+        assert!(rejected.validate_stored().is_err());
+
+        let mut coded = Outcome::accepted("cmd", "digest");
+        coded.rejection = Some(Rejection::new("c", "m"));
+        assert!(coded.validate_stored().is_err());
+    }
     use super::*;
 
     fn input(command_type: &str, streams: &[&str], payload: &str, principal: &str) -> DigestInput {

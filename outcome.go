@@ -11,6 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
+	"strings"
+	"unicode/utf8"
 )
 
 // Limits the storage spec pins for command outcomes (Command Outcomes). Both are checked before
@@ -216,6 +219,84 @@ func CheckCommandID(id CommandID) error {
 	return nil
 }
 
+// CheckDigest validates an identity digest — the output of the default or a custom Digester —
+// before anything is read, run, or written: it must be non-empty valid UTF-8, because it is stored
+// verbatim as a string. A digester that returns anything else is a programmer error.
+func CheckDigest(digest string) error {
+	if digest == "" {
+		return &InvalidArgumentError{Argument: "digest", Message: "the digester returned an empty digest"}
+	}
+
+	if !utf8.ValidString(digest) {
+		return &InvalidArgumentError{Argument: "digest", Message: "the digester returned a digest that is not valid UTF-8"}
+	}
+
+	return nil
+}
+
+// ErrCorruptOutcome matches a CorruptOutcomeError with errors.Is.
+var ErrCorruptOutcome = errors.New("corrupt command outcome")
+
+// CorruptOutcomeError reports a stored outcome row that is not a valid outcome: an unknown status,
+// a missing digest, a status that disagrees with the rejection or the event IDs, a malformed event
+// ID or response. A corrupt row is never replayed as a result.
+type CorruptOutcomeError struct {
+	CommandID CommandID
+	Reason    string
+}
+
+func (e *CorruptOutcomeError) Error() string {
+	return fmt.Sprintf("stored outcome for command %q is corrupt: %s", e.CommandID, e.Reason)
+}
+
+// Is makes errors.Is(err, ErrCorruptOutcome) match.
+func (e *CorruptOutcomeError) Is(target error) bool { return target == ErrCorruptOutcome }
+
+// ValidateStoredOutcome checks an outcome decoded from storage: a known status, a digest, a
+// rejection with a code exactly when the status is rejected, no event IDs on a rejection, and
+// well-formed event IDs ({entityId}:{sequence}, a positive canonical sequence). It returns
+// *CorruptOutcomeError otherwise. Every backend runs it on the rows it reads.
+func ValidateStoredOutcome(outcome Outcome) error {
+	corrupt := func(reason string) error {
+		return &CorruptOutcomeError{CommandID: outcome.CommandID, Reason: reason}
+	}
+
+	if outcome.Digest == "" {
+		return corrupt("the digest is missing")
+	}
+
+	switch outcome.Status {
+	case OutcomeAccepted:
+		if outcome.Rejection != nil {
+			return corrupt("an accepted outcome carries a rejection")
+		}
+	case OutcomeRejected:
+		if outcome.Rejection == nil || outcome.Rejection.Code == "" {
+			return corrupt("a rejected outcome has no rejection code")
+		}
+
+		if len(outcome.EventIDs) > 0 {
+			return corrupt("a rejected outcome lists events")
+		}
+	default:
+		return corrupt(fmt.Sprintf("unknown status %q", outcome.Status))
+	}
+
+	for _, id := range outcome.EventIDs {
+		index := strings.LastIndex(string(id), ":")
+		if index <= 0 {
+			return corrupt(fmt.Sprintf("event ID %q is not {entityId}:{sequence}", id))
+		}
+
+		sequence, err := strconv.ParseInt(string(id)[index+1:], 10, 64)
+		if err != nil || sequence < 1 || strconv.FormatInt(sequence, 10) != string(id)[index+1:] {
+			return corrupt(fmt.Sprintf("event ID %q has no positive canonical sequence", id))
+		}
+	}
+
+	return nil
+}
+
 // CheckOutcome validates an outcome row before any write, in the order the spec pins: the command
 // ID first, then the response bound, then the rejection bound.
 func CheckOutcome(outcome *Outcome) error {
@@ -223,8 +304,8 @@ func CheckOutcome(outcome *Outcome) error {
 		return err
 	}
 
-	if outcome.Digest == "" {
-		return &InvalidArgumentError{Argument: "digest", Message: "an outcome needs an identity digest"}
+	if err := CheckDigest(outcome.Digest); err != nil {
+		return err
 	}
 
 	switch outcome.Status {
@@ -352,6 +433,31 @@ func (e *AmbiguousWriteError) Unwrap() error { return e.Cause }
 // Is makes errors.Is(err, ErrAmbiguousWrite) match.
 func (e *AmbiguousWriteError) Is(target error) bool { return target == ErrAmbiguousWrite }
 
+// ErrCommitInProgress matches a CommitInProgressError with errors.Is.
+var ErrCommitInProgress = errors.New("commit still in progress")
+
+// CommitInProgressError reports that the backend said the commit's transaction is still running
+// (DynamoDB's TransactionInProgressException) and its outcome row did not appear within the wait
+// window. The commit may still land, so it is not known to have failed; but every attempt begins
+// with the outcome read and every write is conditional, so running the same command ID again is
+// safe and finds the outcome if the transaction commits. Backends return it classified transient.
+type CommitInProgressError struct {
+	CommandID CommandID
+
+	// Cause is the backend's report.
+	Cause error
+}
+
+func (e *CommitInProgressError) Error() string {
+	return fmt.Sprintf("commit for command %q is still in progress: %v", e.CommandID, e.Cause)
+}
+
+// Unwrap returns the backend's report.
+func (e *CommitInProgressError) Unwrap() error { return e.Cause }
+
+// Is makes errors.Is(err, ErrCommitInProgress) match.
+func (e *CommitInProgressError) Is(target error) bool { return target == ErrCommitInProgress }
+
 // ErrOutcomesUnsupported matches an OutcomesUnsupportedError with errors.Is.
 var ErrOutcomesUnsupported = errors.New("repository does not support command outcomes")
 
@@ -374,8 +480,14 @@ func (e *OutcomesUnsupportedError) Is(target error) bool { return target == ErrO
 // commit transaction, in its final state, conditioned on the row not existing, and GetOutcome
 // reads it back. The in-memory, DynamoDB, and PostgreSQL repositories implement it.
 //
-// Commit must report a lost outcome condition as *OutcomeConflictError, an indeterminate failure
-// as *AmbiguousWriteError, and count the outcome item in the commit budget.
+// Commit must report a lost outcome condition as *OutcomeConflictError and count the outcome item
+// in the commit budget. It MUST report a commit whose result is genuinely unknown — a timeout or
+// cancelled context, a dispatch or connection failure, a truncated response, a 5xx or server
+// fault, a connection dropped during COMMIT — as *AmbiguousWriteError, because only that error
+// makes the store re-read the outcome row. A definitive failure (validation, a missing table,
+// authorization, a constraint error other than the outcome-row conflict) MUST be returned as is:
+// reporting it as ambiguous would turn a request that can never succeed into a retryable
+// "did not apply". GetOutcome must validate the rows it decodes (ValidateStoredOutcome).
 type OutcomeRepository interface {
 	TransactionalRepository
 
@@ -575,13 +687,15 @@ func OutcomeItemSize(outcome Outcome, events []SerializedEvent) (int, error) {
 // OutcomeFromAttributes rebuilds an Outcome from the string attributes of a stored outcome item
 // (status, digest, response, events, rejection). Missing attributes decode to their empty values.
 // The command ID comes from the key, not the item.
+// A row that is not a valid outcome (see ValidateStoredOutcome) is a *CorruptOutcomeError.
 func OutcomeFromAttributes(id CommandID, status, digest, response, events, rejection string) (Outcome, error) {
 	outcome := Outcome{CommandID: id, Status: OutcomeStatus(status), Digest: digest}
+	corrupt := func(err error) error { return &CorruptOutcomeError{CommandID: id, Reason: err.Error()} }
 
 	if response != "" {
 		decoded, err := base64.StdEncoding.DecodeString(response)
 		if err != nil {
-			return Outcome{}, fmt.Errorf("decode outcome response: %w", err)
+			return Outcome{}, corrupt(fmt.Errorf("decode outcome response: %w", err))
 		}
 
 		outcome.Response = decoded
@@ -590,7 +704,7 @@ func OutcomeFromAttributes(id CommandID, status, digest, response, events, rejec
 	if events != "" {
 		ids, err := DecodeEventIDs(events)
 		if err != nil {
-			return Outcome{}, err
+			return Outcome{}, corrupt(err)
 		}
 
 		outcome.EventIDs = ids
@@ -599,10 +713,14 @@ func OutcomeFromAttributes(id CommandID, status, digest, response, events, rejec
 	if rejection != "" {
 		decoded, err := DecodeRejection([]byte(rejection))
 		if err != nil {
-			return Outcome{}, err
+			return Outcome{}, corrupt(err)
 		}
 
 		outcome.Rejection = &decoded
+	}
+
+	if err := ValidateStoredOutcome(outcome); err != nil {
+		return Outcome{}, err
 	}
 
 	return outcome, nil

@@ -6,7 +6,12 @@ import (
 	"os"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/stretchr/testify/require"
+
+	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/dynamo"
 )
 
 // Regenerate the golden fixtures with: go test ./internal/compat -run TestFixtures -update
@@ -59,4 +64,36 @@ func assertFixture(t *testing.T, name string, value any) {
 	require.NoError(t, err, "missing fixture; run go test ./internal/compat -run TestFixtures -update")
 	require.Equal(t, string(existing), string(data),
 		"Go output differs from %s; if the change is intentional, regenerate with -update and update the Rust side", name)
+}
+
+// Every malformed outcome item must be refused as corrupt by the DynamoDB reader, never replayed.
+func TestMalformedOutcomeRowsAreCorrupt(t *testing.T) {
+	fixtures, err := GenerateOutcomeFixtures()
+	require.NoError(t, err)
+	require.NotEmpty(t, fixtures.MalformedRows)
+
+	for _, row := range fixtures.MalformedRows {
+		t.Run(row.Name, func(t *testing.T) {
+			fake := NewFakeDynamo()
+			item := map[string]types.AttributeValue{}
+
+			for name, value := range row.DynamoItem {
+				attribute, ok := value.(map[string]any)
+				require.True(t, ok)
+
+				if number, isNumber := attribute["N"].(string); isNumber {
+					item[name] = &types.AttributeValueMemberN{Value: number}
+				} else if text, isText := attribute["S"].(string); isText {
+					item[name] = &types.AttributeValueMemberS{Value: text}
+				}
+			}
+
+			_, err := fake.PutItem(context.Background(), &dynamodb.PutItemInput{Item: item})
+			require.NoError(t, err)
+
+			stored, err := dynamo.NewRepository(fake, fakeTable).GetOutcome(context.Background(), "bad")
+			require.ErrorIs(t, err, evt.ErrCorruptOutcome)
+			require.Nil(t, stored)
+		})
+	}
 }

@@ -538,6 +538,8 @@ struct OutcomeFixtures {
     limits: OutcomeLimits,
     digests: Vec<DigestVector>,
     rows: Vec<RowVector>,
+    #[serde(default)]
+    malformed_rows: Vec<MalformedRow>,
 }
 
 #[derive(Deserialize)]
@@ -577,6 +579,13 @@ struct RowVector {
     dynamo_item: Value,
     item_size: usize,
     postgres_row: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MalformedRow {
+    name: String,
+    dynamo_item: Value,
 }
 
 #[derive(Deserialize)]
@@ -703,5 +712,22 @@ fn outcome_rows_match_go_byte_for_byte() {
         });
         assert_eq!(pg, vector.postgres_row, "{name}: postgres row");
         assert_eq!(row.into_outcome().unwrap(), outcome, "{name}: decode row");
+    }
+}
+
+#[test]
+fn malformed_outcome_rows_are_refused_as_corrupt_like_go() {
+    let rows = outcome_fixtures().malformed_rows;
+    assert!(!rows.is_empty());
+
+    for row in rows {
+        let item: dynamo::Item = serde_json::from_value(row.dynamo_item).unwrap();
+        let decoded = dynamo::outcome_from_item(&item);
+
+        assert!(
+            matches!(decoded, Err(photon_evt::Error::InvalidRecord(_))),
+            "{}: a malformed row must be refused, never replayed: {decoded:?}",
+            row.name
+        );
     }
 }

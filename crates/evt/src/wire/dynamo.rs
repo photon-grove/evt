@@ -283,14 +283,28 @@ pub fn outcome_from_item(item: &Item) -> Result<Outcome, Error> {
         )));
     }
 
-    Ok(Outcome {
+    let outcome = Outcome {
         command_id: command_id.into(),
         status,
-        digest: required_string(item, "digest")?.to_owned(),
+        digest: optional_string(item, "digest")?
+            .unwrap_or_default()
+            .to_owned(),
         response,
         event_ids,
         rejection,
-    })
+    };
+    outcome.validate_stored()?;
+
+    // The code attribute repeats the rejection's code.
+    if let Some(rejection) = &outcome.rejection
+        && optional_string(item, "code")?.unwrap_or_default() != rejection.code.as_str()
+    {
+        return Err(Error::InvalidRecord(format!(
+            "stored outcome for command {command_id} is corrupt: the code attribute disagrees with the rejection"
+        )));
+    }
+
+    Ok(outcome)
 }
 
 /// Encodes a single-item view row: `pk = {entityType}#{entityId}`, `sk = "VIEW"`.

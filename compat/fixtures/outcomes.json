@@ -404,5 +404,319 @@
         "status": "rejected"
       }
     }
+  ],
+  "malformedRows": [
+    {
+      "name": "unknown status",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "pending"
+        }
+      }
+    },
+    {
+      "name": "missing status",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        }
+      }
+    },
+    {
+      "name": "missing digest",
+      "dynamoItem": {
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "empty digest",
+      "dynamoItem": {
+        "digest": {
+          "S": ""
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "accepted with a rejection",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":null}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "rejected without a rejection",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "rejected with an empty code",
+      "dynamoItem": {
+        "code": {
+          "S": ""
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"\",\"message\":\"m\",\"details\":null}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "rejected with events",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":null}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "rejected whose code attribute disagrees",
+      "dynamoItem": {
+        "code": {
+          "S": "other"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":null}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "event ID without a sequence",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "event ID with a zero sequence",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:0\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "event ID with a non-canonical sequence",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:01\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "event ID without an entity",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\":1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "events that are not an array of strings",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "{\"a\":1}"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "response that is not base64",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "response": {
+          "S": "not base64!"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    }
   ]
 }

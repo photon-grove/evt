@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -16,6 +17,8 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/internal/compat"
+	"github.com/photon-grove/evt/policy"
+	"github.com/photon-grove/evt/snapshots"
 )
 
 // scriptedClient is a FakeDynamo whose TransactWriteItems and GetItem can be scripted.
@@ -24,6 +27,14 @@ type scriptedClient struct {
 
 	transactErr error
 	getInputs   []*dynamodb.GetItemInput
+
+	// inProgress makes TransactWriteItems report a transaction that is still running: the request
+	// is held, and applied for real once the outcome row has been polled landAfter times (zero
+	// means it never lands within the test).
+	inProgress bool
+	landAfter  int
+	held       *dynamodb.TransactWriteItemsInput
+	polls      int
 }
 
 func (c *scriptedClient) TransactWriteItems(
@@ -35,6 +46,12 @@ func (c *scriptedClient) TransactWriteItems(
 		return nil, c.transactErr
 	}
 
+	if c.inProgress {
+		c.held = params
+
+		return nil, &smithy.GenericAPIError{Code: "TransactionInProgressException", Fault: smithy.FaultClient}
+	}
+
 	return c.FakeDynamo.TransactWriteItems(ctx, params, options...)
 }
 
@@ -44,6 +61,18 @@ func (c *scriptedClient) GetItem(
 	options ...func(*dynamodb.Options),
 ) (*dynamodb.GetItemOutput, error) {
 	c.getInputs = append(c.getInputs, params)
+
+	if c.held != nil {
+		c.polls++
+
+		if c.landAfter > 0 && c.polls >= c.landAfter {
+			if _, err := c.FakeDynamo.TransactWriteItems(ctx, c.held); err != nil {
+				return nil, err
+			}
+
+			c.held = nil
+		}
+	}
 
 	return c.FakeDynamo.GetItem(ctx, params, options...)
 }
@@ -239,3 +268,48 @@ func TestCommitStreamRefusesOutcomes(t *testing.T) {
 }
 
 func strPtr(value string) *string { return &value }
+
+func deposit(amount int) *scriptedCommand { return &scriptedCommand{Amount: amount} }
+
+func TestTransactionInProgressWaitsForTheOutcomeRowInsteadOfCallingItNotApplied(t *testing.T) {
+	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), inProgress: true, landAfter: 3}
+	repo := dynamo.NewRepository(client, "events").WithCommitInProgressWait(5 * time.Second)
+	store := snapshots.NewStore(repo, 0).WithOutcomes()
+	ctx := context.Background()
+
+	id := evt.CommandID("cmd-1")
+	entity := newScriptedEntity("e-1")
+
+	// The transaction commits while the engine is polling for its row: the command returns the
+	// stored outcome and the handler ran exactly once.
+	outcome, err := store.ExecuteWithOutcome(ctx, entity, "e-1", deposit(5), evt.Metadata{CommandID: &id})
+	require.NoError(t, err)
+	require.True(t, outcome.Replayed, "the delayed commit is found, not re-run")
+	require.Equal(t, 1, entity.handled)
+	require.GreaterOrEqual(t, client.polls, 3)
+
+	events, err := repo.GetEvents(ctx, "e-1")
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+}
+
+func TestTransactionInProgressThatNeverLandsIsRetryableNotAmbiguousNotApplied(t *testing.T) {
+	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), inProgress: true}
+	repo := dynamo.NewRepository(client, "events").WithCommitInProgressWait(40 * time.Millisecond)
+	store := snapshots.NewStore(repo, 0).WithOutcomes()
+	ctx := context.Background()
+
+	id := evt.CommandID("cmd-1")
+
+	_, err := store.ExecuteWithOutcome(ctx, newScriptedEntity("e-1"), "e-1", deposit(5), evt.Metadata{CommandID: &id})
+	require.ErrorIs(t, err, evt.ErrCommitInProgress)
+	require.NotErrorIs(t, err, evt.ErrAmbiguousWrite, "it must never be reported as known not to have applied")
+	require.True(t, policy.IsTransient(err), "the retry is safe: every attempt reads the outcome row first")
+
+	// The retry, once DynamoDB stops reporting the transaction as running, commits.
+	client.inProgress = false
+
+	outcome, err := store.ExecuteWithOutcome(ctx, newScriptedEntity("e-1"), "e-1", deposit(5), evt.Metadata{CommandID: &id})
+	require.NoError(t, err)
+	require.False(t, outcome.Replayed)
+}

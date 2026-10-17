@@ -302,6 +302,14 @@ pub enum Error {
     #[error("commit result unknown: {0}")]
     Indeterminate(#[source] BoxError),
 
+    /// DynamoDB reported the commit's transaction as still running (`TransactionInProgressException`)
+    /// and its outcome row did not appear within the repository's wait window. The commit is not
+    /// known to have failed, so it is not [`Error::AmbiguousWrite`] "not applied"; but every attempt
+    /// reads the outcome row first and every write is conditional, so running the same command
+    /// ID again is safe, and it finds the outcome if the transaction commits. Retryable.
+    #[error("commit still in progress: {0}")]
+    CommitInProgress(#[source] BoxError),
+
     /// The storage backend failed. This is a definitive failure, or a failure of a commit that
     /// carries no outcome (whose result may be unknown but cannot be recovered).
     #[error(transparent)]
@@ -336,6 +344,7 @@ impl Error {
             Self::Conflict { .. }
                 | Self::SequenceGap { .. }
                 | Self::Transient(_)
+                | Self::CommitInProgress(_)
                 | Self::AmbiguousWrite {
                     not_applied: true,
                     ..

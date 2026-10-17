@@ -886,6 +886,31 @@ was in flight. Backends classify these themselves (Go `*AmbiguousWriteError` fro
 with known reasons, throttling, a validation, missing-table, or authorization error, a database
 error at statement or `COMMIT` time) is returned as is.
 
+DynamoDB's `TransactionInProgressException` says the transaction is still running and may yet
+commit, so a single early recovery read must not call it "not applied". The DynamoDB repository
+instead polls the outcome row with bounded backoff (50 ms doubling to 1 s, 10 s in all by default):
+when the row appears the store resolves it as above; when the window expires the commit fails
+with the retryable `CommitInProgress` error (Go `*CommitInProgressError`, classified transient;
+Rust `Error::CommitInProgress`), which is deliberately not an ambiguous write. Retrying the same
+command ID is safe, because every attempt reads the outcome row first and every write is
+conditional.
+
+A concurrent attempt with the same command ID and the same digest that loses the race for the
+outcome row returns **only the winner's stored outcome** (its result or rejection, marked
+replayed). The loser's own handler error and local decision are neither returned nor reachable
+through the error chain.
+
+**Stored rows are validated.** A row read back must have a known `status`, a non-empty `digest`, a
+`rejection` with a non-empty code exactly when the status is `rejected` (and a `code` attribute or
+column equal to it), no `events` on a rejection, well-formed event IDs (`{entityId}:{sequence}`
+with a positive, canonical sequence), and a decodable `response`. A malformed row is a typed
+corruption error (Go `*CorruptOutcomeError`, Rust `Error::InvalidRecord`) and is never replayed as a
+result; `compat/fixtures/outcomes.json` carries the malformed rows both languages must refuse.
+
+A digest returned by a digester — the default or a custom one — must be non-empty (and valid
+UTF-8, since it is stored as a string): anything else is a programmer error returned before the
+outcome or the aggregate is read and before the handler runs.
+
 `IdempotencyKeyReuse` is returned as an error and is **not stored**: the existing outcome row
 belongs to the first command that claimed the ID, and nothing overwrites it.
 
