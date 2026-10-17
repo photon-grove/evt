@@ -164,7 +164,9 @@ implements `ToRejection`:
 - **Fence-aware retry (C5).** `execute_with_outcome`, `execute_with_response`, and
   `Store::execute_transaction` retry a command that conflicts with another writer, up to the
   store's `RetryPolicy` (`OutcomeConfig::with_retry`; the default is 5 attempts, 25 ms doubling to
-  1 s, jittered, waiting on `Repository::backoff`). A conflict on anything the engine can
+  1 s, jittered, waiting on `Repository::backoff`; `RetryPolicy::immediate` opts out of waiting for
+  tests and `with_deadline` bounds the whole command; with the defaults the waits total about
+  0.4 s, but an ambiguous write that never resolves costs a recovery window per attempt). A conflict on anything the engine can
   re-derive (an event put, a snapshot or continuity check, an engine-filled fence)
   **re-prepares** the command: the aggregate is loaded again, the handler (or your `prepare`
   closure) runs again against fresh state, and only the attempt that commits writes anything. A
@@ -278,7 +280,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 A multi-stream command runs under the same retry with `Store::execute_transaction`: the closure is
 the command's decision step, run again from scratch whenever the engine re-prepares it, and the
 streams it reads and writes can depend on what it reads. The identity names only what the request
-names (`with_targets`), so the digest is the same on every attempt however the write set changes:
+names (`with_targets`), so the digest is the same on every attempt however the write set changes.
+The flip side is a contract: **everything that distinguishes the request must be in the targets or
+the payload.** A transfer whose destination is chosen only inside the closure has the same identity
+whichever destination it picks, so a second request with the same command ID and a different
+destination replays the first's outcome instead of running; put the destination in the payload (or
+the targets):
 
 ```rust
 use photon_evt::{

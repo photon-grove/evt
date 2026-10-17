@@ -33,26 +33,44 @@ const (
 // A transient backend failure (throttling, an ambiguous write) is retried the same way but, when
 // attempts run out, is returned as an error: nothing says the state went stale. Every other error
 // is returned at once.
+//
+// Unset delay fields take the defaults, as Rust's RetryPolicy::new does: a policy of
+// RetryPolicy{MaxAttempts: 3} waits 25 ms doubling to 1 s with jitter. Immediate opts out of
+// waiting, for tests.
+//
+// Worst case, a command takes MaxAttempts attempts, the waits between them (at most 25, 50, 100,
+// and 200 ms with the defaults, about 0.4 s in total), and, for an ambiguous write whose row never
+// appears, a full recovery window (WithRecoveryWait, 10 s, plus up to a second of grace) per
+// attempt: about a minute with the defaults. Deadline bounds the total.
 type RetryPolicy struct {
 	// MaxAttempts is the number of attempts in total, including the first. A value below 1 means 1:
 	// the first conflict is recorded as a stale-fence rejection without a retry.
 	MaxAttempts int
 
-	// BaseDelay is the delay before the first retry, before jitter. Delays double from it up to
-	// MaxDelay, and jitter keeps them in [delay/2, delay].
+	// BaseDelay is the delay before the first retry, before jitter; DefaultRetryBaseDelay when
+	// zero or less. Delays double from it up to MaxDelay, and jitter keeps them in [delay/2, delay].
 	BaseDelay time.Duration
 
-	// MaxDelay is the upper bound for any delay. A BaseDelay or MaxDelay of zero or less retries
-	// without waiting, as in Rust.
+	// MaxDelay is the upper bound for any delay; DefaultRetryMaxDelay when zero or less.
 	MaxDelay time.Duration
 
-	// Jitter returns a value in [0, limit] used to spread a delay across [delay/2, delay]. Nil
-	// uses delay/2, the bottom of the range, which keeps delays deterministic.
+	// Jitter returns a value in [0, limit] used to spread a delay across [delay/2, delay]. Nil uses
+	// random jitter; a function returning 0 makes delays deterministic (the bottom of the range).
 	Jitter func(limit time.Duration) time.Duration
 
 	// Sleep waits for the delay between attempts and returns early with the context's error when
 	// it ends. Nil uses policy.SleepWithContext; tests inject a recorder.
 	Sleep func(ctx context.Context, delay time.Duration) error
+
+	// Immediate retries without waiting and ignores the delay fields, for tests.
+	Immediate bool
+
+	// Deadline, when positive, bounds the whole command: no attempt starts after Deadline has
+	// elapsed since the first began, and no wait is slept that would end past it. The attempts
+	// made are then treated as exhausted, so a conflict is recorded as a stale-fence rejection and
+	// a transient failure is returned. An attempt already running is not interrupted; use the
+	// context for that. Zero means no deadline.
+	Deadline time.Duration
 }
 
 // DefaultRetryPolicy returns the default policy: DefaultRetryAttempts attempts, delays from
@@ -66,6 +84,12 @@ func DefaultRetryPolicy() RetryPolicy {
 	}
 }
 
+// ImmediateRetryPolicy returns a policy with the given number of attempts and no waiting between
+// them, for tests.
+func ImmediateRetryPolicy(attempts int) RetryPolicy {
+	return RetryPolicy{MaxAttempts: attempts, Immediate: true}
+}
+
 // WithRetry replaces the store's fence-aware retry policy, DefaultRetryPolicy by default. It
 // applies to ExecuteWithOutcome, Execute on a store with outcomes, and ExecuteTransaction. Like
 // the other With options it must be called during Store initialization, before concurrent use.
@@ -77,13 +101,36 @@ func (store *Store) WithRetry(retry RetryPolicy) *Store {
 
 func (p RetryPolicy) attempts() int { return max(p.MaxAttempts, 1) }
 
-// wait sleeps before retry number retry (1 for the first retry).
-func (p RetryPolicy) wait(ctx context.Context, retry int) error {
+// delay returns the wait before retry number retry (1 for the first retry), with unset fields
+// defaulted.
+func (p RetryPolicy) delay(retry int) time.Duration {
+	if p.Immediate {
+		return 0
+	}
+
+	base, ceiling, jitter := p.BaseDelay, p.MaxDelay, p.Jitter
+	if base <= 0 {
+		base = DefaultRetryBaseDelay
+	}
+
+	if ceiling <= 0 {
+		ceiling = DefaultRetryMaxDelay
+	}
+
+	if jitter == nil {
+		jitter = policy.DefaultConfig().Jitter
+	}
+
+	return policy.ExponentialJitterDelay(base, ceiling, retry-1, jitter)
+}
+
+// wait sleeps for a delay computed by delay, unless the context has ended.
+func (p RetryPolicy) wait(ctx context.Context, delay time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	if p.BaseDelay <= 0 || p.MaxDelay <= 0 {
+	if delay <= 0 {
 		return nil
 	}
 
@@ -92,7 +139,7 @@ func (p RetryPolicy) wait(ctx context.Context, retry int) error {
 		sleep = policy.SleepWithContext
 	}
 
-	return sleep(ctx, policy.ExponentialJitterDelay(p.BaseDelay, p.MaxDelay, retry-1, p.Jitter))
+	return sleep(ctx, delay)
 }
 
 // retryKind says what a failed attempt means for the retry loop.
@@ -212,6 +259,8 @@ func (l attemptLoop) run(
 		limit = 1
 	}
 
+	started := time.Now()
+
 	for n := 1; ; n++ {
 		result, err := attempt(n)
 
@@ -225,7 +274,12 @@ func (l attemptLoop) run(
 			return result, unmarkLoad(err)
 		}
 
-		if n >= limit {
+		// The next wait is known up front, so a deadline that it would overrun ends the retries now
+		// instead of sleeping toward it.
+		delay := l.retry.delay(n)
+		pastDeadline := l.retry.Deadline > 0 && time.Since(started)+delay >= l.retry.Deadline
+
+		if n >= limit || pastDeadline {
 			if kind == retryConflict {
 				return exhausted(ctx, n)
 			}
@@ -233,7 +287,7 @@ func (l attemptLoop) run(
 			return result, unmarkLoad(err)
 		}
 
-		if werr := l.retry.wait(ctx, n); werr != nil {
+		if werr := l.retry.wait(ctx, delay); werr != nil {
 			return result, fmt.Errorf("%w (after attempt %d: %w)", werr, n, unmarkLoad(err))
 		}
 	}

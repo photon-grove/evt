@@ -778,6 +778,11 @@ func DefaultDigest(input DigestInput) (string, error) {
 // reads and writes are decided per attempt, after the identity is fixed, and may change between
 // attempts; they are not part of the identity, so a re-prepared command, a client retry that
 // arrives after the command landed, and an ambiguous-write recovery all digest to the same value.
+//
+// That makes the identity a contract: everything that distinguishes the request must be in
+// Targets or Payload. Two requests with the same command ID, type, targets, payload, and principal
+// are the same command, so a transfer whose destination is chosen only inside the decision step
+// would replay the first destination's outcome for a second destination. Put it in the payload.
 type CommandIdentity struct {
 	// Type is the command's type string.
 	Type CommandType

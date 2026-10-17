@@ -55,6 +55,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("EngineFilledConflictRePrepares", func(t *testing.T) { testEngineFilledRePrepare(t, outcomes(t)) })
 	t.Run("CallerFencedConflictFailsFast", func(t *testing.T) { testCallerFencedFailsFast(t, outcomes(t), enforcesConcurrency) })
 	t.Run("ExhaustedRetriesPersistStaleRejection", func(t *testing.T) { testExhaustedRetries(t, outcomes(t)) })
+	t.Run("ReservedWriteIsStillRefused", func(t *testing.T) { testReservedWriteRefused(t, outcomes(t)) })
 	t.Run("WriteSetChangesBetweenAttempts", func(t *testing.T) { testWriteSetChanges(t, outcomes(t)) })
 	t.Run("ResponseIsCopied", func(t *testing.T) { testResponseCopied(t, outcomes(t)) })
 	t.Run("NULIsRefusedBeforeAnyWrite", func(t *testing.T) { testNULRefused(t, outcomes(t)) })

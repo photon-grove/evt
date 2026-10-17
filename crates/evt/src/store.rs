@@ -19,7 +19,7 @@ use crate::outcome::{
     Rejection, Settled, ToRejection, pre_check, principal, require_command_id, settle,
 };
 use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
-use crate::retry::{Failed, Retry, RetryPolicy};
+use crate::retry::{Budget, Failed, Retry, RetryPolicy};
 use crate::transaction::{Begin, Transaction, persist_rejection};
 use crate::upcast::upcast_event;
 
@@ -409,8 +409,9 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         A::Command: OutcomeCommand + Clone,
         A::Error: ToRejection,
     {
-        self.execute_with_response(entity_id, command, metadata, |_, _| Ok(None))
-            .await
+        // Boxed, like each attempt: callers that chain many commands in one task keep a small
+        // future (the conformance cases do, in debug builds, on a default test-thread stack).
+        Box::pin(self.execute_with_response(entity_id, command, metadata, |_, _| Ok(None))).await
     }
 
     /// Like [`execute_with_outcome`](Store::execute_with_outcome), and stores a response with an
@@ -448,9 +449,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             principal: principal(&metadata),
         })?;
 
-        let policy = config.retry();
-        let attempts = policy.max_attempts.max(1);
-        let mut attempt = 1;
+        let mut budget = Budget::new(config.retry());
 
         loop {
             // Boxed: an attempt's future holds the load, the handler, and the commit, and keeping
@@ -476,7 +475,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 return Err(failed.error);
             }
 
-            if attempt >= attempts {
+            let Some(delay) = budget.next() else {
                 if kind == Retry::Transient {
                     return Err(failed.error);
                 }
@@ -486,13 +485,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                     &command_id,
                     &digest,
                     config.recovery_wait(),
-                    Rejection::retries_exhausted(attempt),
+                    Rejection::retries_exhausted(budget.attempts()),
                 )
                 .await;
-            }
+            };
 
-            self.repository.backoff(policy.delay(attempt - 1)).await;
-            attempt += 1;
+            self.repository.backoff(delay).await;
         }
     }
 
@@ -701,9 +699,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
         })?;
 
-        let policy = config.retry();
-        let attempts = policy.max_attempts.max(1);
-        let mut attempt = 1;
+        let mut budget = Budget::new(config.retry());
 
         loop {
             let mut pending = None;
@@ -722,7 +718,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 return Err(failed.error);
             }
 
-            if attempt >= attempts {
+            let Some(delay) = budget.next() else {
                 let Some((command_id, digest)) = pending.filter(|_| kind == Retry::Conflict) else {
                     return Err(failed.error);
                 };
@@ -732,13 +728,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                     &command_id,
                     &digest,
                     config.recovery_wait(),
-                    Rejection::retries_exhausted(attempt),
+                    Rejection::retries_exhausted(budget.attempts()),
                 )
                 .await;
-            }
+            };
 
-            self.repository.backoff(policy.delay(attempt - 1)).await;
-            attempt += 1;
+            self.repository.backoff(delay).await;
         }
     }
 

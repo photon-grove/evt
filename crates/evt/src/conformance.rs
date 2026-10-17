@@ -3100,6 +3100,14 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         Box::pin(retry_single_aggregate(repo)).await,
     );
     record(
+        "a deadline ends the retries and is treated as exhausted attempts",
+        Box::pin(retry_deadline(repo)).await,
+    );
+    record(
+        "a stream outside the identity is still refused when it is reserved",
+        Box::pin(retry_reserved_stream(repo)).await,
+    );
+    record(
         "a failed commit leaves no outcome row",
         Box::pin(outcome_atomicity(repo)).await,
     );
@@ -5083,6 +5091,83 @@ async fn retry_single_aggregate<R: Repository>(repo: &R) -> CaseResult {
     ensure!(replayed.replayed, "the command replays: {replayed:?}");
     ensure_eq!(replayed.outcome, outcome.outcome, "the replayed rejection");
     ensure_eq!(responses.load(Ordering::SeqCst), 3, "a replay runs nothing");
+
+    Ok(())
+}
+
+async fn retry_deadline<R: Repository>(repo: &R) -> CaseResult {
+    let target = ledger_id();
+    seed(repo, &target, 1).await?;
+
+    // Every attempt loses, and the deadline has passed once the first has run: the retries stop
+    // there, and the attempts made are what the rejection records.
+    let meddling = Meddling::new(repo, &target, Trigger::Events, u32::MAX);
+    let store = Store::<Ledger, _>::new(&meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(
+            outcome_config()
+                .with_retry(RetryPolicy::immediate(5).with_deadline(Duration::from_nanos(1))),
+        );
+    let runs = AtomicUsize::new(0);
+
+    let outcome = store
+        .execute_with_response(&target, Add(2), command_metadata(&command_id()), |_, _| {
+            runs.fetch_add(1, Ordering::SeqCst);
+
+            Ok(None)
+        })
+        .await?;
+    ensure!(
+        outcome.is_rejected(),
+        "a conflict past the deadline is recorded like exhausted attempts: {outcome:?}"
+    );
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::retries_exhausted(1)),
+        "the attempts made"
+    );
+    ensure_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "no attempt started past the deadline"
+    );
+
+    Ok(())
+}
+
+async fn retry_reserved_stream<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let named = ledger_id();
+
+    // The identity no longer limits the write set, so the commit is what refuses a reserved
+    // stream, before any write and without retrying.
+    for reserved in ["SYSTEM#retry-case", "command-outcome#retry-case"] {
+        let command = command_id();
+        let calls = AtomicUsize::new(0);
+        let identity = CommandIdentity::new("ledger:copy").with_targets([named.clone()]);
+
+        let result = store
+            .execute_transaction(&identity, &command_metadata(&command), |tx| {
+                calls.fetch_add(1, Ordering::SeqCst);
+
+                Box::pin(async move {
+                    let mut stream = tx.read::<Ledger>(reserved).await?;
+                    tx.append(&mut stream, added(1))?;
+
+                    Ok(Decision::accept())
+                })
+            })
+            .await;
+        ensure!(
+            matches!(&result, Err(Error::ReservedEntityId { .. })),
+            "{reserved}: a reserved stream is refused: {result:?}"
+        );
+        ensure_eq!(calls.load(Ordering::SeqCst), 1, "and not retried");
+        ensure!(
+            repo.outcome(&command).await?.is_none(),
+            "{reserved}: no outcome was recorded"
+        );
+    }
 
     Ok(())
 }

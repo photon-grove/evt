@@ -830,6 +830,18 @@ an append to a stream outside the identity is no longer refused, the digest-inpu
 key became `targets`, and the Go and Rust identity types renamed the field and builder
 (`Targets` / `with_targets`) to say what belongs in them.
 
+**The caller's contract.** Because the digest sees only the type, the targets, the payload, and
+the principal, **everything that distinguishes one request from another must be in the targets or
+the payload**. Two requests with the same command ID, type, targets, payload, and principal are the
+same command: the second replays the first's stored outcome and never runs. A transfer whose
+destination is chosen only inside the decision step (read from state or supplied out of band) is
+therefore a trap: a request moving 10 to account B and a later request moving 10 to account C,
+both named `account:transfer` on account A and sent with one command ID, digest equal, and the
+second silently returns the first's outcome. Name the destination in the payload (or as a second
+target) and the second is `IdempotencyKeyReuse`, which is what it is. State a command derives
+(which handle a profile currently holds) belongs outside the identity; a choice the caller
+makes belongs inside it.
+
 A custom digester stores its own opaque string in `digest`; ambiguous-write recovery compares
 digests for equality only.
 
@@ -1084,16 +1096,21 @@ after the failure:
 Nothing carries over from a failed attempt: its staged events, snapshot, fences, and projector
 operations are discarded, and only the attempt that commits writes anything. The handler or
 prepare step can therefore run several times for one command and must be safe to repeat; external
-side effects it causes must be idempotent. In Go the entity the caller supplied is reset to what
-it was handed in before each re-preparation; an entity the engine cannot reset (not a pointer to
-a struct) is attempted once and a conflict is returned as an error, so applying events twice can
-never double-count them. Rust loads a fresh aggregate for every attempt.
+side effects it causes must be idempotent. In Go the entity the caller supplied is reset before each
+re-preparation: its exported fields (the state a snapshot persists) are restored from a deep copy,
+so events a failed attempt applied are not counted again, and its unexported fields are restored
+shallowly, so an unexported map, slice, or pointer keeps what the failed attempt put in it. Keep
+state that `Apply` changes in exported fields. The command value is reused by every attempt, so a
+handler must not mutate it. An entity the engine cannot reset (not a pointer to a struct) is
+attempted once and a conflict is returned as an error. Rust loads a fresh aggregate for every
+attempt and clones the command.
 
 **The write set may change between attempts.** The streams a command reads and writes come from
 state, so a re-preparation can derive different ones — a rename that found the handle `ada` on the
 first attempt and `ada2` on the second releases a different claim stream. That is one command: its
 identity is the request's intent ([Identity digest](#identity-digest)), computed once before
-any attempt, so the digest is the same on every attempt, on a client retry that arrives after the
+any attempt and kept (never recomputed from the live command or metadata), so the digest is the
+same on every attempt, on a client retry that arrives after the
 command landed, and in a recovery read. The outcome row records the streams the committing attempt
 wrote.
 
@@ -1103,21 +1120,40 @@ The attempts are bounded and spaced by a policy that is configurable per store a
 defaults in both languages (`compat/fixtures/outcomes.json` pins them, and both implementations
 assert them):
 
-| Setting      | Default | Meaning                                                                          |
-| ------------ | ------- | -------------------------------------------------------------------------------- |
-| Max attempts | 5       | Attempts in total, the first included. A value below 1 means 1.                  |
-| Base delay   | 25 ms   | The delay before the first retry, before jitter.                                 |
-| Max delay    | 1 s     | The upper bound for any delay. A zero base or max delay retries without waiting. |
+| Setting      | Default | Meaning                                                                    |
+| ------------ | ------- | -------------------------------------------------------------------------- |
+| Max attempts | 5       | Attempts in total, the first included. A value below 1 means 1.            |
+| Base delay   | 25 ms   | The delay before the first retry, before jitter.                           |
+| Max delay    | 1 s     | The upper bound for any delay.                                             |
+| Deadline     | none    | Optional bound on the whole command (below).                               |
+
+Unset fields take the defaults in both languages: a policy that only sets the attempts still backs
+off and jitters. Waiting is switched off explicitly (`RetryPolicy::immediate` in Rust,
+`snapshots.ImmediateRetryPolicy` or `Immediate: true` in Go), for tests.
 
 The delay before retry _n_ (starting at 0) is `min(base × 2ⁿ, max)`, with jitter taking it
 anywhere in `[delay / 2, delay]`, so writers that conflicted together do not retry together.
-There is no wait after the last attempt. Go configures it with `snapshots.RetryPolicy` and
+There is no wait after the last attempt. An optional **deadline** bounds the whole command: no
+attempt starts once the deadline has elapsed since the first began, and no wait is taken that
+would end past it (an attempt already running is not interrupted; use the context or the
+backend's timeouts). Hitting the deadline is treated as exhausted attempts, so a conflict is
+recorded and a transient failure is returned. Go configures it with `snapshots.RetryPolicy` and
 `Store.WithRetry` (a `Sleep` function and a `Jitter` function are injectable, and the wait ends
 with the context's error if the context ends); Rust with `RetryPolicy` and
 `OutcomeConfig::with_retry`, waiting on the repository's timer (`Repository::backoff`, the timer
-ambiguous-write recovery already uses). A caller that wants to own the loop uses the lower-level
+ambiguous-write recovery already uses). The deadline is checked between attempts against the
+system clock in both languages (`RetryPolicy.Deadline` in Go, `RetryPolicy::with_deadline` in
+Rust). A caller that wants to own the loop uses the lower-level
 calls — `BeginCommand`/`Complete`/`Reject` in Go, `begin_command`/`commit_with_outcome`/`reject`
 in Rust — which attempt once and return an engine-filled conflict as an error.
+
+**Worst-case latency.** A command takes at most the attempts, the waits between them, and any
+recovery windows. With the defaults the waits are at most 25, 50, 100, and 200 ms, about 0.4 s in
+total, so a burst of `TransactionConflict` on a hot key exhausts into a `stale-fence` rejection in
+well under a second. An ambiguous write whose row never appears costs a full recovery window
+([Ambiguous-write recovery](#ambiguous-write-recovery), 10 s plus up to a second of grace) per
+attempt, so five attempts can take about a minute. Set a deadline, a shorter recovery window, or
+fewer attempts to bound it.
 
 ### Exhausted attempts
 

@@ -20,6 +20,13 @@ use std::time::Duration;
 /// each delay (`[delay / 2, delay]`), like Go's `policy.ExponentialJitterDelay`. The jitter keeps
 /// writers that conflicted together from retrying together.
 ///
+/// Worst case, a command takes `max_attempts` attempts, the waits between them (at most 25, 50,
+/// 100, and 200 ms with the defaults, about 0.4 s in total), and, for an ambiguous write whose row
+/// never appears, a full recovery window
+/// ([`OutcomeConfig::with_recovery_wait`](crate::OutcomeConfig::with_recovery_wait), 10 s, plus up
+/// to a second of grace) per attempt: about a minute with the defaults. Set a
+/// [deadline](RetryPolicy::with_deadline) to bound the total.
+///
 /// The crate does not depend on an async runtime. [`Store::execute_with_retry`] takes the sleep
 /// function from the caller, for example `tokio::time::sleep`; fence-aware retry waits on the
 /// repository's own timer ([`Repository::backoff`](crate::Repository::backoff)).
@@ -34,6 +41,10 @@ pub struct RetryPolicy {
     pub base_delay: Duration,
     /// The upper bound for any delay.
     pub max_delay: Duration,
+    /// When set, bounds the whole command: no attempt starts after the deadline has elapsed since
+    /// the first began, and no wait is taken that would end past it (see
+    /// [`with_deadline`](RetryPolicy::with_deadline)).
+    pub deadline: Option<Duration>,
 }
 
 impl Default for RetryPolicy {
@@ -60,6 +71,7 @@ impl RetryPolicy {
             max_attempts,
             base_delay: Duration::from_millis(DEFAULT_BASE_DELAY_MS),
             max_delay: Duration::from_millis(DEFAULT_MAX_DELAY_MS),
+            deadline: None,
         }
     }
 
@@ -69,6 +81,7 @@ impl RetryPolicy {
             max_attempts,
             base_delay: Duration::ZERO,
             max_delay: Duration::ZERO,
+            deadline: None,
         }
     }
 
@@ -77,6 +90,17 @@ impl RetryPolicy {
     pub const fn with_backoff(mut self, base_delay: Duration, max_delay: Duration) -> Self {
         self.base_delay = base_delay;
         self.max_delay = max_delay;
+        self
+    }
+
+    /// Bounds the whole command: no attempt starts after `deadline` has elapsed since the first
+    /// began, and no wait is taken that would end past it. The attempts made are then treated as
+    /// exhausted, so a conflict is recorded as a stale-fence rejection and a transient failure is
+    /// returned. An attempt already running is not interrupted. The check uses the system clock
+    /// between attempts, so it needs no runtime timer.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -94,6 +118,47 @@ impl RetryPolicy {
         }
 
         floor + Duration::from_nanos(random() % (spread + 1))
+    }
+}
+
+/// The attempts one command has left: counts them and applies the policy's bounds.
+pub(crate) struct Budget {
+    policy: RetryPolicy,
+    started: std::time::Instant,
+    attempt: u32,
+}
+
+impl Budget {
+    /// Starts the clock for a command's first attempt.
+    pub(crate) fn new(policy: RetryPolicy) -> Self {
+        Self {
+            policy,
+            started: std::time::Instant::now(),
+            attempt: 1,
+        }
+    }
+
+    /// The number of attempts made so far, the one that just failed included.
+    pub(crate) fn attempts(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Spends one more attempt and returns the delay to wait before it, or `None` when the
+    /// attempts or the deadline are used up.
+    pub(crate) fn next(&mut self) -> Option<Duration> {
+        let delay = self.policy.delay(self.attempt - 1);
+        let past_deadline = self
+            .policy
+            .deadline
+            .is_some_and(|deadline| self.started.elapsed().saturating_add(delay) >= deadline);
+
+        if self.attempt >= self.policy.max_attempts.max(1) || past_deadline {
+            return None;
+        }
+
+        self.attempt += 1;
+
+        Some(delay)
     }
 }
 
@@ -186,6 +251,85 @@ fn random() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conflict_exhausts_only_when_it_came_from_the_commit() {
+        use crate::Error;
+        use crate::ids::{EntityId, EventSequence};
+        use crate::repository::FenceProvenance;
+
+        let conflict = || Error::Conflict {
+            entity_id: EntityId::new("e"),
+            message: "collision".into(),
+        };
+        let gap = || Error::SequenceGap {
+            entity_id: EntityId::new("e"),
+            after: EventSequence(0),
+            found: EventSequence(2),
+        };
+        let fence = |provenance| Error::FenceConflict {
+            entity_id: EntityId::new("e"),
+            head: EventSequence(1),
+            provenance,
+        };
+
+        assert_eq!(Failed::committing(conflict()).retry(), Retry::Conflict);
+        assert_eq!(Failed::committing(gap()).retry(), Retry::Conflict);
+        assert_eq!(
+            Failed::committing(fence(FenceProvenance::Engine)).retry(),
+            Retry::Conflict
+        );
+        assert_eq!(
+            Failed::committing(fence(FenceProvenance::Caller)).retry(),
+            Retry::Never,
+            "a caller-stamped fence is recorded at once, never retried"
+        );
+
+        // The same errors while deciding (loading, or passed on by a prepare step) are retried but
+        // never record a rejection.
+        assert_eq!(Failed::deciding(conflict()).retry(), Retry::Transient);
+        assert_eq!(Failed::deciding(gap()).retry(), Retry::Transient);
+        assert_eq!(
+            Failed::deciding(Error::Transient("throttled".into())).retry(),
+            Retry::Transient
+        );
+        assert_eq!(
+            Failed::committing(Error::Handler("boom".into())).retry(),
+            Retry::Never
+        );
+    }
+
+    #[test]
+    fn the_budget_bounds_attempts_and_honors_the_deadline() {
+        let mut budget = Budget::new(RetryPolicy::immediate(3));
+        assert!(budget.next().is_some());
+        assert!(budget.next().is_some());
+        assert!(budget.next().is_none(), "three attempts in total");
+        assert_eq!(budget.attempts(), 3);
+
+        let mut budget = Budget::new(RetryPolicy::immediate(0));
+        assert!(budget.next().is_none(), "below one means one");
+        assert_eq!(budget.attempts(), 1);
+
+        let mut budget =
+            Budget::new(RetryPolicy::immediate(5).with_deadline(Duration::from_nanos(1)));
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(
+            budget.next().is_none(),
+            "no attempt starts past the deadline"
+        );
+        assert_eq!(budget.attempts(), 1);
+
+        let mut budget = Budget::new(
+            RetryPolicy::new(5)
+                .with_backoff(Duration::from_secs(10), Duration::from_secs(10))
+                .with_deadline(Duration::from_secs(1)),
+        );
+        assert!(
+            budget.next().is_none(),
+            "a wait that would end past the deadline is not taken"
+        );
+    }
 
     #[test]
     fn delays_grow_with_jitter_and_stay_capped() {

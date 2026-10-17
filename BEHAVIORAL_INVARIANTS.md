@@ -374,7 +374,11 @@ error before any write and is never split.
 ### Fence-Aware Retry (v0.9, C5)
 
 - On a store with outcomes a command runs under a bounded policy (default 5 attempts in total,
-  25 ms doubling to 1 s, jittered to `[delay/2, delay]`; a value below 1 attempt means 1). Go:
+  25 ms doubling to 1 s, jittered to `[delay/2, delay]`; a value below 1 attempt means 1; unset
+  delay fields take the defaults, and waiting is switched off only explicitly with
+  `ImmediateRetryPolicy` / `RetryPolicy::immediate`). An optional deadline stops new attempts
+  once it has elapsed and is treated as exhausted attempts. Worst case is the attempts, about
+  0.4 s of waits with the defaults, and a recovery window per attempt for ambiguous writes. Go:
   `snapshots.RetryPolicy` and `Store.WithRetry`; Rust: `RetryPolicy` and
   `OutcomeConfig::with_retry`. Both implementations assert the defaults against
   `compat/fixtures/outcomes.json`. There is no wait after the last attempt, and a Go wait ends with
@@ -398,12 +402,20 @@ error before any write and is never split.
   pre-check ends the loop. The handler or prepare step may run up to `MaxAttempts` times for one
   command and must be safe to repeat; a handler's own error, including a domain `ConflictError`, is
   never retried
+- The identity digest is computed once, before the first attempt, and never recomputed from the
+  live command or metadata. Everything that distinguishes one request from another must be in the
+  targets or the payload: two requests with the same ID, type, targets, payload, and principal are
+  the same command (a transfer whose destination comes only from the decision step would replay
+  the first destination's outcome)
 - The write set may differ between attempts without changing the command: identity is the request's
   intent, computed once before any attempt, so re-preparation, a client retry after the command
   landed, and recovery all digest to the same value (never `IdempotencyKeyReuse`)
-- Go resets the caller's entity before each re-preparation and attempts an entity it cannot reset
-  (not a pointer to a struct) once; after a replayed or exhausted result the entity is reloaded so
-  it reflects durable state. Rust loads a fresh aggregate per attempt
+- Go resets the caller's entity before each re-preparation (exported fields from a deep copy,
+  unexported fields shallowly, so state `Apply` changes belongs in exported fields) and attempts an
+  entity it cannot reset (not a pointer to a struct) once; the command value is reused by every
+  attempt and must not be mutated by a handler. After a replayed or exhausted result the entity is
+  reloaded so it reflects durable state. Rust loads a fresh aggregate and clones the command per
+  attempt
 - `policy.ExecuteWithRetry` (deprecated, K6) and Rust's `execute_with_retry` (a store without
   outcomes) remain blind whole-command retry for code that does not use outcomes
 

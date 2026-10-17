@@ -41,7 +41,11 @@ recorded as a `stale-fence` rejection that a replay of the same ID returns. Writ
 safe to run more than once, and use a new key to try again after a stale-fence rejection. Give a
 multi-stream command an identity that names only what the request names (`evt.CommandIdentity`
 `Targets`): the streams it reads and writes may come from state and change between attempts, and
-they are not part of the identity.
+they are not part of the identity. That makes the identity a contract: everything that
+distinguishes the request must be in `Targets` or the payload. A transfer whose destination comes
+only from the `Prepare` function has the same identity whatever destination it picks, so a second
+request with the same command ID and another destination replays the first outcome instead of
+running. Put the destination in the payload.
 
 ## Upcast historical shapes, always
 

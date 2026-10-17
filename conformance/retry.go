@@ -44,6 +44,7 @@ func newRetryEnv(t *testing.T, repo evt.OutcomeRepository, attempts int) *retryE
 		MaxAttempts: attempts,
 		BaseDelay:   10 * time.Millisecond,
 		MaxDelay:    time.Second,
+		Jitter:      func(time.Duration) time.Duration { return 0 },
 		Sleep: func(_ context.Context, delay time.Duration) error {
 			env.delays = append(env.delays, delay)
 
@@ -456,4 +457,32 @@ func testSingleAggregateRetry(t *testing.T, repo evt.OutcomeRepository) {
 	require.True(t, replayed.Replayed)
 	require.Equal(t, outcome.Outcome, replayed.Outcome)
 	require.EqualValues(t, 3, ran.Load())
+}
+
+// The identity no longer limits a command's write set, so the commit is what refuses a reserved
+// stream: before any write, and without preparing the command again.
+func testReservedWriteRefused(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newRetryEnv(t, repo, 3)
+	identity := evt.CommandIdentity{Type: "ledger:copy", Targets: []evt.EntityID{env.id}}
+
+	for _, reserved := range []evt.EntityID{"SYSTEM#retry-case", "command-outcome#retry-case"} {
+		var calls int
+
+		id := env.commandID("reserved-" + newNamespace())
+
+		_, err := env.store.ExecuteTransaction(ctx, identity, withCommand(id),
+			func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+				calls++
+
+				if rerr := tx.Read(ctx, newLedger(reserved), reserved); rerr != nil {
+					return nil, rerr
+				}
+
+				return nil, tx.Append(reserved, &ledgerEvent{Kind: "deposited", Amount: 1})
+			})
+		require.True(t, evt.IsReservedEntityIdErr(err), "%s: %v", reserved, err)
+		require.Equal(t, 1, calls, "%s: a refusal is not retried", reserved)
+		env.requireNoOutcome(t, id)
+	}
 }

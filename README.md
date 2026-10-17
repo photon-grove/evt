@@ -256,7 +256,9 @@ default:
 - **Fence-aware retry (C5).** `ExecuteWithOutcome`, `Execute` on an outcomes store, and
   `ExecuteTransaction` retry a command that conflicts with another writer, up to
   `snapshots.RetryPolicy` (`Store.WithRetry`; the default is 5 attempts, 25 ms doubling to 1 s,
-  jittered). A conflict on anything the engine can re-derive — an event put, a snapshot or
+  jittered; unset delays take those defaults, `snapshots.ImmediateRetryPolicy` opts out of waiting
+  for tests, and `Deadline` bounds the whole command; with the defaults the waits total about
+  0.4 s, but an ambiguous write that never resolves costs a recovery window per attempt). A conflict on anything the engine can re-derive — an event put, a snapshot or
   continuity check, an engine-filled fence — **re-prepares** the command: the entity is reset and
   loaded again, the handler (or your `Prepare`) runs again against fresh state, and only the
   attempt that commits writes anything. A failed **caller-stamped** fence fails fast with the
@@ -270,7 +272,13 @@ default:
 
   A command whose write set depends on state — a rename that releases whichever handle the
   entity currently holds — keeps one identity across attempts, because only the targets in its
-  `evt.CommandIdentity` are digested:
+  `evt.CommandIdentity` are digested. The flip side is a contract: **everything that distinguishes
+  the request must be in `Targets` or the payload.** A transfer whose destination is chosen only
+  inside `Prepare` has the same identity whichever destination it picks, so a second request with
+  the same command ID and a different destination replays the first's outcome instead of running;
+  put the destination in the payload (or the targets). The handler resets the entity between
+  attempts from a deep copy of its exported fields, so keep the state `Apply` changes in exported
+  fields, and do not mutate the command in a handler.
 
   ```go
   identity := evt.CommandIdentity{

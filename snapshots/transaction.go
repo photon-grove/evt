@@ -40,6 +40,10 @@ type Transaction struct {
 
 	// command is set by BeginCommand on a store with outcomes enabled.
 	command *command
+
+	// readErr is the error of the last Read that failed to load its stream. ExecuteTransaction
+	// uses it to tell a load failure a Prepare function passes on from one of its own errors.
+	readErr error
 }
 
 // transactionStream is one read aggregate and the events appended to it since the read.
@@ -80,6 +84,7 @@ func (tx *Transaction) Read(ctx context.Context, entity evt.Entity, entityID evt
 	context, err := tx.store.LoadEntity(ctx, entity, entityID)
 	if err != nil {
 		tx.used = true
+		tx.readErr = err
 
 		return err
 	}

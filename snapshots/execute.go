@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 )
 
 // Prepare is one attempt's decision step of a multi-stream command (ExecuteTransaction). It
@@ -54,26 +55,32 @@ func (store *Store) ExecuteTransaction(
 		return nil, &evt.InvalidArgumentError{Argument: "prepare", Message: "a prepare function is required"}
 	}
 
-	var state attemptState
+	// The identity and its digest are fixed once, before the first attempt.
+	cmd, err := store.newCommand(identity, metadata)
+	if err != nil {
+		return nil, err
+	}
 
+	state := attemptState{cmd: cmd}
 	loop := attemptLoop{retry: store.retry}
 
 	result, err := loop.run(ctx, func(int) (executed, error) {
-		tx, replayed, err := store.BeginCommand(ctx, identity, metadata)
-		if err != nil || replayed != nil {
-			return executed{outcome: replayed}, err
+		replayed, perr := cmd.preCheck(ctx)
+		if perr != nil || replayed != nil {
+			return executed{outcome: replayed}, perr
 		}
 
-		state.cmd = tx.command
+		tx := store.Transaction()
+		tx.command = cmd
 
-		response, err := prepare(ctx, tx)
-		if err != nil {
-			return prepareFailed(ctx, tx, err)
+		response, rerr := prepare(ctx, tx)
+		if rerr != nil {
+			return prepareFailed(ctx, tx, rerr)
 		}
 
-		outcome, err := tx.Complete(ctx, response)
+		outcome, cerr := tx.Complete(ctx, response)
 
-		return executed{outcome: outcome}, err
+		return executed{outcome: outcome}, cerr
 	}, state.retriesExhausted)
 
 	return result.outcome, err
@@ -87,8 +94,12 @@ func prepareFailed(ctx context.Context, tx *Transaction, err error) (executed, e
 		return executed{outcome: outcome, handlerErr: err}, rerr
 	}
 
-	// A load that raced a compaction found a sequence gap: reloading resolves it.
-	if errors.Is(err, evt.ErrSequenceGap) {
+	// A failed Read the function passed on: a load that raced a compaction found a sequence gap
+	// (reloading resolves it), or the backend was momentarily unavailable. It is retried like a
+	// transient failure but never exhausts into a rejection: it says the read failed, not that the
+	// decision went stale.
+	if tx.readErr != nil && errors.Is(err, tx.readErr) &&
+		(evt.IsOptimisticConflict(tx.readErr) || policy.IsTransient(tx.readErr)) {
 		return executed{}, load(err)
 	}
 

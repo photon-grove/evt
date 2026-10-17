@@ -7,7 +7,9 @@ package snapshots_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -70,6 +72,7 @@ func TestRetry_ABackoffGrowsAndIsBounded(t *testing.T) {
 	waits := &delays{}
 	store, _ := retryStore(t, conflicts(10), snapshots.RetryPolicy{
 		MaxAttempts: 4, BaseDelay: 10 * time.Millisecond, MaxDelay: 25 * time.Millisecond, Sleep: waits.sleep,
+		Jitter: func(time.Duration) time.Duration { return 0 },
 	})
 
 	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
@@ -77,7 +80,7 @@ func TestRetry_ABackoffGrowsAndIsBounded(t *testing.T) {
 	require.True(t, outcome.Rejected())
 	require.Equal(t, evt.RejectionStaleFence, outcome.Rejection.Code)
 
-	// Without jitter each delay is the bottom of [delay/2, delay]: 10 ms doubling, capped at 25 ms.
+	// With no jitter each delay is the bottom of [delay/2, delay]: 10 ms doubling, capped at 25 ms.
 	require.Equal(t, []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 12500 * time.Microsecond}, waits.waited)
 
 	exhausted, err := evt.CanonicalRejection(evt.RetriesExhaustedRejection(4))
@@ -262,22 +265,68 @@ func (*denied) Rejection() evt.Rejection {
 	return evt.Rejection{Code: "denied", Message: "not allowed"}
 }
 
-func TestRetry_ADelayOfZeroRetriesWithoutWaiting(t *testing.T) {
-	for name, retry := range map[string]snapshots.RetryPolicy{
-		"no base delay": {MaxAttempts: 3, MaxDelay: time.Second},
-		"no max delay":  {MaxAttempts: 3, BaseDelay: time.Second},
-	} {
-		waits := &delays{}
-		retry.Sleep = waits.sleep
+func TestRetry_UnsetDelaysTakeTheDefaultsAndImmediateOptsOut(t *testing.T) {
+	// A policy that only sets the attempts still backs off, like Rust's RetryPolicy::new.
+	waits := &delays{}
+	store, repo := retryStore(t, conflicts(2), snapshots.RetryPolicy{MaxAttempts: 3, Sleep: waits.sleep})
 
-		store, repo := retryStore(t, conflicts(2), retry)
+	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, outcome.Accepted())
+	require.EqualValues(t, 3, repo.commits.Load())
+	require.Len(t, waits.waited, 2)
 
-		outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
-		require.NoError(t, err, name)
-		require.True(t, outcome.Accepted(), name)
-		require.EqualValues(t, 3, repo.commits.Load(), name)
-		require.Empty(t, waits.waited, name)
-	}
+	// Jittered into [delay/2, delay] of 25 ms and 50 ms.
+	require.GreaterOrEqual(t, waits.waited[0], 12500*time.Microsecond)
+	require.LessOrEqual(t, waits.waited[0], snapshots.DefaultRetryBaseDelay)
+	require.GreaterOrEqual(t, waits.waited[1], snapshots.DefaultRetryBaseDelay)
+	require.LessOrEqual(t, waits.waited[1], 2*snapshots.DefaultRetryBaseDelay)
+
+	// Immediate never waits, whatever the delay fields say.
+	waits = &delays{}
+	immediate := snapshots.ImmediateRetryPolicy(3)
+	immediate.BaseDelay, immediate.Sleep = time.Hour, waits.sleep
+
+	store, repo = retryStore(t, conflicts(2), immediate)
+
+	outcome, err = store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, outcome.Accepted())
+	require.EqualValues(t, 3, repo.commits.Load())
+	require.Empty(t, waits.waited)
+}
+
+func TestRetry_ADeadlineEndsTheRetries(t *testing.T) {
+	store, repo := retryStore(t, conflicts(10), snapshots.RetryPolicy{
+		MaxAttempts: 5, Immediate: true, Deadline: time.Nanosecond,
+	})
+
+	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, outcome.Rejected(), "a conflict past the deadline is recorded like exhausted attempts")
+	require.EqualValues(t, 1, repo.commits.Load())
+
+	exhausted, err := evt.CanonicalRejection(evt.RetriesExhaustedRejection(1))
+	require.NoError(t, err)
+	require.Equal(t, exhausted, *outcome.Rejection, "the attempts made")
+
+	// A transient failure past the deadline is returned, as when attempts run out.
+	throttled := &policy.ClassifiedError{Class: policy.ClassTransient, Err: errors.New("throttled")}
+	store, repo = retryStore(t, []error{throttled, throttled, throttled}, snapshots.RetryPolicy{
+		MaxAttempts: 5, Immediate: true, Deadline: time.Nanosecond,
+	})
+
+	_, err = store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-2"))
+	require.ErrorIs(t, err, throttled)
+	require.EqualValues(t, 1, repo.commits.Load())
+
+	// Without one, every attempt runs.
+	store, repo = retryStore(t, conflicts(2), snapshots.ImmediateRetryPolicy(5))
+
+	outcome, err = store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-3"))
+	require.NoError(t, err)
+	require.True(t, outcome.Accepted())
+	require.EqualValues(t, 3, repo.commits.Load())
 }
 
 func TestRetry_ATransactionNeedsAPrepareFunction(t *testing.T) {
@@ -326,4 +375,298 @@ func TestRetry_ALoadGapIsRetriedButNeverRecordedAsStale(t *testing.T) {
 	stored, err = repo.GetOutcome(ctx, "cmd-2")
 	require.NoError(t, err)
 	require.Nil(t, stored)
+}
+
+// tally is an entity whose events accumulate: replaying an event twice doubles its effect, so a
+// retry that failed to reset it would be caught.
+type tally struct {
+	id     evt.EntityID
+	Total  int            `json:"total"`
+	Counts map[string]int `json:"counts"`
+}
+
+func newTally(id evt.EntityID) *tally { return &tally{id: id, Counts: map[string]int{}} }
+
+const tallyType evt.EntityType = "retry-tally"
+
+func (t *tally) Type() evt.EntityType  { return tallyType }
+func (t *tally) GetID() evt.EntityID   { return t.id }
+func (t *tally) SetID(id evt.EntityID) { t.id = id }
+func (t *tally) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	return evt.BaseEntity{ID: t.id} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+}
+func (t *tally) EventUpcasters() []evt.EventUpcaster { return nil }
+func (t *tally) Projectors() []evt.EventProjector    { return nil }
+
+type tallied struct {
+	N int `json:"n"`
+}
+
+func (*tallied) Type() evt.EventType        { return "retry-tally:tallied" }
+func (*tallied) Version() evt.EventVersion  { return 1 }
+func (*tallied) EntityType() evt.EntityType { return tallyType }
+func (*tallied) EntityID() evt.EntityID     { return "" }
+
+func (t *tally) Apply(event evt.Event) error {
+	tallied, ok := event.(*tallied)
+	if !ok {
+		return evt.NewBadEventError(event)
+	}
+
+	if t.Counts == nil {
+		t.Counts = map[string]int{}
+	}
+
+	t.Total += tallied.N
+	t.Counts["tallied"]++
+
+	return nil
+}
+
+func (t *tally) DeserializeEvent(serialized evt.SerializedEvent) (evt.Event, error) {
+	var event tallied
+	if err := json.Unmarshal(serialized.Payload, &event); err != nil {
+		return nil, err
+	}
+
+	return &event, nil
+}
+
+// tally adds N. Attempts is set by the handler on every run, so it is part of the command's JSON
+// but not of what the caller asked for.
+type tallyAdd struct {
+	N        int `json:"n"`
+	Attempts int `json:"attempts"`
+}
+
+func (*tallyAdd) Type() evt.CommandType      { return "retry-tally:add" }
+func (*tallyAdd) EntityType() evt.EntityType { return tallyType }
+
+func (t *tally) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
+	add, ok := command.(*tallyAdd)
+	if !ok {
+		return evt.CommandResult{}, evt.NewBadCommandError(command)
+	}
+
+	add.Attempts++
+
+	return evt.CommandResult{Events: []evt.Event{&tallied{N: add.N}}}, nil
+}
+
+func TestRetry_ARetriedCommandNeverAppliesItsEventsTwice(t *testing.T) {
+	ctx := context.Background()
+	store, repo := retryStore(t, conflicts(2), snapshots.ImmediateRetryPolicy(3))
+	entity := newTally("t-1")
+
+	outcome, err := store.ExecuteWithOutcome(ctx, entity, "t-1", &tallyAdd{N: 5}, commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, outcome.Accepted())
+	require.EqualValues(t, 3, repo.commits.Load())
+
+	// Two failed attempts applied the event to the entity before their commits failed.
+	require.Equal(t, 5, entity.Total, "the failed attempts' events were reset, not accumulated")
+	require.Equal(t, map[string]int{"tallied": 1}, entity.Counts, "and so was the exported map")
+
+	events, err := repo.GetEvents(ctx, "t-1")
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+
+	// When the attempts run out the caller's entity is what storage holds: nothing.
+	repo.failures, repo.commits = conflicts(10), atomic.Int32{}
+	entity = newTally("t-2")
+
+	outcome, err = store.ExecuteWithOutcome(ctx, entity, "t-2", &tallyAdd{N: 5}, commandMetadata("cmd-2"))
+	require.NoError(t, err)
+	require.True(t, outcome.Rejected())
+	require.Zero(t, entity.Total)
+	require.Empty(t, entity.Counts)
+}
+
+func TestRetry_TheDigestIsTakenOnceBeforeTheFirstAttempt(t *testing.T) {
+	ctx := context.Background()
+	store, repo := retryStore(t, conflicts(2), snapshots.ImmediateRetryPolicy(3))
+
+	// Every run of the handler changes the command's JSON (Attempts), but not what was asked for.
+	command := &tallyAdd{N: 5}
+
+	input, err := evt.CommandIdentity{Type: command.Type(), Targets: []evt.EntityID{"t-1"}, Payload: &tallyAdd{N: 5}}.DigestInput(commandMetadata("cmd-1"))
+	require.NoError(t, err)
+
+	want, err := evt.DefaultDigest(input)
+	require.NoError(t, err)
+
+	outcome, err := store.ExecuteWithOutcome(ctx, newTally("t-1"), "t-1", command, commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.EqualValues(t, 3, repo.commits.Load())
+	require.Equal(t, 3, command.Attempts, "the handler ran three times")
+	require.Equal(t, want, outcome.Digest, "the digest is the request's, not the command as the last attempt left it")
+
+	// The same request replays: it does not look like another command under the same ID.
+	replayed, err := store.ExecuteWithOutcome(ctx, newTally("t-1"), "t-1", &tallyAdd{N: 5}, commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, replayed.Replayed)
+}
+
+// flakyReadRepository fails the first reads of a stream with a scripted error.
+type flakyReadRepository struct {
+	evt.OutcomeRepository
+
+	failures []error
+	reads    atomic.Int32
+}
+
+func (r *flakyReadRepository) GetEvents(ctx context.Context, id evt.EntityID) ([]evt.SerializedEvent, error) {
+	if read := int(r.reads.Add(1)) - 1; read < len(r.failures) {
+		return nil, r.failures[read]
+	}
+
+	return r.OutcomeRepository.GetEvents(ctx, id)
+}
+
+func TestRetry_ATransientReadInsidePrepareIsRetriedButNeverRecorded(t *testing.T) {
+	ctx := context.Background()
+	identity := evt.CommandIdentity{Type: "test:create", Targets: []evt.EntityID{"e-1"}}
+	throttled := &policy.ClassifiedError{Class: policy.ClassTransient, Err: errors.New("throttled")}
+
+	// The function wraps the load error, as real code does.
+	prepare := func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+		entity := etest.NewEntity("e-1")
+		if err := tx.Read(ctx, entity, "e-1"); err != nil {
+			return nil, fmt.Errorf("read the entity: %w", err)
+		}
+
+		return nil, tx.Append("e-1", &etest.EntityCreated{ID: "e-1", Value: "v"})
+	}
+
+	repo := &flakyReadRepository{OutcomeRepository: memOutcomes(t), failures: []error{throttled}}
+	store := snapshots.NewStore(repo, 0).WithOutcomes().WithRetry(snapshots.ImmediateRetryPolicy(3))
+
+	outcome, err := store.ExecuteTransaction(ctx, identity, commandMetadata("cmd-1"), prepare)
+	require.NoError(t, err, "a transient read inside prepare is retried")
+	require.True(t, outcome.Accepted())
+	require.EqualValues(t, 2, repo.reads.Load())
+
+	// A read that keeps failing is returned when the attempts run out, with nothing recorded.
+	repo = &flakyReadRepository{OutcomeRepository: memOutcomes(t), failures: []error{throttled, throttled, throttled, throttled}}
+	store = snapshots.NewStore(repo, 0).WithOutcomes().WithRetry(snapshots.ImmediateRetryPolicy(3))
+
+	_, err = store.ExecuteTransaction(ctx, identity, commandMetadata("cmd-2"), prepare)
+	require.ErrorIs(t, err, throttled)
+	require.EqualValues(t, 3, repo.reads.Load())
+
+	stored, err := repo.GetOutcome(ctx, "cmd-2")
+	require.NoError(t, err)
+	require.Nil(t, stored, "a failed read says nothing about the decision going stale")
+
+	// A transient error the function makes up itself, not from a Read, is its own failure.
+	repo = &flakyReadRepository{OutcomeRepository: memOutcomes(t)}
+	store = snapshots.NewStore(repo, 0).WithOutcomes().WithRetry(snapshots.ImmediateRetryPolicy(3))
+
+	var runs int
+
+	_, err = store.ExecuteTransaction(ctx, identity, commandMetadata("cmd-3"),
+		func(context.Context, *snapshots.Transaction) ([]byte, error) {
+			runs++
+
+			return nil, throttled
+		})
+	require.ErrorIs(t, err, throttled)
+	require.Equal(t, 1, runs, "only a failed Read the function passes on is a load failure")
+}
+
+func TestRetry_AnAmbiguousWriteOnTheLastAttemptIsAnErrorNotARejection(t *testing.T) {
+	ctx := context.Background()
+	ambiguous := &evt.AmbiguousWriteError{CommandID: "cmd-1", Cause: errors.New("connection reset")}
+	repo := &scriptedRepository{OutcomeRepository: memOutcomes(t), failures: []error{ambiguous, ambiguous}}
+	store := snapshots.NewStore(repo, 0).
+		WithOutcomes(snapshots.WithRecoveryWait(10 * time.Millisecond)).
+		WithRetry(snapshots.ImmediateRetryPolicy(2))
+
+	_, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	require.ErrorIs(t, err, evt.ErrAmbiguousWrite)
+	require.True(t, policy.IsTransient(err))
+	require.EqualValues(t, 2, repo.commits.Load(), "both attempts ran")
+
+	stored, err := repo.GetOutcome(ctx, "cmd-1")
+	require.NoError(t, err)
+	require.Nil(t, stored, "an absent row proves nothing, so no rejection is recorded")
+}
+
+// corruptingRepository serves a malformed outcome row after cleanReads reads, and fails every
+// commit that writes events as an ambiguous write.
+type corruptingRepository struct {
+	evt.OutcomeRepository
+
+	cleanReads int
+	reads      atomic.Int32
+	commits    atomic.Int32
+}
+
+func (r *corruptingRepository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.Outcome, error) {
+	if int(r.reads.Add(1)) > r.cleanReads {
+		return nil, &evt.CorruptOutcomeError{CommandID: id, Reason: "the digest is missing"}
+	}
+
+	return r.OutcomeRepository.GetOutcome(ctx, id)
+}
+
+func (r *corruptingRepository) Commit(ctx context.Context, result evt.SerializedResult) error {
+	if len(result.Events) > 0 {
+		r.commits.Add(1)
+
+		return &evt.AmbiguousWriteError{CommandID: result.Outcome.CommandID, Cause: errors.New("lost")}
+	}
+
+	return r.OutcomeRepository.Commit(ctx, result)
+}
+
+func TestRetry_ACorruptOutcomeIsNeverRePreparedOrRecorded(t *testing.T) {
+	ctx := context.Background()
+
+	// Found by the pre-check.
+	repo := &corruptingRepository{OutcomeRepository: memOutcomes(t)}
+	store := snapshots.NewStore(repo, 0).WithOutcomes().WithRetry(snapshots.ImmediateRetryPolicy(5))
+
+	_, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	require.ErrorIs(t, err, evt.ErrCorruptOutcome)
+	require.EqualValues(t, 1, repo.reads.Load(), "not read again")
+	require.Zero(t, repo.commits.Load(), "and nothing ran")
+
+	// Found by ambiguous-write recovery after the first attempt's commit.
+	repo = &corruptingRepository{OutcomeRepository: memOutcomes(t), cleanReads: 1}
+	store = snapshots.NewStore(repo, 0).
+		WithOutcomes(snapshots.WithRecoveryWait(10 * time.Millisecond)).
+		WithRetry(snapshots.ImmediateRetryPolicy(5))
+
+	_, err = store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-2"))
+	require.ErrorIs(t, err, evt.ErrCorruptOutcome)
+	require.EqualValues(t, 1, repo.commits.Load(), "the command was not prepared again")
+
+	stored, err := repo.OutcomeRepository.GetOutcome(ctx, "cmd-2")
+	require.NoError(t, err)
+	require.Nil(t, stored, "and no rejection was recorded over the corrupt row")
+}
+
+func TestRetry_AReservedStreamIsStillRefusedWithoutAnIdentityCheck(t *testing.T) {
+	ctx := context.Background()
+	store, repo := retryStore(t, nil, snapshots.ImmediateRetryPolicy(3))
+	identity := evt.CommandIdentity{Type: "test:create", Targets: []evt.EntityID{"e-1"}}
+
+	for _, reserved := range []evt.EntityID{"SYSTEM#e-1", "command-outcome#e-1"} {
+		// The reserved stream is not named by the identity, which no longer limits the write set,
+		// but the commit still refuses it, before any write.
+		_, err := store.ExecuteTransaction(ctx, identity, commandMetadata("cmd-"+string(reserved)),
+			func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+				if err := tx.Read(ctx, etest.NewEntity(reserved), reserved); err != nil {
+					return nil, err
+				}
+
+				return nil, tx.Append(reserved, &etest.EntityCreated{ID: reserved, Value: "v"})
+			})
+		require.True(t, evt.IsReservedEntityIdErr(err), "%s: %v", reserved, err)
+
+		events, err := repo.GetEvents(ctx, "e-1")
+		require.NoError(t, err)
+		require.Empty(t, events)
+	}
 }

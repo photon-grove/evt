@@ -129,8 +129,8 @@ type executed struct {
 	discarded bool
 }
 
-// attemptState remembers the command of the latest attempt, which records the stale-fence
-// rejection when the policy runs out of attempts.
+// attemptState holds the command that records the stale-fence rejection when the policy runs out of
+// attempts.
 type attemptState struct{ cmd *command }
 
 // retriesExhausted records the stale-fence rejection of a command whose last attempt conflicted.
@@ -169,8 +169,13 @@ func (state *attemptState) retriesExhausted(ctx context.Context, attempts int) (
 // row, never by re-preparing the command; see evt.AmbiguousWriteError for the one case, a row
 // that never appeared, that is retried the same way.
 //
-// An entity that is not a pointer to a struct cannot be reset between attempts, so its command is
-// attempted once and a conflict is returned as an error.
+// The entity is reset between attempts: its exported fields (the state a snapshot persists) are
+// restored from a deep copy, so events the failed attempt applied are not counted again. Its
+// unexported fields are restored shallowly, so an unexported map, slice, or pointer is shared with
+// the failed attempt and keeps what it accumulated: keep state that Apply changes in exported
+// fields. The command value is reused by every attempt, so a handler must not mutate it. An entity
+// that is not a pointer to a struct cannot be reset, so its command is attempted once and a
+// conflict is returned as an error.
 func (store *Store) ExecuteWithOutcome(
 	ctx context.Context,
 	entity evt.Entity,
@@ -345,8 +350,13 @@ func (store *Store) executeOutcome(
 ) (executed, error) {
 	identity := evt.CommandIdentity{Type: command.Type(), Targets: []evt.EntityID{entityID}, Payload: command}
 
-	var state attemptState
+	// The identity and its digest are fixed once, before the first attempt.
+	cmd, err := store.newCommand(identity, metadata)
+	if err != nil {
+		return executed{}, err
+	}
 
+	state := attemptState{cmd: cmd}
 	loop := attemptLoop{retry: store.retry, once: !resettable}
 
 	return loop.run(ctx, func(attempt int) (executed, error) {
@@ -354,7 +364,7 @@ func (store *Store) executeOutcome(
 			reset()
 		}
 
-		return store.attemptOutcome(ctx, &state, entity, entityID, command, metadata, identity)
+		return store.attemptOutcome(ctx, cmd, entity, entityID, command)
 	}, state.retriesExhausted)
 }
 
@@ -362,14 +372,12 @@ func (store *Store) executeOutcome(
 // handler, and the commit. It prepares everything from the entity as the caller supplied it.
 func (store *Store) attemptOutcome(
 	ctx context.Context,
-	state *attemptState,
+	cmd *command,
 	entity evt.Entity,
 	entityID evt.EntityID,
 	command evt.Command,
-	metadata evt.Metadata,
-	identity evt.CommandIdentity,
 ) (executed, error) {
-	cmd, replayed, err := store.beginCommand(ctx, identity, metadata)
+	replayed, err := cmd.preCheck(ctx)
 	if err != nil {
 		return executed{}, err
 	}
@@ -377,8 +385,6 @@ func (store *Store) attemptOutcome(
 	if replayed != nil {
 		return executed{outcome: replayed}, nil
 	}
-
-	state.cmd = cmd
 
 	eventContext, err := store.LoadEntity(ctx, entity, entityID)
 	if err != nil {
@@ -512,65 +518,85 @@ type command struct {
 	metadata evt.Metadata
 }
 
-// beginCommand validates the command ID, computes the identity digest, and reads the outcome row
-// first: a stored outcome with the same digest is returned (Replayed), one with a different digest
-// is *evt.IdempotencyKeyReuseError, and an absent row returns the command to run.
-func (store *Store) beginCommand(
-	ctx context.Context,
-	identity evt.CommandIdentity,
-	metadata evt.Metadata,
-) (*command, *evt.CommandOutcome, error) {
+// newCommand validates the command ID and computes the identity digest, once. The digest is a
+// snapshot of the request's intent taken before anything is read or run: fence-aware retry
+// prepares the command several times, and every attempt, a client retry, and a recovery read must
+// compare equal, so nothing is recomputed from the live command or its metadata afterwards.
+func (store *Store) newCommand(identity evt.CommandIdentity, metadata evt.Metadata) (*command, error) {
 	repo, err := store.outcomeRepository()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if metadata.CommandID == nil {
-		return nil, nil, evt.CheckCommandID("")
+		return nil, evt.CheckCommandID("")
 	}
 
 	if err = evt.CheckCommandID(*metadata.CommandID); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	input, err := identity.DigestInput(metadata)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	digest, err := store.outcomes.digester(input)
 	if err != nil {
-		return nil, nil, fmt.Errorf("compute command digest: %w", err)
+		return nil, fmt.Errorf("compute command digest: %w", err)
 	}
 
 	// A bad digest is a programmer error found before anything is read or run.
 	if err = evt.CheckDigest(digest); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// The command's metadata is snapshotted here: the ID and digest are frozen, so a caller that
 	// changes its metadata (or anything it points to) before Complete or Reject must not change what
 	// they write.
-	cmd := &command{
+	return &command{
 		store:    store,
 		repo:     repo,
 		id:       *metadata.CommandID,
 		digest:   digest,
 		metadata: metadata.Clone(),
+	}, nil
+}
+
+// preCheck reads the command's outcome row first, strongly consistent: a stored outcome with the
+// same digest is returned (Replayed), one with a different digest is
+// *evt.IdempotencyKeyReuseError, and an absent row returns nil, nil: the command runs.
+func (c *command) preCheck(ctx context.Context) (*evt.CommandOutcome, error) {
+	stored, err := c.repo.GetOutcome(ctx, c.id)
+	if err != nil {
+		return nil, err
 	}
 
-	stored, err := repo.GetOutcome(ctx, cmd.id)
+	if stored == nil {
+		return nil, nil
+	}
+
+	return c.resolve(*stored)
+}
+
+// beginCommand is newCommand followed by preCheck: the command to run, or the stored outcome it
+// resolves to.
+func (store *Store) beginCommand(
+	ctx context.Context,
+	identity evt.CommandIdentity,
+	metadata evt.Metadata,
+) (*command, *evt.CommandOutcome, error) {
+	cmd, err := store.newCommand(identity, metadata)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if stored == nil {
-		return cmd, nil, nil
+	replayed, err := cmd.preCheck(ctx)
+	if err != nil || replayed != nil {
+		return nil, replayed, err
 	}
 
-	replayed, err := cmd.resolve(*stored)
-
-	return nil, replayed, err
+	return cmd, nil, nil
 }
 
 // resolve answers a command whose row exists: the stored outcome when the digests match, an
