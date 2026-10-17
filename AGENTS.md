@@ -163,6 +163,11 @@
   them like any reviewer's — reply, then resolve before merge. The reviewer is configured outside the
   repo (provider settings), so keep guidance here agent-agnostic. What it flags is tuned by the
   `## Review guidelines` section below.
+- Review-agent budget (its quota is limited): run a local adversarial review and fix its findings
+  before marking a PR ready. Max two agent rounds per PR: the automatic pass on ready, plus one
+  re-request only if that pass raised P0/P1. Verify later fixes with a local review, reply to and
+  resolve the threads, and file leftover below-P1 findings (nits, edge cases) as follow-up issues.
+  Prefer smaller PRs for core changes over repeated review rounds on one.
 
 ## Review guidelines
 
