@@ -25,7 +25,7 @@ func TestDefaultDigestReproducesTheSpecExamples(t *testing.T) {
 		{
 			name: "single stream",
 			input: evt.DigestInput{
-				CommandType: "account:open", Streams: []evt.EntityID{"acct-1"},
+				CommandType: "account:open", Targets: []evt.EntityID{"acct-1"},
 				Payload: []byte(`{"owner":"Ada"}`), Principal: "user:42",
 			},
 			want: "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6",
@@ -33,7 +33,7 @@ func TestDefaultDigestReproducesTheSpecExamples(t *testing.T) {
 		{
 			name: "multi stream, declaration order does not matter",
 			input: evt.DigestInput{
-				CommandType: "claim-username", Streams: []evt.EntityID{"profile#u-1", "claim#ada"},
+				CommandType: "claim-username", Targets: []evt.EntityID{"profile#u-1", "claim#ada"},
 				Payload: []byte(`{"handle":"ada"}`),
 			},
 			want: "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
@@ -41,20 +41,20 @@ func TestDefaultDigestReproducesTheSpecExamples(t *testing.T) {
 		{
 			name: "multi stream with a principal",
 			input: evt.DigestInput{
-				CommandType: "claim-username", Streams: []evt.EntityID{"claim#ada", "profile#u-1"},
+				CommandType: "claim-username", Targets: []evt.EntityID{"claim#ada", "profile#u-1"},
 				Payload: []byte(`{"handle":"ada"}`), Principal: "user:42",
 			},
 			want: "56d01f5b9788b60e12a686e40807c28d9dfde802d82faf46888adda0acee7050",
 		},
 		{
 			name:  "absent payload",
-			input: evt.DigestInput{CommandType: "account:ping", Streams: []evt.EntityID{"acct-1"}, Principal: "user:42"},
+			input: evt.DigestInput{CommandType: "account:ping", Targets: []evt.EntityID{"acct-1"}, Principal: "user:42"},
 			want:  "d24c7d5ce955a76c936a83e6eca2c3bc277d936c88a76460ed2d221e285a215a",
 		},
 		{
 			name: "stale fence",
 			input: evt.DigestInput{
-				CommandType: "account:rename", Streams: []evt.EntityID{"acct-1"},
+				CommandType: "account:rename", Targets: []evt.EntityID{"acct-1"},
 				Payload: []byte(`{"name":"Grace"}`), Principal: "user:42",
 			},
 			want: "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b",
@@ -76,7 +76,7 @@ func TestCanonicalDigestBytesMatchTheSpecLayout(t *testing.T) {
 	t.Parallel()
 
 	bytes := evt.CanonicalDigestBytes(evt.DigestInput{
-		CommandType: "account:open", Streams: []evt.EntityID{"acct-1"},
+		CommandType: "account:open", Targets: []evt.EntityID{"acct-1"},
 		Payload: []byte(`{"owner":"Ada"}`), Principal: "user:42",
 	})
 
@@ -87,8 +87,8 @@ func TestCanonicalDigestBytesMatchTheSpecLayout(t *testing.T) {
 func TestDigestDeduplicatesAndSortsStreams(t *testing.T) {
 	t.Parallel()
 
-	a := evt.CanonicalDigestBytes(evt.DigestInput{CommandType: "t", Streams: []evt.EntityID{"b", "a", "b"}})
-	b := evt.CanonicalDigestBytes(evt.DigestInput{CommandType: "t", Streams: []evt.EntityID{"a", "b"}})
+	a := evt.CanonicalDigestBytes(evt.DigestInput{CommandType: "t", Targets: []evt.EntityID{"b", "a", "b"}})
+	b := evt.CanonicalDigestBytes(evt.DigestInput{CommandType: "t", Targets: []evt.EntityID{"a", "b"}})
 
 	assert.Equal(t, b, a)
 }
@@ -99,7 +99,7 @@ func TestCommandIdentityEncodesThePayloadCanonically(t *testing.T) {
 	principal := evt.PrincipalID("user:42")
 	input, err := evt.CommandIdentity{
 		Type:    "account:open",
-		Streams: []evt.EntityID{"acct-1"},
+		Targets: []evt.EntityID{"acct-1"},
 		Payload: map[string]string{"owner": "Ada"},
 	}.DigestInput(evt.Metadata{PrincipalID: &principal})
 	require.NoError(t, err)
@@ -108,7 +108,7 @@ func TestCommandIdentityEncodesThePayloadCanonically(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6", got)
 
-	none, err := evt.CommandIdentity{Type: "account:ping", Streams: []evt.EntityID{"acct-1"}}.DigestInput(evt.Metadata{PrincipalID: &principal})
+	none, err := evt.CommandIdentity{Type: "account:ping", Targets: []evt.EntityID{"acct-1"}}.DigestInput(evt.Metadata{PrincipalID: &principal})
 	require.NoError(t, err)
 	assert.Nil(t, none.Payload, "a nil payload digests as the zero-length byte string")
 }
@@ -438,4 +438,53 @@ func TestCheckOutcomeInspectsTheEncodingOfTypedRejectionDetails(t *testing.T) {
 		CommandID: "cmd", Status: evt.OutcomeRejected, Digest: "d",
 		Rejection: &evt.Rejection{Code: "c", Message: "m", Details: map[string]any{"s": payload{Name: "fine"}}},
 	}))
+}
+
+func TestStaleFenceRejectionsHaveAPinnedShape(t *testing.T) {
+	caller, err := evt.EncodeRejection(evt.CallerFenceStaleRejection())
+	require.NoError(t, err)
+	require.Equal(t, `{"code":"stale-fence","message":"a caller-stamped fence went stale","details":null}`, string(caller))
+
+	exhausted, err := evt.EncodeRejection(evt.RetriesExhaustedRejection(5))
+	require.NoError(t, err)
+	require.Equal(t,
+		`{"code":"stale-fence","message":"the state this command was decided on kept changing; retries were exhausted","details":{"attempts":5}}`,
+		string(exhausted))
+
+	// Both survive a round trip through storage as the same rejection.
+	canonical, err := evt.CanonicalRejection(evt.RetriesExhaustedRejection(5))
+	require.NoError(t, err)
+
+	again, err := evt.EncodeRejection(canonical)
+	require.NoError(t, err)
+	require.Equal(t, string(exhausted), string(again))
+}
+
+func TestTheIdentityDigestIgnoresWhatACommandWrites(t *testing.T) {
+	// A rename names the profile it is aimed at. The streams it releases and claims come from the
+	// state it reads, so they are not identity, and nothing the caller passes as one can change the
+	// digest: only the targets, type, payload, and principal do.
+	principal := evt.PrincipalID("user:42")
+	metadata := evt.Metadata{PrincipalID: &principal}
+	identity := evt.CommandIdentity{
+		Type: "profile:rename", Targets: []evt.EntityID{"profile#u-1"}, Payload: map[string]string{"handle": "grace"},
+	}
+
+	input, err := identity.DigestInput(metadata)
+	require.NoError(t, err)
+
+	digest, err := evt.DefaultDigest(input)
+	require.NoError(t, err)
+	require.Equal(t, "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0", digest,
+		"the digest the Rust implementation reproduces (compat/fixtures/outcomes.json)")
+
+	other := identity
+	other.Targets = []evt.EntityID{"profile#u-2"}
+
+	input, err = other.DigestInput(metadata)
+	require.NoError(t, err)
+
+	changed, err := evt.DefaultDigest(input)
+	require.NoError(t, err)
+	require.NotEqual(t, digest, changed, "a request aimed at another stream is another command")
 }

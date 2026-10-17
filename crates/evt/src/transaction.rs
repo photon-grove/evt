@@ -38,8 +38,6 @@ static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
 struct PendingCommand {
     command_id: CommandId,
     digest: String,
-    /// The streams the command's identity declares it will write. The digest covers exactly these.
-    declared: HashSet<EntityId>,
     metadata: Metadata,
 }
 
@@ -234,7 +232,9 @@ impl<'a, R: Repository> Transaction<'a, R> {
     ///   [`commit_with_outcome`](Transaction::commit_with_outcome) or
     ///   [`reject`](Transaction::reject).
     ///
-    /// The identity declares the streams the command will write; `metadata` supplies the command
+    /// The identity is the caller's intent, fixed before any state is read: it names the streams
+    /// the request addresses, not the streams the transaction goes on to read and write, which may
+    /// depend on state and differ between attempts. `metadata` supplies the command
     /// ID, the principal, and the commit's stamped metadata. A missing command ID is
     /// [`Error::InvalidArgument`] and one over 512 bytes [`Error::CommandIdTooLong`], both before
     /// any read.
@@ -259,7 +259,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             });
         }
 
-        crate::outcome::check_declared_streams(identity.declared_streams())?;
+        crate::outcome::check_targets(identity.targets())?;
         let command_id = require_command_id(metadata)?;
         let digest = config.digest(&identity.digest_input(metadata))?;
 
@@ -272,7 +272,6 @@ impl<'a, R: Repository> Transaction<'a, R> {
         self.command = Some(PendingCommand {
             command_id,
             digest,
-            declared: identity.declared_streams().iter().cloned().collect(),
             metadata: metadata.clone(),
         });
 
@@ -435,19 +434,6 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
         if events.is_empty() {
             return Ok(());
-        }
-
-        // A command records the identity digest of the streams it declared. Writing any other
-        // stream would commit an effect that digest omits, so a later call with the declared
-        // identity would replay an outcome for it. Nothing has changed yet, so the transaction
-        // stays usable.
-        if let Some(command) = &self.command
-            && !command.declared.contains(&read.loaded.entity_id)
-        {
-            return Err(Error::InvalidCommit(format!(
-                "stream {} is written but was not declared by the command's identity",
-                read.loaded.entity_id
-            )));
         }
 
         // Serialization changes nothing, so its failure leaves the transaction usable.
@@ -740,30 +726,23 @@ impl<'a, R: Repository> Transaction<'a, R> {
     /// transaction that carries none of the failed commit's other items: no fences (they are
     /// stale by definition), no events, no snapshots, no projector operations.
     async fn persist_stale_fence(&self, pending: &PendingCommand) -> Result<CommandOutcome, Error> {
-        let outcome = Outcome::rejected(
-            pending.command_id.clone(),
-            pending.digest.clone(),
-            Rejection::stale_fence(),
-        );
-        let commit = TransactionCommit::new(Vec::new()).with_outcome(outcome);
-        let stored = commit
-            .stored_outcome()
-            .expect("the commit carries the outcome");
-
-        let result = self.repository.commit_transaction(commit).await;
-
-        match settle(
+        persist_rejection(
             self.repository,
             &pending.command_id,
             &pending.digest,
             self.recovery_wait(),
-            result,
+            Rejection::stale_fence(),
         )
-        .await?
-        {
-            Settled::Committed => Ok(CommandOutcome::fresh(stored, Vec::new(), Vec::new())),
-            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
-        }
+        .await
+    }
+
+    /// The command ID and identity digest [`begin_command`](Transaction::begin_command) fixed,
+    /// while the command is pending. Fence-aware retry records the stale-fence rejection of a
+    /// command whose attempts ran out under them.
+    pub(crate) fn pending_command(&self) -> Option<(CommandId, String)> {
+        self.command
+            .as_ref()
+            .map(|pending| (pending.command_id.clone(), pending.digest.clone()))
     }
 
     /// Stamps the commit ID once and builds the repository commit: every unwritten read becomes
@@ -850,6 +829,31 @@ impl<'a, R: Repository> Transaction<'a, R> {
         commit.operations = operations;
 
         Ok((commit, committed))
+    }
+}
+
+/// Records a command as rejected with an outcome-only transaction: the feature-marker and
+/// rebuild-lock checks and the outcome put, with no fences, events, snapshots, or projector
+/// operations (the storage spec's Fence-Aware Retry). A lost outcome put and an indeterminate
+/// result resolve through the outcome row, like any outcome-carrying commit.
+pub(crate) async fn persist_rejection<R: Repository, E>(
+    repository: &R,
+    command_id: &CommandId,
+    digest: &str,
+    recovery_wait: Duration,
+    rejection: Rejection,
+) -> Result<CommandOutcome<E>, Error> {
+    let outcome = Outcome::rejected(command_id.clone(), digest, rejection.canonical()?);
+    let commit = TransactionCommit::new(Vec::new()).with_outcome(outcome);
+    let stored = commit
+        .stored_outcome()
+        .expect("the commit carries the outcome");
+
+    let result = repository.commit_transaction(commit).await;
+
+    match settle(repository, command_id, digest, recovery_wait, result).await? {
+        Settled::Committed => Ok(CommandOutcome::fresh(stored, Vec::new(), Vec::new())),
+        Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
     }
 }
 
@@ -1634,15 +1638,15 @@ mod tests {
     }
 
     fn identity(stream: &str) -> CommandIdentity {
-        CommandIdentity::new("ledger:test").with_streams([stream])
+        CommandIdentity::new("ledger:test").with_targets([stream])
     }
 
     fn two_streams() -> CommandIdentity {
-        CommandIdentity::new("ledger:test").with_streams(["a", "b"])
+        CommandIdentity::new("ledger:test").with_targets(["a", "b"])
     }
 
     #[tokio::test]
-    async fn a_command_may_only_write_the_streams_it_declared() {
+    async fn a_command_may_write_streams_its_identity_does_not_name() {
         let store = outcome_store();
 
         let mut tx = store.transaction();
@@ -1652,16 +1656,15 @@ mod tests {
         let mut a = tx.read::<Ledger>("a").await.unwrap();
         let mut b = tx.read::<Ledger>("b").await.unwrap();
 
-        // A stream outside the declared identity is refused, without changing the transaction.
-        let refused = tx.append(&mut b, added(1)).err();
-        assert!(
-            matches!(refused, Some(Error::InvalidCommit(_))),
-            "{refused:?}"
-        );
-
+        // The identity is the request's intent: the write set is derived from state per attempt,
+        // so a stream the request did not name needs no declaration.
         tx.append(&mut a, added(2)).unwrap();
+        tx.append(&mut b, added(1)).unwrap();
         let done = tx.commit_with_outcome(None).await.unwrap();
-        assert_eq!(done.outcome.event_ids, vec![crate::EventId::new("a:1")]);
+        assert_eq!(
+            done.outcome.event_ids,
+            vec![crate::EventId::new("a:1"), crate::EventId::new("b:1")]
+        );
     }
 
     #[tokio::test]
@@ -1973,7 +1976,7 @@ mod tests {
         let begun = tx
             .begin_command(
                 &CommandIdentity::new("ledger:add")
-                    .with_streams(["a"])
+                    .with_targets(["a"])
                     .with_payload(&1_i64)
                     .unwrap(),
                 &command("done"),

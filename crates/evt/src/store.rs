@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,11 +15,12 @@ use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
 use crate::outcome::{
-    CommandOutcome, DigestInput, Outcome, OutcomeCommand, OutcomeConfig, Settled, ToRejection,
-    pre_check, principal, require_command_id, settle,
+    CommandIdentity, CommandOutcome, DigestInput, Outcome, OutcomeCommand, OutcomeConfig,
+    Rejection, Settled, ToRejection, pre_check, principal, require_command_id, settle,
 };
 use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
-use crate::retry::RetryPolicy;
+use crate::retry::{Failed, Retry, RetryPolicy};
+use crate::transaction::{Begin, Transaction, persist_rejection};
 use crate::upcast::upcast_event;
 
 /// How many times [`Store::load`] reads the stream when it finds a sequence gap.
@@ -206,6 +208,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// Like [`execute`](Store::execute), but reloads and re-handles the command after a
     /// [retryable](Error::is_retryable) error (a conflict or a transient backend failure), waiting
     /// [`RetryPolicy::delay`] between attempts with `sleep`, such as `tokio::time::sleep`.
+    ///
+    /// This is blind whole-command retry for a store without outcomes: when attempts run out the
+    /// last error is returned. On a store with [outcomes enabled](Store::with_outcomes) use
+    /// [`execute_with_outcome`](Store::execute_with_outcome) or
+    /// [`execute_transaction`](Store::execute_transaction), which retry under the store's own
+    /// policy (fence-aware retry, C5) and record a stale-fence rejection when attempts run out.
     pub async fn execute_with_retry<S, F>(
         &self,
         entity_id: impl Into<EntityId>,
@@ -350,7 +358,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     }
 
     /// Loads the aggregate, handles the command, and records the result as a durable outcome on a
-    /// store with [outcomes enabled](Store::with_outcomes) (C3, C4).
+    /// store with [outcomes enabled](Store::with_outcomes) (C3, C4), under fence-aware retry (C5).
     ///
     /// Every attempt starts by reading the command's outcome row, strongly consistent:
     ///
@@ -362,6 +370,18 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     ///   mapped with [`ToRejection`] and, when that yields a rejection, persisted as a rejected
     ///   outcome (a `None` is an internal failure: [`Error::Handler`], nothing recorded), which a retry of the
     ///   command replays verbatim. A handler that returns no events is an accepted no-op.
+    ///
+    /// When the commit conflicts with another writer the command is re-prepared: the aggregate is
+    /// loaded again and the handler runs again against the fresh state, after a backoff on the
+    /// repository's timer ([`Repository::backoff`]), up to the store's [`RetryPolicy`]
+    /// ([`OutcomeConfig::with_retry`]). A single-aggregate command fences nothing, so every
+    /// conflict can be re-prepared. When the last attempt also conflicts, the engine records a
+    /// stale-fence rejection ([`Rejection::retries_exhausted`](crate::Rejection::retries_exhausted))
+    /// as the command's outcome and returns it, so a replay of the command ID gets the same
+    /// answer; the remedy is a new command ID. The handler may therefore run several times for one
+    /// command, but at most one attempt commits. A transient backend failure is retried the same
+    /// way and returned as an error when attempts run out. The command is cloned for every
+    /// attempt, which is why it must be [`Clone`].
     ///
     /// Returns a [`CommandOutcome`], not an aggregate, so a replayed outcome has no loaded aggregate
     /// to keep in sync; call [`load`](Store::load) for the current state.
@@ -386,7 +406,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         metadata: Metadata,
     ) -> Result<CommandOutcome<A::Event>, Error>
     where
-        A::Command: OutcomeCommand,
+        A::Command: OutcomeCommand + Clone,
         A::Error: ToRejection,
     {
         self.execute_with_response(entity_id, command, metadata, |_, _| Ok(None))
@@ -397,29 +417,30 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// accepted outcome so a retried command returns the original answer. `respond` runs after the
     /// handler succeeds, with the aggregate as it is after the decided events (the current state
     /// for a no-op) and those events. The response is at most 65536 bytes
-    /// ([`Error::OutcomeTooLarge`]); `None` or empty stores none.
+    /// ([`Error::OutcomeTooLarge`]); `None` or empty stores none. When the command is re-prepared
+    /// after a conflict, `respond` runs again with the fresh state.
     pub async fn execute_with_response<F>(
         &self,
         entity_id: impl Into<EntityId>,
         command: A::Command,
         metadata: Metadata,
-        respond: F,
+        mut respond: F,
     ) -> Result<CommandOutcome<A::Event>, Error>
     where
-        A::Command: OutcomeCommand,
+        A::Command: OutcomeCommand + Clone,
         A::Error: ToRejection,
-        F: FnOnce(&A, &[A::Event]) -> Result<Option<Vec<u8>>, BoxError>,
+        F: FnMut(&A, &[A::Event]) -> Result<Option<Vec<u8>>, BoxError>,
     {
         let config = self.outcomes.as_ref().ok_or_else(|| {
             Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
         })?;
 
         let entity_id = entity_id.into();
-        crate::outcome::check_declared_streams([&entity_id])?;
+        crate::outcome::check_targets([&entity_id])?;
         let command_id = require_command_id(&metadata)?;
         let digest = config.digest(&DigestInput {
             command_type: command.command_type(),
-            streams: vec![entity_id.clone()],
+            targets: vec![entity_id.clone()],
             payload: command
                 .canonical_payload()
                 .map_err(|err| Error::InvalidArgument(format!("the command payload: {err}")))?
@@ -427,66 +448,150 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             principal: principal(&metadata),
         })?;
 
-        if let Some(stored) = pre_check(&self.repository, &command_id, &digest).await? {
+        let policy = config.retry();
+        let attempts = policy.max_attempts.max(1);
+        let mut attempt = 1;
+
+        loop {
+            // Boxed: an attempt's future holds the load, the handler, and the commit, and keeping
+            // it on the heap keeps this loop's own future small for callers that chain many
+            // commands in one task (the conformance cases do, in debug builds).
+            let result = Box::pin(self.attempt_with_response(
+                entity_id.clone(),
+                command.clone(),
+                &metadata,
+                &command_id,
+                &digest,
+                &mut respond,
+            ))
+            .await;
+
+            let failed = match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(failed) => failed,
+            };
+
+            let kind = failed.retry();
+            if kind == Retry::Never {
+                return Err(failed.error);
+            }
+
+            if attempt >= attempts {
+                if kind == Retry::Transient {
+                    return Err(failed.error);
+                }
+
+                return persist_rejection(
+                    &self.repository,
+                    &command_id,
+                    &digest,
+                    config.recovery_wait(),
+                    Rejection::retries_exhausted(attempt),
+                )
+                .await;
+            }
+
+            self.repository.backoff(policy.delay(attempt - 1)).await;
+            attempt += 1;
+        }
+    }
+
+    /// One attempt of [`execute_with_response`](Store::execute_with_response): the outcome
+    /// pre-check, the load, the handler, and the commit, all from scratch.
+    async fn attempt_with_response<F>(
+        &self,
+        entity_id: EntityId,
+        command: A::Command,
+        metadata: &Metadata,
+        command_id: &CommandId,
+        digest: &str,
+        respond: &mut F,
+    ) -> Result<CommandOutcome<A::Event>, Failed>
+    where
+        A::Error: ToRejection,
+        F: FnMut(&A, &[A::Event]) -> Result<Option<Vec<u8>>, BoxError>,
+    {
+        if let Some(stored) = pre_check(&self.repository, command_id, digest)
+            .await
+            .map_err(Failed::deciding)?
+        {
             return Ok(CommandOutcome::replay(stored));
         }
 
-        let loaded = self.load(entity_id).await?;
+        let loaded = self.load(entity_id).await.map_err(Failed::deciding)?;
 
         // Events written before outcomes existed carry command IDs but have no outcome row; the
         // window catches those duplicates (and only those: this store's own commits write rows).
-        if loaded.has_seen(&command_id) {
-            return Err(Error::DuplicateCommand(command_id));
+        if loaded.has_seen(command_id) {
+            return Err(Failed::deciding(Error::DuplicateCommand(
+                command_id.clone(),
+            )));
         }
 
         let entity_id = loaded.entity_id.clone();
+        let digest = digest.to_owned();
+        let command_id = command_id.clone();
 
         let events = match loaded.aggregate.handle(command, &self.services).await {
             Ok(events) => events,
             Err(error) => {
                 // `None` is an internal failure: returned, and nothing is recorded.
                 let Some(rejection) = error.to_rejection() else {
-                    return Err(Error::Handler(Box::new(error)));
+                    return Err(Failed::deciding(Error::Handler(Box::new(error))));
                 };
 
                 // Canonicalized through its stored encoding, so a first execution and a replay
                 // return the same rejection.
-                let rejection = rejection.canonical()?;
+                let rejection = rejection.canonical().map_err(Failed::deciding)?;
                 let outcome = Outcome::rejected(command_id, digest, rejection);
                 let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
 
-                return self.record(commit, Vec::new(), Vec::new()).await;
+                return self
+                    .record(commit, Vec::new(), Vec::new())
+                    .await
+                    .map_err(Failed::committing);
             }
         };
 
         let decided = events.clone();
 
         if events.is_empty() {
-            let response = respond(&loaded.aggregate, &[]).map_err(response_error)?;
+            let response = respond(&loaded.aggregate, &[])
+                .map_err(response_error)
+                .map_err(Failed::deciding)?;
             let outcome = with_response(Outcome::accepted(command_id, digest), response);
             let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
 
-            return self.record(commit, Vec::new(), decided).await;
+            return self
+                .record(commit, Vec::new(), decided)
+                .await
+                .map_err(Failed::committing);
         }
 
-        let (loaded, serialized, mut commit) = self.stage(loaded, events, &metadata)?;
-        let response = respond(&loaded.aggregate, &decided).map_err(response_error)?;
+        let (loaded, serialized, mut commit) = self
+            .stage(loaded, events, metadata)
+            .map_err(Failed::deciding)?;
+        let response = respond(&loaded.aggregate, &decided)
+            .map_err(response_error)
+            .map_err(Failed::deciding)?;
         commit.outcome = Some(with_response(
             Outcome::accepted(command_id, digest),
             response,
         ));
 
-        self.record(commit, serialized, decided).await
+        self.record(commit, serialized, decided)
+            .await
+            .map_err(Failed::committing)
     }
 
     /// Reads the outcome row of a command without running or writing anything, as ambiguous-write
     /// recovery does. `command` supplies the identity (its type and payload) and `entity_id` the
-    /// declared stream, exactly as [`execute_with_outcome`](Store::execute_with_outcome) digests
+    /// target stream, exactly as [`execute_with_outcome`](Store::execute_with_outcome) digests
     /// them; `metadata` supplies the command ID and principal.
     ///
-    /// Returns `None` when no row exists (a command that did not apply is safe to run again), the
-    /// stored outcome ([`CommandOutcome::replayed`]) for the same identity digest, and
-    /// [`Error::IdempotencyKeyReuse`] for another.
+    /// Returns `None` when no row exists, the stored outcome ([`CommandOutcome::replayed`]) for
+    /// the same identity digest, and [`Error::IdempotencyKeyReuse`] for another. A missing row is
+    /// not proof the command did not apply: a transaction can land after any single read.
     pub async fn resolve_outcome(
         &self,
         entity_id: impl Into<EntityId>,
@@ -501,11 +606,11 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         })?;
 
         let entity_id = entity_id.into();
-        crate::outcome::check_declared_streams([&entity_id])?;
+        crate::outcome::check_targets([&entity_id])?;
         let command_id = require_command_id(metadata)?;
         let digest = config.digest(&DigestInput {
             command_type: command.command_type(),
-            streams: vec![entity_id],
+            targets: vec![entity_id],
             payload: command
                 .canonical_payload()
                 .map_err(|err| Error::InvalidArgument(format!("the command payload: {err}")))?
@@ -543,40 +648,135 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         }
     }
 
-    /// Like [`execute_with_outcome`](Store::execute_with_outcome), but reloads and re-handles the
-    /// command after a [retryable](Error::is_retryable) error (a conflict, a transient backend
-    /// failure, or an ambiguous write that provably did not apply), waiting
-    /// [`RetryPolicy::delay`] between attempts with `sleep`. Every attempt starts by reading the
-    /// outcome row, so a retry never repeats a command that already committed.
-    pub async fn execute_with_outcome_retry<S, F>(
-        &self,
-        entity_id: impl Into<EntityId>,
-        command: A::Command,
-        metadata: Metadata,
-        policy: &RetryPolicy,
-        sleep: S,
-    ) -> Result<CommandOutcome<A::Event>, Error>
+    /// Runs a multi-stream command on a store with [outcomes enabled](Store::with_outcomes) under
+    /// fence-aware retry (C5). Each attempt starts a [`Transaction`], begins the command
+    /// ([`Transaction::begin_command`]: it validates the command ID, computes the identity digest
+    /// from `identity` and the metadata's principal, and reads the outcome row), runs `prepare`
+    /// against the transaction, and commits it with the [`Decision`] it returns. A stored outcome
+    /// with the same digest is returned without running `prepare`.
+    ///
+    /// `prepare` is the command's decision step, and does what a handler does: read the aggregates
+    /// it needs ([`Transaction::read`]), decide, append events to any of them, and add
+    /// caller-stamped fences ([`Transaction::fence`]). Return [`Decision::accept`] to commit,
+    /// [`Decision::reject`] with a domain [`Rejection`] to record a rejected outcome (fenced on
+    /// everything it read, so it is only recorded on state that still holds), or an `Err` for an
+    /// internal failure, which is returned with no outcome written. Appending nothing and
+    /// accepting is an accepted no-op.
+    ///
+    /// When the commit conflicts with another writer, the command is re-prepared: `prepare` runs
+    /// again, from scratch, against freshly loaded state, after a backoff on the repository's
+    /// timer, up to the store's [`RetryPolicy`] ([`OutcomeConfig::with_retry`]), provided the
+    /// failed item is one the engine can re-derive: an event put, a floor or snapshot condition, a
+    /// continuity check, or an engine-filled fence. A failed caller-stamped fence is not retried:
+    /// the engine records the stale-fence rejection at once ([`Transaction::commit_with_outcome`]).
+    /// When the last attempt also conflicts, it records a stale-fence rejection
+    /// ([`Rejection::retries_exhausted`](crate::Rejection::retries_exhausted)) as the outcome
+    /// instead of returning the conflict, so a replay of the command ID gets the same answer; the
+    /// remedy is a new command ID. A transient backend failure is retried the same way and
+    /// returned as an error when attempts run out.
+    ///
+    /// `prepare` must therefore be safe to repeat: it decides from the transaction's reads, not
+    /// from state captured by an earlier call, and its external side effects must be idempotent.
+    /// Only the attempt that commits writes anything.
+    ///
+    /// The identity is the caller's intent, fixed before anything is read. Its targets are the
+    /// streams the request names, not the streams `prepare` ends up writing, so a command whose
+    /// write set depends on state, such as a rename that releases whichever handle the entity
+    /// currently holds, keeps one identity across attempts, client retries, and recovery.
+    ///
+    /// # Cancellation
+    ///
+    /// Not cancellation safe, like [`execute_with_outcome`](Store::execute_with_outcome): run the
+    /// command again with the same command ID, and the outcome row tells whether it applied.
+    pub async fn execute_transaction<'s, F>(
+        &'s self,
+        identity: &CommandIdentity,
+        metadata: &Metadata,
+        mut prepare: F,
+    ) -> Result<CommandOutcome, Error>
     where
-        A::Command: OutcomeCommand + Clone,
-        A::Error: ToRejection,
-        S: Fn(Duration) -> F + Send,
-        F: Future<Output = ()> + Send,
+        F: for<'t> FnMut(&'t mut Transaction<'s, R>) -> PrepareFuture<'t>,
     {
-        let entity_id = entity_id.into();
-        let max_attempts = policy.max_attempts.max(1);
-        let mut retry = 0;
+        let config = self.outcomes.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
+        })?;
+
+        let policy = config.retry();
+        let attempts = policy.max_attempts.max(1);
+        let mut attempt = 1;
 
         loop {
-            match self
-                .execute_with_outcome(entity_id.clone(), command.clone(), metadata.clone())
-                .await
-            {
-                Err(err) if err.is_retryable() && retry + 1 < max_attempts => {
-                    sleep(policy.delay(retry)).await;
-                    retry += 1;
-                }
-                result => return result,
+            let mut pending = None;
+            // Boxed for the same reason as the single-aggregate attempt.
+            let result =
+                Box::pin(self.attempt_transaction(identity, metadata, &mut prepare, &mut pending))
+                    .await;
+
+            let failed = match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(failed) => failed,
+            };
+
+            let kind = failed.retry();
+            if kind == Retry::Never {
+                return Err(failed.error);
             }
+
+            if attempt >= attempts {
+                let Some((command_id, digest)) = pending.filter(|_| kind == Retry::Conflict) else {
+                    return Err(failed.error);
+                };
+
+                return persist_rejection(
+                    &self.repository,
+                    &command_id,
+                    &digest,
+                    config.recovery_wait(),
+                    Rejection::retries_exhausted(attempt),
+                )
+                .await;
+            }
+
+            self.repository.backoff(policy.delay(attempt - 1)).await;
+            attempt += 1;
+        }
+    }
+
+    /// One attempt of [`execute_transaction`](Store::execute_transaction). `pending` receives the
+    /// command ID and digest once the command has begun, so the caller can record the stale-fence
+    /// rejection of a command whose attempts ran out.
+    async fn attempt_transaction<'s, F>(
+        &'s self,
+        identity: &CommandIdentity,
+        metadata: &Metadata,
+        prepare: &mut F,
+        pending: &mut Option<(CommandId, String)>,
+    ) -> Result<CommandOutcome, Failed>
+    where
+        F: for<'t> FnMut(&'t mut Transaction<'s, R>) -> PrepareFuture<'t>,
+    {
+        let mut transaction = self.transaction();
+
+        match transaction
+            .begin_command(identity, metadata)
+            .await
+            .map_err(Failed::deciding)?
+        {
+            Begin::Replayed(outcome) => return Ok(*outcome),
+            Begin::Proceed => {}
+        }
+
+        *pending = transaction.pending_command();
+
+        match prepare(&mut transaction).await.map_err(Failed::deciding)? {
+            Decision::Accept(response) => transaction
+                .commit_with_outcome(response)
+                .await
+                .map_err(Failed::committing),
+            Decision::Reject(rejection) => transaction
+                .reject(*rejection)
+                .await
+                .map_err(Failed::committing),
         }
     }
 
@@ -822,6 +1022,40 @@ pub(crate) fn stamp_commit_id(
     metadata
 }
 
+/// The decision a [`Store::execute_transaction`] `prepare` function reaches: commit the staged
+/// events and record an accepted outcome, or record a domain rejection.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Decision {
+    /// Commit what the transaction staged and record an accepted outcome, storing the response
+    /// (at most 65536 bytes; `None` or empty stores none) for a retried command to return.
+    Accept(Option<Vec<u8>>),
+    /// Record the command as rejected, writing no events. The rejection is fenced on everything
+    /// the transaction read, so it is only recorded on state that still holds.
+    Reject(Box<Rejection>),
+}
+
+impl Decision {
+    /// Accepts the command without a response.
+    pub fn accept() -> Self {
+        Self::Accept(None)
+    }
+
+    /// Accepts the command and stores `response` with the outcome.
+    pub fn accept_with(response: impl Into<Vec<u8>>) -> Self {
+        Self::Accept(Some(response.into()))
+    }
+
+    /// Rejects the command with a domain rejection.
+    pub fn reject(rejection: Rejection) -> Self {
+        Self::Reject(Box::new(rejection))
+    }
+}
+
+/// The future a [`Store::execute_transaction`] `prepare` function returns. Box it:
+/// `|tx| Box::pin(async move { ... })`.
+pub type PrepareFuture<'t> = Pin<Box<dyn Future<Output = Result<Decision, Error>> + Send + 't>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,6 +1214,113 @@ mod tests {
 
         fn command(id: &str) -> Metadata {
             Metadata::default().with_command_id(id)
+        }
+
+        /// A repository whose event reads skip sequence 1, as a load that raced a compaction (or
+        /// one over expired events) sees the stream.
+        struct Gapped<R>(R);
+
+        impl<R: crate::Repository> crate::Repository for Gapped<R> {
+            type Operation = R::Operation;
+
+            async fn commit(&self, commit: crate::Commit<R::Operation>) -> Result<(), Error> {
+                self.0.commit(commit).await
+            }
+
+            async fn outcome(
+                &self,
+                command_id: &CommandId,
+            ) -> Result<Option<crate::Outcome>, Error> {
+                self.0.outcome(command_id).await
+            }
+
+            async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
+                let mut events = self.0.events(entity_id).await?;
+                events.push(SerializedEvent {
+                    id: EventId::for_event(entity_id, EventSequence(2)),
+                    entity_id: entity_id.clone(),
+                    sequence: EventSequence(2),
+                    ..events.first().cloned().expect("a seeded event")
+                });
+                events.remove(0);
+
+                Ok(events)
+            }
+
+            async fn events_after(
+                &self,
+                entity_id: &EntityId,
+                after: EventSequence,
+            ) -> Result<Vec<SerializedEvent>, Error> {
+                self.0.events_after(entity_id, after).await
+            }
+
+            async fn latest(
+                &self,
+                entity_id: &EntityId,
+                n: usize,
+            ) -> Result<Vec<SerializedEvent>, Error> {
+                self.0.latest(entity_id, n).await
+            }
+
+            async fn snapshot(
+                &self,
+                entity_id: &EntityId,
+            ) -> Result<Option<crate::SerializedSnapshot>, Error> {
+                self.0.snapshot(entity_id).await
+            }
+
+            async fn put_snapshot(
+                &self,
+                snapshot: &crate::SerializedSnapshot,
+            ) -> Result<bool, Error> {
+                self.0.put_snapshot(snapshot).await
+            }
+
+            async fn compact_below(
+                &self,
+                entity_id: &EntityId,
+                through: EventSequence,
+            ) -> Result<usize, Error> {
+                self.0.compact_below(entity_id, through).await
+            }
+
+            async fn entity_heads(
+                &self,
+                entity_type: Option<&crate::EntityType>,
+            ) -> Result<std::collections::BTreeMap<EntityId, EventSequence>, Error> {
+                self.0.entity_heads(entity_type).await
+            }
+        }
+
+        #[tokio::test]
+        async fn a_load_gap_is_retried_but_never_recorded_as_a_stale_fence() {
+            let inner = MemRepository::new();
+            Store::<Counter, _>::new(&inner, ())
+                .execute("c-1", Bump(1), Metadata::default())
+                .await
+                .unwrap();
+
+            let gapped = Gapped(&inner);
+            let store = Store::<Counter, _>::new(&gapped, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(3)));
+
+            // The gap persists through every attempt: it is returned, not turned into a rejection,
+            // because it says the read was inconsistent, not that the decision went stale.
+            let error = store
+                .execute_with_outcome("c-1", Bump(1), command("gap"))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::SequenceGap { .. }), "{error:?}");
+            assert!(
+                inner
+                    .outcome(&CommandId::new("gap"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no outcome is recorded for an inconsistent read"
+            );
         }
 
         #[tokio::test]
@@ -1225,12 +1566,14 @@ mod tests {
         #[tokio::test]
         async fn a_commit_that_never_lands_is_a_retryable_ambiguous_write_never_not_applied() {
             let fault = FaultInjectingRepository::new(MemRepository::new());
-            let store = Store::<Counter, _>::new(&fault, ())
+
+            // One attempt shows what a single attempt returns.
+            let once = Store::<Counter, _>::new(&fault, ())
                 .with_snapshot_interval(0)
-                .with_outcomes(OutcomeConfig::new());
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(1)));
 
             fault.arm_before_apply();
-            let error = store
+            let error = once
                 .execute_with_outcome("c-1", Bump(1), command("c"))
                 .await
                 .unwrap_err();
@@ -1238,16 +1581,24 @@ mod tests {
                 matches!(error, Error::AmbiguousWrite { .. }) && error.is_retryable(),
                 "an absent row never proves the commit did not apply: {error:?}"
             );
+            assert!(
+                fault
+                    .inner()
+                    .events(&"c-1".into())
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a transient failure is returned as an error, never recorded as a rejection"
+            );
+
+            // With attempts to spare, the engine runs the command again on its own.
+            let store = Store::<Counter, _>::new(&fault, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(3)));
 
             fault.arm_before_apply();
             let done = store
-                .execute_with_outcome_retry(
-                    "c-1",
-                    Bump(1),
-                    command("c"),
-                    &RetryPolicy::immediate(3),
-                    |_| async {},
-                )
+                .execute_with_outcome("c-1", Bump(1), command("c"))
                 .await
                 .unwrap();
             assert!(
@@ -1273,9 +1624,14 @@ mod tests {
             assert_eq!(fault.inner().events(&"c-1".into()).await.unwrap().len(), 1);
 
             // When the recovery read fails too, the original failure is reported, still retryable.
+            // One attempt shows it; with attempts to spare the engine would run the command again
+            // and find the row.
+            let once = Store::<Counter, _>::new(&fault, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(1)));
             fault.arm_after_apply();
             fault.fail_outcome_read_after(1);
-            let error = store
+            let error = once
                 .execute_with_outcome("c-2", Bump(4), command("d"))
                 .await
                 .unwrap_err();

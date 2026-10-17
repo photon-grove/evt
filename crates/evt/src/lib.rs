@@ -81,8 +81,10 @@ pub use repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
     snapshot_events_due,
 };
-pub use retry::RetryPolicy;
-pub use store::{DEFAULT_SNAPSHOT_INTERVAL, Executed, Loaded, Store, serialize_events};
+pub use retry::{DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY_MS, RetryPolicy};
+pub use store::{
+    DEFAULT_SNAPSHOT_INTERVAL, Decision, Executed, Loaded, PrepareFuture, Store, serialize_events,
+};
 pub use transaction::{Begin, Read, Transaction};
 pub use upcast::{JsonUpcaster, Upcaster};
 

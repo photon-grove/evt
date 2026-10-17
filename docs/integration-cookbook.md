@@ -34,6 +34,15 @@ command returns the stored outcome (`Replayed`), a different command under the s
 re-reading the outcome row rather than re-running it. Use a stable idempotency key per logical
 request, never one per attempt.
 
+A command that loses a race with another writer is re-prepared for you
+([fence-aware retry](../README.md#command-outcomes-and-rejections-v09-c3c4)): the handler runs again
+against fresh state, up to `store.WithRetry(...)` attempts, and when they run out the command is
+recorded as a `stale-fence` rejection that a replay of the same ID returns. Write handlers that are
+safe to run more than once, and use a new key to try again after a stale-fence rejection. Give a
+multi-stream command an identity that names only what the request names (`evt.CommandIdentity`
+`Targets`): the streams it reads and writes may come from state and change between attempts, and
+they are not part of the identity.
+
 ## Upcast historical shapes, always
 
 Never assume a stored payload has the latest struct shape. When an event's JSON

@@ -262,3 +262,35 @@ func Test_HasConditionalCheckFailure(t *testing.T) {
 		require.Equal(t, 0, idx)
 	})
 }
+
+func Test_classifyCommitFailure_ATransactionConflictIsAnOptimisticConflict(t *testing.T) {
+	repo := &Repository{}
+
+	cancelled := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")},
+			{Code: aws.String("TransactionConflict")},
+		},
+	}
+
+	err := repo.classifyCommitFailure(context.Background(), nil, nil, commitLayout{}, cancelled)
+	require.ErrorIs(t, err, ErrTransactionConflict)
+	require.ErrorIs(t, err, evt.ErrOptimisticConflict, "fence-aware retry re-prepares on it, as in Rust")
+	require.ErrorIs(t, err, cancelled, "the SDK error stays matchable")
+	require.True(t, evt.IsOptimisticConflict(err))
+	require.True(t, policy.IsTransient(err))
+
+	// Throttling is transient but says nothing about another writer moving state.
+	throttled := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{{Code: aws.String("ThrottlingError")}},
+	}
+
+	err = repo.classifyCommitFailure(context.Background(), nil, nil, commitLayout{}, throttled)
+	require.False(t, evt.IsOptimisticConflict(err))
+	require.True(t, policy.IsTransient(err))
+}
+
+func Test_theSnapshotRaceConditionIsAnOptimisticConflict(t *testing.T) {
+	require.ErrorIs(t, ErrSnapshotRaceCondition, evt.ErrOptimisticConflict)
+	require.NotErrorIs(t, ErrSnapshotRaceCondition, ErrTransactionConflict, "each sentinel keeps its own identity")
+}

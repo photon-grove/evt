@@ -315,3 +315,16 @@ func Test_ConflictError(t *testing.T) {
 
 	require.False(t, IsConflictErr(errors.New("other")))
 }
+
+func TestIsOptimisticConflict(t *testing.T) {
+	gap := &SequenceGapError{EntityID: "e-1", After: 1, Found: 3}
+	fence := &FenceConflictError{Fence: ReadFence{EntityID: "e-2", Head: 4}}
+
+	require.True(t, IsOptimisticConflict(gap), "a load that raced a compaction")
+	require.True(t, IsOptimisticConflict(fence))
+	require.True(t, IsOptimisticConflict(fmt.Errorf("commit: %w", NewConflictError("collision"))))
+	require.True(t, IsOptimisticConflict(fmt.Errorf("commit: %w", ErrOptimisticConflict)))
+	require.False(t, IsOptimisticConflict(nil))
+	require.False(t, IsOptimisticConflict(errors.New("throttled")))
+	require.False(t, IsOptimisticConflict(&OutcomeConflictError{CommandID: "c"}), "resolved by the outcome row, never re-prepared")
+}

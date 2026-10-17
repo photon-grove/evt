@@ -4,10 +4,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/snapshots"
 )
 
 // OutcomeFixtureFile holds the shared C3/C4 vectors: identity digests, canonical digest bytes,
@@ -19,6 +21,9 @@ const OutcomeFixtureFile = "outcomes.json"
 type OutcomeFixtures struct {
 	// Limits are the bounds checked before any write.
 	Limits OutcomeLimits `json:"limits"`
+
+	// Retry are the fence-aware retry policy defaults (C5), which both languages ship.
+	Retry RetryDefaults `json:"retry"`
 
 	Digests []DigestVector `json:"digests"`
 	Rows    []RowVector    `json:"rows"`
@@ -34,6 +39,15 @@ type MalformedRow struct {
 	DynamoItem map[string]any `json:"dynamoItem"`
 }
 
+// RetryDefaults mirrors the default fence-aware retry policy: attempts in total, and the delay
+// before the first retry and the upper bound for any delay, in milliseconds.
+type RetryDefaults struct {
+	MaxAttempts int    `json:"maxAttempts"`
+	BaseDelayMs int    `json:"baseDelayMs"`
+	MaxDelayMs  int    `json:"maxDelayMs"`
+	StaleCode   string `json:"staleCode"`
+}
+
 // OutcomeLimits mirrors evt.MaxCommandIDBytes and evt.MaxOutcomeBytes.
 type OutcomeLimits struct {
 	MaxCommandIDBytes int `json:"maxCommandIdBytes"`
@@ -44,7 +58,7 @@ type OutcomeLimits struct {
 // with no payload.
 type DigestInputVector struct {
 	CommandType string   `json:"commandType"`
-	Streams     []string `json:"streams"`
+	Targets     []string `json:"targets"`
 	Payload     *string  `json:"payload"`
 	Principal   string   `json:"principal"`
 }
@@ -85,6 +99,12 @@ type RowVector struct {
 func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 	fixtures := OutcomeFixtures{
 		Limits: OutcomeLimits{MaxCommandIDBytes: evt.MaxCommandIDBytes, MaxOutcomeBytes: evt.MaxOutcomeBytes},
+		Retry: RetryDefaults{
+			MaxAttempts: snapshots.DefaultRetryAttempts,
+			BaseDelayMs: int(snapshots.DefaultRetryBaseDelay / time.Millisecond),
+			MaxDelayMs:  int(snapshots.DefaultRetryMaxDelay / time.Millisecond),
+			StaleCode:   string(evt.RejectionStaleFence),
+		},
 	}
 
 	payload := func(text string) *string { return &text }
@@ -93,14 +113,18 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 		name  string
 		input evt.DigestInput
 	}{
-		{"single stream", evt.DigestInput{CommandType: "account:open", Streams: []evt.EntityID{"acct-1"}, Payload: []byte(`{"owner":"Ada"}`), Principal: "user:42"}},
-		{"multi stream, sorted", evt.DigestInput{CommandType: "claim-username", Streams: []evt.EntityID{"profile#u-1", "claim#ada"}, Payload: []byte(`{"handle":"ada"}`)}},
-		{"multi stream with principal", evt.DigestInput{CommandType: "claim-username", Streams: []evt.EntityID{"claim#ada", "profile#u-1"}, Payload: []byte(`{"handle":"ada"}`), Principal: "user:42"}},
-		{"absent payload", evt.DigestInput{CommandType: "account:ping", Streams: []evt.EntityID{"acct-1"}, Principal: "user:42"}},
-		{"stale fence", evt.DigestInput{CommandType: "account:rename", Streams: []evt.EntityID{"acct-1"}, Payload: []byte(`{"name":"Grace"}`), Principal: "user:42"}},
-		{"duplicate streams collapse", evt.DigestInput{CommandType: "t", Streams: []evt.EntityID{"b", "a", "b"}, Payload: []byte(`null`)}},
+		{"single stream", evt.DigestInput{CommandType: "account:open", Targets: []evt.EntityID{"acct-1"}, Payload: []byte(`{"owner":"Ada"}`), Principal: "user:42"}},
+		{"multi stream, sorted", evt.DigestInput{CommandType: "claim-username", Targets: []evt.EntityID{"profile#u-1", "claim#ada"}, Payload: []byte(`{"handle":"ada"}`)}},
+		{"multi stream with principal", evt.DigestInput{CommandType: "claim-username", Targets: []evt.EntityID{"claim#ada", "profile#u-1"}, Payload: []byte(`{"handle":"ada"}`), Principal: "user:42"}},
+		// A rename releases whichever handle the profile currently holds, so the streams it
+		// writes (the released claim, the new claim, the profile) come from state. Only what the
+		// request names is identity: the same digest whichever write set an attempt derives.
+		{"rename, state-derived write set is not identity", evt.DigestInput{CommandType: "profile:rename", Targets: []evt.EntityID{"profile#u-1"}, Payload: []byte(`{"handle":"grace"}`), Principal: "user:42"}},
+		{"absent payload", evt.DigestInput{CommandType: "account:ping", Targets: []evt.EntityID{"acct-1"}, Principal: "user:42"}},
+		{"stale fence", evt.DigestInput{CommandType: "account:rename", Targets: []evt.EntityID{"acct-1"}, Payload: []byte(`{"name":"Grace"}`), Principal: "user:42"}},
+		{"duplicate streams collapse", evt.DigestInput{CommandType: "t", Targets: []evt.EntityID{"b", "a", "b"}, Payload: []byte(`null`)}},
 		{"outcome-only, no streams", evt.DigestInput{CommandType: "account:audit", Payload: []byte(`{"note":"checked"}`)}},
-		{"non-ASCII and HTML-sensitive payload", evt.DigestInput{CommandType: "note:add", Streams: []evt.EntityID{"naïve#1"}, Payload: []byte(`{"text":"a<b> & é"}`), Principal: "user:é"}},
+		{"non-ASCII and HTML-sensitive payload", evt.DigestInput{CommandType: "note:add", Targets: []evt.EntityID{"naïve#1"}, Payload: []byte(`{"text":"a<b> & é"}`), Principal: "user:é"}},
 	}
 
 	for _, test := range digests {
@@ -115,13 +139,13 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 			Digest:       digest,
 			Input: DigestInputVector{
 				CommandType: string(test.input.CommandType),
-				Streams:     make([]string, 0, len(test.input.Streams)),
+				Targets:     make([]string, 0, len(test.input.Targets)),
 				Principal:   test.input.Principal,
 			},
 		}
 
-		for _, stream := range test.input.Streams {
-			vector.Input.Streams = append(vector.Input.Streams, string(stream))
+		for _, stream := range test.input.Targets {
+			vector.Input.Targets = append(vector.Input.Targets, string(stream))
 		}
 
 		if test.input.Payload != nil {
@@ -130,6 +154,16 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 
 		fixtures.Digests = append(fixtures.Digests, vector)
 	}
+
+	// The rename command's digest is computed, not copied: it is the digest vector above.
+	renameDigest, err := evt.DefaultDigest(evt.DigestInput{
+		CommandType: "profile:rename", Targets: []evt.EntityID{"profile#u-1"}, Payload: []byte(`{"handle":"grace"}`), Principal: "user:42",
+	})
+	if err != nil {
+		return fixtures, err
+	}
+
+	callerFence, exhausted := evt.CallerFenceStaleRejection(), evt.RetriesExhaustedRejection(5)
 
 	rows := []struct {
 		name    string
@@ -162,10 +196,15 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 		}},
 		{"rejected stale fence", evt.Outcome{
 			CommandID: "cmd-0005", Status: evt.OutcomeRejected,
-			Digest: "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b",
-			Rejection: &evt.Rejection{
-				Code: evt.RejectionStaleFence, Message: "a caller-stamped fence went stale",
-			},
+			Digest:    "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b",
+			Rejection: &callerFence,
+		}},
+		{"accepted rename, state-derived write set", evt.Outcome{
+			CommandID: "cmd-0008", Status: evt.OutcomeAccepted, Digest: renameDigest,
+			EventIDs: []evt.EventID{"claim#ada:2", "claim#grace:1", "profile#u-1:2"},
+		}},
+		{"rejected stale fence, retries exhausted", evt.Outcome{
+			CommandID: "cmd-0009", Status: evt.OutcomeRejected, Digest: renameDigest, Rejection: &exhausted,
 		}},
 		{"rejected with escaped and nested details", evt.Outcome{
 			CommandID: "cmd-0007", Status: evt.OutcomeRejected, Digest: "d",

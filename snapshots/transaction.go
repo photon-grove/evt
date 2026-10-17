@@ -108,17 +108,6 @@ func (tx *Transaction) Append(entityID evt.EntityID, events ...evt.Event) error 
 		return fmt.Errorf("snapshots: stream %s was not read by this transaction", entityID)
 	}
 
-	// A command records the identity digest of the streams it declared. Writing any other stream
-	// would commit an effect that digest omits, so a later call with the declared identity would
-	// replay an outcome for it. Nothing is changed, so the transaction stays usable.
-	if tx.command != nil && len(events) > 0 {
-		if _, declared := tx.command.declared[entityID]; !declared {
-			return &evt.InvalidCommitError{Reason: fmt.Sprintf(
-				"stream %s is written but was not declared by the command's identity", entityID,
-			)}
-		}
-	}
-
 	for _, event := range events {
 		if event.EntityType() != stream.entity.Type() {
 			tx.used = true
@@ -200,9 +189,11 @@ func (tx *Transaction) Commit(ctx context.Context, metadata evt.Metadata) ([]evt
 }
 
 // BeginCommand starts a transaction for one command on a store with outcomes enabled. It checks
-// the command ID, computes the identity digest from the declared command (its type, the streams it
-// declares it will write, and its payload) and the metadata's principal, and reads the outcome row
-// before anything is loaded:
+// the command ID, computes the identity digest from the command's identity (its type, the streams
+// the request names, and its payload) and the metadata's principal, and reads the outcome row
+// before anything is loaded. The identity is the caller's intent, fixed before any state is read:
+// the streams the transaction goes on to read and write are not part of it, so they may depend on
+// state and differ between attempts of one command.
 //
 //   - a stored outcome with the same digest is returned and the transaction is nil — the command
 //     already ran, and nothing should run again;
@@ -231,8 +222,10 @@ func (store *Store) BeginCommand(
 //
 // A failed caller-stamped fence is a stale-fence rejection: the engine records it as the command's
 // outcome through an outcome-only transaction and returns it. Every other conflict, including a
-// failed engine-filled fence, is returned for the caller to retry with a fresh BeginCommand. A lost
-// race on the outcome row and an ambiguous commit result are resolved by re-reading the row.
+// failed engine-filled fence, is returned for the caller to retry with a fresh BeginCommand; use
+// Store.ExecuteTransaction to have the engine re-prepare the command under the store's
+// RetryPolicy and record a stale-fence rejection when attempts run out. A lost race on the outcome
+// row and an ambiguous commit result are resolved by re-reading the row.
 func (tx *Transaction) Complete(ctx context.Context, response []byte) (*evt.CommandOutcome, error) {
 	return tx.finish(ctx, evt.OutcomeAccepted, response, nil)
 }
@@ -291,7 +284,7 @@ func (tx *Transaction) finish(
 
 	var conflict *evt.FenceConflictError
 	if errors.As(err, &conflict) && conflict.Fence.CallerStamped {
-		return tx.command.staleFence(ctx)
+		return tx.command.staleFence(ctx, evt.CallerFenceStaleRejection())
 	}
 
 	return outcome, err
@@ -310,13 +303,13 @@ func (tx *Transaction) checkLegacyDuplicate() error {
 	return nil
 }
 
-// staleFence records the engine's stale-fence rejection: a caller-stamped fence went stale, so the
-// engine cannot know the caller's decision still holds. The outcome-only transaction carries none
-// of the failed commit's other items — no fences (they are stale by definition), events, or
-// snapshots — and the old command ID stays terminal; the remedy is a new command ID.
-func (c *command) staleFence(ctx context.Context) (*evt.CommandOutcome, error) {
-	rejection := evt.Rejection{Code: evt.RejectionStaleFence, Message: "a caller-stamped fence went stale"}
-
+// staleFence records the engine's stale-fence rejection: the state the command was decided on went
+// stale and the command cannot be decided again — a caller-stamped fence failed, so the engine
+// cannot know the caller's decision still holds, or fence-aware retry ran out of attempts. The
+// outcome-only transaction carries none of the failed commit's other items — no fences (they are
+// stale by definition), events, or snapshots — and the old command ID stays terminal; the remedy
+// is a new command ID.
+func (c *command) staleFence(ctx context.Context, rejection evt.Rejection) (*evt.CommandOutcome, error) {
 	return c.commit(ctx, evt.SerializedResult{}, evt.OutcomeRejected, nil, &rejection)
 }
 

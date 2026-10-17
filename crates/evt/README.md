@@ -135,8 +135,8 @@ implements `ToRejection`:
 
 - A repeat of a command (same ID, same identity digest) returns the stored outcome and does not
   run the handler or write. The dedupe is global, so it survives snapshots and compaction. The
-  digest is a SHA-256 over the command's type, declared streams, canonical payload JSON, and
-  principal, and `OutcomeConfig::with_digester` replaces it. The same ID with another digest is
+  digest is a SHA-256 over the command's type, the target streams the request names, canonical
+  payload JSON, and principal (the caller's intent, never the streams the command ends up writing), and `OutcomeConfig::with_digester` replaces it. The same ID with another digest is
   `Error::IdempotencyKeyReuse`, carrying the stored `prior_outcome`; it is never stored.
 - An error from `handle` that `ToRejection` maps to `Some` is a domain rejection: it is persisted
   as a `rejected` outcome (`Rejection { code, message, details }`) and a retried command replays it
@@ -159,8 +159,23 @@ implements `ToRejection`:
 - `Store::transaction` records multi-stream commands with `Transaction::begin_command`, which must
   be the first call on the transaction (`Error::CommandOrder` after any read, append, or fence; a
   replayed result finishes the transaction), then
-  `commit_with_outcome` or `reject`. A failed caller-stamped fence persists a `stale-fence`
-  rejection instead of retrying; the remedy is a new command ID.
+  `commit_with_outcome` or `reject`, attempting once. A failed caller-stamped fence persists a
+  `stale-fence` rejection instead of retrying; the remedy is a new command ID.
+- **Fence-aware retry (C5).** `execute_with_outcome`, `execute_with_response`, and
+  `Store::execute_transaction` retry a command that conflicts with another writer, up to the
+  store's `RetryPolicy` (`OutcomeConfig::with_retry`; the default is 5 attempts, 25 ms doubling to
+  1 s, jittered, waiting on `Repository::backoff`). A conflict on anything the engine can
+  re-derive (an event put, a snapshot or continuity check, an engine-filled fence)
+  **re-prepares** the command: the aggregate is loaded again, the handler (or your `prepare`
+  closure) runs again against fresh state, and only the attempt that commits writes anything. A
+  failed **caller-stamped** fence fails fast with the `stale-fence` rejection instead, because the
+  engine cannot know your decision still holds. When the last attempt also conflicts, the engine
+  persists `Rejection::retries_exhausted(attempts)` (code `stale-fence`) as the command's outcome,
+  so a replay of the ID gets the same answer; submit a new command ID to try again. Handlers and
+  `prepare` closures may therefore run more than once and must be safe to repeat, and a command
+  passed to `execute_with_outcome` must be `Clone`. A transient failure that is not a conflict
+  (throttling, an ambiguous write that never resolved) is retried the same way but returned as an
+  error when attempts run out.
 
 ```rust
 use photon_evt::{
@@ -191,6 +206,7 @@ impl ToRejection for NotPositive {
     }
 }
 
+#[derive(Clone)]
 pub struct Count(pub i64);
 
 impl OutcomeCommand for Count {
@@ -254,6 +270,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .execute_with_outcome("c-1", Count(0), Metadata::new("us-west-2").with_command_id("cmd-2"))
         .await?;
     assert_eq!(rejected.rejection().map(|r| r.code.as_str()), Some("not-positive"));
+
+    Ok(())
+}
+```
+
+A multi-stream command runs under the same retry with `Store::execute_transaction`: the closure is
+the command's decision step, run again from scratch whenever the engine re-prepares it, and the
+streams it reads and writes can depend on what it reads. The identity names only what the request
+names (`with_targets`), so the digest is the same on every attempt however the write set changes:
+
+```rust
+use photon_evt::{
+    Aggregate, CommandIdentity, Decision, MemRepository, Metadata, OutcomeConfig, Store,
+    domain_events,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Counted {
+    pub by: i64,
+}
+
+domain_events! {
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum CounterEvent {
+        Counted(Counted) => ("counter:counted", 1),
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Counter {
+    pub total: i64,
+}
+
+impl Aggregate for Counter {
+    const TYPE: &'static str = "counter";
+
+    type Command = ();
+    type Event = CounterEvent;
+    type Error = std::convert::Infallible;
+    type Services = ();
+
+    async fn handle(&self, _: (), _: &()) -> Result<Vec<CounterEvent>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn apply(&mut self, event: CounterEvent) {
+        match event {
+            CounterEvent::Counted(counted) => self.total += counted.by,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Store::<Counter, _>::new(MemRepository::new(), ())
+        .with_outcomes(OutcomeConfig::new());
+
+    // The request names counter "a". Which counter it also writes comes from the state it reads.
+    let identity = CommandIdentity::new("counter:spill").with_targets(["a"]);
+    let metadata = Metadata::new("us-west-2").with_command_id("cmd-1");
+
+    let outcome = store
+        .execute_transaction(&identity, &metadata, |tx| {
+            Box::pin(async move {
+                let a = tx.read::<Counter>("a").await?; // read only: an engine-filled fence
+                let spill = if a.aggregate().total > 0 { "b" } else { "c" };
+
+                let mut destination = tx.read::<Counter>(spill).await?;
+                tx.append(&mut destination, vec![Counted { by: 1 }.into()])?;
+
+                Ok(Decision::accept())
+            })
+        })
+        .await?;
+    assert!(outcome.is_accepted());
+
+    // The same command again replays the stored outcome; the closure does not run.
+    let again = store
+        .execute_transaction(&identity, &metadata, |_| unreachable!("a replay prepares nothing"))
+        .await?;
+    assert!(again.replayed);
 
     Ok(())
 }

@@ -102,6 +102,22 @@ func (e *ConflictError) Error() string {
 	return e.msg
 }
 
+// ErrOptimisticConflict matches, with errors.Is, a failure that means another writer moved state
+// this attempt read or wrote: a colliding event sequence, a moved snapshot, a failed fence, a
+// continuity gap, or a concurrent transaction. Reloading and deciding again can succeed. A backend
+// reports such failures so that errors.Is(err, ErrOptimisticConflict) or IsConflictErr matches;
+// fence-aware retry (ADR 0004, C5) re-prepares a command on exactly these.
+var ErrOptimisticConflict = errors.New("optimistic concurrency conflict")
+
+// IsOptimisticConflict reports whether err is an optimistic-concurrency conflict: it matches
+// ErrOptimisticConflict, or is (or wraps) a ConflictError, which includes SequenceGapError and
+// FenceConflictError. Apply it to errors from loading and committing only. A domain error an
+// entity's Handle returns can be a ConflictError too (a duplicate resource) and is not a
+// concurrency conflict.
+func IsOptimisticConflict(err error) bool {
+	return err != nil && (errors.Is(err, ErrOptimisticConflict) || IsConflictErr(err))
+}
+
 // ErrSequenceGap identifies a stream whose stored events skip a sequence while loading: another
 // writer snapshotted and compacted the stream between the snapshot read and the event read, or
 // events expired. Match it with errors.Is; the same error also matches IsConflictErr.

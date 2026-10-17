@@ -52,10 +52,30 @@ const (
 	// RejectionBadCommand is the code of a BadCommandError.
 	RejectionBadCommand RejectionCode = "bad-command"
 
-	// RejectionStaleFence is the code the engine records when a caller-stamped read fence went
-	// stale before the commit.
+	// RejectionStaleFence is the code the engine records when the state a command was decided on
+	// went stale and the command cannot be decided again: a caller-stamped read fence failed, or
+	// fence-aware retry ran out of attempts (ADR 0004, C5).
 	RejectionStaleFence RejectionCode = "stale-fence"
 )
+
+// CallerFenceStaleRejection is the stale-fence rejection the engine records when a caller-stamped
+// read fence went stale before the commit: the engine cannot know the caller's decision still
+// holds, so it does not retry.
+func CallerFenceStaleRejection() Rejection {
+	return Rejection{Code: RejectionStaleFence, Message: "a caller-stamped fence went stale"}
+}
+
+// RetriesExhaustedRejection is the stale-fence rejection the engine records when fence-aware
+// retry ran out of attempts: every attempt was decided on state another writer then moved. The
+// attempt count is the policy's, kept in the details as an integer so both languages store the
+// same bytes.
+func RetriesExhaustedRejection(attempts int) Rejection {
+	return Rejection{
+		Code:    RejectionStaleFence,
+		Message: "the state this command was decided on kept changing; retries were exhausted",
+		Details: map[string]any{"attempts": attempts},
+	}
+}
 
 // Rejection is the standard, persisted domain rejection (ADR 0004, C4). Its JSON encoding is the
 // stored form: keys in the order code, message, details, with details null when absent.
@@ -643,7 +663,11 @@ func (e *OutcomesUnsupportedError) Is(target error) bool { return target == ErrO
 // reads it back. The in-memory, DynamoDB, and PostgreSQL repositories implement it.
 //
 // Commit must report a lost outcome condition as *OutcomeConflictError and count the outcome item
-// in the commit budget. It MUST report a commit whose result is genuinely unknown — a timeout or
+// in the commit budget. It must report a failed event put, floor or snapshot condition, fence, or
+// continuity check — another writer moved a stream — as an optimistic-concurrency conflict
+// (errors.Is(err, ErrOptimisticConflict), or a ConflictError), because fence-aware retry
+// re-prepares the command on exactly those and persists a stale-fence rejection when it runs out
+// of attempts. It MUST report a commit whose result is genuinely unknown — a timeout or
 // cancelled context, a dispatch or connection failure, a truncated response, a 5xx or server
 // fault, a connection dropped during COMMIT — as *AmbiguousWriteError, because only that error
 // makes the store re-read the outcome row. A definitive failure (validation, a missing table,
@@ -676,14 +700,18 @@ func OutcomeKey(id CommandID) string {
 // digestTag pins the canonical identity encoding. A change to the encoding bumps the tag.
 const digestTag = "evt-cmd-digest-v1"
 
-// DigestInput is the identity of a command: what it is, never what the executed commit wrote.
+// DigestInput is the identity of a command: what the caller asked for, never what the executed
+// commit wrote.
 type DigestInput struct {
 	// CommandType is the command's type string.
 	CommandType CommandType
 
-	// Streams are the stream IDs the command declares it will write. They are deduplicated and
-	// sorted by byte order when digested. Fenced (read-only) streams are not part of it.
-	Streams []EntityID
+	// Targets are the stream IDs the request itself names, known before any state is read. They
+	// are deduplicated and sorted by byte order when digested. The streams a command ends up
+	// reading, fencing, or writing are not part of its identity: a command may derive them from
+	// the state it reads (a rename releases whichever handle the entity currently holds), so they
+	// can differ between attempts of the same command.
+	Targets []EntityID
 
 	// Payload is the canonical JSON of the command payload, or nil when it has none.
 	Payload []byte
@@ -700,13 +728,13 @@ type Digester func(DigestInput) (string, error)
 //
 //	"evt-cmd-digest-v1" || 0x00
 //	|| lp(command type)
-//	|| uint32-le(stream count) || lp(stream ID) ...
+//	|| uint32-le(target count) || lp(target stream ID) ...
 //	|| lp(canonical payload JSON)
 //	|| lp(principal)
 func CanonicalDigestBytes(input DigestInput) []byte {
-	streams := slices.Clone(input.Streams)
-	slices.Sort(streams)
-	streams = slices.Compact(streams)
+	targets := slices.Clone(input.Targets)
+	slices.Sort(targets)
+	targets = slices.Compact(targets)
 
 	var buffer bytes.Buffer
 
@@ -715,11 +743,11 @@ func CanonicalDigestBytes(input DigestInput) []byte {
 	writeLengthPrefixed(&buffer, []byte(input.CommandType))
 
 	var count [4]byte
-	binary.LittleEndian.PutUint32(count[:], uint32(len(streams))) //nolint:gosec // a stream count cannot approach 2^32
+	binary.LittleEndian.PutUint32(count[:], uint32(len(targets))) //nolint:gosec // a target count cannot approach 2^32
 	buffer.Write(count[:])
 
-	for _, stream := range streams {
-		writeLengthPrefixed(&buffer, []byte(stream))
+	for _, target := range targets {
+		writeLengthPrefixed(&buffer, []byte(target))
 	}
 
 	writeLengthPrefixed(&buffer, input.Payload)
@@ -744,12 +772,21 @@ func DefaultDigest(input DigestInput) (string, error) {
 
 // CommandIdentity describes a command to a store with outcomes enabled when there is no single
 // Command value to derive it from, such as a multi-stream transaction.
+//
+// It is the caller's intent — the principal (from the metadata), the command type, the streams
+// the request names, and the payload — and nothing derived from state. The streams a command
+// reads and writes are decided per attempt, after the identity is fixed, and may change between
+// attempts; they are not part of the identity, so a re-prepared command, a client retry that
+// arrives after the command landed, and an ambiguous-write recovery all digest to the same value.
 type CommandIdentity struct {
 	// Type is the command's type string.
 	Type CommandType
 
-	// Streams are the stream IDs the command declares it will write.
-	Streams []EntityID
+	// Targets are the stream IDs the request itself names (an account, a profile), known before
+	// any state is read. Streams the command derives from state it reads, such as the handle an
+	// entity currently holds, are not targets. A command with no named stream, such as an
+	// outcome-only command, has none.
+	Targets []EntityID
 
 	// Payload is JSON-encoded canonically into the digest. Nil means the command has no payload.
 	Payload any
@@ -757,22 +794,22 @@ type CommandIdentity struct {
 
 // DigestInput builds the digest input for the identity and the command metadata's principal.
 func (identity CommandIdentity) DigestInput(metadata Metadata) (DigestInput, error) {
-	input := DigestInput{CommandType: identity.Type, Streams: identity.Streams}
+	input := DigestInput{CommandType: identity.Type, Targets: identity.Targets}
 
-	// The identity strings are hashed as bytes, but a command's type, streams, and principal that
+	// The identity strings are hashed as bytes, but a command's type, targets, and principal that
 	// are not valid UTF-8 cannot be stored or compared identically on every backend.
 	if err := checkText("commandType", string(identity.Type)); err != nil {
 		return DigestInput{}, err
 	}
 
-	for _, stream := range identity.Streams {
-		if err := checkText("streams", string(stream)); err != nil {
+	for _, target := range identity.Targets {
+		if err := checkText("targets", string(target)); err != nil {
 			return DigestInput{}, err
 		}
 
-		// A command may not declare a reserved target stream: no outcome is read or recorded for
-		// a command aimed at engine-managed rows, even one that later writes nothing.
-		if err := CheckReservedEntityID(stream); err != nil {
+		// A command may not name a reserved target stream: no outcome is read or recorded for a
+		// command aimed at engine-managed rows, even one that later writes nothing.
+		if err := CheckReservedEntityID(target); err != nil {
 			return DigestInput{}, err
 		}
 	}

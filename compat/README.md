@@ -9,7 +9,7 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 | ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes the C6 `metadata-extensions` handoff; remaining v0.9 scenarios (C1–C10) for E2.8/E3.8 are listed in the [storage format](../docs/spec/storage-format.md#compat-scenarios-to-add). |
 | `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
-| `fixtures/outcomes.json`  | Go generator | C3/C4 identity-digest vectors (canonical bytes and SHA-256) and the encodings of outcome rows: DynamoDB item, budgeted item size, PostgreSQL row, rejection and event-ID JSON. |
+| `fixtures/outcomes.json`  | Go generator | C3/C4 identity-digest vectors (canonical bytes and SHA-256, keyed by `targets`, including a rename whose write set comes from state), the encodings of outcome rows (DynamoDB item, budgeted item size, PostgreSQL row, rejection and event-ID JSON, including both stale-fence rejections), and the C5 retry-policy defaults both languages assert. |
 | `fixtures/feature-marker.json` | Go generator | C9 canonical manifest JSON, complete DynamoDB marker items, PostgreSQL declaration rows, ordered commit requests, and schema-upgrade DDL. |
 | `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items, SNS messages, sequences, and loaded state.                                                                                             |
 
@@ -68,7 +68,7 @@ changed, and update the spec.
    `execute` step may set `injectCommitFault` (`applyThenFail` or `failWithoutApplying`) to make
    its commit apply, or drop, while the caller observes an indeterminate error. The harness scopes
    command IDs to the run and scenario (`compat-<run>-<scenario>-<id>`) and uses a digest that
-   maps the run name in the declared stream IDs to the fixture run's, so digests are run
+   maps the run name in the target stream IDs to the fixture run's, so digests are run
    independent; the digested payload is the step's `command` object with sorted keys.
 2. If the scenario needs a new command or event, add it to both account domains.
 3. Regenerate the fixtures and run both test suites and both live runs.

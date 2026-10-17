@@ -151,10 +151,10 @@ replaces the contracts that require them:
 - `evt/result` — `Repository.StreamAllEvents`, `Repository.StreamEntities`,
   `SnapshotStreamer`, and `RebuildProjectionsFromStream` still return `result.Result` channels
 - `policy.Hooks` / `policy.Attempt` / `policy.Config.Classify` / `policy.Classifier` (K6) —
-  `policy.Execute`/`ExecuteWithRetry` still take a `Hooks` argument, and custom retry
-  decisions (`Config.Classify`) have no replacement until the core reshape (C5) lands
+  `policy.Execute` still takes a `Hooks` argument, so these carry no `Deprecated:` notice yet
   (the built-in `policy.Classify` only recognizes `ClassifiedError`, so a custom classifier
-  is the only supported way to mark raw backend errors transient)
+  is the only supported way to mark raw backend errors transient). `policy.ExecuteWithRetry`
+  is deprecated: fence-aware retry (C5, below) replaces blind whole-command retry
 
 Three v0.9.0 changes are source-breaking without a deprecation window:
 
@@ -222,10 +222,12 @@ default:
 }
 ```
 
-- **Identity.** A command's identity digest (SHA-256 over its type, declared target streams,
-  canonical payload JSON, and principal) is computed before it runs; the same ID with the same
-  digest replays, a different digest is `*evt.IdempotencyKeyReuseError` (carrying the stored
-  outcome). Supply your own with `snapshots.WithDigester`.
+- **Identity.** A command's identity digest (SHA-256 over its type, the target streams the
+  request names, canonical payload JSON, and principal) is computed before it runs; the same ID
+  with the same digest replays, a different digest is `*evt.IdempotencyKeyReuseError` (carrying
+  the stored outcome). The identity is the caller's intent: the streams a command goes on to read
+  and write are not part of it, because they can depend on state and change between attempts.
+  Supply your own with `snapshots.WithDigester`.
 - **Rejections (C4).** A handler error that implements `evt.Rejectioner` (`NotFoundError` and
   `BadCommandError` do, with the engine codes `not-found` and `bad-command`) is persisted as a
   rejected outcome. Any other error — a bad event, an encoding or storage failure — is an internal
@@ -245,10 +247,50 @@ default:
   be valid UTF-8, and a custom digest must be non-empty: both are refused before anything is read. U+0000 is refused
   alike on every backend in a command ID, a digest, and a rejection's code, message, and details.
   `Store.ResolveCommand` runs the same read for a caller that lost the result entirely.
-- **Multi-stream commands** use `Store.BeginCommand`, which reads the outcome row first, then the
-  usual `Read`/`Append`/`Fence`, then `Transaction.Complete` (accepted, or a no-op when nothing was
-  appended) or `Transaction.Reject`. A failed caller-stamped fence is persisted as a `stale-fence`
-  rejection; the remedy is a new command ID.
+- **Multi-stream commands** use `Store.ExecuteTransaction`, which runs your decision step
+  (`snapshots.Prepare`) under fence-aware retry (below), or `Store.BeginCommand`, which reads the
+  outcome row first, then the usual `Read`/`Append`/`Fence`, then `Transaction.Complete`
+  (accepted, or a no-op when nothing was appended) or `Transaction.Reject`, attempting once. A
+  failed caller-stamped fence is persisted as a `stale-fence` rejection; the remedy is a new
+  command ID.
+- **Fence-aware retry (C5).** `ExecuteWithOutcome`, `Execute` on an outcomes store, and
+  `ExecuteTransaction` retry a command that conflicts with another writer, up to
+  `snapshots.RetryPolicy` (`Store.WithRetry`; the default is 5 attempts, 25 ms doubling to 1 s,
+  jittered). A conflict on anything the engine can re-derive — an event put, a snapshot or
+  continuity check, an engine-filled fence — **re-prepares** the command: the entity is reset and
+  loaded again, the handler (or your `Prepare`) runs again against fresh state, and only the
+  attempt that commits writes anything. A failed **caller-stamped** fence fails fast with the
+  `stale-fence` rejection instead, because the engine cannot know your decision still holds. When
+  the last attempt also conflicts, the engine persists a `stale-fence` rejection
+  (`evt.RetriesExhaustedRejection`) as the command's outcome, so a replay of the ID gets the same
+  answer; submit a new command ID to try again. Handlers and `Prepare` functions may therefore
+  run more than once and must be safe to repeat. A transient failure that is not a conflict
+  (throttling, an ambiguous write that never resolved) is retried the same way but returned as an
+  error when attempts run out.
+
+  A command whose write set depends on state — a rename that releases whichever handle the
+  entity currently holds — keeps one identity across attempts, because only the targets in its
+  `evt.CommandIdentity` are digested:
+
+  ```go
+  identity := evt.CommandIdentity{
+      Type: "profile:rename", Targets: []evt.EntityID{profileID}, Payload: rename,
+  }
+
+  outcome, err := store.ExecuteTransaction(ctx, identity, metadata,
+      func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+          profile := NewProfile(profileID)
+          if err := tx.Read(ctx, profile, profileID); err != nil {
+              return nil, err
+          }
+
+          // The handle this profile holds now decides which claim stream is released.
+          released, taken := ClaimID(profile.Handle), ClaimID(rename.Handle)
+          // ... Read both claims, check the new handle is free (return a Rejectioner if not),
+          // then Append to the profile and to both claims.
+          return nil, nil
+      })
+  ```
 - Bounds checked before any write: a command ID is at most 512 UTF-8 bytes
   (`*evt.CommandIDTooLongError`), and the response and the encoded rejection are each at most
   64 KiB (`*evt.OutcomeTooLargeError`). The outcome row counts in the commit budget.

@@ -342,8 +342,9 @@ the transaction, and both implementations classify a failed commit by that index
 - A fence-check failure means another writer moved the stream
   ([Read Fences](#read-fences)). The classification keys off the failing item itself: a failed
   event put, floor check, or snapshot condition is an ordinary conflict regardless of the
-  commit's fences, and only a failed caller-stamped fence yields a stale-fence rejection — per
-  its provenance, per [Fence-Aware Retry](#fence-aware-retry).
+  commit's fences, and only a failed caller-stamped fence yields an immediate stale-fence rejection
+  — per its provenance, per [Fence-Aware Retry](#fence-aware-retry). Conflicts that keep
+  re-preparing until the attempts run out end in a stale-fence rejection too.
 - A feature-marker check failure means the feature set changed under the writer: the writer
   re-validates the feature set, then retries the commit ([Feature Marker](#feature-marker)).
 - A rebuild-lock check failure means a rebuild holds the lock: the commit fails with a
@@ -622,9 +623,9 @@ fence's provenance (engine-filled or caller-stamped). It does **not** carry the 
 index: backends classify a failure internally by the cancellation reason's position (or the
 failing statement), which is neither stable nor comparable across backends. In Go an
 engine-filled fence conflict is classified transient (`policy.Classify` reports
-`ClassTransient`), so `policy.ExecuteWithRetry` retries it exactly like an event-put conflict; a
-caller-stamped one is not classified retryable. In Rust the same split is
-`Error::is_retryable`.
+`ClassTransient`) and matches `evt.IsOptimisticConflict`, so fence-aware retry re-prepares it
+exactly like an event-put conflict; a caller-stamped one is not classified retryable. In Rust the
+same split is `Error::is_retryable`.
 
 Worked example. A transaction loads `claim#ada` at head 3 and fences it. The two items are:
 
@@ -772,17 +773,19 @@ next attempt reads the winner's row and returns whichever branch applies.
 ### Identity digest
 
 The default digest is SHA-256 over the **canonical bytes** of the command's identity, computed
-**before the command executes**. The input is what the command _is_ — its type, the stream IDs it
-declares it will write, its payload, its principal — never the streams the executed commit ended
-up writing. A retry or a recovery re-read therefore computes the same digest without re-running
-the command, even when intervening commits would make a re-preparation derive a different write
-set. A repeat with the same digest returns the stored outcome; a repeat with a different digest is
-`IdempotencyKeyReuse`. The canonical bytes are:
+**before the command executes**. The identity is the caller's **intent**: what the request _is_ —
+its type, the streams it names, its payload, its principal — and nothing that depends on state. It
+is never the streams a command ends up reading, fencing, or writing. A retry, a re-preparation
+(see [Fence-Aware Retry](#fence-aware-retry)), a client retry that arrives after the command
+landed, and an ambiguous-write recovery therefore all compute the same digest without running the
+command, even when a re-preparation derives a different write set. A repeat with the same digest
+returns the stored outcome; a repeat with a different digest is `IdempotencyKeyReuse`. The
+canonical bytes are:
 
 ```text
 "evt-cmd-digest-v1" || 0x00
 || lp(command type)
-|| uint32-le(stream count) || lp(stream ID) …    declared target stream IDs, sorted by byte order, deduplicated
+|| uint32-le(target count) || lp(target stream ID) …    target stream IDs, sorted by byte order, deduplicated
 || lp(canonical payload JSON)
 || lp(principal)
 
@@ -790,15 +793,16 @@ lp(x)  = uint32 little-endian byte length of x, followed by x
 ```
 
 - `command type` is the command's type string.
-- The declared target stream IDs are the streams the command declares it will write events to —
-  fixed before execution, deduplicated and sorted by byte order. The executed commit may write a
-  subset of them (state can change under it); the digest is unchanged either way, which is what
-  makes retries and recovery compare equal. It may **not** write a stream outside them: the digest
-  would omit that effect, and a later call with the declared identity would replay an outcome for
-  it. Appending to an undeclared stream is refused (Go `*InvalidCommitError`, Rust
-  `Error::InvalidCommit`) before anything is staged, and the transaction stays usable. Fenced (read-only) streams are not part of the
-  digest; a fenced conflict is caught by the fence checks themselves. An outcome-only commit
-  declares an empty list.
+- The **target** stream IDs are the streams the request itself names — an account, a profile — and
+  are known from the request alone, before any state is read. They are deduplicated and sorted by
+  byte order. Whether the command goes on to write them is not part of the identity. A command that
+  names no stream, such as an outcome-only command, has none.
+- The streams a command **derives from state it reads** are not targets and are not in the digest:
+  a rename releases whichever handle the profile currently holds, so the streams it writes (the
+  released claim, the new claim, the profile) come from the profile's state and can differ from one
+  attempt to the next. A command may read, fence, and append to any stream, named or not; the
+  outcome row's `events` lists every stream the commit wrote. Fenced (read-only) streams are not
+  part of the digest either; a fenced conflict is caught by the fence checks themselves.
 - `canonical payload JSON` is the command payload encoded by the shared JSON rules (the same
   encoder as every JSON document in this format). A command with no payload contributes the
   zero-length byte string (`lp("")`); a payload of JSON `null` encodes as the four bytes `null`.
@@ -810,6 +814,22 @@ lp(x)  = uint32 little-endian byte length of x, followed by x
   old command IDs then digest differently, which surfaces as `IdempotencyKeyReuse` rather than a
   silently matched outcome.
 
+**Why the write set is not identity (v0.9, C5).** Putting the streams a command will write in the
+digest cannot express a command whose write set depends on state. Declared up front, the set is a
+guess; derived from the state one attempt read, it changes when the command is re-prepared against
+newer state, and the same request then looks like an `IdempotencyKeyReuse` or cannot be replayed.
+Identity is therefore what the caller can state before reading anything, and the effects are
+recorded where they belong, in the outcome row's `events` list, which a replay returns verbatim.
+A replay needs nothing more: it returns the stored outcome without running the command, so no
+effect goes unrecorded, and a digest that omits the write set cannot hide one.
+
+**There is no wire-format change.** The canonical bytes above are unchanged, the tag stays
+`evt-cmd-digest-v1`, and every existing digest vector in `compat/fixtures/outcomes.json` is
+byte-for-byte what it was. What changed is the meaning of the stream list and the API around it:
+an append to a stream outside the identity is no longer refused, the digest-input vectors' `streams`
+key became `targets`, and the Go and Rust identity types renamed the field and builder
+(`Targets` / `with_targets`) to say what belongs in them.
+
 A custom digester stores its own opaque string in `digest`; ambiguous-write recovery compares
 digests for equality only.
 
@@ -819,7 +839,7 @@ Worked example. Command type `account:open`, target stream `acct-1`, payload
 ```text
 evt-cmd-digest-v1 00
 0c000000 6163636f756e743a6f70656e                    "account:open"
-01000000 06000000 616363742d31                       1 stream: "acct-1"
+01000000 06000000 616363742d31                       1 target: "acct-1"
 0f000000 7b226f776e6572223a22416461227d              '{"owner":"Ada"}'
 07000000 757365723a3432                              "user:42"
 ```
@@ -842,6 +862,34 @@ evt-cmd-digest-v1 00
 
 SHA-256 is `21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79` — the `digest` in
 the rejected example above.
+
+A command whose write set comes from state: command type `profile:rename`, target stream
+`profile#u-1`, payload `{"handle":"grace"}`, principal `user:42`. The request names the profile; the
+claims it releases and takes (`claim#ada`, `claim#grace`) come from the profile's state and are not
+in the bytes:
+
+```text
+evt-cmd-digest-v1 00
+0e000000 70726f66696c653a72656e616d65                "profile:rename"
+01000000 0b000000 70726f66696c6523752d31             1 target: "profile#u-1"
+12000000 7b2268616e646c65223a226772616365227d        '{"handle":"grace"}'
+07000000 757365723a3432                              "user:42"
+```
+
+88 bytes; SHA-256 is `00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0`. A first
+attempt that read the profile at one handle and a re-preparation that reads it at another write
+different streams under this one digest, and the accepted outcome lists what the committing
+attempt wrote:
+
+```json
+{
+  "pk": "command-outcome#cmd-0008",
+  "sk": 1,
+  "status": "accepted",
+  "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0",
+  "events": "[\"claim#ada:2\",\"claim#grace:1\",\"profile#u-1:2\"]"
+}
+```
 
 A store with outcomes enabled **requires a command ID** on every command; a missing ID is a
 programmer error returned before the commit — no outcome row, no events. Stores built without
@@ -914,7 +962,7 @@ corruption error (Go `*CorruptOutcomeError`, Rust `Error::InvalidRecord`) and is
 result; `compat/fixtures/outcomes.json` carries the malformed rows both languages must refuse.
 
 A command ID must be valid UTF-8 (Go strings can hold arbitrary bytes; Rust `String`s are UTF-8 by
-construction), as must the command type, declared stream IDs, and principal that feed the digest:
+construction), as must the command type, target stream IDs, and principal that feed the digest:
 anything else is a typed invalid-argument error before the outcome or the aggregate is read. A
 first execution returns the rejection in its stored (decoded) form, with the numbers in `details`
 read back as the stored text, so its result equals a replay's on every backend.
@@ -974,40 +1022,135 @@ language; codes are free-form strings beyond the engine-provided ones.
 
 A `stale-fence` rejection is durable even though the condition it records is transient: exactly
 one outcome per command ID is the contract, so the old ID stays terminal and its rejection replays
-verbatim. It is persisted by the outcome-only transaction pinned in
-[Fence-Aware Retry](#fence-aware-retry), which deliberately omits the failed fences. The remedy is
-a new command ID, not a retry of the old one.
+verbatim. The engine records it in two cases, both persisted by the outcome-only transaction
+pinned in [Fence-Aware Retry](#fence-aware-retry), which deliberately omits the failed fences: a
+caller-stamped fence failed, or fence-aware retry ran out of attempts. The remedy is a new command
+ID, decided on fresh state, not a retry of the old one.
 
 ## Fence-Aware Retry
 
-On conflict, a failed commit is classified **by the transaction item that failed** — DynamoDB
-reports one cancellation reason per item, indexed by position, and PostgreSQL maps the statement
-that raised the error — and only then by fence provenance (v0.9, C5):
+A command on a store with outcomes runs under **fence-aware retry** (v0.9, C5): a bounded number
+of attempts, each of which decides the command from scratch against freshly loaded state, and a
+persisted answer when the attempts run out. It replaces blind whole-command retry
+(`policy.ExecuteWithRetry`, `Store::execute_with_retry`) as the default path for commands with
+outcomes; the policy packages remain for backend-level transient classification and for stores
+without outcomes.
 
-- A failed **event put, floor check, or snapshot condition** is an ordinary optimistic-concurrency
-  conflict, re-prepared like any other ([Writes](#writes)) — the command re-runs against a fresh
-  load — **whether or not the commit carried caller-stamped fences**. A caller-stamped fence that
-  still passed says nothing about this failure: the commit's own write set moved, the fences are
-  beside the point, and persisting a rejection would be false. Re-preparation re-derives the
-  fences from the fresh load in the usual way.
-- A failed **caller-stamped fence check** (a head the caller supplied) is a **stale-fence
-  rejection**: the engine cannot know the caller's decision is still valid, so it does not retry.
-  It returns the rejection persisted as the command's outcome
-  ([Command Outcomes](#command-outcomes)) with the reserved code `stale-fence`. Only a
-  caller-stamped fence that itself failed produces one; engine-filled fences re-prepare
-  internally and never surface it. Although a stale fence is transient by nature, the rejection
-  is a durable, terminal outcome — exactly one outcome per command ID is the contract — so the
-  remedy is not a retry of the same command: the caller re-reads the fenced streams, re-decides,
-  and submits a **new command ID**. The old ID replays its stored `stale-fence` rejection
-  verbatim, like any rejected outcome.
-- A failed **engine-filled fence check** re-prepares internally: the engine loaded the fenced
-  streams itself, so it can reload them and re-decide.
+### Classification
 
-This replaces blind whole-command retry as the default path for transactional commands; the
-policy packages remain for backend-level transient classification. Control-row failures — the
-feature-marker and rebuild-lock checks — are classified separately ([Writes](#writes)) and never
-reach this rule: a stale-fence rejection is produced only by a caller-stamped fence that failed,
-never by a control row, an event put, or a snapshot condition.
+A failed commit is classified **by the transaction item that failed** — DynamoDB reports one
+cancellation reason per item, indexed by position, and PostgreSQL maps the statement that raised
+the error — and only then by fence provenance:
+
+- A failed **event put, floor check, snapshot condition, or continuity check** at commit time is
+  an ordinary optimistic-concurrency
+  conflict, re-prepared like any other ([Writes](#writes)) — the command runs again against a
+  fresh load — **whether or not the commit carried caller-stamped fences**. A caller-stamped
+  fence that still passed says nothing about this failure: the commit's own write set moved, the
+  fences are beside the point, and persisting a rejection for it would be false. Re-preparation
+  re-derives the engine-filled fences from the fresh load in the usual way.
+- A failed **engine-filled fence check** is re-prepared: the engine loaded the fenced streams
+  itself, so it can reload them and decide again.
+- A failed **caller-stamped fence check** (a head the caller supplied) **fails fast**: the engine
+  cannot know the caller's decision is still valid, so it neither re-prepares nor waits. It
+  persists the command's outcome at once as a rejection with the reserved code `stale-fence` and
+  the message `a caller-stamped fence went stale`. Only a caller-stamped fence that itself failed
+  produces this form.
+- A DynamoDB `TransactionConflict` (another transaction was writing the same items) is a conflict
+  in both languages. A throttled commit and an ambiguous write whose outcome row never appeared
+  are **transient**: they run again after a backoff, but they are not conflicts, so they never
+  exhaust into a rejection ([Exhausted attempts](#exhausted-attempts)). So is a **load** that
+  found a sequence gap (a compaction raced it, or events expired): reloading resolves the first
+  case, so it is retried, but it says the read was inconsistent, not that a decision went stale,
+  and a gap that persists is returned as an error rather than recorded against the command ID.
+- Control-row failures — the feature-marker and rebuild-lock checks — are classified separately
+  ([Writes](#writes)) and never reach this rule, and a lost outcome put is resolved through the
+  outcome row, never by re-preparing ([Command Outcomes](#command-outcomes)). Every other error
+  (an invalid argument, a handler's own error, `IdempotencyKeyReuse`, a corrupt row) is returned
+  at once.
+
+### Re-preparing
+
+**Re-prepare** means running the command's decision step again from scratch, against state read
+after the failure:
+
+1. read the command's outcome row again (every attempt starts with the pre-check, so a competing
+   writer that recorded the same command, or an attempt that landed after an ambiguous result, is
+   found and returned instead of run again);
+2. load the aggregates again;
+3. run the handler (single aggregate) or the caller's prepare step (multi-stream) again;
+4. commit again.
+
+Nothing carries over from a failed attempt: its staged events, snapshot, fences, and projector
+operations are discarded, and only the attempt that commits writes anything. The handler or
+prepare step can therefore run several times for one command and must be safe to repeat; external
+side effects it causes must be idempotent. In Go the entity the caller supplied is reset to what
+it was handed in before each re-preparation; an entity the engine cannot reset (not a pointer to
+a struct) is attempted once and a conflict is returned as an error, so applying events twice can
+never double-count them. Rust loads a fresh aggregate for every attempt.
+
+**The write set may change between attempts.** The streams a command reads and writes come from
+state, so a re-preparation can derive different ones — a rename that found the handle `ada` on the
+first attempt and `ada2` on the second releases a different claim stream. That is one command: its
+identity is the request's intent ([Identity digest](#identity-digest)), computed once before
+any attempt, so the digest is the same on every attempt, on a client retry that arrives after the
+command landed, and in a recovery read. The outcome row records the streams the committing attempt
+wrote.
+
+### Policy
+
+The attempts are bounded and spaced by a policy that is configurable per store and has the same
+defaults in both languages (`compat/fixtures/outcomes.json` pins them, and both implementations
+assert them):
+
+| Setting      | Default | Meaning                                                                          |
+| ------------ | ------- | -------------------------------------------------------------------------------- |
+| Max attempts | 5       | Attempts in total, the first included. A value below 1 means 1.                  |
+| Base delay   | 25 ms   | The delay before the first retry, before jitter.                                 |
+| Max delay    | 1 s     | The upper bound for any delay. A zero base or max delay retries without waiting. |
+
+The delay before retry _n_ (starting at 0) is `min(base × 2ⁿ, max)`, with jitter taking it
+anywhere in `[delay / 2, delay]`, so writers that conflicted together do not retry together.
+There is no wait after the last attempt. Go configures it with `snapshots.RetryPolicy` and
+`Store.WithRetry` (a `Sleep` function and a `Jitter` function are injectable, and the wait ends
+with the context's error if the context ends); Rust with `RetryPolicy` and
+`OutcomeConfig::with_retry`, waiting on the repository's timer (`Repository::backoff`, the timer
+ambiguous-write recovery already uses). A caller that wants to own the loop uses the lower-level
+calls — `BeginCommand`/`Complete`/`Reject` in Go, `begin_command`/`commit_with_outcome`/`reject`
+in Rust — which attempt once and return an engine-filled conflict as an error.
+
+### Exhausted attempts
+
+When the last attempt also ends in a conflict, the engine persists a `stale-fence` rejection as the
+command's outcome instead of returning the conflict, so a replay of the command ID gets the same
+answer. Its shape is pinned in both languages: the code is `stale-fence`, the message is
+`the state this command was decided on kept changing; retries were exhausted`, and `details` is
+`{"attempts": N}` with `N` the number of attempts made, an integer so both languages store the same
+bytes:
+
+```json
+{
+  "pk": "command-outcome#cmd-0009",
+  "sk": 1,
+  "status": "rejected",
+  "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0",
+  "rejection": "{\"code\":\"stale-fence\",\"message\":\"the state this command was decided on kept changing; retries were exhausted\",\"details\":{\"attempts\":5}}",
+  "code": "stale-fence"
+}
+```
+
+Only a conflict exhausts into a rejection. When attempts run out on a transient failure that is
+not a conflict (throttling, an ambiguous write whose row never appeared), nothing says the state
+went stale, so the error is returned and no rejection is recorded; the same command ID can run
+again.
+
+Although a stale fence is transient by nature, the rejection is a durable, terminal outcome —
+exactly one outcome per command ID is the contract — so the remedy is not a retry of the same
+command: the caller re-reads, re-decides, and submits a **new command ID**. The old ID replays its
+stored `stale-fence` rejection verbatim, like any rejected outcome, and the same ID with another
+identity is `IdempotencyKeyReuse`.
+
+### The outcome-only transaction
 
 The rejection is persisted by an **outcome-only transaction** that carries none of the failed
 commit's other items: no fences (they are stale by definition), no event puts, no snapshot or
@@ -1028,8 +1171,9 @@ rebuild — neither turns the pending rejection into something else. If the outc
 condition, the standard
 resolution applies: the next read of the row returns the winner's outcome (same digest) or
 `IdempotencyKeyReuse` (different digest) ([Command Outcomes](#command-outcomes)). A persisted
-`stale-fence` row — command `account:rename` on `acct-1`, payload `{"name":"Grace"}`, principal
-`user:42`, whose caller-stamped fence on `referral#r-3` at head 2 went stale before the commit:
+`stale-fence` row for a caller-stamped fence — command `account:rename` on `acct-1`, payload
+`{"name":"Grace"}`, principal `user:42`, whose caller-stamped fence on `referral#r-3` at head 2
+went stale before the commit:
 
 ```json
 {
@@ -1049,7 +1193,10 @@ re-prepared as a generic conflict. The next attempt's outcome pre-check resolves
 winner's row returns the stored outcome (same digest) or `IdempotencyKeyReuse` (different digest)
 ([Command Outcomes](#command-outcomes)).
 
-Fence provenance (engine-filled vs caller-stamped) is in-memory commit metadata, not stored.
+Fence provenance (engine-filled vs caller-stamped) is in-memory commit metadata, not stored. The
+only stored trace of fence-aware retry is the exhausted rejection above, which is an ordinary
+outcome row, so **there is no wire-format change** beyond the pinned message and details of that
+rejection.
 
 ## Reserved Namespaces
 
@@ -1776,6 +1923,10 @@ These differences are deliberate and covered by tests. Keep them documented here
   upgraded log it is the only guard for pre-v0.9 command IDs, which have no outcome rows — a
   pre-v0.9 duplicate beyond the latest snapshot is not detected (a documented upgrade limitation,
   no backfill).
+- **Resetting between attempts.** Go resets the entity the caller supplied to its original value
+  before each re-preparation (a deep copy of its exported fields) and, for an entity that is not a
+  pointer to a struct, attempts the command once and returns a conflict as an error. Rust loads a
+  fresh aggregate for every attempt. Neither is observable in the stored data.
 - **PostgreSQL metadata.** Stored as `jsonb`, so its bytes differ from the encoded JSON. Compare it
   as JSON.
 
@@ -1799,7 +1950,7 @@ rather than only the re-read branches); the remaining scenarios need more (`decl
 `acquireRebuildLock`, `releaseRebuildLock`, `forceReleaseRebuildLock`, `readLatest`,
 `rebuildViews`, a multi-stream execute). [`compat/README.md`](../../compat/README.md) holds the op
 table. The harness scopes command IDs to the run and scenario, because outcome rows are global to
-the table, and uses a digest that replaces the run name in the declared stream IDs, so a command
+the table, and uses a digest that replaces the run name in the target stream IDs, so a command
 digests the same in every run and the committed digests hold against live backends.
 `compat/fixtures/outcomes.json` pins the digest vectors (canonical bytes and digest) and the
 encodings of the outcome rows (DynamoDB item, its budgeted size, PostgreSQL row).
@@ -1813,7 +1964,7 @@ encodings of the outcome rows (DynamoDB item, its budgeted size, PostgreSQL row)
 | `commit-too-large`     | C1     | A commit whose item budget exceeds 100, or whose estimated request exceeds the byte budgets (3,800,000 bytes in aggregate, 380,000 bytes for any single item), fails with `CommitTooLarge` before any write, in both languages and on both backends; nothing is stored and the commit is never split.                                                                                                                                                                                                                                                                                                                                                                                          |
 | `multi-stream-commit`  | C1     | One commit appends to two streams atomically; the other language interleaves and must see both streams or neither. Per-stream floor checks apply. Every touched stream is observed, and the fixture pins the transaction's `TransactWriteItems` action order, which the Rust builder asserts.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `read-fences`          | C2     | A fenced read fails when the other language appends past the head; the compaction ABA (append, snapshot, compact past the head) still fails the fence; the snapshot companion is present on every fenced read, including one whose aggregate has snapshots disabled; a fenced-and-written stream emits no fence checks; the fixture pins every fenced transaction's action order (fence checks after the written streams' groups); a fence on a stream whose type is in the manifest's durable `retention` set is refused with `RetentionConflict` — including by a writer that configured no retention itself.                                                                                |
-| `fence-aware-retry`    | C2, C5 | Classification is per failing item: an event-put or floor failure in a commit that also carries caller-stamped fences still re-prepares and succeeds; a failed caller-stamped fence produces the persisted `stale-fence` rejection, whose only remedy is a new command ID — the old ID replays the rejection.                                                                                                                                                                                                                                                                                                                                                                                  |
+| `fence-aware-retry`    | C2, C5 | Classification is per failing item: an event-put or floor failure in a commit that also carries caller-stamped fences still re-prepares and succeeds; a failed caller-stamped fence produces the persisted `stale-fence` rejection at once, without preparing again, whose only remedy is a new command ID — the old ID replays the rejection; an engine-filled conflict re-prepares and only the committing attempt writes; exhausted attempts persist the `retries exhausted` rejection, which replays identically; a command whose write set changes between attempts keeps one identity. Both languages run these cases in their conformance suites on every backend; the fixtures pin the rejection bytes, the rename digest, and the policy defaults. |
 | `metadata-extensions`  | C6     | `principalId`, `causationId`, and `extensions` round-trip in both directions, including the defaults: `causationId` written as the command ID when unset, `extensions` written as `{}`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `commit-grouping`      | C6, C7 | A multi-stream commit's events carry one `commitId` across all its streams. A rebuild of a **history-dependent** projector replays every commit grouped by `commitId`, each group's events in the pinned (stream ID, sequence) order, and pre-v0.9 events without `commitId` replay as single-event commits; a rebuild of a **current-state** projector never replays — it loads every aggregate's final state and derives the complete row set through the state entry point, producing the same rows over a compacted prefix as over a full log. `CompactBelow` refuses an entity type in the durable `historyDependent` set — including from a process that never registered the projector. |
 | `commit-wide-views`    | C7     | A commit-wide projector writes rows at a `pk` outside `{entityType}#{entityId}` and deletes a row; the other language reads the rows after the commit; a `pk` over 2,048 or an `sk` over 1,024 UTF-8 bytes fails with `ViewKeyTooLong` before any write.                                                                                                                                                                                                                                                                                                                                                                                                                                       |

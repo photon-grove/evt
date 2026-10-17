@@ -9,8 +9,8 @@ use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Begin, CommandIdentity, CommandOutcome, Commit, DigestInput, EntityId, EntityType, Error,
     EventId, EventSequence, EventType, EventVersion, ExecuteError, FenceProvenance, Metadata,
-    NewSnapshot, OutcomeConfig, ReadFence, Repository, SerializedEvent, Store, TransactionCommit,
-    default_digest, json,
+    NewSnapshot, OutcomeConfig, ReadFence, Repository, RetryPolicy, SerializedEvent, Store,
+    TransactionCommit, default_digest, json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -417,7 +417,7 @@ impl<R: Repository> Runner<R> {
 
     /// A runner for a scenario in a run: a store with command outcomes for an outcomes scenario,
     /// a plain one otherwise. The outcomes store's identity digest replaces the run name in each
-    /// declared stream ID with the fixture run's, so a command digests the same in every run and
+    /// target stream ID with the fixture run's, so a command digests the same in every run and
     /// the golden fixtures' digests hold against live backends. Command IDs are scoped to the run
     /// and the scenario, because outcome rows are global to the table.
     pub fn for_scenario(repository: R, scenario: &Scenario, run: &str) -> Self {
@@ -426,13 +426,16 @@ impl<R: Repository> Runner<R> {
         if scenario.outcomes {
             let (from, to) = (format!("compat-{run}-"), format!("compat-{FIXTURE_RUN}-"));
             // A short recovery window keeps the dropped-commit step quick; it still ends in the retryable
-            // ambiguous result because the row never appears.
+            // ambiguous result because the row never appears. One attempt per step: a scenario step
+            // pins what a single attempt returns, so the engine must not run the command again on
+            // its own (fence-aware retry has its own conformance cases).
             let config = OutcomeConfig::new()
                 .with_recovery_wait(std::time::Duration::from_millis(100))
+                .with_retry(RetryPolicy::immediate(1))
                 .with_digester(move |input: &DigestInput| {
                     let mut input = input.clone();
-                    for stream in &mut input.streams {
-                        *stream = EntityId::new(stream.as_str().replacen(&from, &to, 1));
+                    for target in &mut input.targets {
+                        *target = EntityId::new(target.as_str().replacen(&from, &to, 1));
                     }
 
                     default_digest(&input)
@@ -668,7 +671,7 @@ impl<R: Repository> Runner<R> {
     }
 
     /// Records a command that writes no events: an accepted outcome carrying the step's response,
-    /// from an outcome-only transaction that declares no streams.
+    /// from an outcome-only transaction that names no streams.
     async fn outcome_only(&self, step: &Step) -> Result<Outcome, StepError> {
         let identity = step
             .identity

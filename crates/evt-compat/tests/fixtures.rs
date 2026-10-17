@@ -9,10 +9,11 @@ use evt_compat::{Account, Runner, ScenarioFixtures, Scenarios};
 use photon_evt::wire::postgres::OutcomeRow;
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
-    Aggregate, DigestInput, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion,
-    FeatureManifest, FeatureMarker, MAX_COMMAND_ID_BYTES, MAX_OUTCOME_BYTES, MemRepository,
-    Metadata, Outcome, Rejection, SerializedEvent, SerializedSnapshot, canonical_digest_bytes,
-    default_digest, json, snapshot_events_due,
+    Aggregate, CommandIdentity, DigestInput, EntityId, EntityType, EventId, EventSequence,
+    EventType, EventVersion, FeatureManifest, FeatureMarker, MAX_COMMAND_ID_BYTES,
+    MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, Rejection, RejectionCode, RetryPolicy,
+    SerializedEvent, SerializedSnapshot, canonical_digest_bytes, default_digest, json,
+    snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -536,10 +537,20 @@ async fn sibling_fixtures_pin_the_streams_scenarios_write() {
 #[serde(rename_all = "camelCase")]
 struct OutcomeFixtures {
     limits: OutcomeLimits,
+    retry: RetryDefaults,
     digests: Vec<DigestVector>,
     rows: Vec<RowVector>,
     #[serde(default)]
     malformed_rows: Vec<MalformedRow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryDefaults {
+    max_attempts: u32,
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+    stale_code: String,
 }
 
 #[derive(Deserialize)]
@@ -562,7 +573,7 @@ struct DigestVector {
 #[serde(rename_all = "camelCase")]
 struct DigestInputVector {
     command_type: String,
-    streams: Vec<String>,
+    targets: Vec<String>,
     payload: Option<String>,
     principal: String,
 }
@@ -619,12 +630,83 @@ fn outcome_limits_match_go() {
 }
 
 #[test]
+fn retry_defaults_match_go() {
+    let retry = outcome_fixtures().retry;
+    let policy = RetryPolicy::default();
+
+    assert_eq!(policy.max_attempts, retry.max_attempts);
+    assert_eq!(
+        policy.base_delay,
+        Duration::from_millis(retry.base_delay_ms)
+    );
+    assert_eq!(policy.max_delay, Duration::from_millis(retry.max_delay_ms));
+    assert_eq!(RejectionCode::STALE_FENCE, retry.stale_code.as_str());
+}
+
+/// The stale-fence rejections the engine records are built, not just decoded: Rust's constructors
+/// must produce the bytes Go's do.
+#[test]
+fn stale_fence_rejections_match_go_byte_for_byte() {
+    let rows = outcome_fixtures().rows;
+    let stored = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row vector {name:?}"))
+            .input
+            .rejection
+            .clone()
+            .expect("a rejection")
+    };
+
+    assert_eq!(
+        Rejection::stale_fence().encode().unwrap(),
+        stored("rejected stale fence")
+    );
+    assert_eq!(
+        Rejection::retries_exhausted(5).encode().unwrap(),
+        stored("rejected stale fence, retries exhausted")
+    );
+}
+
+/// A command's identity is its intent: the digest of a rename, whose write set comes from state, is
+/// computed from the request alone, and Rust's `CommandIdentity` reproduces Go's vector.
+#[test]
+fn a_command_identity_digests_from_the_request_alone() {
+    let fixtures = outcome_fixtures();
+    let vector = fixtures
+        .digests
+        .iter()
+        .find(|vector| vector.name == "rename, state-derived write set is not identity")
+        .expect("the rename digest vector");
+
+    let identity = CommandIdentity::new(&vector.input.command_type)
+        .with_targets(vector.input.targets.iter().map(String::as_str))
+        .with_payload_json(vector.input.payload.clone().unwrap_or_default());
+    let metadata = Metadata::default().with_principal_id(vector.input.principal.as_str());
+
+    assert_eq!(
+        default_digest(&identity.digest_input(&metadata)).unwrap(),
+        vector.digest
+    );
+
+    let row = fixtures
+        .rows
+        .iter()
+        .find(|row| row.name == "accepted rename, state-derived write set")
+        .expect("the rename row vector");
+    assert_eq!(
+        row.input.digest, vector.digest,
+        "the stored outcome carries the request's digest, whatever streams the commit wrote"
+    );
+}
+
+#[test]
 fn command_identity_digests_match_go_byte_for_byte() {
     for vector in outcome_fixtures().digests {
         let name = &vector.name;
         let input = DigestInput {
             command_type: vector.input.command_type,
-            streams: vector.input.streams.iter().map(EntityId::new).collect(),
+            targets: vector.input.targets.iter().map(EntityId::new).collect(),
             payload: vector.input.payload.unwrap_or_default().into_bytes(),
             principal: vector.input.principal,
         };
