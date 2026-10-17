@@ -234,6 +234,17 @@ impl Rejection {
         // A stored `null` and an absent `details` are the same thing.
         rejection.details = rejection.details.filter(|details| !details.is_null());
 
+        // Details are a JSON object or absent; anything else is a corrupt row, as in Go.
+        if rejection
+            .details
+            .as_ref()
+            .is_some_and(|details| !details.is_object())
+        {
+            return Err(Error::InvalidRecord(
+                "decode rejection: details must be a JSON object or null".into(),
+            ));
+        }
+
         Ok(rejection)
     }
 }
@@ -1025,6 +1036,24 @@ mod tests {
         .await;
 
         assert!(matches!(polled, Polled::Unreadable), "{polled:?}");
+    }
+
+    #[test]
+    fn a_stored_rejection_must_be_one_object_with_object_details() {
+        for stored in [
+            r#"{"code":"c","message":"m","details":["x"]}"#,
+            r#"{"code":"c","message":"m","details":"x"}"#,
+            r#"{"code":"c","message":"m","details":1}"#,
+            r#"{"code":"c","message":"m","details":null} {}"#,
+            r#"{"code":"c","message":"m","details":null}x"#,
+        ] {
+            assert!(
+                matches!(Rejection::decode(stored), Err(Error::InvalidRecord(_))),
+                "{stored}"
+            );
+        }
+
+        assert!(Rejection::decode(r#"{"code":"c","message":"m","details":{"a":1}} "#).is_ok());
     }
 
     #[test]

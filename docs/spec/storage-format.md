@@ -369,8 +369,10 @@ digest). See [Command Outcomes](#command-outcomes).
 
 Both implementations reject a commit whose sequences are not contiguous for each entity (each one
 more than the last), or start below 1, before writing anything. Sequence 0 is the DynamoDB snapshot
-slot. Rust also rejects an event whose ID is not `{entityId}:{sequence}`, because DynamoDB does not
-store the ID and rebuilds it from the key on read. The floor check reads the first event and the snapshot
+slot. Both languages reject an event whose ID is not `{entityId}:{sequence}`, with a typed invalid-commit
+error before anything is written (Go `*InvalidCommitError`, Rust `Error::InvalidCommit`), because
+DynamoDB does not store the ID and rebuilds it from the key on read, and an outcome receipt names
+events by that ID. A Go commit that records no outcome tolerates an absent ID, as before v0.9. The floor check reads the first event and the snapshot
 records the last, so both depend on that order, and loads reject a stream with a gap. Every backend
 also enforces that a written stream **continues from its stored head** (next section).
 
@@ -842,7 +844,9 @@ A store with outcomes enabled **requires a command ID** on every command; a miss
 programmer error returned before the commit — no outcome row, no events. Stores built without
 outcomes keep the older behavior. The older load-time duplicate window still runs after the
 outcome read misses, and only for command IDs recorded by events with no outcome row (pre-v0.9
-commands); a command executed with outcomes enabled always has its row. The window check precedes
+commands) that were replayed since the latest snapshot; one already folded into a snapshot or
+compacted away is not detected (see the upgrade limitation under Loading and Duplicate Commands).
+A command executed with outcomes enabled always has its row. The window check precedes
 recording **any** outcome — an accepted one, a rejection (including the engine's stale-fence
 rejection): a command whose ID a read stream already carries has run, so it is a duplicate and no
 terminal outcome is written for it. A multi-stream command performs the outcome read first, before
@@ -899,8 +903,9 @@ replayed). The loser's own handler error and local decision are neither returned
 through the error chain.
 
 **Stored rows are validated.** A row read back must have a known `status`, a non-empty `digest`, a
-`rejection` with a non-empty code exactly when the status is `rejected` (and a `code` attribute or
-column equal to it), no `events` on a rejection, well-formed event IDs (`{entityId}:{sequence}`
+`rejection` — one complete JSON document whose `details` is an object or `null`, with trailing
+data refused — with a non-empty code exactly when the status is `rejected` (and a `code` attribute
+or column present exactly then, equal to it), no `events` on a rejection, well-formed event IDs (`{entityId}:{sequence}`
 with a positive, canonical sequence), and a decodable `response`. A malformed row is a typed
 corruption error (Go `*CorruptOutcomeError`, Rust `Error::InvalidRecord`) and is never replayed as a
 result; `compat/fixtures/outcomes.json` carries the malformed rows both languages must refuse.

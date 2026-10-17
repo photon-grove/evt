@@ -382,7 +382,14 @@ impl OutcomeRow {
         };
         outcome.validate_stored()?;
 
-        // The code column repeats the rejection's code.
+        // The code column exists exactly with a rejection, and repeats its code.
+        if outcome.rejection.is_none() && self.code.is_some() {
+            return Err(Error::InvalidRecord(format!(
+                "stored outcome for command {} is corrupt: an accepted outcome carries a code",
+                outcome.command_id
+            )));
+        }
+
         if let Some(rejection) = &outcome.rejection
             && self.code.as_deref() != Some(rejection.code.as_str())
         {

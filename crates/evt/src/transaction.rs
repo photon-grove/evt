@@ -643,6 +643,15 @@ impl<'a, R: Repository> Transaction<'a, R> {
         }
 
         let streams = std::mem::take(&mut self.streams);
+
+        // A caller fence for a stream this transaction read is superseded by the engine's own
+        // fence, whichever order `fence` and `read` were called in, exactly as in `prepare`.
+        self.fences.retain(|fence| {
+            !streams
+                .iter()
+                .any(|stream| stream.entity_id == fence.entity_id)
+        });
+
         let mut fences: Vec<ReadFence> = streams
             .into_iter()
             .map(|stream| ReadFence {
@@ -2018,5 +2027,32 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_drops_a_caller_fence_that_a_later_read_supersedes() {
+        let store = outcome_store();
+        store
+            .execute_with_outcome("a", Add(1), command("seed"))
+            .await
+            .unwrap();
+
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("a"), &command("fence-then-read"))
+            .await
+            .unwrap();
+        tx.fence(crate::ReadFence::new(
+            "a",
+            "ledger",
+            EventSequence(1),
+            FenceProvenance::Caller,
+        ))
+        .unwrap();
+        tx.read::<Ledger>("a").await.unwrap();
+
+        // The read's engine fence supersedes the earlier caller fence: no duplicate fence, and the
+        // rejection is recorded.
+        let outcome = tx.reject(Rejection::new("nope", "refused")).await.unwrap();
+        assert!(outcome.is_rejected(), "{outcome:?}");
     }
 }

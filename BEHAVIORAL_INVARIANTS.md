@@ -291,13 +291,16 @@ error before any write and is never split.
   type, the sorted declared target streams, the canonical payload JSON, and the principal)
 - Before any outcome is recorded — accepted, rejected, or stale-fence — the load-time duplicate
   window of the streams the command read is applied: a pre-v0.9 event that carries this command ID
-  is a duplicate (`DuplicateCommandError` / `Error::DuplicateCommand`), and no terminal outcome is
-  written for a command that already ran
+  and was replayed since the latest snapshot is a duplicate (`DuplicateCommandError` /
+  `Error::DuplicateCommand`), and no terminal outcome is written for a command that already ran.
+  The window only sees events after the latest snapshot; a pre-v0.9 command ID folded into a
+  snapshot or compacted away is not detected (the documented upgrade limitation, no backfill)
 - A multi-stream command begins with the outcome pre-check (`BeginCommand` /
   `Transaction::begin_command`) before any read, append, or fence; a transaction whose pre-check
   returned a stored outcome is finished and accepts no further work
-- This check covers command IDs folded into snapshots and compacted away; on an upgraded log the
-  load-time event window remains the only guard for pre-v0.9 IDs
+- The outcome-row check covers commands executed with outcomes enabled, including IDs folded into
+  snapshots and compacted away; on an upgraded log the load-time event window remains the only
+  guard for pre-v0.9 IDs, and it sees only those after the latest snapshot
 - A lost outcome put is never a generic optimistic-concurrency conflict and is never resolved by
   re-preparing the command: it is `OutcomeConflict`, and it outranks every other failed item in the
   commit's classification, so the engine resolves it by re-reading the row. An ordinary conflict

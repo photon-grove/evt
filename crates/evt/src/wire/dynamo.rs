@@ -295,7 +295,13 @@ pub fn outcome_from_item(item: &Item) -> Result<Outcome, Error> {
     };
     outcome.validate_stored()?;
 
-    // The code attribute repeats the rejection's code.
+    // The code attribute exists exactly with a rejection, and repeats its code.
+    if outcome.rejection.is_none() && optional_string(item, "code")?.is_some() {
+        return Err(Error::InvalidRecord(format!(
+            "stored outcome for command {command_id} is corrupt: an accepted outcome carries a code attribute"
+        )));
+    }
+
     if let Some(rejection) = &outcome.rejection
         && optional_string(item, "code")?.unwrap_or_default() != rejection.code.as_str()
     {

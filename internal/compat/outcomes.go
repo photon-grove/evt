@@ -213,6 +213,10 @@ func malformedRows() []MalformedRow {
 
 	rejection := text(`{"code":"c","message":"m","details":null}`)
 
+	rejectedRow := func(stored map[string]any) map[string]any {
+		return accepted(map[string]any{"status": text("rejected"), "events": nil, "code": text("c"), "rejection": stored})
+	}
+
 	return []MalformedRow{
 		{"unknown status", accepted(map[string]any{"status": text("pending")})},
 		{"missing status", accepted(map[string]any{"status": nil})},
@@ -241,6 +245,12 @@ func malformedRows() []MalformedRow {
 		{"rejection stored as binary", accepted(map[string]any{
 			"status": text("rejected"), "events": nil, "code": text("c"), "rejection": map[string]any{"B": "eA=="},
 		})},
+		{"accepted with a stray code attribute", accepted(map[string]any{"code": text("c")})},
+		{"rejection details that are an array", rejectedRow(text(`{"code":"c","message":"m","details":["x"]}`))},
+		{"rejection details that are a string", rejectedRow(text(`{"code":"c","message":"m","details":"x"}`))},
+		{"rejection details that are a number", rejectedRow(text(`{"code":"c","message":"m","details":1}`))},
+		{"rejection followed by another value", rejectedRow(text(`{"code":"c","message":"m","details":null} {}`))},
+		{"rejection followed by garbage", rejectedRow(text(`{"code":"c","message":"m","details":null}x`))},
 		{"code stored as a number", accepted(map[string]any{
 			"status": text("rejected"), "events": nil, "code": map[string]any{"N": "1"},
 			"rejection": text(`{"code":"c","message":"m","details":null}`),

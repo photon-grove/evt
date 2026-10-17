@@ -125,7 +125,11 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 		return nil, err
 	}
 
-	// The code column repeats the rejection's code.
+	// The code column exists exactly with a rejection, and repeats its code.
+	if outcome.Rejection == nil && code != nil {
+		return nil, corrupt(errors.New("an accepted outcome carries a code"))
+	}
+
 	if outcome.Rejection != nil && (code == nil || *code != string(outcome.Rejection.Code)) {
 		return nil, corrupt(errors.New("the code column disagrees with the rejection"))
 	}

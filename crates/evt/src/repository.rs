@@ -959,6 +959,25 @@ mod tests {
     }
 
     #[test]
+    fn an_event_id_that_is_not_canonical_is_refused_before_an_outcome_is_recorded() {
+        let mut bad = event("a", 1);
+        bad.id = "elsewhere:9".into();
+
+        let outcome = crate::Outcome::accepted("cmd", "digest");
+
+        let mut transaction =
+            TransactionCommit::new(vec![Commit::<u8>::new("a", vec![bad.clone()])])
+                .with_outcome(outcome.clone());
+        assert!(matches!(
+            transaction.normalize(),
+            Err(Error::InvalidCommit(_))
+        ));
+
+        let single = Commit::<u8>::new("a", vec![bad]).with_outcome(outcome);
+        assert!(matches!(single.validate(), Err(Error::InvalidCommit(_))));
+    }
+
+    #[test]
     fn an_empty_commit_is_still_a_no_op() {
         let mut commit = TransactionCommit::<u8>::new(Vec::new());
 

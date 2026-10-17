@@ -181,6 +181,14 @@ func CheckBatchEntry(result SerializedResult) error {
 	return &UnsupportedBatchEntryError{Snapshots: len(result.Snapshots), Fences: len(result.Fences), Outcomes: outcomes}
 }
 
+// InvalidCommitError reports a commit built wrong — for example an event whose ID is not the
+// canonical {entityId}:{sequence} for its stream and sequence. Nothing was written.
+type InvalidCommitError struct {
+	Reason string
+}
+
+func (e *InvalidCommitError) Error() string { return "invalid commit: " + e.Reason }
+
 // NormalizeCommit validates a transactional commit and returns a normalized copy: events sorted
 // bytewise by stream ID (the pinned transaction order), snapshots and fences likewise, fences
 // for written streams dropped (the event put at head + 1 supersedes them), and stream-local
@@ -213,6 +221,19 @@ func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
 	for _, event := range result.Events {
 		if err := CheckReservedEntityID(event.EntityID); err != nil {
 			return result, err
+		}
+
+		// The event ID is the canonical {entityId}:{sequence}. DynamoDB does not store it and rebuilds
+		// it from the key, and the outcome receipt names events by it, so a commit that disagrees
+		// would write one event and tell retries about another.
+		//
+		// An absent ID is tolerated on a commit without an outcome, as it was before v0.9 (the
+		// stored key is what counts); a commit that records an outcome needs the exact ID.
+		if canonical := GetEventID(event.EntityID, event.Sequence); event.ID != canonical &&
+			(event.ID != "" || result.Outcome != nil) {
+			return result, &InvalidCommitError{Reason: fmt.Sprintf(
+				"event %q should have the ID %q", event.ID, canonical,
+			)}
 		}
 
 		previous, seen := last[event.EntityID]

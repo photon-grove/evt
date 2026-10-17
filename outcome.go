@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -136,6 +137,12 @@ func DecodeRejection(data []byte) (Rejection, error) {
 
 	if err := decoder.Decode(&rejection); err != nil {
 		return Rejection{}, fmt.Errorf("decode rejection: %w", err)
+	}
+
+	// The whole document must be the rejection: a second value or trailing garbage is a corrupt
+	// row, as it is for Rust's parser and PostgreSQL's jsonb.
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return Rejection{}, errors.New("decode rejection: unexpected data after the rejection")
 	}
 
 	return rejection, nil

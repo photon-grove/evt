@@ -331,3 +331,54 @@ func TestIdempotencyKeyReuseMatchesWithErrorsIs(t *testing.T) {
 	require.ErrorAs(t, err, &reuse)
 	assert.Equal(t, "old", reuse.Prior.Digest)
 }
+
+func TestDecodeRejectionRequiresTheWholeDocumentAndObjectDetails(t *testing.T) {
+	t.Parallel()
+
+	for name, stored := range map[string]string{
+		"a second value":   `{"code":"c","message":"m","details":null} {}`,
+		"trailing garbage": `{"code":"c","message":"m","details":null}x`,
+		"array details":    `{"code":"c","message":"m","details":["x"]}`,
+		"string details":   `{"code":"c","message":"m","details":"x"}`,
+		"number details":   `{"code":"c","message":"m","details":1}`,
+	} {
+		_, err := evt.DecodeRejection([]byte(stored))
+		require.Error(t, err, name)
+	}
+
+	_, err := evt.DecodeRejection([]byte(`{"code":"c","message":"m","details":{"a":1}} `))
+	require.NoError(t, err, "trailing whitespace is not data")
+}
+
+func TestNormalizeCommitRefusesNonCanonicalEventIDs(t *testing.T) {
+	t.Parallel()
+
+	event := func(id evt.EventID) evt.SerializedEvent {
+		return evt.SerializedEvent{
+			ID: id, Sequence: 1, EntityID: "a", EntityType: "t", Type: "t:e", Version: 1,
+		}
+	}
+	outcome := &evt.Outcome{CommandID: "cmd", Status: evt.OutcomeAccepted, Digest: "d"}
+
+	// A mismatched ID is refused with or without an outcome, before any receipt is derived.
+	for _, withOutcome := range []bool{false, true} {
+		result := evt.SerializedResult{Events: []evt.SerializedEvent{event("b:9")}}
+		if withOutcome {
+			result.Outcome = outcome
+		}
+
+		_, err := evt.NormalizeCommit(result)
+
+		var invalid *evt.InvalidCommitError
+		require.ErrorAs(t, err, &invalid)
+	}
+
+	// An absent ID is tolerated without an outcome (as before v0.9) and refused with one, because
+	// the receipt names events by ID.
+	_, err := evt.NormalizeCommit(evt.SerializedResult{Events: []evt.SerializedEvent{event("")}})
+	require.NoError(t, err)
+
+	_, err = evt.NormalizeCommit(evt.SerializedResult{Events: []evt.SerializedEvent{event("")}, Outcome: outcome})
+	var invalid *evt.InvalidCommitError
+	require.ErrorAs(t, err, &invalid)
+}

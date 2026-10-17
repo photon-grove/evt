@@ -825,6 +825,144 @@
       }
     },
     {
+      "name": "accepted with a stray code attribute",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "rejection details that are an array",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":[\"x\"]}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "rejection details that are a string",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":\"x\"}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "rejection details that are a number",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":1}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "rejection followed by another value",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":null} {}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "rejection followed by garbage",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":null}x"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
       "name": "code stored as a number",
       "dynamoItem": {
         "code": {

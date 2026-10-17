@@ -50,6 +50,8 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("TransactionOutcomes", func(t *testing.T) { testTransactionOutcomes(t, outcomes(t)) })
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
+	t.Run("NonCanonicalEventIDsWriteNothing", func(t *testing.T) { testNonCanonicalEventIDs(t, outcomes(t)) })
+	t.Run("RejectionSupersedesCallerFences", func(t *testing.T) { testRejectionFenceOrdering(t, outcomes(t)) })
 	t.Run("LegacyCommandIDWindow", func(t *testing.T) { testLegacyCommandIDWindow(t, outcomes(t)) })
 	t.Run("RejectsReservedOutcomeStreams", func(t *testing.T) { testOutcomeStreamsAreReserved(t, outcomes(t)) })
 
@@ -956,6 +958,54 @@ func mustEvents(t *testing.T, repo evt.Repository, id evt.EntityID) []evt.Serial
 	require.NoError(t, err)
 
 	return events
+}
+
+func testNonCanonicalEventIDs(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	ns := newNamespace()
+	id := evt.EntityID(ns + "-ledger")
+
+	events, err := evt.SerializeEvents([]evt.Event{&ledgerEvent{Kind: "deposited", Amount: 1}}, 0, id, evt.Metadata{})
+	require.NoError(t, err)
+
+	events[0].ID = "someone-else:7"
+
+	err = repo.Commit(ctx, evt.SerializedResult{
+		Events:  events,
+		Outcome: &evt.Outcome{CommandID: evt.CommandID(ns + "-cmd"), Status: evt.OutcomeAccepted, Digest: "d"},
+	})
+
+	var invalid *evt.InvalidCommitError
+	require.ErrorAs(t, err, &invalid)
+
+	stored, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Empty(t, stored, "nothing is written")
+
+	receipt, err := repo.GetOutcome(ctx, evt.CommandID(ns+"-cmd"))
+	require.NoError(t, err)
+	require.Nil(t, receipt, "and no receipt names an event that was not written")
+}
+
+func testRejectionFenceOrdering(t *testing.T, repo evt.OutcomeRepository) {
+	env := newOutcomeEnv(t, repo, 0)
+	ctx := context.Background()
+
+	// A caller fence declared before the stream is read is superseded by the engine's own fence,
+	// whichever order the calls came in, so the rejection is recorded (no duplicate fence).
+	_, err := env.run(t, &ledgerCommand{Kind: "deposit", Amount: 1}, env.commandID("seed"))
+	require.NoError(t, err)
+
+	id := env.commandID("fence-then-read")
+	tx, replayed, err := env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "ledger:withdraw", Streams: []evt.EntityID{env.id}}, withCommand(id))
+	require.NoError(t, err)
+	require.Nil(t, replayed)
+	require.NoError(t, tx.Fence(evt.ReadFence{EntityID: env.id, EntityType: ledgerType, Head: 1}))
+	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
+
+	outcome, err := tx.Reject(ctx, evt.Rejection{Code: "insufficient-funds", Message: "balance is too low"})
+	require.NoError(t, err)
+	require.True(t, outcome.Rejected())
 }
 
 func testLegacyCommandIDWindow(t *testing.T, repo evt.OutcomeRepository) {

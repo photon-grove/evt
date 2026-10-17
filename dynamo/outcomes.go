@@ -97,7 +97,11 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 		return nil, err
 	}
 
-	// The code attribute repeats the rejection's code.
+	// The code attribute exists exactly with a rejection, and repeats its code.
+	if outcome.Rejection == nil && texts[5] != "" {
+		return nil, &evt.CorruptOutcomeError{CommandID: id, Reason: "an accepted outcome carries a code attribute"}
+	}
+
 	if outcome.Rejection != nil && texts[5] != string(outcome.Rejection.Code) {
 		return nil, &evt.CorruptOutcomeError{CommandID: id, Reason: "the code attribute disagrees with the rejection"}
 	}
