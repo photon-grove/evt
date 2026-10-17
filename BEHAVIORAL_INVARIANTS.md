@@ -295,6 +295,14 @@ error before any write and is never split.
   `Error::DuplicateCommand`), and no terminal outcome is written for a command that already ran.
   The window only sees events after the latest snapshot; a pre-v0.9 command ID folded into a
   snapshot or compacted away is not detected (the documented upgrade limitation, no backfill)
+- A command may not declare a reserved target stream (`SYSTEM#`, `command-outcome#`): the identity
+  is refused with the typed reserved-ID error before the outcome row is read, so no outcome is read
+  or recorded for a command aimed at engine-managed rows. An outcome read with an empty,
+  non-UTF-8, or oversized command ID is the same typed error on every backend, never "absent"
+- Go's error-returning `Execute`/`ExecuteWithFactory` keep their contract on an outcomes store: when
+  the outcome is replayed (a duplicate, or a lost race settled by the winner's row) the supplied
+  entity is restored and loaded again, so it reflects durable state. Rust's outcome methods return
+  a `CommandOutcome`, not an aggregate
 - A multi-stream command begins with the outcome pre-check (`BeginCommand` /
   `Transaction::begin_command`) before any read, append, or fence; a transaction whose pre-check
   returned a stored outcome is finished and accepts no further work

@@ -392,6 +392,10 @@ impl Repository for MemRepository {
     }
 
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        // The same validation as the durable backends: a bad ID is a programmer error, not an
+        // absent row.
+        crate::outcome::check_command_id(command_id)?;
+
         Ok(self.outcomes_lock().get(command_id).cloned())
     }
 

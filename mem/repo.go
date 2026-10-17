@@ -147,6 +147,12 @@ func (repo Repository) Commit(
 // GetOutcome reads a command's outcome row, or nil when none exists. The in-memory repository is
 // strongly consistent by construction. It implements evt.OutcomeRepository.
 func (repo Repository) GetOutcome(_ context.Context, id evt.CommandID) (*evt.Outcome, error) {
+	// The same typed validation as the durable backends: an empty, non-UTF-8, or oversized ID is a
+	// programmer error, not an absent row.
+	if err := evt.CheckCommandID(id); err != nil {
+		return nil, err
+	}
+
 	repo.features.mu.Lock()
 	defer repo.features.mu.Unlock()
 

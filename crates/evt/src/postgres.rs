@@ -840,6 +840,8 @@ impl Repository for PostgresRepository {
     }
 
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        crate::outcome::check_command_id(command_id)?;
+
         self.outcome_row(command_id)
             .await?
             .map(OutcomeRow::into_outcome)

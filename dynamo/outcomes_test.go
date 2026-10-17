@@ -284,7 +284,7 @@ func TestTransactionInProgressIsPolledForByTheStoreNotCalledNotApplied(t *testin
 	outcome, err := store.ExecuteWithOutcome(ctx, entity, "e-1", deposit(5), evt.Metadata{CommandID: &id})
 	require.NoError(t, err)
 	require.True(t, outcome.Replayed, "the delayed commit is found, not re-run")
-	require.Equal(t, 1, entity.handled)
+	require.Equal(t, 1, *entity.handled)
 	require.GreaterOrEqual(t, client.polls, 3)
 
 	events, err := repo.GetEvents(ctx, "e-1")
@@ -329,7 +329,7 @@ func TestACancelledCallerStillGetsAPolledRecovery(t *testing.T) {
 	outcome, err := store.ExecuteWithOutcome(ctx, entity, "e-1", deposit(5), evt.Metadata{CommandID: &id})
 	require.NoError(t, err)
 	require.True(t, outcome.Replayed)
-	require.Equal(t, 1, entity.handled)
+	require.Equal(t, 1, *entity.handled)
 }
 
 func TestWrongAttributeTypesAreACorruptRowNotAnEmptyValue(t *testing.T) {

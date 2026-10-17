@@ -3008,6 +3008,14 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         outcome_race(repo).await,
     );
     record(
+        "an outcome read validates the command ID like a write",
+        outcome_read_validation(repo).await,
+    );
+    record(
+        "a command may not declare a reserved target stream",
+        outcome_reserved_targets(repo).await,
+    );
+    record(
         "a winner of the same command that moved a fenced stream resolves to its outcome",
         outcome_fence_race(repo).await,
     );
@@ -3933,6 +3941,68 @@ async fn outcome_race<R: Repository>(repo: &R) -> CaseResult {
         repo.events(&other.id).await?.is_empty(),
         "the failed commit's events were not written"
     );
+
+    Ok(())
+}
+
+async fn outcome_read_validation<R: Repository>(repo: &R) -> CaseResult {
+    let empty = repo.outcome(&CommandId::new("")).await;
+    ensure!(
+        matches!(empty, Err(Error::InvalidArgument(_))),
+        "an empty ID is a programmer error, not an absent row: {empty:?}"
+    );
+
+    let long = repo
+        .outcome(&CommandId::new(
+            "a".repeat(crate::outcome::MAX_COMMAND_ID_BYTES + 1),
+        ))
+        .await;
+    ensure!(
+        matches!(long, Err(Error::CommandIdTooLong { .. })),
+        "an oversized ID is refused: {long:?}"
+    );
+
+    Ok(())
+}
+
+async fn outcome_reserved_targets<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+
+    for reserved in ["SYSTEM#target", "command-outcome#target"] {
+        let command = command_id();
+        let metadata = command_metadata(&command);
+
+        // A no-op or a rejection aimed at a reserved stream would otherwise record an outcome.
+        for amount in [0, 5] {
+            let result = store
+                .execute_with_outcome(reserved, Add(amount), metadata.clone())
+                .await;
+            ensure!(
+                matches!(result, Err(Error::ReservedEntityId { .. })),
+                "{reserved}: the single-aggregate path refuses it: {result:?}"
+            );
+        }
+
+        let resolved = store.resolve_outcome(reserved, &Add(5), &metadata).await;
+        ensure!(
+            matches!(resolved, Err(Error::ReservedEntityId { .. })),
+            "{reserved}: resolving refuses it: {resolved:?}"
+        );
+
+        let identity = CommandIdentity::new("ledger:any")
+            .with_streams([ledger_id().to_string(), reserved.to_owned()]);
+        let mut transaction = store.transaction();
+        let begun = transaction.begin_command(&identity, &metadata).await;
+        ensure!(
+            matches!(begun, Err(Error::ReservedEntityId { .. })),
+            "{reserved}: begin_command refuses it: {begun:?}"
+        );
+
+        ensure!(
+            repo.outcome(&command).await?.is_none(),
+            "{reserved}: no outcome is recorded"
+        );
+    }
 
     Ok(())
 }

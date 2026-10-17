@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/photon-grove/evt"
@@ -148,7 +149,7 @@ func (store *Store) ExecuteWithOutcome(
 	command evt.Command,
 	metadata evt.Metadata,
 ) (*evt.CommandOutcome, error) {
-	result, err := store.executeOutcome(ctx, entity, entityID, command, metadata)
+	result, err := store.run(ctx, entity, entityID, command, metadata)
 
 	return result.outcome, err
 }
@@ -161,7 +162,7 @@ func (store *Store) executeForError(
 	command evt.Command,
 	metadata evt.Metadata,
 ) error {
-	result, err := store.executeOutcome(ctx, entity, entityID, command, metadata)
+	result, err := store.run(ctx, entity, entityID, command, metadata)
 	if err != nil {
 		return err
 	}
@@ -171,6 +172,52 @@ func (store *Store) executeForError(
 	}
 
 	return nil
+}
+
+// run is executeOutcome plus the contract Execute has always had: the entity the caller supplied
+// reflects durable state when the call returns. A replayed outcome (a duplicate command, or a lost
+// race settled by the winner's row) returns before, or after discarding, this call's own work, so
+// the entity is restored to what the caller handed in and loaded again from storage.
+func (store *Store) run(
+	ctx context.Context,
+	entity evt.Entity,
+	entityID evt.EntityID,
+	command evt.Command,
+	metadata evt.Metadata,
+) (executed, error) {
+	restore := captureEntity(entity)
+
+	result, err := store.executeOutcome(ctx, entity, entityID, command, metadata)
+	if err != nil || result.outcome == nil || !result.outcome.Replayed {
+		return result, err
+	}
+
+	restore()
+
+	if _, err = store.LoadEntity(ctx, entity, entityID); err != nil {
+		return result, err
+	}
+
+	if setter, ok := entity.(interface{ SetID(evt.EntityID) }); ok {
+		setter.SetID(entityID)
+	}
+
+	return result, nil
+}
+
+// captureEntity remembers a pointer-to-struct entity's value so a later restore puts back what the
+// caller supplied, discarding events applied locally. It is shallow: it covers the entity's own
+// fields, which is what a freshly constructed aggregate holds. Any other entity kind is left as is.
+func captureEntity(entity evt.Entity) func() {
+	value := reflect.ValueOf(entity)
+	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() || value.Elem().Kind() != reflect.Struct {
+		return func() {}
+	}
+
+	saved := reflect.New(value.Elem().Type()).Elem()
+	saved.Set(value.Elem())
+
+	return func() { value.Elem().Set(saved) }
 }
 
 func (store *Store) executeOutcome(

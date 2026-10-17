@@ -363,6 +363,9 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     ///   outcome (a `None` is an internal failure: [`Error::Handler`], nothing recorded), which a retry of the
     ///   command replays verbatim. A handler that returns no events is an accepted no-op.
     ///
+    /// Returns a [`CommandOutcome`], not an aggregate, so a replayed outcome has no loaded aggregate
+    /// to keep in sync; call [`load`](Store::load) for the current state.
+    ///
     /// Internal failures (encoding, storage, replay, projector errors) are errors and record no
     /// outcome. A lost outcome-put race resolves through the winner's row; an indeterminate commit
     /// failure is recovered by re-reading the row (see [`Error::AmbiguousWrite`]).
@@ -412,6 +415,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         })?;
 
         let entity_id = entity_id.into();
+        crate::outcome::check_declared_streams([&entity_id])?;
         let command_id = require_command_id(&metadata)?;
         let digest = config.digest(&DigestInput {
             command_type: command.command_type(),
@@ -496,10 +500,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
         })?;
 
+        let entity_id = entity_id.into();
+        crate::outcome::check_declared_streams([&entity_id])?;
         let command_id = require_command_id(metadata)?;
         let digest = config.digest(&DigestInput {
             command_type: command.command_type(),
-            streams: vec![entity_id.into()],
+            streams: vec![entity_id],
             payload: command
                 .canonical_payload()
                 .map_err(|err| Error::InvalidArgument(format!("the command payload: {err}")))?

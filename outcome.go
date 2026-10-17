@@ -603,6 +603,12 @@ func (identity CommandIdentity) DigestInput(metadata Metadata) (DigestInput, err
 		if !utf8.ValidString(string(stream)) {
 			return DigestInput{}, &InvalidArgumentError{Argument: "streams", Message: "stream IDs must be valid UTF-8"}
 		}
+
+		// A command may not declare a reserved target stream: no outcome is read or recorded for
+		// a command aimed at engine-managed rows, even one that later writes nothing.
+		if err := CheckReservedEntityID(stream); err != nil {
+			return DigestInput{}, err
+		}
 	}
 
 	if identity.Payload != nil {

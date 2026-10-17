@@ -23,11 +23,13 @@ func (*scriptedEvent) EntityID() evt.EntityID     { return "" }
 // scriptedEntity counts how many times its handler ran.
 type scriptedEntity struct {
 	id      evt.EntityID
-	Total   int `json:"total"`
-	handled int
+	Total   int  `json:"total"`
+	handled *int // shared, so a restore of the entity cannot reset the count
 }
 
-func newScriptedEntity(id evt.EntityID) *scriptedEntity { return &scriptedEntity{id: id} }
+func newScriptedEntity(id evt.EntityID) *scriptedEntity {
+	return &scriptedEntity{id: id, handled: new(int)}
+}
 
 func (e *scriptedEntity) Type() evt.EntityType                { return "scripted" }
 func (e *scriptedEntity) GetID() evt.EntityID                 { return e.id }
@@ -39,7 +41,7 @@ func (e *scriptedEntity) Base() evt.BaseEntity { //nolint:staticcheck // depreca
 }
 
 func (e *scriptedEntity) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
-	e.handled++
+	*e.handled++
 
 	c, ok := command.(*scriptedCommand)
 	if !ok {

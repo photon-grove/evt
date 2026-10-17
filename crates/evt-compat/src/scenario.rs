@@ -736,6 +736,12 @@ impl<R: Repository> Runner<R> {
 
         let mut outcomes = Vec::new();
         for id in ids {
+            // An ID over the limit can never have a row (the step fails with CommandIdTooLong
+            // before any write), and reading one is refused.
+            if id.len() > photon_evt::MAX_COMMAND_ID_BYTES {
+                continue;
+            }
+
             if let Some(outcome) = self.store.repository().outcome(&id.as_str().into()).await? {
                 outcomes.push(OutcomeExpectation {
                     command_id: id,

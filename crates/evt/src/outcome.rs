@@ -654,6 +654,10 @@ impl CommandIdentity {
         self
     }
 
+    pub(crate) fn declared_streams(&self) -> &[EntityId] {
+        &self.streams
+    }
+
     /// Builds the digest input for this identity and the command metadata's principal.
     pub fn digest_input(&self, metadata: &Metadata) -> DigestInput {
         DigestInput {
@@ -663,6 +667,17 @@ impl CommandIdentity {
             principal: principal(metadata),
         }
     }
+}
+
+/// Refuses a command that declares a reserved target stream (`SYSTEM#`, `command-outcome#`) with
+/// [`Error::ReservedEntityId`], before the outcome row is read: no outcome is read or recorded for
+/// a command aimed at engine-managed rows, even one that later writes nothing.
+pub(crate) fn check_declared_streams<'a>(
+    streams: impl IntoIterator<Item = &'a EntityId>,
+) -> Result<(), Error> {
+    streams
+        .into_iter()
+        .try_for_each(crate::features::check_not_reserved)
 }
 
 /// The metadata's principal as the digest sees it: `""` when unset.

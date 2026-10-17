@@ -50,6 +50,9 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("TransactionOutcomes", func(t *testing.T) { testTransactionOutcomes(t, outcomes(t)) })
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
+	t.Run("ReservedTargetStreams", func(t *testing.T) { testReservedTargets(t, outcomes(t)) })
+	t.Run("OutcomeReadValidatesCommandIDs", func(t *testing.T) { testOutcomeReadValidation(t, outcomes(t)) })
+	t.Run("ReplayRehydratesTheEntity", func(t *testing.T) { testReplayRehydrates(t, outcomes(t)) })
 	t.Run("FenceRaceResolvesToTheWinner", func(t *testing.T) { testFenceRace(t, outcomes(t)) })
 	t.Run("NonCanonicalEventIDsWriteNothing", func(t *testing.T) { testNonCanonicalEventIDs(t, outcomes(t)) })
 	t.Run("RejectionSupersedesCallerFences", func(t *testing.T) { testRejectionFenceOrdering(t, outcomes(t)) })
@@ -1025,6 +1028,98 @@ func testFenceRace(t *testing.T, repo evt.OutcomeRepository) {
 
 		require.Empty(t, env.events(t, target), "the loser wrote nothing")
 	}
+}
+
+func testReservedTargets(t *testing.T, repo evt.OutcomeRepository) {
+	env := newOutcomeEnv(t, repo, 0)
+	ctx := context.Background()
+
+	for _, reserved := range []evt.EntityID{"SYSTEM#target", "command-outcome#target"} {
+		// Multi-stream: the identity declares a reserved stream, so no outcome is read or recorded.
+		id := env.commandID("reserved-" + string(reserved))
+		identity := evt.CommandIdentity{Type: "ledger:any", Streams: []evt.EntityID{env.id, reserved}}
+
+		_, _, err := env.store.BeginCommand(ctx, identity, withCommand(id))
+		require.True(t, evt.IsReservedEntityIdErr(err), "BeginCommand: %v", err)
+
+		_, err = env.store.ResolveCommand(ctx, identity, withCommand(id))
+		require.True(t, evt.IsReservedEntityIdErr(err), "ResolveCommand: %v", err)
+
+		// Single aggregate: a no-op or a rejection aimed at a reserved stream records nothing.
+		for _, kind := range []string{"check", "withdraw"} {
+			sid := env.commandID(kind + "-" + string(reserved))
+			_, err = env.store.ExecuteWithOutcome(ctx, newLedger(reserved), reserved,
+				&ledgerCommand{Kind: kind, Amount: 1000}, withCommand(sid))
+			require.True(t, evt.IsReservedEntityIdErr(err), "%s: %v", kind, err)
+			env.requireNoOutcome(t, sid)
+		}
+
+		env.requireNoOutcome(t, id)
+	}
+}
+
+func testOutcomeReadValidation(t *testing.T, repo evt.OutcomeRepository) {
+	env := newOutcomeEnv(t, repo, 0)
+	ctx := context.Background()
+
+	// Every backend refuses an empty, non-UTF-8, or oversized ID with a typed error, never
+	// "absent": a lookup with a bad ID is a programmer error.
+	for name, id := range map[string]evt.CommandID{
+		"empty":     "",
+		"not UTF-8": "bad\xff",
+		"oversized": evt.CommandID(strings.Repeat("a", evt.MaxCommandIDBytes+1)),
+	} {
+		stored, err := repo.GetOutcome(ctx, id)
+		require.Error(t, err, name)
+		require.Nil(t, stored, name)
+
+		_, err = env.store.Outcome(ctx, id)
+		require.Error(t, err, name)
+	}
+}
+
+func testReplayRehydrates(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+
+	faulty, err := test.NewFaultRepository(repo)
+	require.NoError(t, err)
+
+	env := newOutcomeEnv(t, faulty, 0)
+	rival := snapshots.NewStore(repo, 0).WithOutcomes()
+
+	_, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 5}, env.commandID("seed"))
+	require.NoError(t, err)
+
+	// A duplicate command returns early, before any load: the entity the caller supplied (zero
+	// state) must still reflect durable state when Execute returns.
+	id := env.commandID("early")
+	require.NoError(t, env.store.Execute(ctx, newLedger(env.id), env.id, &ledgerCommand{Kind: "deposit", Amount: 2}, withCommand(id)))
+
+	duplicate := newLedger(env.id)
+	require.NoError(t, env.store.Execute(ctx, duplicate, env.id, &ledgerCommand{Kind: "deposit", Amount: 2}, withCommand(id)))
+	require.Equal(t, 7, duplicate.Total, "a replayed Execute loads the entity")
+
+	// A lost race settled by the winner's row: the loser decided on balance 7 and applied it
+	// locally, but the winner ran later and the durable state is different. The supplied entity
+	// must show the durable state, not the loser's local mutation.
+	raced := env.commandID("raced")
+	faulty.Intercept = func(_ context.Context, _ evt.SerializedResult, commit func() error) error {
+		faulty.Intercept = nil
+
+		_, rerr := rival.ExecuteWithOutcome(ctx, newLedger(env.id), env.id,
+			&ledgerCommand{Kind: "deposit", Amount: 10}, withCommand(env.commandID("mover")))
+		require.NoError(t, rerr)
+
+		_, rerr = rival.ExecuteWithOutcome(ctx, newLedger(env.id), env.id,
+			&ledgerCommand{Kind: "withdraw", Amount: 1}, withCommand(raced))
+		require.NoError(t, rerr)
+
+		return commit()
+	}
+
+	loser := newLedger(env.id)
+	require.NoError(t, env.store.Execute(ctx, loser, env.id, &ledgerCommand{Kind: "withdraw", Amount: 1}, withCommand(raced)))
+	require.Equal(t, 16, loser.Total, "7 + 10 - 1: the durable state, not the loser's local 6")
 }
 
 func testNonCanonicalEventIDs(t *testing.T, repo evt.OutcomeRepository) {

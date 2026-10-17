@@ -257,6 +257,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             });
         }
 
+        crate::outcome::check_declared_streams(identity.declared_streams())?;
         let command_id = require_command_id(metadata)?;
         let digest = config.digest(&identity.digest_input(metadata))?;
 
