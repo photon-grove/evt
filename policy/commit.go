@@ -47,6 +47,12 @@ func DefaultConfig() Config {
 // ExecuteWithRetry runs Store.Execute inside a bounded retry loop. On transient
 // commit failures the entity is reloaded from scratch via the factory before the
 // next attempt. Errors returned on give-up are wrapped in ClassifiedError.
+//
+// Deprecated: Cut in ADR-0006 (K6): blind whole-command retry is replaced by fence-aware retry
+// (ADR 0004, C5). On a store with outcomes (snapshots.Store.WithOutcomes), ExecuteWithOutcome and
+// ExecuteTransaction re-prepare a command when the engine can re-derive what failed, are bounded
+// by snapshots.RetryPolicy, and record a stale-fence rejection when attempts run out. It will be
+// removed in the next minor release.
 func ExecuteWithRetry(
 	ctx context.Context,
 	store evt.Store,

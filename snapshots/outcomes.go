@@ -24,7 +24,7 @@ const (
 )
 
 // errOutcomesNeedCommand refuses a bare Commit on a store with outcomes enabled: the outcome row
-// needs the command's identity (its type, declared streams, and payload), which only the
+// needs the command's identity (its type, target streams, and payload), which only the
 // command-level entry points have.
 var errOutcomesNeedCommand = &evt.InvalidArgumentError{
 	Argument: "commit",
@@ -41,7 +41,7 @@ type outcomeConfig struct {
 type OutcomeOption func(*outcomeConfig)
 
 // WithDigester replaces the default identity digest (SHA-256 over the canonical encoding of the
-// command type, declared target streams, payload JSON, and principal). A custom digester returns
+// command type, target streams, payload JSON, and principal). A custom digester returns
 // its own opaque string; the engine compares digests for equality only, and a digester that is
 // not deterministic turns every retry into an IdempotencyKeyReuse error.
 func WithDigester(digester evt.Digester) OutcomeOption {
@@ -122,12 +122,32 @@ func (store *Store) ResolveCommand(
 type executed struct {
 	outcome    *evt.CommandOutcome
 	handlerErr error
+
+	// discarded reports that this call applied events to the caller's entity and then threw them
+	// away without committing (a stale-fence rejection after the last attempt), so the entity no
+	// longer reflects durable state.
+	discarded bool
+}
+
+// attemptState holds the command that records the stale-fence rejection when the policy runs out of
+// attempts.
+type attemptState struct{ cmd *command }
+
+// retriesExhausted records the stale-fence rejection of a command whose last attempt conflicted.
+func (state *attemptState) retriesExhausted(ctx context.Context, attempts int) (executed, error) {
+	if state.cmd == nil {
+		return executed{}, errors.New("snapshots: retries were exhausted before the command began")
+	}
+
+	outcome, err := state.cmd.staleFence(ctx, evt.RetriesExhaustedRejection(attempts))
+
+	return executed{outcome: outcome, discarded: true}, err
 }
 
 // ExecuteWithOutcome loads the entity, handles the command, and commits the result together with
 // its outcome row. It requires WithOutcomes and a command ID in the metadata.
 //
-// Every call reads the outcome row first. A stored outcome with the same identity digest is
+// Every attempt reads the outcome row first. A stored outcome with the same identity digest is
 // returned (Replayed) without running the handler; one with a different digest is
 // *evt.IdempotencyKeyReuseError. Otherwise the handler runs:
 //
@@ -137,12 +157,25 @@ type executed struct {
 //     CommandOutcome with a nil error;
 //   - any other error: an internal failure, returned as an error with no outcome written.
 //
-// A lost race on the outcome row and an ambiguous commit result are resolved by re-reading the
-// row, never by re-preparing the command; see evt.AmbiguousWriteError for the one case, a commit
-// proven not to have applied, that the caller should retry.
+// Retry is fence-aware (ADR 0004, C5). When the commit conflicts with another writer, the entity
+// is reset, loaded again, and the handler runs again against the fresh state, after a backoff,
+// up to the store's RetryPolicy (WithRetry). A single-aggregate command fences nothing, so every
+// conflict can be re-prepared. When the last attempt also conflicts, the engine records a
+// stale-fence rejection (evt.RetriesExhaustedRejection) as the command's outcome and returns it,
+// so a replay of the command ID gets the same answer; the remedy is a new command ID. The handler
+// may therefore run several times for one command, but at most one attempt commits.
 //
-// The single-aggregate shortcut fences nothing: a rejection or no-op it records was decided on the
-// head the entity was loaded at.
+// A lost race on the outcome row and an ambiguous commit result are resolved by re-reading the
+// row, never by re-preparing the command; see evt.AmbiguousWriteError for the one case, a row
+// that never appeared, that is retried the same way.
+//
+// The entity is reset between attempts: its exported fields (the state a snapshot persists) are
+// restored from a deep copy, so events the failed attempt applied are not counted again. Its
+// unexported fields are restored shallowly, so an unexported map, slice, or pointer is shared with
+// the failed attempt and keeps what it accumulated: keep state that Apply changes in exported
+// fields. The command value is reused by every attempt, so a handler must not mutate it. An entity
+// that is not a pointer to a struct cannot be reset, so its command is attempted once and a
+// conflict is returned as an error.
 func (store *Store) ExecuteWithOutcome(
 	ctx context.Context,
 	entity evt.Entity,
@@ -177,8 +210,9 @@ func (store *Store) executeForError(
 
 // run is executeOutcome plus the contract Execute has always had: the entity the caller supplied
 // reflects durable state when the call returns. A replayed outcome (a duplicate command, or a lost
-// race settled by the winner's row) returns before, or after discarding, this call's own work, so
-// the entity is restored to what the caller handed in and loaded again from storage.
+// race settled by the winner's row) returns before, or after discarding, this call's own work, and
+// so does a stale-fence rejection after the last attempt, so the entity is restored to what the
+// caller handed in and loaded again from storage.
 func (store *Store) run(
 	ctx context.Context,
 	entity evt.Entity,
@@ -186,14 +220,14 @@ func (store *Store) run(
 	command evt.Command,
 	metadata evt.Metadata,
 ) (executed, error) {
-	restore := captureEntity(entity)
+	reset, resettable := captureEntity(entity)
 
-	result, err := store.executeOutcome(ctx, entity, entityID, command, metadata)
-	if err != nil || result.outcome == nil || !result.outcome.Replayed {
+	result, err := store.executeOutcome(ctx, entity, entityID, command, metadata, reset, resettable)
+	if err != nil || result.outcome == nil || (!result.outcome.Replayed && !result.discarded) {
 		return result, err
 	}
 
-	restore()
+	reset()
 
 	if _, err = store.LoadEntity(ctx, entity, entityID); err != nil {
 		return result, err
@@ -206,20 +240,22 @@ func (store *Store) run(
 	return result, nil
 }
 
-// captureEntity remembers a pointer-to-struct entity's value so a later restore puts back what the
+// captureEntity remembers a pointer-to-struct entity's value so a later reset puts back what the
 // caller supplied, discarding events applied locally. The copy is deep over the entity's exported
 // fields — every map, slice, pointer, and nested struct — because those are exactly the state a
 // snapshot persists, so state a constructor initialized (a labels map, say) cannot be aliased and
-// kept dirty by Apply. Unexported fields are copied shallowly. Any other entity kind is left as is.
-func captureEntity(entity evt.Entity) func() {
+// kept dirty by Apply. Unexported fields are copied shallowly. Any other entity kind cannot be
+// reset: resettable is false and reset does nothing.
+func captureEntity(entity evt.Entity) (reset func(), resettable bool) {
 	value := reflect.ValueOf(entity)
 	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() || value.Elem().Kind() != reflect.Struct {
-		return func() {}
+		return func() {}, false
 	}
 
 	saved := deepCopy(value.Elem(), map[uintptr]reflect.Value{})
 
-	return func() { value.Elem().Set(saved) }
+	// Each reset installs a fresh copy, so a later attempt cannot alias what an earlier one saved.
+	return func() { value.Elem().Set(deepCopy(saved, map[uintptr]reflect.Value{})) }, true
 }
 
 // deepCopy returns a copy of v that shares no map, slice, or pointer storage with it, through its
@@ -300,16 +336,48 @@ func deepCopy(v reflect.Value, seen map[uintptr]reflect.Value) reflect.Value {
 	}
 }
 
+// executeOutcome runs the command through fence-aware retry: each attempt resets the entity,
+// reads the outcome row, loads, handles, and commits; a conflict runs the next attempt, and the
+// last conflict is recorded as a stale-fence rejection.
 func (store *Store) executeOutcome(
 	ctx context.Context,
 	entity evt.Entity,
 	entityID evt.EntityID,
 	command evt.Command,
 	metadata evt.Metadata,
+	reset func(),
+	resettable bool,
 ) (executed, error) {
-	identity := evt.CommandIdentity{Type: command.Type(), Streams: []evt.EntityID{entityID}, Payload: command}
+	identity := evt.CommandIdentity{Type: command.Type(), Targets: []evt.EntityID{entityID}, Payload: command}
 
-	cmd, replayed, err := store.beginCommand(ctx, identity, metadata)
+	// The identity and its digest are fixed once, before the first attempt.
+	cmd, err := store.newCommand(identity, metadata)
+	if err != nil {
+		return executed{}, err
+	}
+
+	state := attemptState{cmd: cmd}
+	loop := attemptLoop{retry: store.retry, once: !resettable}
+
+	return loop.run(ctx, func(attempt int) (executed, error) {
+		if attempt > 1 {
+			reset()
+		}
+
+		return store.attemptOutcome(ctx, cmd, entity, entityID, command)
+	}, state.retriesExhausted)
+}
+
+// attemptOutcome is one attempt of a single-aggregate command: the pre-check, the load, the
+// handler, and the commit. It prepares everything from the entity as the caller supplied it.
+func (store *Store) attemptOutcome(
+	ctx context.Context,
+	cmd *command,
+	entity evt.Entity,
+	entityID evt.EntityID,
+	command evt.Command,
+) (executed, error) {
+	replayed, err := cmd.preCheck(ctx)
 	if err != nil {
 		return executed{}, err
 	}
@@ -320,7 +388,7 @@ func (store *Store) executeOutcome(
 
 	eventContext, err := store.LoadEntity(ctx, entity, entityID)
 	if err != nil {
-		return executed{}, err
+		return executed{}, load(err)
 	}
 
 	// Keep the entity's internal ID aligned with the store key, as Execute does.
@@ -331,7 +399,7 @@ func (store *Store) executeOutcome(
 	// The event window is superseded by the outcome row, but pre-v0.9 commands have no row: an
 	// event that carries this command ID without an outcome is one of those.
 	if eventContext.HasCommandID(cmd.id) {
-		return executed{}, evt.NewDuplicateCommandError(cmd.id)
+		return executed{}, internal(evt.NewDuplicateCommandError(cmd.id))
 	}
 
 	result, err := entity.Handle(ctx, command)
@@ -341,7 +409,7 @@ func (store *Store) executeOutcome(
 
 	for _, event := range result.Events {
 		if err = entity.Apply(event); err != nil {
-			return executed{}, err
+			return executed{}, internal(err)
 		}
 	}
 
@@ -361,12 +429,12 @@ func (store *Store) executeOutcome(
 
 	projectorTransaction, err := buildProjectorTransaction(ctx, entity, result.Events)
 	if err != nil {
-		return executed{}, err
+		return executed{}, internal(err)
 	}
 
 	serialized, snapshots, err := store.stage(entity, &eventContext, entityID, result.Events, evt.CommitMetadata(cmd.metadata))
 	if err != nil {
-		return executed{}, err
+		return executed{}, internal(err)
 	}
 
 	outcome, err := cmd.commit(ctx, evt.SerializedResult{
@@ -389,7 +457,9 @@ func (store *Store) handlerFailed(ctx context.Context, cmd *command, handlerErr 
 
 	rejection, ok := evt.RejectionOf(handlerErr)
 	if !ok {
-		return executed{}, handlerErr
+		// An internal failure is returned as is: whatever the handler returned, it is not a
+		// concurrency conflict, so retry never re-runs it.
+		return executed{}, internal(handlerErr)
 	}
 
 	outcome, err := cmd.commit(ctx, evt.SerializedResult{}, evt.OutcomeRejected, nil, &rejection)
@@ -445,79 +515,88 @@ type command struct {
 	id     evt.CommandID
 	digest string
 
-	// declared is the set of streams the command's identity declares it will write. The digest
-	// covers exactly these, so a write to any other stream would record an outcome whose identity
-	// omits it.
-	declared map[evt.EntityID]struct{}
-
 	metadata evt.Metadata
 }
 
-// beginCommand validates the command ID, computes the identity digest, and reads the outcome row
-// first: a stored outcome with the same digest is returned (Replayed), one with a different digest
-// is *evt.IdempotencyKeyReuseError, and an absent row returns the command to run.
-func (store *Store) beginCommand(
-	ctx context.Context,
-	identity evt.CommandIdentity,
-	metadata evt.Metadata,
-) (*command, *evt.CommandOutcome, error) {
+// newCommand validates the command ID and computes the identity digest, once. The digest is a
+// snapshot of the request's intent taken before anything is read or run: fence-aware retry
+// prepares the command several times, and every attempt, a client retry, and a recovery read must
+// compare equal, so nothing is recomputed from the live command or its metadata afterwards.
+func (store *Store) newCommand(identity evt.CommandIdentity, metadata evt.Metadata) (*command, error) {
 	repo, err := store.outcomeRepository()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if metadata.CommandID == nil {
-		return nil, nil, evt.CheckCommandID("")
+		return nil, evt.CheckCommandID("")
 	}
 
 	if err = evt.CheckCommandID(*metadata.CommandID); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	input, err := identity.DigestInput(metadata)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	digest, err := store.outcomes.digester(input)
 	if err != nil {
-		return nil, nil, fmt.Errorf("compute command digest: %w", err)
+		return nil, fmt.Errorf("compute command digest: %w", err)
 	}
 
 	// A bad digest is a programmer error found before anything is read or run.
 	if err = evt.CheckDigest(digest); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// The command's metadata is snapshotted here: the ID and digest are frozen, so a caller that
 	// changes its metadata (or anything it points to) before Complete or Reject must not change what
 	// they write.
-	declared := make(map[evt.EntityID]struct{}, len(identity.Streams))
-	for _, stream := range identity.Streams {
-		declared[stream] = struct{}{}
-	}
-
-	cmd := &command{
+	return &command{
 		store:    store,
 		repo:     repo,
 		id:       *metadata.CommandID,
 		digest:   digest,
-		declared: declared,
 		metadata: metadata.Clone(),
+	}, nil
+}
+
+// preCheck reads the command's outcome row first, strongly consistent: a stored outcome with the
+// same digest is returned (Replayed), one with a different digest is
+// *evt.IdempotencyKeyReuseError, and an absent row returns nil, nil: the command runs.
+func (c *command) preCheck(ctx context.Context) (*evt.CommandOutcome, error) {
+	stored, err := c.repo.GetOutcome(ctx, c.id)
+	if err != nil {
+		return nil, err
 	}
 
-	stored, err := repo.GetOutcome(ctx, cmd.id)
+	if stored == nil {
+		return nil, nil
+	}
+
+	return c.resolve(*stored)
+}
+
+// beginCommand is newCommand followed by preCheck: the command to run, or the stored outcome it
+// resolves to.
+func (store *Store) beginCommand(
+	ctx context.Context,
+	identity evt.CommandIdentity,
+	metadata evt.Metadata,
+) (*command, *evt.CommandOutcome, error) {
+	cmd, err := store.newCommand(identity, metadata)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if stored == nil {
-		return cmd, nil, nil
+	replayed, err := cmd.preCheck(ctx)
+	if err != nil || replayed != nil {
+		return nil, replayed, err
 	}
 
-	replayed, err := cmd.resolve(*stored)
-
-	return nil, replayed, err
+	return cmd, nil, nil
 }
 
 // resolve answers a command whose row exists: the stored outcome when the digests match, an
@@ -633,7 +712,7 @@ func (c *command) recover(ctx context.Context, commitErr error) (*evt.CommandOut
 	}
 
 	// Safe to retry: every attempt reads the outcome row first and every write is conditional, so
-	// policy.ExecuteWithRetry may run the same command ID again and finds the outcome if it lands.
+	// fence-aware retry runs the same command ID again and finds the outcome if it lands.
 	retryable := func(cause error) error {
 		return &policy.ClassifiedError{
 			Class: policy.ClassTransient,

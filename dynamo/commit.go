@@ -765,6 +765,12 @@ func (repo *Repository) classifyCommitFailure(
 ) error {
 	ok, i := HasConditionalCheckFailure(err)
 	if !ok {
+		// Another transaction was writing the same items: an optimistic-concurrency conflict, as
+		// in Rust, so fence-aware retry re-prepares the command.
+		if hasTransactionConflict(err) {
+			return wrapClassifiedError(fmt.Errorf("%w: %w", ErrTransactionConflict, err))
+		}
+
 		// A commit that carries an outcome and fails indeterminately is resolved by re-reading the
 		// outcome row (ambiguous-write recovery); other failures are definitive refusals.
 		if layout.hasOutcome && indeterminateCommit(err) {

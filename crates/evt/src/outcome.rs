@@ -29,6 +29,7 @@ use crate::ids::{CommandId, EntityId, EntityType, EventId, PrincipalId};
 use crate::json;
 use crate::metadata::Metadata;
 use crate::repository::Repository;
+use crate::retry::RetryPolicy;
 use crate::sha256::sha256_hex;
 
 /// The longest command ID a store with outcomes accepts, in UTF-8 bytes. The outcome partition key
@@ -90,7 +91,8 @@ impl RejectionCode {
     /// The command itself was malformed or invalid.
     pub const BAD_COMMAND: Self = Self(Cow::Borrowed("bad-command"));
 
-    /// A caller-stamped read fence went stale before the commit.
+    /// The state a command was decided on went stale and the command cannot be decided again: a
+    /// caller-stamped read fence failed, or fence-aware retry ran out of attempts (C5).
     pub const STALE_FENCE: Self = Self(Cow::Borrowed("stale-fence"));
 
     /// Creates an application-defined code.
@@ -200,12 +202,25 @@ impl Rejection {
     }
 
     /// The engine's [`STALE_FENCE`](RejectionCode::STALE_FENCE) rejection, recorded when a
-    /// caller-stamped read fence went stale before the commit.
+    /// caller-stamped read fence went stale before the commit: the engine cannot know the caller's
+    /// decision still holds, so it does not retry.
     pub fn stale_fence() -> Self {
         Self::new(
             RejectionCode::STALE_FENCE,
             "a caller-stamped fence went stale",
         )
+    }
+
+    /// The engine's [`STALE_FENCE`](RejectionCode::STALE_FENCE) rejection, recorded when
+    /// fence-aware retry ran out of attempts: every attempt was decided on state another writer
+    /// then moved. The attempt count is kept in the details as an integer, so Go and Rust store
+    /// the same bytes.
+    pub fn retries_exhausted(attempts: u32) -> Self {
+        Self::new(
+            RejectionCode::STALE_FENCE,
+            "the state this command was decided on kept changing; retries were exhausted",
+        )
+        .with_details(serde_json::json!({ "attempts": attempts }))
     }
 
     /// Encodes the rejection as its stored JSON, byte for byte as Go's `json.Marshal` writes it.
@@ -507,14 +522,17 @@ impl<E> CommandOutcome<E> {
     }
 }
 
-/// The identity of a command: what it is, never what the executed commit wrote.
+/// The identity of a command: what the caller asked for, never what the executed commit wrote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DigestInput {
     /// The command's type string.
     pub command_type: String,
-    /// The stream IDs the command declares it will write. They are deduplicated and sorted by byte
-    /// order when digested. Fenced (read-only) streams are not part of it.
-    pub streams: Vec<EntityId>,
+    /// The stream IDs the request itself names, known before any state is read. They are
+    /// deduplicated and sorted by byte order when digested. The streams a command ends up reading,
+    /// fencing, or writing are not part of its identity: a command may derive them from the state
+    /// it reads (a rename releases whichever handle the entity currently holds), so they can differ
+    /// between attempts of the same command.
+    pub targets: Vec<EntityId>,
     /// The canonical JSON of the command payload; empty when the command has none.
     pub payload: Vec<u8>,
     /// The command metadata's `principalId`, empty when unset.
@@ -530,16 +548,16 @@ pub type Digester = Arc<dyn Fn(&DigestInput) -> Result<String, BoxError> + Send 
 /// ```text
 /// "evt-cmd-digest-v1" || 0x00
 /// || lp(command type)
-/// || uint32-le(stream count) || lp(stream ID) ...
+/// || uint32-le(target count) || lp(target stream ID) ...
 /// || lp(canonical payload JSON)
 /// || lp(principal)
 /// ```
 ///
 /// where `lp(x)` is the little-endian `uint32` length of `x` followed by `x`.
 pub fn canonical_digest_bytes(input: &DigestInput) -> Vec<u8> {
-    let mut streams: Vec<&EntityId> = input.streams.iter().collect();
-    streams.sort();
-    streams.dedup();
+    let mut targets: Vec<&EntityId> = input.targets.iter().collect();
+    targets.sort();
+    targets.dedup();
 
     let mut bytes = Vec::with_capacity(
         DIGEST_TAG.len()
@@ -548,7 +566,7 @@ pub fn canonical_digest_bytes(input: &DigestInput) -> Vec<u8> {
             + input.payload.len()
             + input.principal.len()
             + 20
-            + streams
+            + targets
                 .iter()
                 .map(|id| id.as_str().len() + 4)
                 .sum::<usize>(),
@@ -558,9 +576,9 @@ pub fn canonical_digest_bytes(input: &DigestInput) -> Vec<u8> {
     bytes.push(0);
     length_prefixed(&mut bytes, input.command_type.as_bytes());
 
-    bytes.extend_from_slice(&(streams.len() as u32).to_le_bytes());
-    for stream in streams {
-        length_prefixed(&mut bytes, stream.as_str().as_bytes());
+    bytes.extend_from_slice(&(targets.len() as u32).to_le_bytes());
+    for target in targets {
+        length_prefixed(&mut bytes, target.as_str().as_bytes());
     }
 
     length_prefixed(&mut bytes, &input.payload);
@@ -621,10 +639,23 @@ pub trait OutcomeCommand {
 
 /// Describes a command to a store with outcomes when there is no single command value to derive
 /// its identity from, such as a multi-stream transaction.
+///
+/// It is the caller's intent: the command type, the streams the request names
+/// ([`with_targets`](CommandIdentity::with_targets)), the payload, and the principal (from the
+/// metadata), and nothing derived from state. The streams a command reads and writes are decided
+/// per attempt, after the identity is fixed, and may change between attempts; they are not part of
+/// the identity, so a re-prepared command, a client retry that arrives after the command landed,
+/// and an ambiguous-write recovery all digest to the same value.
+///
+/// That makes the identity a contract: everything that distinguishes the request must be in the
+/// targets or the payload. Two requests with the same command ID, type, targets, payload, and
+/// principal are the same command, so a transfer whose destination is chosen only inside the
+/// decision step would replay the first destination's outcome for a second destination. Put it
+/// in the payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandIdentity {
     command_type: String,
-    streams: Vec<EntityId>,
+    targets: Vec<EntityId>,
     payload: Vec<u8>,
 }
 
@@ -633,20 +664,22 @@ impl CommandIdentity {
     pub fn new(command_type: impl Into<String>) -> Self {
         Self {
             command_type: command_type.into(),
-            streams: Vec::new(),
+            targets: Vec::new(),
             payload: Vec::new(),
         }
     }
 
-    /// Declares the streams the command will write events to. Fenced read-only streams are not
-    /// declared. An outcome-only command declares none.
+    /// Names the streams the request itself addresses (an account, a profile), known before any
+    /// state is read. Streams the command derives from state it reads, such as the handle an
+    /// entity currently holds, are not targets: they are decided per attempt and may change. A
+    /// command that names no stream, such as an outcome-only command, has none.
     #[must_use]
-    pub fn with_streams<I, S>(mut self, streams: I) -> Self
+    pub fn with_targets<I, S>(mut self, targets: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<EntityId>,
     {
-        self.streams = streams.into_iter().map(Into::into).collect();
+        self.targets = targets.into_iter().map(Into::into).collect();
         self
     }
 
@@ -664,31 +697,31 @@ impl CommandIdentity {
         self
     }
 
-    pub(crate) fn declared_streams(&self) -> &[EntityId] {
-        &self.streams
+    pub(crate) fn targets(&self) -> &[EntityId] {
+        &self.targets
     }
 
     /// Builds the digest input for this identity and the command metadata's principal.
     pub fn digest_input(&self, metadata: &Metadata) -> DigestInput {
         DigestInput {
             command_type: self.command_type.clone(),
-            streams: self.streams.clone(),
+            targets: self.targets.clone(),
             payload: self.payload.clone(),
             principal: principal(metadata),
         }
     }
 }
 
-/// Refuses a command that declares a reserved target stream (`SYSTEM#`, `command-outcome#`) with
+/// Refuses a command that names a reserved target stream (`SYSTEM#`, `command-outcome#`) with
 /// [`Error::ReservedEntityId`], before the outcome row is read: no outcome is read or recorded for
 /// a command aimed at engine-managed rows, even one that later writes nothing.
-pub(crate) fn check_declared_streams<'a>(
-    streams: impl IntoIterator<Item = &'a EntityId>,
+pub(crate) fn check_targets<'a>(
+    targets: impl IntoIterator<Item = &'a EntityId>,
 ) -> Result<(), Error> {
-    streams.into_iter().try_for_each(|stream| {
-        check_text("a declared stream ID", stream.as_str())?;
+    targets.into_iter().try_for_each(|target| {
+        check_text("a target stream ID", target.as_str())?;
 
-        crate::features::check_not_reserved(stream)
+        crate::features::check_not_reserved(target)
     })
 }
 
@@ -707,6 +740,7 @@ pub(crate) fn principal(metadata: &Metadata) -> String {
 pub struct OutcomeConfig {
     digester: Digester,
     recovery_wait: Duration,
+    retry: RetryPolicy,
 }
 
 impl Default for OutcomeConfig {
@@ -727,7 +761,21 @@ impl OutcomeConfig {
         Self {
             digester: Arc::new(default_digest),
             recovery_wait: Duration::from_secs(10),
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// Bounds fence-aware retry (C5), [`RetryPolicy::default`] by default. See
+    /// [`Store::execute_with_outcome`](crate::Store::execute_with_outcome) and
+    /// [`Store::execute_transaction`](crate::Store::execute_transaction).
+    #[must_use]
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    pub(crate) fn retry(&self) -> RetryPolicy {
+        self.retry
     }
 
     /// Bounds how long ambiguous-write recovery polls the outcome row for a commit whose result is
@@ -1384,10 +1432,10 @@ mod tests {
     }
     use super::*;
 
-    fn input(command_type: &str, streams: &[&str], payload: &str, principal: &str) -> DigestInput {
+    fn input(command_type: &str, targets: &[&str], payload: &str, principal: &str) -> DigestInput {
         DigestInput {
             command_type: command_type.into(),
-            streams: streams.iter().map(|id| EntityId::new(*id)).collect(),
+            targets: targets.iter().map(|id| EntityId::new(*id)).collect(),
             payload: payload.as_bytes().to_vec(),
             principal: principal.into(),
         }
@@ -1462,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_are_deduplicated_and_sorted_by_bytes() {
+    fn targets_are_deduplicated_and_sorted_by_bytes() {
         assert_eq!(
             canonical_digest_bytes(&input("t", &["b", "a", "b"], "", "")),
             canonical_digest_bytes(&input("t", &["a", "b"], "", ""))
@@ -1491,7 +1539,7 @@ mod tests {
 
         let metadata = Metadata::default().with_principal_id("user:42");
         let identity = CommandIdentity::new("account:open")
-            .with_streams(["acct-1"])
+            .with_targets(["acct-1"])
             .with_payload(&Open { owner: "Ada" })
             .unwrap();
 
@@ -1500,7 +1548,7 @@ mod tests {
             "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6"
         );
 
-        let none = CommandIdentity::new("account:ping").with_streams(["acct-1"]);
+        let none = CommandIdentity::new("account:ping").with_targets(["acct-1"]);
         assert!(none.digest_input(&metadata).payload.is_empty());
         assert_eq!(
             digest(&none.digest_input(&metadata)),

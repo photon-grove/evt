@@ -3,12 +3,18 @@
     "maxCommandIdBytes": 512,
     "maxOutcomeBytes": 65536
   },
+  "retry": {
+    "maxAttempts": 5,
+    "baseDelayMs": 25,
+    "maxDelayMs": 1000,
+    "staleCode": "stale-fence"
+  },
   "digests": [
     {
       "name": "single stream",
       "input": {
         "commandType": "account:open",
-        "streams": [
+        "targets": [
           "acct-1"
         ],
         "payload": "{\"owner\":\"Ada\"}",
@@ -21,7 +27,7 @@
       "name": "multi stream, sorted",
       "input": {
         "commandType": "claim-username",
-        "streams": [
+        "targets": [
           "profile#u-1",
           "claim#ada"
         ],
@@ -35,7 +41,7 @@
       "name": "multi stream with principal",
       "input": {
         "commandType": "claim-username",
-        "streams": [
+        "targets": [
           "claim#ada",
           "profile#u-1"
         ],
@@ -46,10 +52,23 @@
       "digest": "56d01f5b9788b60e12a686e40807c28d9dfde802d82faf46888adda0acee7050"
     },
     {
+      "name": "rename, state-derived write set is not identity",
+      "input": {
+        "commandType": "profile:rename",
+        "targets": [
+          "profile#u-1"
+        ],
+        "payload": "{\"handle\":\"grace\"}",
+        "principal": "user:42"
+      },
+      "canonicalHex": "6576742d636d642d6469676573742d7631000e00000070726f66696c653a72656e616d65010000000b00000070726f66696c6523752d31120000007b2268616e646c65223a226772616365227d07000000757365723a3432",
+      "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0"
+    },
+    {
       "name": "absent payload",
       "input": {
         "commandType": "account:ping",
-        "streams": [
+        "targets": [
           "acct-1"
         ],
         "payload": null,
@@ -62,7 +81,7 @@
       "name": "stale fence",
       "input": {
         "commandType": "account:rename",
-        "streams": [
+        "targets": [
           "acct-1"
         ],
         "payload": "{\"name\":\"Grace\"}",
@@ -75,7 +94,7 @@
       "name": "duplicate streams collapse",
       "input": {
         "commandType": "t",
-        "streams": [
+        "targets": [
           "b",
           "a",
           "b"
@@ -90,7 +109,7 @@
       "name": "outcome-only, no streams",
       "input": {
         "commandType": "account:audit",
-        "streams": [],
+        "targets": [],
         "payload": "{\"note\":\"checked\"}",
         "principal": ""
       },
@@ -101,7 +120,7 @@
       "name": "non-ASCII and HTML-sensitive payload",
       "input": {
         "commandType": "note:add",
-        "streams": [
+        "targets": [
           "naïve#1"
         ],
         "payload": "{\"text\":\"a<b> & é\"}",
@@ -358,6 +377,91 @@
         "digest": "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b",
         "events": "[]",
         "rejection": "{\"code\":\"stale-fence\",\"message\":\"a caller-stamped fence went stale\",\"details\":null}",
+        "response": null,
+        "status": "rejected"
+      }
+    },
+    {
+      "name": "accepted rename, state-derived write set",
+      "input": {
+        "commandId": "cmd-0008",
+        "status": "accepted",
+        "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0",
+        "response": null,
+        "eventIds": [
+          "claim#ada:2",
+          "claim#grace:1",
+          "profile#u-1:2"
+        ],
+        "rejection": null
+      },
+      "eventsJson": "[\"claim#ada:2\",\"claim#grace:1\",\"profile#u-1:2\"]",
+      "dynamoItem": {
+        "digest": {
+          "S": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0"
+        },
+        "events": {
+          "S": "[\"claim#ada:2\",\"claim#grace:1\",\"profile#u-1:2\"]"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0008"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      },
+      "itemSize": 166,
+      "postgresRow": {
+        "code": null,
+        "command_id": "cmd-0008",
+        "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0",
+        "events": "[\"claim#ada:2\",\"claim#grace:1\",\"profile#u-1:2\"]",
+        "rejection": null,
+        "response": null,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "rejected stale fence, retries exhausted",
+      "input": {
+        "commandId": "cmd-0009",
+        "status": "rejected",
+        "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0",
+        "response": null,
+        "eventIds": [],
+        "rejection": "{\"code\":\"stale-fence\",\"message\":\"the state this command was decided on kept changing; retries were exhausted\",\"details\":{\"attempts\":5}}"
+      },
+      "rejectionJson": "{\"code\":\"stale-fence\",\"message\":\"the state this command was decided on kept changing; retries were exhausted\",\"details\":{\"attempts\":5}}",
+      "dynamoItem": {
+        "code": {
+          "S": "stale-fence"
+        },
+        "digest": {
+          "S": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0009"
+        },
+        "rejection": {
+          "S": "{\"code\":\"stale-fence\",\"message\":\"the state this command was decided on kept changing; retries were exhausted\",\"details\":{\"attempts\":5}}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      },
+      "itemSize": 272,
+      "postgresRow": {
+        "code": "stale-fence",
+        "command_id": "cmd-0009",
+        "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0",
+        "events": "[]",
+        "rejection": "{\"code\":\"stale-fence\",\"message\":\"the state this command was decided on kept changing; retries were exhausted\",\"details\":{\"attempts\":5}}",
         "response": null,
         "status": "rejected"
       }

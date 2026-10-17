@@ -244,7 +244,7 @@ func TestOutcomes_ResolveCommandReportsWhatHappened(t *testing.T) {
 	store, _ := newOutcomeStore(t)
 	ctx := context.Background()
 
-	identity := evt.CommandIdentity{Type: "test:create", Streams: []evt.EntityID{"e-1"}, Payload: createCommand()}
+	identity := evt.CommandIdentity{Type: "test:create", Targets: []evt.EntityID{"e-1"}, Payload: createCommand()}
 
 	absent, err := store.ResolveCommand(ctx, identity, commandMetadata("cmd-1"))
 	require.NoError(t, err)
@@ -340,7 +340,7 @@ func TestOutcomes_MetadataIsSnapshottedAtBeginCommand(t *testing.T) {
 		Region: "us-west-2", Timestamp: "2026-10-12T00:00:00Z", Extensions: map[string]string{"k": "v"},
 	}
 
-	tx, replayed, err := store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Streams: []evt.EntityID{"e-1"}}, metadata)
+	tx, replayed, err := store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Targets: []evt.EntityID{"e-1"}}, metadata)
 	require.NoError(t, err)
 	require.Nil(t, replayed)
 	require.NoError(t, tx.Read(ctx, etest.NewEntity("e-1"), "e-1"))
@@ -427,7 +427,7 @@ func TestOutcomes_NonUTF8IdentityStringsAreRefusedBeforeAnyReadOrHandler(t *test
 	_, _, err = store.BeginCommand(ctx, evt.CommandIdentity{Type: evt.CommandType(bad)}, commandMetadata("cmd-2"))
 	require.ErrorIs(t, err, evt.ErrInvalidArgument)
 
-	_, _, err = store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Streams: []evt.EntityID{evt.EntityID(bad)}}, commandMetadata("cmd-3"))
+	_, _, err = store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Targets: []evt.EntityID{evt.EntityID(bad)}}, commandMetadata("cmd-3"))
 	require.ErrorIs(t, err, evt.ErrInvalidArgument)
 
 	stored, err := repo.GetOutcome(ctx, "cmd-1")
@@ -459,7 +459,11 @@ func (r *slowReadRepository) GetOutcome(ctx context.Context, id evt.CommandID) (
 
 func TestOutcomes_RecoveryNeverOutlivesItsWindowEvenWhenAReadHangs(t *testing.T) {
 	repo := &slowReadRepository{OutcomeRepository: memOutcomes(t)}
-	store := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(150 * time.Millisecond))
+	// One attempt: a retry's own pre-check read would hang on the caller's context, which has no
+	// deadline here. Recovery is what this test bounds.
+	store := snapshots.NewStore(repo, 0).
+		WithOutcomes(snapshots.WithRecoveryWait(150 * time.Millisecond)).
+		WithRetry(snapshots.RetryPolicy{MaxAttempts: 1})
 
 	entity := &MockEntity{}
 	entity.ID = "e-1"

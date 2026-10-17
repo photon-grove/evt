@@ -24,7 +24,7 @@ use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ use crate::repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
 };
 use crate::retry::RetryPolicy;
-use crate::store::{Store, serialize_events};
+use crate::store::{Decision, Store, serialize_events};
 use crate::transaction::Begin;
 
 /// The aggregate the [`Store`] cases use: a running total of positive amounts.
@@ -3076,6 +3076,42 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         Box::pin(outcome_stale_fence(repo)).await,
     );
     record(
+        "a transaction may write streams its identity does not name",
+        Box::pin(outcome_write_set_is_not_identity(repo)).await,
+    );
+    record(
+        "an engine-filled conflict re-prepares the command and only the committing attempt writes",
+        Box::pin(retry_engine_filled(repo)).await,
+    );
+    record(
+        "a caller-stamped fence conflict fails fast without preparing again",
+        Box::pin(retry_caller_fenced(repo)).await,
+    );
+    record(
+        "exhausted retries persist a stale-fence rejection that replays identically",
+        Box::pin(retry_exhausted(repo)).await,
+    );
+    record(
+        "a write set that changes between attempts is still one command identity",
+        Box::pin(retry_write_set_changes(repo)).await,
+    );
+    record(
+        "the single-aggregate shortcut re-prepares and records a stale-fence rejection",
+        Box::pin(retry_single_aggregate(repo)).await,
+    );
+    record(
+        "the identity digest is computed once, however many attempts a command takes",
+        Box::pin(retry_digest_once(repo)).await,
+    );
+    record(
+        "a deadline ends the retries and is treated as exhausted attempts",
+        Box::pin(retry_deadline(repo)).await,
+    );
+    record(
+        "a stream outside the identity is still refused when it is reserved",
+        Box::pin(retry_reserved_stream(repo)).await,
+    );
+    record(
         "a failed commit leaves no outcome row",
         Box::pin(outcome_atomicity(repo)).await,
     );
@@ -3106,6 +3142,15 @@ fn outcome_store<R: Repository>(repo: R) -> Store<Ledger, R> {
         .with_outcomes(outcome_config())
 }
 
+/// A store that runs each command once: the cases that pin what a single attempt returns (an
+/// ambiguous write whose row never appears, say) must not have the engine run the command again on
+/// its own. Fence-aware retry has its own cases.
+fn single_attempt_store<R: Repository>(repo: R) -> Store<Ledger, R> {
+    Store::new(repo, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(outcome_config().with_retry(RetryPolicy::immediate(1)))
+}
+
 fn command_id() -> CommandId {
     CommandId::new(format!("{}-cmd", namespace()))
 }
@@ -3119,7 +3164,7 @@ fn ledger_digest(entity_id: &EntityId, amount: i64) -> Result<String, Failure> {
     let command = Add(amount);
     let input = DigestInput {
         command_type: command.command_type(),
-        streams: vec![entity_id.clone()],
+        targets: vec![entity_id.clone()],
         payload: command
             .canonical_payload()
             .map_err(|err| Failure(err.to_string()))?
@@ -3475,7 +3520,7 @@ async fn outcome_noop<R: Repository>(repo: &R) -> CaseResult {
     let store = outcome_store(repo);
     let id = ledger_id();
     let command = command_id();
-    let identity = CommandIdentity::new("ledger:review").with_streams([id.clone()]);
+    let identity = CommandIdentity::new("ledger:review").with_targets([id.clone()]);
     let metadata = command_metadata(&command);
     let response = br#"{"reviewed":true}"#.to_vec();
 
@@ -3520,7 +3565,7 @@ async fn outcome_noop<R: Repository>(repo: &R) -> CaseResult {
     // The no-op still checks the read set's fences: a stream that moved fails it, retryably, and
     // records nothing.
     let command = command_id();
-    let identity = CommandIdentity::new("ledger:review").with_streams([id.clone()]);
+    let identity = CommandIdentity::new("ledger:review").with_targets([id.clone()]);
     let mut tx = store.transaction();
     tx.begin_command(&identity, &command_metadata(&command))
         .await?;
@@ -3595,7 +3640,7 @@ async fn outcome_transaction_reject<R: Repository>(repo: &R) -> CaseResult {
     let plain = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(0);
     plain.execute(&ext, Add(1), metadata()).await?;
     let command = command_id();
-    let identity = CommandIdentity::new("username:claim").with_streams([ext.clone()]);
+    let identity = CommandIdentity::new("username:claim").with_targets([ext.clone()]);
     let rejection = Rejection::new("username-taken", "handle ada is taken")
         .with_details(serde_json::json!({ "handle": "ada" }));
 
@@ -3760,7 +3805,7 @@ async fn outcome_limits<R: Repository>(repo: &R) -> CaseResult {
     );
 
     let command = command_id();
-    let identity = CommandIdentity::new("ledger:review").with_streams([id.clone()]);
+    let identity = CommandIdentity::new("ledger:review").with_targets([id.clone()]);
     let mut tx = store.transaction();
     tx.begin_command(&identity, &command_metadata(&command))
         .await?;
@@ -3785,7 +3830,7 @@ async fn outcome_limits<R: Repository>(repo: &R) -> CaseResult {
 
 async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
     let fault = FaultInjectingRepository::new(repo);
-    let store = outcome_store(&fault);
+    let store = single_attempt_store(&fault);
 
     // The commit applied but the caller saw a failure: recovery returns the stored outcome and
     // the command does not run again.
@@ -4097,7 +4142,7 @@ async fn outcome_nul_refused<R: Repository>(repo: &R) -> CaseResult {
         Rejection::new("c", "m").with_details(serde_json::json!({ "ke\0y": "value" })),
         Rejection::new("c", "m").with_details(serde_json::json!({ "n": [{ "deep": "x\0" }] })),
     ];
-    let identity = CommandIdentity::new("ledger:nul").with_streams([ext.clone()]);
+    let identity = CommandIdentity::new("ledger:nul").with_targets([ext.clone()]);
     for rejection in rejections {
         let command = command_id();
         let mut tx = store.transaction();
@@ -4162,7 +4207,7 @@ async fn outcome_reserved_targets<R: Repository>(repo: &R) -> CaseResult {
         );
 
         let identity = CommandIdentity::new("ledger:any")
-            .with_streams([ledger_id().to_string(), reserved.to_owned()]);
+            .with_targets([ledger_id().to_string(), reserved.to_owned()]);
         let mut transaction = store.transaction();
         let begun = transaction.begin_command(&identity, &metadata).await;
         ensure!(
@@ -4194,9 +4239,9 @@ async fn outcome_fence_race<R: Repository>(repo: &R) -> CaseResult {
         plain.execute(&watched, Add(1), metadata()).await?;
 
         let command = command_id();
-        // Both writers declare both streams: the winner writes the watched one.
+        // Both writers name both streams: the winner writes the watched one.
         let identity =
-            CommandIdentity::new("ledger:copy").with_streams([target.clone(), watched.clone()]);
+            CommandIdentity::new("ledger:copy").with_targets([target.clone(), watched.clone()]);
         let metadata = command_metadata(&command);
 
         // The loser reads the watched stream (an engine fence at head 1) and writes the target.
@@ -4211,7 +4256,7 @@ async fn outcome_fence_race<R: Repository>(repo: &R) -> CaseResult {
         let winner_identity = if same_identity {
             identity.clone()
         } else {
-            CommandIdentity::new("ledger:other").with_streams([target.clone(), watched.clone()])
+            CommandIdentity::new("ledger:other").with_targets([target.clone(), watched.clone()])
         };
         let digest = default_digest(&winner_identity.digest_input(&metadata))
             .map_err(|err| Failure(err.to_string()))?;
@@ -4261,7 +4306,7 @@ async fn outcome_stale_fence<R: Repository>(repo: &R) -> CaseResult {
 
     let target = ledger_id();
     let command = command_id();
-    let identity = CommandIdentity::new("ledger:copy").with_streams([target.clone()]);
+    let identity = CommandIdentity::new("ledger:copy").with_targets([target.clone()]);
     let metadata = command_metadata(&command);
 
     // The caller stamped a fence at head 1; the stream is at 2.
@@ -4387,6 +4432,855 @@ async fn outcome_stale_fence<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Fence-aware retry (C5)
+// ---------------------------------------------------------------------------------------------
+
+/// Which commits a [`Meddling`] repository interferes with.
+#[derive(Clone, Copy)]
+enum Trigger {
+    /// Commits that carry read fences.
+    Fences,
+    /// Commits that write events.
+    Events,
+}
+
+/// Wraps a repository so another writer moves a stream between a command's reads and its commit:
+/// just before each commit its [`Trigger`] selects, up to a number of times, it appends one event
+/// to the stream. It also records the backoffs the engine asks for, returning at once.
+struct Meddling<'a, R> {
+    inner: &'a R,
+    stream: EntityId,
+    trigger: Trigger,
+    moves: Mutex<u32>,
+    delays: Mutex<Vec<Duration>>,
+}
+
+impl<'a, R: Repository> Meddling<'a, R> {
+    /// A repository that moves `stream` before the next `moves` matching commits (`u32::MAX` for
+    /// every one).
+    fn new(inner: &'a R, stream: &EntityId, trigger: Trigger, moves: u32) -> Self {
+        Self {
+            inner,
+            stream: stream.clone(),
+            trigger,
+            moves: Mutex::new(moves),
+            delays: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn moves(&self) -> std::sync::MutexGuard<'_, u32> {
+        self.moves
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn disarm(&self) {
+        *self.moves() = 0;
+    }
+
+    fn delays(&self) -> Vec<Duration> {
+        self.delays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn meddle(&self, fenced: bool, writes_events: bool) -> Result<(), Error> {
+        let matches = match self.trigger {
+            Trigger::Fences => fenced,
+            Trigger::Events => writes_events,
+        };
+        if !matches {
+            return Ok(());
+        }
+
+        {
+            let mut moves = self.moves();
+
+            match *moves {
+                0 => return Ok(()),
+                u32::MAX => {}
+                remaining => *moves = remaining - 1,
+            }
+        }
+
+        Store::<Ledger, _>::new(self.inner, ())
+            .with_snapshot_interval(0)
+            .execute(&self.stream, Add(1), Metadata::default())
+            .await
+            .map_err(|err| Error::backend(err.to_string()))?;
+
+        Ok(())
+    }
+}
+
+impl<R: Repository> Repository for Meddling<'_, R> {
+    type Operation = R::Operation;
+
+    async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
+        self.meddle(false, !commit.events.is_empty()).await?;
+
+        self.inner.commit(commit).await
+    }
+
+    async fn commit_transaction(
+        &self,
+        commit: TransactionCommit<R::Operation>,
+    ) -> Result<(), Error> {
+        let writes_events = commit
+            .streams
+            .iter()
+            .any(|stream| !stream.events.is_empty());
+        self.meddle(!commit.fences.is_empty(), writes_events)
+            .await?;
+
+        self.inner.commit_transaction(commit).await
+    }
+
+    fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        self.delays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(duration);
+
+        async {}
+    }
+
+    async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        self.inner.outcome(command_id).await
+    }
+
+    async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
+        self.inner.events(entity_id).await
+    }
+
+    async fn events_after(
+        &self,
+        entity_id: &EntityId,
+        after: EventSequence,
+    ) -> Result<Vec<SerializedEvent>, Error> {
+        self.inner.events_after(entity_id, after).await
+    }
+
+    async fn latest(&self, entity_id: &EntityId, n: usize) -> Result<Vec<SerializedEvent>, Error> {
+        self.inner.latest(entity_id, n).await
+    }
+
+    async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
+        self.inner.snapshot(entity_id).await
+    }
+
+    async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+        self.inner.put_snapshot(snapshot).await
+    }
+
+    async fn compact_below(
+        &self,
+        entity_id: &EntityId,
+        through: EventSequence,
+    ) -> Result<usize, Error> {
+        self.inner.compact_below(entity_id, through).await
+    }
+
+    async fn entity_heads(
+        &self,
+        entity_type: Option<&EntityType>,
+    ) -> Result<BTreeMap<EntityId, EventSequence>, Error> {
+        self.inner.entity_heads(entity_type).await
+    }
+}
+
+/// A store over a [`Meddling`] repository whose retry policy has `attempts` attempts.
+fn retry_store<'m, R: Repository + 'm>(
+    meddling: &'m Meddling<'_, R>,
+    attempts: u32,
+) -> Store<Ledger, &'m Meddling<'m, R>> {
+    Store::new(meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(outcome_config().with_retry(RetryPolicy::new(attempts)))
+}
+
+fn added(amount: i64) -> Vec<LedgerEvent> {
+    vec![Added { amount }.into()]
+}
+
+async fn seed<R: Repository>(repo: &R, id: &EntityId, amount: i64) -> CaseResult {
+    Store::<Ledger, _>::new(repo, ())
+        .with_snapshot_interval(0)
+        .execute(id, Add(amount), metadata())
+        .await?;
+
+    Ok(())
+}
+
+/// The engine-filled copy command: reads `watched` (an engine-filled fence), writes its total into
+/// `target`, and records how often it ran and what it saw.
+struct CopyCommand<'a> {
+    watched: &'a EntityId,
+    target: &'a EntityId,
+    calls: AtomicUsize,
+    saw: Mutex<Vec<i64>>,
+}
+
+impl<'a> CopyCommand<'a> {
+    fn new(watched: &'a EntityId, target: &'a EntityId) -> Self {
+        Self {
+            watched,
+            target,
+            calls: AtomicUsize::new(0),
+            saw: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn saw(&self) -> Vec<i64> {
+        self.saw
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn prepare<R: Repository>(
+        &self,
+        tx: &mut crate::Transaction<'_, R>,
+    ) -> Result<Decision, Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+
+        let source = tx.read::<Ledger>(self.watched).await?;
+        let mut destination = tx.read::<Ledger>(self.target).await?;
+        let total = source.aggregate().total;
+        self.saw
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(total);
+
+        tx.append(&mut destination, added(total))?;
+
+        Ok(Decision::accept_with(total.to_string()))
+    }
+}
+
+async fn retry_engine_filled<R: Repository>(repo: &R) -> CaseResult {
+    let watched = ledger_id();
+    let target = ledger_id();
+    seed(repo, &watched, 1).await?;
+
+    // Another writer moves the watched stream between the command's reads and its first commit.
+    let meddling = Meddling::new(repo, &watched, Trigger::Fences, 1);
+    let store = retry_store(&meddling, 3);
+    let copy = CopyCommand::new(&watched, &target);
+    let identity = CommandIdentity::new("ledger:copy").with_targets([target.clone()]);
+    let command = command_id();
+
+    let outcome = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            Box::pin(copy.prepare(tx))
+        })
+        .await?;
+    ensure!(
+        outcome.is_accepted() && !outcome.replayed,
+        "the re-prepared command committed: {outcome:?}"
+    );
+    ensure_eq!(
+        copy.calls(),
+        2,
+        "the failed fence re-prepared the command once"
+    );
+    ensure_eq!(
+        copy.saw(),
+        vec![1, 2],
+        "the second attempt decided on the fresh state"
+    );
+    ensure_eq!(outcome.response(), Some(&b"2"[..]), "the response");
+    ensure_eq!(
+        meddling.delays().len(),
+        1,
+        "one backoff between the two attempts"
+    );
+
+    // The failed attempt wrote nothing: the target holds exactly the committing attempt's event.
+    let events = repo.events(&target).await?;
+    ensure_eq!(events.len(), 1, "one event in the target");
+    ensure_eq!(
+        String::from_utf8_lossy(&events[0].payload).into_owned(),
+        r#"{"amount":2}"#.to_owned(),
+        "the committing attempt's decision"
+    );
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(outcome.outcome.clone()),
+        "exactly one outcome row, the committed one"
+    );
+
+    Ok(())
+}
+
+/// A command that decided on a caller-supplied head of `referral`, stamped as a caller fence.
+struct StampedCommand<'a> {
+    referral: &'a EntityId,
+    target: &'a EntityId,
+    calls: AtomicUsize,
+}
+
+impl StampedCommand<'_> {
+    async fn prepare<R: Repository>(
+        &self,
+        tx: &mut crate::Transaction<'_, R>,
+        head: EventSequence,
+    ) -> Result<Decision, Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+
+        let mut ledger = tx.read::<Ledger>(self.target).await?;
+        tx.append(&mut ledger, added(1))?;
+        tx.fence(ReadFence::new(
+            self.referral.clone(),
+            Ledger::TYPE,
+            head,
+            FenceProvenance::Caller,
+        ))?;
+
+        Ok(Decision::accept())
+    }
+}
+
+async fn retry_caller_fenced<R: Repository>(repo: &R) -> CaseResult {
+    let referral = ledger_id();
+    let target = ledger_id();
+    seed(repo, &referral, 1).await?;
+
+    let identity = CommandIdentity::new("ledger:rename")
+        .with_targets([target.clone()])
+        .with_payload(&"Grace")?;
+    let stamped = StampedCommand {
+        referral: &referral,
+        target: &target,
+        calls: AtomicUsize::new(0),
+    };
+
+    // The caller decided on the referral at head 1; another writer moves it before the commit.
+    let meddling = Meddling::new(repo, &referral, Trigger::Events, 1);
+    let store = retry_store(&meddling, 3);
+    let command = command_id();
+
+    let outcome = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            Box::pin(stamped.prepare(tx, EventSequence(1)))
+        })
+        .await?;
+    ensure!(
+        outcome.is_rejected() && !outcome.replayed,
+        "a stale caller-stamped fence is a persisted rejection, not an error: {outcome:?}"
+    );
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::stale_fence()),
+        "the caller-fence stale-fence rejection"
+    );
+    ensure_eq!(
+        stamped.calls.load(Ordering::SeqCst),
+        1,
+        "the command was not prepared again"
+    );
+    ensure!(meddling.delays().is_empty(), "and nothing waited");
+    ensure!(
+        repo.events(&target).await?.is_empty(),
+        "the failed commit wrote none of its events"
+    );
+
+    // The old command ID is terminal: it replays the stored rejection without preparing anything.
+    let replayed = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            Box::pin(stamped.prepare(tx, EventSequence(1)))
+        })
+        .await?;
+    ensure!(replayed.replayed, "the old ID replays: {replayed:?}");
+    ensure_eq!(replayed.outcome, outcome.outcome, "the replayed rejection");
+    ensure_eq!(
+        stamped.calls.load(Ordering::SeqCst),
+        1,
+        "a replay prepares nothing"
+    );
+
+    // A caller-stamped fence that held says nothing about an event conflict beside it: the failed
+    // item is the event put, an ordinary conflict, so the command re-prepares and succeeds.
+    let head = Store::<Ledger, _>::new(repo, ())
+        .load(&referral)
+        .await?
+        .sequence();
+    let rival = Meddling::new(repo, &target, Trigger::Events, 1);
+    let store = retry_store(&rival, 3);
+    stamped.calls.store(0, Ordering::SeqCst);
+
+    let retried = store
+        .execute_transaction(&identity, &command_metadata(&command_id()), |tx| {
+            Box::pin(stamped.prepare(tx, head))
+        })
+        .await?;
+    ensure!(
+        retried.is_accepted(),
+        "a caller fence that held does not turn a conflict into a rejection: {retried:?}"
+    );
+    ensure_eq!(
+        stamped.calls.load(Ordering::SeqCst),
+        2,
+        "the event conflict re-prepared"
+    );
+    ensure_eq!(
+        repo.events(&target).await?.len(),
+        2,
+        "the rival's event and the committing attempt's"
+    );
+
+    Ok(())
+}
+
+async fn retry_exhausted<R: Repository>(repo: &R) -> CaseResult {
+    let watched = ledger_id();
+    let target = ledger_id();
+    seed(repo, &watched, 1).await?;
+
+    // The watched stream moves before every commit that fences it. The rejection's own outcome-only
+    // commit carries no fences, so it is left alone.
+    let meddling = Meddling::new(repo, &watched, Trigger::Fences, u32::MAX);
+    let store = retry_store(&meddling, 3);
+    let copy = CopyCommand::new(&watched, &target);
+    let identity = CommandIdentity::new("ledger:copy").with_targets([target.clone()]);
+    let command = command_id();
+
+    let outcome = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            Box::pin(copy.prepare(tx))
+        })
+        .await?;
+    ensure!(
+        outcome.is_rejected() && !outcome.replayed,
+        "exhausted retries are a persisted rejection, not an error: {outcome:?}"
+    );
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::retries_exhausted(3)),
+        "the exhausted stale-fence rejection"
+    );
+    ensure_eq!(copy.calls(), 3, "prepared once per attempt and no more");
+    ensure_eq!(copy.saw(), vec![1, 2, 3], "each attempt saw fresh state");
+
+    let delays = meddling.delays();
+    ensure_eq!(
+        delays.len(),
+        2,
+        "a backoff between attempts, none after the last"
+    );
+    ensure!(delays[1] >= delays[0], "the delays grow: {delays:?}");
+    ensure!(
+        outcome.outcome.event_ids.is_empty(),
+        "no event was committed"
+    );
+    ensure!(
+        repo.events(&target).await?.is_empty(),
+        "no attempt committed"
+    );
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(outcome.outcome.clone()),
+        "the rejection is the command's stored outcome"
+    );
+
+    // A replay of the same command gets the same answer and prepares nothing.
+    meddling.disarm();
+    let replayed = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            Box::pin(copy.prepare(tx))
+        })
+        .await?;
+    ensure!(replayed.replayed, "the command replays: {replayed:?}");
+    ensure_eq!(replayed.outcome, outcome.outcome, "the replayed rejection");
+    ensure_eq!(copy.calls(), 3, "a replay prepares nothing");
+
+    // A different command under the same ID is still a reuse, never a replay of the rejection.
+    let other = CommandIdentity::new("ledger:other").with_targets([target.clone()]);
+    let reuse = store
+        .execute_transaction(&other, &command_metadata(&command), |tx| {
+            Box::pin(copy.prepare(tx))
+        })
+        .await;
+    expect_reuse(reuse, "another identity under the exhausted command's ID")?;
+
+    // The remedy is a new command ID, decided on the fresh state.
+    let fresh = store
+        .execute_transaction(&identity, &command_metadata(&command_id()), |tx| {
+            Box::pin(copy.prepare(tx))
+        })
+        .await?;
+    ensure!(fresh.is_accepted(), "a new ID commits: {fresh:?}");
+    ensure_eq!(
+        repo.events(&target).await?.len(),
+        1,
+        "the new command's event"
+    );
+
+    Ok(())
+}
+
+/// A rename: it releases the slot the index currently names, so the stream it writes comes from
+/// state it reads, and records which slot each attempt released.
+struct RenameCommand<'a> {
+    ns: &'a str,
+    index: &'a EntityId,
+    profile: &'a EntityId,
+    released: Mutex<Vec<EntityId>>,
+}
+
+impl RenameCommand<'_> {
+    fn slot(&self, n: i64) -> EntityId {
+        EntityId::new(format!("{}-slot-{n}", self.ns))
+    }
+
+    fn released(&self) -> Vec<EntityId> {
+        self.released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn prepare<R: Repository>(
+        &self,
+        tx: &mut crate::Transaction<'_, R>,
+    ) -> Result<Decision, Error> {
+        let holder = tx.read::<Ledger>(self.index).await?;
+        let released = self.slot(holder.aggregate().total);
+        self.released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(released.clone());
+
+        let mut profile = tx.read::<Ledger>(self.profile).await?;
+        let mut slot = tx.read::<Ledger>(&released).await?;
+        tx.append(&mut profile, added(1))?;
+        tx.append(&mut slot, added(1))?;
+
+        Ok(Decision::accept())
+    }
+}
+
+async fn retry_write_set_changes<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let index = EntityId::new(format!("{ns}-index"));
+    let profile = EntityId::new(format!("{ns}-profile"));
+    seed(repo, &index, 1).await?;
+
+    // The holder changes under the first attempt, so the second derives another write set.
+    let meddling = Meddling::new(repo, &index, Trigger::Fences, 1);
+    let store = retry_store(&meddling, 3);
+    let rename = RenameCommand {
+        ns: &ns,
+        index: &index,
+        profile: &profile,
+        released: Mutex::new(Vec::new()),
+    };
+
+    // The request names the profile; the slot it releases is not part of its identity.
+    let identity = CommandIdentity::new("ledger:rename")
+        .with_targets([profile.clone()])
+        .with_payload(&"grace")?;
+    let command = command_id();
+    let metadata = command_metadata(&command);
+
+    let outcome = store
+        .execute_transaction(&identity, &metadata, |tx| Box::pin(rename.prepare(tx)))
+        .await?;
+    ensure!(
+        outcome.is_accepted(),
+        "the re-prepared command committed: {outcome:?}"
+    );
+    ensure_eq!(
+        rename.released(),
+        vec![rename.slot(1), rename.slot(2)],
+        "the write set changed between attempts"
+    );
+    ensure!(
+        repo.events(&rename.slot(1)).await?.is_empty(),
+        "the first attempt's write set was never committed"
+    );
+    ensure_eq!(
+        repo.events(&rename.slot(2)).await?.len(),
+        1,
+        "the second attempt's slot"
+    );
+    ensure_eq!(repo.events(&profile).await?.len(), 1, "the profile");
+    ensure_eq!(
+        outcome.outcome.event_ids,
+        vec![
+            EventId::for_event(&profile, EventSequence(1)),
+            EventId::for_event(&rename.slot(2), EventSequence(1)),
+        ],
+        "the outcome names every stream the commit wrote"
+    );
+
+    // The recorded digest is the identity's: the request's targets, never the streams written.
+    ensure_eq!(
+        outcome.outcome.digest,
+        default_digest(&identity.digest_input(&metadata))
+            .map_err(|err| Failure(err.to_string()))?,
+        "the identity digest"
+    );
+
+    // A client retry that arrives after the rename landed is the same command, not a key reuse.
+    let again = store
+        .execute_transaction(&identity, &metadata, |tx| Box::pin(rename.prepare(tx)))
+        .await?;
+    ensure!(again.replayed, "the retry replays: {again:?}");
+    ensure_eq!(again.outcome, outcome.outcome, "the replayed outcome");
+    ensure_eq!(rename.released().len(), 2, "a replay prepares nothing");
+
+    Ok(())
+}
+
+async fn retry_single_aggregate<R: Repository>(repo: &R) -> CaseResult {
+    let target = ledger_id();
+    seed(repo, &target, 1).await?;
+
+    let responses = AtomicUsize::new(0);
+    let respond = |ledger: &Ledger, _: &[LedgerEvent]| {
+        responses.fetch_add(1, Ordering::SeqCst);
+
+        Ok(Some(ledger.total.to_string().into_bytes()))
+    };
+
+    // Another writer appends between the command's load and its commit, once: a single-aggregate
+    // command fences nothing, so the conflict re-prepares.
+    let meddling = Meddling::new(repo, &target, Trigger::Events, 1);
+    let store = retry_store(&meddling, 3);
+    let outcome = store
+        .execute_with_response(&target, Add(2), command_metadata(&command_id()), respond)
+        .await?;
+    ensure!(outcome.is_accepted(), "the retry committed: {outcome:?}");
+    ensure_eq!(
+        responses.load(Ordering::SeqCst),
+        2,
+        "the handler ran again against the fresh state"
+    );
+    ensure_eq!(outcome.response(), Some(&b"4"[..]), "1 + the rival's 1 + 2");
+    ensure_eq!(repo.events(&target).await?.len(), 3, "no event twice");
+
+    // Every attempt loses: the rejection is recorded.
+    let meddling = Meddling::new(repo, &target, Trigger::Events, u32::MAX);
+    let store = retry_store(&meddling, 3);
+    let command = command_id();
+    responses.store(0, Ordering::SeqCst);
+
+    let outcome = store
+        .execute_with_response(&target, Add(2), command_metadata(&command), respond)
+        .await?;
+    ensure!(outcome.is_rejected(), "the attempts ran out: {outcome:?}");
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::retries_exhausted(3)),
+        "the exhausted stale-fence rejection"
+    );
+    ensure_eq!(responses.load(Ordering::SeqCst), 3, "one run per attempt");
+    ensure_eq!(
+        repo.events(&target).await?.len(),
+        6,
+        "three rival events; the command committed none"
+    );
+
+    meddling.disarm();
+    let replayed = store
+        .execute_with_response(&target, Add(2), command_metadata(&command), respond)
+        .await?;
+    ensure!(replayed.replayed, "the command replays: {replayed:?}");
+    ensure_eq!(replayed.outcome, outcome.outcome, "the replayed rejection");
+    ensure_eq!(responses.load(Ordering::SeqCst), 3, "a replay runs nothing");
+
+    Ok(())
+}
+
+async fn retry_digest_once<R: Repository>(repo: &R) -> CaseResult {
+    // A digester with state: it returns a different value on every call, so a digest recomputed
+    // per attempt would drift from the one the first attempt computed.
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let config = outcome_config()
+        .with_retry(RetryPolicy::immediate(3))
+        .with_digester(move |_| Ok(format!("digest-{}", counted.fetch_add(1, Ordering::SeqCst))));
+
+    // A multi-stream command that loses its first attempt to a moved fence.
+    let watched = ledger_id();
+    let target = ledger_id();
+    seed(repo, &watched, 1).await?;
+
+    let meddling = Meddling::new(repo, &watched, Trigger::Fences, 1);
+    let store = Store::<Ledger, _>::new(&meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config.clone());
+    let copy = CopyCommand::new(&watched, &target);
+    let identity = CommandIdentity::new("ledger:copy").with_targets([target.clone()]);
+
+    let outcome = store
+        .execute_transaction(&identity, &command_metadata(&command_id()), |tx| {
+            Box::pin(copy.prepare(tx))
+        })
+        .await?;
+    ensure!(outcome.is_accepted(), "the retry committed: {outcome:?}");
+    ensure_eq!(copy.calls(), 2, "the command was prepared twice");
+    ensure_eq!(calls.load(Ordering::SeqCst), 1, "the digester ran once");
+    ensure_eq!(
+        outcome.outcome.digest,
+        "digest-0".to_owned(),
+        "the stored digest is the first value"
+    );
+
+    // The single-aggregate path, with a rival append that costs it one attempt.
+    calls.store(0, Ordering::SeqCst);
+    let single = ledger_id();
+    seed(repo, &single, 1).await?;
+
+    let meddling = Meddling::new(repo, &single, Trigger::Events, 1);
+    let store = Store::<Ledger, _>::new(&meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config);
+    let outcome = store
+        .execute_with_outcome(&single, Add(2), command_metadata(&command_id()))
+        .await?;
+    ensure!(outcome.is_accepted(), "the retry committed: {outcome:?}");
+    ensure_eq!(calls.load(Ordering::SeqCst), 1, "the digester ran once");
+    ensure_eq!(
+        outcome.outcome.digest,
+        "digest-0".to_owned(),
+        "the stored digest is the first value"
+    );
+
+    Ok(())
+}
+
+async fn retry_deadline<R: Repository>(repo: &R) -> CaseResult {
+    let target = ledger_id();
+    seed(repo, &target, 1).await?;
+
+    // Every attempt loses, and the deadline has passed once the first has run: the retries stop
+    // there, and the attempts made are what the rejection records.
+    let meddling = Meddling::new(repo, &target, Trigger::Events, u32::MAX);
+    let store = Store::<Ledger, _>::new(&meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(
+            outcome_config()
+                .with_retry(RetryPolicy::immediate(5).with_deadline(Duration::from_nanos(1))),
+        );
+    let runs = AtomicUsize::new(0);
+
+    let outcome = store
+        .execute_with_response(&target, Add(2), command_metadata(&command_id()), |_, _| {
+            runs.fetch_add(1, Ordering::SeqCst);
+
+            Ok(None)
+        })
+        .await?;
+    ensure!(
+        outcome.is_rejected(),
+        "a conflict past the deadline is recorded like exhausted attempts: {outcome:?}"
+    );
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::retries_exhausted(1)),
+        "the attempts made"
+    );
+    ensure_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "no attempt started past the deadline"
+    );
+
+    Ok(())
+}
+
+async fn retry_reserved_stream<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let named = ledger_id();
+
+    // The identity no longer limits the write set, so the commit is what refuses a reserved
+    // stream, before any write and without retrying.
+    for reserved in ["SYSTEM#retry-case", "command-outcome#retry-case"] {
+        let command = command_id();
+        let calls = AtomicUsize::new(0);
+        let identity = CommandIdentity::new("ledger:copy").with_targets([named.clone()]);
+
+        let result = store
+            .execute_transaction(&identity, &command_metadata(&command), |tx| {
+                calls.fetch_add(1, Ordering::SeqCst);
+
+                Box::pin(async move {
+                    let mut stream = tx.read::<Ledger>(reserved).await?;
+                    tx.append(&mut stream, added(1))?;
+
+                    Ok(Decision::accept())
+                })
+            })
+            .await;
+        ensure!(
+            matches!(&result, Err(Error::ReservedEntityId { .. })),
+            "{reserved}: a reserved stream is refused: {result:?}"
+        );
+        ensure_eq!(calls.load(Ordering::SeqCst), 1, "and not retried");
+        ensure!(
+            repo.outcome(&command).await?.is_none(),
+            "{reserved}: no outcome was recorded"
+        );
+    }
+
+    Ok(())
+}
+
+async fn outcome_write_set_is_not_identity<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let named = ledger_id();
+    let derived = ledger_id();
+    let command = command_id();
+    let identity = CommandIdentity::new("ledger:copy").with_targets([named.clone()]);
+    let metadata = command_metadata(&command);
+
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &metadata).await?;
+    let mut first = tx.read::<Ledger>(&named).await?;
+    let mut second = tx.read::<Ledger>(&derived).await?;
+    tx.append(&mut first, added(1))?;
+    tx.append(&mut second, added(1))?;
+    let outcome = tx.commit_with_outcome(None).await?;
+    ensure!(
+        outcome.is_accepted(),
+        "a stream derived from state needs no declaration: {outcome:?}"
+    );
+    ensure_eq!(repo.events(&named).await?.len(), 1, "the named stream");
+    ensure_eq!(repo.events(&derived).await?.len(), 1, "the derived stream");
+
+    // The same identity replays the outcome, which lists every stream the commit wrote.
+    let mut tx = store.transaction();
+    match tx.begin_command(&identity, &metadata).await? {
+        Begin::Replayed(replayed) => {
+            ensure_eq!(replayed.outcome, outcome.outcome, "the replayed outcome");
+            ensure_eq!(
+                replayed.outcome.event_ids.len(),
+                2,
+                "both streams are named"
+            );
+        }
+        Begin::Proceed => return Err(Failure("the same identity must replay".into())),
+    }
+
+    // A request that names a different stream is a different command.
+    let other = CommandIdentity::new("ledger:copy").with_targets([derived.clone()]);
+    let mut tx = store.transaction();
+    expect_reuse(
+        tx.begin_command(&other, &metadata).await,
+        "another target under the same command ID",
+    )?;
+
+    Ok(())
+}
+
 fn metadata_for_plain() -> Metadata {
     metadata()
 }
@@ -4396,7 +5290,7 @@ async fn outcome_atomicity<R: Repository>(repo: &R) -> CaseResult {
     let plain = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(0);
     let (a, b) = (ledger_id(), ledger_id());
     let command = command_id();
-    let identity = CommandIdentity::new("ledger:pair").with_streams([a.clone(), b.clone()]);
+    let identity = CommandIdentity::new("ledger:pair").with_targets([a.clone(), b.clone()]);
 
     let mut tx = store.transaction();
     tx.begin_command(&identity, &command_metadata(&command))

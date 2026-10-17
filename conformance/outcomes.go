@@ -51,7 +51,12 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("TransactionOutcomes", func(t *testing.T) { testTransactionOutcomes(t, outcomes(t)) })
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
-	t.Run("UndeclaredStreamWriteIsRefused", func(t *testing.T) { testUndeclaredStream(t, outcomes(t)) })
+	t.Run("WriteSetIsNotIdentity", func(t *testing.T) { testWriteSetIsNotIdentity(t, outcomes(t)) })
+	t.Run("EngineFilledConflictRePrepares", func(t *testing.T) { testEngineFilledRePrepare(t, outcomes(t)) })
+	t.Run("CallerFencedConflictFailsFast", func(t *testing.T) { testCallerFencedFailsFast(t, outcomes(t), enforcesConcurrency) })
+	t.Run("ExhaustedRetriesPersistStaleRejection", func(t *testing.T) { testExhaustedRetries(t, outcomes(t)) })
+	t.Run("ReservedWriteIsStillRefused", func(t *testing.T) { testReservedWriteRefused(t, outcomes(t)) })
+	t.Run("WriteSetChangesBetweenAttempts", func(t *testing.T) { testWriteSetChanges(t, outcomes(t)) })
 	t.Run("ResponseIsCopied", func(t *testing.T) { testResponseCopied(t, outcomes(t)) })
 	t.Run("NULIsRefusedBeforeAnyWrite", func(t *testing.T) { testNULRefused(t, outcomes(t)) })
 	t.Run("ReservedTargetStreams", func(t *testing.T) { testReservedTargets(t, outcomes(t)) })
@@ -65,6 +70,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 
 	if enforcesConcurrency {
 		t.Run("ConflictLeavesNoOutcome", func(t *testing.T) { testConflictLeavesNoOutcome(t, outcomes(t)) })
+		t.Run("SingleAggregateRetryRePrepares", func(t *testing.T) { testSingleAggregateRetry(t, outcomes(t)) })
 	}
 }
 
@@ -553,7 +559,11 @@ func testAmbiguousRecovery(t *testing.T, repo evt.OutcomeRepository) {
 	faulty, err := test.NewFaultRepository(repo)
 	require.NoError(t, err)
 
+	// One attempt: this case pins what a single attempt returns when the row never appears. Fence-
+	// aware retry would run the command again on its own (see the retry cases).
 	env := newOutcomeEnv(t, faulty, 0)
+	env.store.WithRetry(snapshots.RetryPolicy{MaxAttempts: 1})
+
 	ran := counter()
 	cause := errors.New("connection reset by peer")
 
@@ -734,10 +744,20 @@ func testConflictLeavesNoOutcome(t *testing.T, repo evt.OutcomeRepository) {
 	env := newOutcomeEnv(t, faulty, 0)
 	rival := newOutcomeEnv(t, repo, 0)
 	rival.id, rival.ns = env.id, env.ns
+	ctx := context.Background()
 
 	// Another command appends between this writer's load and its commit: the event put fails, the
-	// whole transaction rolls back, and no outcome row remains.
+	// whole transaction rolls back, and no outcome row remains. A single attempt (Complete) shows
+	// the raw conflict; the engine's own retry is covered by the retry cases.
 	id := env.commandID("loser")
+	identity := evt.CommandIdentity{Type: "ledger:deposit", Targets: []evt.EntityID{env.id}}
+
+	tx, replayed, err := env.store.BeginCommand(ctx, identity, withCommand(id))
+	require.NoError(t, err)
+	require.Nil(t, replayed)
+	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
+	require.NoError(t, tx.Append(env.id, &ledgerEvent{Kind: "deposited", Amount: 2}))
+
 	faulty.Intercept = func(_ context.Context, _ evt.SerializedResult, commit func() error) error {
 		faulty.Intercept = nil
 
@@ -747,14 +767,14 @@ func testConflictLeavesNoOutcome(t *testing.T, repo evt.OutcomeRepository) {
 		return commit()
 	}
 
-	_, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 2}, id)
+	_, err = tx.Complete(ctx, nil)
 	require.Error(t, err)
-	require.True(t, evt.IsConflictErr(err) || policy.IsTransient(err), "an event collision is an ordinary conflict: %v", err)
+	require.True(t, evt.IsOptimisticConflict(err), "an event collision is an ordinary conflict: %v", err)
 	require.False(t, errors.Is(err, evt.ErrOutcomeConflict), "it is not an outcome conflict")
 	env.requireNoOutcome(t, id)
 	require.Len(t, env.events(t, env.id), 1)
 
-	// The retry runs the command against the fresh state.
+	// The command ID is still free: the same command runs against the fresh state.
 	retried, err := env.run(t, &ledgerCommand{Kind: "deposit", Amount: 2}, id)
 	require.NoError(t, err)
 	require.JSONEq(t, `{"total":3}`, string(retried.Response))
@@ -766,7 +786,7 @@ func testTransactionOutcomes(t *testing.T, repo evt.OutcomeRepository) {
 	other := evt.EntityID(env.ns + "-aaa-first")
 
 	identity := evt.CommandIdentity{
-		Type: "ledger:transfer", Streams: []evt.EntityID{env.id, other}, Payload: map[string]int{"amount": 5},
+		Type: "ledger:transfer", Targets: []evt.EntityID{env.id, other}, Payload: map[string]int{"amount": 5},
 	}
 	deposited := &ledgerEvent{Kind: "deposited", Amount: 5}
 
@@ -803,7 +823,7 @@ func testTransactionOutcomes(t *testing.T, repo evt.OutcomeRepository) {
 	// unchanged, and fails with an ordinary (retryable) fence conflict, recording nothing, once the
 	// stream has moved.
 	noop := env.commandID("noop")
-	tx, _, err = env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "ledger:peek", Streams: nil}, withCommand(noop))
+	tx, _, err = env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "ledger:peek", Targets: nil}, withCommand(noop))
 	require.NoError(t, err)
 	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
 
@@ -829,7 +849,7 @@ func testTransactionOutcomes(t *testing.T, repo evt.OutcomeRepository) {
 	// A rejection is an outcome-only commit; the engine rejects only against state that still holds.
 	rejection := evt.Rejection{Code: "username-taken", Message: "handle ada is taken", Details: map[string]any{"handle": "ada"}}
 	reject := env.commandID("reject")
-	tx, _, err = env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "claim-username", Streams: []evt.EntityID{env.id}}, withCommand(reject))
+	tx, _, err = env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "claim-username", Targets: []evt.EntityID{env.id}}, withCommand(reject))
 	require.NoError(t, err)
 	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
 
@@ -865,7 +885,7 @@ func testStaleFencePersistence(t *testing.T, repo evt.OutcomeRepository) {
 	}
 	moveReferral("referral-1")
 
-	identity := evt.CommandIdentity{Type: "ledger:rename", Streams: []evt.EntityID{env.id}, Payload: map[string]string{"name": "Grace"}}
+	identity := evt.CommandIdentity{Type: "ledger:rename", Targets: []evt.EntityID{env.id}, Payload: map[string]string{"name": "Grace"}}
 	id := env.commandID("stale")
 
 	begin := func(cmdID evt.CommandID, head evt.EventSequence) *snapshots.Transaction {
@@ -999,9 +1019,8 @@ func testFenceRace(t *testing.T, repo evt.OutcomeRepository) {
 		require.NoError(t, err)
 
 		id := env.commandID(fmt.Sprintf("fence-race-%t-%s", sameIdentity, watched))
-		// Both writers declare both streams: the winner writes the watched one, and a command
-		// may only write streams its identity declares.
-		identity := evt.CommandIdentity{Type: "ledger:copy", Streams: []evt.EntityID{target, watched}}
+		// Both writers name both streams: the winner writes the watched one.
+		identity := evt.CommandIdentity{Type: "ledger:copy", Targets: []evt.EntityID{target, watched}}
 
 		// The loser reads the watched stream (an engine fence at head 1) and writes the target.
 		tx, replayed, berr := env.store.BeginCommand(ctx, identity, withCommand(id))
@@ -1046,39 +1065,6 @@ func testFenceRace(t *testing.T, repo evt.OutcomeRepository) {
 	}
 }
 
-// A command's identity digest covers the streams it declares, so it may only write those: a write
-// to any other stream would be an effect the digest omits, replayed for a different identity.
-func testUndeclaredStream(t *testing.T, repo evt.OutcomeRepository) {
-	ctx := context.Background()
-	env := newOutcomeEnv(t, repo, 0)
-
-	declared := env.id
-	other := evt.EntityID(string(env.id) + "-other")
-	id := env.commandID("undeclared")
-	identity := evt.CommandIdentity{Type: "ledger:copy", Streams: []evt.EntityID{declared}}
-
-	tx, replayed, err := env.store.BeginCommand(ctx, identity, withCommand(id))
-	require.NoError(t, err)
-	require.Nil(t, replayed)
-	require.NoError(t, tx.Read(ctx, newLedger(declared), declared))
-	require.NoError(t, tx.Read(ctx, newLedger(other), other))
-
-	err = tx.Append(other, &ledgerEvent{Kind: "deposited", Amount: 1})
-	require.Error(t, err)
-
-	var invalid *evt.InvalidCommitError
-	require.ErrorAs(t, err, &invalid)
-
-	// The refusal changed nothing: the declared stream can still be written and the command completes.
-	require.NoError(t, tx.Append(declared, &ledgerEvent{Kind: "deposited", Amount: 1}))
-
-	outcome, err := tx.Complete(ctx, nil)
-	require.NoError(t, err)
-	require.True(t, outcome.Accepted())
-	require.Empty(t, env.events(t, other), "the undeclared stream was never written")
-	require.Len(t, env.events(t, declared), 1)
-}
-
 // The returned outcome owns its response bytes: a caller that reuses its buffer after the commit
 // changes neither the stored row nor the outcome it was handed.
 func testResponseCopied(t *testing.T, repo evt.OutcomeRepository) {
@@ -1086,7 +1072,7 @@ func testResponseCopied(t *testing.T, repo evt.OutcomeRepository) {
 	env := newOutcomeEnv(t, repo, 0)
 
 	id := env.commandID("response-copy")
-	identity := evt.CommandIdentity{Type: "ledger:respond", Streams: []evt.EntityID{env.id}}
+	identity := evt.CommandIdentity{Type: "ledger:respond", Targets: []evt.EntityID{env.id}}
 
 	tx, _, err := env.store.BeginCommand(ctx, identity, withCommand(id))
 	require.NoError(t, err)
@@ -1169,7 +1155,7 @@ func testNULRefused(t *testing.T, repo evt.OutcomeRepository) {
 	} {
 		id := env.commandID(fmt.Sprintf("reject-nul-%d", index))
 
-		tx, replayed, berr := env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Streams: []evt.EntityID{env.id}}, withCommand(id))
+		tx, replayed, berr := env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Targets: []evt.EntityID{env.id}}, withCommand(id))
 		require.NoError(t, berr)
 		require.Nil(t, replayed)
 
@@ -1184,9 +1170,9 @@ func testReservedTargets(t *testing.T, repo evt.OutcomeRepository) {
 	ctx := context.Background()
 
 	for _, reserved := range []evt.EntityID{"SYSTEM#target", "command-outcome#target"} {
-		// Multi-stream: the identity declares a reserved stream, so no outcome is read or recorded.
+		// Multi-stream: the identity names a reserved stream, so no outcome is read or recorded.
 		id := env.commandID("reserved-" + string(reserved))
-		identity := evt.CommandIdentity{Type: "ledger:any", Streams: []evt.EntityID{env.id, reserved}}
+		identity := evt.CommandIdentity{Type: "ledger:any", Targets: []evt.EntityID{env.id, reserved}}
 
 		_, _, err := env.store.BeginCommand(ctx, identity, withCommand(id))
 		require.True(t, evt.IsReservedEntityIdErr(err), "BeginCommand: %v", err)
@@ -1310,7 +1296,7 @@ func testRejectionFenceOrdering(t *testing.T, repo evt.OutcomeRepository) {
 	require.NoError(t, err)
 
 	id := env.commandID("fence-then-read")
-	tx, replayed, err := env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "ledger:withdraw", Streams: []evt.EntityID{env.id}}, withCommand(id))
+	tx, replayed, err := env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "ledger:withdraw", Targets: []evt.EntityID{env.id}}, withCommand(id))
 	require.NoError(t, err)
 	require.Nil(t, replayed)
 	require.NoError(t, tx.Fence(evt.ReadFence{EntityID: env.id, EntityType: ledgerType, Head: 1}))
@@ -1338,7 +1324,7 @@ func testLegacyCommandIDWindow(t *testing.T, repo evt.OutcomeRepository) {
 	require.True(t, evt.IsDuplicateCommandErr(err), "the single-aggregate path: %v", err)
 	env.requireNoOutcome(t, id)
 
-	identity := evt.CommandIdentity{Type: "ledger:withdraw", Streams: []evt.EntityID{env.id}}
+	identity := evt.CommandIdentity{Type: "ledger:withdraw", Targets: []evt.EntityID{env.id}}
 
 	tx, replayed, err := env.store.BeginCommand(ctx, identity, withCommand(id))
 	require.NoError(t, err)

@@ -265,9 +265,9 @@ error before any write and is never split.
 - A fence conflict fails the whole commit and surfaces as `*FenceConflictError` carrying the
   fenced stream ID, its fenced head, and the fence's provenance — never a transaction item
   index, which is internal and differs by backend. It unwraps to a conflict. An engine-filled
-  fence conflict is classified transient (`policy.Classify`, so `policy.ExecuteWithRetry`
-  retries it exactly like an event-put conflict); a caller-stamped one is a stale-fence
-  rejection and is not retried
+  fence conflict is classified transient (`policy.Classify`) and matches
+  `evt.IsOptimisticConflict`, so fence-aware retry re-prepares it exactly like an event-put
+  conflict; a caller-stamped one is a stale-fence rejection and is not retried
 - Fences for entity types in the feature manifest's durable `retention` set are refused with
   `*RetentionConflictError` — the refusal consults the manifest, so it binds writers that
   configured no retention themselves
@@ -288,14 +288,15 @@ error before any write and is never split.
   digest returns the stored outcome (events, response, rejection) without running the handler; a
   different digest is `IdempotencyKeyReuse` carrying the stored outcome, and is never stored. The
   stored digest is computed before execution from the command's identity alone (SHA-256 over the
-  type, the sorted declared target streams, the canonical payload JSON, and the principal)
+  type, the sorted target streams the request names, the canonical payload JSON, and the
+  principal) — the caller's intent, never the streams the command goes on to read or write
 - Before any outcome is recorded — accepted, rejected, or stale-fence — the load-time duplicate
   window of the streams the command read is applied: a pre-v0.9 event that carries this command ID
   and was replayed since the latest snapshot is a duplicate (`DuplicateCommandError` /
   `Error::DuplicateCommand`), and no terminal outcome is written for a command that already ran.
   The window only sees events after the latest snapshot; a pre-v0.9 command ID folded into a
   snapshot or compacted away is not detected (the documented upgrade limitation, no backfill)
-- A command may not declare a reserved target stream (`SYSTEM#`, `command-outcome#`): the identity
+- A command may not name a reserved target stream (`SYSTEM#`, `command-outcome#`): the identity
   is refused with the typed reserved-ID error before the outcome row is read, so no outcome is read
   or recorded for a command aimed at engine-managed rows. An outcome read with an empty,
   non-UTF-8, or oversized command ID is the same typed error on every backend, never "absent"
@@ -323,8 +324,10 @@ error before any write and is never split.
   keys and values, ...), or a rejection's code, message, details strings, or details keys is
   `ErrInvalidArgument` / `Error::InvalidArgument` on every backend (PostgreSQL cannot store it),
   before any handler side effect or write
-- A command writes only the streams its identity declares; appending to another stream is refused
-  before anything is staged (`InvalidCommitError` / `Error::InvalidCommit`)
+- The write set is not part of a command's identity: a command may read, fence, and append to any
+  stream, named or not, because the streams it touches can depend on the state it reads and differ
+  between attempts. The outcome's `events` list records what the committing attempt wrote, and a
+  replay returns it without running the command
 - Recovery polls the outcome row with bounded backoff (50 ms doubling to 1 s, 10 s by default) on a
   context detached from the caller's cancellation, for every indeterminate failure (including
   DynamoDB's `TransactionInProgressException`): a row that appears is resolved, and one still
@@ -364,7 +367,59 @@ error before any write and is never split.
   fences to check
 - A failed caller-stamped fence is persisted as a `stale-fence` rejection by an outcome-only
   transaction that omits the failed fences (the old ID stays terminal; the remedy is a new command
-  ID). Engine-filled fence conflicts and event, floor, or snapshot conflicts are never rejections
+  ID). A single engine-filled fence conflict or event, floor, or snapshot conflict is never a
+  rejection; it re-prepares the command, and only the exhaustion of the attempts records one
+  (see Fence-Aware Retry below)
+
+### Fence-Aware Retry (v0.9, C5)
+
+- On a store with outcomes a command runs under a bounded policy (default 5 attempts in total,
+  25 ms doubling to 1 s, jittered to `[delay/2, delay]`; a value below 1 attempt means 1; unset
+  delay fields take the defaults, and waiting is switched off only explicitly with
+  `ImmediateRetryPolicy` / `RetryPolicy::immediate`). An optional deadline stops new attempts
+  once it has elapsed and is treated as exhausted attempts. Worst case is the attempts, about
+  0.4 s of waits with the defaults, and a recovery window per attempt for ambiguous writes. Go:
+  `snapshots.RetryPolicy` and `Store.WithRetry`; Rust: `RetryPolicy` and
+  `OutcomeConfig::with_retry`. Both implementations assert the defaults against
+  `compat/fixtures/outcomes.json`. There is no wait after the last attempt, and a Go wait ends with
+  the context's error
+- A failure is classified by the transaction item that failed. An optimistic-concurrency conflict
+  at commit time (event put, floor or snapshot condition, continuity check, engine-filled fence,
+  DynamoDB `TransactionConflict`) re-prepares the command: the outcome row is read again, the
+  aggregates are loaded again, and the handler or prepare step runs again from scratch. Throttling,
+  an ambiguous write whose row never appeared, and a load that found a sequence gap are retried
+  after a backoff too, but are transient, not conflicts: they never become a rejection. Everything
+  else is returned at once, including an error a multi-stream prepare step makes up itself (only a
+  failed `Read` it passes on is a load failure) and, in both languages, a command ID, digest, and
+  targets that are validated and computed once before the first attempt
+- A failed caller-stamped fence fails fast: the engine records the `stale-fence` rejection
+  immediately, without re-preparing or waiting, because it cannot know the caller's decision still
+  holds. A caller-stamped fence that passed does not turn another item's conflict into a rejection
+- Exhausted attempts on a conflict persist a `stale-fence` rejection (message `the state this
+  command was decided on kept changing; retries were exhausted`, details `{"attempts": N}`) as the
+  command's outcome through the outcome-only transaction, so a replay of the command ID returns
+  the same rejection and the remedy is a new command ID. Exhausted attempts on a transient
+  non-conflict return the error and record nothing
+- Only the attempt that commits writes anything, and a stored outcome found by any attempt's
+  pre-check ends the loop. The handler or prepare step may run up to `MaxAttempts` times for one
+  command and must be safe to repeat; a handler's own error, including a domain `ConflictError`, is
+  never retried
+- The identity digest is computed once, before the first attempt, and never recomputed from the
+  live command or metadata. Everything that distinguishes one request from another must be in the
+  targets or the payload: two requests with the same ID, type, targets, payload, and principal are
+  the same command (a transfer whose destination comes only from the decision step would replay
+  the first destination's outcome)
+- The write set may differ between attempts without changing the command: identity is the request's
+  intent, computed once before any attempt, so re-preparation, a client retry after the command
+  landed, and recovery all digest to the same value (never `IdempotencyKeyReuse`)
+- Go resets the caller's entity before each re-preparation (exported fields from a deep copy,
+  unexported fields shallowly, so state `Apply` changes belongs in exported fields) and attempts an
+  entity it cannot reset (not a pointer to a struct) once; the command value is reused by every
+  attempt and must not be mutated by a handler. After a replayed or exhausted result the entity is
+  reloaded so it reflects durable state. Rust loads a fresh aggregate and clones the command per
+  attempt
+- `policy.ExecuteWithRetry` (deprecated, K6) and Rust's `execute_with_retry` (a store without
+  outcomes) remain blind whole-command retry for code that does not use outcomes
 
 ## Snapshot Logic
 
@@ -685,8 +740,9 @@ DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimi
 - **Optimistic concurrency on commit** — a commit that reuses an already-committed `(EntityID,
 EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with a conditional
   write (`attribute_not_exists(sk)`); PostgreSQL with the `(entity_id, sequence)` primary key, whose
-  unique violation surfaces as an `evt.ConflictError`, classified as transient so
-  `policy.ExecuteWithRetry` retries it. (The in-memory backend is a permissive test
+  unique violation surfaces as an `evt.ConflictError`, classified as transient so retry
+  re-prepares it. A backend must report every such conflict so that `evt.IsOptimisticConflict`
+  matches (`evt.ErrOptimisticConflict` or a `ConflictError`): fence-aware retry keys off it. (The in-memory backend is a permissive test
   double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency` is false for it.)
 - **Stable event ordering** — `GetEvents` returns an entity's events in ascending sequence order,
   and `GetLatestEvents(lastSequence)` returns only events with `sequence > lastSequence`.

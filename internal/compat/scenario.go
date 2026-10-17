@@ -239,7 +239,7 @@ func (r Runner) metadata(step Step) evt.Metadata {
 }
 
 // NewOutcomeRunner returns a runner whose store records command outcomes. Its identity digest
-// replaces the run name in the declared stream IDs with the fixture run's, so a command digests
+// replaces the run name in the target stream IDs with the fixture run's, so a command digests
 // the same in every run and the golden fixtures' digests hold against live backends.
 func NewOutcomeRunner(repo evt.Repository, scenario Scenario, run string) Runner {
 	interval := scenario.SnapshotInterval
@@ -250,25 +250,29 @@ func NewOutcomeRunner(repo evt.Repository, scenario Scenario, run string) Runner
 
 func outcomeStore(repo evt.Repository, interval int, run string) *snapshots.Store {
 	// A short recovery window keeps the dropped-commit step quick; the step still ends in the
-	// retryable ambiguous result because the row never appears.
-	return snapshots.NewStore(repo, interval).WithOutcomes(
-		snapshots.WithDigester(runIndependentDigest(run)),
-		snapshots.WithRecoveryWait(100*time.Millisecond),
-	)
+	// retryable ambiguous result because the row never appears. One attempt per step: a scenario
+	// step pins what a single attempt returns, so the engine must not run the command again on its
+	// own (fence-aware retry has its own conformance cases).
+	return snapshots.NewStore(repo, interval).
+		WithOutcomes(
+			snapshots.WithDigester(runIndependentDigest(run)),
+			snapshots.WithRecoveryWait(100*time.Millisecond),
+		).
+		WithRetry(snapshots.RetryPolicy{MaxAttempts: 1})
 }
 
-// runIndependentDigest is the default digest with the run name in each declared stream ID replaced
+// runIndependentDigest is the default digest with the run name in each target stream ID replaced
 // by the fixture run's.
 func runIndependentDigest(run string) evt.Digester {
 	from, to := "compat-"+run+"-", "compat-"+FixtureRun+"-"
 
 	return func(input evt.DigestInput) (string, error) {
-		streams := make([]evt.EntityID, len(input.Streams))
-		for i, stream := range input.Streams {
+		streams := make([]evt.EntityID, len(input.Targets))
+		for i, stream := range input.Targets {
 			streams[i] = evt.EntityID(strings.Replace(string(stream), from, to, 1))
 		}
 
-		input.Streams = streams
+		input.Targets = streams
 
 		return evt.DefaultDigest(input)
 	}
@@ -473,7 +477,7 @@ func (r Runner) resolveOutcome(ctx context.Context, entityID evt.EntityID, step 
 	}
 
 	command := *step.Command
-	identity := evt.CommandIdentity{Type: command.Type(), Streams: []evt.EntityID{entityID}, Payload: &command}
+	identity := evt.CommandIdentity{Type: command.Type(), Targets: []evt.EntityID{entityID}, Payload: &command}
 
 	outcome, err := r.Outcomes.ResolveCommand(ctx, identity, r.metadata(step))
 	if err == nil && outcome == nil {

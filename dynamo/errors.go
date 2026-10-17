@@ -22,3 +22,20 @@ func HasConditionalCheckFailure(err error) (bool, int) {
 
 	return false, 0
 }
+
+// hasTransactionConflict reports whether a cancelled transaction was cancelled because another
+// transaction was writing the same items, and no condition failed.
+func hasTransactionConflict(err error) bool {
+	var transactionCanceled *types.TransactionCanceledException
+	if !errors.As(err, &transactionCanceled) {
+		return false
+	}
+
+	for _, reason := range transactionCanceled.CancellationReasons {
+		if reason.Code != nil && *reason.Code == "TransactionConflict" {
+			return true
+		}
+	}
+
+	return false
+}

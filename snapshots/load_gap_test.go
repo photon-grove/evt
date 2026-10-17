@@ -91,7 +91,7 @@ func TestExecuteWithRetryRetriesALoadGap(t *testing.T) {
 	}
 
 	retries := 0
-	entity, err := policy.ExecuteWithRetry(ctx,
+	entity, err := policy.ExecuteWithRetry(ctx, //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 		snapshots.NewStore(&gapOnce{Repository: repo}, 3),
 		func() evt.Entity { return test.NewEntity(id) },
 		id,

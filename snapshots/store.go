@@ -23,6 +23,9 @@ type Store struct {
 
 	// outcomes is non-nil when command outcomes are enabled (ADR 0004, C3); see WithOutcomes.
 	outcomes *outcomeConfig
+
+	// retry bounds fence-aware retry on a store with outcomes (ADR 0004, C5); see WithRetry.
+	retry RetryPolicy
 }
 
 // NewStore creates a new Store with the given Repository and Snapshot size
@@ -33,6 +36,7 @@ func NewStore(repo evt.Repository, snapshotSize int) *Store {
 		snapshotSize:             snapshotSize,
 		snapshotOverrides:        make(map[evt.EntityType]int),
 		replayEstimatePerEventMS: defaultReplayEstimatePerEventMS,
+		retry:                    DefaultRetryPolicy(),
 	}
 }
 

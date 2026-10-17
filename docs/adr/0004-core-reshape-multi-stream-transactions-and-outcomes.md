@@ -303,6 +303,30 @@ event put, floor check, or snapshot condition is an ordinary conflict that re-pr
 the commit also carried caller-stamped fences, and only a failed caller-stamped fence produces
 the stale-fence rejection. The storage spec pins this in "Fence-aware retry".
 
+_Errata (E2.5/E3.5):_ the shipped retry is built into the store, not a wrapper around it. On a
+store with outcomes, Go's `Store.ExecuteWithOutcome` (and `Execute`) and the new
+`Store.ExecuteTransaction`, and Rust's `Store::execute_with_outcome` and the new
+`Store::execute_transaction`, run the command under a bounded, configurable policy (defaults: 5
+attempts, 25 ms doubling to 1 s, jittered; `snapshots.RetryPolicy` / `OutcomeConfig::with_retry`).
+A conflict on anything the engine can re-derive re-prepares the command: reload, then run the
+handler or prepare step again. A failed caller-stamped fence fails fast with the stale-fence
+rejection instead. When the last attempt also conflicts, the engine persists the stale-fence
+rejection (`details: {"attempts": N}`) as the outcome, so a replay gets the same answer; a
+transient failure that is not a conflict is returned as an error. `policy.ExecuteWithRetry` is
+deprecated (K6) and Rust's blind `execute_with_outcome_retry` is gone. The multi-stream retry takes
+the caller's decision step as a function (`Prepare` in Go, a boxed-future closure returning a
+`Decision` in Rust) because only the caller can say how to decide again.
+
+The same change fixes a design flaw in C3's identity digest. A command's write set can depend on
+state it reads (a rename releases whichever handle the entity currently holds), so it cannot be part
+of an identity that must be computed before any state is read and must survive re-preparation,
+client retries, and recovery. **The identity is the caller's intent** — principal, command type,
+the streams the request names (`Targets`, no longer "the streams it declares it will write"), and
+payload. The streams a command reads and writes are decided per attempt and recorded in the
+outcome's `events` list; appending to a stream outside the identity is no longer refused. The
+canonical bytes and the `evt-cmd-digest-v1` tag are unchanged, so this is not a wire-format
+change; the storage spec's "Identity digest" and "Fence-aware retry" sections pin it.
+
 ### C6 — Metadata: `principalId`, `causationId`, `extensions`
 
 **Current state.** `Metadata` is `commandId`, `trace`, `origin`, `address`, `region`, `timestamp`
