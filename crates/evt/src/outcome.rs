@@ -221,6 +221,12 @@ impl Rejection {
         Ok(json::to_string(self)?)
     }
 
+    /// The rejection as it reads back from storage (encoded and decoded). A first execution
+    /// returns this form so it equals a replay on every backend.
+    pub fn canonical(&self) -> Result<Self, Error> {
+        Self::decode(&self.encode()?)
+    }
+
     /// Parses the stored JSON form of a rejection.
     pub fn decode(text: &str) -> Result<Self, Error> {
         let mut rejection: Rejection = serde_json::from_str(text)
@@ -662,6 +668,7 @@ pub(crate) fn principal(metadata: &Metadata) -> String {
 #[derive(Clone)]
 pub struct OutcomeConfig {
     digester: Digester,
+    recovery_wait: Duration,
 }
 
 impl Default for OutcomeConfig {
@@ -681,7 +688,21 @@ impl OutcomeConfig {
     pub fn new() -> Self {
         Self {
             digester: Arc::new(default_digest),
+            recovery_wait: Duration::from_secs(10),
         }
+    }
+
+    /// Bounds how long ambiguous-write recovery polls the outcome row for a commit whose result is
+    /// unknown, 10 seconds by default. If the row has not appeared when the window ends the command
+    /// fails with the retryable [`Error::AmbiguousWrite`].
+    #[must_use]
+    pub fn with_recovery_wait(mut self, wait: Duration) -> Self {
+        self.recovery_wait = wait;
+        self
+    }
+
+    pub(crate) fn recovery_wait(&self) -> Duration {
+        self.recovery_wait
     }
 
     /// Replaces the identity digest. The digester computes an opaque string from the command's
@@ -711,7 +732,8 @@ impl OutcomeConfig {
 
 /// Checks a command ID before any read or write: required when outcomes are enabled
 /// ([`Error::InvalidArgument`]) and at most [`MAX_COMMAND_ID_BYTES`] UTF-8 bytes
-/// ([`Error::CommandIdTooLong`]).
+/// ([`Error::CommandIdTooLong`]). Command IDs, principals, and digests are Rust `String`s, which
+/// are UTF-8 by construction, so unlike Go there is no invalid-encoding case to refuse.
 pub fn check_command_id(command_id: &CommandId) -> Result<(), Error> {
     if command_id.is_empty() {
         return Err(Error::InvalidArgument(
@@ -818,28 +840,29 @@ pub(crate) enum Settled {
     Replayed(Outcome),
 }
 
-/// What waiting for the outcome row of an in-progress commit found.
+/// What polling for an outcome row found.
 #[derive(Debug)]
-pub(crate) enum RowWait {
-    /// The row exists: the commit landed.
-    Appeared,
+pub(crate) enum Polled {
+    /// The row exists: the commit landed (or another writer's did).
+    Found(Box<Outcome>),
     /// The window passed without a row.
-    Expired,
+    Absent,
     /// The row could not be read, so nothing can be said.
     Unreadable,
 }
 
 /// Polls `read` for an outcome row with exponential backoff (50 ms, doubling to 1 s) until it
-/// appears or `window` has been slept through. `sleep` is the runtime's timer, so the core stays
-/// runtime-agnostic; the elapsed time is the sum of the delays, which keeps the wait deterministic.
-pub(crate) async fn wait_for_row<R, RF, S, SF>(
+/// appears or `window` has been slept through. `sleep` is the repository's timer
+/// ([`Repository::backoff`]), so the core stays runtime-agnostic; the elapsed time is the sum of
+/// the delays, which keeps the wait deterministic.
+pub(crate) async fn poll_for_row<R, RF, S, SF>(
     mut read: R,
     mut sleep: S,
     window: Duration,
-) -> RowWait
+) -> Polled
 where
     R: FnMut() -> RF,
-    RF: Future<Output = Result<bool, Error>>,
+    RF: Future<Output = Result<Option<Outcome>, Error>>,
     S: FnMut(Duration) -> SF,
     SF: Future<Output = ()>,
 {
@@ -848,13 +871,13 @@ where
 
     loop {
         match read().await {
-            Ok(true) => return RowWait::Appeared,
-            Ok(false) => {}
-            Err(_) => return RowWait::Unreadable,
+            Ok(Some(outcome)) => return Polled::Found(Box::new(outcome)),
+            Ok(None) => {}
+            Err(_) => return Polled::Unreadable,
         }
 
         if waited >= window {
-            return RowWait::Expired;
+            return Polled::Absent;
         }
 
         let step = delay.min(window - waited);
@@ -895,15 +918,16 @@ pub(crate) async fn pre_check<R: Repository>(
 ///
 /// - a lost outcome put ([`Error::OutcomeConflict`]) resolves through the winner's row;
 /// - an indeterminate failure ([`Error::Indeterminate`], which backends return only for a commit
-///   whose result is genuinely unknown) is recovered by re-reading the row: present with
-///   the same digest, the commit won; another digest, [`Error::IdempotencyKeyReuse`]; absent,
-///   [`Error::AmbiguousWrite`] with `not_applied` set, safe to retry. When the re-read itself
-///   fails, the original error is returned as an `AmbiguousWrite` that is not known to be
-///   unapplied. The handler is never re-run.
+///   whose result is genuinely unknown) is recovered by polling the row for the recovery
+///   `window` (bounded backoff via [`Repository::backoff`]): present with the same digest, the
+///   commit won; another digest, [`Error::IdempotencyKeyReuse`]; still absent when the window ends
+///   (or unreadable), a retryable [`Error::AmbiguousWrite`], never "not applied", because a
+///   transaction can land after any single read. The handler is never re-run.
 pub(crate) async fn settle<R: Repository>(
     repository: &R,
     command_id: &CommandId,
     digest: &str,
+    window: Duration,
     result: Result<(), Error>,
 ) -> Result<Settled, Error> {
     match result {
@@ -915,19 +939,22 @@ pub(crate) async fn settle<R: Repository>(
                 None => Err(conflict),
             }
         }
-        Err(Error::Indeterminate(source)) => match repository.outcome(command_id).await {
-            Ok(Some(stored)) => Ok(Settled::Replayed(same_command(stored, digest)?)),
-            Ok(None) => Err(Error::AmbiguousWrite {
-                command_id: command_id.clone(),
-                not_applied: true,
-                source,
-            }),
-            Err(_) => Err(Error::AmbiguousWrite {
-                command_id: command_id.clone(),
-                not_applied: false,
-                source,
-            }),
-        },
+        Err(Error::Indeterminate(source)) => {
+            let polled = poll_for_row(
+                || repository.outcome(command_id),
+                |step| repository.backoff(step),
+                window,
+            )
+            .await;
+
+            match polled {
+                Polled::Found(stored) => Ok(Settled::Replayed(same_command(*stored, digest)?)),
+                Polled::Absent | Polled::Unreadable => Err(Error::AmbiguousWrite {
+                    command_id: command_id.clone(),
+                    source,
+                }),
+            }
+        }
         // An ordinary conflict may be the loser of a race for the same command ID: the winner's
         // row exists by now. Re-read once, so the retry's pre-check is not needed to find it.
         // Fence conflicts are not ordinary conflicts here; a failed read keeps the conflict.
@@ -946,15 +973,15 @@ mod tests {
     use std::cell::Cell;
 
     #[tokio::test]
-    async fn waiting_for_an_in_progress_commit_finds_a_row_that_appears_late() {
+    async fn polling_finds_a_row_that_appears_late() {
         let reads = Cell::new(0);
         let slept = Cell::new(Duration::ZERO);
 
-        let wait = wait_for_row(
+        let polled = poll_for_row(
             || {
                 reads.set(reads.get() + 1);
-                let appeared = reads.get() >= 4;
-                async move { Ok(appeared) }
+                let row = (reads.get() >= 4).then(|| Outcome::accepted("cmd", "digest"));
+                async move { Ok(row) }
             },
             |step| {
                 slept.set(slept.get() + step);
@@ -964,18 +991,18 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(wait, RowWait::Appeared), "{wait:?}");
+        assert!(matches!(polled, Polled::Found(_)), "{polled:?}");
         assert_eq!(reads.get(), 4);
         // 50 + 100 + 200 ms of backoff before the fourth read finds the row.
         assert_eq!(slept.get(), Duration::from_millis(350));
     }
 
     #[tokio::test]
-    async fn waiting_for_an_in_progress_commit_expires_at_the_window_and_never_overshoots_it() {
+    async fn polling_expires_at_the_window_and_never_overshoots_it() {
         let slept = Cell::new(Duration::ZERO);
 
-        let wait = wait_for_row(
-            || async { Ok(false) },
+        let polled = poll_for_row(
+            || async { Ok(None) },
             |step| {
                 slept.set(slept.get() + step);
                 async {}
@@ -984,20 +1011,20 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(wait, RowWait::Expired), "{wait:?}");
+        assert!(matches!(polled, Polled::Absent), "{polled:?}");
         assert_eq!(slept.get(), Duration::from_secs(10));
     }
 
     #[tokio::test]
-    async fn an_unreadable_row_ends_the_wait_without_a_verdict() {
-        let wait = wait_for_row(
+    async fn an_unreadable_row_ends_polling_without_a_verdict() {
+        let polled = poll_for_row(
             || async { Err(Error::backend("table unavailable")) },
             |_| async {},
             Duration::from_secs(10),
         )
         .await;
 
-        assert!(matches!(wait, RowWait::Unreadable), "{wait:?}");
+        assert!(matches!(polled, Polled::Unreadable), "{polled:?}");
     }
 
     #[test]

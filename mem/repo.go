@@ -166,9 +166,15 @@ func cloneOutcome(outcome evt.Outcome) evt.Outcome {
 	outcome.EventIDs = slices.Clone(outcome.EventIDs)
 
 	if outcome.Rejection != nil {
-		rejection := *outcome.Rejection
-		rejection.Details = maps.Clone(rejection.Details)
-		outcome.Rejection = &rejection
+		// A JSON round trip copies nested maps and slices too, and yields the form the durable
+		// backends return, so mutating a value the caller holds cannot change the stored row.
+		if canonical, err := evt.CanonicalRejection(*outcome.Rejection); err == nil {
+			outcome.Rejection = &canonical
+		} else {
+			rejection := *outcome.Rejection
+			rejection.Details = maps.Clone(rejection.Details)
+			outcome.Rejection = &rejection
+		}
 	}
 
 	return outcome

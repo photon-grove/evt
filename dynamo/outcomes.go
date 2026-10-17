@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -17,7 +16,6 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/policy"
 )
 
 // OutcomeCondition guards the outcome put (storage spec, Command Outcomes): the row is written
@@ -25,56 +23,6 @@ import (
 const OutcomeCondition = "attribute_not_exists(pk)"
 
 var _ evt.OutcomeRepository = (*Repository)(nil)
-
-const (
-	defaultInProgressWait = 10 * time.Second
-	inProgressFirstDelay  = 50 * time.Millisecond
-	inProgressMaxDelay    = time.Second
-)
-
-// commitInProgress reports whether DynamoDB said the transaction is still running: an earlier
-// attempt with the same idempotency token has not finished, so it may yet commit.
-func commitInProgress(err error) bool {
-	var apiErr smithy.APIError
-
-	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "TransactionInProgressException"
-}
-
-// awaitInProgress waits, with bounded exponential backoff, for the outcome row of a commit that is
-// still in progress. When the row appears it returns an *evt.AmbiguousWriteError so the store's
-// recovery read resolves it. When the window expires it returns a transient
-// *evt.CommitInProgressError: the commit is not known to have failed, and running the same command
-// again is safe because every attempt reads the outcome row first and every write is conditional.
-func (repo *Repository) awaitInProgress(ctx context.Context, id evt.CommandID, cause error) error {
-	// The wait outlives a cancelled caller context, like the recovery read it stands in for.
-	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), repo.inProgressWait)
-	defer cancel()
-
-	delay := inProgressFirstDelay
-
-	for {
-		outcome, err := repo.GetOutcome(waitCtx, id)
-		if err != nil && waitCtx.Err() == nil {
-			// The row cannot be read: the result is unknown, and recovery will try again.
-			return &evt.AmbiguousWriteError{CommandID: id, Cause: errors.Join(cause, err)}
-		}
-
-		if outcome != nil {
-			return &evt.AmbiguousWriteError{CommandID: id, Cause: cause}
-		}
-
-		select {
-		case <-waitCtx.Done():
-			return &policy.ClassifiedError{
-				Class: policy.ClassTransient,
-				Err:   &evt.CommitInProgressError{CommandID: id, Cause: cause},
-			}
-		case <-time.After(delay):
-		}
-
-		delay = min(delay*2, inProgressMaxDelay)
-	}
-}
 
 // buildOutcomePut builds the outcome row's Put, the last action of the commit transaction. The
 // item's shape comes from evt.OutcomeAttributes, which the commit budget also sizes.
@@ -126,21 +74,31 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 		return nil, nil
 	}
 
-	text := func(name string) string {
-		if value, ok := output.Item[name].(*types.AttributeValueMemberS); ok {
-			return value.Value
+	// An absent attribute reads as empty; a present one of the wrong DynamoDB type is a corrupt
+	// row, not an empty value.
+	var texts [6]string
+
+	for i, name := range []string{"status", "digest", "response", "events", "rejection", "code"} {
+		attribute, present := output.Item[name]
+		if !present {
+			continue
 		}
 
-		return ""
+		value, ok := attribute.(*types.AttributeValueMemberS)
+		if !ok {
+			return nil, &evt.CorruptOutcomeError{CommandID: id, Reason: fmt.Sprintf("attribute %s is not a string (%T)", name, attribute)}
+		}
+
+		texts[i] = value.Value
 	}
 
-	outcome, err := evt.OutcomeFromAttributes(id, text("status"), text("digest"), text("response"), text("events"), text("rejection"))
+	outcome, err := evt.OutcomeFromAttributes(id, texts[0], texts[1], texts[2], texts[3], texts[4])
 	if err != nil {
 		return nil, err
 	}
 
 	// The code attribute repeats the rejection's code.
-	if outcome.Rejection != nil && text("code") != string(outcome.Rejection.Code) {
+	if outcome.Rejection != nil && texts[5] != string(outcome.Rejection.Code) {
 		return nil, &evt.CorruptOutcomeError{CommandID: id, Reason: "the code attribute disagrees with the rejection"}
 	}
 

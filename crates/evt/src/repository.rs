@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
@@ -634,6 +635,16 @@ pub trait Repository: Send + Sync {
         }
     }
 
+    /// Waits `duration` on the repository's runtime timer, between the polls of ambiguous-write
+    /// recovery. The core is runtime-agnostic, so a backend that has a timer (the DynamoDB SDK's,
+    /// Tokio's) overrides it; the default returns at once, which keeps in-memory and test
+    /// repositories fast (the polls then run back to back).
+    fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        let _ = duration;
+
+        async {}
+    }
+
     /// Reads the command outcome row for a command ID, or `None` when none exists. The read must
     /// be strongly consistent regardless of the repository's read-consistency setting: an
     /// eventually consistent miss would re-execute a committed command. The default refuses with
@@ -654,8 +665,8 @@ pub trait Repository: Send + Sync {
     /// (validation, a missing table or relation, authorization, a constraint error other than the
     /// outcome-row conflict) **must** stay [`Error::Backend`] (or another definitive error),
     /// because recovering it would turn a request that can never succeed into a retryable "did not
-    /// apply". A backend that knows a transaction is still running may poll for the row itself and
-    /// report [`Error::CommitInProgress`] if it never appears. Rows decoded from storage must pass
+    /// apply". The store polls the row for its recovery window (using [`backoff`](Self::backoff))
+    /// and never concludes "not applied" from an absent row. Rows decoded from storage must pass
     /// [`Outcome::validate_stored`] (a malformed row is [`Error::InvalidRecord`]). The store's
     /// recovery behavior for both sides is pinned by [`conformance::outcome_cases`].
     fn outcome(
@@ -735,6 +746,10 @@ macro_rules! forward_repository {
 
             fn commit_transaction(&self, commit: TransactionCommit<Self::Operation>) -> impl Future<Output = Result<(), Error>> + Send {
                 (**self).commit_transaction(commit)
+            }
+
+            fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+                (**self).backoff(duration)
             }
 
             fn outcome(

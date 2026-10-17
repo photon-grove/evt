@@ -835,6 +835,10 @@ impl Repository for PostgresRepository {
 
     /// Reads the outcome row. PostgreSQL reads are transactionally consistent, so no flag is
     /// needed: a committed outcome is always visible.
+    fn backoff(&self, duration: std::time::Duration) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(duration)
+    }
+
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
         self.outcome_row(command_id)
             .await?

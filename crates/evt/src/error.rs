@@ -272,22 +272,16 @@ pub enum Error {
         command_id: CommandId,
     },
 
-    /// A commit's result is unknown (a timeout, a lost connection) and re-reading the outcome row
-    /// could not settle it. With `not_applied`, the row is absent: the commit did not apply and
-    /// running the command again with the same ID is safe, so the error is retryable.
-    #[error(
-        "command {command_id} {}: {source}",
-        if *not_applied {
-            "did not apply; safe to retry with the same command ID"
-        } else {
-            "may or may not have been applied"
-        }
-    )]
+    /// A commit's result is unknown (a timeout, a lost connection, a cancelled call, a server
+    /// fault) and polling the outcome row for the store's recovery window did not settle it. An
+    /// absent row is never proof that the commit did not apply: the transaction may still land, so
+    /// the error never says it did not. It is retryable: running the command again with the same
+    /// ID is safe, because every attempt reads the outcome row first and every write is conditional,
+    /// and it finds the outcome if the first commit lands.
+    #[error("command {command_id} may or may not have been applied: {source}")]
     AmbiguousWrite {
         /// The command ID.
         command_id: CommandId,
-        /// Recovery found no outcome row, so the commit did not apply.
-        not_applied: bool,
         /// The indeterminate failure.
         source: BoxError,
     },
@@ -301,14 +295,6 @@ pub enum Error {
     /// is never recovered.
     #[error("commit result unknown: {0}")]
     Indeterminate(#[source] BoxError),
-
-    /// DynamoDB reported the commit's transaction as still running (`TransactionInProgressException`)
-    /// and its outcome row did not appear within the repository's wait window. The commit is not
-    /// known to have failed, so it is not [`Error::AmbiguousWrite`] "not applied"; but every attempt
-    /// reads the outcome row first and every write is conditional, so running the same command
-    /// ID again is safe, and it finds the outcome if the transaction commits. Retryable.
-    #[error("commit still in progress: {0}")]
-    CommitInProgress(#[source] BoxError),
 
     /// The storage backend failed. This is a definitive failure, or a failure of a commit that
     /// carries no outcome (whose result may be unknown but cannot be recovered).
@@ -344,11 +330,7 @@ impl Error {
             Self::Conflict { .. }
                 | Self::SequenceGap { .. }
                 | Self::Transient(_)
-                | Self::CommitInProgress(_)
-                | Self::AmbiguousWrite {
-                    not_applied: true,
-                    ..
-                }
+                | Self::AmbiguousWrite { .. }
                 | Self::FenceConflict {
                     provenance: crate::repository::FenceProvenance::Engine,
                     ..

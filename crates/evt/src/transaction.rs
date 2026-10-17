@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::aggregate::{Aggregate, Projector};
 use crate::commit_id::CommitIdGenerator;
@@ -605,6 +606,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             self.repository,
             &pending.command_id,
             &pending.digest,
+            self.recovery_wait(),
             result,
         )
         .await?
@@ -655,7 +657,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         let outcome = Outcome::rejected(
             pending.command_id.clone(),
             pending.digest.clone(),
-            rejection,
+            rejection.canonical()?,
         );
         let commit = TransactionCommit::new(Vec::new())
             .with_fences(fences)
@@ -677,6 +679,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             self.repository,
             &pending.command_id,
             &pending.digest,
+            self.recovery_wait(),
             result,
         )
         .await?
@@ -684,6 +687,12 @@ impl<'a, R: Repository> Transaction<'a, R> {
             Settled::Committed => Ok(CommandOutcome::fresh(stored, Vec::new(), Vec::new())),
             Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
         }
+    }
+
+    fn recovery_wait(&self) -> Duration {
+        self.outcomes
+            .as_ref()
+            .map_or(Duration::ZERO, OutcomeConfig::recovery_wait)
     }
 
     fn take_command(&mut self) -> Result<PendingCommand, Error> {
@@ -721,6 +730,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             self.repository,
             &pending.command_id,
             &pending.digest,
+            self.recovery_wait(),
             result,
         )
         .await?
@@ -1969,6 +1979,44 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "no terminal rejection is recorded for a command that already ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_metadata_is_snapshotted_at_begin_command() {
+        let store = outcome_store();
+        let mut metadata = command("original").with_principal_id("user:42");
+
+        let mut tx = store.transaction();
+        tx.begin_command(&identity("a"), &metadata).await.unwrap();
+        let mut a = tx.read::<Ledger>("a").await.unwrap();
+        tx.append(&mut a, added(1)).unwrap();
+
+        // The caller keeps and changes its metadata before completing.
+        metadata = command("tampered").with_principal_id("user:evil");
+        let _ = &metadata;
+
+        let outcome = tx.commit_with_outcome(None).await.unwrap();
+        assert_eq!(outcome.outcome.command_id.as_str(), "original");
+
+        let events = store.repository().events(&"a".into()).await.unwrap();
+        let written = &events[0].metadata;
+        assert_eq!(
+            written.command_id.as_ref().map(|id| id.as_str()),
+            Some("original")
+        );
+        assert_eq!(written.commit_id, "original");
+        assert_eq!(
+            written.principal_id.as_ref().map(ToString::to_string),
+            Some("user:42".to_owned())
+        );
+        assert!(
+            store
+                .repository()
+                .outcome(&"tampered".into())
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

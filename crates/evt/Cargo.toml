@@ -18,7 +18,7 @@ default = []
 # Its minimum Rust version is the SDK's, which can be higher than the crate's `rust-version`.
 dynamodb = ["dep:aws-sdk-dynamodb"]
 # PostgreSQL event log via tokio-postgres with a deadpool connection pool. Requires Tokio.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio"]
 # The backend conformance suite (`photon_evt::conformance`), for testing Repository implementations.
 conformance = []
 # Given/when/then test utilities over `MemRepository` (`photon_evt::testing`). The conformance
@@ -32,6 +32,8 @@ thiserror.workspace = true
 futures-core.workspace = true
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
+# The timer behind recovery polling (`Repository::backoff`); the PostgreSQL feature already needs Tokio.
+tokio = { version = "1", default-features = false, features = ["time"], optional = true }
 deadpool-postgres = { workspace = true, optional = true }
 
 [dev-dependencies]

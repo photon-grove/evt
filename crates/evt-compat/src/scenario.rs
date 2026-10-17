@@ -425,14 +425,18 @@ impl<R: Repository> Runner<R> {
 
         if scenario.outcomes {
             let (from, to) = (format!("compat-{run}-"), format!("compat-{FIXTURE_RUN}-"));
-            let config = OutcomeConfig::new().with_digester(move |input: &DigestInput| {
-                let mut input = input.clone();
-                for stream in &mut input.streams {
-                    *stream = EntityId::new(stream.as_str().replacen(&from, &to, 1));
-                }
+            // A short recovery window keeps the dropped-commit step quick; it still ends in the retryable
+            // ambiguous result because the row never appears.
+            let config = OutcomeConfig::new()
+                .with_recovery_wait(std::time::Duration::from_millis(100))
+                .with_digester(move |input: &DigestInput| {
+                    let mut input = input.clone();
+                    for stream in &mut input.streams {
+                        *stream = EntityId::new(stream.as_str().replacen(&from, &to, 1));
+                    }
 
-                default_digest(&input)
-            });
+                    default_digest(&input)
+                });
 
             runner.store = runner.store.with_outcomes(config.clone());
             runner.outcomes = Some(OutcomeRun {

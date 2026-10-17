@@ -64,7 +64,7 @@ changed, and update the spec.
    A scenario with `"outcomes": true` runs on stores with command outcomes enabled (C3/C4): every
    step needs a `commandId`, and `execute` steps record and replay outcomes. Outcomes steps
    expect `ok` (with `events`, 0 for a no-op), `rejected` (with `code`), `reuse`, `idTooLong`,
-   `ambiguous`, or `absent`, plus `"replayed": true` when the stored outcome is returned. An
+   `ambiguous` (a row still absent after the recovery window), or `absent`, plus `"replayed": true` when the stored outcome is returned. An
    `execute` step may set `injectCommitFault` (`applyThenFail` or `failWithoutApplying`) to make
    its commit apply, or drop, while the caller observes an indeterminate error. The harness scopes
    command IDs to the run and scenario (`compat-<run>-<scenario>-<id>`) and uses a digest that

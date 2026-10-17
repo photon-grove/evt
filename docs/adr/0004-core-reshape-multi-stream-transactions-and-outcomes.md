@@ -236,7 +236,10 @@ entry points compiling. Go adds `Store.ExecuteWithOutcome` (returning `*CommandO
 outcome-only commit (a persisted rejection or an accepted no-op) is the feature-marker check plus,
 for a transaction, the fence checks of its reads, then the outcome put; the stale-fence
 rejection omits the failed fences. A failed outcome put outranks every other failed item except the
-feature-marker check. See the storage spec's Command Outcomes section.
+feature-marker check. Ambiguous-write recovery polls the row for a bounded window and treats a
+row still absent at the end as a retryable ambiguous write rather than proof that the commit did
+not apply ("absent → safe to retry" above is superseded: a transaction can land after any single
+read). See the storage spec's Command Outcomes section.
 
 ### C4 — Rejections
 

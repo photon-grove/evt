@@ -163,6 +163,46 @@ func NewMetadata(_ context.Context, region *string, opts ...MetadataOption) Meta
 	return m
 }
 
+// Clone returns a deep copy: every pointer, map, and slice the metadata holds is copied, so later
+// changes to the original (or the copy) cannot reach the other.
+func (m Metadata) Clone() Metadata {
+	clone := m
+
+	clone.CommandID = clonePtr(m.CommandID)
+	clone.Address = clonePtr(m.Address)
+	clone.Origin = clonePtr(m.Origin)
+	clone.PrincipalID = clonePtr(m.PrincipalID)
+	clone.CausationID = clonePtr(m.CausationID)
+
+	if m.Trace != nil {
+		carrier := make(propagation.MapCarrier, len(*m.Trace))
+		for key, value := range *m.Trace {
+			carrier[key] = value
+		}
+
+		clone.Trace = &carrier
+	}
+
+	if m.Extensions != nil {
+		clone.Extensions = make(map[string]string, len(m.Extensions))
+		for key, value := range m.Extensions {
+			clone.Extensions[key] = value
+		}
+	}
+
+	return clone
+}
+
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+
+	value := *p
+
+	return &value
+}
+
 // Equal reports whether two metadata values carry the same effective data. An unset CausationID
 // defaults to CommandID, and nil and empty Extensions maps compare equal, matching their encoding.
 func (m Metadata) Equal(other Metadata) bool {

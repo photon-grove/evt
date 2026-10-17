@@ -85,6 +85,8 @@ func TestMalformedOutcomeRowsAreCorrupt(t *testing.T) {
 					item[name] = &types.AttributeValueMemberN{Value: number}
 				} else if text, isText := attribute["S"].(string); isText {
 					item[name] = &types.AttributeValueMemberS{Value: text}
+				} else if binary, isBinary := attribute["B"].(string); isBinary {
+					item[name] = &types.AttributeValueMemberB{Value: []byte(binary)}
 				}
 			}
 

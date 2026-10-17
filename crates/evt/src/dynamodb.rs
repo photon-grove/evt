@@ -56,8 +56,6 @@ pub struct DynamoRepository {
     scan_page_size: Option<i32>,
     retention: BTreeMap<EntityType, Duration>,
     clock: fn() -> SystemTime,
-    /// How long a commit that DynamoDB reports as still running waits for its outcome row.
-    in_progress_wait: Duration,
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
     /// its own writer: clones validate independently, like separate processes.
     validated_marker: Mutex<CachedMarker>,
@@ -72,7 +70,6 @@ impl Clone for DynamoRepository {
             scan_page_size: self.scan_page_size,
             retention: self.retention.clone(),
             clock: self.clock,
-            in_progress_wait: self.in_progress_wait,
             validated_marker: Mutex::new(*self.validated_marker()),
         }
     }
@@ -89,45 +86,7 @@ impl DynamoRepository {
             scan_page_size: None,
             retention: BTreeMap::new(),
             clock: SystemTime::now,
-            in_progress_wait: Duration::from_secs(10),
             validated_marker: Mutex::new(None),
-        }
-    }
-
-    /// Bounds how long a commit that carries an outcome and that DynamoDB reports as still running
-    /// (`TransactionInProgressException`) waits for its outcome row to appear, 10 seconds by
-    /// default. When the row appears the store resolves it; when the window passes the commit
-    /// fails with the retryable [`Error::CommitInProgress`].
-    #[must_use]
-    pub fn with_in_progress_wait(mut self, wait: Duration) -> Self {
-        self.in_progress_wait = wait;
-        self
-    }
-
-    /// Settles a commit DynamoDB reported as still in progress: polls the outcome row with bounded
-    /// backoff. A row that appears (or a row that cannot be read) is [`Error::Indeterminate`], so
-    /// the store's recovery read resolves it; an expired window keeps the retryable
-    /// [`Error::CommitInProgress`].
-    async fn await_in_progress(&self, command_id: &CommandId, in_progress: Error) -> Error {
-        let Some(sleeper) = self.client.config().sleep_impl() else {
-            return in_progress;
-        };
-
-        let wait = crate::outcome::wait_for_row(
-            || async { Ok(self.outcome(command_id).await?.is_some()) },
-            |step| sleeper.sleep(step),
-            self.in_progress_wait,
-        )
-        .await;
-
-        match wait {
-            crate::outcome::RowWait::Expired => in_progress,
-            crate::outcome::RowWait::Appeared | crate::outcome::RowWait::Unreadable => {
-                match in_progress {
-                    Error::CommitInProgress(source) => Error::Indeterminate(source),
-                    other => other,
-                }
-            }
         }
     }
 
@@ -859,19 +818,12 @@ impl Repository for DynamoRepository {
                         });
                     }
 
-                    let classified = classify_transaction_error(
+                    return Err(classify_transaction_error(
                         &commit.entity_id,
                         operations,
                         outcome.is_some(),
                         err,
-                    );
-                    if let (Error::CommitInProgress(_), Some(outcome)) = (&classified, &outcome) {
-                        return Err(self
-                            .await_in_progress(&outcome.command_id, classified)
-                            .await);
-                    }
-
-                    return Err(classified);
+                    ));
                 }
             }
         }
@@ -1004,19 +956,12 @@ impl Repository for DynamoRepository {
                     // A concurrent transaction is reported on the item it collided with.
                     let colliding = failed_items(&codes, "TransactionConflict").next();
 
-                    let classified = classify_transaction_error(
+                    return Err(classify_transaction_error(
                         &entity_at(colliding),
                         layout.operations,
                         outcome.is_some(),
                         err,
-                    );
-                    if let (Error::CommitInProgress(_), Some(outcome)) = (&classified, &outcome) {
-                        return Err(self
-                            .await_in_progress(&outcome.command_id, classified)
-                            .await);
-                    }
-
-                    return Err(classified);
+                    ));
                 }
             }
         }
@@ -1025,6 +970,18 @@ impl Repository for DynamoRepository {
     /// Reads the outcome row with a strongly consistent `GetItem`, whatever
     /// [`with_consistent_read`](DynamoRepository::with_consistent_read) says: an eventually
     /// consistent miss would re-execute a command that already committed.
+    fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        // The SDK's own timer, so recovery polling works on whatever runtime the client was built
+        // for. A client with no timer returns at once: the polls then run back to back.
+        let sleeper = self.client.config().sleep_impl();
+
+        async move {
+            if let Some(sleeper) = sleeper {
+                sleeper.sleep(duration).await;
+            }
+        }
+    }
+
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
         crate::outcome::check_command_id(command_id)?;
 
@@ -1638,28 +1595,11 @@ where
         // response the transaction may have been applied, and running the command again would
         // write its events twice.
         None if throttled(&err) => Error::Transient(Box::new(err)),
-        // The transaction is still running and may yet commit: the caller polls for its outcome row.
-        None if carries_outcome && commit_in_progress(&err) => {
-            Error::CommitInProgress(Box::new(err))
-        }
         None if carries_outcome && commit_result_unknown(&err) => {
             Error::Indeterminate(Box::new(err))
         }
         None => Error::backend(err),
     }
-}
-
-/// Reports whether DynamoDB said the transaction is still running: an earlier attempt with the
-/// same idempotency token has not finished, so it may yet commit.
-fn commit_in_progress<R>(err: &SdkError<TransactWriteItemsError, R>) -> bool
-where
-    R: std::fmt::Debug + Send + Sync + 'static,
-{
-    matches!(
-        err,
-        SdkError::ServiceError(service)
-            if service.err().code() == Some("TransactionInProgressException")
-    )
 }
 
 /// Reports whether a failed commit leaves it unknown whether the transaction applied: a timeout, a
@@ -1678,6 +1618,7 @@ where
             Some(
                 "InternalServerError"
                     | "ServiceUnavailable"
+                    | "TransactionInProgressException"
                     | "IdempotentParameterMismatchException"
             )
         ),
@@ -2538,6 +2479,8 @@ mod tests {
             SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost"),
             service("InternalServerError"),
             service("ServiceUnavailable"),
+            // Still running: it may yet commit, so the store polls for its row.
+            service("TransactionInProgressException"),
         ] {
             assert!(
                 matches!(
@@ -2547,12 +2490,6 @@ mod tests {
                 "an unknown result of an outcome commit is indeterminate"
             );
         }
-
-        // A transaction still in progress is polled for, never called unapplied: it may yet commit.
-        assert!(matches!(
-            classify_transaction_error(&entity, 0, true, service("TransactionInProgressException")),
-            Error::CommitInProgress(_)
-        ));
 
         // Without an outcome there is nothing to recover from: the classification is unchanged.
         let classified = classify_transaction_error(

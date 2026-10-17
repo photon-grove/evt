@@ -445,6 +445,9 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                     return Err(Error::Handler(Box::new(error)));
                 };
 
+                // Canonicalized through its stored encoding, so a first execution and a replay
+                // return the same rejection.
+                let rejection = rejection.canonical()?;
                 let outcome = Outcome::rejected(command_id, digest, rejection);
                 let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
 
@@ -523,7 +526,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
         let result = self.repository.commit(commit).await;
 
-        match settle(&self.repository, &command_id, &digest, result).await? {
+        let window = self
+            .outcomes
+            .as_ref()
+            .map_or(Duration::ZERO, OutcomeConfig::recovery_wait);
+
+        match settle(&self.repository, &command_id, &digest, window, result).await? {
             Settled::Committed => Ok(CommandOutcome::fresh(stored, serialized, typed_events)),
             Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
         }
@@ -1209,7 +1217,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn an_unapplied_ambiguous_write_retries_with_the_same_command_id() {
+        async fn a_commit_that_never_lands_is_a_retryable_ambiguous_write_never_not_applied() {
             let fault = FaultInjectingRepository::new(MemRepository::new());
             let store = Store::<Counter, _>::new(&fault, ())
                 .with_snapshot_interval(0)
@@ -1221,14 +1229,8 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(
-                    error,
-                    Error::AmbiguousWrite {
-                        not_applied: true,
-                        ..
-                    }
-                ) && error.is_retryable(),
-                "{error:?}"
+                matches!(error, Error::AmbiguousWrite { .. }) && error.is_retryable(),
+                "an absent row never proves the commit did not apply: {error:?}"
             );
 
             fault.arm_before_apply();
@@ -1264,7 +1266,7 @@ mod tests {
             assert!(done.replayed && done.is_accepted());
             assert_eq!(fault.inner().events(&"c-1".into()).await.unwrap().len(), 1);
 
-            // When the recovery read fails too, the original failure is reported, not unapplied.
+            // When the recovery read fails too, the original failure is reported, still retryable.
             fault.arm_after_apply();
             fault.fail_outcome_read_after(1);
             let error = store
@@ -1272,13 +1274,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(
-                    &error,
-                    Error::AmbiguousWrite {
-                        not_applied: false,
-                        ..
-                    }
-                ) && !error.is_retryable(),
+                matches!(&error, Error::AmbiguousWrite { .. }) && error.is_retryable(),
                 "{error:?}"
             );
         }

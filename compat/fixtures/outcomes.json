@@ -717,6 +717,135 @@
           "S": "accepted"
         }
       }
+    },
+    {
+      "name": "status stored as a number",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "N": "1"
+        }
+      }
+    },
+    {
+      "name": "digest stored as a number",
+      "dynamoItem": {
+        "digest": {
+          "N": "7"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "events stored as a number",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "N": "1"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "response stored as binary",
+      "dynamoItem": {
+        "digest": {
+          "S": "digest"
+        },
+        "events": {
+          "S": "[\"a:1\"]"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "response": {
+          "B": "eA=="
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "accepted"
+        }
+      }
+    },
+    {
+      "name": "rejection stored as binary",
+      "dynamoItem": {
+        "code": {
+          "S": "c"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "B": "eA=="
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
+    },
+    {
+      "name": "code stored as a number",
+      "dynamoItem": {
+        "code": {
+          "N": "1"
+        },
+        "digest": {
+          "S": "digest"
+        },
+        "pk": {
+          "S": "command-outcome#bad"
+        },
+        "rejection": {
+          "S": "{\"code\":\"c\",\"message\":\"m\",\"details\":null}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      }
     }
   ]
 }

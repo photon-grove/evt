@@ -247,7 +247,6 @@ func TestIndeterminateCommitFailuresAreAmbiguousWrites(t *testing.T) {
 				require.ErrorAs(t, err, &ambiguous)
 				require.ErrorIs(t, err, test.err)
 				require.Equal(t, evt.CommandID("cmd-1"), ambiguous.CommandID)
-				require.False(t, ambiguous.NotApplied, "only recovery can say the commit did not apply")
 			} else {
 				require.NotErrorAs(t, err, &ambiguous)
 			}
@@ -271,16 +270,16 @@ func strPtr(value string) *string { return &value }
 
 func deposit(amount int) *scriptedCommand { return &scriptedCommand{Amount: amount} }
 
-func TestTransactionInProgressWaitsForTheOutcomeRowInsteadOfCallingItNotApplied(t *testing.T) {
+func TestTransactionInProgressIsPolledForByTheStoreNotCalledNotApplied(t *testing.T) {
 	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), inProgress: true, landAfter: 3}
-	repo := dynamo.NewRepository(client, "events").WithCommitInProgressWait(5 * time.Second)
-	store := snapshots.NewStore(repo, 0).WithOutcomes()
+	repo := dynamo.NewRepository(client, "events")
+	store := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(5 * time.Second))
 	ctx := context.Background()
 
 	id := evt.CommandID("cmd-1")
 	entity := newScriptedEntity("e-1")
 
-	// The transaction commits while the engine is polling for its row: the command returns the
+	// The transaction commits while the store is polling for its row: the command returns the
 	// stored outcome and the handler ran exactly once.
 	outcome, err := store.ExecuteWithOutcome(ctx, entity, "e-1", deposit(5), evt.Metadata{CommandID: &id})
 	require.NoError(t, err)
@@ -293,17 +292,16 @@ func TestTransactionInProgressWaitsForTheOutcomeRowInsteadOfCallingItNotApplied(
 	require.Len(t, events, 1)
 }
 
-func TestTransactionInProgressThatNeverLandsIsRetryableNotAmbiguousNotApplied(t *testing.T) {
+func TestTransactionInProgressThatNeverLandsIsARetryableAmbiguousWrite(t *testing.T) {
 	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), inProgress: true}
-	repo := dynamo.NewRepository(client, "events").WithCommitInProgressWait(40 * time.Millisecond)
-	store := snapshots.NewStore(repo, 0).WithOutcomes()
+	repo := dynamo.NewRepository(client, "events")
+	store := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(60 * time.Millisecond))
 	ctx := context.Background()
 
 	id := evt.CommandID("cmd-1")
 
 	_, err := store.ExecuteWithOutcome(ctx, newScriptedEntity("e-1"), "e-1", deposit(5), evt.Metadata{CommandID: &id})
-	require.ErrorIs(t, err, evt.ErrCommitInProgress)
-	require.NotErrorIs(t, err, evt.ErrAmbiguousWrite, "it must never be reported as known not to have applied")
+	require.ErrorIs(t, err, evt.ErrAmbiguousWrite, "an absent row never proves the commit did not apply")
 	require.True(t, policy.IsTransient(err), "the retry is safe: every attempt reads the outcome row first")
 
 	// The retry, once DynamoDB stops reporting the transaction as running, commits.
@@ -312,4 +310,56 @@ func TestTransactionInProgressThatNeverLandsIsRetryableNotAmbiguousNotApplied(t 
 	outcome, err := store.ExecuteWithOutcome(ctx, newScriptedEntity("e-1"), "e-1", deposit(5), evt.Metadata{CommandID: &id})
 	require.NoError(t, err)
 	require.False(t, outcome.Replayed)
+}
+
+func TestACancelledCallerStillGetsAPolledRecovery(t *testing.T) {
+	// A client timeout while the transaction is still executing: the caller's context is cancelled,
+	// the commit lands a moment later, and recovery still finds it on a detached context.
+	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), inProgress: true, landAfter: 2}
+	repo := dynamo.NewRepository(client, "events")
+	store := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(5 * time.Second))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	id := evt.CommandID("cmd-1")
+	entity := newScriptedEntity("e-1")
+
+	// The pre-check and load run on the live path of the fake client, which ignores the context.
+	outcome, err := store.ExecuteWithOutcome(ctx, entity, "e-1", deposit(5), evt.Metadata{CommandID: &id})
+	require.NoError(t, err)
+	require.True(t, outcome.Replayed)
+	require.Equal(t, 1, entity.handled)
+}
+
+func TestWrongAttributeTypesAreACorruptRowNotAnEmptyValue(t *testing.T) {
+	valid := func() map[string]types.AttributeValue {
+		return map[string]types.AttributeValue{
+			"pk":     &types.AttributeValueMemberS{Value: "command-outcome#bad"},
+			"sk":     &types.AttributeValueMemberN{Value: "1"},
+			"status": &types.AttributeValueMemberS{Value: "accepted"},
+			"digest": &types.AttributeValueMemberS{Value: "digest"},
+			"events": &types.AttributeValueMemberS{Value: `["a:1"]`},
+		}
+	}
+
+	for _, name := range []string{"status", "digest", "response", "events", "rejection", "code"} {
+		for kind, value := range map[string]types.AttributeValue{
+			"number": &types.AttributeValueMemberN{Value: "1"},
+			"binary": &types.AttributeValueMemberB{Value: []byte("x")},
+		} {
+			t.Run(name+" as "+kind, func(t *testing.T) {
+				fake := compat.NewFakeDynamo()
+				item := valid()
+				item[name] = value
+
+				_, err := fake.PutItem(context.Background(), &dynamodb.PutItemInput{Item: item})
+				require.NoError(t, err)
+
+				stored, err := dynamo.NewRepository(fake, "events").GetOutcome(context.Background(), "bad")
+				require.ErrorIs(t, err, evt.ErrCorruptOutcome)
+				require.Nil(t, stored)
+			})
+		}
+	}
 }

@@ -308,9 +308,10 @@ error before any write and is never split.
   a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust
   `Error::Indeterminate`). A definitive failure (validation, a missing table or relation,
   authorization, a constraint error other than the outcome-row conflict) is returned as is
-- DynamoDB's `TransactionInProgressException` is polled, not recovered with one read: the outcome
-  row is awaited with bounded backoff (10 s by default); a row that appears is resolved as below,
-  and an expired window is the retryable `CommitInProgress` error (never "not applied")
+- Recovery polls the outcome row with bounded backoff (50 ms doubling to 1 s, 10 s by default) on a
+  context detached from the caller's cancellation, for every indeterminate failure (including
+  DynamoDB's `TransactionInProgressException`): a row that appears is resolved, and one still
+  absent when the window ends is a retryable ambiguous write, never "not applied"
 - A concurrent same-ID, same-digest loser returns only the winner's stored outcome, never its own
   handler error or local decision
 - Outcome rows read from storage are validated (known status, digest, rejection/code consistency,
@@ -318,9 +319,9 @@ error before any write and is never split.
   is never replayed. A custom digest must be non-empty, checked before anything is read or run
 - After an indeterminate commit failure (timeout, lost connection, server fault) the engine
   re-reads the row: present with the same digest returns the stored outcome, a different digest is
-  `IdempotencyKeyReuse`, absent proves the commit did not apply and is returned as a retryable
-  `AmbiguousWrite` with `NotApplied`. The handler never re-runs during recovery, and the read does
-  not depend on the caller's cancelled context
+  `IdempotencyKeyReuse`, and an absent row after the window is a retryable `AmbiguousWrite`. The
+  handler never re-runs during recovery, and the reads do not depend on the caller's cancelled
+  context
 - The response (raw bytes, stored as padded base64) and the encoded rejection are each at most
   65,536 bytes (`OutcomeTooLarge`, before any write); an empty response is stored as no response
 - The outcome item counts in the commit budget (one action and its encoded size); an outcome-only

@@ -235,12 +235,14 @@ default:
   accepted with no events — a durable, observable outcome rather than an error.
 - **Ambiguous writes.** If a commit's result is unknown (a timeout, a lost connection) the store
   re-reads the outcome row instead of re-running the command: a stored outcome is returned; an
-  absent row is `*evt.AmbiguousWriteError` with `NotApplied` set (`errors.Is(err,
-  evt.ErrAmbiguousWrite)`), which is transient, so retrying the same command ID is safe. A lost
+  absent row is polled for a bounded window (`snapshots.WithRecoveryWait`, 10 s, on a context detached
+  from the caller's cancellation); a row that never appears is a retryable `*evt.AmbiguousWriteError`
+  (`errors.Is(err, evt.ErrAmbiguousWrite)`, transient) and never "not applied", because a
+  transaction can land after any single read. Retrying the same command ID is safe. A lost
   race on the outcome row is resolved the same way, never as a generic conflict, and the loser
-  returns only the winner's stored outcome. DynamoDB's `TransactionInProgressException` waits for
-  the row (`WithCommitInProgressWait`, 10 s) and then returns the transient
-  `*evt.CommitInProgressError`.
+  returns only the winner's stored outcome. A first execution returns its rejection in the stored
+  (decoded) form, so its `Details` equal a replay's. A command ID, principal, and command type must
+  be valid UTF-8, and a custom digest must be non-empty: both are refused before anything is read.
   `Store.ResolveCommand` runs the same read for a caller that lost the result entirely.
 - **Multi-stream commands** use `Store.BeginCommand`, which reads the outcome row first, then the
   usual `Read`/`Append`/`Fence`, then `Transaction.Complete` (accepted, or a no-op when nothing was

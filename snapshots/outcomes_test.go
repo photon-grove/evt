@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/mem"
@@ -322,4 +323,113 @@ func TestOutcomes_ABadCustomDigestIsAProgrammerErrorBeforeAnyReadOrHandler(t *te
 			require.Nil(t, stored)
 		})
 	}
+}
+
+func TestOutcomes_MetadataIsSnapshottedAtBeginCommand(t *testing.T) {
+	store, repo := newOutcomeStore(t)
+	ctx := context.Background()
+
+	id := evt.CommandID("cmd-1")
+	principal := evt.PrincipalID("user:42")
+	trace := propagation.MapCarrier{"traceparent": "00-aa-bb-01"}
+	origin := &evt.Origin{Source: "api", Endpoint: "POST /x"}
+	address := "203.0.113.7"
+	metadata := evt.Metadata{
+		CommandID: &id, PrincipalID: &principal, Trace: &trace, Origin: origin, Address: &address,
+		Region: "us-west-2", Timestamp: "2026-10-12T00:00:00Z", Extensions: map[string]string{"k": "v"},
+	}
+
+	tx, replayed, err := store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Streams: []evt.EntityID{"e-1"}}, metadata)
+	require.NoError(t, err)
+	require.Nil(t, replayed)
+	require.NoError(t, tx.Read(ctx, etest.NewEntity("e-1"), "e-1"))
+	require.NoError(t, tx.Append("e-1", &etest.EntityCreated{ID: "e-1", Value: "v"}))
+
+	// The caller changes everything its metadata points to before completing.
+	id = "other-command"
+	principal = "user:evil"
+	trace["traceparent"] = "tampered"
+	trace["extra"] = "x"
+	origin.Source = "tampered"
+	address = "198.51.100.1"
+	metadata.Extensions["k"] = "tampered"
+	metadata.Extensions["more"] = "x"
+
+	outcome, err := tx.Complete(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, evt.CommandID("cmd-1"), outcome.CommandID, "the outcome stays keyed by the original ID")
+
+	stored, err := repo.GetOutcome(ctx, "cmd-1")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+
+	other, err := repo.GetOutcome(ctx, "other-command")
+	require.NoError(t, err)
+	require.Nil(t, other)
+
+	events, err := repo.GetEvents(ctx, "e-1")
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+
+	written := events[0].Metadata
+	require.Equal(t, evt.CommandID("cmd-1"), *written.CommandID)
+	require.Equal(t, "cmd-1", written.CommitID)
+	require.Equal(t, evt.PrincipalID("user:42"), *written.PrincipalID)
+	require.Equal(t, "00-aa-bb-01", (*written.Trace)["traceparent"])
+	require.NotContains(t, *written.Trace, "extra")
+	require.Equal(t, evt.Source("api"), written.Origin.Source)
+	require.Equal(t, "203.0.113.7", *written.Address)
+	require.Equal(t, map[string]string{"k": "v"}, written.Extensions)
+}
+
+func TestMetadataCloneIsDeep(t *testing.T) {
+	id := evt.CommandID("c")
+	causation := evt.CommandID("p")
+	trace := propagation.MapCarrier{"a": "b"}
+	original := evt.Metadata{
+		CommandID: &id, CausationID: &causation, Trace: &trace,
+		Origin: &evt.Origin{Source: "s"}, Extensions: map[string]string{"k": "v"},
+	}
+
+	clone := original.Clone()
+	require.True(t, original.Equal(clone))
+
+	id, causation = "x", "y"
+	trace["a"] = "changed"
+	original.Origin.Source = "changed"
+	original.Extensions["k"] = "changed"
+
+	require.Equal(t, evt.CommandID("c"), *clone.CommandID)
+	require.Equal(t, evt.CommandID("p"), *clone.CausationID)
+	require.Equal(t, "b", (*clone.Trace)["a"])
+	require.Equal(t, evt.Source("s"), clone.Origin.Source)
+	require.Equal(t, "v", clone.Extensions["k"])
+}
+
+func TestOutcomes_NonUTF8IdentityStringsAreRefusedBeforeAnyReadOrHandler(t *testing.T) {
+	store, repo := newOutcomeStore(t)
+	ctx := context.Background()
+	bad := "bad\xff"
+
+	entity := &MockEntity{}
+	entity.ID = "e-1"
+
+	_, err := store.ExecuteWithOutcome(ctx, entity, "e-1", &MockCommand{}, commandMetadata(bad))
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+	principal := evt.PrincipalID(bad)
+	metadata := commandMetadata("cmd-1")
+	metadata.PrincipalID = &principal
+	_, err = store.ExecuteWithOutcome(ctx, entity, "e-1", &MockCommand{}, metadata)
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+	_, _, err = store.BeginCommand(ctx, evt.CommandIdentity{Type: evt.CommandType(bad)}, commandMetadata("cmd-2"))
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+	_, _, err = store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Streams: []evt.EntityID{evt.EntityID(bad)}}, commandMetadata("cmd-3"))
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+	stored, err := repo.GetOutcome(ctx, "cmd-1")
+	require.NoError(t, err)
+	require.Nil(t, stored)
 }

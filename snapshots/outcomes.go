@@ -10,10 +10,16 @@ import (
 	"github.com/photon-grove/evt/policy"
 )
 
-// recoveryTimeout bounds the outcome re-read that settles an ambiguous write. The re-read runs on
-// a context detached from the caller's cancellation, because the usual reason for an ambiguous
-// write is exactly a cancelled or timed-out context.
-const recoveryTimeout = 10 * time.Second
+// The outcome reads that settle an ambiguous write run on a context detached from the caller's
+// cancellation, because the usual reason for an ambiguous write is exactly a cancelled or timed-out
+// context. A single read is bounded by readTimeout; polling for a row that has not appeared yet
+// backs off from recoveryFirstDelay to recoveryMaxDelay within the configured recovery wait.
+const (
+	readTimeout         = 10 * time.Second
+	defaultRecoveryWait = 10 * time.Second
+	recoveryFirstDelay  = 50 * time.Millisecond
+	recoveryMaxDelay    = time.Second
+)
 
 // errOutcomesNeedCommand refuses a bare Commit on a store with outcomes enabled: the outcome row
 // needs the command's identity (its type, declared streams, and payload), which only the
@@ -25,7 +31,8 @@ var errOutcomesNeedCommand = &evt.InvalidArgumentError{
 
 // outcomeConfig is a store's command-outcome configuration.
 type outcomeConfig struct {
-	digester evt.Digester
+	digester     evt.Digester
+	recoveryWait time.Duration
 }
 
 // OutcomeOption configures command outcomes on a store.
@@ -43,6 +50,15 @@ func WithDigester(digester evt.Digester) OutcomeOption {
 	}
 }
 
+// WithRecoveryWait bounds how long ambiguous-write recovery polls the outcome row for a commit
+// whose result is unknown, 10 seconds by default. If the row has not appeared when the window ends
+// the command fails with a retryable *evt.AmbiguousWriteError.
+func WithRecoveryWait(wait time.Duration) OutcomeOption {
+	return func(config *outcomeConfig) {
+		config.recoveryWait = max(wait, 0)
+	}
+}
+
 // WithOutcomes enables durable command outcomes on the store (ADR 0004, C3/C4). Every command then
 // needs a command ID, reads its outcome row before it runs, and is recorded — accepted, accepted
 // with no events, or rejected — in the same transaction as its events, so a retried command
@@ -52,7 +68,7 @@ func WithDigester(digester evt.Digester) OutcomeOption {
 // *evt.OutcomesUnsupportedError before reading or writing anything otherwise. Like the other With
 // options it must be called during Store initialization, before concurrent use.
 func (store *Store) WithOutcomes(options ...OutcomeOption) *Store {
-	config := &outcomeConfig{digester: evt.DefaultDigest}
+	config := &outcomeConfig{digester: evt.DefaultDigest, recoveryWait: defaultRecoveryWait}
 	for _, option := range options {
 		option(config)
 	}
@@ -341,7 +357,10 @@ func (store *Store) beginCommand(
 		return nil, nil, err
 	}
 
-	cmd := &command{store: store, repo: repo, id: *metadata.CommandID, digest: digest, metadata: metadata}
+	// The command's metadata is snapshotted here: the ID and digest are frozen, so a caller that
+	// changes its metadata (or anything it points to) before Complete or Reject must not change what
+	// they write.
+	cmd := &command{store: store, repo: repo, id: *metadata.CommandID, digest: digest, metadata: metadata.Clone()}
 
 	stored, err := repo.GetOutcome(ctx, cmd.id)
 	if err != nil {
@@ -377,6 +396,17 @@ func (c *command) commit(
 	response []byte,
 	rejection *evt.Rejection,
 ) (*evt.CommandOutcome, error) {
+	// The rejection is canonicalized through its stored encoding before it is committed and
+	// returned, so a first execution and a replay expose the same Details on every backend.
+	if rejection != nil {
+		canonical, err := evt.CanonicalRejection(*rejection)
+		if err != nil {
+			return nil, err
+		}
+
+		rejection = &canonical
+	}
+
 	result.Outcome = &evt.Outcome{
 		CommandID: c.id,
 		Status:    status,
@@ -436,10 +466,11 @@ func (c *command) settle(ctx context.Context, commitErr error) (*evt.CommandOutc
 	return nil, commitErr
 }
 
-// recover resolves an ambiguous write by re-reading the outcome row (storage spec,
-// Ambiguous-write recovery): the same digest means the commit won; a different digest is
-// IdempotencyKeyReuse; an absent row proves the commit did not apply, so the same command ID is
-// safe to run again. The handler never runs here.
+// recover resolves an ambiguous write by polling the outcome row (storage spec, Ambiguous-write
+// recovery) with bounded exponential backoff on a context detached from the caller's cancellation:
+// the same digest means the commit won; a different digest is IdempotencyKeyReuse. A row still
+// absent when the window ends proves nothing — the transaction may yet land — so it is returned
+// as a retryable *evt.AmbiguousWriteError, never as "not applied". The handler never runs here.
 func (c *command) recover(ctx context.Context, commitErr error) (*evt.CommandOutcome, error) {
 	var ambiguous *evt.AmbiguousWriteError
 
@@ -448,23 +479,48 @@ func (c *command) recover(ctx context.Context, commitErr error) (*evt.CommandOut
 		cause = ambiguous.Cause
 	}
 
-	resolved, err := c.reread(ctx)
-	if errors.Is(err, evt.ErrIdempotencyKeyReuse) {
-		return nil, err
+	// Safe to retry: every attempt reads the outcome row first and every write is conditional, so
+	// policy.ExecuteWithRetry may run the same command ID again and finds the outcome if it lands.
+	retryable := func(cause error) error {
+		return &policy.ClassifiedError{
+			Class: policy.ClassTransient,
+			Err:   &evt.AmbiguousWriteError{CommandID: c.id, Cause: cause},
+		}
 	}
 
-	if err != nil {
-		return nil, &evt.AmbiguousWriteError{CommandID: c.id, Cause: errors.Join(cause, err)}
-	}
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.store.outcomes.recoveryWait+readTimeout)
+	defer cancel()
 
-	if resolved != nil {
-		return resolved, nil
-	}
+	delay, waited := recoveryFirstDelay, time.Duration(0)
 
-	// Safe to retry: the caller can run the same command again, so policy.ExecuteWithRetry may.
-	return nil, &policy.ClassifiedError{
-		Class: policy.ClassTransient,
-		Err:   &evt.AmbiguousWriteError{CommandID: c.id, Cause: cause, NotApplied: true},
+	for {
+		resolved, err := c.reread(waitCtx)
+		if errors.Is(err, evt.ErrIdempotencyKeyReuse) || errors.Is(err, evt.ErrCorruptOutcome) {
+			return nil, err
+		}
+
+		if err != nil {
+			return nil, retryable(errors.Join(cause, err))
+		}
+
+		if resolved != nil {
+			return resolved, nil
+		}
+
+		if waited >= c.store.outcomes.recoveryWait {
+			return nil, retryable(cause)
+		}
+
+		step := min(delay, c.store.outcomes.recoveryWait-waited)
+
+		select {
+		case <-waitCtx.Done():
+			return nil, retryable(cause)
+		case <-time.After(step):
+		}
+
+		waited += step
+		delay = min(delay*2, recoveryMaxDelay)
 	}
 }
 
@@ -472,7 +528,7 @@ func (c *command) recover(ctx context.Context, commitErr error) (*evt.CommandOut
 // resolves it against the command's digest. It returns nil, nil when the row is absent, and
 // *evt.IdempotencyKeyReuseError when the stored digest differs.
 func (c *command) reread(ctx context.Context) (*evt.CommandOutcome, error) {
-	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recoveryTimeout)
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readTimeout)
 	defer cancel()
 
 	stored, err := c.repo.GetOutcome(readCtx, c.id)

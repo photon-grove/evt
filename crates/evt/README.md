@@ -144,16 +144,16 @@ implements `ToRejection`:
   starts clean.
 - A command that decides no events is an accepted no-op, and a response (at most 65536 bytes) is
   stored with the outcome. See `Store::execute_with_response`.
-- A commit whose result is unknown (`Error::Indeterminate`: a timeout, a dropped connection, a server fault; a definitive refusal such as a validation or authorization error stays `Error::Backend` and is not recovered) is settled by re-reading the outcome row, never
-  by running the handler again: the stored outcome comes back with `replayed` set, or
-  `Error::AmbiguousWrite { not_applied: true, .. }` says it is safe to retry with the same ID.
+- A commit whose result is unknown (`Error::Indeterminate`: a timeout, a dropped connection, a server fault; a definitive refusal such as a validation or authorization error stays `Error::Backend` and is not recovered) is settled by polling the outcome row for the recovery window
+  (`OutcomeConfig::with_recovery_wait`, 10 s), never by running the handler again: the stored outcome
+  comes back with `replayed` set, or a row that never appears is the retryable `Error::AmbiguousWrite`
+  (never "not applied": a transaction can land after any single read).
 - **Backend authors:** a commit that carries an outcome and whose result is genuinely unknown
   (timeout, lost connection or response, server fault, a dropped `COMMIT`) must fail with
   `Error::Indeterminate`, the only error the store recovers by re-reading the outcome row; a
   definitive failure (validation, missing table, authorization, a constraint error) must stay
-  `Error::Backend`. DynamoDB's `TransactionInProgressException` is polled for the outcome row
-  (`with_in_progress_wait`, 10 s) and then reported as the retryable `Error::CommitInProgress`.
-  Decoded outcome rows must pass `Outcome::validate_stored`.
+  `Error::Backend`. `Repository::backoff` is the timer recovery polling sleeps on (override it if your
+  runtime has one). Decoded outcome rows must pass `Outcome::validate_stored`.
 - `Store::transaction` records multi-stream commands with `Transaction::begin_command`, which must
   be the first call on the transaction (`Error::CommandOrder` after any read, append, or fence; a
   replayed result finishes the transaction), then

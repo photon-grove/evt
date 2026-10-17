@@ -2714,6 +2714,8 @@ pub struct FaultInjectingRepository<R: Repository> {
 
 struct FaultState<Op> {
     fault: Option<Fault>,
+    /// A held commit that lands after a number of outcome reads (see `arm_land_after_reads`).
+    delayed: Option<(Commit<Op>, usize)>,
     rival: Option<Commit<Op>>,
     reads_before_failure: Option<usize>,
 }
@@ -2723,6 +2725,7 @@ enum Fault {
     AfterApply,
     BeforeApply,
     Definitive,
+    LandAfterReads(usize),
 }
 
 impl<R: Repository> FaultInjectingRepository<R> {
@@ -2732,6 +2735,7 @@ impl<R: Repository> FaultInjectingRepository<R> {
             inner,
             state: Mutex::new(FaultState {
                 fault: None,
+                delayed: None,
                 rival: None,
                 reads_before_failure: None,
             }),
@@ -2757,6 +2761,14 @@ impl<R: Repository> FaultInjectingRepository<R> {
     /// The next outcome-carrying commit fails with [`Error::Indeterminate`] without applying.
     pub fn arm_before_apply(&self) {
         self.state().fault = Some(Fault::BeforeApply);
+    }
+
+    /// The next outcome-carrying commit (through [`Repository::commit`]) is held and fails with
+    /// [`Error::Indeterminate`]; it really applies just before the `reads`-th outcome read after
+    /// that, the way a transaction that was still executing when the caller gave up lands a moment
+    /// later. Recovery must poll for it, not call the first miss "not applied".
+    pub fn arm_land_after_reads(&self, reads: usize) {
+        self.state().fault = Some(Fault::LandAfterReads(reads));
     }
 
     /// The next outcome-carrying commit fails with a plain [`Error::Backend`] without applying: a
@@ -2809,6 +2821,11 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
                 Some(Fault::Definitive) => {
                     return Err(Error::backend("injected fault: the request was refused"));
                 }
+                Some(Fault::LandAfterReads(reads)) => {
+                    self.state().delayed = Some((commit, reads));
+
+                    return Err(Self::injected());
+                }
                 None => {}
             }
         }
@@ -2837,6 +2854,9 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
                 Some(Fault::Definitive) => {
                     return Err(Error::backend("injected fault: the request was refused"));
                 }
+                Some(Fault::LandAfterReads(_)) => {
+                    unreachable!("arm_land_after_reads holds single-stream commits only")
+                }
                 None => {}
             }
         }
@@ -2844,7 +2864,29 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
         self.inner.commit_transaction(commit).await
     }
 
+    fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        self.inner.backoff(duration)
+    }
+
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+        // A held commit lands just before the read it was waiting for.
+        let landing = {
+            let mut state = self.state();
+
+            match state.delayed.take() {
+                Some((held, 0 | 1)) => Some(held),
+                Some((held, remaining)) => {
+                    state.delayed = Some((held, remaining - 1));
+
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(held) = landing {
+            self.inner.commit(held).await?;
+        }
+
         let fail = {
             let mut state = self.state();
 
@@ -2987,10 +3029,17 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
     }
 }
 
+/// The outcome configuration the cases use: a short recovery window, long enough to catch a commit
+/// that lands a moment after the caller gave up, short enough that a row that never appears does
+/// not stall the suite.
+fn outcome_config() -> OutcomeConfig {
+    OutcomeConfig::new().with_recovery_wait(Duration::from_millis(300))
+}
+
 fn outcome_store<R: Repository>(repo: R) -> Store<Ledger, R> {
     Store::new(repo, ())
         .with_snapshot_interval(0)
-        .with_outcomes(OutcomeConfig::new())
+        .with_outcomes(outcome_config())
 }
 
 fn command_id() -> CommandId {
@@ -3116,7 +3165,7 @@ async fn outcome_replay<R: Repository>(repo: &R, other: &R) -> CaseResult {
     // the outcome row is global, unlike the event window.
     let snapshots = Store::<Ledger, _>::new(repo, ())
         .with_snapshot_interval(1)
-        .with_outcomes(OutcomeConfig::new());
+        .with_outcomes(outcome_config());
     let id = ledger_id();
     let commands: Vec<CommandId> = (0..3).map(|_| command_id()).collect();
     for (amount, command) in (1..=3).zip(&commands) {
@@ -3253,7 +3302,7 @@ async fn outcome_legacy_duplicate<R: Repository>(repo: &R) -> CaseResult {
 async fn outcome_internal_failure<R: Repository>(repo: &R) -> CaseResult {
     let store: Store<Flaky, &R> = Store::new(repo, ())
         .with_snapshot_interval(0)
-        .with_outcomes(OutcomeConfig::new());
+        .with_outcomes(outcome_config());
     let id = ledger_id();
     let command = command_id();
 
@@ -3702,8 +3751,8 @@ async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
         .await
         .err();
     ensure!(
-        matches!(&error, Some(err @ Error::AmbiguousWrite { not_applied: true, .. }) if err.is_retryable()),
-        "an unapplied ambiguous write is a retryable AmbiguousWrite: {error:?}"
+        matches!(&error, Some(err @ Error::AmbiguousWrite { .. }) if err.is_retryable()),
+        "an absent row after the whole window is a retryable AmbiguousWrite, never \"not applied\": {error:?}"
     );
     ensure!(repo.events(&id).await?.is_empty(), "nothing was written");
     let retried = store
@@ -3730,6 +3779,20 @@ async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
         ledger_digest(&id, 6)?,
         "the prior outcome's digest"
     );
+
+    // The commit lands a moment after the caller gave up: recovery polls for the row and finds it
+    // instead of calling the first miss "not applied".
+    let id = ledger_id();
+    let command = command_id();
+    fault.arm_land_after_reads(3);
+    let late = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+    ensure!(
+        late.replayed && late.is_accepted(),
+        "a delayed commit is found by polling: {late:?}"
+    );
+    ensure_eq!(repo.events(&id).await?.len(), 1, "the command applied once");
 
     // A definitive refusal is not an unknown result: it is returned as is, with no recovery read
     // and nothing that would make the command run again.
@@ -3760,8 +3823,8 @@ async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
         .await
         .err();
     ensure!(
-        matches!(&error, Some(err @ Error::AmbiguousWrite { not_applied: false, .. }) if !err.is_retryable()),
-        "an unreadable recovery is AmbiguousWrite, not known unapplied: {error:?}"
+        matches!(&error, Some(err @ Error::AmbiguousWrite { .. }) if err.is_retryable()),
+        "an unreadable recovery is a retryable AmbiguousWrite: {error:?}"
     );
     ensure_eq!(repo.events(&id).await?.len(), 1, "the commit did apply");
     let later = store

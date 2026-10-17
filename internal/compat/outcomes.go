@@ -234,6 +234,17 @@ func malformedRows() []MalformedRow {
 		{"event ID without an entity", accepted(map[string]any{"events": text(`[":1"]`)})},
 		{"events that are not an array of strings", accepted(map[string]any{"events": text(`{"a":1}`)})},
 		{"response that is not base64", accepted(map[string]any{"response": text("not base64!")})},
+		{"status stored as a number", accepted(map[string]any{"status": map[string]any{"N": "1"}})},
+		{"digest stored as a number", accepted(map[string]any{"digest": map[string]any{"N": "7"}})},
+		{"events stored as a number", accepted(map[string]any{"events": map[string]any{"N": "1"}})},
+		{"response stored as binary", accepted(map[string]any{"response": map[string]any{"B": "eA=="}})},
+		{"rejection stored as binary", accepted(map[string]any{
+			"status": text("rejected"), "events": nil, "code": text("c"), "rejection": map[string]any{"B": "eA=="},
+		})},
+		{"code stored as a number", accepted(map[string]any{
+			"status": text("rejected"), "events": nil, "code": map[string]any{"N": "1"},
+			"rejection": text(`{"code":"c","message":"m","details":null}`),
+		})},
 	}
 }
 

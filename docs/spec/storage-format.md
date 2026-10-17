@@ -861,24 +861,28 @@ stale-fence rejection ([Fence-Aware Retry](#fence-aware-retry)), which omits the
 
 ### Ambiguous-write recovery
 
-After an indeterminate commit error (a timeout, a lost connection — the caller cannot know
-whether the transaction applied), re-read the outcome row by command ID (get
-`(command-outcome#<id>, sk = 1)`, strongly consistent as above):
+After an indeterminate commit error (a timeout, a lost connection, a cancelled call — the caller
+cannot know whether the transaction applied, and it may still land), poll the outcome row by
+command ID (get `(command-outcome#<id>, sk = 1)`, strongly consistent as above) with bounded
+exponential backoff (50 ms doubling to 1 s) for a recovery window, **10 seconds by default**:
 
 - present with the **same identity digest** → the commit won; return the stored outcome,
   including the stored response and events.
 - present with a **different digest** → `IdempotencyKeyReuse`.
-- absent → the commit did not apply; safe to retry.
+- still absent when the window ends → a retryable ambiguous-write error. An absent row is **never**
+  proof that the commit did not apply — a transaction can land after any single read, including
+  one that was still executing when the caller gave up — so the engine never reports "not applied".
 
 The digest is the pre-execution digest defined above, computed from the command's identity alone,
 so recovery never re-prepares the command to compute it.
 
-The engine performs this recovery itself. An absent row is returned as an `AmbiguousWrite` error
-marked `not applied` (Go `*AmbiguousWriteError{NotApplied: true}`, Rust `Error::AmbiguousWrite {
-not_applied: true }`), which is retryable: the same command ID runs again from its outcome
-pre-check. If the recovery read itself fails, the error is returned `AmbiguousWrite` without the
-mark. The recovery read does not depend on the caller's cancellation: a context cancelled while the
-commit was in flight is the usual reason the result is unknown. Which failures are indeterminate:
+The engine performs this recovery itself. A row still absent at the end of the window (or a
+recovery read that fails) is returned as an `AmbiguousWrite` error (Go `*AmbiguousWriteError`,
+classified transient; Rust `Error::AmbiguousWrite`, retryable): the same command ID can run again,
+because every attempt reads the outcome row first and every write is conditional, and the retry
+finds the outcome if the first commit lands later. The recovery reads do not depend on the caller's
+cancellation: a context cancelled while the commit was in flight is the usual reason the result is
+unknown. Which failures are indeterminate:
 a commit that carries an outcome and fails with a timeout, a lost connection or response, a dispatch
 failure, a server fault, or a cancelled context, or a PostgreSQL connection dropped while `COMMIT`
 was in flight. Backends classify these themselves (Go `*AmbiguousWriteError` from the backend, Rust
@@ -886,14 +890,8 @@ was in flight. Backends classify these themselves (Go `*AmbiguousWriteError` fro
 with known reasons, throttling, a validation, missing-table, or authorization error, a database
 error at statement or `COMMIT` time) is returned as is.
 
-DynamoDB's `TransactionInProgressException` says the transaction is still running and may yet
-commit, so a single early recovery read must not call it "not applied". The DynamoDB repository
-instead polls the outcome row with bounded backoff (50 ms doubling to 1 s, 10 s in all by default):
-when the row appears the store resolves it as above; when the window expires the commit fails
-with the retryable `CommitInProgress` error (Go `*CommitInProgressError`, classified transient;
-Rust `Error::CommitInProgress`), which is deliberately not an ambiguous write. Retrying the same
-command ID is safe, because every attempt reads the outcome row first and every write is
-conditional.
+DynamoDB's `TransactionInProgressException` is one more indeterminate result (the transaction is
+still running and may yet commit), recovered by the same polling.
 
 A concurrent attempt with the same command ID and the same digest that loses the race for the
 outcome row returns **only the winner's stored outcome** (its result or rejection, marked
@@ -906,6 +904,12 @@ column equal to it), no `events` on a rejection, well-formed event IDs (`{entity
 with a positive, canonical sequence), and a decodable `response`. A malformed row is a typed
 corruption error (Go `*CorruptOutcomeError`, Rust `Error::InvalidRecord`) and is never replayed as a
 result; `compat/fixtures/outcomes.json` carries the malformed rows both languages must refuse.
+
+A command ID must be valid UTF-8 (Go strings can hold arbitrary bytes; Rust `String`s are UTF-8 by
+construction), as must the command type, declared stream IDs, and principal that feed the digest:
+anything else is a typed invalid-argument error before the outcome or the aggregate is read. A
+first execution returns the rejection in its stored (decoded) form, with the numbers in `details`
+read back as the stored text, so its result equals a replay's on every backend.
 
 A digest returned by a digester — the default or a custom one — must be non-empty (and valid
 UTF-8, since it is stored as a string): anything else is a programmer error returned before the

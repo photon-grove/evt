@@ -8,7 +8,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/photon-grove/evt"
@@ -194,6 +196,10 @@ func (l *ledger) Handle(_ context.Context, command evt.Command) (evt.CommandResu
 	return evt.CommandResult{}, evt.NewBadCommandError(command)
 }
 
+// recoveryWait is the ambiguous-write polling window the suite's stores use: long enough to catch
+// a commit that lands a moment after the caller gave up, short enough to keep the suite quick.
+const recoveryWait = 300 * time.Millisecond
+
 // --- helpers ---
 
 type outcomeEnv struct {
@@ -210,7 +216,7 @@ func newOutcomeEnv(t *testing.T, repo evt.OutcomeRepository, snapshotSize int) o
 
 	return outcomeEnv{
 		repo:  repo,
-		store: snapshots.NewStore(repo, snapshotSize).WithOutcomes(),
+		store: snapshots.NewStore(repo, snapshotSize).WithOutcomes(snapshots.WithRecoveryWait(recoveryWait)),
 		id:    evt.EntityID(ns + "-ledger"),
 		ns:    ns,
 	}
@@ -397,6 +403,9 @@ func testRejectionPersistence(t *testing.T, repo evt.OutcomeRepository) {
 	require.True(t, replayed.Replayed)
 	require.True(t, replayed.Rejected())
 	require.Equal(t, stored.Rejection, replayed.Rejection)
+	require.Equal(t, first.Rejection, replayed.Rejection,
+		"a first execution returns the canonical stored form, so it equals a replay on every backend")
+	require.Equal(t, json.Number("3"), first.Rejection.Details["balance"], "numbers read back as json.Number")
 	require.EqualValues(t, 1, ran.Load())
 	require.Len(t, env.events(t, env.id), 2, "a rejection writes no events")
 
@@ -550,24 +559,42 @@ func testAmbiguousRecovery(t *testing.T, repo evt.OutcomeRepository) {
 	require.True(t, outcome.Replayed)
 	require.True(t, outcome.Rejected())
 
-	// The commit did not apply: the row is absent, so retrying the same command ID is safe.
+	// The commit lands a moment after the caller gave up: recovery polls the row for its window
+	// and finds it, instead of calling the first miss "not applied".
+	delayed := env.commandID("delayed")
+	faulty.Intercept = func(_ context.Context, _ evt.SerializedResult, commit func() error) error {
+		faulty.Intercept = nil
+
+		go func() {
+			time.Sleep(recoveryWait / 3)
+
+			assert.NoError(t, commit())
+		}()
+
+		return &evt.AmbiguousWriteError{CommandID: delayed, Cause: cause}
+	}
+
+	outcome, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 4, ran: ran}, delayed)
+	require.NoError(t, err)
+	require.True(t, outcome.Replayed, "the late commit is found by polling")
+	require.EqualValues(t, 2, ran.Load(), "the handler ran once for the delayed command")
+
+	// The commit never lands: the row stays absent through the whole window. That proves nothing —
+	// a transaction can land after any single read — so the error is a retryable ambiguous write,
+	// never "not applied". Retrying the same command ID is safe: every attempt reads the row first.
 	missing := env.commandID("missing-row")
 	faulty.FailWithoutApplying(cause)
 
 	_, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 1, ran: ran}, missing)
 	require.ErrorIs(t, err, evt.ErrAmbiguousWrite)
 	require.ErrorIs(t, err, cause)
-	require.True(t, policy.IsTransient(err), "a commit proven not to have applied is retryable")
-
-	var ambiguous *evt.AmbiguousWriteError
-	require.ErrorAs(t, err, &ambiguous)
-	require.True(t, ambiguous.NotApplied)
+	require.True(t, policy.IsTransient(err), "an ambiguous write is retryable")
 	env.requireNoOutcome(t, missing)
 
 	retried, err := env.run(t, &ledgerCommand{Kind: "deposit", Amount: 1, ran: ran}, missing)
 	require.NoError(t, err)
 	require.False(t, retried.Replayed)
-	require.Len(t, env.events(t, env.id), 2)
+	require.Len(t, env.events(t, env.id), 3)
 
 	// Another command claimed the ID between the pre-check and the commit: its row has a different
 	// digest, so recovery reports IdempotencyKeyReuse.

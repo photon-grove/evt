@@ -141,6 +141,18 @@ func DecodeRejection(data []byte) (Rejection, error) {
 	return rejection, nil
 }
 
+// CanonicalRejection returns the rejection as it reads back from storage: encoded and decoded, so
+// the numbers in Details are json.Number, nested values are fresh copies, and a nil or empty
+// Details stays as it round-trips. A first execution returns this form so it equals a replay.
+func CanonicalRejection(rejection Rejection) (Rejection, error) {
+	encoded, err := EncodeRejection(rejection)
+	if err != nil {
+		return Rejection{}, fmt.Errorf("encode rejection: %w", err)
+	}
+
+	return DecodeRejection(encoded)
+}
+
 // Outcome is the durable record of one command: the row written once, in its final state, on the
 // reserved command-outcome#<id> stream inside the commit transaction.
 type Outcome struct {
@@ -210,6 +222,10 @@ func DecodeEventIDs(data string) ([]EventID, error) {
 func CheckCommandID(id CommandID) error {
 	if id == "" {
 		return &InvalidArgumentError{Argument: "commandId", Message: "a command ID is required when command outcomes are enabled"}
+	}
+
+	if !utf8.ValidString(string(id)) {
+		return &InvalidArgumentError{Argument: "commandId", Message: "a command ID must be valid UTF-8"}
 	}
 
 	if len(id) > MaxCommandIDBytes {
@@ -404,26 +420,24 @@ func (e *OutcomeConflictError) Is(target error) bool { return target == ErrOutco
 var ErrAmbiguousWrite = errors.New("ambiguous write")
 
 // AmbiguousWriteError reports a commit whose result the caller cannot know (a timeout, a lost
-// connection): the transaction may or may not have applied. A backend returns it from Commit for an
-// indeterminate failure of a commit that carries an outcome. The store resolves it by re-reading
-// the outcome row (ambiguous-write recovery); it returns the error itself only when recovery
-// could not settle the question.
+// connection, a cancelled context, a server fault): the transaction may or may not have applied,
+// and may still land later. A backend returns it from Commit for an indeterminate failure of a
+// commit that carries an outcome. The store resolves it by polling the outcome row for a bounded
+// window (ambiguous-write recovery) on a context detached from the caller's cancellation; it
+// returns the error itself only when the row never appeared (or could not be read). An absent row
+// is never proof that the commit did not apply, so the error never says it did not.
+//
+// The store returns it classified transient: running the same command ID again is safe, because
+// every attempt reads the outcome row first and every write is conditional, and it finds the
+// outcome if the first commit lands.
 type AmbiguousWriteError struct {
 	CommandID CommandID
 
 	// Cause is the indeterminate failure.
 	Cause error
-
-	// NotApplied is set by the store when recovery re-read the outcome row and found it absent: the
-	// commit did not apply, and running the command again with the same ID is safe.
-	NotApplied bool
 }
 
 func (e *AmbiguousWriteError) Error() string {
-	if e.NotApplied {
-		return fmt.Sprintf("command %q did not apply; safe to retry: %v", e.CommandID, e.Cause)
-	}
-
 	return fmt.Sprintf("command %q may or may not have applied: %v", e.CommandID, e.Cause)
 }
 
@@ -432,31 +446,6 @@ func (e *AmbiguousWriteError) Unwrap() error { return e.Cause }
 
 // Is makes errors.Is(err, ErrAmbiguousWrite) match.
 func (e *AmbiguousWriteError) Is(target error) bool { return target == ErrAmbiguousWrite }
-
-// ErrCommitInProgress matches a CommitInProgressError with errors.Is.
-var ErrCommitInProgress = errors.New("commit still in progress")
-
-// CommitInProgressError reports that the backend said the commit's transaction is still running
-// (DynamoDB's TransactionInProgressException) and its outcome row did not appear within the wait
-// window. The commit may still land, so it is not known to have failed; but every attempt begins
-// with the outcome read and every write is conditional, so running the same command ID again is
-// safe and finds the outcome if the transaction commits. Backends return it classified transient.
-type CommitInProgressError struct {
-	CommandID CommandID
-
-	// Cause is the backend's report.
-	Cause error
-}
-
-func (e *CommitInProgressError) Error() string {
-	return fmt.Sprintf("commit for command %q is still in progress: %v", e.CommandID, e.Cause)
-}
-
-// Unwrap returns the backend's report.
-func (e *CommitInProgressError) Unwrap() error { return e.Cause }
-
-// Is makes errors.Is(err, ErrCommitInProgress) match.
-func (e *CommitInProgressError) Is(target error) bool { return target == ErrCommitInProgress }
 
 // ErrOutcomesUnsupported matches an OutcomesUnsupportedError with errors.Is.
 var ErrOutcomesUnsupported = errors.New("repository does not support command outcomes")
@@ -597,6 +586,18 @@ type CommandIdentity struct {
 func (identity CommandIdentity) DigestInput(metadata Metadata) (DigestInput, error) {
 	input := DigestInput{CommandType: identity.Type, Streams: identity.Streams}
 
+	// The identity strings are hashed as bytes, but a command's type, streams, and principal that
+	// are not valid UTF-8 cannot be stored or compared identically on every backend.
+	if !utf8.ValidString(string(identity.Type)) {
+		return DigestInput{}, &InvalidArgumentError{Argument: "commandType", Message: "must be valid UTF-8"}
+	}
+
+	for _, stream := range identity.Streams {
+		if !utf8.ValidString(string(stream)) {
+			return DigestInput{}, &InvalidArgumentError{Argument: "streams", Message: "stream IDs must be valid UTF-8"}
+		}
+	}
+
 	if identity.Payload != nil {
 		payload, err := json.Marshal(identity.Payload)
 		if err != nil {
@@ -608,6 +609,10 @@ func (identity CommandIdentity) DigestInput(metadata Metadata) (DigestInput, err
 
 	if metadata.PrincipalID != nil {
 		input.Principal = string(*metadata.PrincipalID)
+
+		if !utf8.ValidString(input.Principal) {
+			return DigestInput{}, &InvalidArgumentError{Argument: "principalId", Message: "must be valid UTF-8"}
+		}
 	}
 
 	return input, nil

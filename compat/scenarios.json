@@ -262,7 +262,7 @@
     },
     {
       "name": "outcomes-ambiguous",
-      "description": "After an indeterminate commit error injected so the commit really applied, the re-read by command ID returns the stored outcome (same digest); a dropped commit leaves the row absent so the retry is safe; a different digest is IdempotencyKeyReuse; a recovered rejection is the stored rejection.",
+      "description": "After an indeterminate commit error injected so the commit really applied, the re-read by command ID returns the stored outcome (same digest); a dropped commit leaves the row absent for the whole recovery window, so the result is a retryable ambiguous write (never \"not applied\") and the retry is safe; a different digest is IdempotencyKeyReuse; a recovered rejection is the stored rejection.",
       "snapshotInterval": 0,
       "outcomes": true,
       "steps": [

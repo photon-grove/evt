@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/propagation"
 
@@ -248,7 +249,12 @@ func NewOutcomeRunner(repo evt.Repository, scenario Scenario, run string) Runner
 }
 
 func outcomeStore(repo evt.Repository, interval int, run string) *snapshots.Store {
-	return snapshots.NewStore(repo, interval).WithOutcomes(snapshots.WithDigester(runIndependentDigest(run)))
+	// A short recovery window keeps the dropped-commit step quick; the step still ends in the
+	// retryable ambiguous result because the row never appears.
+	return snapshots.NewStore(repo, interval).WithOutcomes(
+		snapshots.WithDigester(runIndependentDigest(run)),
+		snapshots.WithRecoveryWait(100*time.Millisecond),
+	)
 }
 
 // runIndependentDigest is the default digest with the run name in each declared stream ID replaced
