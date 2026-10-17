@@ -37,6 +37,7 @@ mod ids;
 pub mod json;
 mod mem;
 mod metadata;
+mod numbers;
 mod outcome;
 mod repository;
 mod retry;
@@ -71,6 +72,7 @@ pub use ids::{
 };
 pub use mem::MemRepository;
 pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};
+pub use numbers::canonical_numbers;
 pub use outcome::{
     CommandIdentity, CommandOutcome, DigestInput, Digester, MAX_COMMAND_ID_BYTES,
     MAX_OUTCOME_BYTES, Outcome, OutcomeCommand, OutcomeConfig, OutcomeStatus, Rejection,

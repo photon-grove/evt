@@ -3,6 +3,7 @@ package evt_test
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -146,6 +147,65 @@ func TestDecodeRejectionKeepsNumbersVerbatim(t *testing.T) {
 	reencoded, err := evt.EncodeRejection(rejection)
 	require.NoError(t, err)
 	assert.Equal(t, stored, string(reencoded), "a replayed rejection re-encodes byte for byte")
+}
+
+// Numbers in details take the text PostgreSQL's jsonb prints, so every backend stores the same
+// bytes; strings and keys that look like numbers are left alone. compat/fixtures/outcomes.json
+// carries the literal-by-literal vectors both languages reproduce.
+func TestEncodeRejectionWritesCanonicalNumbers(t *testing.T) {
+	t.Parallel()
+
+	rejection := evt.Rejection{
+		Code: "c", Message: "1e5 \"-0\"",
+		Details: map[string]any{
+			"1e5":     "2e3",
+			"big":     1e21,
+			"tiny":    1.5e-7,
+			"negzero": math.Copysign(0, -1),
+			"number":  json.Number("-1.50e1"),
+			"plain":   []any{3, 2.5, json.Number("0.10")},
+		},
+	}
+
+	encoded, err := evt.EncodeRejection(rejection)
+	require.NoError(t, err)
+	assert.Equal(t,
+		`{"code":"c","message":"1e5 \"-0\"","details":{"1e5":"2e3","big":1000000000000000000000,"negzero":0,"number":-15.0,"plain":[3,2.5,0.10],"tiny":0.00000015}}`,
+		string(encoded))
+
+	canonical, err := evt.CanonicalRejection(rejection)
+	require.NoError(t, err)
+	assert.Equal(t, json.Number("1000000000000000000000"), canonical.Details["big"], "a first execution returns the stored text")
+}
+
+// A number PostgreSQL's numeric type cannot hold is refused on every backend before any write, and
+// the size bound applies to the canonical form, which an exponent can expand.
+func TestCheckOutcomeRefusesNumbersPostgreSQLCannotStore(t *testing.T) {
+	t.Parallel()
+
+	rejected := func(details map[string]any) *evt.Outcome {
+		return &evt.Outcome{
+			CommandID: "cmd-1", Status: evt.OutcomeRejected, Digest: "d",
+			Rejection: &evt.Rejection{Code: "c", Message: "m", Details: details},
+		}
+	}
+
+	for _, number := range []json.Number{"1e-16384", "1e131072", "0e1073741824", "0.0e-16383"} {
+		require.ErrorIs(t, evt.CheckOutcome(rejected(map[string]any{"n": number})), evt.ErrInvalidArgument, number)
+	}
+
+	require.NoError(t, evt.CheckOutcome(rejected(map[string]any{"n": json.Number("0e1073741823")})))
+
+	var sizeErr *evt.OutcomeTooLargeError
+	require.ErrorAs(t, evt.CheckOutcome(rejected(map[string]any{"n": json.Number("1e65536")})), &sizeErr)
+	assert.Equal(t, "rejection", sizeErr.What)
+	assert.Greater(t, sizeErr.Size, evt.MaxOutcomeBytes)
+
+	// U+0000 is still the error a rejection that also holds an unstorable number reports.
+	withNUL := rejected(map[string]any{"n": json.Number("1e-16384"), "s": "a\x00"})
+	err := evt.CheckOutcome(withNUL)
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "U+0000")
 }
 
 func TestRejectionOfMapsEngineErrors(t *testing.T) {
