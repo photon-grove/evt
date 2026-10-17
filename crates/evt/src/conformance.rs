@@ -3100,6 +3100,10 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         Box::pin(retry_single_aggregate(repo)).await,
     );
     record(
+        "the identity digest is computed once, however many attempts a command takes",
+        Box::pin(retry_digest_once(repo)).await,
+    );
+    record(
         "a deadline ends the retries and is treated as exhausted attempts",
         Box::pin(retry_deadline(repo)).await,
     );
@@ -5091,6 +5095,64 @@ async fn retry_single_aggregate<R: Repository>(repo: &R) -> CaseResult {
     ensure!(replayed.replayed, "the command replays: {replayed:?}");
     ensure_eq!(replayed.outcome, outcome.outcome, "the replayed rejection");
     ensure_eq!(responses.load(Ordering::SeqCst), 3, "a replay runs nothing");
+
+    Ok(())
+}
+
+async fn retry_digest_once<R: Repository>(repo: &R) -> CaseResult {
+    // A digester with state: it returns a different value on every call, so a digest recomputed
+    // per attempt would drift from the one the first attempt computed.
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let config = outcome_config()
+        .with_retry(RetryPolicy::immediate(3))
+        .with_digester(move |_| Ok(format!("digest-{}", counted.fetch_add(1, Ordering::SeqCst))));
+
+    // A multi-stream command that loses its first attempt to a moved fence.
+    let watched = ledger_id();
+    let target = ledger_id();
+    seed(repo, &watched, 1).await?;
+
+    let meddling = Meddling::new(repo, &watched, Trigger::Fences, 1);
+    let store = Store::<Ledger, _>::new(&meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config.clone());
+    let copy = CopyCommand::new(&watched, &target);
+    let identity = CommandIdentity::new("ledger:copy").with_targets([target.clone()]);
+
+    let outcome = store
+        .execute_transaction(&identity, &command_metadata(&command_id()), |tx| {
+            Box::pin(copy.prepare(tx))
+        })
+        .await?;
+    ensure!(outcome.is_accepted(), "the retry committed: {outcome:?}");
+    ensure_eq!(copy.calls(), 2, "the command was prepared twice");
+    ensure_eq!(calls.load(Ordering::SeqCst), 1, "the digester ran once");
+    ensure_eq!(
+        outcome.outcome.digest,
+        "digest-0".to_owned(),
+        "the stored digest is the first value"
+    );
+
+    // The single-aggregate path, with a rival append that costs it one attempt.
+    calls.store(0, Ordering::SeqCst);
+    let single = ledger_id();
+    seed(repo, &single, 1).await?;
+
+    let meddling = Meddling::new(repo, &single, Trigger::Events, 1);
+    let store = Store::<Ledger, _>::new(&meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config);
+    let outcome = store
+        .execute_with_outcome(&single, Add(2), command_metadata(&command_id()))
+        .await?;
+    ensure!(outcome.is_accepted(), "the retry committed: {outcome:?}");
+    ensure_eq!(calls.load(Ordering::SeqCst), 1, "the digester ran once");
+    ensure_eq!(
+        outcome.outcome.digest,
+        "digest-0".to_owned(),
+        "the stored digest is the first value"
+    );
 
     Ok(())
 }

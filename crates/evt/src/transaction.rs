@@ -34,11 +34,51 @@ use crate::store::{
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
 
 /// The command a transaction with outcomes enabled is executing, fixed by
-/// [`Transaction::begin_command`].
-struct PendingCommand {
+/// [`Transaction::begin_command`]. Fence-aware retry freezes one before its first attempt and
+/// installs it into every attempt's transaction, so the command ID, the identity digest, and the
+/// metadata are validated and computed once, never from live state.
+#[derive(Clone)]
+pub(crate) struct PendingCommand {
     command_id: CommandId,
     digest: String,
     metadata: Metadata,
+}
+
+impl PendingCommand {
+    pub(crate) fn command_id(&self) -> &CommandId {
+        &self.command_id
+    }
+
+    pub(crate) fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+/// Validates the command and computes its identity digest, once: the targets, the command ID and
+/// metadata strings, and the digest the configured digester returns.
+pub(crate) fn freeze_command(
+    config: &OutcomeConfig,
+    identity: &CommandIdentity,
+    metadata: &Metadata,
+) -> Result<PendingCommand, Error> {
+    crate::outcome::check_targets(identity.targets())?;
+    let command_id = require_command_id(metadata)?;
+    let digest = config.digest(&identity.digest_input(metadata))?;
+
+    Ok(PendingCommand {
+        command_id,
+        digest,
+        metadata: metadata.clone(),
+    })
+}
+
+/// What a transaction's last failed [`read`](Transaction::read) looked like, so a retrying caller
+/// can tell an error its prepare step passed on from one it made up itself. [`Error`] is not
+/// `Clone`, so the variant and the message stand in for the error's identity: a step that returns
+/// the read's error unchanged (with `?`) matches.
+struct ReadFailure {
+    variant: std::mem::Discriminant<Error>,
+    message: String,
 }
 
 /// The result of [`Transaction::begin_command`].
@@ -149,6 +189,8 @@ pub struct Transaction<'a, R: Repository> {
     outcomes: Option<OutcomeConfig>,
     /// The command fixed by [`Transaction::begin_command`].
     command: Option<PendingCommand>,
+    /// The last [`read`](Transaction::read) that failed to load its stream.
+    read_failure: Option<ReadFailure>,
 }
 
 impl<A: Aggregate, R: Repository> Store<A, R> {
@@ -207,6 +249,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             finished: false,
             outcomes: None,
             command: None,
+            read_failure: None,
         }
     }
 
@@ -243,9 +286,31 @@ impl<'a, R: Repository> Transaction<'a, R> {
         identity: &CommandIdentity,
         metadata: &Metadata,
     ) -> Result<Begin, Error> {
-        let config = self.outcomes.as_ref().ok_or_else(|| {
+        let config = self.outcomes_config()?;
+        self.check_can_begin()?;
+
+        let pending = freeze_command(config, identity, metadata)?;
+
+        self.begin_pending(pending).await
+    }
+
+    /// Begins the command with a [frozen](freeze_command) identity: the same ordering rules and
+    /// outcome pre-check as [`begin_command`](Transaction::begin_command), without validating the
+    /// command or computing its digest again.
+    pub(crate) async fn begin_frozen(&mut self, pending: &PendingCommand) -> Result<Begin, Error> {
+        self.outcomes_config()?;
+        self.check_can_begin()?;
+
+        self.begin_pending(pending.clone()).await
+    }
+
+    fn outcomes_config(&self) -> Result<&OutcomeConfig, Error> {
+        self.outcomes.as_ref().ok_or_else(|| {
             Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
-        })?;
+        })
+    }
+
+    fn check_can_begin(&self) -> Result<(), Error> {
         self.check_open()?;
         if self.command.is_some() {
             return Err(Error::InvalidCommit(
@@ -259,21 +324,19 @@ impl<'a, R: Repository> Transaction<'a, R> {
             });
         }
 
-        crate::outcome::check_targets(identity.targets())?;
-        let command_id = require_command_id(metadata)?;
-        let digest = config.digest(&identity.digest_input(metadata))?;
+        Ok(())
+    }
 
-        if let Some(stored) = pre_check(self.repository, &command_id, &digest).await? {
+    async fn begin_pending(&mut self, pending: PendingCommand) -> Result<Begin, Error> {
+        if let Some(stored) =
+            pre_check(self.repository, &pending.command_id, &pending.digest).await?
+        {
             self.finished = true;
 
             return Ok(Begin::Replayed(Box::new(CommandOutcome::replay(stored))));
         }
 
-        self.command = Some(PendingCommand {
-            command_id,
-            digest,
-            metadata: metadata.clone(),
-        });
+        self.command = Some(pending);
 
         Ok(Begin::Proceed)
     }
@@ -298,9 +361,28 @@ impl<'a, R: Repository> Transaction<'a, R> {
         self.check_open()?;
         self.check_unread(&entity_id)?;
 
-        let loaded = load_aggregate::<A, R>(self.repository, entity_id).await?;
+        let loaded = match load_aggregate::<A, R>(self.repository, entity_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.read_failure = Some(ReadFailure {
+                    variant: std::mem::discriminant(&error),
+                    message: error.to_string(),
+                });
+
+                return Err(error);
+            }
+        };
 
         self.read_loaded(loaded)
+    }
+
+    /// Reports whether `error` is the error of this transaction's last failed
+    /// [`read`](Transaction::read), passed on unchanged. Fence-aware retry retries only such an
+    /// error from a prepare step: one the step made up itself is its own failure.
+    pub(crate) fn is_read_failure(&self, error: &Error) -> bool {
+        self.read_failure.as_ref().is_some_and(|failure| {
+            failure.variant == std::mem::discriminant(error) && failure.message == error.to_string()
+        })
     }
 
     /// Adds an already loaded aggregate to the read set. See [`read`](Transaction::read).
@@ -734,15 +816,6 @@ impl<'a, R: Repository> Transaction<'a, R> {
             Rejection::stale_fence(),
         )
         .await
-    }
-
-    /// The command ID and identity digest [`begin_command`](Transaction::begin_command) fixed,
-    /// while the command is pending. Fence-aware retry records the stale-fence rejection of a
-    /// command whose attempts ran out under them.
-    pub(crate) fn pending_command(&self) -> Option<(CommandId, String)> {
-        self.command
-            .as_ref()
-            .map(|pending| (pending.command_id.clone(), pending.digest.clone()))
     }
 
     /// Stamps the commit ID once and builds the repository commit: every unwritten read becomes

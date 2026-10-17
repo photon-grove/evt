@@ -389,7 +389,9 @@ error before any write and is never split.
   aggregates are loaded again, and the handler or prepare step runs again from scratch. Throttling,
   an ambiguous write whose row never appeared, and a load that found a sequence gap are retried
   after a backoff too, but are transient, not conflicts: they never become a rejection. Everything
-  else is returned at once
+  else is returned at once, including an error a multi-stream prepare step makes up itself (only a
+  failed `Read` it passes on is a load failure) and, in both languages, a command ID, digest, and
+  targets that are validated and computed once before the first attempt
 - A failed caller-stamped fence fails fast: the engine records the `stale-fence` rejection
   immediately, without re-preparing or waiting, because it cannot know the caller's decision still
   holds. A caller-stamped fence that passed does not turn another item's conflict into a rejection

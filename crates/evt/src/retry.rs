@@ -208,19 +208,38 @@ impl Retry {
     }
 }
 
-/// A failed attempt: the error, and whether it came from the commit (where a conflict means
-/// another writer moved state the attempt used) or from the decision phase before it.
+/// Where in an attempt an error arose, which decides what the retry loop makes of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// The command's own failure: a handler's or prepare step's error, an encoding error. Never
+    /// retried, whatever variant it is.
+    Internal,
+    /// Reading the outcome row or loading state (including a load a prepare step passed on).
+    Deciding,
+    /// The commit.
+    Committing,
+}
+
+/// A failed attempt: the error, and the phase it arose in.
 pub(crate) struct Failed {
     pub(crate) error: crate::Error,
-    pub(crate) committing: bool,
+    pub(crate) phase: Phase,
 }
 
 impl Failed {
+    /// An error the command itself produced.
+    pub(crate) fn internal(error: crate::Error) -> Self {
+        Self {
+            error,
+            phase: Phase::Internal,
+        }
+    }
+
     /// An error from the decision phase.
     pub(crate) fn deciding(error: crate::Error) -> Self {
         Self {
             error,
-            committing: false,
+            phase: Phase::Deciding,
         }
     }
 
@@ -228,16 +247,16 @@ impl Failed {
     pub(crate) fn committing(error: crate::Error) -> Self {
         Self {
             error,
-            committing: true,
+            phase: Phase::Committing,
         }
     }
 
     /// What the retry loop does with it.
     pub(crate) fn retry(&self) -> Retry {
-        if self.committing {
-            Retry::of(&self.error)
-        } else {
-            Retry::of_decision(&self.error)
+        match self.phase {
+            Phase::Internal => Retry::Never,
+            Phase::Deciding => Retry::of_decision(&self.error),
+            Phase::Committing => Retry::of(&self.error),
         }
     }
 }

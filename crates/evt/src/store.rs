@@ -20,7 +20,7 @@ use crate::outcome::{
 };
 use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
 use crate::retry::{Budget, Failed, Retry, RetryPolicy};
-use crate::transaction::{Begin, Transaction, persist_rejection};
+use crate::transaction::{Begin, PendingCommand, Transaction, freeze_command, persist_rejection};
 use crate::upcast::upcast_event;
 
 /// How many times [`Store::load`] reads the stream when it finds a sequence gap.
@@ -521,7 +521,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         // Events written before outcomes existed carry command IDs but have no outcome row; the
         // window catches those duplicates (and only those: this store's own commits write rows).
         if loaded.has_seen(command_id) {
-            return Err(Failed::deciding(Error::DuplicateCommand(
+            return Err(Failed::internal(Error::DuplicateCommand(
                 command_id.clone(),
             )));
         }
@@ -535,12 +535,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             Err(error) => {
                 // `None` is an internal failure: returned, and nothing is recorded.
                 let Some(rejection) = error.to_rejection() else {
-                    return Err(Failed::deciding(Error::Handler(Box::new(error))));
+                    return Err(Failed::internal(Error::Handler(Box::new(error))));
                 };
 
                 // Canonicalized through its stored encoding, so a first execution and a replay
                 // return the same rejection.
-                let rejection = rejection.canonical().map_err(Failed::deciding)?;
+                let rejection = rejection.canonical().map_err(Failed::internal)?;
                 let outcome = Outcome::rejected(command_id, digest, rejection);
                 let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
 
@@ -556,7 +556,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         if events.is_empty() {
             let response = respond(&loaded.aggregate, &[])
                 .map_err(response_error)
-                .map_err(Failed::deciding)?;
+                .map_err(Failed::internal)?;
             let outcome = with_response(Outcome::accepted(command_id, digest), response);
             let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
 
@@ -568,10 +568,10 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
         let (loaded, serialized, mut commit) = self
             .stage(loaded, events, metadata)
-            .map_err(Failed::deciding)?;
+            .map_err(Failed::internal)?;
         let response = respond(&loaded.aggregate, &decided)
             .map_err(response_error)
-            .map_err(Failed::deciding)?;
+            .map_err(Failed::internal)?;
         commit.outcome = Some(with_response(
             Outcome::accepted(command_id, digest),
             response,
@@ -699,14 +699,14 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             Error::InvalidConfig("command outcomes are not enabled; call with_outcomes".into())
         })?;
 
+        // The command is validated and its identity digest computed once, before the first
+        // attempt; every attempt's transaction installs these frozen values.
+        let pending = freeze_command(config, identity, metadata)?;
         let mut budget = Budget::new(config.retry());
 
         loop {
-            let mut pending = None;
             // Boxed for the same reason as the single-aggregate attempt.
-            let result =
-                Box::pin(self.attempt_transaction(identity, metadata, &mut prepare, &mut pending))
-                    .await;
+            let result = Box::pin(self.attempt_transaction(&pending, &mut prepare)).await;
 
             let failed = match result {
                 Ok(outcome) => return Ok(outcome),
@@ -719,14 +719,14 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             }
 
             let Some(delay) = budget.next() else {
-                let Some((command_id, digest)) = pending.filter(|_| kind == Retry::Conflict) else {
+                if kind != Retry::Conflict {
                     return Err(failed.error);
-                };
+                }
 
                 return persist_rejection(
                     &self.repository,
-                    &command_id,
-                    &digest,
+                    pending.command_id(),
+                    pending.digest(),
                     config.recovery_wait(),
                     Rejection::retries_exhausted(budget.attempts()),
                 )
@@ -737,15 +737,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         }
     }
 
-    /// One attempt of [`execute_transaction`](Store::execute_transaction). `pending` receives the
-    /// command ID and digest once the command has begun, so the caller can record the stale-fence
-    /// rejection of a command whose attempts ran out.
+    /// One attempt of [`execute_transaction`](Store::execute_transaction) with the command frozen
+    /// before the first attempt.
     async fn attempt_transaction<'s, F>(
         &'s self,
-        identity: &CommandIdentity,
-        metadata: &Metadata,
+        pending: &PendingCommand,
         prepare: &mut F,
-        pending: &mut Option<(CommandId, String)>,
     ) -> Result<CommandOutcome, Failed>
     where
         F: for<'t> FnMut(&'t mut Transaction<'s, R>) -> PrepareFuture<'t>,
@@ -753,7 +750,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         let mut transaction = self.transaction();
 
         match transaction
-            .begin_command(identity, metadata)
+            .begin_frozen(pending)
             .await
             .map_err(Failed::deciding)?
         {
@@ -761,9 +758,18 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             Begin::Proceed => {}
         }
 
-        *pending = transaction.pending_command();
+        let decision = match prepare(&mut transaction).await {
+            Ok(decision) => decision,
+            // An error the step passed on from a failed `Transaction::read` is a load failure,
+            // retried but never recorded against the command. Any other error is the step's own
+            // failure, even when it is a `Conflict` or `Transient`: it is returned at once.
+            Err(error) if transaction.is_read_failure(&error) => {
+                return Err(Failed::deciding(error));
+            }
+            Err(error) => return Err(Failed::internal(error)),
+        };
 
-        match prepare(&mut transaction).await.map_err(Failed::deciding)? {
+        match decision {
             Decision::Accept(response) => transaction
                 .commit_with_outcome(response)
                 .await
@@ -1315,6 +1321,111 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 "no outcome is recorded for an inconsistent read"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_error_a_prepare_step_makes_up_is_never_retried() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            use crate::{CommandIdentity, Decision};
+
+            let store = Store::<Counter, _>::new(MemRepository::new(), ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(5)));
+            let identity = CommandIdentity::new("counter:check").with_targets(["c-1"]);
+
+            // Whatever variant the step returns, an error it produced itself is its own failure:
+            // the same `Conflict` or `Transient` a failed read would give is not retried, and no
+            // rejection is recorded for it.
+            type Made = fn() -> Error;
+            let made: [(&str, Made); 2] = [
+                ("conflict", || Error::Conflict {
+                    entity_id: EntityId::new("c-1"),
+                    message: "made up by the step".into(),
+                }),
+                ("transient", || {
+                    Error::Transient("made up by the step".into())
+                }),
+            ];
+
+            for (name, make) in made {
+                let calls = AtomicUsize::new(0);
+
+                let result = store
+                    .execute_transaction(&identity, &command(name), |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+
+                        Box::pin(async move { Err::<Decision, _>(make()) })
+                    })
+                    .await;
+
+                assert!(
+                    matches!(&result, Err(Error::Conflict { .. } | Error::Transient(_))),
+                    "{name}: {result:?}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{name}: no re-prepare");
+                assert!(
+                    store
+                        .repository()
+                        .outcome(&CommandId::new(name))
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{name}: nothing recorded"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failed_read_a_prepare_step_passes_on_is_retried_but_never_recorded() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            use crate::{CommandIdentity, Decision};
+
+            let inner = MemRepository::new();
+            Store::<Counter, _>::new(&inner, ())
+                .execute("c-1", Bump(1), Metadata::default())
+                .await
+                .unwrap();
+
+            let gapped = Gapped(&inner);
+            let store = Store::<Counter, _>::new(&gapped, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(3)));
+            let identity = CommandIdentity::new("counter:check").with_targets(["c-1"]);
+            let calls = AtomicUsize::new(0);
+
+            // The step reads a stream whose load keeps finding a sequence gap and passes the error
+            // on with `?`: it is retried until the attempts run out, then returned, never recorded.
+            let result = store
+                .execute_transaction(&identity, &command("read"), |tx| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+
+                    Box::pin(async move {
+                        tx.read::<Counter>("c-1").await?;
+
+                        Ok(Decision::accept())
+                    })
+                })
+                .await;
+
+            assert!(
+                matches!(&result, Err(Error::SequenceGap { .. })),
+                "{result:?}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                3,
+                "retried like a load failure"
+            );
+            assert!(
+                inner
+                    .outcome(&CommandId::new("read"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a failed read says nothing about the decision going stale"
             );
         }
 

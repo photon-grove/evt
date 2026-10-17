@@ -1075,6 +1075,9 @@ the error — and only then by fence provenance:
   found a sequence gap (a compaction raced it, or events expired): reloading resolves the first
   case, so it is retried, but it says the read was inconsistent, not that a decision went stale,
   and a gap that persists is returned as an error rather than recorded against the command ID.
+  Only a failed read that a multi-stream prepare step passes on counts: an error the step makes up
+  itself, even one shaped like a conflict or a transient failure, is the step's own failure and is
+  returned at once in both languages.
 - Control-row failures — the feature-marker and rebuild-lock checks — are classified separately
   ([Writes](#writes)) and never reach this rule, and a lost outcome put is resolved through the
   outcome row, never by re-preparing ([Command Outcomes](#command-outcomes)). Every other error
