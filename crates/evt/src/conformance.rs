@@ -3008,6 +3008,10 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         outcome_race(repo).await,
     );
     record(
+        "a winner of the same command that moved a fenced stream resolves to its outcome",
+        outcome_fence_race(repo).await,
+    );
+    record(
         "a failed caller-stamped fence persists a stale-fence rejection",
         outcome_stale_fence(repo).await,
     );
@@ -3929,6 +3933,77 @@ async fn outcome_race<R: Repository>(repo: &R) -> CaseResult {
         repo.events(&other.id).await?.is_empty(),
         "the failed commit's events were not written"
     );
+
+    Ok(())
+}
+
+/// The winner of a race for the same command ID wrote a stream the loser fenced at the head it
+/// read. A backend that asserts fences before inserting the outcome (PostgreSQL) reports the stale
+/// fence, not the lost outcome put; the loser must still resolve to the winner's outcome (or key
+/// reuse), and only fall back to a fence-aware retry when no winner's row exists.
+async fn outcome_fence_race<R: Repository>(repo: &R) -> CaseResult {
+    let fault = FaultInjectingRepository::new(repo);
+    let store = outcome_store(&fault);
+    let plain = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(0);
+
+    for (name, same_identity) in [("same identity", true), ("another identity", false)] {
+        let watched = ledger_id();
+        let target = ledger_id();
+        plain.execute(&watched, Add(1), metadata()).await?;
+
+        let command = command_id();
+        let identity = CommandIdentity::new("ledger:copy").with_streams([target.clone()]);
+        let metadata = command_metadata(&command);
+
+        // The loser reads the watched stream (an engine fence at head 1) and writes the target.
+        let mut tx = store.transaction();
+        tx.begin_command(&identity, &metadata).await?;
+        tx.read::<Ledger>(&watched).await?;
+        let mut ledger = tx.read::<Ledger>(&target).await?;
+        tx.append(&mut ledger, vec![Added { amount: 1 }.into()])?;
+
+        // The winner, between the loser's load and commit, moves the watched stream and records
+        // the same command ID.
+        let winner_identity = if same_identity {
+            identity.clone()
+        } else {
+            CommandIdentity::new("ledger:other").with_streams([target.clone()])
+        };
+        let digest = default_digest(&winner_identity.digest_input(&metadata))
+            .map_err(|err| Failure(err.to_string()))?;
+        let events = serialize_events::<Ledger>(
+            &watched,
+            EventSequence(1),
+            &[LedgerEvent::from(Added { amount: 1 })],
+            &Metadata::default().with_command_id(command.clone()),
+        )?;
+        fault.race_with(
+            Commit::new(watched.clone(), events)
+                .with_outcome(Outcome::accepted(command.clone(), digest)),
+        );
+
+        let result = tx.commit_with_outcome(None).await;
+
+        if same_identity {
+            let resolved = result.map_err(|err| Failure(format!("{name}: {err}")))?;
+            ensure!(
+                resolved.replayed && resolved.is_accepted(),
+                "{name}: the loser returns the winner's stored outcome: {resolved:?}"
+            );
+        } else {
+            expect_reuse(result, name)?;
+        }
+
+        ensure!(
+            repo.events(&target).await?.is_empty(),
+            "{name}: the loser wrote nothing"
+        );
+        ensure_eq!(
+            repo.events(&watched).await?.len(),
+            2,
+            "only the winner moved the watched stream"
+        );
+    }
 
     Ok(())
 }

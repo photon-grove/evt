@@ -967,14 +967,19 @@ pub(crate) async fn settle<R: Repository>(
             }
         }
         // An ordinary conflict may be the loser of a race for the same command ID: the winner's
-        // row exists by now. Re-read once, so the retry's pre-check is not needed to find it.
-        // Fence conflicts are not ordinary conflicts here; a failed read keeps the conflict.
-        Err(conflict @ (Error::Conflict { .. } | Error::SequenceGap { .. })) => {
-            match repository.outcome(command_id).await {
-                Ok(Some(stored)) => Ok(Settled::Replayed(same_command(stored, digest)?)),
-                _ => Err(conflict),
-            }
-        }
+        // row exists by now. Re-read once, so the retry's pre-check is not needed to find it. That
+        // includes a fence conflict: the winner wrote the very stream the loser fenced, and a
+        // backend that asserts fences before inserting the outcome (PostgreSQL) reports the fence,
+        // not the lost outcome put. Absent, the conflict stands and the fence-aware retry runs; a
+        // failed read keeps the conflict.
+        Err(
+            conflict @ (Error::Conflict { .. }
+            | Error::SequenceGap { .. }
+            | Error::FenceConflict { .. }),
+        ) => match repository.outcome(command_id).await {
+            Ok(Some(stored)) => Ok(Settled::Replayed(same_command(stored, digest)?)),
+            _ => Err(conflict),
+        },
         Err(other) => Err(other),
     }
 }

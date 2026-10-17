@@ -50,6 +50,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("TransactionOutcomes", func(t *testing.T) { testTransactionOutcomes(t, outcomes(t)) })
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
+	t.Run("FenceRaceResolvesToTheWinner", func(t *testing.T) { testFenceRace(t, outcomes(t)) })
 	t.Run("NonCanonicalEventIDsWriteNothing", func(t *testing.T) { testNonCanonicalEventIDs(t, outcomes(t)) })
 	t.Run("RejectionSupersedesCallerFences", func(t *testing.T) { testRejectionFenceOrdering(t, outcomes(t)) })
 	t.Run("LegacyCommandIDWindow", func(t *testing.T) { testLegacyCommandIDWindow(t, outcomes(t)) })
@@ -958,6 +959,72 @@ func mustEvents(t *testing.T, repo evt.Repository, id evt.EntityID) []evt.Serial
 	require.NoError(t, err)
 
 	return events
+}
+
+// The winner of a race for the same command ID wrote a stream the loser fenced at the head it
+// read. A backend that asserts fences before the outcome insert reports the stale fence, not the
+// lost outcome put; the loser must still resolve to the winner's outcome (or key reuse).
+func testFenceRace(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+
+	faulty, err := test.NewFaultRepository(repo)
+	require.NoError(t, err)
+
+	env := newOutcomeEnv(t, faulty, 0)
+	rival := snapshots.NewStore(repo, 0).WithOutcomes()
+
+	for _, sameIdentity := range []bool{true, false} {
+		watched := evt.EntityID(newNamespace() + "-watched")
+		target := evt.EntityID(newNamespace() + "-target")
+
+		_, err = rival.ExecuteWithOutcome(ctx, newLedger(watched), watched,
+			&ledgerCommand{Kind: "deposit", Amount: 1}, withCommand(env.commandID("seed-"+string(watched))))
+		require.NoError(t, err)
+
+		id := env.commandID(fmt.Sprintf("fence-race-%t-%s", sameIdentity, watched))
+		identity := evt.CommandIdentity{Type: "ledger:copy", Streams: []evt.EntityID{target}}
+
+		// The loser reads the watched stream (an engine fence at head 1) and writes the target.
+		tx, replayed, berr := env.store.BeginCommand(ctx, identity, withCommand(id))
+		require.NoError(t, berr)
+		require.Nil(t, replayed)
+		require.NoError(t, tx.Read(ctx, newLedger(watched), watched))
+		require.NoError(t, tx.Read(ctx, newLedger(target), target))
+		require.NoError(t, tx.Append(target, &ledgerEvent{Kind: "deposited", Amount: 1}))
+
+		// The winner, between the loser's load and commit, moves the watched stream under the same
+		// command ID.
+		winnerIdentity := identity
+		if !sameIdentity {
+			winnerIdentity.Type = "ledger:other"
+		}
+
+		faulty.Intercept = func(_ context.Context, _ evt.SerializedResult, commit func() error) error {
+			faulty.Intercept = nil
+
+			winner, wtx, werr := rival.BeginCommand(ctx, winnerIdentity, withCommand(id))
+			require.NoError(t, werr)
+			require.Nil(t, wtx)
+			require.NoError(t, winner.Read(ctx, newLedger(watched), watched))
+			require.NoError(t, winner.Append(watched, &ledgerEvent{Kind: "deposited", Amount: 1}))
+
+			_, werr = winner.Complete(ctx, nil)
+			require.NoError(t, werr)
+
+			return commit()
+		}
+
+		outcome, err := tx.Complete(ctx, nil)
+
+		if sameIdentity {
+			require.NoError(t, err)
+			require.True(t, outcome.Replayed, "the loser returns the winner's stored outcome")
+		} else {
+			require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse)
+		}
+
+		require.Empty(t, env.events(t, target), "the loser wrote nothing")
+	}
 }
 
 func testNonCanonicalEventIDs(t *testing.T, repo evt.OutcomeRepository) {
