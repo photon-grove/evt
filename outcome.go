@@ -142,9 +142,17 @@ func (e *RejectionError) Unwrap() error { return e.Err }
 // Is makes errors.Is(err, ErrRejected) match.
 func (e *RejectionError) Is(target error) bool { return target == ErrRejected }
 
-// EncodeRejection returns the stored JSON form of a rejection.
+// EncodeRejection returns the stored JSON form of a rejection. Numbers in Details are written in
+// their canonical text (no exponent, no sign on zero: the text PostgreSQL's jsonb prints), so every
+// backend stores, and reads back, the same bytes. A number past PostgreSQL's numeric limits is an
+// *InvalidArgumentError, and an encoding over MaxOutcomeBytes an *OutcomeTooLargeError.
 func EncodeRejection(rejection Rejection) ([]byte, error) {
-	return json.Marshal(rejection)
+	encoded, err := json.Marshal(rejection)
+	if err != nil {
+		return nil, err
+	}
+
+	return canonicalNumbers(encoded)
 }
 
 // DecodeRejection parses the stored JSON form of a rejection. Numbers inside details keep their
@@ -169,8 +177,9 @@ func DecodeRejection(data []byte) (Rejection, error) {
 }
 
 // CanonicalRejection returns the rejection as it reads back from storage: encoded and decoded, so
-// the numbers in Details are json.Number, nested values are fresh copies, and a nil or empty
-// Details stays as it round-trips. A first execution returns this form so it equals a replay.
+// the numbers in Details are json.Number in their canonical text, nested values are fresh copies,
+// and a nil or empty Details stays as it round-trips. A first execution returns this form so it
+// equals a replay on every backend.
 func CanonicalRejection(rejection Rejection) (Rejection, error) {
 	encoded, err := EncodeRejection(rejection)
 	if err != nil {
@@ -273,7 +282,12 @@ func CheckCommandID(id CommandID) error {
 func jsonHasNUL(encoded []byte) (bool, error) {
 	var decoded any
 
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
+	// Numbers stay json.Number: one past float64's range is still a valid document here, refused
+	// later as unstorable rather than as a decode failure.
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+
+	if err := decoder.Decode(&decoded); err != nil {
 		return false, err
 	}
 
@@ -516,9 +530,9 @@ func CheckOutcome(outcome *Outcome) error {
 	}
 
 	if outcome.Rejection != nil {
-		encoded, err := EncodeRejection(*outcome.Rejection)
-		if err != nil {
-			return fmt.Errorf("encode rejection: %w", err)
+		encoded, marshalErr := json.Marshal(*outcome.Rejection)
+		if marshalErr != nil {
+			return fmt.Errorf("encode rejection: %w", marshalErr)
 		}
 
 		// The code and message are stored as plain text as well as inside the JSON, where invalid
@@ -540,8 +554,15 @@ func CheckOutcome(outcome *Outcome) error {
 			return &InvalidArgumentError{Argument: "rejection", Message: "a rejection must not contain U+0000 in its code, message, or details"}
 		}
 
-		if len(encoded) > MaxOutcomeBytes {
-			return &OutcomeTooLargeError{What: "rejection", Size: len(encoded)}
+		// The bound applies to the stored form, whose numbers are canonical; a number PostgreSQL
+		// cannot store is refused here too.
+		stored, err := canonicalNumbers(encoded)
+		if err != nil {
+			return err
+		}
+
+		if len(stored) > MaxOutcomeBytes {
+			return &OutcomeTooLargeError{What: "rejection", Size: len(stored)}
 		}
 	}
 

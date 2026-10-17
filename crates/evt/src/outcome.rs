@@ -152,8 +152,10 @@ impl PartialEq<&str> for RejectionCode {
 /// The standard, persisted domain rejection. Its JSON encoding is the stored form: keys in the
 /// order `code`, `message`, `details`, with `details` `null` when absent.
 ///
-/// `details` is a JSON object of application details or `None`. Numbers inside it are not
-/// normalized across languages, so keep them integral for a replay that is byte-identical in Go.
+/// `details` is a JSON object of application details or `None`. Its numbers are stored in their
+/// canonical text ([`canonical_numbers`](crate::canonical_numbers)), the same on every backend.
+/// Floats still format differently in Go and Rust before that (`100.0` here, `100` in Go), so keep
+/// them integral for a rejection that is byte-identical across languages.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejection {
     /// The machine-readable reason.
@@ -223,7 +225,10 @@ impl Rejection {
         .with_details(serde_json::json!({ "attempts": attempts }))
     }
 
-    /// Encodes the rejection as its stored JSON, byte for byte as Go's `json.Marshal` writes it.
+    /// Encodes the rejection as its stored JSON, byte for byte as Go's `EncodeRejection` writes
+    /// it: numbers in `details` take their canonical text. A number past PostgreSQL's numeric
+    /// limits is [`Error::InvalidArgument`], and an encoding over [`MAX_OUTCOME_BYTES`]
+    /// [`Error::OutcomeTooLarge`].
     pub fn encode(&self) -> Result<String, Error> {
         if let Some(details) = &self.details
             && !details.is_object()
@@ -243,11 +248,13 @@ impl Rejection {
             ));
         }
 
-        Ok(json::to_string(self)?)
+        let encoded = json::to_string(self)?;
+
+        Ok(crate::numbers::canonical_numbers(&encoded)?.into_owned())
     }
 
-    /// The rejection as it reads back from storage (encoded and decoded). A first execution
-    /// returns this form so it equals a replay on every backend.
+    /// The rejection as it reads back from storage (encoded and decoded, its numbers canonical).
+    /// A first execution returns this form so it equals a replay on every backend.
     pub fn canonical(&self) -> Result<Self, Error> {
         Self::decode(&self.encode()?)
     }

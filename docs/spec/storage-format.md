@@ -48,7 +48,9 @@ crate reproduces it byte for byte (`photon_evt::json`):
   standard JSON escapes.
 - Byte fields (`payload` in serialized events and snapshots) are standard, padded base64.
 - Floating-point numbers are **not** normalized: Go and Rust format some floats differently. Payloads
-  that must be identical across languages should use integers (for example, cents).
+  that must be identical across languages should use integers (for example, cents). The one
+  exception is a stored rejection's `details`, whose numbers take a canonical text
+  ([Rejections](#rejections)).
 
 Decoding is lenient in both languages: missing fields and `null` decode to the zero value, and
 unknown fields are ignored.
@@ -977,7 +979,8 @@ A command ID must be valid UTF-8 (Go strings can hold arbitrary bytes; Rust `Str
 construction), as must the command type, target stream IDs, and principal that feed the digest:
 anything else is a typed invalid-argument error before the outcome or the aggregate is read. A
 first execution returns the rejection in its stored (decoded) form, with the numbers in `details`
-read back as the stored text, so its result equals a replay's on every backend.
+read back as their stored, canonical text ([Rejections](#rejections)), so its result equals a
+replay's on every backend.
 
 A digest returned by a digester — the default or a custom one — must be non-empty (and valid
 UTF-8, since it is stored as a string): anything else is a programmer error returned before the
@@ -1021,6 +1024,30 @@ The `rejection` attribute is the JSON encoding of this struct, keys in order `co
 `details`. `code` and `message` are strings; `details` is a JSON object of application details,
 or `null` when the rejection carries none. A rejected outcome is terminal for that digest: a
 retried command replays the original rejection verbatim from the stored row.
+
+**Numbers in `details` are stored in a canonical text** — the text PostgreSQL's `jsonb` prints, so
+every backend stores and returns the same bytes (DynamoDB and the in-memory repository keep the text
+verbatim; `jsonb` rewrites it). Each encoder rewrites every number literal it wrote, leaving
+strings and keys untouched:
+
+- No exponent: the digits are written out in full (`1e+21` → `1000000000000000000000`,
+  `1.5e-7` → `0.00000015`).
+- The scale is the literal's own fraction digits minus its exponent, never fewer than zero, and
+  trailing zeros within it are kept (`1.50e1` → `15.0`, `0.0010e2` → `0.10`, `1E2` → `100`,
+  `100.00` → `100.00`).
+- Zero has no sign (`-0` → `0`, `-0.0` → `0.0`).
+
+A literal without an exponent is already canonical unless it is a negative zero. A number
+PostgreSQL's numeric type cannot hold — a written exponent past ±1073741823, more than 16383
+digits after the decimal point, or more than 131072 significant digits before it — is a typed
+invalid-argument error (Go `ErrInvalidArgument`, Rust `Error::InvalidArgument`) on every backend,
+before any write. The 65536-byte bound applies to the canonical form, so an exponent that expands a
+rejection past it is `OutcomeTooLarge`; the size is computed before the text is built. The rewrite
+fixes the stored text, not the value a language formats before it: Go writes `float64(100)` as
+`100` and Rust writes `100.0_f64` as `100.0`, and both are canonical, so keep floats integral in
+details that must be byte-identical across languages. `compat/fixtures/outcomes.json`
+(`rejectionNumbers`) carries the literal-by-literal vectors, checked against PostgreSQL itself by
+the PostgreSQL integration suite.
 
 Only domain rejections are durable. Internal failures — event encoding errors, bad events,
 storage errors — are returned as errors and **write no outcome**, so a retry after the underlying
