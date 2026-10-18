@@ -191,11 +191,12 @@ func TestCheckOutcomeRefusesNumbersPostgreSQLCannotStore(t *testing.T) {
 		}
 	}
 
-	for _, number := range []json.Number{"1e-16384", "1e131072", "0e1073741824", "0.0e-16383"} {
+	for _, number := range []json.Number{"1e-16384", "1e131072", "0.0e-16383", "1e99999999999", "1e-99999999999"} {
 		require.ErrorIs(t, evt.CheckOutcome(rejected(map[string]any{"n": number})), evt.ErrInvalidArgument, number)
 	}
 
-	require.NoError(t, evt.CheckOutcome(rejected(map[string]any{"n": json.Number("0e1073741823")})))
+	// A zero is 0 whatever its exponent.
+	require.NoError(t, evt.CheckOutcome(rejected(map[string]any{"n": json.Number("0e99999999999")})))
 
 	var sizeErr *evt.OutcomeTooLargeError
 	require.ErrorAs(t, evt.CheckOutcome(rejected(map[string]any{"n": json.Number("1e65536")})), &sizeErr)

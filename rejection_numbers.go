@@ -6,26 +6,25 @@ import (
 	"strconv"
 )
 
-// Limits PostgreSQL's numeric type puts on a JSON number (storage spec, Rejections). A number past
-// any of them cannot be stored in a jsonb column, so it is refused on every backend alike.
+// Limits PostgreSQL's numeric type puts on the canonical text of a number (storage spec,
+// Rejections). A number past either cannot be stored in a jsonb column, so it is refused on every
+// backend alike.
 const (
-	// maxNumberExponent bounds the magnitude of a number's written exponent.
-	maxNumberExponent = 1<<30 - 1
-
 	// maxNumberScale bounds the digits after the decimal point in the canonical text.
 	maxNumberScale = 16383
 
 	// maxNumberIntegerDigits bounds the significant digits before the decimal point.
 	maxNumberIntegerDigits = 131072
+
+	// exponentCap saturates a written exponent so the digit arithmetic cannot overflow. It is far
+	// past both limits: a non-zero number with a larger exponent is refused by one of them, and a
+	// zero is 0 whatever its exponent.
+	exponentCap = 1 << 30
 )
 
 // jsonNumber is one JSON number literal, split into the parts its canonical text is built from.
 type jsonNumber struct {
 	negative bool
-
-	// exponent is the written exponent, zero when there is none, saturated past
-	// maxNumberExponent.
-	exponent int64
 
 	// integer and fraction are the digits on each side of the written decimal point. They alias
 	// the encoded document, which outlives the number.
@@ -160,7 +159,7 @@ func isNumberByte(c byte) bool {
 }
 
 // parseJSONNumber splits a JSON number literal. The literal comes from a JSON encoder, so it is
-// well formed; an exponent too long to hold is saturated, and refused by check.
+// well formed; an exponent too long to hold is saturated at exponentCap.
 func parseJSONNumber(text []byte) jsonNumber {
 	var number jsonNumber
 
@@ -181,7 +180,6 @@ func parseJSONNumber(text []byte) jsonNumber {
 
 	exponent := parseExponent(exponentText)
 
-	number.exponent = exponent
 	number.integer, number.fraction = integer, fraction
 	number.point = int64(len(integer)) + exponent
 	number.scale = max(0, int64(len(fraction))-exponent)
@@ -198,7 +196,7 @@ func parseJSONNumber(text []byte) jsonNumber {
 	return number
 }
 
-// parseExponent reads an optionally signed exponent, saturating past maxNumberExponent.
+// parseExponent reads an optionally signed exponent, saturating at exponentCap.
 func parseExponent(text []byte) int64 {
 	negative := false
 
@@ -210,7 +208,7 @@ func parseExponent(text []byte) int64 {
 	var exponent int64
 
 	for _, c := range text {
-		exponent = min(exponent*10+int64(c-'0'), maxNumberExponent+1)
+		exponent = min(exponent*10+int64(c-'0'), exponentCap)
 	}
 
 	if negative {
@@ -235,8 +233,7 @@ func (n *jsonNumber) integerDigits() int64 {
 
 // check refuses a number past PostgreSQL's numeric limits.
 func (n *jsonNumber) check(text []byte) error {
-	if n.exponent > maxNumberExponent || n.exponent < -maxNumberExponent ||
-		n.scale > maxNumberScale || n.integerDigits() > maxNumberIntegerDigits {
+	if n.scale > maxNumberScale || n.integerDigits() > maxNumberIntegerDigits {
 		return &InvalidArgumentError{
 			Argument: "rejection",
 			Message:  fmt.Sprintf("rejection details hold a number out of the storable range: %s", truncateNumber(text)),

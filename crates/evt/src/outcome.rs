@@ -155,7 +155,8 @@ impl PartialEq<&str> for RejectionCode {
 /// `details` is a JSON object of application details or `None`. Its numbers are stored in their
 /// canonical text ([`canonical_numbers`](crate::canonical_numbers)), the same on every backend.
 /// Floats still format differently in Go and Rust before that (`100.0` here, `100` in Go), so keep
-/// them integral for a rejection that is byte-identical across languages.
+/// them integral for a rejection that is byte-identical across languages. A float whose canonical
+/// text is an integer (`1.5e16` is `15000000000000000`) reads back as an integer `Number`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejection {
     /// The machine-readable reason.

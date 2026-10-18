@@ -9,14 +9,16 @@ use std::borrow::Cow;
 use crate::error::Error;
 use crate::outcome::MAX_OUTCOME_BYTES;
 
-/// The largest magnitude of a written exponent PostgreSQL's numeric type accepts.
-const MAX_EXPONENT: i64 = (1 << 30) - 1;
-
 /// The most digits after the decimal point in the canonical text.
 const MAX_SCALE: i64 = 16383;
 
 /// The most significant digits before the decimal point.
 const MAX_INTEGER_DIGITS: i64 = 131_072;
+
+/// Saturates a written exponent so the digit arithmetic cannot overflow. It is far past both
+/// limits: a non-zero number with a larger exponent is refused by one of them, and a zero is `0`
+/// whatever its exponent.
+const EXPONENT_CAP: i64 = 1 << 30;
 
 /// Rewrites every number in an encoded JSON document into its canonical text, the one
 /// PostgreSQL's `jsonb` prints: plain decimal digits with no exponent, the fraction digits the
@@ -24,8 +26,10 @@ const MAX_INTEGER_DIGITS: i64 = 131_072;
 /// `1e+21` becomes `1000000000000000000000`, `1.50e1` becomes `15.0`, and `-0` becomes `0`.
 /// Everything outside the numbers is kept byte for byte.
 ///
-/// The input must be valid, compact JSON, as an encoder writes it. A number past PostgreSQL's
-/// numeric limits is [`Error::InvalidArgument`]; a document whose canonical form is over
+/// The input must be valid JSON, as an encoder writes it; other input never panics, but its output
+/// is unspecified. A number whose canonical text PostgreSQL's numeric type cannot hold (more than
+/// 16383 digits after the decimal point, or more than 131072 before it) is
+/// [`Error::InvalidArgument`]; a document whose canonical form is over
 /// [`MAX_OUTCOME_BYTES`] is [`Error::OutcomeTooLarge`], refused before it is built.
 pub fn canonical_numbers(json: &str) -> Result<Cow<'_, str>, Error> {
     let mut size: i64 = 0;
@@ -140,8 +144,6 @@ fn is_number_byte(c: u8) -> bool {
 /// One JSON number literal, split into the parts its canonical text is built from.
 struct Number<'a> {
     negative: bool,
-    /// The written exponent, zero when there is none, saturated past [`MAX_EXPONENT`].
-    exponent: i64,
     /// The integer digits and the fraction digits, without the decimal point.
     integer: &'a [u8],
     fraction: &'a [u8],
@@ -172,7 +174,6 @@ impl<'a> Number<'a> {
 
         Self {
             negative,
-            exponent,
             integer: integer.as_bytes(),
             fraction: fraction.as_bytes(),
             point: integer.len() as i64 + exponent,
@@ -223,10 +224,7 @@ impl<'a> Number<'a> {
 
     /// Refuses a number past PostgreSQL's numeric limits.
     fn check(&self, text: &str) -> Result<(), Error> {
-        if self.exponent.abs() > MAX_EXPONENT
-            || self.scale > MAX_SCALE
-            || self.integer_digits() > MAX_INTEGER_DIGITS
-        {
+        if self.scale > MAX_SCALE || self.integer_digits() > MAX_INTEGER_DIGITS {
             let shown = if text.len() <= 64 {
                 text.to_owned()
             } else {
@@ -279,7 +277,8 @@ impl<'a> Number<'a> {
     }
 }
 
-/// Reads an optionally signed exponent, saturating past [`MAX_EXPONENT`].
+/// Reads an optionally signed exponent, saturating at [`EXPONENT_CAP`]. A byte that is not a digit
+/// counts as zero, so malformed input cannot panic.
 fn parse_exponent(text: &str) -> i64 {
     let (negative, digits) = match text.as_bytes().first() {
         Some(b'-') => (true, &text[1..]),
@@ -288,7 +287,9 @@ fn parse_exponent(text: &str) -> i64 {
     };
 
     let magnitude = digits.bytes().fold(0i64, |exponent, c| {
-        (exponent * 10 + i64::from(c - b'0')).min(MAX_EXPONENT + 1)
+        let digit = if c.is_ascii_digit() { c - b'0' } else { 0 };
+
+        (exponent * 10 + i64::from(digit)).min(EXPONENT_CAP)
     });
 
     if negative { -magnitude } else { magnitude }
@@ -336,14 +337,22 @@ mod tests {
 
     #[test]
     fn numbers_past_the_numeric_limits_are_refused() {
-        for input in ["1e-16384", "1e131072", "0e1073741824", "0.0e-16383"] {
+        for input in [
+            "1e-16384",
+            "1e131072",
+            "0.0e-16383",
+            "1e99999999999",
+            "1e-99999999999",
+        ] {
             assert!(
                 matches!(canonical_numbers(input), Err(Error::InvalidArgument(_))),
                 "{input}"
             );
         }
 
-        assert_eq!(canonical("0e1073741823"), "0");
+        // A zero is 0 whatever its exponent, and malformed input does not panic.
+        assert_eq!(canonical("0e99999999999"), "0");
+        assert!(canonical_numbers("1e+-5").is_ok());
         assert!(matches!(
             canonical_numbers("1e65536"),
             Err(Error::OutcomeTooLarge {

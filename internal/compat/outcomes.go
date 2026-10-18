@@ -243,7 +243,7 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 			CommandID: "cmd-0008", Status: evt.OutcomeRejected, Digest: "d",
 			Rejection: &evt.Rejection{
 				Code: "limits", Message: "numbers Go writes with an exponent or a signed zero",
-				Details: map[string]any{"big": 1e21, "tiny": 1.5e-7, "negzero": math.Copysign(0, -1), "half": 2.5},
+				Details: map[string]any{"big": 1e21, "huge": 6.805598656397509e25, "tiny": 1.5e-7, "negzero": math.Copysign(0, -1), "half": 2.5},
 			},
 		}},
 	}
@@ -280,9 +280,10 @@ func rejectionNumbers() ([]RejectionNumberVector, error) {
 		{"already canonical", details(`"frac":100.00,"int":123,"negative":-7,"precise":9007199254740993`)},
 		{"nested", details(`"a":[1e2,{"b":-0e0}],"c":{"d":[[2.5e1]]}`)},
 		{"number-like strings and keys", `{"code":"1e5","message":"-0 \"2e3\" \\","details":{"1e5":"-0.0e1","n":-0}}`},
-		{"exponent at the limit", details(`"n":0e1073741823`)},
+		{"zero with a huge exponent", details(`"n":0e99999999999`)},
 		{"scale at the limit", details(`"n":1.000e-16380`)},
-		{"exponent past the limit", details(`"n":0e1073741824`)},
+		{"huge exponent", details(`"n":1e99999999999`)},
+		{"huge negative exponent", details(`"n":1e-99999999999`)},
 		{"scale past the limit", details(`"n":1e-16384`)},
 		{"zero scale past the limit", details(`"n":0.0e-16383`)},
 		{"integer digits past the limit", details(`"n":1e131072`)},

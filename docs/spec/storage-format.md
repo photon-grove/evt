@@ -1029,9 +1029,10 @@ or `null` when the rejection carries none. A rejected outcome is terminal for th
 retried command replays the original rejection verbatim from the stored row.
 
 **Numbers in `details` are stored in a canonical text** — the text PostgreSQL's `jsonb` prints, so
-every backend stores and returns the same bytes (DynamoDB and the in-memory repository keep the text
-verbatim; `jsonb` rewrites it). Each encoder rewrites every number literal it wrote, leaving
-strings and keys untouched:
+every backend returns the same number text and a replayed rejection decodes to the same value
+(DynamoDB and the in-memory repository keep the stored text verbatim; `jsonb` keeps the numbers
+but reorders keys and adds whitespace). Each encoder rewrites every number literal it wrote,
+leaving strings and keys untouched:
 
 - No exponent: the digits are written out in full (`1e+21` → `1000000000000000000000`,
   `1.5e-7` → `0.00000015`).
@@ -1040,15 +1041,20 @@ strings and keys untouched:
   `100.00` → `100.00`).
 - Zero has no sign (`-0` → `0`, `-0.0` → `0.0`).
 
-A literal without an exponent is already canonical unless it is a negative zero. A number
-PostgreSQL's numeric type cannot hold — a written exponent past ±1073741823, more than 16383
-digits after the decimal point, or more than 131072 significant digits before it — is a typed
-invalid-argument error (Go `ErrInvalidArgument`, Rust `Error::InvalidArgument`) on every backend,
-before any write. The 65536-byte bound applies to the canonical form, so an exponent that expands a
-rejection past it is `OutcomeTooLarge`; the size is computed before the text is built. The rewrite
-fixes the stored text, not the value a language formats before it: Go writes `float64(100)` as
-`100` and Rust writes `100.0_f64` as `100.0`, and both are canonical, so keep floats integral in
-details that must be byte-identical across languages. `compat/fixtures/outcomes.json`
+A literal without an exponent is already canonical unless it is a negative zero, and a zero is `0`
+(or `0.0`…) whatever its exponent. A number whose canonical text PostgreSQL's numeric type cannot
+hold — more than 16383 digits after the decimal point, or more than 131072 significant digits
+before it — is a typed invalid-argument error (Go `ErrInvalidArgument`, Rust
+`Error::InvalidArgument`) on every backend, before any write. The 65536-byte bound applies to the
+canonical form, so an exponent that expands a rejection past it is `OutcomeTooLarge`; the size is
+computed before the text is built. When a rejection breaks more than one rule, the checks run in
+this order and the first failure is returned: an invalid-UTF-8 code or message (Go only; Rust
+strings are UTF-8), U+0000 anywhere, an unstorable number, then the size bound. The rewrite fixes
+the stored text, not the value a language formats before it: Go writes `float64(100)` as `100` and
+Rust writes `100.0_f64` as `100.0`, and both are canonical, so keep floats integral in details that
+must be byte-identical across languages. Rust parses floats exactly (serde_json's
+`float_roundtrip`), so a float's canonical text reads back as the same `f64`; one whose canonical
+text is an integer (for example `1.5e16`) reads back as an integer `Number`. `compat/fixtures/outcomes.json`
 (`rejectionNumbers`) carries the literal-by-literal vectors, checked against PostgreSQL itself by
 the PostgreSQL integration suite.
 

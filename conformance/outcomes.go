@@ -247,6 +247,7 @@ func (l *ledger) Handle(_ context.Context, command evt.Command) (evt.CommandResu
 			Code: "numbers", Message: "numbers in every form",
 			Details: map[string]any{
 				"big":     1e21,
+				"huge":    6.805598656397509e25,
 				"tiny":    1.5e-7,
 				"negzero": math.Copysign(0, -1),
 				"scaled":  json.Number("1.50e1"),
@@ -511,7 +512,7 @@ func testRejectionNumbers(t *testing.T, repo evt.OutcomeRepository) {
 	encoded, err := evt.EncodeRejection(*stored.Rejection)
 	require.NoError(t, err)
 	require.Equal(t,
-		`{"code":"numbers","message":"numbers in every form","details":{"big":1000000000000000000000,"negzero":0,"nested":[100,{"zero":0.0}],"scaled":15.0,"tiny":0.00000015}}`,
+		`{"code":"numbers","message":"numbers in every form","details":{"big":1000000000000000000000,"huge":68055986563975090000000000,"negzero":0,"nested":[100,{"zero":0.0}],"scaled":15.0,"tiny":0.00000015}}`,
 		string(encoded), "every backend stores and returns the same numeric text")
 }
 
