@@ -3,7 +3,9 @@ package compat
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -31,6 +33,20 @@ type OutcomeFixtures struct {
 	// MalformedRows are outcome items no reader may replay: each must fail to decode in every
 	// language as a corrupt record.
 	MalformedRows []MalformedRow `json:"malformedRows"`
+
+	// RejectionNumbers pin the canonical text of the numbers in a stored rejection.
+	RejectionNumbers []RejectionNumberVector `json:"rejectionNumbers"`
+}
+
+// RejectionNumberVector is a rejection as an encoder may write it, before its numbers are made
+// canonical, and either the stored text every language writes for it or the error every language
+// refuses it with: "invalid-argument" for a number PostgreSQL's numeric type cannot hold,
+// "outcome-too-large" for a canonical form over the outcome bound.
+type RejectionNumberVector struct {
+	Name   string `json:"name"`
+	Input  string `json:"input"`
+	Stored string `json:"stored,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // MalformedRow is a stored outcome item that is not a valid outcome, with the reason.
@@ -223,12 +239,19 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 				Details: map[string]any{"z": []any{1, "two", nil}, "a": map[string]any{"n": 10, "m": 2}},
 			},
 		}},
+		{"rejected with float details", evt.Outcome{
+			CommandID: "cmd-0008", Status: evt.OutcomeRejected, Digest: "d",
+			Rejection: &evt.Rejection{
+				Code: "limits", Message: "numbers Go writes with an exponent or a signed zero",
+				Details: map[string]any{"big": 1e21, "huge": 6.805598656397509e25, "tiny": 1.5e-7, "negzero": math.Copysign(0, -1), "half": 2.5},
+			},
+		}},
 	}
 
 	for _, test := range rows {
-		vector, err := rowVector(test.name, test.outcome)
-		if err != nil {
-			return fixtures, fmt.Errorf("%s: %w", test.name, err)
+		vector, rowErr := rowVector(test.name, test.outcome)
+		if rowErr != nil {
+			return fixtures, fmt.Errorf("%s: %w", test.name, rowErr)
 		}
 
 		fixtures.Rows = append(fixtures.Rows, vector)
@@ -236,7 +259,70 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 
 	fixtures.MalformedRows = malformedRows()
 
+	numbers, err := rejectionNumbers()
+	if err != nil {
+		return fixtures, err
+	}
+
+	fixtures.RejectionNumbers = numbers
+
 	return fixtures, nil
+}
+
+// rejectionNumbers builds the canonical-number vectors from literal inputs, which DecodeRejection
+// keeps verbatim, so each one exercises the exact text an encoder could have written.
+func rejectionNumbers() ([]RejectionNumberVector, error) {
+	details := func(body string) string { return `{"code":"c","message":"m","details":{` + body + `}}` }
+
+	inputs := []struct{ name, input string }{
+		{"exponent forms", details(`"bare":1e21,"big":1e+21,"down":12.5e-1,"negative":-1.5e3,"scaled":1.50e1,"shifted":0.0010e2,"tiny":1.5e-7,"upper":1E2,"zero":0e5`)},
+		{"signed zeros", details(`"exp":-0.000e2,"frac":-0.0,"int":-0`)},
+		{"already canonical", details(`"frac":100.00,"int":123,"negative":-7,"precise":9007199254740993`)},
+		{"nested", details(`"a":[1e2,{"b":-0e0}],"c":{"d":[[2.5e1]]}`)},
+		{"number-like strings and keys", `{"code":"1e5","message":"-0 \"2e3\" \\","details":{"1e5":"-0.0e1","n":-0}}`},
+		{"zero with a huge exponent", details(`"n":0e99999999999`)},
+		{"scale at the limit", details(`"n":1.000e-16380`)},
+		{"huge exponent", details(`"n":1e99999999999`)},
+		{"huge negative exponent", details(`"n":1e-99999999999`)},
+		{"scale past the limit", details(`"n":1e-16384`)},
+		{"zero scale past the limit", details(`"n":0.0e-16383`)},
+		{"integer digits past the limit", details(`"n":1e131072`)},
+		{"integer digits at the limit", details(`"n":1e131071`)},
+		{"expansion past the outcome bound", details(`"n":1e65536`)},
+	}
+
+	vectors := make([]RejectionNumberVector, 0, len(inputs))
+
+	for _, test := range inputs {
+		rejection, err := evt.DecodeRejection([]byte(test.input))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", test.name, err)
+		}
+
+		vector := RejectionNumberVector{Name: test.name, Input: test.input}
+
+		stored, err := evt.EncodeRejection(rejection)
+
+		var tooLarge *evt.OutcomeTooLargeError
+
+		switch {
+		case err == nil:
+			vector.Stored = string(stored)
+
+		case errors.Is(err, evt.ErrInvalidArgument):
+			vector.Error = "invalid-argument"
+
+		case errors.As(err, &tooLarge):
+			vector.Error = "outcome-too-large"
+
+		default:
+			return nil, fmt.Errorf("%s: %w", test.name, err)
+		}
+
+		vectors = append(vectors, vector)
+	}
+
+	return vectors, nil
 }
 
 // malformedRows builds items that violate one rule of a valid outcome each, starting from a valid

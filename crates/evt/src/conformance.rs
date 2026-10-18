@@ -3183,6 +3183,10 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         Box::pin(outcome_transaction_reject(repo)).await,
     );
     record(
+        "a rejection's numbers read back the same on every backend",
+        Box::pin(outcome_rejection_numbers(repo)).await,
+    );
+    record(
         "command ID and outcome bounds are refused before any write",
         Box::pin(outcome_limits(repo)).await,
     );
@@ -3861,6 +3865,52 @@ async fn outcome_transaction_reject<R: Repository>(repo: &R) -> CaseResult {
     ensure!(
         repo.outcome(&command).await?.is_none(),
         "the stale rejection recorded nothing"
+    );
+
+    Ok(())
+}
+
+/// A rejection's numbers are stored in their canonical text, so a first execution equals a replay
+/// even on a backend that rewrites the stored text (PostgreSQL's `jsonb` prints numbers without an
+/// exponent and drops the sign of zero).
+async fn outcome_rejection_numbers<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let ext = ledger_id();
+    let command = command_id();
+    let identity = CommandIdentity::new("numbers:reject").with_targets([ext.clone()]);
+    let rejection = Rejection::new("numbers", "numbers in every form").with_details(
+        serde_json::json!({ "big": 1e21, "huge": 6.805598656397509e25, "tiny": 1.5e-7, "negzero": -0.0, "nested": [100.0, { "zero": -0.0 }] }),
+    );
+
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command))
+        .await?;
+    let rejected = tx.reject(rejection).await?;
+
+    let mut tx = store.transaction();
+    match tx
+        .begin_command(&identity, &command_metadata(&command))
+        .await?
+    {
+        Begin::Replayed(replayed) => {
+            ensure_eq!(
+                replayed.outcome,
+                rejected.outcome,
+                "a first execution equals a replay"
+            );
+        }
+        Begin::Proceed => return Err(Failure("a recorded rejection must replay".into())),
+    }
+
+    let stored = repo
+        .outcome(&command)
+        .await?
+        .and_then(|stored| stored.rejection)
+        .ok_or_else(|| Failure("the rejection is stored".into()))?;
+    ensure_eq!(
+        stored.encode()?,
+        r#"{"code":"numbers","message":"numbers in every form","details":{"big":1000000000000000000000,"huge":68055986563975090000000000,"negzero":0.0,"nested":[100.0,{"zero":0.0}],"tiny":0.00000015}}"#,
+        "every backend stores and returns the same numeric text"
     );
 
     Ok(())

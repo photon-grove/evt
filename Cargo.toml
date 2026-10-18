@@ -13,7 +13,7 @@ homepage = "https://github.com/photon-grove/evt"
 [workspace.dependencies]
 photon-evt = { path = "crates/evt" }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 thiserror = "2"
 futures-core = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

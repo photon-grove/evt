@@ -7,7 +7,9 @@ package snapshots_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -535,5 +537,35 @@ func TestOutcomes_ARejectionWithInvalidUTF8CodeOrMessageIsRefused(t *testing.T) 
 			CommandID: "cmd", Status: evt.OutcomeRejected, Digest: "d", Rejection: &rejection,
 		})
 		require.ErrorIs(t, err, evt.ErrInvalidArgument, name)
+	}
+}
+
+// The engine canonicalizes a rejection through its stored encoding, which would rewrite invalid
+// UTF-8 to U+FFFD; the rejection is checked first, in CheckOutcome's order, so the engine refuses
+// what CheckOutcome refuses, and U+0000 is reported before the size bound, as in Rust.
+func TestOutcomes_TheEngineChecksARejectionBeforeCanonicalizingIt(t *testing.T) {
+	ctx := context.Background()
+
+	for name, rejection := range map[string]evt.Rejection{
+		"invalid UTF-8 code":      {Code: "bad\xff", Message: "m"},
+		"invalid UTF-8 message":   {Code: "c", Message: "bad\xff"},
+		"U+0000 and oversized":    {Code: "c", Message: "a\x00" + strings.Repeat("x", evt.MaxOutcomeBytes)},
+		"U+0000 and out of range": {Code: "c", Message: "a\x00", Details: map[string]any{"n": json.Number("1e-16384")}},
+		"unstorable number":       {Code: "c", Message: "m", Details: map[string]any{"n": json.Number("1e-16384")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, repo := newOutcomeStore(t)
+
+			tx, replayed, err := store.BeginCommand(ctx, evt.CommandIdentity{Type: "t"}, commandMetadata("cmd-1"))
+			require.NoError(t, err)
+			require.Nil(t, replayed)
+
+			_, err = tx.Reject(ctx, rejection)
+			require.ErrorIs(t, err, evt.ErrInvalidArgument)
+
+			stored, err := repo.GetOutcome(ctx, "cmd-1")
+			require.NoError(t, err)
+			require.Nil(t, stored, "nothing is written")
+		})
 	}
 }

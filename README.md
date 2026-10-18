@@ -267,6 +267,9 @@ default:
   (decoded) form, so its `Details` equal a replay's. A command ID, principal, and command type must
   be valid UTF-8, and a custom digest must be non-empty: both are refused before anything is read. U+0000 is refused
   alike on every backend in a command ID, a digest, and a rejection's code, message, and details.
+  Numbers in a rejection's details are stored in the canonical text PostgreSQL's `jsonb` prints
+  (no exponent, no sign on zero), so they read back the same on every backend; one PostgreSQL's
+  numeric type cannot hold is refused as an invalid argument.
   `Store.ResolveCommand` runs the same read for a caller that lost the result entirely.
 - **Multi-stream commands** use `Store.ExecuteTransaction`, which runs your decision step
   (`snapshots.Prepare`) under fence-aware retry (below), or `Store.BeginCommand`, which reads the
@@ -321,8 +324,8 @@ default:
       })
   ```
 - Bounds checked before any write: a command ID is at most 512 UTF-8 bytes
-  (`*evt.CommandIDTooLongError`), and the response and the encoded rejection are each at most
-  64 KiB (`*evt.OutcomeTooLargeError`). The outcome row counts in the commit budget.
+  (`*evt.CommandIDTooLongError`), and the response and the encoded rejection (its numbers in
+  canonical text) are each at most 64 KiB (`*evt.OutcomeTooLargeError`). The outcome row counts in the commit budget.
 - A repository opts in by implementing `evt.OutcomeRepository`; the in-memory, DynamoDB, and
   PostgreSQL repositories do (PostgreSQL keeps the rows in `{events}__evt_command_outcomes`, created
   by `EnsureSchema`). On an upgraded log, command IDs recorded before outcomes were enabled keep

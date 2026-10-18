@@ -152,8 +152,11 @@ impl PartialEq<&str> for RejectionCode {
 /// The standard, persisted domain rejection. Its JSON encoding is the stored form: keys in the
 /// order `code`, `message`, `details`, with `details` `null` when absent.
 ///
-/// `details` is a JSON object of application details or `None`. Numbers inside it are not
-/// normalized across languages, so keep them integral for a replay that is byte-identical in Go.
+/// `details` is a JSON object of application details or `None`. Its numbers are stored in their
+/// canonical text ([`canonical_numbers`](crate::canonical_numbers)), the same on every backend.
+/// Floats still format differently in Go and Rust before that (`100.0` here, `100` in Go), so keep
+/// them integral for a rejection that is byte-identical across languages. A float whose canonical
+/// text is an integer (`1.5e16` is `15000000000000000`) reads back as an integer `Number`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejection {
     /// The machine-readable reason.
@@ -223,7 +226,10 @@ impl Rejection {
         .with_details(serde_json::json!({ "attempts": attempts }))
     }
 
-    /// Encodes the rejection as its stored JSON, byte for byte as Go's `json.Marshal` writes it.
+    /// Encodes the rejection as its stored JSON, byte for byte as Go's `EncodeRejection` writes
+    /// it: numbers in `details` take their canonical text. A number past PostgreSQL's numeric
+    /// limits is [`Error::InvalidArgument`], and an encoding over [`MAX_OUTCOME_BYTES`]
+    /// [`Error::OutcomeTooLarge`].
     pub fn encode(&self) -> Result<String, Error> {
         if let Some(details) = &self.details
             && !details.is_object()
@@ -243,11 +249,13 @@ impl Rejection {
             ));
         }
 
-        Ok(json::to_string(self)?)
+        let encoded = json::to_string(self)?;
+
+        Ok(crate::numbers::canonical_numbers(&encoded)?.into_owned())
     }
 
-    /// The rejection as it reads back from storage (encoded and decoded). A first execution
-    /// returns this form so it equals a replay on every backend.
+    /// The rejection as it reads back from storage (encoded and decoded, its numbers canonical).
+    /// A first execution returns this form so it equals a replay on every backend.
     pub fn canonical(&self) -> Result<Self, Error> {
         Self::decode(&self.encode()?)
     }
@@ -1010,14 +1018,10 @@ pub fn check_outcome(outcome: &Outcome) -> Result<(), Error> {
         });
     }
 
+    // Encoding checks the rejection: U+0000, numbers PostgreSQL can store, then the bound on the
+    // canonical form (`OutcomeTooLarge`).
     if let Some(rejection) = &outcome.rejection {
-        let size = rejection.encode()?.len();
-        if size > MAX_OUTCOME_BYTES {
-            return Err(Error::OutcomeTooLarge {
-                what: "rejection",
-                size,
-            });
-        }
+        rejection.encode()?;
     }
 
     Ok(())
@@ -1603,6 +1607,21 @@ mod tests {
             nested.encode().unwrap(),
             r#"{"code":"c","message":"m","details":{"a":2,"b":1}}"#
         );
+    }
+
+    #[test]
+    fn a_nul_is_reported_before_the_size_bound_as_in_go() {
+        let oversized = Rejection::new("c", format!("a\0{}", "x".repeat(MAX_OUTCOME_BYTES)));
+        assert!(matches!(oversized.encode(), Err(Error::InvalidArgument(_))));
+
+        let fine = Rejection::new("c", "x".repeat(MAX_OUTCOME_BYTES));
+        assert!(matches!(
+            fine.encode(),
+            Err(Error::OutcomeTooLarge {
+                what: "rejection",
+                ..
+            })
+        ));
     }
 
     #[test]

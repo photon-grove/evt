@@ -187,13 +187,23 @@ func (e *RejectionError) Unwrap() error { return e.Err }
 // Is makes errors.Is(err, ErrRejected) match.
 func (e *RejectionError) Is(target error) bool { return target == ErrRejected }
 
-// EncodeRejection returns the stored JSON form of a rejection.
+// EncodeRejection returns the stored JSON form of a rejection. Numbers in Details are written in
+// their canonical text (no exponent, no sign on zero: the text PostgreSQL's jsonb prints), so every
+// backend stores, and reads back, the same bytes. A number past PostgreSQL's numeric limits is an
+// *InvalidArgumentError, and an encoding over MaxOutcomeBytes an *OutcomeTooLargeError.
 func EncodeRejection(rejection Rejection) ([]byte, error) {
-	return json.Marshal(rejection)
+	encoded, err := json.Marshal(rejection)
+	if err != nil {
+		return nil, err
+	}
+
+	return canonicalNumbers(encoded)
 }
 
 // DecodeRejection parses the stored JSON form of a rejection. Numbers inside details keep their
-// stored text, so a replayed rejection re-encodes verbatim.
+// stored text, so a replayed rejection re-encodes verbatim once that text is canonical (every row
+// written since canonical numbers; an older row may still hold an exponent or a negative zero,
+// which re-encodes in canonical form).
 func DecodeRejection(data []byte) (Rejection, error) {
 	var rejection Rejection
 
@@ -214,15 +224,54 @@ func DecodeRejection(data []byte) (Rejection, error) {
 }
 
 // CanonicalRejection returns the rejection as it reads back from storage: encoded and decoded, so
-// the numbers in Details are json.Number, nested values are fresh copies, and a nil or empty
-// Details stays as it round-trips. A first execution returns this form so it equals a replay.
+// the numbers in Details are json.Number in their canonical text, nested values are fresh copies,
+// and a nil or empty Details stays as it round-trips. A first execution returns this form so it
+// equals a replay on every backend. The rejection is checked first, with the errors and in the
+// order CheckOutcome reports them, so a rejection that cannot be stored is refused here rather
+// than rewritten.
 func CanonicalRejection(rejection Rejection) (Rejection, error) {
-	encoded, err := EncodeRejection(rejection)
+	encoded, err := checkedRejection(rejection)
 	if err != nil {
-		return Rejection{}, fmt.Errorf("encode rejection: %w", err)
+		return Rejection{}, err
 	}
 
 	return DecodeRejection(encoded)
+}
+
+// checkedRejection returns a rejection's stored encoding after the checks the spec pins, in order:
+// valid UTF-8 code and message, no U+0000 anywhere, then numbers PostgreSQL can store, then the
+// bound on the canonical form.
+func checkedRejection(rejection Rejection) ([]byte, error) {
+	encoded, err := json.Marshal(rejection)
+	if err != nil {
+		return nil, fmt.Errorf("encode rejection: %w", err)
+	}
+
+	// The code and message are stored as plain text as well as inside the JSON, where invalid
+	// bytes would silently become U+FFFD: require valid UTF-8 so both copies agree.
+	if err = checkText("rejection.code", string(rejection.Code)); err != nil {
+		return nil, err
+	}
+
+	if err = checkText("rejection.message", rejection.Message); err != nil {
+		return nil, err
+	}
+
+	// U+0000 cannot be stored by PostgreSQL (text, jsonb), so a rejection that carries it in its
+	// code, message, or details (whatever Go types the details hold) is refused on every backend
+	// alike, before any write. The encoding is checked, so the test is exact.
+	hasNUL, err := jsonHasNUL(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("encode rejection: %w", err)
+	}
+
+	if hasNUL {
+		return nil, &InvalidArgumentError{Argument: "rejection", Message: "a rejection must not contain U+0000 in its code, message, or details"}
+	}
+
+	// The bound applies to the stored form, whose numbers are canonical; canonicalNumbers enforces
+	// it, and refuses a number PostgreSQL cannot store.
+	return canonicalNumbers(encoded)
 }
 
 // Outcome is the durable record of one command: the row written once, in its final state, on the
@@ -320,7 +369,12 @@ func CheckCommandID(id CommandID) error {
 func jsonHasNUL(encoded []byte) (bool, error) {
 	var decoded any
 
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
+	// Numbers stay json.Number: one past float64's range is still a valid document here, refused
+	// later as unstorable rather than as a decode failure.
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+
+	if err := decoder.Decode(&decoded); err != nil {
 		return false, err
 	}
 
@@ -560,32 +614,8 @@ func CheckOutcome(outcome *Outcome) error {
 	}
 
 	if outcome.Rejection != nil {
-		encoded, err := EncodeRejection(*outcome.Rejection)
-		if err != nil {
-			return fmt.Errorf("encode rejection: %w", err)
-		}
-
-		// The code and message are stored as plain text as well as inside the JSON, where invalid
-		// bytes would silently become U+FFFD: require valid UTF-8 so both copies agree.
-		if err := checkText("rejection.code", string(outcome.Rejection.Code)); err != nil {
+		if _, err := checkedRejection(*outcome.Rejection); err != nil {
 			return err
-		}
-
-		if err := checkText("rejection.message", outcome.Rejection.Message); err != nil {
-			return err
-		}
-
-		// U+0000 cannot be stored by PostgreSQL (text, jsonb), so a rejection that carries it in its
-		// code, message, or details (whatever Go types the details hold) is refused on every
-		// backend alike, before any write. The encoding is checked, so the test is exact.
-		if hasNUL, err := jsonHasNUL(encoded); err != nil {
-			return fmt.Errorf("encode rejection: %w", err)
-		} else if hasNUL {
-			return &InvalidArgumentError{Argument: "rejection", Message: "a rejection must not contain U+0000 in its code, message, or details"}
-		}
-
-		if len(encoded) > MaxOutcomeBytes {
-			return &OutcomeTooLargeError{What: "rejection", Size: len(encoded)}
 		}
 	}
 
