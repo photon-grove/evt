@@ -8,6 +8,11 @@ C12 in [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md) and
 [Stream Heads](../spec/storage-format.md#stream-heads-proposed-adr-0007) section of the storage
 spec, which is marked proposed and leaves every existing paragraph untouched.
 
+**Decided:** the migration from v0.8 storage is a stop-the-world procedure (stop writers, backfill,
+verify, declare the marker feature, start the new writers). The project is greenfield, so there is
+no dual-layout transition release. The defaults below stand: fences stay refused for retained types,
+PostgreSQL gets a heads table, and `stream-heads` is a required marker feature.
+
 It amends the commit layout of [ADR 0004](0004-core-reshape-multi-stream-transactions-and-outcomes.md)
 (C1, C2) and adds one feature to the C9 marker. It does not change events, snapshots, outcomes,
 metadata, or views. v0.9 (C1–C9) is unreleased, so the wire format can still change before release.
@@ -401,6 +406,15 @@ commit once C10 lands. It couples two protocols (one already implemented), and i
 cancellation reason ambiguous between "revalidate" and "`RebuildInProgress`" without returned values.
 Worth a follow-up; out of scope.
 
+**(h) A dual-layout transition release (rejected).** v0.9 writers would keep the old continuation,
+floor, slot, and companion checks until the `stream-heads` declaration flipped them to head
+conditions, so v0.8 and v0.9 writers could coexist during a rolling deployment. It would keep both
+layouts' code, the pinned-snapshot machinery, and the snapshot companion alive in two languages and
+three backends for a release, double the conformance matrix for it, and still leave the flip racing
+any v0.8 writer that does not read the marker. All of that buys the avoidance of a short quiet
+window. The project is greenfield, so the quiet window is acceptable and the dual layout is not
+worth building.
+
 Recommendation: (a), with (b) as the fallback and (g) as a follow-up.
 
 ## Migration and compatibility
@@ -414,29 +428,37 @@ nothing of the marker.
 without updating the head item. After that, the head item is stale (H2, H4 broken) and a v0.9 head
 writer conflicts on the stream until it is repaired, and a fence on it passes although the stream
 moved. The first is a liveness problem, the second a correctness one, and the marker cannot stop a
-writer that does not read it. So v0.8 writers must be stopped before heads are declared. v0.9 itself
-already asks for a quiet window (the reserved-namespace renames), so this adds a step to it rather
-than a new kind of upgrade.
+writer that does not read it. So v0.8 writers must be stopped before heads are declared.
 
-**The protocol:**
+**Decision: the migration is stop-the-world.** There is no transition release in which old and new
+writers coexist. The procedure is: stop writers, backfill, verify, declare the marker feature, start
+the new writers. The project is greenfield, a quiet window is acceptable, and the alternative (a
+dual layout, rejected below) costs more than the window does.
 
-1. Deploy no v0.9 head writers yet, and stop every v0.8 writer.
+**The procedure:**
+
+1. **Stop writers.** Stop every v0.8 writer, and do not start any head-aware writer yet. A
+   head-aware writer started early refuses to commit (`StreamHeadsNotMigrated`, below).
 2. Run `evt-doctor migrate-heads` (Go only, per ADR 0006). On DynamoDB it is an explicit scan
    (allowed: it is a migration), projecting `pk, sk, eventSeq, ttl`. Per non-reserved partition it
    computes the derived head (H4) and the `ttl` of the highest item, then writes the head item with
    `SET head = :h` conditioned on `attribute_not_exists(head)`. It never lowers an existing head: a
    head above the derived value is reported (events were deleted), a head below is repaired upward
    in `--repair` mode. It is idempotent and resumable, and `--dry-run` reports without writing.
-3. `evt-doctor migrate-heads --verify` rescans and checks that every non-reserved partition's
-   `head` equals its derived head.
-4. The tool declares `stream-heads: 1` in the marker, through the ordinary declaration transaction
-   (the `version` bump re-fails every cached writer).
-5. Start v0.9 writers.
+   This is the **backfill**.
+3. **Verify.** `evt-doctor migrate-heads --verify` rescans and checks that every non-reserved
+   partition's `head` equals its derived head, and exits non-zero otherwise.
+4. **Declare.** The tool declares `stream-heads: 1` in the marker, through the ordinary declaration
+   transaction (the `version` bump re-fails every cached writer). `migrate-heads` runs the
+   declaration only after a clean verification pass in the same invocation.
+5. **Start the new writers.**
 
 On PostgreSQL, `EnsureSchema` creates the empty heads table, and the migration is one transaction
 under the exclusive feature advisory lock: `INSERT INTO … SELECT` the per-stream maximum of
 `sequence` and `event_sequence` from both tables, then the declaration. The lock blocks v0.9 commits
-for its duration; v0.8 writers must still be stopped.
+for its duration; v0.8 writers must still be stopped, as in step 1. The same four steps apply:
+backfill, verify (a count of streams missing a row or with a lower head must be zero), and
+declare happen in that one transaction, and writers start afterwards.
 
 **A required feature.** The marker today only stops a writer that does not know a declared feature.
 This adds the other direction: a head-aware writer requires `stream-heads: 1` and otherwise refuses
@@ -455,12 +477,6 @@ heads once it is stopped.
 
 **Rollback.** Stop the head writers, run v0.8 writers (they ignore head items), and to return, run
 `migrate-heads --repair` before restarting head writers. The declaration is not removed.
-
-**Rolling upgrade (not chosen).** A dual layout would let v0.9 writers keep the old checks until
-the flip, so v0.8 writers could coexist during a deployment. It keeps both layouts' code, the
-pinned-snapshot machinery, and the companion in two languages and three backends for a release, in
-exchange for avoiding a short quiet window that v0.9 already needs. If a consumer cannot stop its v0.8
-writers, this is the path; see the open questions.
 
 **Compatibility fixtures that change.** Fixtures are generated by Go
 (`go test ./internal/compat -run TestFixtures -update`), never hand-edited, and Rust must reproduce
@@ -505,16 +521,18 @@ them:
 
 ## Risks and open questions
 
-1. **Non-rolling upgrade from v0.8.** Is there a deployment that cannot stop its v0.8 writers for the
-   migration window? If so, the dual layout is needed. This is the main question for approval.
-2. **Condition-check billing.** The WCU numbers assume a `ConditionCheck` bills by the size of the
-   item it reads. The implementation must confirm it on real DynamoDB before the numbers are quoted
-   anywhere else. The action-count result stands either way.
-3. **Retention.** Do we accept `ttl` on the head item for retained types and keep fences refused, or
-   should this ADR carry an incarnation token to lift the refusal now?
-4. **PostgreSQL.** Include the heads table now (parity, cheaper `entity_heads`) or leave PostgreSQL
-   on derived heads, which is conformant? The recommendation is to include it so the spec has one
-   definition of head, but it can be split into a follow-up without affecting DynamoDB.
+1. **Non-rolling upgrade from v0.8: resolved.** Stop-the-world is accepted (see Migration and
+   compatibility); no dual-layout release. The remaining risk is operational: a v0.8 writer left
+   running after the declaration leaves stale heads, and `migrate-heads --repair` fixes them.
+2. **Condition-check billing: unconfirmed.** The WCU numbers assume a `ConditionCheck` bills by the
+   size of the item it reads. They stay marked as unconfirmed until measured on real DynamoDB with
+   `ReturnConsumedCapacity`; that measurement is on the
+   [#159](https://github.com/photon-grove/evt/issues/159) checklist. The action-count result stands
+   either way.
+3. **Retention: decided.** The head item carries `ttl` for retained types and fences stay refused
+   (`RetentionConflict`). Lifting the refusal would need an incarnation token and is out of scope.
+4. **PostgreSQL: decided.** PostgreSQL gets the heads table, so the spec has one definition of head.
+   It can still land as a separate change from the DynamoDB one.
 5. **Drift is loud but not self-healing.** A writer that appends without maintaining the head fails
    closed (conflicts, `evt-doctor` flags it), except for fences, which can pass. That is why the
    v0.8 writers must be stopped.

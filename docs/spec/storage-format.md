@@ -1960,21 +1960,28 @@ existing rule.
 
 ### Migration
 
-For a table written by v0.8 (streams with no head items), the migration is, with every v0.8 writer
-stopped:
+Migrating a table written by v0.8 (streams with no head items) is **stop-the-world**: there is no
+release in which old and new writers coexist. The procedure, in order:
 
-1. `evt-doctor migrate-heads` scans the table (an explicit migration scan, projecting `pk`, `sk`,
-   `eventSeq`, `ttl`). For each non-reserved partition it computes the derived head and the `ttl` of
-   its highest item and writes the head item with `attribute_not_exists(head)`. It is idempotent and
-   resumable, supports `--dry-run`, and never lowers a head.
-2. `evt-doctor migrate-heads --verify` rescans and checks `head` equals the derived head for every
-   non-reserved partition.
-3. The tool declares `stream-heads: 1` in the marker by the ordinary declaration transaction.
+1. **Stop writers.** Stop every v0.8 writer, and start no head-aware writer. A head-aware writer
+   started before the declaration refuses to commit with `StreamHeadsNotMigrated`.
+2. **Backfill.** `evt-doctor migrate-heads` scans the table (an explicit migration scan, projecting
+   `pk`, `sk`, `eventSeq`, `ttl`). For each non-reserved partition it computes the derived head and
+   the `ttl` of its highest item and writes the head item with `attribute_not_exists(head)`. It is
+   idempotent and resumable, supports `--dry-run`, and never lowers a head.
+3. **Verify.** `evt-doctor migrate-heads --verify` rescans and checks `head` equals the derived head
+   for every non-reserved partition, and exits non-zero otherwise.
+4. **Declare.** After a clean verification in the same invocation, the tool declares
+   `stream-heads: 1` in the marker by the ordinary declaration transaction.
+5. **Start the new writers.**
 
-A v0.8 writer that runs afterwards leaves the head item stale. v0.9 writers then conflict on that
-stream, and a fence on it can pass although the stream moved, so v0.8 writers are not supported
-once heads are declared. `--repair` fixes the heads. Reading a migrated table with v0.8 code is
-unaffected. See the ADR for rollback.
+On PostgreSQL the same four steps run as one transaction under the exclusive feature advisory lock
+(see [PostgreSQL](#postgresql-proposed)). Writers are stopped before it and started after it.
+
+A v0.8 writer that runs after the declaration leaves the head item stale. Head-aware writers then
+conflict on that stream, and a fence on it can pass although the stream moved, so v0.8 writers are
+not supported once heads are declared. `--repair` fixes the heads. Reading a migrated table with v0.8
+code is unaffected. See the ADR for rollback.
 
 ### PostgreSQL (proposed)
 
@@ -2010,8 +2017,9 @@ The two fence assertions of [PostgreSQL](#postgresql), the continuity query, and
 away. The snapshot upsert keeps its monotonic `event_sequence` guard and its sequence-predecessor
 check. Entity heads read this table. `EnsureSchema` creates it empty. The migration is one
 transaction under the exclusive feature advisory lock: the per-stream maximum of `sequence` and
-`event_sequence` over both tables, inserted `ON CONFLICT DO NOTHING`, then the `stream-heads`
-declaration. PostgreSQL's reads are transactionally consistent, so none of the consistency rules
+`event_sequence` over both tables, inserted `ON CONFLICT DO NOTHING`; a verification query that
+finds no stream missing a row or holding a lower head (otherwise the transaction aborts); then the
+`stream-heads` declaration. PostgreSQL's reads are transactionally consistent, so none of the consistency rules
 above apply there.
 
 ### Compatibility fixtures
