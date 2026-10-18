@@ -10,7 +10,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! photon-evt = { version = "0.1", features = ["testing"] }
+//! photon-evt = { version = "0.2", features = ["testing"] }
 //! ```
 //!
 //! ```
