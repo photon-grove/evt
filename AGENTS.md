@@ -11,9 +11,8 @@
 
 ## Agent Memory
 
-- Maintainer agent sessions use a cross-session memory MCP server (`agent-memory`) configured in the
-  harness's user-level settings. Its endpoint and token never belong in this repo; without the
-  server, skip this section.
+- Maintainer agent sessions may have a cross-session memory MCP server. Its connection details
+  never belong in this repo; without such a server, skip this section.
 - This repo's memory group is `photon-grove/evt`; every call names it.
 - **Recall first:** at the start of substantive work, `search_memory {query, group:
   "photon-grove/evt"}` for the topic (and `get_memory` for a known id).
