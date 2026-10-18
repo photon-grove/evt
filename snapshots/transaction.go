@@ -232,15 +232,30 @@ func (store *Store) BeginCommand(
 // RetryPolicy and record a stale-fence rejection when attempts run out. A lost race on the outcome
 // row and an ambiguous commit result are resolved by re-reading the row.
 func (tx *Transaction) Complete(ctx context.Context, response []byte) (*evt.CommandOutcome, error) {
-	return tx.finish(ctx, evt.OutcomeAccepted, response, nil)
+	return tx.finish(ctx, evt.OutcomeAccepted, response, nil, false)
 }
 
 // Reject records the command as rejected, with the given domain rejection, in an outcome-only
-// commit. No staged events are written. The fences of the transaction's reads are still checked, so
-// a rejection is only recorded if the state it was decided on still holds. Use evt.RejectionOf to
-// map a handler error to a rejection and return any other error to the caller instead.
+// commit. No staged events are written (RejectWithEvents commits them). The fences of the
+// transaction's reads are still checked, so a rejection is only recorded if the state it was
+// decided on still holds. Use evt.RejectionOf to map a handler error to a rejection and return any
+// other error to the caller instead.
 func (tx *Transaction) Reject(ctx context.Context, rejection evt.Rejection) (*evt.CommandOutcome, error) {
-	return tx.finish(ctx, evt.OutcomeRejected, nil, &rejection)
+	return tx.finish(ctx, evt.OutcomeRejected, nil, &rejection, false)
+}
+
+// RejectWithEvents records the command as rejected and commits the events staged with Append in
+// the same atomic commit as the rejected outcome row: the aggregate leaves the state the command
+// refused, and the history shows why, or nothing is written. The commit is a normal one: the same
+// continuity, fence, snapshot, projector, and budget rules as Complete, with the outcome row
+// listing the events it wrote. A transaction that appended nothing behaves like Reject.
+//
+// A conflict is returned for the caller to retry with a fresh BeginCommand, or re-prepared by
+// Store.ExecuteTransaction. A failed caller-stamped fence records the stale-fence rejection
+// without these events, as Complete does. A replay returns the stored rejection and never applies
+// the events again.
+func (tx *Transaction) RejectWithEvents(ctx context.Context, rejection evt.Rejection) (*evt.CommandOutcome, error) {
+	return tx.finish(ctx, evt.OutcomeRejected, nil, &rejection, true)
 }
 
 func (tx *Transaction) finish(
@@ -248,6 +263,7 @@ func (tx *Transaction) finish(
 	status evt.OutcomeStatus,
 	response []byte,
 	rejection *evt.Rejection,
+	withEvents bool,
 ) (*evt.CommandOutcome, error) {
 	if tx.used {
 		return nil, fmt.Errorf("snapshots: transaction is already consumed")
@@ -278,8 +294,9 @@ func (tx *Transaction) finish(
 		err    error
 	)
 
-	if status == evt.OutcomeRejected {
-		// Rejections write no events, but keep checking the fences of everything the decision read.
+	if status == evt.OutcomeRejected && !withEvents {
+		// A plain rejection writes no events, but keeps checking the fences of everything the
+		// decision read.
 		result = tx.fencedReads()
 	} else if result, err = tx.prepare(ctx, metadata); err != nil {
 		return nil, err

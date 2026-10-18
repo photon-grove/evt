@@ -135,6 +135,11 @@ pub enum AccountCommand {
     Withdraw {
         amount_cents: i64,
     },
+    /// Like `Withdraw`, but a refusal for insufficient funds is recorded in the account's history
+    /// as a tag, in the same commit as the rejection.
+    WithdrawAudited {
+        amount_cents: i64,
+    },
     Tag {
         tags: Vec<String>,
     },
@@ -162,6 +167,7 @@ impl AccountCommand {
             Self::Deposit { .. } => "deposit",
             Self::BatchDeposit { .. } => "batchDeposit",
             Self::Withdraw { .. } => "withdraw",
+            Self::WithdrawAudited { .. } => "withdrawAudited",
             Self::Tag { .. } => "tag",
             Self::SetLabels { .. } => "setLabels",
             Self::Rename { .. } => "rename",
@@ -178,6 +184,7 @@ impl AccountCommand {
             Self::Deposit { .. }
                 | Self::BatchDeposit { .. }
                 | Self::Withdraw { .. }
+                | Self::WithdrawAudited { .. }
                 | Self::Balance
         )
     }
@@ -209,6 +216,8 @@ pub fn balance_response(account: &Account) -> Vec<u8> {
 pub struct Rejected {
     pub reason: &'static str,
     pub details: Option<Value>,
+    /// The refusal is recorded in the account's history beside the rejection.
+    pub audited: bool,
 }
 
 impl Rejected {
@@ -216,6 +225,7 @@ impl Rejected {
         Self {
             reason,
             details: None,
+            audited: false,
         }
     }
 }
@@ -310,6 +320,23 @@ impl Aggregate for Account {
                             "balanceCents": self.balance_cents,
                             "requestedCents": amount_cents,
                         })),
+                        audited: false,
+                    });
+                }
+                Ok(vec![MoneyWithdrawn { amount_cents }.into()])
+            }
+            C::WithdrawAudited { amount_cents } => {
+                if amount_cents <= 0 {
+                    return Err(Rejected::new("amount must be positive"));
+                }
+                if amount_cents > self.balance_cents {
+                    return Err(Rejected {
+                        reason: "insufficient funds",
+                        details: Some(serde_json::json!({
+                            "balanceCents": self.balance_cents,
+                            "requestedCents": amount_cents,
+                        })),
+                        audited: true,
                     });
                 }
                 Ok(vec![MoneyWithdrawn { amount_cents }.into()])
@@ -360,6 +387,19 @@ impl Aggregate for Account {
             AccountEvent::Renamed(e) => self.owner = e.owner,
             AccountEvent::Closed(_) => self.status = "closed".to_owned(),
         }
+    }
+
+    fn rejection_events(&self, error: &Rejected) -> Vec<AccountEvent> {
+        if !error.audited {
+            return Vec::new();
+        }
+
+        vec![
+            AccountTagged {
+                tags: vec!["overdraft-attempted".to_owned()],
+            }
+            .into(),
+        ]
     }
 
     fn upcasters() -> &'static [&'static dyn Upcaster] {

@@ -14,7 +14,9 @@ import (
 // with Fence. It returns the response to store with the accepted outcome, or an error:
 //
 //   - an error that maps to a rejection (evt.RejectionOf) records a rejected outcome, fenced on
-//     everything it read, so the command is only rejected on state that still holds;
+//     everything it read, so the command is only rejected on state that still holds. The events
+//     staged with Append are discarded, unless the error is marked with evt.RejectWithEvents: then
+//     they are committed in the same atomic commit (Transaction.RejectWithEvents);
 //   - any other error is an internal failure, returned with no outcome written.
 //
 // Returning nil with nothing appended records an accepted no-op.
@@ -89,7 +91,12 @@ func (store *Store) ExecuteTransaction(
 // prepareFailed records or returns the error a Prepare function returned.
 func prepareFailed(ctx context.Context, tx *Transaction, err error) (executed, error) {
 	if rejection, ok := evt.RejectionOf(err); ok {
-		outcome, rerr := tx.Reject(ctx, rejection)
+		reject := tx.Reject
+		if evt.RejectsWithEvents(err) {
+			reject = tx.RejectWithEvents
+		}
+
+		outcome, rerr := reject(ctx, rejection)
 
 		return executed{outcome: outcome, handlerErr: err}, rerr
 	}

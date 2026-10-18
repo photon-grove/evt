@@ -233,7 +233,7 @@ entry points compiling. Go adds `Store.ExecuteWithOutcome` (returning `*CommandO
 `Store.BeginCommand` then `Transaction.Complete`/`Reject`. Rust adds
 `Store::execute_with_outcome`/`execute_with_response` and `Transaction::begin_command`
 → `commit_with_outcome`/`reject`, returning `CommandOutcome<E>` rather than a bare enum. An
-outcome-only commit (a persisted rejection or an accepted no-op) is the feature-marker check plus,
+outcome-only commit (a persisted rejection that carries no events, or an accepted no-op) is the feature-marker check plus,
 for a transaction, the fence checks of its reads, then the outcome put; the stale-fence
 rejection omits the failed fences. A failed outcome put outranks every other failed item except the
 feature-marker check. Ambiguous-write recovery polls the row for a bounded window and treats a

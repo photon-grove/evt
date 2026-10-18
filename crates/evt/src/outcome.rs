@@ -333,8 +333,11 @@ pub struct Outcome {
     pub digest: String,
     /// The stored response bytes, `None` when the command returned none.
     pub response: Option<Vec<u8>>,
-    /// The events the commit wrote, ordered by stream ID bytewise, then sequence. Empty for a
-    /// rejection and for an accepted no-op.
+    /// The events the commit wrote, ordered by stream ID bytewise, then sequence. Empty for an
+    /// accepted no-op and for a rejection that carries no events; a rejection recorded with
+    /// [`Aggregate::rejection_events`](crate::Aggregate::rejection_events) or
+    /// [`Decision::reject_with_events`](crate::Decision::reject_with_events) lists the events it
+    /// committed.
     pub event_ids: Vec<EventId>,
     /// The rejection, set exactly when the status is [`Rejected`](OutcomeStatus::Rejected).
     pub rejection: Option<Rejection>,
@@ -342,8 +345,8 @@ pub struct Outcome {
 
 impl Outcome {
     /// Checks an outcome decoded from storage: a digest, a rejection with a code exactly when the
-    /// status is rejected, no event IDs on a rejection, and well-formed event IDs
-    /// (`{entityId}:{sequence}` with a positive, canonical sequence). A malformed row is
+    /// status is rejected, and well-formed event IDs (`{entityId}:{sequence}` with a positive,
+    /// canonical sequence; a rejection may list the events it committed). A malformed row is
     /// [`Error::InvalidRecord`], never replayed as a result. Every backend runs it on the rows it
     /// reads, with the same rules as Go's `ValidateStoredOutcome`.
     pub fn validate_stored(&self) -> Result<(), Error> {
@@ -363,11 +366,7 @@ impl Outcome {
                 return corrupt("an accepted outcome carries a rejection".into());
             }
             OutcomeStatus::Rejected => match &self.rejection {
-                Some(rejection) if !rejection.code.as_str().is_empty() => {
-                    if !self.event_ids.is_empty() {
-                        return corrupt("a rejected outcome lists events".into());
-                    }
-                }
+                Some(rejection) if !rejection.code.as_str().is_empty() => {}
                 _ => return corrupt("a rejected outcome has no rejection code".into()),
             },
             OutcomeStatus::Accepted => {}
@@ -1423,7 +1422,10 @@ mod tests {
 
         let mut rejected = Outcome::rejected("cmd", "digest", Rejection::new("c", "m"));
         assert!(rejected.validate_stored().is_ok());
+        // A rejection may list the events it committed, held to the same event ID rules.
         rejected.event_ids = vec!["a:1".into()];
+        assert!(rejected.validate_stored().is_ok());
+        rejected.event_ids = vec!["a:0".into()];
         assert!(rejected.validate_stored().is_err());
 
         let mut coded = Outcome::accepted("cmd", "digest");

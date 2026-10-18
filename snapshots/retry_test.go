@@ -443,6 +443,10 @@ func (*tallyAdd) Type() evt.CommandType      { return "retry-tally:add" }
 func (*tallyAdd) EntityType() evt.EntityType { return tallyType }
 
 func (t *tally) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
+	if refuse, isRefuse := command.(*tallyRefuse); isRefuse {
+		return t.handleRefuse(refuse)
+	}
+
 	add, ok := command.(*tallyAdd)
 	if !ok {
 		return evt.CommandResult{}, evt.NewBadCommandError(command)
@@ -451,6 +455,20 @@ func (t *tally) Handle(_ context.Context, command evt.Command) (evt.CommandResul
 	add.Attempts++
 
 	return evt.CommandResult{Events: []evt.Event{&tallied{N: add.N}}}, nil
+}
+
+func (t *tally) handleRefuse(refuse *tallyRefuse) (evt.CommandResult, error) {
+	refuse.Attempts++
+
+	return evt.CommandResult{Events: []evt.Event{&tallied{N: refuse.N}}}, evt.RejectWithEvents(&refused{})
+}
+
+// refused is a domain error that maps onto the "refused" rejection.
+type refused struct{}
+
+func (*refused) Error() string { return "refused" }
+func (*refused) Rejection() evt.Rejection {
+	return evt.Rejection{Code: "refused", Message: "refused"}
 }
 
 func TestRetry_ARetriedCommandNeverAppliesItsEventsTwice(t *testing.T) {
@@ -669,4 +687,70 @@ func TestRetry_AReservedStreamIsStillRefusedWithoutAnIdentityCheck(t *testing.T)
 		require.NoError(t, err)
 		require.Empty(t, events)
 	}
+}
+
+// tallyRefuse records its event beside a domain rejection (evt.RejectWithEvents).
+type tallyRefuse struct {
+	N        int `json:"n"`
+	Attempts int `json:"attempts"`
+}
+
+func (*tallyRefuse) Type() evt.CommandType      { return "retry-tally:refuse" }
+func (*tallyRefuse) EntityType() evt.EntityType { return tallyType }
+
+func TestRetry_ARejectionWithEventsIsPreparedAgainAndCommitsOnce(t *testing.T) {
+	ctx := context.Background()
+	store, repo := retryStore(t, conflicts(2), snapshots.ImmediateRetryPolicy(3))
+	entity := newTally("t-1")
+	command := &tallyRefuse{N: 5}
+
+	outcome, err := store.ExecuteWithOutcome(ctx, entity, "t-1", command, commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, outcome.Rejected())
+	require.Equal(t, evt.RejectionCode("refused"), outcome.Rejection.Code)
+	require.Equal(t, 3, command.Attempts, "each conflict re-prepared the command")
+	require.EqualValues(t, 3, repo.commits.Load())
+	require.Equal(t, []evt.EventID{"t-1:1"}, outcome.EventIDs)
+
+	// The events of the failed attempts were reset, not accumulated.
+	require.Equal(t, 5, entity.Total)
+	require.Equal(t, map[string]int{"tallied": 1}, entity.Counts)
+
+	events, err := repo.GetEvents(ctx, "t-1")
+	require.NoError(t, err)
+	require.Len(t, events, 1, "only the attempt that committed wrote anything")
+
+	// A replay returns the stored rejection and neither runs the handler nor writes again.
+	again := &tallyRefuse{N: 5}
+
+	replayed, err := store.ExecuteWithOutcome(ctx, newTally("t-1"), "t-1", again, commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, replayed.Replayed)
+	require.Equal(t, outcome.Outcome, replayed.Outcome)
+	require.Zero(t, again.Attempts, "the handler did not run")
+
+	events, err = repo.GetEvents(ctx, "t-1")
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+}
+
+func TestRetry_ExhaustedAttemptsRecordTheStaleFenceWithoutTheRejectionsEvents(t *testing.T) {
+	ctx := context.Background()
+	store, repo := retryStore(t, conflicts(10), snapshots.ImmediateRetryPolicy(3))
+	entity := newTally("t-1")
+	command := &tallyRefuse{N: 5}
+
+	outcome, err := store.ExecuteWithOutcome(ctx, entity, "t-1", command, commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, outcome.Rejected())
+	require.Equal(t, evt.RejectionStaleFence, outcome.Rejection.Code)
+	require.Empty(t, outcome.EventIDs)
+	require.Empty(t, outcome.Events)
+	require.Equal(t, 3, command.Attempts)
+
+	events, err := repo.GetEvents(ctx, "t-1")
+	require.NoError(t, err)
+	require.Empty(t, events, "the caller's events are not written with the exhaustion rejection")
+	require.Zero(t, entity.Total, "the caller's entity reflects durable state")
+	require.Empty(t, entity.Counts)
 }

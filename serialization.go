@@ -37,7 +37,7 @@ func (e *SerializedEvent) UnmarshalJSON(data []byte) error {
 //
 // Outcome, when set (ADR 0004, C3), is the command outcome row written once, in its final state,
 // inside the same transaction. A commit may carry an Outcome and no Events: an accepted no-op or a
-// persisted rejection is an outcome-only commit. Only a Repository that implements
+// persisted rejection that carries no events is an outcome-only commit. Only a Repository that implements
 // OutcomeRepository honors it; Outcome.EventIDs is derived from Events by NormalizeCommit.
 type SerializedResult struct {
 	Events      []SerializedEvent    `json:"events"`

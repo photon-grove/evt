@@ -296,6 +296,31 @@ func TestOutcomes_ANoOpCarryingProjectorOperationsIsRefusedNotRecordedAsAccepted
 	require.Nil(t, stored, "nothing is written, and no false accepted outcome is recorded")
 }
 
+// rejectsWithOperations rejects with events marked but decides none, carrying a projector
+// operation: with no event behind it the operation can never be rebuilt, so it is refused, not
+// dropped into a recorded rejection.
+type rejectsWithOperations struct{ MockEntity }
+
+func (rejectsWithOperations) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
+	return evt.CommandResult{Transaction: evt.Transaction{opGroup{}}}, evt.RejectWithEvents(evt.NewNotFoundError("gone"))
+}
+
+func TestOutcomes_AMarkedRejectionWithoutEventsStillRefusesProjectorOperations(t *testing.T) {
+	store, repo := newOutcomeStore(t)
+	entity := &rejectsWithOperations{}
+	entity.ID = "e-1"
+
+	_, err := store.ExecuteWithOutcome(context.Background(), entity, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
+
+	var projectorOnly *evt.ProjectorOnlyCommitError
+	require.ErrorAs(t, err, &projectorOnly)
+	require.Equal(t, 1, projectorOnly.Operations)
+
+	stored, err := repo.GetOutcome(context.Background(), "cmd-1")
+	require.NoError(t, err)
+	require.Nil(t, stored, "no rejection is recorded around operations that were dropped")
+}
+
 func TestOutcomes_ABadCustomDigestIsAProgrammerErrorBeforeAnyReadOrHandler(t *testing.T) {
 	ctx := context.Background()
 

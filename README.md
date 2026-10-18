@@ -233,6 +233,27 @@ default:
   rejected outcome. Any other error — a bad event, an encoding or storage failure — is an internal
   failure: returned, nothing recorded, so a retry after the fix starts clean. The error-returning
   `Execute` reports a rejection as `*evt.RejectionError` (`errors.Is(err, evt.ErrRejected)`).
+- **Rejections that carry events.** Some refusals still have to be recorded. A proposal whose apply
+  finds its base revision stale should answer the client with a rejection *and* leave an
+  `apply-failed` event on the proposal, so the aggregate is no longer "applicable" and the history
+  shows the attempt. Return the events beside the error and mark it with `evt.RejectWithEvents`:
+  they commit in the same atomic commit as the rejected row, which lists them.
+
+  ```go
+  func (p *Proposal) Handle(ctx context.Context, command evt.Command) (evt.CommandResult, error) {
+      // ... the base revision is stale:
+      return evt.CommandResult{Events: []evt.Event{ApplyFailed{Base: apply.Base}}},
+          evt.RejectWithEvents(&BaseStale{Base: apply.Base}) // a Rejectioner
+  }
+  ```
+
+  In a `Prepare` function, stage the events with `tx.Append` and return the marked error (or finish
+  a transaction by hand with `Transaction.RejectWithEvents`); a plain rejection still discards what
+  was staged. Everything an accepted commit enforces applies: continuity and fences, reserved
+  streams, projectors, snapshots, and the commit budget. A replay returns the stored rejection
+  without running the handler or writing the events again. A conflict re-prepares the command, and
+  it may then decide differently and record no failure at all; if the attempts run out, the
+  `stale-fence` rejection is recorded without your events. A rejection stores no response.
 - **Accepted no-op.** A command that produces no events (or returns `NoOpError`) is recorded as
   accepted with no events — a durable, observable outcome rather than an error.
 - **Ambiguous writes.** If a commit's result is unknown (a timeout, a lost connection) the store

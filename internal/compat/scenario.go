@@ -505,7 +505,10 @@ func classifyCommand(outcome *evt.CommandOutcome, err error) (Outcome, error) {
 
 		return Outcome{}, err
 	case outcome.Rejected():
-		return Outcome{Result: ResultRejected, Code: string(outcome.Rejection.Code), Replayed: outcome.Replayed}, nil
+		return Outcome{
+			Result: ResultRejected, Code: string(outcome.Rejection.Code), Replayed: outcome.Replayed,
+			Events: len(outcome.EventIDs),
+		}, nil
 	}
 
 	return Outcome{Result: ResultOK, Events: len(outcome.EventIDs), Replayed: outcome.Replayed}, nil

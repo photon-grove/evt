@@ -94,6 +94,27 @@ pub trait Aggregate: Default + Serialize + DeserializeOwned + Send + Sync + 'sta
     /// Folds one event into state.
     fn apply(&mut self, event: Self::Event);
 
+    /// Events to commit with a rejection, in the same atomic commit as the rejected outcome row
+    /// (see [`Store::execute_with_outcome`](crate::Store::execute_with_outcome)).
+    ///
+    /// It runs on a store with outcomes enabled when [`handle`](Aggregate::handle) returned an
+    /// `error` that maps to a rejection ([`ToRejection`](crate::ToRejection)), with the state the
+    /// command was decided on. The default is no events: a plain rejection, which writes none. A
+    /// domain that must record what happened beside the refusal, such as a proposal whose apply
+    /// fails recording an `apply-failed` event, returns it here, decided from the state and the
+    /// error (carry what the event needs in the error).
+    ///
+    /// The events are committed on this aggregate's stream under the rules of an accepted commit:
+    /// they are applied to the state, snapshotted, and projected, and the outcome row lists them.
+    /// A conflict re-prepares the whole command, so this runs again on the fresh state; when
+    /// retries run out the engine records the stale-fence rejection without them. A replay returns
+    /// the stored rejection and never commits them again. It must not change state or fail.
+    fn rejection_events(&self, error: &Self::Error) -> Vec<Self::Event> {
+        let _ = error;
+
+        Vec::new()
+    }
+
     /// Upcasters for stored events of this aggregate, run in order before decoding.
     fn upcasters() -> &'static [&'static dyn Upcaster] {
         &[]

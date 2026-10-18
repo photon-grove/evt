@@ -4192,6 +4192,522 @@
       ]
     },
     {
+      "name": "outcomes-rejection-events",
+      "entityId": "compat-fixture-outcomes-rejection-events",
+      "sequence": 5,
+      "snapshotSequence": 1,
+      "state": "{\"owner\":\"Ada Lovelace\",\"status\":\"open\",\"balanceCents\":60,\"deposits\":1,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":[\"overdraft-attempted\",\"overdraft-attempted\"],\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-outcomes-rejection-events:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c1\"}}",
+        "{\"id\":\"compat-fixture-outcomes-rejection-events:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c2\"}}",
+        "{\"id\":\"compat-fixture-outcomes-rejection-events:3\",\"sequence\":3,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm92ZXJkcmFmdC1hdHRlbXB0ZWQiXX0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c3\"}}",
+        "{\"id\":\"compat-fixture-outcomes-rejection-events:4\",\"sequence\":4,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm92ZXJkcmFmdC1hdHRlbXB0ZWQiXX0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c4\"}}",
+        "{\"id\":\"compat-fixture-outcomes-rejection-events:5\",\"sequence\":5,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDB9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c5\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-outcomes-rejection-events\",\"sequence\":1,\"eventSequence\":3,\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjEwMCwiZGVwb3NpdHMiOjEsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIiwidGFncyI6WyJvdmVyZHJhZnQtYXR0ZW1wdGVkIl0sImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOm51bGx9\"}",
+      "dynamoItems": [
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "3"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"status\":\"open\",\"balanceCents\":100,\"deposits\":1,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":[\"overdraft-attempted\"],\"labels\":null,\"lastMemo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection-events"
+          },
+          "seq": {
+            "N": "1"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-rejection-events-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Ada Lovelace\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection-events"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-rejection-events-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection-events"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-rejection-events-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c3\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"overdraft-attempted\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection-events"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-rejection-events-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c4\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"overdraft-attempted\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection-events"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-outcomes-rejection-events-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c5\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":40}"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection-events"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:withdrawn"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection-events:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection-events:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIn0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection-events:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection-events:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection-events:3\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection-events:3\",\"sequence\":3,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm92ZXJkcmFmdC1hdHRlbXB0ZWQiXX0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection-events:4\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection-events:4\",\"sequence\":4,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm92ZXJkcmFmdC1hdHRlbXB0ZWQiXX0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c4\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection-events:5\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection-events:5\",\"sequence\":5,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDB9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c5\"}}}"
+      ],
+      "transactions": [
+        {
+          "step": 0,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 1,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-events-c1",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 1,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 1,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 2,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "2"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-events-c2",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 2,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 2,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 3,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 0,
+                "condition": "attribute_not_exists(seq)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-events-c3",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 4,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 4,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 0,
+                "condition": "eventSeq = :prev",
+                "values": {
+                  ":prev": {
+                    "N": "3"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-events-c4",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 7,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 4,
+                "condition": "attribute_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 5,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": 0,
+                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+                "values": {
+                  ":first": {
+                    "N": "5"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-events-c5",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 8,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-outcomes-rejection-events-c6",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        }
+      ],
+      "outcomes": [
+        {
+          "commandId": "compat-fixture-outcomes-rejection-events-c1",
+          "dynamoItem": {
+            "digest": {
+              "S": "b5095d222b0f40fe6ce783a4f516888772d1cb6e078a313e6f914e220dcea2df"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-rejection-events:1\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-events-c1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-events-c2",
+          "dynamoItem": {
+            "digest": {
+              "S": "fc6717cd76ffbd92d1f9d2ef4da89283d71c78d91353ca5d8604a372e68b7af9"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-rejection-events:2\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-events-c2"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjEwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-events-c3",
+          "dynamoItem": {
+            "code": {
+              "S": "insufficient-funds"
+            },
+            "digest": {
+              "S": "7e6751554410403f57aa12870589691c84490455e2ec38112338d8b11ca17da3"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-rejection-events:3\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-events-c3"
+            },
+            "rejection": {
+              "S": "{\"code\":\"insufficient-funds\",\"message\":\"insufficient funds\",\"details\":{\"balanceCents\":100,\"requestedCents\":500}}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-events-c4",
+          "dynamoItem": {
+            "code": {
+              "S": "insufficient-funds"
+            },
+            "digest": {
+              "S": "ce68e5df11e0463f995b2439fcef9fc7f5322b955d626e1ee891d1cd44f7e364"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-rejection-events:4\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-events-c4"
+            },
+            "rejection": {
+              "S": "{\"code\":\"insufficient-funds\",\"message\":\"insufficient funds\",\"details\":{\"balanceCents\":100,\"requestedCents\":700}}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-events-c5",
+          "dynamoItem": {
+            "digest": {
+              "S": "7366b1a2a1106ba515a056e82242f8cd0b560b4247fd31cd1ac4378f3dc3bdf6"
+            },
+            "events": {
+              "S": "[\"compat-fixture-outcomes-rejection-events:5\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-events-c5"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjYwfQ=="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-outcomes-rejection-events-c6",
+          "dynamoItem": {
+            "code": {
+              "S": "insufficient-funds"
+            },
+            "digest": {
+              "S": "965d9b2e095e283ce7328377bae62ed95303ea8d54138b8ac5a1e7397bcd792b"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-outcomes-rejection-events-c6"
+            },
+            "rejection": {
+              "S": "{\"code\":\"insufficient-funds\",\"message\":\"insufficient funds\",\"details\":{\"balanceCents\":60,\"requestedCents\":1000}}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "outcomes-ambiguous",
       "entityId": "compat-fixture-outcomes-ambiguous",
       "sequence": 4,

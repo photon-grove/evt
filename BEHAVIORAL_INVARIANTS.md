@@ -335,7 +335,7 @@ error before any write and is never split.
 - A concurrent same-ID, same-digest loser returns only the winner's stored outcome, never its own
   handler error or local decision
 - Outcome rows read from storage are validated (known status, digest, rejection/code consistency,
-  no events on a rejection, well-formed event IDs); a malformed row is a typed corruption error and
+  well-formed event IDs, on a rejection too); a malformed row is a typed corruption error and
   is never replayed. A custom digest must be non-empty, checked before anything is read or run
 - After an indeterminate commit failure (timeout, lost connection, server fault) the engine
   re-reads the row: present with the same digest returns the stored outcome, a different digest is
@@ -365,6 +365,22 @@ error before any write and is never split.
   written. Outcome-only commits carry the feature-marker check and, for a
   multi-stream transaction, the fence checks of its reads; the single-aggregate shortcut has no
   fences to check
+- A rejection may carry domain events that commit atomically with it. Go marks the handler or
+  `Prepare` error with `evt.RejectWithEvents` (events from the returned `CommandResult`, or the ones
+  staged with `Transaction.Append`; `Transaction.RejectWithEvents` for a transaction finished by
+  hand); Rust implements `Aggregate::rejection_events` (single aggregate) or returns
+  `Decision::reject_with_events` / `Transaction::reject_with_events`. The unmarked forms
+  (`Reject`, `Decision::reject`) keep discarding staged events, and a rejection without events is
+  byte-for-byte the plain rejection
+- The events and the rejected row are one atomic commit under the rules of an accepted commit:
+  continuity, floor and snapshot checks, read fences, reserved streams refused, projector
+  operations only with an event behind them, the budget counting the outcome item. The rejected
+  row lists the event IDs it wrote (same order as an accepted row), a conflict writes neither, and
+  no response is stored with a rejection
+- A replay of a rejection with events returns the stored rejection and event IDs, runs nothing,
+  and never commits the events again. A conflict re-prepares the command (it may now decide
+  differently, and then writes no failure event); exhausted attempts persist the `stale-fence`
+  rejection without the caller's events, and so does a failed caller-stamped fence
 - A failed caller-stamped fence is persisted as a `stale-fence` rejection by an outcome-only
   transaction that omits the failed fences (the old ID stays terminal; the remedy is a new command
   ID). A single engine-filled fence conflict or event, floor, or snapshot conflict is never a

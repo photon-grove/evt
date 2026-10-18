@@ -248,10 +248,6 @@ func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
 			return result, err
 		}
 
-		if result.Outcome.Rejected() && len(result.Events) > 0 {
-			return result, &InvalidArgumentError{Argument: "outcome", Message: "a rejected outcome cannot be committed with events"}
-		}
-
 		// Everything else this commit persists as text is held to the same rule as the metadata
 		// and the outcome: valid UTF-8 and no U+0000 (PostgreSQL cannot store it), so the commit
 		// has the same result on every backend and fails before any write.

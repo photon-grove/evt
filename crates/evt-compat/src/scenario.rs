@@ -274,6 +274,7 @@ impl Outcome {
         match &outcome.rejection {
             Some(rejection) => Self {
                 code: rejection.code.to_string(),
+                events: outcome.event_ids.len(),
                 replayed: command.replayed,
                 ..Self::of("rejected")
             },

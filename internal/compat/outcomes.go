@@ -206,6 +206,16 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 		{"rejected stale fence, retries exhausted", evt.Outcome{
 			CommandID: "cmd-0009", Status: evt.OutcomeRejected, Digest: renameDigest, Rejection: &exhausted,
 		}},
+		// A rejection recorded with its failure events (RejectWithEvents): the same row as an
+		// accepted outcome's, with the rejection and code attributes beside the events.
+		{"rejected with events", evt.Outcome{
+			CommandID: "cmd-0010", Status: evt.OutcomeRejected,
+			Digest: "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+			Rejection: &evt.Rejection{
+				Code: "apply-conflict", Message: "the proposal was decided on a stale base", Details: map[string]any{"base": 3},
+			},
+			EventIDs: []evt.EventID{"proposal#p-1:4", "proposal#p-1:5"},
+		}},
 		{"rejected with escaped and nested details", evt.Outcome{
 			CommandID: "cmd-0007", Status: evt.OutcomeRejected, Digest: "d",
 			Rejection: &evt.Rejection{
@@ -267,7 +277,9 @@ func malformedRows() []MalformedRow {
 			"status": text("rejected"), "events": nil, "code": text(""),
 			"rejection": text(`{"code":"","message":"m","details":null}`),
 		})},
-		{"rejected with events", accepted(map[string]any{"status": text("rejected"), "rejection": rejection, "code": text("c")})},
+		{"rejected with a malformed event ID", accepted(map[string]any{
+			"status": text("rejected"), "events": text(`["a:0"]`), "rejection": rejection, "code": text("c"),
+		})},
 		{"rejected whose code attribute disagrees", accepted(map[string]any{
 			"status": text("rejected"), "events": nil, "rejection": rejection, "code": text("other"),
 		})},
