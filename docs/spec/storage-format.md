@@ -1773,9 +1773,10 @@ continuation, floor, slot, and snapshot-companion items.
 - The row carries only `pk`, `sk`, `head`, and `ttl`. An `Update` is billed on the larger of the item
   before and after, so the item stays well under 1 KB; no other attribute is added to it.
 - `ttl` is written only for an entity type with positive retention, and is **at least the `ttl` of
-  every other item of the stream**: a commit sets it to the `ttl` of its event items, and an
-  out-of-band snapshot write refreshes it in the same transaction. It is not written for any other
-  type, so the head item of a stream without retention is never deleted.
+  every other item of the stream and never lowered**: a commit raises it and an out-of-band snapshot
+  write refreshes it in the same transaction, both by the [never-lower
+  rule](#retention-proposed). It is not written for any other type, so the head item of a stream
+  without retention is never deleted.
 - `head` is not a DynamoDB reserved word; `ttl` is, and an expression reaches it through `#ttl`
   (`ExpressionAttributeNames: {"#ttl": "ttl"}`).
 - The head item is concurrency-control metadata for the log, not a view. It is written only in the
@@ -1819,8 +1820,8 @@ unchanged except that step 5 emits one check per fenced stream.
 ```
 
 A commit that appends events 8 and 9 to `acct-1` at head 7. For a type with retention the update
-is `SET head = :last, #ttl = :ttl`. When the stream's first sequence is 1 the condition is
-`attribute_not_exists(head)` and `:prev` is omitted.
+and its condition follow the [never-lower rule](#retention-proposed). When the stream's first
+sequence is 1 the condition is `attribute_not_exists(head)` and `:prev` is omitted.
 
 | Write                                     | Condition                                                        |
 | ----------------------------------------- | ---------------------------------------------------------------- |
@@ -1940,7 +1941,11 @@ transient, fence-aware retry returns it at once, it writes no outcome row, and i
 as a `stale-fence` rejection. It is raised when:
 
 - the stream's head update passed and an event put failed (the cancellation reasons show the head
-  update as passing): an event exists above the head;
+  update as passing): an event exists above the head. For an entity type with retention this goes
+  through the retention-aware probe first, because TTL can delete the head before an expired event:
+  the engine reads the stream's remaining items (the snapshot and a `sk > 0` query projecting `sk`
+  and `ttl`), and if every one has a `ttl` in the past the failure is a transient conflict that
+  heals when TTL deletes them; otherwise it is drift. A type without retention is drift at once;
 - the probe finds drift;
 - an out-of-band snapshot write finds the snapshot ahead of the head, or no head item.
 
@@ -1950,14 +1955,36 @@ bump the snapshot sequence without moving the head.
 ### Retention (proposed)
 
 Fences stay refused (`RetentionConflict`) for entity types with retention. The head item of such a
-type carries a `ttl` at least that of every other item of the stream (a commit sets it to its events'
-`ttl`; an out-of-band snapshot write refreshes it in the same transaction, because `PutSnapshot`
-stamps its snapshot's `ttl` at call time and would otherwise outlive the head item; the backfill uses
-the maximum `ttl` across the partition). A retained stream disappears whole once every item has
+type carries a `ttl` at least that of every other item of the stream, and the engine never lowers it
+(a commit raises it; an out-of-band snapshot write refreshes it in the same transaction, because
+`PutSnapshot` stamps its snapshot's `ttl` at call time and would otherwise outlive the head item;
+the backfill uses the maximum `ttl` across the partition). A retained stream disappears whole once every item has
 expired and its entity ID is then reusable, but TTL deletion is lazy and unordered, so a partly
 deleted stream is possible and transient. A head item without a `ttl` would make a fully expired
 stream unrecreatable, and a head item with a `ttl` is not an incarnation-proof fence (TTL deletion
 is lazy), which is why the refusal stands. See the ADR.
+
+**The never-lower rule.** Two writers can configure different retention durations (the manifest
+records only entity-type names) and a clock can step back, so stamping the commit's own `ttl` on
+the head could shorten it. DynamoDB has no `max()` in an update expression, so the head `ttl` is
+raised by value and guarded by a condition; no single durable retention duration is required. On
+append, a retained stream's head update is:
+
+```text
+UpdateExpression:    SET head = :last, #ttl = :t
+ConditionExpression: head = :prev AND (attribute_not_exists(#ttl) OR #ttl <= :t)
+ExpressionAttributeNames: {"#ttl": "ttl"}
+```
+
+`:t` is the larger of the commit's own `ttl` and the largest `ttl` among the items the writer loaded
+for the stream (the snapshot and the events after it). On create the update is
+`SET head = :last, #ttl = :t` under `attribute_not_exists(head)`, with `:t` the commit's `ttl`. The
+event items keep the commit's own `ttl`; only the head takes the maximum. If an unseen writer (an
+out-of-band snapshot) raised the stored `ttl` above `:t`, the condition fails as an ordinary
+conflict, and the retry reloads, sees the larger `ttl`, and passes. An out-of-band snapshot write
+uses the same `ttl` condition with `:t` its snapshot's `ttl`; when only that condition fails, it
+reads the head item once and retries as a `ConditionCheck` on `head >= :new`, which needs no
+refresh.
 
 ### Snapshot writes outside a commit (proposed)
 
@@ -1966,11 +1993,16 @@ eventSeq <= :new` on the snapshot put and adds the head item to its transaction,
 
 1. the feature-marker check;
 2. the head item: for a type without retention a `ConditionCheck` with `head >= :new`; for a type
-   with retention an `Update` with `ConditionExpression: head >= :new` and `SET #ttl = :ttl`;
+   with retention an `Update` with `head >= :new` and the [never-lower](#retention-proposed) `ttl`
+   refresh;
 3. the snapshot put.
 
-`:new` is the snapshot's `eventSeq`. A failed head condition is `StreamHeadDrift` (the snapshot is
-ahead of the stream, or the stream has no head item). A failed snapshot condition keeps its current
+`:new` is the snapshot's `eventSeq`. When `:new` is 0 (a snapshot of an empty stream, including a
+snapshot-only partition the migration left without a head item) the head item may be absent: the
+check is `attribute_not_exists(head) OR head >= :new`, and it is a `ConditionCheck` even for a
+retained type, because an `Update` would create a head item with no `head` attribute. Otherwise a
+failed head condition is `StreamHeadDrift` (the snapshot is ahead of the stream, or the stream has
+no head item). A failed snapshot condition keeps its current
 meaning, a no-op because a newer snapshot already covers the write. PostgreSQL checks
 `head >= :new` under the entity lock in the same transaction.
 
@@ -2048,8 +2080,10 @@ release in which old and new writers coexist, and it is one-way. The procedure, 
 
 1. **Stop writers and take a backup.** Stop every v0.8 writer and start no head-aware writer.
    Enforce it: an IAM deny on `PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`, and
-   `TransactWriteItems` for every principal except the migration role, or zero write capacity, held
-   until step 6. Take an on-demand backup or confirm point-in-time recovery.
+   `TransactWriteItems` for every principal except the migration role (an identity policy on each
+   writer principal, a table resource policy, or a service control policy), held until step 6.
+   DynamoDB cannot stop writes by capacity (provisioned mode has a positive minimum, on-demand has
+   no writable-capacity setting). Take an on-demand backup or confirm point-in-time recovery.
 2. **Upgrade readers.** Deploy the scanner and consumer changes above (scan and rebuild jobs,
    `evt-doctor`, every Streams, ESM, or Pipes consumer with the filter), before any head item
    exists. The backfill emits `sk = -1` stream records.
@@ -2066,8 +2100,8 @@ release in which old and new writers coexist, and it is one-way. The procedure, 
    above), and exits non-zero otherwise.
 5. **Declare.** After a clean verification in the same invocation, repeated immediately before the
    declaration, and with `--confirm-writers-stopped`, the tool declares `stream-heads: 1` by the
-   ordinary declaration transaction, then verifies once more and reports drift. The step-1 deny or
-   zero capacity is the evidence that writers stayed stopped; the tool cannot prove it.
+   ordinary declaration transaction, then verifies once more and reports drift. The step-1 deny is
+   the evidence that writers stayed stopped; the tool cannot prove it.
 6. **Start the new writers,** then lift the step-1 deny.
 
 On PostgreSQL steps 3 to 5 are one transaction (see [PostgreSQL](#postgresql-proposed)). Writers are
@@ -2117,12 +2151,14 @@ first failure; the ranking (drift, gap, then conflicts); then the event inserts,
 and the outcome insert. A snapshot write outside a commit checks `head >= :new` in its transaction.
 
 The two fence assertions of [PostgreSQL](#postgresql), the continuity query, and the floor check go
-away. The snapshot upsert keeps its monotonic `event_sequence` guard and its sequence-predecessor
-check. Entity heads read this table. `EnsureSchema` creates it empty. Steps 3 to 5 of the migration
+away. The snapshot upsert is unchanged. `entity_heads` reads the marker first: once `stream-heads`
+is declared it reads this table, and until then it keeps the aggregate over events and snapshots,
+because `EnsureSchema` creates the table empty on a populated v0.8 database and a head-aware
+process would otherwise report no entities (Go and Rust alike). Steps 3 to 5 of the migration
 are one transaction under the exclusive feature advisory lock: the per-stream maximum of `sequence`
 and `event_sequence` over both tables (skipping a maximum of 0), inserted `ON CONFLICT DO NOTHING`;
-a verification query that finds no stream missing a row or holding a lower head (otherwise the
-transaction aborts); then the `stream-heads` declaration. PostgreSQL's reads are transactionally
+a verification query that finds no stream whose row is missing or unequal to the derived head,
+lower or higher (otherwise the transaction aborts, and `--repair` is the remedy); then the `stream-heads` declaration. PostgreSQL's reads are transactionally
 consistent, so none of the DynamoDB consistency rules apply there, and it has no TTL, Streams, or
 scan jobs to upgrade.
 
