@@ -1017,14 +1017,10 @@ pub fn check_outcome(outcome: &Outcome) -> Result<(), Error> {
         });
     }
 
+    // Encoding checks the rejection: U+0000, numbers PostgreSQL can store, then the bound on the
+    // canonical form (`OutcomeTooLarge`).
     if let Some(rejection) = &outcome.rejection {
-        let size = rejection.encode()?.len();
-        if size > MAX_OUTCOME_BYTES {
-            return Err(Error::OutcomeTooLarge {
-                what: "rejection",
-                size,
-            });
-        }
+        rejection.encode()?;
     }
 
     Ok(())
@@ -1610,6 +1606,21 @@ mod tests {
             nested.encode().unwrap(),
             r#"{"code":"c","message":"m","details":{"a":2,"b":1}}"#
         );
+    }
+
+    #[test]
+    fn a_nul_is_reported_before_the_size_bound_as_in_go() {
+        let oversized = Rejection::new("c", format!("a\0{}", "x".repeat(MAX_OUTCOME_BYTES)));
+        assert!(matches!(oversized.encode(), Err(Error::InvalidArgument(_))));
+
+        let fine = Rejection::new("c", "x".repeat(MAX_OUTCOME_BYTES));
+        assert!(matches!(
+            fine.encode(),
+            Err(Error::OutcomeTooLarge {
+                what: "rejection",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -27,10 +27,14 @@ type jsonNumber struct {
 	// maxNumberExponent.
 	exponent int64
 
-	// digits are the integer and fraction digits, in order, without the decimal point.
-	digits []byte
+	// integer and fraction are the digits on each side of the written decimal point. They alias
+	// the encoded document, which outlives the number.
+	integer, fraction []byte
 
-	// point is the decimal point's position in digits once the exponent is applied. It may lie
+	// first is the index of the first non-zero digit, or the digit count for zero.
+	first int64
+
+	// point is the decimal point's position in the digits once the exponent is applied. It may lie
 	// before the first digit (negative) or past the last.
 	point int64
 
@@ -178,9 +182,18 @@ func parseJSONNumber(text []byte) jsonNumber {
 	exponent := parseExponent(exponentText)
 
 	number.exponent = exponent
-	number.digits = append(append([]byte{}, integer...), fraction...)
+	number.integer, number.fraction = integer, fraction
 	number.point = int64(len(integer)) + exponent
 	number.scale = max(0, int64(len(fraction))-exponent)
+	number.first = number.digitCount()
+
+	for index := range number.digitCount() {
+		if number.digit(index) != '0' {
+			number.first = index
+
+			break
+		}
+	}
 
 	return number
 }
@@ -207,18 +220,9 @@ func parseExponent(text []byte) int64 {
 	return exponent
 }
 
-// firstSignificant returns the index of the first non-zero digit, or len(digits) for zero.
-func (n *jsonNumber) firstSignificant() int64 {
-	for index, c := range n.digits {
-		if c != '0' {
-			return int64(index)
-		}
-	}
+func (n *jsonNumber) digitCount() int64 { return int64(len(n.integer) + len(n.fraction)) }
 
-	return int64(len(n.digits))
-}
-
-func (n *jsonNumber) zero() bool { return n.firstSignificant() == int64(len(n.digits)) }
+func (n *jsonNumber) zero() bool { return n.first == n.digitCount() }
 
 // integerDigits is the number of significant digits before the decimal point.
 func (n *jsonNumber) integerDigits() int64 {
@@ -226,7 +230,7 @@ func (n *jsonNumber) integerDigits() int64 {
 		return 0
 	}
 
-	return max(0, n.point-n.firstSignificant())
+	return max(0, n.point-n.first)
 }
 
 // check refuses a number past PostgreSQL's numeric limits.
@@ -278,8 +282,7 @@ func (n *jsonNumber) appendCanonical(out []byte) []byte {
 	if integerDigits := n.integerDigits(); integerDigits == 0 {
 		out = append(out, '0')
 	} else {
-		first := n.firstSignificant()
-		for index := first; index < n.point; index++ {
+		for index := n.first; index < n.point; index++ {
 			out = append(out, n.digit(index))
 		}
 	}
@@ -296,9 +299,14 @@ func (n *jsonNumber) appendCanonical(out []byte) []byte {
 
 // digit returns the digit at a position in the shifted number: zero outside the written digits.
 func (n *jsonNumber) digit(index int64) byte {
-	if index < 0 || index >= int64(len(n.digits)) {
+	switch {
+	case index < 0 || index >= n.digitCount():
 		return '0'
-	}
 
-	return n.digits[index]
+	case index < int64(len(n.integer)):
+		return n.integer[index]
+
+	default:
+		return n.fraction[index-int64(len(n.integer))]
+	}
 }
