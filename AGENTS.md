@@ -9,6 +9,21 @@
 - This is a public repository. Do not add private application names, environment details, account
   identifiers, credentials, internal incident details, or non-public infrastructure references.
 
+## Agent Memory
+
+- Maintainer agent sessions use a cross-session memory MCP server (`agent-memory`) configured in the
+  harness's user-level settings. Its endpoint and token never belong in this repo; without the
+  server, skip this section.
+- This repo's memory group is `photon-grove/evt`; every call names it.
+- **Recall first:** at the start of substantive work, `search_memory {query, group:
+  "photon-grove/evt"}` for the topic (and `get_memory` for a known id).
+- **Remember outcomes:** before ending substantive work, `remember` what a future session needs
+  (decisions with reasons, gotchas, follow-ups) as `{id: "<kebab-topic>", group:
+  "photon-grove/evt", corpus: "explicit", source: "<PR/issue/path>", text}`. Deterministic ids
+  overwrite instead of duplicating.
+- Session transcripts sync automatically through harness hooks, so keep `remember` for distilled
+  outcomes, not raw logs. Never store secrets.
+
 ## Repository Identity
 
 - This repo is `evt`, a Go event-sourcing framework published as `github.com/photon-grove/evt`.
