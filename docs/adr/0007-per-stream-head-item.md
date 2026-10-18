@@ -14,7 +14,7 @@ no dual-layout transition release. The defaults below stand: fences stay refused
 PostgreSQL gets a heads table, and `stream-heads` is a required marker feature.
 
 It amends the commit layout of [ADR 0004](0004-core-reshape-multi-stream-transactions-and-outcomes.md)
-(C1, C2) and adds one feature to the C9 marker. It does not change events, snapshots, outcomes,
+(C1, C2; ADR 0004 carries a note pointing here) and adds one feature to the C9 marker. It does not change events, snapshots, outcomes,
 metadata, or views. v0.9 (C1–C9) is unreleased, so the wire format can still change before release.
 
 ## Context
@@ -72,7 +72,8 @@ a commit conditions on for concurrency. Compaction, snapshots, and retention kee
 - `sk = -1` sits in the stream's own partition, below the snapshot at `0` and the events from `1`.
   Every events query already bounds `sk` from below at 0 or more (`sk > :after`, `sk > 0`,
   `sk BETWEEN :lo AND :hi` with `:lo ≥ 1`), so queries, `latest(n)`, and compaction never return or
-  delete it, and readers that predate the item are unaffected. This was checked against the Go and
+  delete it, and event and snapshot reads by code that predates the item are unaffected. Full-table
+  scans are not (see Readers). This was checked against the Go and
   Rust query sites. One needs a guard: Go's `GetLatestEvents` passes its `lastSequence` straight into
   `sk > :sk` (Rust clamps with `.max(0)`), so a negative argument would already return the snapshot
   and would now return the head item; the implementation clamps it at 0.
@@ -93,7 +94,9 @@ Four invariants make it sound:
   declared exception).
 - **H2, exact.** After a commit that writes a stream, `head` equals the stream's highest committed
   event sequence.
-- **H3, covered.** A snapshot's `eventSeq` never exceeds `head`.
+- **H3, covered.** A snapshot's `eventSeq` never exceeds `head`. Commits keep it by raising `head` to at
+  least every snapshot they write. Out-of-band snapshot writes enforce it with a condition on the head
+  item; see Snapshots and compaction.
 - **H4, derivable.** The head a loader derives (the larger of the highest event `sk` and the
   snapshot's `eventSeq`) equals `head`. Compaction deletes events at or below a snapshot's
   `eventSeq`, and `eventSeq ≤ head`, so compaction cannot change the derived head.
@@ -222,10 +225,25 @@ never targets a head item twice. A stream that is fenced and written contributes
 
 ### Snapshots and compaction
 
-- Snapshot puts keep `attribute_not_exists(seq)` and `seq = :seq` and lose `eventSeq < :first`.
-  Out-of-band `PutSnapshot` keeps `attribute_not_exists(eventSeq) OR eventSeq <= :new` and does not
-  touch the head. It does not need to: a snapshot is taken from a loaded state at or below the head
-  (H3), and a snapshot above the head is already a poisoned stream today.
+- Commit snapshot puts keep `attribute_not_exists(seq)` and `seq = :seq` and lose `eventSeq < :first`.
+- **Out-of-band snapshot writes enforce H3.** `PutSnapshot` (`dynamo/snapshot.go`) only checks that
+  `eventSeq` is monotone, which is not enough. With the stored head at 7, `PutSnapshot(eventSeq = 10)`
+  would let a writer that loaded earlier pass `head = 7` and write events 8 to 10 beneath a snapshot
+  that already covers them; loaders skip those events, and every later writer derives 10 and
+  conflicts with the stored head forever. The old floor check refused that stale writer. So
+  `PutSnapshot`, and any rebuild path that seeds a snapshot (`SeedEntity`), adds the head item to its
+  existing transaction, which becomes marker check, head item, snapshot put:
+  - for a type without retention, a `ConditionCheck` with `head >= :new` (`:new` is the snapshot's
+    `eventSeq`);
+  - for a type with retention, an `Update` of the same item with that condition and
+    `SET #ttl = :ttl` (a transaction cannot touch an item twice; see Retention).
+
+  A failed head condition means the snapshot is ahead of the stream, or the stream has no head item:
+  it is `StreamHeadDrift`. It is not the existing no-op for "a newer snapshot already covers this",
+  which keeps its meaning for a failed snapshot condition. PostgreSQL does the same under the entity
+  lock (`SELECT head` must be at least the new `event_sequence`). Rust's `put_snapshot` does the
+  same on all three backends.
+
 - `CompactBelow(through)` still requires `through ≤ snapshot.eventSeq`, still deletes `[1, through]`,
   and still never deletes the snapshot. It also never deletes or writes the head item, which is
   outside the range. Compaction can delete the head **event** without consequence: continuity no
@@ -257,14 +275,23 @@ expire, another writer can create the stream afresh and reach head 1, and `head 
 different incarnation. Closing that needs an incarnation token in the head item, which is a format
 addition for a feature nobody has asked for.
 
-**Decision:** for an entity type with retention, the head item carries `ttl` equal to the `ttl` of the
-commit that last wrote the stream (refreshed by every commit, so it expires with the stream's newest
-event and snapshot), and `RetentionConflict` stays. This keeps today's lifecycle: a retained stream
-that expires vanishes whole, and its ID is reusable. A head item that outlives its events by TTL
-deletion order (or the reverse) gives a conflict that heals when the other items are deleted, which
-is the same transient the partial-expiry gap already produces for loads. If retention-compatible
-fences are wanted later, the head item is the place to add an incarnation token without another
-migration.
+**Decision:** the head item of a type with retention carries a `ttl` that is **at least the `ttl` of
+every other item of the stream**, and `RetentionConflict` stays.
+
+- Every commit sets the head `ttl` to the `ttl` it stamps on its events.
+- Every out-of-band snapshot write refreshes it in the same transaction. `PutSnapshot` stamps its
+  snapshot's `ttl` at call time, so without the refresh the snapshot would outlive both the events
+  and the head item: a loader would derive the snapshot's `eventSeq` with no head item, and no
+  `head = :prev` could ever hold.
+- The backfill sets it to the maximum `ttl` across the partition, snapshot included.
+
+A retained stream disappears whole once every one of its items has expired, and its ID is then
+reusable. TTL deletion is lazy and unordered, so a partly deleted stream is possible and transient,
+and the failure-path probe classifies it: a head item absent while events or a snapshot remain is
+`StreamHeadDrift` **unless every remaining item's `ttl` has passed** (expired, awaiting deletion),
+which is a conflict that heals once they are deleted. For a retained type, a head above the derived
+head is the same expired-tail transient, not drift. If retention-compatible fences are wanted later,
+the head item is the place to add an incarnation token without another migration.
 
 ### Interaction with the other capabilities
 
@@ -276,7 +303,8 @@ migration.
 - **C5 fence-aware retry.** Provenance is in-memory commit metadata and does not change. A failed
   head **update** is an ordinary conflict, like a failed event put, and re-prepares whether or not
   the commit carries caller-stamped fences. Only a failed caller-stamped **fence check** fails fast
-  into a `stale-fence` rejection. With one fence item per stream there is one index to map. The
+  into a `stale-fence` rejection. `StreamHeadDrift` is never retried and never exhausted into a
+  rejection (see Failure classification). With one fence item per stream there is one index to map. The
   head update's condition is exactly an expected-version check, which is what
   [#154](https://github.com/photon-grove/evt/issues/154) wants for streams a command also writes;
   that design can build on it.
@@ -284,32 +312,67 @@ migration.
   Migration. The marker check itself is unchanged.
 - **C10 rebuild fence.** The lock check is still a mandatory control item; nothing about the head
   item changes it. Rebuild view writes touch no stream items. A rebuild reads events, never head
-  items. The rebuild path that seeds snapshots (`SeedEntity`) writes snapshots only, and does not
-  touch heads.
+  items. A rebuild path that seeds a snapshot goes through the `PutSnapshot` guard above, which reads
+  the head item; it never raises a head.
 - **Fences and the marker's `retention` set.** Unchanged, per Retention above.
 
 ### Failure classification
 
-The commit is classified by the failing item's cancellation-reason index, as now. The mapping
-changes in the stream items:
+The commit is classified by the failing items' cancellation-reason indexes. Where several items
+failed, the engine ranks them, and every backend reports the same one. The rank, highest first:
 
-| Failed item                                      | Classification                                                                                                    |
-| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| feature-marker check                             | re-validate and retry (unchanged)                                                                                 |
-| outcome put                                      | `OutcomeConflict`, outranks all but the marker (unchanged)                                                        |
-| a stream's head update                           | ordinary conflict; a **gap** (`SequenceGapError`) when the stored head is below `first - 1`, otherwise a conflict |
-| an event put or snapshot put                     | ordinary conflict (unchanged). If the same stream's head update passed, an event sits above the head: head drift  |
-| a fence's head check                             | fence conflict carrying the stream, head, and provenance (unchanged contract)                                     |
-| `TransactionConflict`, throttling, indeterminate | unchanged                                                                                                         |
+1. the feature-marker check (revalidate and retry, unchanged), then the rebuild-lock check
+   (`RebuildInProgress`, unchanged);
+2. the outcome put (`OutcomeConflict`, unchanged);
+3. **`StreamHeadDrift`**;
+4. **`SequenceGapError`**;
+5. any other conflict: a head update, an event put, a snapshot put, or a fence check (a fence
+   carries its provenance, unchanged), then projector conditions.
 
-The gap is not detected before the write any more. It is detected on the failure path: after a
-cancellation with a failed head update, the engine reads that stream's head item (`GetItem`, strongly
-consistent, 1 RCU) and returns `SequenceGapError` if the stored head is below `first - 1`, else a
-conflict. Where the SDK returns it, `ReturnValuesOnConditionCheckFailure = ALL_OLD` on the head update
-carries the same answer without a read. The observable result is the same typed error with nothing
-written, and the happy path loses its reads. Head drift (an event above the head, from a writer that
-does not maintain heads) is reported as a conflict and flagged by `evt-doctor`; the engine cannot
-repair it mid-commit.
+`TransactionConflict`, throttling, and indeterminate writes are unchanged. **A gap used to be
+refused before any write**, ahead of everything, by the pre-commit reads. It is now whichever
+transaction item fails, so it ranks below the outcome conflict: if the outcome row exists, the row is
+the answer, and the next attempt returns the stored outcome. PostgreSQL pins the same rank (see
+PostgreSQL).
+
+**The failure-path probe.** A failed head update, or a failed fence check, is classified by reading
+the stream, with no `ReturnValues` on the transaction: both implementations do exactly this, so the
+classification is identical.
+
+1. Derive the head `D1` with strongly consistent reads: the snapshot item's `eventSeq` and the
+   highest event `sk` (a `Query` of `sk > 0`, descending, limit 1).
+2. Read the head item (`GetItem`, strongly consistent) as `S`, absent as 0.
+3. `S < D1`: an event or snapshot sits above the head. That is drift (a healthy stream cannot show
+   it, because a commit writes the head and the events together and `D1` was read first).
+4. `S = D1`: no drift. For a failed head update, `S < first - 1` is a **gap** and anything else a
+   conflict. A failed fence is a fence conflict.
+5. `S > D1`: derive again as `D2`. `D2 < S` is drift (events are missing below the head). Otherwise a
+   commit landed between the reads, which is an ordinary conflict.
+
+The probe costs a few reads on the failure path only; the happy path has none.
+
+**`StreamHeadDrift`** (Go `*StreamHeadDriftError`, Rust `Error::StreamHeadDrift`) means H2, H3, or H4
+is broken for a stream: a writer appended without maintaining the head, events were deleted, or a
+snapshot is ahead of the head. It carries the stream ID, the stored head (or absent), and the
+derived head. It is **not retryable and never exhausted into a rejection**: fence-aware retry
+returns it at once, like any internal failure, writes no outcome row, and never records a
+`stale-fence` rejection for it. Without this, a head that sits below the derived head would fail
+`head = :prev` five times and persist a false `stale-fence` that replays forever. It is raised in
+three cases:
+
+- the **certain** case: the stream's head update passed and its event put failed, so an event exists
+  above the head (the cancellation reasons show the head update as passing);
+- the probe finds drift (steps 3 and 5 above);
+- an out-of-band snapshot write finds the snapshot ahead of the head.
+
+A failed **snapshot put** whose head update passed is not drift: an out-of-band snapshot can bump the
+snapshot sequence without moving the head, and that is an ordinary conflict.
+
+Repair is offline: `evt-doctor migrate-heads --repair` raises a head below the derived value and
+creates a missing one. A head **above** the derived value is lowered only by
+`--repair --allow-lower`, which must run with every writer stopped and writes
+`SET head = :derived` conditioned on `head = :observed`. Lowering breaks H1, which is why it needs
+writers stopped (an in-flight fence reads the head).
 
 ### The 4 MB byte budget
 
@@ -338,8 +401,17 @@ Under the per-entity advisory locks the commit already takes, in the same order:
 
 - create: `INSERT … ON CONFLICT (entity_id) DO NOTHING`, which must affect one row;
 - append: `UPDATE … SET head = $last WHERE entity_id = $1 AND head = $prev`, which must affect one row
-  (a guarded version: zero rows is a conflict, or a gap if a follow-up read finds `head < $prev`);
-- fence: `SELECT head … WHERE entity_id = $1`, absent as 0, which must equal `:head`.
+  (a guarded version);
+- fence: `SELECT head … WHERE entity_id = $1`, absent as 0, which must equal `:head`;
+- a failure is classified by the same probe as DynamoDB (derive, read the head, re-derive when the
+  head is ahead), run inside the transaction.
+
+To report the same failure as DynamoDB, PostgreSQL pins its statement order and ranks before it
+reports: locks; marker `SELECT`; rebuild assertion; a probe for an existing outcome row for the
+command (`OutcomeConflict` ranks above gap and drift, as on DynamoDB; the final `INSERT`'s `23505`
+still resolves a real race); every head statement and fence read, evaluated without stopping at the
+first failure; then the ranking (drift, then gap, then conflicts); then the event inserts, snapshot
+upserts, and outcome insert. A snapshot write also checks `head >=` its new `event_sequence`.
 
 The continuity query (`GREATEST(MAX(sequence), MAX(event_sequence))`), the floor query, and the two
 fence queries go away. The advisory locks stay: they serialize writers and make the absent-row fence
@@ -351,19 +423,56 @@ with the existing 34-byte base cap.
 PostgreSQL can remain conformant without this table (derived heads under the same locks are
 equivalent), so it is the least essential part of the ADR; see the open questions.
 
+### Every event-writing path
+
+Each path that adds, removes, or snapshots events either maintains the head or is fenced off:
+
+| Path                                                                                                    | Effect on the head                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Go `Commit`, `CommitWithSnapshot` (DynamoDB, PostgreSQL, in-memory); outcome-only and rejection commits | The head update is part of the commit. `CommitWithSnapshot` routes through `Commit`.                                                                                                                        |
+| Go PostgreSQL and in-memory `CommitStream`                                                              | Loops over `Commit`; nothing to change.                                                                                                                                                                     |
+| Go DynamoDB `CommitStream` (deprecated, K1)                                                             | Builds its own continuation and floor checks and writes events with no head update, so it would drift heads. It **refuses with a typed error once `stream-heads` is declared**, or is deleted first (#134). |
+| Rust `commit` and `commit_transaction` (DynamoDB, PostgreSQL, in-memory)                                | The head update is part of the commit.                                                                                                                                                                      |
+| `PutSnapshot`, `put_snapshot` (all backends), and a rebuild path that seeds a snapshot                  | Reads the head (`head >= :new`) and refreshes its `ttl` for retained types. Never raises it.                                                                                                                |
+| `CompactBelow`, `compact_below`                                                                         | Deletes events at or below a covering snapshot. Never touches the head.                                                                                                                                     |
+| `dynamo.Delete` (K7, `!prod`) and fixture or reset tooling                                              | Deletes events only. A deleted stream keeps its head, so the tool must delete the head item too.                                                                                                            |
+| `evt-doctor migrate-heads`                                                                              | The only tool that writes head items outside a commit.                                                                                                                                                      |
+
 ### Readers and other consumers
 
 - Event reads, `latest(n)`, snapshot reads, and compaction ranges are unchanged.
-- Enumeration and rebuild scans already filter by `entityType`; a head item has none, so it is never
-  enumerated. Heads scans (`pk, sk, eventSeq`) must skip `sk < 1` rows explicitly: Go's
-  `headSeqFromItem` currently routes every `sk ≤ 0` row to the snapshot branch, and Rust's
-  `item_head` returns any non-zero `sk` as the head, so `-1` would contribute `-1`. Both are
-  harmless today and must be made explicit.
+- **Full-table scans break on the head row, in v0.8 as well as v0.9.** Go's `decodeScanPage` skips
+  only `sk == 0` and then decodes the row's metadata, which is empty, so `json.Unmarshal` fails; the
+  v0.8.0 scanner is the same. Rust's `read_page` (`crates/evt/src/dynamodb/enumerate.rs`) hands any
+  non-snapshot item to `event_from_item`, which also fails. Both are reachable through
+  `StreamAllEvents(StreamFilter{})`, unfiltered `StreamEntities`, and a rebuild with no entity type
+  (C10 rebuilds). A scan with an `entityType` filter is unaffected, because a head item has no
+  `entityType`. So "readers that predate the item are unaffected" holds for queries only.
+- **Required scanner changes**, in both languages:
+  - `decodeScanPage` and `read_page` skip every row with `sk < 1`;
+  - `enumerateEntityIDs` projects `sk` as well as `pk` and skips head rows (`sk < 0`), because an
+    unfiltered scan would otherwise list an orphan head (a partition with no events or snapshot) as a
+    ghost entity ID; snapshot rows still enumerate their entity;
+  - heads scans (`pk, sk, eventSeq`) skip `sk < 0` explicitly: Go's `headSeqFromItem` routes every
+    `sk ≤ 0` row to the snapshot branch and Rust's `item_head` returns any non-zero `sk` as the
+    head, so `-1` would contribute `-1`.
+    These ship, and scan jobs are upgraded, **before** the backfill (see Migration).
 - Diagnostics that list a whole partition (Rust's `partition_items`) now return the head item.
-- DynamoDB Streams consumers see a record per written stream per commit for `sk = -1`. A consumer
-  that already filters on the presence of `type` (to skip the snapshot item at `sk = 0`) is
-  unaffected; the Lambda `NEW_IMAGE` decoder (X3) and the ESM or Pipes filter helpers must skip
-  `sk < 1`. Consumers that do not filter pay for the extra records.
+- **DynamoDB Streams consumers** see an `INSERT` or `MODIFY` record for `sk = -1` per written stream
+  per commit, and the backfill emits one per stream. A consumer must skip them. An ESM or Pipes
+  filter does it on the keys, which every view type carries, including `KEYS_ONLY`:
+
+  ```json
+  {
+    "dynamodb": { "Keys": { "sk": { "N": [{ "anything-but": ["-1", "0"] }] } } }
+  }
+  ```
+
+  The pattern also drops the snapshot at `sk = 0`, which consumers already skip. The Lambda
+  `NEW_IMAGE` decoder (X3) skips `sk < 1` itself. `KEYS_ONLY` wake-ups (the journal's) fire on every
+  head update unless filtered, so they need the filter; consumers that do not filter pay for the
+  extra records.
+
 - `dynamo.Delete` (cut, K7) and fixture cleanups must delete the head item too, or a deleted stream
   keeps its head and rejects its own recreation.
 
@@ -423,60 +532,80 @@ v0.9 is unreleased, so this is a change to the v0.9 format, not a v0.9-to-v0.10 
 a path is **v0.8 storage**: a table of streams with no head items, written by v0.8 writers that know
 nothing of the marker.
 
-**Reading is compatible both ways.** A v0.8 reader never sees a head item (all its queries bound
-`sk` at 0 or above) and its scans tolerate the row. **Writing is not.** A v0.8 writer appends events
-without updating the head item. After that, the head item is stale (H2, H4 broken) and a v0.9 head
-writer conflicts on the stream until it is repaired, and a fence on it passes although the stream
-moved. The first is a liveness problem, the second a correctness one, and the marker cannot stop a
-writer that does not read it. So v0.8 writers must be stopped before heads are declared.
+**Queries are compatible, scans and writes are not.** A v0.8 `Query` or `GetItem` never sees a head
+item (every query bounds `sk` at 0 or above). A v0.8 **full-table scan** fails on it, as Readers
+explains, so every unfiltered scan job and rebuild must be upgraded before head items exist. A v0.8
+**writer** appends events without updating the head item, which leaves it stale (H2 and H4 broken):
+head-aware writers then fail on that stream with `StreamHeadDrift`, and a fence on it passes although
+the stream moved. The marker cannot stop a writer that does not read it. So v0.8 writers must be
+stopped before heads are declared.
 
 **Decision: the migration is stop-the-world.** There is no transition release in which old and new
-writers coexist. The procedure is: stop writers, backfill, verify, declare the marker feature, start
-the new writers. The project is greenfield, a quiet window is acceptable, and the alternative (a
+writers coexist. The project is greenfield, a quiet window is acceptable, and the alternative (a
 dual layout, rejected below) costs more than the window does.
 
 **The procedure:**
 
-1. **Stop writers.** Stop every v0.8 writer, and do not start any head-aware writer yet. A
-   head-aware writer started early refuses to commit (`StreamHeadsNotMigrated`, below).
-2. Run `evt-doctor migrate-heads` (Go only, per ADR 0006). On DynamoDB it is an explicit scan
-   (allowed: it is a migration), projecting `pk, sk, eventSeq, ttl`. Per non-reserved partition it
-   computes the derived head (H4) and the `ttl` of the highest item, then writes the head item with
-   `SET head = :h` conditioned on `attribute_not_exists(head)`. It never lowers an existing head: a
-   head above the derived value is reported (events were deleted), a head below is repaired upward
-   in `--repair` mode. It is idempotent and resumable, and `--dry-run` reports without writing.
-   This is the **backfill**.
-3. **Verify.** `evt-doctor migrate-heads --verify` rescans and checks that every non-reserved
-   partition's `head` equals its derived head, and exits non-zero otherwise.
-4. **Declare.** The tool declares `stream-heads: 1` in the marker, through the ordinary declaration
-   transaction (the `version` bump re-fails every cached writer). `migrate-heads` runs the
-   declaration only after a clean verification pass in the same invocation.
-5. **Start the new writers.**
+1. **Stop writers and take a backup.** Stop every v0.8 writer and start no head-aware writer. Enforce
+   it rather than trusting it: apply an IAM deny on the write actions (`PutItem`, `UpdateItem`,
+   `DeleteItem`, `BatchWriteItem`, `TransactWriteItems`) for every principal except the migration
+   role, or drop the table's write capacity to zero, and keep that in place until step 6. Take an
+   on-demand backup or confirm point-in-time recovery; a rollback needs it.
+2. **Upgrade readers.** Deploy the scanner and consumer changes from Readers: scan jobs, rebuild
+   jobs, `evt-doctor`, and every Streams, ESM, or Pipes consumer (with the filter above). The
+   backfill itself emits `sk = -1` stream records, so consumers must be ready first.
+3. **Backfill.** Run `evt-doctor migrate-heads`. `migrate-heads` refuses a table whose marker
+   declares `journal` or any other feature the Go tool does not model (the Rust-first extensions
+   keep rows it would misread). On DynamoDB it is an explicit scan (allowed: it is a migration),
+   projecting `pk, sk, eventSeq, ttl`, accumulating per partition across the whole scan (a partition
+   split across a page boundary is finalized only when the scan ends, memory is one entry per
+   stream). Items whose `ttl` has passed but which are not yet deleted are ignored, and a partition
+   with nothing left is skipped. For each remaining partition it computes the derived head (H4) and
+   the **maximum `ttl` across the partition**, and **skips a partition whose derived head is 0** (a
+   snapshot-only partition at `eventSeq` 0), because `head ≥ 1`. It writes the head item with
+   `SET head = :h` (and `#ttl`) conditioned on `attribute_not_exists(head)`. It is idempotent and
+   resumable, supports `--dry-run`, and never lowers an existing head: a head above the derived value
+   is reported, and a head below is raised only by `--repair`.
+4. **Verify.** `evt-doctor migrate-heads --verify` rescans and requires that every partition with a
+   non-expired item has a head item equal to its derived head (items past their `ttl` but not yet
+   deleted are ignored, as in the backfill), and exits non-zero otherwise.
+5. **Declare.** After a clean verification in the same invocation, repeated immediately before the
+   declaration, the tool declares `stream-heads: 1` in the marker by the ordinary declaration
+   transaction. It requires `--confirm-writers-stopped`, and the IAM deny or zero capacity of step 1
+   is the evidence that writers stayed stopped between verify and declare; the tool cannot prove it.
+   It verifies once more after the declaration and reports any drift.
+6. **Start the new writers,** then lift the step-1 deny.
 
-On PostgreSQL, `EnsureSchema` creates the empty heads table, and the migration is one transaction
+On PostgreSQL, `EnsureSchema` creates the empty heads table, and steps 3 to 5 are one transaction
 under the exclusive feature advisory lock: `INSERT INTO … SELECT` the per-stream maximum of
-`sequence` and `event_sequence` from both tables, then the declaration. The lock blocks v0.9 commits
-for its duration; v0.8 writers must still be stopped, as in step 1. The same four steps apply:
-backfill, verify (a count of streams missing a row or with a lower head must be zero), and
-declare happen in that one transaction, and writers start afterwards.
+`sequence` and `event_sequence` from both tables (skipping a maximum of 0), a verification query that
+finds no stream missing a row or holding a lower head (otherwise the transaction aborts), then the
+declaration. The lock blocks head-aware commits for its duration; v0.8 writers must still be stopped
+(step 1). PostgreSQL has no TTL, no Streams, and no scan jobs to upgrade.
 
 **A required feature.** The marker today only stops a writer that does not know a declared feature.
 This adds the other direction: a head-aware writer requires `stream-heads: 1` and otherwise refuses
-to commit with a typed `StreamHeadsNotMigrated` error, so a v0.9 build pointed at a table nobody has
-migrated fails loudly on its first commit instead of conflicting on every stream. On a table with no
-marker row, a writer may declare `stream-heads` itself, but only after confirming the table holds no
+with a typed `StreamHeadsNotMigrated` error, so a build pointed at a table nobody has migrated fails
+loudly on its first write instead of failing on every stream. The refusal covers **every write path
+that validates the marker**: commits (including outcome-only and rejection commits), `PutSnapshot`,
+`CompactBelow`, and the mutating `evt-doctor` commands other than `migrate-heads` itself. Read-only
+paths do not need the feature. On a table with no marker row, a writer may declare `stream-heads`
+itself, but only after confirming, with a **strongly consistent** scan, that the table holds no
 non-reserved items (it reads until it finds one or exhausts the table; a populated table stops it
 immediately). A fresh table therefore needs no step, and a populated unmigrated table can never be
 declared by accident.
 
 **Writers that predate the feature.** A v0.9 build without `stream-heads` refuses a table that
 declares it (the existing rule), so a mixed fleet of old and new v0.9 builds cannot corrupt heads
-after the declaration. v0.8 builds cannot be stopped; after declaration a stray v0.8 writer causes
-conflicts (stale heads) and, for fenced streams, missed fences. `migrate-heads --repair` fixes the
-heads once it is stopped.
+after the declaration. v0.8 builds cannot be stopped; a stray v0.8 writer after the declaration
+produces `StreamHeadDrift` (stale heads) and, for fenced streams, missed fences. `migrate-heads
+--repair` fixes the heads once it is stopped.
 
-**Rollback.** Stop the head writers, run v0.8 writers (they ignore head items), and to return, run
-`migrate-heads --repair` before restarting head writers. The declaration is not removed.
+**Rollback is not supported in place.** The declaration is never removed, so a pre-heads v0.9 build
+refuses the table, and v0.8 full-table scans fail on head rows. Returning to the old layout means
+restoring the step-1 backup. Plan the migration as one-way.
+
+**A dual-layout transition release** (rejected) is Alternative (h).
 
 **Compatibility fixtures that change.** Fixtures are generated by Go
 (`go test ./internal/compat -run TestFixtures -update`), never hand-edited, and Rust must reproduce
@@ -494,11 +623,25 @@ them:
 - `compat/scenarios.json`: changes to `read-fences` (one check; the append, snapshot, compact ABA
   still fails; the interval-0 case no longer special), `multi-stream-commit` (action order),
   `commit-too-large` (new budget, including the create-with-snapshot case), `fence-aware-retry`
-  (classification keys), and `feature-marker` (declare, required refusal, fresh-table declaration);
-  and new scenarios `stream-heads-migration` (an unmigrated table is refused, the migration runs,
-  both languages then commit and fence) and `stream-heads-compaction` (compacting past the head
-  neither moves the head nor conflicts with a current writer), plus a drift case with `appendRaw`.
+  (classification keys, and drift is never exhausted into a rejection), and `feature-marker`
+  (declare, required refusal, fresh-table declaration); and new scenarios `stream-heads-migration`
+  (an unmigrated table is refused, the migration runs, both languages then commit and fence),
+  `stream-heads-compaction` (compacting past the head neither moves the head nor conflicts with a
+  current writer), `stream-heads-snapshot-guard` (an out-of-band snapshot above the head is refused),
+  and `stream-heads-drift` (an `appendRaw` that bypasses the head yields `StreamHeadDrift` in both
+  languages).
 - `compat/README.md` and the "Compat Scenarios to Add" table in the spec.
+
+**Implementation surface beyond the fixtures** (so the implementing change does not miss them):
+
+- `internal/compat/fakedynamo.go`: it has no `UpdateItem`/`Update` transaction action and matches
+  conditions by exact string, so it needs the head `Update`, the new condition strings, and the new
+  fence check.
+- The in-memory backends (Go `mem/repo.go`, Rust `crates/evt/src/mem.rs`) keep a head per stream in
+  the commit.
+- Both conformance suites (`conformance/repository.go`, `crates/evt/src/conformance.rs`).
+- Docs: `BEHAVIORAL_INVARIANTS.md`, `docs/dynamodb.md`, `docs/streams.md`, the READMEs, and the
+  spec.
 
 ## Consequences
 
@@ -508,13 +651,15 @@ them:
 - **A simpler protocol.** The continuation check, the floor check, the pinned conditions, the
   pre-commit observation, and the snapshot companion are deleted from both languages. The compaction
   ABA is not mitigated; it cannot occur.
-- **A format change and a migration.** One new item per stream, one new feature, one new required
-  refusal, one migration tool. Existing v0.8 tables need a quiet window.
+- **A format change and a one-way migration.** One new item per stream, one new feature, one new
+  required refusal, one new error (`StreamHeadDrift`), one migration tool. Existing v0.8 tables need
+  a quiet window, a backup, and upgraded scanners and consumers first.
 - **One regression.** Creating a stream and writing its first snapshot in one commit costs one more
   action.
 - **A new thing to keep true.** H1–H4 are invariants the engine must maintain and `evt-doctor` must
   check (head below derived, head above derived, orphan head item, missing head item). Anything that
-  deletes or writes events outside the commit path (fixtures, repair tools) must maintain the head.
+  deletes or writes events outside the commit path (fixtures, repair tools, the deprecated
+  DynamoDB `CommitStream`) must maintain the head or be refused.
 - **More stream records.** A head update per written stream per commit reaches DynamoDB Streams
   consumers.
 - **Retention is unchanged.** Fences stay refused for retained types.
@@ -533,13 +678,18 @@ them:
    (`RetentionConflict`). Lifting the refusal would need an incarnation token and is out of scope.
 4. **PostgreSQL: decided.** PostgreSQL gets the heads table, so the spec has one definition of head.
    It can still land as a separate change from the DynamoDB one.
-5. **Drift is loud but not self-healing.** A writer that appends without maintaining the head fails
-   closed (conflicts, `evt-doctor` flags it), except for fences, which can pass. That is why the
-   v0.8 writers must be stopped.
+5. **Drift is loud but not self-healing.** A writer that appends without maintaining the head
+   produces `StreamHeadDrift` (never a retry loop, never a recorded rejection), except for fences,
+   which can pass until the probe runs. That is why the v0.8 writers must be stopped, and why the
+   migration needs enforced evidence that they stayed stopped.
 6. **The extra action on create-with-snapshot.** Cheap to accept, but it is the one place the new
    layout is worse, so say so in the release notes.
 7. **Required-feature refusal is new marker behavior** (a writer refusing because a feature is
    missing). It needs its own conformance cases in `feature-marker`.
+8. **Failure-path probe cost and races.** The probe adds a few strongly consistent reads to a failed
+   commit. The read order (derive, then read the head, then re-derive only when the head is ahead)
+   is what keeps a concurrent commit from reading as drift; the conformance suite needs a case that
+   interleaves a commit with the probe.
 
 See [ADR 0004](0004-core-reshape-multi-stream-transactions-and-outcomes.md) for the layout this
 amends and [ADR 0001](0001-event-compaction-and-snapshot-truncation.md) for compaction.
