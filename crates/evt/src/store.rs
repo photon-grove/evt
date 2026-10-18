@@ -369,7 +369,10 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     ///   commit in one transaction. An error returned by the handler is a domain rejection: it is
     ///   mapped with [`ToRejection`] and, when that yields a rejection, persisted as a rejected
     ///   outcome (a `None` is an internal failure: [`Error::Handler`], nothing recorded), which a retry of the
-    ///   command replays verbatim. A handler that returns no events is an accepted no-op.
+    ///   command replays verbatim. It writes no events unless the aggregate's
+    ///   [`rejection_events`](Aggregate::rejection_events) returns some: those commit with the
+    ///   rejected row in the same transaction, and the outcome lists them. A handler that returns
+    ///   no events is an accepted no-op.
     ///
     /// When the commit conflicts with another writer the command is re-prepared: the aggregate is
     /// loaded again and the handler runs again against the fresh state, after a backoff on the
@@ -542,10 +545,27 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 // return the same rejection.
                 let rejection = rejection.canonical().map_err(Failed::internal)?;
                 let outcome = Outcome::rejected(command_id, digest, rejection);
-                let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
+
+                // A rejection may carry events: they commit with the rejected row like an
+                // accepted command's, decided on the state this attempt loaded.
+                let failure_events = loaded.aggregate.rejection_events(&error);
+                if failure_events.is_empty() {
+                    let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
+
+                    return self
+                        .record(commit, Vec::new(), Vec::new())
+                        .await
+                        .map_err(Failed::committing);
+                }
+
+                let decided = failure_events.clone();
+                let (_, serialized, mut commit) = self
+                    .stage(loaded, failure_events, metadata)
+                    .map_err(Failed::internal)?;
+                commit.outcome = Some(outcome);
 
                 return self
-                    .record(commit, Vec::new(), Vec::new())
+                    .record(commit, serialized, decided)
                     .await
                     .map_err(Failed::committing);
             }
@@ -657,7 +677,9 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// it needs ([`Transaction::read`]), decide, append events to any of them, and add
     /// caller-stamped fences ([`Transaction::fence`]). Return [`Decision::accept`] to commit,
     /// [`Decision::reject`] with a domain [`Rejection`] to record a rejected outcome (fenced on
-    /// everything it read, so it is only recorded on state that still holds), or an `Err` for an
+    /// everything it read, so it is only recorded on state that still holds; staged events are
+    /// discarded), [`Decision::reject_with_events`] to commit the staged events with the
+    /// rejection in the same atomic commit, or an `Err` for an
     /// internal failure, which is returned with no outcome written. Appending nothing and
     /// accepting is an accepted no-op.
     ///
@@ -776,6 +798,10 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 .map_err(Failed::committing),
             Decision::Reject(rejection) => transaction
                 .reject(*rejection)
+                .await
+                .map_err(Failed::committing),
+            Decision::RejectWithEvents(rejection) => transaction
+                .reject_with_events(*rejection)
                 .await
                 .map_err(Failed::committing),
         }
@@ -1024,7 +1050,8 @@ pub(crate) fn stamp_commit_id(
 }
 
 /// The decision a [`Store::execute_transaction`] `prepare` function reaches: commit the staged
-/// events and record an accepted outcome, or record a domain rejection.
+/// events and record an accepted outcome, or record a domain rejection, with or without the
+/// staged events.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Decision {
@@ -1034,6 +1061,9 @@ pub enum Decision {
     /// Record the command as rejected, writing no events. The rejection is fenced on everything
     /// the transaction read, so it is only recorded on state that still holds.
     Reject(Box<Rejection>),
+    /// Record the command as rejected and commit the events the transaction staged in the same
+    /// atomic commit (see [`Transaction::reject_with_events`]).
+    RejectWithEvents(Box<Rejection>),
 }
 
 impl Decision {
@@ -1050,6 +1080,14 @@ impl Decision {
     /// Rejects the command with a domain rejection.
     pub fn reject(rejection: Rejection) -> Self {
         Self::Reject(Box::new(rejection))
+    }
+
+    /// Rejects the command and commits the events staged with [`Transaction::append`] in the same
+    /// atomic commit, so the aggregate leaves the state the command refused and the history shows
+    /// why: for example, a proposal whose apply fails records an `apply-failed` event beside the
+    /// rejection. [`Decision::reject`] discards staged events instead.
+    pub fn reject_with_events(rejection: Rejection) -> Self {
+        Self::RejectWithEvents(Box::new(rejection))
     }
 }
 

@@ -154,7 +154,9 @@ func (state *attemptState) retriesExhausted(ctx context.Context, attempts int) (
 //   - events: committed with an accepted outcome carrying CommandResult.Response;
 //   - no events, or a *evt.NoOpError: an accepted no-op outcome;
 //   - an error that maps to a rejection (evt.RejectionOf): a rejected outcome, returned as a
-//     CommandOutcome with a nil error;
+//     CommandOutcome with a nil error. It writes no events, unless the error is marked with
+//     evt.RejectWithEvents: then the Events of the result returned beside it are committed on the
+//     entity's stream in the same atomic commit, and the outcome lists them;
 //   - any other error: an internal failure, returned as an error with no outcome written.
 //
 // Retry is fence-aware (ADR 0004, C5). When the commit conflicts with another writer, the entity
@@ -404,13 +406,7 @@ func (store *Store) attemptOutcome(
 
 	result, err := entity.Handle(ctx, command)
 	if err != nil {
-		return store.handlerFailed(ctx, cmd, err)
-	}
-
-	for _, event := range result.Events {
-		if err = entity.Apply(event); err != nil {
-			return executed{}, internal(err)
-		}
+		return store.handlerFailed(ctx, cmd, entity, &eventContext, entityID, result, err)
 	}
 
 	if len(result.Events) == 0 {
@@ -427,28 +423,64 @@ func (store *Store) attemptOutcome(
 		return executed{outcome: outcome}, cerr
 	}
 
-	projectorTransaction, err := buildProjectorTransaction(ctx, entity, result.Events)
+	staged, err := store.prepareEvents(ctx, cmd, entity, &eventContext, entityID, result)
 	if err != nil {
-		return executed{}, internal(err)
+		return executed{}, err
 	}
 
-	serialized, snapshots, err := store.stage(entity, &eventContext, entityID, result.Events, evt.CommitMetadata(cmd.metadata))
-	if err != nil {
-		return executed{}, internal(err)
-	}
-
-	outcome, err := cmd.commit(ctx, evt.SerializedResult{
-		Events:      serialized,
-		Snapshots:   snapshots,
-		Transaction: evt.MergeTransactions(result.Transaction, projectorTransaction), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	}, evt.OutcomeAccepted, result.Response, nil)
+	outcome, err := cmd.commit(ctx, staged, evt.OutcomeAccepted, result.Response, nil)
 
 	return executed{outcome: outcome}, err
 }
 
+// prepareEvents applies a handler's events to the entity and builds the commit that persists them:
+// the serialized events, the snapshot when the interval is reached, and the projector operations.
+// It is shared by an accepted command and a rejection that carries events. Its errors are internal
+// failures.
+func (store *Store) prepareEvents(
+	ctx context.Context,
+	cmd *command,
+	entity evt.Entity,
+	eventContext *evt.Context,
+	entityID evt.EntityID,
+	result evt.CommandResult,
+) (evt.SerializedResult, error) {
+	for _, event := range result.Events {
+		if err := entity.Apply(event); err != nil {
+			return evt.SerializedResult{}, internal(err)
+		}
+	}
+
+	projectorTransaction, err := buildProjectorTransaction(ctx, entity, result.Events)
+	if err != nil {
+		return evt.SerializedResult{}, internal(err)
+	}
+
+	serialized, snapshots, err := store.stage(entity, eventContext, entityID, result.Events, evt.CommitMetadata(cmd.metadata))
+	if err != nil {
+		return evt.SerializedResult{}, internal(err)
+	}
+
+	return evt.SerializedResult{
+		Events:      serialized,
+		Snapshots:   snapshots,
+		Transaction: evt.MergeTransactions(result.Transaction, projectorTransaction), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	}, nil
+}
+
 // handlerFailed records a handler error: a no-op and a domain rejection are durable outcomes; any
-// other error is an internal failure that is returned and writes nothing.
-func (store *Store) handlerFailed(ctx context.Context, cmd *command, handlerErr error) (executed, error) {
+// other error is an internal failure that is returned and writes nothing. A rejection marked with
+// evt.RejectWithEvents commits the events of the handler's result in the same commit as the
+// rejected outcome row.
+func (store *Store) handlerFailed(
+	ctx context.Context,
+	cmd *command,
+	entity evt.Entity,
+	eventContext *evt.Context,
+	entityID evt.EntityID,
+	result evt.CommandResult,
+	handlerErr error,
+) (executed, error) {
 	if evt.IsNoOpErr(handlerErr) {
 		outcome, err := cmd.commit(ctx, evt.SerializedResult{}, evt.OutcomeAccepted, nil, nil)
 
@@ -462,7 +494,24 @@ func (store *Store) handlerFailed(ctx context.Context, cmd *command, handlerErr 
 		return executed{}, internal(handlerErr)
 	}
 
-	outcome, err := cmd.commit(ctx, evt.SerializedResult{}, evt.OutcomeRejected, nil, &rejection)
+	staged := evt.SerializedResult{}
+
+	if evt.RejectsWithEvents(handlerErr) {
+		if len(result.Events) == 0 {
+			// Projector operations without an event are never silently dropped: the commit keeps
+			// them so the shared validation refuses them (ProjectorOnlyCommitError) before any
+			// write, as it does for an accepted command.
+			staged.Transaction = result.Transaction //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		} else {
+			var err error
+
+			if staged, err = store.prepareEvents(ctx, cmd, entity, eventContext, entityID, result); err != nil {
+				return executed{}, err
+			}
+		}
+	}
+
+	outcome, err := cmd.commit(ctx, staged, evt.OutcomeRejected, nil, &rejection)
 
 	// The handler's own error belongs to the rejection only when this call committed it. A lost
 	// race returns the winner's stored outcome, and with it nothing of this call's decision.

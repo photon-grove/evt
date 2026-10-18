@@ -30,7 +30,7 @@ func Test_MalformedOutcomeRowsAreCorrupt(t *testing.T) {
 		{"event ID without a sequence", `INSERT INTO %s (command_id, status, digest, events) VALUES ($1, 'accepted', 'd', '["a"]')`},
 		{"event ID with a zero sequence", `INSERT INTO %s (command_id, status, digest, events) VALUES ($1, 'accepted', 'd', '["a:0"]')`},
 		{"events that are not an array of strings", `INSERT INTO %s (command_id, status, digest, events) VALUES ($1, 'accepted', 'd', '{"a":1}')`},
-		{"rejected with events", `INSERT INTO %s (command_id, status, digest, events, rejection, code) VALUES ($1, 'rejected', 'd', '["a:1"]', '{"code":"c","message":"m","details":null}', 'c')`},
+		{"rejected with a malformed event ID", `INSERT INTO %s (command_id, status, digest, events, rejection, code) VALUES ($1, 'rejected', 'd', '["a:0"]', '{"code":"c","message":"m","details":null}', 'c')`},
 		{"rejected whose code column disagrees", `INSERT INTO %s (command_id, status, digest, rejection, code) VALUES ($1, 'rejected', 'd', '{"code":"c","message":"m","details":null}', 'other')`},
 		{"rejection details that are an array", `INSERT INTO %s (command_id, status, digest, rejection, code) VALUES ($1, 'rejected', 'd', '{"code":"c","message":"m","details":["x"]}', 'c')`},
 		{"rejected with an empty rejection code", `INSERT INTO %s (command_id, status, digest, rejection, code) VALUES ($1, 'rejected', 'd', '{"code":"","message":"m","details":null}', '')`},

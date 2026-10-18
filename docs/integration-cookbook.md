@@ -47,6 +47,20 @@ only from the `Prepare` function has the same identity whatever destination it p
 request with the same command ID and another destination replays the first outcome instead of
 running. Put the destination in the payload.
 
+## Record a failure beside the rejection
+
+Some refusals must leave a trace in the domain. When applying a proposal finds its base revision
+stale, the client should get a rejection, and the proposal should also record an `apply-failed`
+event so it is no longer "applicable" and the history shows the attempt. Writing the event in a
+second step is not atomic, and accepting the command gives the client the wrong answer. Return the
+event with the rejection instead: in Go, mark the handler's error with `evt.RejectWithEvents` (in a
+`Prepare` function, stage the event with `tx.Append` first); in Rust, return it from
+`Aggregate::rejection_events` or finish with `Decision::reject_with_events`. The event and the
+rejected [outcome](../README.md#command-outcomes-and-rejections-v09-c3c4) commit together or not
+at all, a replay of the command ID returns the rejection without writing the event again, and a
+command that loses a race is re-prepared and may decide differently. Decide which events belong
+there as you would for an accepted command: record facts, never view state.
+
 ## Upcast historical shapes, always
 
 Never assume a stored payload has the latest struct shape. When an event's JSON

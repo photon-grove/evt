@@ -258,6 +258,145 @@ impl Aggregate for Claim {
     }
 }
 
+/// A third aggregate type for rejections that carry events: a wallet that records a refused
+/// spend in its history, in the same commit as the rejection.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Wallet {
+    /// Funds added minus funds spent.
+    pub balance: i64,
+    /// The number of refused spends recorded in the history.
+    pub refusals: i64,
+}
+
+/// The payload of `wallet:funded`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Funded {
+    /// The amount.
+    pub amount: i64,
+}
+
+/// The payload of `wallet:spent`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spent {
+    /// The amount.
+    pub amount: i64,
+}
+
+/// The payload of `wallet:refused`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refused {
+    /// The amount that was asked for.
+    pub amount: i64,
+}
+
+crate::domain_events! {
+    /// The [`Wallet`] events.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum WalletEvent {
+        /// Funds were added.
+        Funded(Funded) => ("wallet:funded", 1),
+        /// Funds were spent.
+        Spent(Spent) => ("wallet:spent", 1),
+        /// A spend was refused. Recorded beside the rejection.
+        Refused(Refused) => ("wallet:refused", 1),
+    }
+}
+
+/// The [`Wallet`] commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalletCommand {
+    /// Add funds.
+    Fund(i64),
+    /// Spend funds. Over the balance it is rejected, and the refusal is recorded as an event.
+    Spend(i64),
+}
+
+/// The [`Wallet`] rejections.
+#[derive(Debug, thiserror::Error)]
+pub enum WalletError {
+    /// A non-positive amount. Recorded as a plain rejection with no events.
+    #[error("amount must be positive")]
+    InvalidAmount,
+    /// A spend over the balance. Recorded with a `wallet:refused` event.
+    #[error("balance is too low")]
+    Overdrawn {
+        /// The amount asked for.
+        requested: i64,
+        /// The balance it was decided on.
+        balance: i64,
+    },
+}
+
+impl OutcomeCommand for WalletCommand {
+    fn command_type(&self) -> String {
+        match self {
+            Self::Fund(_) => "wallet:fund".into(),
+            Self::Spend(_) => "wallet:spend".into(),
+        }
+    }
+
+    fn canonical_payload(&self) -> Result<Option<Vec<u8>>, BoxError> {
+        let (Self::Fund(amount) | Self::Spend(amount)) = self;
+
+        Ok(Some(canonical_json(amount)?))
+    }
+}
+
+impl ToRejection for WalletError {
+    fn to_rejection(&self) -> Option<Rejection> {
+        Some(match self {
+            Self::InvalidAmount => Rejection::new("invalid-amount", self.to_string()),
+            Self::Overdrawn { requested, balance } => {
+                Rejection::new("insufficient-funds", self.to_string())
+                    .with_details(serde_json::json!({ "balance": balance, "requested": requested }))
+            }
+        })
+    }
+}
+
+impl Aggregate for Wallet {
+    const TYPE: &'static str = "wallet";
+
+    type Command = WalletCommand;
+    type Event = WalletEvent;
+    type Error = WalletError;
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: WalletCommand,
+        _: &(),
+    ) -> Result<Vec<WalletEvent>, WalletError> {
+        match command {
+            WalletCommand::Fund(amount) if amount > 0 => Ok(vec![Funded { amount }.into()]),
+            WalletCommand::Spend(amount) if amount > 0 && amount <= self.balance => {
+                Ok(vec![Spent { amount }.into()])
+            }
+            WalletCommand::Spend(requested) if requested > 0 => Err(WalletError::Overdrawn {
+                requested,
+                balance: self.balance,
+            }),
+            _ => Err(WalletError::InvalidAmount),
+        }
+    }
+
+    fn apply(&mut self, event: WalletEvent) {
+        match event {
+            WalletEvent::Funded(funded) => self.balance += funded.amount,
+            WalletEvent::Spent(spent) => self.balance -= spent.amount,
+            WalletEvent::Refused(_) => self.refusals += 1,
+        }
+    }
+
+    fn rejection_events(&self, error: &WalletError) -> Vec<WalletEvent> {
+        match error {
+            WalletError::Overdrawn { requested, .. } => vec![Refused { amount: *requested }.into()],
+            WalletError::InvalidAmount => Vec::new(),
+        }
+    }
+}
+
 /// A backend's view storage, for the case that checks projector operations commit atomically
 /// with events.
 pub trait ViewTarget<R: Repository>: Send + Sync {
@@ -3119,6 +3258,26 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         "the outcome row counts against the commit budget",
         Box::pin(outcome_budget(repo)).await,
     );
+    record(
+        "a rejection that carries events commits them atomically with its row and replays without them",
+        Box::pin(rejection_events(repo)).await,
+    );
+    record(
+        "a transaction rejects with its staged events, or discards them",
+        Box::pin(rejection_events_transaction(repo)).await,
+    );
+    record(
+        "a rejection with events obeys the commit rules of an accepted commit",
+        Box::pin(rejection_events_rules(repo)).await,
+    );
+    record(
+        "a conflict re-prepares a rejection with events, and exhaustion records none of its events",
+        Box::pin(rejection_events_retry(repo)).await,
+    );
+    record(
+        "a stale caller-stamped fence beside a rejection's events persists the stale-fence rejection alone",
+        Box::pin(rejection_events_caller_fence(repo)).await,
+    );
 
     if !failures.is_empty() {
         panic!(
@@ -3604,19 +3763,24 @@ async fn outcome_noop<R: Repository>(repo: &R) -> CaseResult {
         "a second outcome for the ID is OutcomeConflict, not a generic conflict: {again:?}"
     );
 
-    // A rejected outcome cannot carry events.
+    // A rejected outcome may carry events: they commit with the row, and the row lists them.
     let stream = Stream::new(&namespace(), "rejected", "ledger");
-    let rejected = Outcome::rejected(command_id(), "digest", Rejection::new("c", "m"));
-    let result = stream
-        .commit_with_outcome(repo, stream.events(1..=1), rejected)
-        .await;
-    ensure!(
-        matches!(&result, Err(Error::InvalidCommit(_))),
-        "a rejection with events is an invalid commit: {result:?}"
+    let command = command_id();
+    let rejected = Outcome::rejected(command.clone(), "digest", Rejection::new("c", "m"));
+    stream
+        .commit_with_outcome(repo, stream.events(1..=1), rejected.clone())
+        .await?;
+    ensure_eq!(
+        repo.events(&stream.id).await?.len(),
+        1,
+        "the rejection's event was written"
     );
-    ensure!(
-        repo.events(&stream.id).await?.is_empty(),
-        "nothing was written"
+    ensure_eq!(
+        repo.outcome(&command)
+            .await?
+            .map(|stored| (stored.is_rejected(), stored.event_ids)),
+        Some((true, vec![EventId::for_event(&stream.id, EventSequence(1))])),
+        "the rejected row lists it"
     );
 
     Ok(())
@@ -4454,6 +4618,8 @@ struct Meddling<'a, R> {
     trigger: Trigger,
     moves: Mutex<u32>,
     delays: Mutex<Vec<Duration>>,
+    /// Moves the stream by funding a [`Wallet`] with this amount instead of adding to a ledger.
+    wallet: Option<i64>,
 }
 
 impl<'a, R: Repository> Meddling<'a, R> {
@@ -4466,7 +4632,14 @@ impl<'a, R: Repository> Meddling<'a, R> {
             trigger,
             moves: Mutex::new(moves),
             delays: Mutex::new(Vec::new()),
+            wallet: None,
         }
+    }
+
+    /// Moves a [`Wallet`] stream, by funding it with `amount`, instead of a ledger.
+    fn funding(mut self, amount: i64) -> Self {
+        self.wallet = Some(amount);
+        self
     }
 
     fn moves(&self) -> std::sync::MutexGuard<'_, u32> {
@@ -4503,6 +4676,20 @@ impl<'a, R: Repository> Meddling<'a, R> {
                 u32::MAX => {}
                 remaining => *moves = remaining - 1,
             }
+        }
+
+        if let Some(amount) = self.wallet {
+            Store::<Wallet, _>::new(self.inner, ())
+                .with_snapshot_interval(0)
+                .execute(
+                    &self.stream,
+                    WalletCommand::Fund(amount),
+                    Metadata::default(),
+                )
+                .await
+                .map_err(|err| Error::backend(err.to_string()))?;
+
+            return Ok(());
         }
 
         Store::<Ledger, _>::new(self.inner, ())
@@ -5420,6 +5607,539 @@ async fn outcome_budget<R: Repository>(repo: &R) -> CaseResult {
             .await?
             .is_some_and(|stored| stored.is_noop()),
         "an outcome-only transaction stores an accepted no-op"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rejections that carry events
+// ---------------------------------------------------------------------------------------------
+
+fn wallet_store<R: Repository>(repo: R, snapshot_interval: usize) -> Store<Wallet, R> {
+    Store::new(repo, ())
+        .with_snapshot_interval(snapshot_interval)
+        .with_outcomes(outcome_config())
+}
+
+/// The stored event types of a stream, in order.
+async fn event_types<R: Repository>(repo: &R, id: &EntityId) -> Result<Vec<String>, Failure> {
+    Ok(repo
+        .events(id)
+        .await?
+        .iter()
+        .map(|event| event.event_type.to_string())
+        .collect())
+}
+
+fn types(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+async fn rejection_events<R: Repository>(repo: &R) -> CaseResult {
+    // A snapshot interval of two puts a snapshot on the rejection's own event.
+    let store = wallet_store(repo, 2);
+    let id = ledger_id();
+
+    let funded = store
+        .execute_with_outcome(&id, WalletCommand::Fund(2), command_metadata(&command_id()))
+        .await?;
+    ensure!(funded.is_accepted(), "the seed commits: {funded:?}");
+
+    // A spend over the balance is rejected, and the refusal is recorded in the same commit.
+    let command = command_id();
+    let rejected = store
+        .execute_with_outcome(&id, WalletCommand::Spend(5), command_metadata(&command))
+        .await?;
+    ensure!(
+        rejected.is_rejected() && !rejected.replayed,
+        "a fresh rejection: {rejected:?}"
+    );
+    ensure_eq!(
+        rejected
+            .rejection()
+            .map(|rejection| rejection.code.as_str()),
+        Some("insufficient-funds"),
+        "the rejection code"
+    );
+    ensure_eq!(
+        rejected.outcome.event_ids,
+        vec![EventId::for_event(&id, EventSequence(2))],
+        "the rejected row lists the event it wrote"
+    );
+    ensure_eq!(rejected.events.len(), 1, "the committed events");
+    ensure_eq!(rejected.typed_events.len(), 1, "the typed events");
+    ensure!(
+        rejected.response().is_none(),
+        "a rejection stores no response"
+    );
+    ensure_eq!(
+        event_types(repo, &id).await?,
+        types(&["wallet:funded", "wallet:refused"]),
+        "the refusal is on the stream"
+    );
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(rejected.outcome.clone()),
+        "the stored row is the returned outcome"
+    );
+
+    let loaded = store.load(&id).await?;
+    ensure_eq!(loaded.aggregate().balance, 2, "the refusal moved no funds");
+    ensure_eq!(loaded.aggregate().refusals, 1, "and is part of the state");
+    ensure!(
+        repo.snapshot(&id).await?.is_some(),
+        "the rejection's events count toward the snapshot interval"
+    );
+
+    // A replay returns the stored rejection and writes nothing again.
+    let again = store
+        .execute_with_outcome(&id, WalletCommand::Spend(5), command_metadata(&command))
+        .await?;
+    ensure!(again.replayed && again.is_rejected(), "a replay: {again:?}");
+    ensure_eq!(again.outcome, rejected.outcome, "the replayed rejection");
+    ensure!(again.events.is_empty(), "a replay commits nothing");
+    ensure_eq!(repo.events(&id).await?.len(), 2, "no duplicate event");
+
+    // The ID is terminal for its digest, and another command under it is a reuse.
+    let reuse = store
+        .execute_with_outcome(&id, WalletCommand::Spend(6), command_metadata(&command))
+        .await;
+    expect_reuse(reuse, "another identity under the rejected command's ID")?;
+    ensure_eq!(repo.events(&id).await?.len(), 2, "nothing was written");
+
+    // A plain rejection (no events behind it) is unchanged.
+    let plain = store
+        .execute_with_outcome(
+            &id,
+            WalletCommand::Spend(0),
+            command_metadata(&command_id()),
+        )
+        .await?;
+    ensure!(
+        plain.is_rejected() && plain.outcome.event_ids.is_empty() && plain.events.is_empty(),
+        "a rejection without events writes none: {plain:?}"
+    );
+    ensure_eq!(repo.events(&id).await?.len(), 2, "still two events");
+
+    // A spend within the balance is an ordinary accepted command, with no failure event.
+    let fine = store
+        .execute_with_outcome(
+            &id,
+            WalletCommand::Spend(1),
+            command_metadata(&command_id()),
+        )
+        .await?;
+    ensure!(fine.is_accepted(), "within the balance: {fine:?}");
+    ensure_eq!(
+        event_types(repo, &id).await?,
+        types(&["wallet:funded", "wallet:refused", "wallet:spent"]),
+        "the stream"
+    );
+
+    Ok(())
+}
+
+/// A prepare step that stages a refusal on the wallet and rejects, keeping the staged event or not.
+async fn refuse_staged<R: Repository>(
+    tx: &mut crate::Transaction<'_, R>,
+    id: &EntityId,
+    with_events: bool,
+) -> Result<Decision, Error> {
+    let mut wallet = tx.read::<Wallet>(id).await?;
+    tx.append(&mut wallet, vec![Refused { amount: 7 }.into()])?;
+
+    let rejection = Rejection::new("apply-failed", "the base is stale");
+
+    Ok(if with_events {
+        Decision::reject_with_events(rejection)
+    } else {
+        Decision::reject(rejection)
+    })
+}
+
+async fn rejection_events_transaction<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let id = ledger_id();
+    let identity = CommandIdentity::new("wallet:apply").with_targets([id.clone()]);
+    let refusal = || Rejection::new("apply-failed", "the base is stale");
+
+    let command = command_id();
+
+    // The staged event, on a stream the command read, commits with the rejection; plain
+    // rejection discards it, as before.
+    let plain = store
+        .execute_transaction(&identity, &command_metadata(&command_id()), |tx| {
+            Box::pin(refuse_staged(tx, &id, false))
+        })
+        .await?;
+    ensure!(
+        plain.is_rejected() && plain.outcome.event_ids.is_empty() && plain.events.is_empty(),
+        "reject discards staged events: {plain:?}"
+    );
+    ensure!(repo.events(&id).await?.is_empty(), "and writes none");
+
+    let marked = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            Box::pin(refuse_staged(tx, &id, true))
+        })
+        .await?;
+    ensure!(
+        marked.is_rejected() && !marked.replayed,
+        "a fresh rejection: {marked:?}"
+    );
+    ensure_eq!(
+        marked.rejection().cloned(),
+        Some(refusal()),
+        "the rejection"
+    );
+    ensure_eq!(
+        marked.outcome.event_ids,
+        vec![EventId::for_event(&id, EventSequence(1))],
+        "the row lists the event"
+    );
+    ensure_eq!(marked.events.len(), 1, "the committed events");
+    ensure_eq!(
+        event_types(repo, &id).await?,
+        types(&["wallet:refused"]),
+        "the stream"
+    );
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(marked.outcome.clone()),
+        "the stored row"
+    );
+
+    // A replay prepares nothing and writes nothing.
+    let calls = AtomicUsize::new(0);
+    let replayed = store
+        .execute_transaction(&identity, &command_metadata(&command), |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+
+            Box::pin(async { Ok(Decision::accept()) })
+        })
+        .await?;
+    ensure!(replayed.replayed, "a replay: {replayed:?}");
+    ensure_eq!(replayed.outcome, marked.outcome, "the replayed rejection");
+    ensure_eq!(calls.load(Ordering::SeqCst), 0, "nothing was prepared");
+    ensure_eq!(repo.events(&id).await?.len(), 1, "no duplicate event");
+
+    // The Transaction API: with nothing staged it is an outcome-only rejection.
+    let mut tx = store.transaction();
+    tx.begin_command(&identity, &command_metadata(&command_id()))
+        .await?;
+    tx.read::<Wallet>(&id).await?;
+    let bare = tx.reject_with_events(refusal()).await?;
+    ensure!(
+        bare.is_rejected() && bare.outcome.event_ids.is_empty(),
+        "no staged events: {bare:?}"
+    );
+
+    Ok(())
+}
+
+async fn rejection_events_rules<R: Repository>(repo: &R) -> CaseResult {
+    let rejected = |command: CommandId| {
+        Outcome::rejected(command, "digest", Rejection::new("refused", "refused"))
+    };
+
+    // A conflicting commit writes neither its events nor its rejected row.
+    let stream = Stream::new(&namespace(), "rules", "ledger");
+    stream.commit(repo, stream.events(1..=1), None).await?;
+    let command = command_id();
+    let result = stream
+        .commit_with_outcome(repo, stream.events(1..=1), rejected(command.clone()))
+        .await;
+    expect_conflict(result, "a stale sequence")?;
+    ensure!(
+        repo.outcome(&command).await?.is_none() && repo.events(&stream.id).await?.len() == 1,
+        "a failed commit leaves no row"
+    );
+
+    // The winning commit writes both, and the row lists the events.
+    let command = command_id();
+    stream
+        .commit_with_outcome(repo, stream.events(2..=3), rejected(command.clone()))
+        .await?;
+    let stored = repo
+        .outcome(&command)
+        .await?
+        .ok_or_else(|| Failure("the rejected row".into()))?;
+    ensure!(stored.is_rejected(), "the row is a rejection");
+    ensure_eq!(
+        stored.event_ids,
+        vec![
+            EventId::for_event(&stream.id, EventSequence(2)),
+            EventId::for_event(&stream.id, EventSequence(3)),
+        ],
+        "the row lists what the commit wrote"
+    );
+
+    // A reserved stream is refused before any write.
+    let reserved = Stream::new("SYSTEM#", &namespace(), "ledger");
+    let command = command_id();
+    let result = repo
+        .commit_transaction(
+            TransactionCommit::new(vec![write(&reserved, 1..=1)])
+                .with_outcome(rejected(command.clone())),
+        )
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::ReservedEntityId { .. })),
+        "a reserved stream is refused: {result:?}"
+    );
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "no row for a refused commit"
+    );
+
+    // The rejected row counts against the budget like an accepted one.
+    let creates = Stream::new(&namespace(), "budget", "ledger");
+    let command = command_id();
+    let result = creates
+        .commit_with_outcome(repo, creates.events(1..=98), rejected(command.clone()))
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
+        "98 events plus the row are one action too many: {result:?}"
+    );
+    ensure!(
+        repo.events(&creates.id).await?.is_empty() && repo.outcome(&command).await?.is_none(),
+        "an oversized commit writes nothing"
+    );
+    creates
+        .commit_with_outcome(repo, creates.events(1..=97), rejected(command_id()))
+        .await?;
+
+    // The same bound holds for a command: a transaction that stages too many events with its
+    // rejection fails before any write.
+    let store = outcome_store(repo);
+    let id = ledger_id();
+    let identity = CommandIdentity::new("wallet:apply").with_targets([id.clone()]);
+    let command = command_id();
+    let result = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            let id = id.clone();
+
+            Box::pin(async move {
+                let mut wallet = tx.read::<Wallet>(&id).await?;
+                tx.append(
+                    &mut wallet,
+                    (0..98).map(|_| Refused { amount: 1 }.into()).collect(),
+                )?;
+
+                Ok(Decision::reject_with_events(Rejection::new(
+                    "refused", "no",
+                )))
+            })
+        })
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { .. })),
+        "an oversized rejection fails: {result:?}"
+    );
+    ensure!(
+        repo.events(&id).await?.is_empty() && repo.outcome(&command).await?.is_none(),
+        "and writes nothing"
+    );
+
+    // A reserved stream staged by a command is refused too, and not retried.
+    let calls = AtomicUsize::new(0);
+    let command = command_id();
+    let result = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            calls.fetch_add(1, Ordering::SeqCst);
+
+            Box::pin(async move {
+                let mut wallet = tx.read::<Wallet>("SYSTEM#rejection-events").await?;
+                tx.append(&mut wallet, vec![Refused { amount: 1 }.into()])?;
+
+                Ok(Decision::reject_with_events(Rejection::new(
+                    "refused", "no",
+                )))
+            })
+        })
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::ReservedEntityId { .. })),
+        "a reserved stream is refused: {result:?}"
+    );
+    ensure_eq!(calls.load(Ordering::SeqCst), 1, "and not retried");
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "no outcome was recorded"
+    );
+
+    Ok(())
+}
+
+async fn rejection_events_retry<R: Repository>(repo: &R) -> CaseResult {
+    let id = ledger_id();
+    Store::<Wallet, _>::new(repo, ())
+        .with_snapshot_interval(0)
+        .execute(&id, WalletCommand::Fund(2), metadata())
+        .await?;
+
+    let wallet_retry = |meddling| {
+        Store::<Wallet, _>::new(meddling, ())
+            .with_snapshot_interval(0)
+            .with_outcomes(outcome_config().with_retry(RetryPolicy::new(3)))
+    };
+
+    // Another writer moves the stream between the load and the first commit, once. Still short of
+    // funds, the second attempt rejects again, and its event follows the rival's.
+    let meddling = Meddling::new(repo, &id, Trigger::Events, 1).funding(1);
+    let store = wallet_retry(&meddling);
+    let rejected = store
+        .execute_with_outcome(
+            &id,
+            WalletCommand::Spend(50),
+            command_metadata(&command_id()),
+        )
+        .await?;
+    ensure!(rejected.is_rejected(), "still short of funds: {rejected:?}");
+    ensure_eq!(
+        meddling.delays().len(),
+        1,
+        "the failed commit re-prepared the command once"
+    );
+    ensure_eq!(
+        event_types(repo, &id).await?,
+        types(&["wallet:funded", "wallet:funded", "wallet:refused"]),
+        "only the committing attempt's event was written"
+    );
+    ensure_eq!(
+        rejected.outcome.event_ids,
+        vec![EventId::for_event(&id, EventSequence(3))],
+        "the row lists the committed event"
+    );
+
+    // The rival's move can change the decision: now the command is accepted and records no
+    // failure at all.
+    let meddling = Meddling::new(repo, &id, Trigger::Events, 1).funding(100);
+    let store = wallet_retry(&meddling);
+    let flipped = store
+        .execute_with_outcome(
+            &id,
+            WalletCommand::Spend(50),
+            command_metadata(&command_id()),
+        )
+        .await?;
+    ensure!(
+        flipped.is_accepted(),
+        "decided on the fresh state: {flipped:?}"
+    );
+    ensure_eq!(
+        event_types(repo, &id).await?,
+        types(&[
+            "wallet:funded",
+            "wallet:funded",
+            "wallet:refused",
+            "wallet:funded",
+            "wallet:spent",
+        ]),
+        "no failure event from the superseded attempt"
+    );
+
+    // Every attempt loses: the stale-fence rejection is recorded with none of the caller's events.
+    let before = repo.events(&id).await?.len();
+    let meddling = Meddling::new(repo, &id, Trigger::Events, u32::MAX).funding(1);
+    let store = wallet_retry(&meddling);
+    let command = command_id();
+    let lost = store
+        .execute_with_outcome(&id, WalletCommand::Spend(5000), command_metadata(&command))
+        .await?;
+    ensure!(lost.is_rejected(), "the attempts ran out: {lost:?}");
+    ensure_eq!(
+        lost.rejection().cloned(),
+        Some(Rejection::retries_exhausted(3)),
+        "the exhausted stale-fence rejection"
+    );
+    ensure!(
+        lost.outcome.event_ids.is_empty() && lost.events.is_empty(),
+        "none of the caller's events: {lost:?}"
+    );
+    let after = event_types(repo, &id).await?;
+    ensure_eq!(
+        after.len(),
+        before + 3,
+        "three rival events and nothing else"
+    );
+    ensure!(
+        after[before..].iter().all(|kind| kind == "wallet:funded"),
+        "no refusal was written: {after:?}"
+    );
+
+    // The exhausted ID replays the stale-fence rejection.
+    meddling.disarm();
+    let replayed = store
+        .execute_with_outcome(&id, WalletCommand::Spend(5000), command_metadata(&command))
+        .await?;
+    ensure!(replayed.replayed, "a replay: {replayed:?}");
+    ensure_eq!(replayed.outcome, lost.outcome, "the replayed rejection");
+
+    Ok(())
+}
+
+async fn rejection_events_caller_fence<R: Repository>(repo: &R) -> CaseResult {
+    let referral = ledger_id();
+    let target = ledger_id();
+    seed(repo, &referral, 1).await?;
+
+    let identity = CommandIdentity::new("wallet:apply").with_targets([target.clone()]);
+    let calls = AtomicUsize::new(0);
+
+    // The caller decided on the referral at head 1 and rejects with a failure event on the target;
+    // another writer moves the referral before the commit.
+    let meddling = Meddling::new(repo, &referral, Trigger::Events, 1);
+    let store = retry_store(&meddling, 3);
+    let command = command_id();
+
+    let outcome = store
+        .execute_transaction(&identity, &command_metadata(&command), |tx| {
+            calls.fetch_add(1, Ordering::SeqCst);
+
+            let (referral, target) = (referral.clone(), target.clone());
+
+            Box::pin(async move {
+                let mut wallet = tx.read::<Wallet>(&target).await?;
+                tx.append(&mut wallet, vec![Refused { amount: 1 }.into()])?;
+                tx.fence(ReadFence::new(
+                    referral,
+                    Ledger::TYPE,
+                    EventSequence(1),
+                    FenceProvenance::Caller,
+                ))?;
+
+                Ok(Decision::reject_with_events(Rejection::new(
+                    "apply-failed",
+                    "the base is stale",
+                )))
+            })
+        })
+        .await?;
+    ensure!(
+        outcome.is_rejected() && !outcome.replayed,
+        "a stale caller-stamped fence is a persisted rejection, not an error: {outcome:?}"
+    );
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::stale_fence()),
+        "the stale-fence rejection, not the caller's"
+    );
+    ensure!(
+        outcome.outcome.event_ids.is_empty() && outcome.events.is_empty(),
+        "without the caller's events: {outcome:?}"
+    );
+    ensure_eq!(calls.load(Ordering::SeqCst), 1, "not prepared again");
+    ensure!(
+        repo.events(&target).await?.is_empty(),
+        "nothing was written on the target"
+    );
+    ensure_eq!(
+        repo.outcome(&command).await?,
+        Some(outcome.outcome.clone()),
+        "the stored row"
     );
 
     Ok(())

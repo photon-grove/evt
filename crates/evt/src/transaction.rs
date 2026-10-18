@@ -702,7 +702,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
     }
 
     /// Records the command as a rejected outcome (C4) without writing events: the domain refused
-    /// it. Staged appends are discarded. The commit is an outcome-only transaction: the
+    /// it. Staged appends are discarded ([`reject_with_events`](Transaction::reject_with_events)
+    /// commits them). The commit is an outcome-only transaction: the
     /// feature-marker check, then the fence check of every stream the transaction read (at the
     /// head it saw) and every caller-stamped fence, then the rejected outcome row. A rejection
     /// decided from stale input is therefore not persisted: an engine-filled fence conflict is
@@ -748,14 +749,50 @@ impl<'a, R: Repository> Transaction<'a, R> {
             .collect();
         fences.append(&mut self.fences);
 
-        let outcome = Outcome::rejected(
+        let commit = TransactionCommit::new(Vec::new()).with_fences(fences);
+
+        self.commit_rejection(&pending, rejection, commit, Vec::new())
+            .await
+    }
+
+    /// Records the command as a rejected outcome and commits the events staged with
+    /// [`append`](Transaction::append) in the same atomic repository commit: the aggregate leaves
+    /// the state the command refused and the history shows why, or nothing is written. The commit
+    /// is a normal one: the same continuity, fence, snapshot, projector, and budget rules as
+    /// [`commit_with_outcome`](Transaction::commit_with_outcome), and the rejected outcome row
+    /// lists the events it wrote. A transaction that appended nothing behaves like
+    /// [`reject`](Transaction::reject).
+    ///
+    /// A conflict is an error for the caller to retry with a new transaction, or is re-prepared by
+    /// [`Store::execute_transaction`]. A failed caller-stamped fence persists the `stale-fence`
+    /// rejection without these events, as in `commit_with_outcome`. A replay returns the stored
+    /// rejection and never commits the events again. The returned [`CommandOutcome`] carries the
+    /// committed events in the order the commit persists them.
+    pub async fn reject_with_events(
+        mut self,
+        rejection: Rejection,
+    ) -> Result<CommandOutcome, Error> {
+        let pending = self.take_command()?;
+        let (commit, committed) = self.prepare(&pending.metadata)?;
+
+        self.commit_rejection(&pending, rejection, commit, committed)
+            .await
+    }
+
+    /// Writes a rejected outcome with the fences and events of `commit` and settles the result,
+    /// as a failed caller-stamped fence, a lost outcome put, and an indeterminate failure resolve.
+    async fn commit_rejection(
+        &self,
+        pending: &PendingCommand,
+        rejection: Rejection,
+        mut commit: TransactionCommit<R::Operation>,
+        committed: Vec<SerializedEvent>,
+    ) -> Result<CommandOutcome, Error> {
+        commit.outcome = Some(Outcome::rejected(
             pending.command_id.clone(),
             pending.digest.clone(),
             rejection.canonical()?,
-        );
-        let commit = TransactionCommit::new(Vec::new())
-            .with_fences(fences)
-            .with_outcome(outcome);
+        ));
         let stored = commit
             .stored_outcome()
             .expect("the commit carries the outcome");
@@ -766,7 +803,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             ..
         }) = &result
         {
-            return self.persist_stale_fence(&pending).await;
+            return self.persist_stale_fence(pending).await;
         }
 
         match settle(
@@ -778,7 +815,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         )
         .await?
         {
-            Settled::Committed => Ok(CommandOutcome::fresh(stored, Vec::new(), Vec::new())),
+            Settled::Committed => Ok(CommandOutcome::fresh(stored, committed, Vec::new())),
             Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
         }
     }
@@ -1565,6 +1602,47 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a poisoned transaction writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_transaction_cannot_reject_with_events() {
+        use crate::outcome::{CommandIdentity, OutcomeConfig};
+
+        let repository = MemRepository::new();
+        let bump = || -> Vec<FragileEvent> { vec![Bumped {}.into()] };
+
+        let mut tx = Transaction::new(&repository)
+            .with_outcomes(OutcomeConfig::new())
+            .with_snapshot_interval(1);
+        let command = Metadata::default().with_command_id("poisoned-reject");
+        tx.begin_command(&CommandIdentity::new("fragile:bump"), &command)
+            .await
+            .unwrap();
+        let mut fragile = tx.read::<Fragile>("fragile-2").await.unwrap();
+        tx.append(&mut fragile, bump()).unwrap();
+        assert!(tx.append(&mut fragile, bump()).is_err());
+
+        // The handle is ahead of the staged events: neither rejection form may reach the log.
+        let rejected = tx.reject_with_events(Rejection::new("refused", "no")).await;
+        assert!(
+            matches!(rejected, Err(Error::TransactionPoisoned)),
+            "{rejected:?}"
+        );
+        assert!(
+            repository
+                .events(&"fragile-2".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .outcome(&"poisoned-reject".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "and no outcome row"
         );
     }
 

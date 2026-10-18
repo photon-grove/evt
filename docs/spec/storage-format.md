@@ -676,7 +676,10 @@ so a response of arbitrary bytes round-trips exactly in both languages; the deco
 stored response returned to a retried command. An empty response is no response: the attribute is
 absent (PostgreSQL: `NULL`), and a reader returns no response bytes either way. `events` is a JSON array of event IDs
 (`{entityId}:{sequence}` strings) encoded with the shared JSON rules, in ascending order by
-stream ID bytewise, then by sequence — the same order as the transaction's event puts.
+stream ID bytewise, then by sequence — the same order as the transaction's event puts. A
+**rejected** row lists events only when its rejection carries some
+([Rejections that carry events](#rejections-that-carry-events)); a plain rejection has no `events`
+attribute.
 
 The stored values are bounded **before any write**: the `response` bytes and the encoded
 `rejection` — the `rejection` attribute's JSON, its `message` and `details` included — are each
@@ -916,8 +919,8 @@ terminal outcome is written for it. A multi-stream command performs the outcome 
 any stream is read, fenced, or appended to, and a transaction whose read returned a stored outcome
 is finished.
 
-**Outcome-only commits and their checks.** An accepted no-op, a persisted rejection, and an
-outcome-only command write no event, snapshot, or floor item. Their transaction is the
+**Outcome-only commits and their checks.** An accepted no-op, a persisted rejection that carries
+no events, and an outcome-only command write no event, snapshot, or floor item. Their transaction is the
 feature-marker check, then — for a multi-stream transaction — the fence checks for the streams it
 read (engine-filled and caller-stamped, in the pinned order), then the outcome put, so a
 rejection or a no-op is recorded only if the state it was decided on still holds: a moved
@@ -968,8 +971,8 @@ through the error chain.
 **Stored rows are validated.** A row read back must have a known `status`, a non-empty `digest`, a
 `rejection` — one complete JSON document whose `details` is an object or `null`, with trailing
 data refused — with a non-empty code exactly when the status is `rejected` (and a `code` attribute
-or column present exactly then, equal to it), no `events` on a rejection, well-formed event IDs (`{entityId}:{sequence}`
-with a positive, canonical sequence), and a decodable `response`. A malformed row is a typed
+or column present exactly then, equal to it), well-formed event IDs (`{entityId}:{sequence}`
+with a positive, canonical sequence, on a rejection too), and a decodable `response`. A malformed row is a typed
 corruption error (Go `*CorruptOutcomeError`, Rust `Error::InvalidRecord`) and is never replayed as a
 result; `compat/fixtures/outcomes.json` carries the malformed rows both languages must refuse.
 
@@ -1038,6 +1041,84 @@ verbatim. The engine records it in two cases, both persisted by the outcome-only
 pinned in [Fence-Aware Retry](#fence-aware-retry), which deliberately omits the failed fences: a
 caller-stamped fence failed, or fence-aware retry ran out of attempts. The remedy is a new command
 ID, decided on fresh state, not a retry of the old one.
+
+### Rejections that carry events
+
+A rejection may carry **domain events** (v0.9, C4): the domain refuses the command, and the
+history still has to record what happened. A proposal whose apply finds its base revision stale is
+the example: the client gets a rejection, and the proposal stream gets an `apply-failed` event in
+the same commit, so the aggregate leaves its "applicable" state and the audit trail is complete.
+Without this the choices are to accept the command, which gives the client the wrong answer, or to
+write the event outside the outcome commit, which is not atomic.
+
+**Declaration.** Go marks the handler or `Prepare` error with `evt.RejectWithEvents`, and
+`Transaction.RejectWithEvents` finishes a transaction that way; Rust implements
+`Aggregate::rejection_events` for the single-aggregate path, and returns
+`Decision::reject_with_events` (`Transaction::reject_with_events`) for a transaction. The events are
+the ones a command of the same shape would commit if accepted: for a single-aggregate command, new
+events on the command's own stream; for a transaction, events appended to any stream the command
+read (a stream it did not read cannot be appended to). A rejection with no events is the plain
+rejection, and the plain forms (`Reject`, `Decision::reject`) keep discarding staged events.
+
+**Commit.** The events and the rejected outcome row are one atomic commit, with the transaction
+shape of an accepted commit ([Writes](#writes)): the feature-marker check, projector operations,
+the written streams (continuation and floor checks, event puts, snapshot puts), the fence checks of
+the streams the command read but did not write, and the outcome put last. Every rule of an accepted
+commit applies unchanged:
+
+- optimistic concurrency and continuity: a stale head is a conflict, and neither the events nor the
+  row are written;
+- a caller-stamped fence that went stale is the `stale-fence` rejection, without these events;
+- reserved streams (`SYSTEM#`, `command-outcome#`) are refused, and projector operations need an
+  event behind them ([Views](#views)), so a rejection that carries operations but no events is
+  `ProjectorOnlyCommitError` (Go) / `ProjectorWithoutEvents` (Rust);
+- the commit budget counts every action, the outcome item included, so an oversized rejection is
+  `CommitTooLarge` before any write ([Writes](#writes));
+- snapshots, projectors, event metadata (`commitId`, `commandId`, `causationId`), and the
+  U+0000/UTF-8 rules are those of an accepted commit.
+
+The response is not stored with a rejection. The `rejection` attribute and its bound are unchanged.
+
+**The row.** It is the rejected row of [Command Outcomes](#command-outcomes) with an `events`
+attribute listing the event IDs the commit wrote, in the same stream-ID-then-sequence order as an
+accepted row's; the attribute order and encoding are unchanged. The rejection `code` still repeats
+`rejection.code`. For `proposal#p-1`, which a command read at sequence 3 and recorded two failure
+events on:
+
+```json
+{
+  "pk": "command-outcome#cmd-0010",
+  "sk": 1,
+  "status": "rejected",
+  "digest": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+  "events": "[\"proposal#p-1:4\",\"proposal#p-1:5\"]",
+  "rejection": "{\"code\":\"apply-conflict\",\"message\":\"the proposal was decided on a stale base\",\"details\":{\"base\":3}}",
+  "code": "apply-conflict"
+}
+```
+
+**Replay.** Like any outcome, a rejection with events is terminal for its digest. A retry reads
+the row first, returns the stored rejection (marked replayed, with the stored event IDs), runs
+nothing, and writes nothing, so the events are never applied twice. The command ID is not reusable
+for another command (`IdempotencyKeyReuse`).
+
+**Fence-aware retry.** A conflict while committing a rejection with events re-prepares the command
+like any commit-time conflict ([Re-preparing](#re-preparing)): the handler runs again on freshly
+loaded state, and it may reach a different decision, such as accepting, in which case no failure
+event is written. Only the committing attempt writes anything. When the attempts run out, the
+engine persists the `stale-fence` rejection by the [outcome-only
+transaction](#the-outcome-only-transaction) **without the caller's events**: the decision they
+describe was made on state that kept changing, so none of it is recorded.
+
+**Wire compatibility.** The row layout does not change: `events` is an existing attribute, and a
+rejected row without it (every plain rejection, including both `stale-fence` forms) is
+byte-identical to what v0.9 pre-release writers produced. What changes is the validation of a
+stored rejected row: it no longer must be free of event IDs, and its event IDs are held to the
+same rules as an accepted row's. A reader that predates this rule refuses a rejected row that lists
+events as corrupt (fail closed, never replayed as a result); outcomes ship in v0.9, so no
+released reader exists. `compat/fixtures/outcomes.json` pins the new row (`rejected with events`),
+and `compat/scenarios.json` the `outcomes-rejection-events` scenario; the row that was a malformed
+vector (`rejected with events`) is a valid one now.
 
 ## Fence-Aware Retry
 
@@ -1235,7 +1316,8 @@ winner's row returns the stored outcome (same digest) or `IdempotencyKeyReuse` (
 Fence provenance (engine-filled vs caller-stamped) is in-memory commit metadata, not stored. The
 only stored trace of fence-aware retry is the exhausted rejection above, which is an ordinary
 outcome row, so **there is no wire-format change** beyond the pinned message and details of that
-rejection.
+rejection. The outcome-only transaction never carries a caller's events, even when the command
+that failed was a [rejection with events](#rejections-that-carry-events).
 
 ## Reserved Namespaces
 
@@ -1978,7 +2060,7 @@ and the live interleaved runs (`scripts/compat-integration.sh dynamo|postgres`) 
 steps on real backends. **E2.8** (Go conformance suite + fixtures) and **E3.8** (Rust conformance
 suite + the live runs) must implement every scenario in this list; the names are the shared keys
 in `compat/scenarios.json`. The `metadata-extensions` case is implemented for C6 (E2.1/E3.1)
-in the current single-stream harness; it does not enable outcomes. The four `outcomes-*` scenarios
+in the current single-stream harness; it does not enable outcomes. The five `outcomes-*` scenarios
 are implemented with C3/C4 (E2.4/E3.4): they set `"outcomes": true`, so both writers run them on
 stores with outcomes enabled and a command ID on every step, and the fixtures pin each stored
 outcome row and the `TransactWriteItems` request order of every step. The other scenarios are
@@ -1999,6 +2081,7 @@ encodings of the outcome rows (DynamoDB item, its budgeted size, PostgreSQL row)
 | `outcomes-idempotency` | C3     | A retry with the same identity digest returns the stored outcome and writes nothing; a retry with a different digest is `IdempotencyKeyReuse` in both languages; a command ID over 512 UTF-8 bytes fails with `CommandIdTooLong` before any write.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `outcomes-noop`        | C3     | A zero-event command and an outcome-only commit are stored as accepted with no `events` attribute.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `outcomes-rejection`   | C3, C4 | A domain rejection is persisted once in final state; the retried command replays it verbatim, cross-language.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `outcomes-rejection-events` | C4 | A rejection that carries events commits them atomically with the rejected row, across a snapshot boundary; the row lists them; the retried command replays the rejection in either language without writing them again; a plain rejection still writes none. |
 | `outcomes-ambiguous`   | C3     | After an indeterminate commit error — injected with `injectCommitFault` so the commit really applied — the re-read by command ID returns the stored outcome (same digest), `IdempotencyKeyReuse` (different digest), or absence (safe retry).                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `commit-too-large`     | C1     | A commit whose item budget exceeds 100, or whose estimated request exceeds the byte budgets (3,800,000 bytes in aggregate, 380,000 bytes for any single item), fails with `CommitTooLarge` before any write, in both languages and on both backends; nothing is stored and the commit is never split.                                                                                                                                                                                                                                                                                                                                                                                          |
 | `multi-stream-commit`  | C1     | One commit appends to two streams atomically; the other language interleaves and must see both streams or neither. Per-stream floor checks apply. Every touched stream is observed, and the fixture pins the transaction's `TransactWriteItems` action order, which the Rust builder asserts.                                                                                                                                                                                                                                                                                                                                                                                                  |

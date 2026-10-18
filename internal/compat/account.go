@@ -315,6 +315,21 @@ func (a *Account) Handle(_ context.Context, command evt.Command) (evt.CommandRes
 		}
 		return emitWithBalance(a.BalanceCents-c.AmountCents, MoneyWithdrawn{AmountCents: c.AmountCents})
 
+	case "withdrawAudited":
+		// Like withdraw, but a refusal for insufficient funds is recorded in the account's history
+		// as a tag, in the same commit as the rejection.
+		if c.AmountCents <= 0 {
+			return reject("amount must be positive")
+		}
+		if c.AmountCents > a.BalanceCents {
+			return evt.CommandResult{Events: []evt.Event{AccountTagged{Tags: []string{"overdraft-attempted"}}}},
+				evt.RejectWithEvents(&RejectedError{
+					Reason:  "insufficient funds",
+					Details: map[string]any{"balanceCents": a.BalanceCents, "requestedCents": c.AmountCents},
+				})
+		}
+		return emitWithBalance(a.BalanceCents-c.AmountCents, MoneyWithdrawn{AmountCents: c.AmountCents})
+
 	case "ping":
 		// Accepted with no events and no response.
 		return evt.CommandResult{}, nil

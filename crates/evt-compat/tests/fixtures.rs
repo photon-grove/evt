@@ -668,6 +668,39 @@ fn stale_fence_rejections_match_go_byte_for_byte() {
     );
 }
 
+/// A rejection that carries events lists them on its row, beside the rejection and its code; a
+/// plain rejection's row has no `events` attribute, exactly as it never did.
+#[test]
+fn a_rejection_lists_events_only_when_it_committed_some() {
+    let rows = outcome_fixtures().rows;
+    let row = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row vector {name:?}"))
+    };
+
+    let with_events = row("rejected with events");
+    assert_eq!(with_events.input.status, "rejected");
+    assert_eq!(
+        with_events.input.event_ids,
+        ["proposal#p-1:4", "proposal#p-1:5"]
+    );
+    assert!(with_events.dynamo_item["events"]["S"].is_string());
+    assert!(with_events.dynamo_item["rejection"]["S"].is_string());
+
+    for plain in [
+        "rejected",
+        "rejected stale fence",
+        "rejected stale fence, retries exhausted",
+    ] {
+        let plain = row(plain);
+
+        assert!(plain.input.event_ids.is_empty(), "{}", plain.name);
+        assert!(plain.dynamo_item.get("events").is_none(), "{}", plain.name);
+        assert_eq!(plain.postgres_row["events"], "[]", "{}", plain.name);
+    }
+}
+
 /// A command's identity is its intent: the digest of a rename, whose write set comes from state, is
 /// computed from the request alone, and Rust's `CommandIdentity` reproduces Go's vector.
 #[test]

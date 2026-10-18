@@ -165,12 +165,13 @@ impl<Op> Commit<Op> {
     /// checks only look at `entity_id` and the first event's sequence, loads reject streams with
     /// gaps, typed scans read each row's entity type, and DynamoDB does not store the event ID.
     ///
-    /// A commit with an [outcome](Commit::with_outcome) is validated first: the command ID, the
-    /// response and rejection bounds, and a rejected outcome with events is invalid. A commit
-    /// with no events and no operations is a valid no-op (or an outcome-only commit when it
-    /// carries an outcome), and repositories ignore its snapshot. Operations without an event are refused with
-    /// [`Error::ProjectorWithoutEvents`]: views are projections of committed events, so a
-    /// projector operation with no backing event could never be rebuilt by replay (ADR-0012).
+    /// A commit with an [outcome](Commit::with_outcome) is validated first: the command ID and the
+    /// response and rejection bounds. A rejected outcome may carry events, under the rules of an
+    /// accepted commit. A commit with no events and no operations is a valid no-op (or an
+    /// outcome-only commit when it carries an outcome), and repositories ignore its snapshot.
+    /// Operations without an event are refused with [`Error::ProjectorWithoutEvents`]: views are
+    /// projections of committed events, so a projector operation with no backing event could never
+    /// be rebuilt by replay (ADR-0012).
     pub fn validate(&self) -> Result<(), Error> {
         let invalid = |message: String| Err(Error::InvalidCommit(message));
 
@@ -181,13 +182,6 @@ impl<Op> Commit<Op> {
                 self.snapshot.iter().map(|snapshot| &snapshot.entity_type),
                 [&self.entity_id],
             )?;
-
-            if outcome.is_rejected() && !self.events.is_empty() {
-                return invalid(format!(
-                    "a rejected outcome for command {} cannot carry events",
-                    outcome.command_id
-                ));
-            }
         }
 
         let Some(first) = self.events.first() else {
@@ -441,15 +435,6 @@ impl<Op> TransactionCommit<Op> {
         operations.append(&mut self.operations);
         self.operations = operations;
         self.streams.retain(|stream| !stream.events.is_empty());
-        if let Some(outcome) = &self.outcome
-            && outcome.is_rejected()
-            && !self.streams.is_empty()
-        {
-            return Err(Error::InvalidCommit(format!(
-                "a rejected outcome for command {} cannot carry events",
-                outcome.command_id
-            )));
-        }
         self.streams.sort_by(|a, b| {
             a.entity_id
                 .as_str()
@@ -1114,19 +1099,30 @@ mod tests {
     fn commits_validate_their_outcome_before_anything_else() {
         let rejected = Outcome::rejected("c", "digest", crate::outcome::Rejection::new("x", "y"));
 
-        // A rejection cannot carry events, in either commit shape.
+        // A rejection may carry events, in either commit shape, and lists them.
         let with_events =
             Commit::<u8>::new("a", vec![event("a", 1)]).with_outcome(rejected.clone());
-        assert!(matches!(
-            with_events.validate(),
-            Err(Error::InvalidCommit(_))
-        ));
+        with_events.validate().unwrap();
+        assert_eq!(
+            with_events.stored_outcome().unwrap().event_ids,
+            vec![EventId::new("a:1")]
+        );
         let mut transaction =
             TransactionCommit::new(vec![Commit::<u8>::new("a", vec![event("a", 1)])])
                 .with_outcome(rejected.clone());
+        transaction.normalize().unwrap();
+        assert_eq!(
+            transaction.stored_outcome().unwrap().event_ids,
+            vec![EventId::new("a:1")]
+        );
+
+        // Operations still need an event behind them, rejected or not.
+        let mut operations = TransactionCommit::<u8>::new(Vec::new())
+            .with_operations([1])
+            .with_outcome(rejected.clone());
         assert!(matches!(
-            transaction.normalize(),
-            Err(Error::InvalidCommit(_))
+            operations.normalize(),
+            Err(Error::ProjectorWithoutEvents { operations: 1 })
         ));
 
         // Without events it is a valid outcome-only commit.

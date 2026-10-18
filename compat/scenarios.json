@@ -261,6 +261,24 @@
       ]
     },
     {
+      "name": "outcomes-rejection-events",
+      "description": "A rejection can carry domain events: the events and the rejected outcome row commit atomically, the row lists the events, and the retried command replays the rejection in either language without writing them again; a plain rejection still writes none. The events cross a snapshot boundary.",
+      "snapshotInterval": 3,
+      "outcomes": true,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Ada Lovelace", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "withdrawAudited", "amountCents": 500 }, "expect": { "result": "rejected", "code": "insufficient-funds", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c3", "command": { "type": "withdrawAudited", "amountCents": 500 }, "expect": { "result": "rejected", "code": "insufficient-funds", "events": 1, "replayed": true } },
+        { "by": "rust", "op": "execute", "commandId": "c4", "command": { "type": "withdrawAudited", "amountCents": 700 }, "expect": { "result": "rejected", "code": "insufficient-funds", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c4", "command": { "type": "withdrawAudited", "amountCents": 700 }, "expect": { "result": "rejected", "code": "insufficient-funds", "events": 1, "replayed": true } },
+        { "by": "go", "op": "execute", "commandId": "c4", "command": { "type": "withdrawAudited", "amountCents": 701 }, "expect": { "result": "reuse" } },
+        { "by": "rust", "op": "execute", "commandId": "c5", "command": { "type": "withdrawAudited", "amountCents": 40 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "execute", "commandId": "c6", "command": { "type": "withdraw", "amountCents": 1000 }, "expect": { "result": "rejected", "code": "insufficient-funds" } },
+        { "by": "rust", "op": "execute", "commandId": "c6", "command": { "type": "withdraw", "amountCents": 1000 }, "expect": { "result": "rejected", "code": "insufficient-funds", "replayed": true } }
+      ]
+    },
+    {
       "name": "outcomes-ambiguous",
       "description": "After an indeterminate commit error injected so the commit really applied, the re-read by command ID returns the stored outcome (same digest); a dropped commit leaves the row absent for the whole recovery window, so the result is a retryable ambiguous write (never \"not applied\") and the retry is safe; a different digest is IdempotencyKeyReuse; a recovered rejection is the stored rejection.",
       "snapshotInterval": 0,

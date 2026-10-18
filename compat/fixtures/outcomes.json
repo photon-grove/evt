@@ -467,6 +467,55 @@
       }
     },
     {
+      "name": "rejected with events",
+      "input": {
+        "commandId": "cmd-0010",
+        "status": "rejected",
+        "digest": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+        "response": null,
+        "eventIds": [
+          "proposal#p-1:4",
+          "proposal#p-1:5"
+        ],
+        "rejection": "{\"code\":\"apply-conflict\",\"message\":\"the proposal was decided on a stale base\",\"details\":{\"base\":3}}"
+      },
+      "eventsJson": "[\"proposal#p-1:4\",\"proposal#p-1:5\"]",
+      "rejectionJson": "{\"code\":\"apply-conflict\",\"message\":\"the proposal was decided on a stale base\",\"details\":{\"base\":3}}",
+      "dynamoItem": {
+        "code": {
+          "S": "apply-conflict"
+        },
+        "digest": {
+          "S": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79"
+        },
+        "events": {
+          "S": "[\"proposal#p-1:4\",\"proposal#p-1:5\"]"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0010"
+        },
+        "rejection": {
+          "S": "{\"code\":\"apply-conflict\",\"message\":\"the proposal was decided on a stale base\",\"details\":{\"base\":3}}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        }
+      },
+      "itemSize": 280,
+      "postgresRow": {
+        "code": "apply-conflict",
+        "command_id": "cmd-0010",
+        "digest": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+        "events": "[\"proposal#p-1:4\",\"proposal#p-1:5\"]",
+        "rejection": "{\"code\":\"apply-conflict\",\"message\":\"the proposal was decided on a stale base\",\"details\":{\"base\":3}}",
+        "response": null,
+        "status": "rejected"
+      }
+    },
+    {
       "name": "rejected with escaped and nested details",
       "input": {
         "commandId": "cmd-0007",
@@ -651,7 +700,7 @@
       }
     },
     {
-      "name": "rejected with events",
+      "name": "rejected with a malformed event ID",
       "dynamoItem": {
         "code": {
           "S": "c"
@@ -660,7 +709,7 @@
           "S": "digest"
         },
         "events": {
-          "S": "[\"a:1\"]"
+          "S": "[\"a:0\"]"
         },
         "pk": {
           "S": "command-outcome#bad"

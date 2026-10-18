@@ -85,6 +85,51 @@ type Rejection struct {
 	Details map[string]any `json:"details"`
 }
 
+// RejectWithEvents marks an error that maps to a rejection (RejectionOf) as one whose events are
+// committed with it: the events and the rejected outcome row land in one atomic commit, under the
+// same continuity, fence, and budget rules as an accepted commit. It is how a command records what
+// happened next to the refusal, such as a proposal whose apply fails recording an `apply-failed`
+// event beside its rejection.
+//
+// Which events are committed depends on where the error is returned:
+//
+//   - Entity.Handle: the Events of the CommandResult returned beside the error, on the entity's
+//     own stream. The Response is not stored with a rejection.
+//   - snapshots.Prepare: the events staged with Transaction.Append, on any stream the Prepare
+//     function read.
+//
+// A replay returns the stored rejection and never applies the events again. If the commit
+// conflicts with another writer the command is re-prepared like any other; when retries run out the
+// engine records the stale-fence rejection without these events. An error that does not map to a
+// rejection stays an internal failure and writes nothing. Returning the unmarked error keeps the
+// plain rejection, which writes no events.
+//
+// Only a store with outcomes enabled records a rejection: Store.Execute on a store without
+// outcomes returns the marked error and discards the events. The marker is transparent to
+// errors.Is and errors.As, but it is the type of RejectionError.Err, so a direct type assertion on
+// the handler's error no longer matches; use errors.As.
+func RejectWithEvents(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	return &rejectWithEventsError{err: err}
+}
+
+// RejectsWithEvents reports whether err, anywhere in its chain, was marked by RejectWithEvents.
+func RejectsWithEvents(err error) bool {
+	var marked *rejectWithEventsError
+
+	return errors.As(err, &marked)
+}
+
+// rejectWithEventsError is the RejectWithEvents marker. It deliberately does not implement
+// Rejectioner: RejectionOf finds the wrapped error's rejection through Unwrap.
+type rejectWithEventsError struct{ err error }
+
+func (e *rejectWithEventsError) Error() string { return e.err.Error() }
+func (e *rejectWithEventsError) Unwrap() error { return e.err }
+
 // Rejectioner is implemented by domain errors that map onto a Rejection. An error returned by
 // Entity.Handle that implements it (anywhere in its Unwrap chain) is persisted as a rejected
 // outcome; any other error is an internal failure that writes no outcome.
@@ -193,7 +238,8 @@ type Outcome struct {
 	Response []byte
 
 	// EventIDs are the events the commit wrote, in ascending order by stream ID (bytewise), then
-	// sequence. Empty for a rejection and for an accepted no-op.
+	// sequence. Empty for an accepted no-op and for a rejection that carries no events; a
+	// rejection recorded with RejectWithEvents lists the events it committed.
 	EventIDs []EventID
 
 	// Rejection is set when Status is OutcomeRejected.
@@ -215,7 +261,8 @@ type CommandOutcome struct {
 	Outcome
 
 	// Events are the events this call committed, in the order the commit persists them. Empty
-	// when the outcome was replayed from a stored row, and for a rejection or a no-op.
+	// when the outcome was replayed from a stored row, for a no-op, and for a rejection that
+	// carries no events (a RejectWithEvents rejection lists the events it committed).
 	Events []SerializedEvent
 
 	// Replayed reports that the outcome was read back from a stored row — a duplicate command
@@ -443,9 +490,10 @@ func (e *CorruptOutcomeError) Error() string {
 func (e *CorruptOutcomeError) Is(target error) bool { return target == ErrCorruptOutcome }
 
 // ValidateStoredOutcome checks an outcome decoded from storage: a known status, a digest, a
-// rejection with a code exactly when the status is rejected, no event IDs on a rejection, and
-// well-formed event IDs ({entityId}:{sequence}, a positive canonical sequence). It returns
-// *CorruptOutcomeError otherwise. Every backend runs it on the rows it reads.
+// rejection with a code exactly when the status is rejected, and well-formed event IDs
+// ({entityId}:{sequence}, a positive canonical sequence). A rejection may list the events it
+// committed, and its event IDs are held to the same rule. It returns *CorruptOutcomeError
+// otherwise. Every backend runs it on the rows it reads.
 func ValidateStoredOutcome(outcome Outcome) error {
 	corrupt := func(reason string) error {
 		return &CorruptOutcomeError{CommandID: outcome.CommandID, Reason: reason}
@@ -463,10 +511,6 @@ func ValidateStoredOutcome(outcome Outcome) error {
 	case OutcomeRejected:
 		if outcome.Rejection == nil || outcome.Rejection.Code == "" {
 			return corrupt("a rejected outcome has no rejection code")
-		}
-
-		if len(outcome.EventIDs) > 0 {
-			return corrupt("a rejected outcome lists events")
 		}
 	default:
 		return corrupt(fmt.Sprintf("unknown status %q", outcome.Status))

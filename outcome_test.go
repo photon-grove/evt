@@ -3,6 +3,7 @@ package evt_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -303,21 +304,103 @@ func TestNormalizeCommitDerivesOutcomeEventIDsInCanonicalOrder(t *testing.T) {
 func TestNormalizeCommitRefusesBadOutcomes(t *testing.T) {
 	t.Parallel()
 
-	rejectedWithEvents := evt.SerializedResult{
-		Events: []evt.SerializedEvent{{
-			ID: "a:1", Sequence: 1, EntityID: "a", EntityType: "t", Type: "t:e", Version: 1,
-		}},
-		Outcome: &evt.Outcome{
-			CommandID: "cmd", Status: evt.OutcomeRejected, Digest: "d",
-			Rejection: &evt.Rejection{Code: "c", Message: "m"},
-		},
+	_, err := evt.NormalizeCommit(evt.SerializedResult{Outcome: &evt.Outcome{CommandID: "", Status: evt.OutcomeAccepted, Digest: "d"}})
+	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+}
+
+func TestNormalizeCommitAcceptsARejectionThatCarriesEvents(t *testing.T) {
+	t.Parallel()
+
+	event := func(stream string) evt.SerializedEvent {
+		return evt.SerializedEvent{
+			ID: evt.GetEventID(evt.EntityID(stream), 1), Sequence: 1,
+			EntityID: evt.EntityID(stream), EntityType: "t", Type: "t:e", Version: 1,
+		}
 	}
 
-	_, err := evt.NormalizeCommit(rejectedWithEvents)
-	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+	rejected := func(events ...evt.SerializedEvent) evt.SerializedResult {
+		return evt.SerializedResult{
+			Events: events,
+			Outcome: &evt.Outcome{
+				CommandID: "cmd", Status: evt.OutcomeRejected, Digest: "d",
+				Rejection: &evt.Rejection{Code: "c", Message: "m"},
+			},
+		}
+	}
 
-	_, err = evt.NormalizeCommit(evt.SerializedResult{Outcome: &evt.Outcome{CommandID: "", Status: evt.OutcomeAccepted, Digest: "d"}})
-	require.ErrorIs(t, err, evt.ErrInvalidArgument)
+	// The rejected row lists what the commit writes, in the pinned order.
+	normalized, err := evt.NormalizeCommit(rejected(event("profile#u-1"), event("claim#ada")))
+	require.NoError(t, err)
+	assert.Equal(t, []evt.EventID{"claim#ada:1", "profile#u-1:1"}, normalized.Outcome.EventIDs)
+	assert.True(t, normalized.Outcome.Rejected())
+
+	// The checks an accepted commit has still apply: a reserved stream is refused, and so is a
+	// canonical-ID mismatch.
+	_, err = evt.NormalizeCommit(rejected(event("SYSTEM#FEATURES")))
+	require.True(t, evt.IsReservedEntityIdErr(err), "%v", err)
+
+	wrong := event("a")
+	wrong.ID = "a:7"
+	_, err = evt.NormalizeCommit(rejected(wrong))
+
+	var invalid *evt.InvalidCommitError
+	require.ErrorAs(t, err, &invalid)
+
+	// Projector operations still need a backing event: a rejection without events cannot carry them.
+	withOperations := rejected()
+	withOperations.Transaction = evt.Transaction{stubGroup{}}
+	_, err = evt.NormalizeCommit(withOperations)
+
+	var projectorOnly *evt.ProjectorOnlyCommitError
+	require.ErrorAs(t, err, &projectorOnly)
+}
+
+// stubGroup is a one-operation projector group.
+type stubGroup struct{}
+
+func (stubGroup) Len() int                                                 { return 1 }
+func (stubGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) { return stubGroup{}, nil }
+func (stubGroup) StorageType() evt.StorageType                             { return "stub" }
+func (stubGroup) TransactionType() evt.TransactionType                     { return "stub" }
+func (stubGroup) HandleError(err error, _ int) error                       { return err }
+
+func TestRejectWithEventsMarksARejectionAndKeepsItsMapping(t *testing.T) {
+	t.Parallel()
+
+	domain := evt.NewNotFoundError("proposal not found")
+	marked := evt.RejectWithEvents(domain)
+
+	require.True(t, evt.RejectsWithEvents(marked))
+	require.False(t, evt.RejectsWithEvents(domain))
+	require.False(t, evt.RejectsWithEvents(nil))
+	require.NoError(t, evt.RejectWithEvents(nil))
+
+	// The marker is transparent: the wrapped error still maps and matches, even when wrapped again.
+	rejection, ok := evt.RejectionOf(fmt.Errorf("apply: %w", marked))
+	require.True(t, ok)
+	assert.Equal(t, evt.RejectionNotFound, rejection.Code)
+	assert.True(t, evt.RejectsWithEvents(fmt.Errorf("apply: %w", marked)))
+	assert.True(t, evt.IsNotFoundErr(marked))
+	assert.Equal(t, domain.Error(), marked.Error())
+
+	// Marking an error that is not a rejection does not turn it into one.
+	_, ok = evt.RejectionOf(evt.RejectWithEvents(errors.New("storage exploded")))
+	assert.False(t, ok)
+}
+
+func TestValidateStoredOutcomeAllowsARejectionThatListsEvents(t *testing.T) {
+	t.Parallel()
+
+	rejected := evt.Outcome{
+		CommandID: "cmd", Status: evt.OutcomeRejected, Digest: "d",
+		Rejection: &evt.Rejection{Code: "c", Message: "m"},
+		EventIDs:  []evt.EventID{"a:2", "b:1"},
+	}
+	require.NoError(t, evt.ValidateStoredOutcome(rejected))
+
+	// Its event IDs are held to the same rules as an accepted outcome's.
+	rejected.EventIDs = []evt.EventID{"a:0"}
+	require.ErrorIs(t, evt.ValidateStoredOutcome(rejected), evt.ErrCorruptOutcome)
 }
 
 func TestIdempotencyKeyReuseMatchesWithErrorsIs(t *testing.T) {

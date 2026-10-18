@@ -143,6 +143,18 @@ implements `ToRejection`:
   verbatim. A `None` is an internal failure the handler could not decide: it is returned as
   `Error::Handler` and records nothing, like every other internal failure, so a retry after the fix
   starts clean.
+- A rejection can carry events. A proposal whose apply finds its base revision stale should answer
+  the client with a rejection *and* leave an `apply-failed` event on the proposal. Implement
+  `Aggregate::rejection_events(&self, error)` to return those events for the errors that map to a
+  rejection (the default is none): they commit in the same atomic transaction as the rejected row,
+  which lists them, and a replay returns the stored rejection without writing them again. They are
+  applied, snapshotted, and projected like an accepted command's events. In a transaction, stage
+  the events with `append` and return `Decision::reject_with_events` (or call
+  `Transaction::reject_with_events`); `Decision::reject` and `Transaction::reject` still discard
+  what was staged. Every rule of an accepted commit applies (continuity, fences, reserved streams,
+  the commit budget). A conflict re-prepares the command, which may then decide differently; when
+  attempts run out, the `stale-fence` rejection is recorded without these events. A rejection
+  stores no response.
 - A command that decides no events is an accepted no-op, and a response (at most 65536 bytes) is
   stored with the outcome. See `Store::execute_with_response`.
 - A commit whose result is unknown (`Error::Indeterminate`: a timeout, a dropped connection, a server fault; a definitive refusal such as a validation or authorization error stays `Error::Backend` and is not recovered) is settled by polling the outcome row for the recovery window

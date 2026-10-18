@@ -67,10 +67,15 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("RejectionSupersedesCallerFences", func(t *testing.T) { testRejectionFenceOrdering(t, outcomes(t)) })
 	t.Run("LegacyCommandIDWindow", func(t *testing.T) { testLegacyCommandIDWindow(t, outcomes(t)) })
 	t.Run("RejectsReservedOutcomeStreams", func(t *testing.T) { testOutcomeStreamsAreReserved(t, outcomes(t)) })
+	t.Run("RejectionWithEvents", func(t *testing.T) { testRejectionWithEvents(t, outcomes(t)) })
+	t.Run("RejectionWithEventsInATransaction", func(t *testing.T) { testRejectionWithEventsTransaction(t, outcomes(t)) })
+	t.Run("RejectionWithEventsCommitRules", func(t *testing.T) { testRejectionWithEventsCommitRules(t, outcomes(t), enforcesConcurrency) })
 
 	if enforcesConcurrency {
 		t.Run("ConflictLeavesNoOutcome", func(t *testing.T) { testConflictLeavesNoOutcome(t, outcomes(t)) })
 		t.Run("SingleAggregateRetryRePrepares", func(t *testing.T) { testSingleAggregateRetry(t, outcomes(t)) })
+		t.Run("RejectionWithEventsRePreparesAndExhausts", func(t *testing.T) { testRejectionWithEventsRetry(t, outcomes(t)) })
+		t.Run("RejectionWithEventsAndAStaleCallerFence", func(t *testing.T) { testRejectionWithEventsCallerFence(t, outcomes(t)) })
 	}
 }
 
@@ -122,9 +127,12 @@ func (l *ledger) Apply(event evt.Event) error {
 
 	l.Seen[changed.Kind]++
 
-	if changed.Kind == "withdrawn" {
+	switch changed.Kind {
+	case "withdrawn":
 		l.Total -= changed.Amount
-	} else {
+	case "flagged":
+		// A failure record: it changes no balance.
+	default:
 		l.Total += changed.Amount
 	}
 
@@ -190,6 +198,23 @@ func (l *ledger) Handle(_ context.Context, command evt.Command) (evt.CommandResu
 				Code: "insufficient-funds", Message: "balance is too low",
 				Details: map[string]any{"balance": l.Total, "requested": c.Amount},
 			}}
+		}
+
+		return evt.CommandResult{
+			Events:   []evt.Event{&ledgerEvent{Kind: "withdrawn", Amount: c.Amount}},
+			Response: total(-c.Amount),
+		}, nil
+
+	case "withdraw-flagged":
+		if c.Amount > l.Total {
+			// The refusal is recorded beside the rejection: the failed attempt is part of the history.
+			return evt.CommandResult{
+					Events:   []evt.Event{&ledgerEvent{Kind: "flagged", Amount: c.Amount}},
+					Response: []byte("ignored with a rejection"),
+				}, evt.RejectWithEvents(&domainRejection{evt.Rejection{
+					Code: "insufficient-funds", Message: "balance is too low",
+					Details: map[string]any{"balance": l.Total, "requested": c.Amount},
+				}})
 		}
 
 		return evt.CommandResult{
@@ -1367,4 +1392,380 @@ func testOutcomeStreamsAreReserved(t *testing.T, repo evt.OutcomeRepository) {
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 		Outcome: &evt.Outcome{CommandID: evt.CommandID(ns), Status: evt.OutcomeAccepted, Digest: "d"},
 	}))
+}
+
+// --- rejections that carry events ---
+
+// kinds lists the event kinds of a stream's stored events, in order.
+func kinds(t *testing.T, events []evt.SerializedEvent) []string {
+	t.Helper()
+
+	out := make([]string, 0, len(events))
+
+	for _, event := range events {
+		var payload ledgerEvent
+		require.NoError(t, json.Unmarshal(event.Payload, &payload))
+
+		out = append(out, payload.Kind)
+	}
+
+	return out
+}
+
+// A rejection marked with RejectWithEvents commits its events and the rejected outcome row in one
+// atomic commit; the outcome lists the events, and a replay returns the stored rejection without
+// running the handler or writing the events again.
+func testRejectionWithEvents(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newOutcomeEnv(t, repo, 0)
+	ran := counter()
+
+	first, err := env.run(t, &ledgerCommand{Kind: "deposit", Amount: 2}, env.commandID("seed"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted())
+
+	id := env.commandID("flagged")
+	command := &ledgerCommand{Kind: "withdraw-flagged", Amount: 5, ran: ran}
+	entity := newLedger(env.id)
+
+	outcome, err := env.store.ExecuteWithOutcome(ctx, entity, env.id, command, withCommand(id))
+	require.NoError(t, err)
+	require.True(t, outcome.Rejected())
+	require.False(t, outcome.Replayed)
+	require.Equal(t, evt.RejectionCode("insufficient-funds"), outcome.Rejection.Code)
+	require.Nil(t, outcome.Response, "a rejection stores no response")
+	require.Equal(t, []evt.EventID{evt.GetEventID(env.id, 2)}, outcome.EventIDs)
+	require.Len(t, outcome.Events, 1)
+	require.Equal(t, 1, int(ran.Load()))
+
+	stored := env.events(t, env.id)
+	require.Equal(t, []string{"deposited", "flagged"}, kinds(t, stored))
+	require.Equal(t, 2, entity.Total, "the flagged event changed no balance")
+	require.Equal(t, 1, entity.Seen["flagged"], "the entity reflects the committed events")
+
+	row, err := env.repo.GetOutcome(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, outcome.Outcome, *row, "the rejected row lists the events it wrote")
+
+	// Store.Execute surfaces the rejection and still commits the events once.
+	errID := env.commandID("flagged-execute")
+	err = env.store.Execute(ctx, newLedger(env.id), env.id, &ledgerCommand{Kind: "withdraw-flagged", Amount: 9}, withCommand(errID))
+
+	var rejected *evt.RejectionError
+	require.ErrorAs(t, err, &rejected)
+	require.ErrorIs(t, err, evt.ErrRejected)
+	require.Len(t, env.events(t, env.id), 3)
+
+	// A replay returns the stored rejection and applies nothing.
+	replayed, err := env.store.ExecuteWithOutcome(ctx, newLedger(env.id), env.id, command, withCommand(id))
+	require.NoError(t, err)
+	require.True(t, replayed.Replayed)
+	require.Equal(t, outcome.Outcome, replayed.Outcome)
+	require.Empty(t, replayed.Events)
+	require.Equal(t, 1, int(ran.Load()), "the handler did not run again")
+	require.Len(t, env.events(t, env.id), 3, "the events were not duplicated")
+
+	// The command ID is terminal for its digest, and another command under it is a reuse.
+	_, err = env.run(t, &ledgerCommand{Kind: "withdraw-flagged", Amount: 6}, id)
+	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse)
+	require.Len(t, env.events(t, env.id), 3)
+
+	// The same marked error without a balance problem is an ordinary accepted command.
+	accepted, err := env.run(t, &ledgerCommand{Kind: "withdraw-flagged", Amount: 1}, env.commandID("fine"))
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted())
+	require.Equal(t, []string{"deposited", "flagged", "flagged", "withdrawn"}, kinds(t, env.events(t, env.id)))
+}
+
+// A Prepare function that stages events and returns a marked rejection commits them with the
+// rejection, on any stream it read; a plain rejection still discards what it staged.
+func testRejectionWithEventsTransaction(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newRetryEnv(t, repo, 3)
+
+	target := evt.EntityID(env.ns + "-target")
+	env.deposit(t, target, 2)
+
+	identity := evt.CommandIdentity{Type: "ledger:apply", Targets: []evt.EntityID{target}}
+	rejection := &domainRejection{evt.Rejection{Code: "apply-conflict", Message: "the base is stale"}}
+
+	stage := func(wrap func(error) error) snapshots.Prepare {
+		return func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+			if err := tx.Read(ctx, newLedger(target), target); err != nil {
+				return nil, err
+			}
+
+			if err := tx.Append(target, &ledgerEvent{Kind: "flagged"}); err != nil {
+				return nil, err
+			}
+
+			return nil, wrap(rejection)
+		}
+	}
+
+	// Plain: the staged event is discarded, as before.
+	plain, err := env.store.ExecuteTransaction(ctx, identity, withCommand(env.commandID("plain")), stage(func(err error) error { return err }))
+	require.NoError(t, err)
+	require.True(t, plain.Rejected())
+	require.Empty(t, plain.EventIDs)
+	require.Len(t, env.events(t, target), 1)
+
+	// Marked: the event and the rejected row commit together.
+	id := env.commandID("marked")
+	marked, err := env.store.ExecuteTransaction(ctx, identity, withCommand(id), stage(evt.RejectWithEvents))
+	require.NoError(t, err)
+	require.True(t, marked.Rejected())
+	require.Equal(t, evt.RejectionCode("apply-conflict"), marked.Rejection.Code)
+	require.Equal(t, []evt.EventID{evt.GetEventID(target, 2)}, marked.EventIDs)
+	require.Len(t, marked.Events, 1)
+	require.Equal(t, []string{"deposited", "flagged"}, kinds(t, env.events(t, target)))
+
+	row, err := env.repo.GetOutcome(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, marked.Outcome, *row)
+
+	// A replay prepares nothing and writes nothing.
+	calls := 0
+	replayed, err := env.store.ExecuteTransaction(ctx, identity, withCommand(id),
+		func(context.Context, *snapshots.Transaction) ([]byte, error) { calls++; return nil, rejection })
+	require.NoError(t, err)
+	require.True(t, replayed.Replayed)
+	require.Equal(t, marked.Outcome, replayed.Outcome)
+	require.Zero(t, calls)
+	require.Len(t, env.events(t, target), 2)
+
+	// A marked error that is not a rejection is an internal failure that writes nothing.
+	internalID := env.commandID("internal")
+	_, err = env.store.ExecuteTransaction(ctx, identity, withCommand(internalID),
+		stage(func(error) error { return evt.RejectWithEvents(errors.New("storage exploded")) }))
+	require.ErrorContains(t, err, "storage exploded")
+	env.requireNoOutcome(t, internalID)
+	require.Len(t, env.events(t, target), 2)
+
+	// The Transaction API: Reject discards, RejectWithEvents commits.
+	manual, _, err := env.store.BeginCommand(ctx, identity, withCommand(env.commandID("manual")))
+	require.NoError(t, err)
+	require.NoError(t, manual.Read(ctx, newLedger(target), target))
+	require.NoError(t, manual.Append(target, &ledgerEvent{Kind: "flagged"}))
+
+	committed, err := manual.RejectWithEvents(ctx, rejection.Rejection())
+	require.NoError(t, err)
+	require.True(t, committed.Rejected())
+	require.Len(t, committed.Events, 1)
+	require.Len(t, env.events(t, target), 3)
+}
+
+// The commit rules of an accepted commit apply to a rejection with events: it is atomic, a
+// reserved stream and a projector-only commit are refused, and the budget counts the outcome row.
+func testRejectionWithEventsCommitRules(t *testing.T, repo evt.OutcomeRepository, enforcesConcurrency bool) {
+	ctx := context.Background()
+	ns := newNamespace()
+
+	rejected := func(name string) *evt.Outcome {
+		return &evt.Outcome{
+			CommandID: evt.CommandID(ns + name), Status: evt.OutcomeRejected, Digest: "digest",
+			Rejection: &evt.Rejection{Code: "refused", Message: "refused"},
+		}
+	}
+
+	events := func(id evt.EntityID, from, count int) []evt.SerializedEvent {
+		out := make([]evt.Event, 0, count)
+		for range count {
+			out = append(out, &ledgerEvent{Kind: "flagged"})
+		}
+
+		serialized, err := evt.SerializeEvents(out, evt.EventSequence(from), id, evt.Metadata{})
+		require.NoError(t, err)
+
+		for i := range serialized {
+			serialized[i].EntityType = ledgerType
+		}
+
+		return serialized
+	}
+
+	stream := evt.EntityID(ns + "-stream")
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(stream, 0, 1)}))
+
+	// A conflicting commit writes neither its events nor its rejected row.
+	if enforcesConcurrency {
+		err := repo.Commit(ctx, evt.SerializedResult{Events: events(stream, 0, 1), Outcome: rejected("-lost")})
+		require.True(t, evt.IsOptimisticConflict(err), "got %v", err)
+
+		missing, gerr := repo.GetOutcome(ctx, evt.CommandID(ns+"-lost"))
+		require.NoError(t, gerr)
+		require.Nil(t, missing)
+		require.Len(t, mustEvents(t, repo, stream), 1)
+	}
+
+	// The winning commit writes both, and the row lists the events.
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(stream, 1, 2), Outcome: rejected("-won")}))
+
+	row, err := repo.GetOutcome(ctx, evt.CommandID(ns+"-won"))
+	require.NoError(t, err)
+	require.True(t, row.Rejected())
+	require.Equal(t, []evt.EventID{evt.GetEventID(stream, 2), evt.GetEventID(stream, 3)}, row.EventIDs)
+	require.Len(t, mustEvents(t, repo, stream), 3)
+
+	// A reserved stream is refused before any write.
+	reserved := evt.EntityID("SYSTEM#" + ns)
+	err = repo.Commit(ctx, evt.SerializedResult{Events: events(reserved, 0, 1), Outcome: rejected("-reserved")})
+	require.True(t, evt.IsReservedEntityIdErr(err), "got %v", err)
+
+	// Projector operations without an event are refused.
+	err = repo.Commit(ctx, evt.SerializedResult{Transaction: evt.Transaction{rejectedGroup{}}, Outcome: rejected("-projector")})
+
+	var projectorOnly *evt.ProjectorOnlyCommitError
+	require.ErrorAs(t, err, &projectorOnly)
+
+	// The outcome row counts against the budget: marker, 97 event puts, floor check, and outcome fit;
+	// one more event does not.
+	fits := evt.EntityID(ns + "-fits")
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(fits, 0, 97), Outcome: rejected("-fits")}))
+
+	over := evt.EntityID(ns + "-over")
+	err = repo.Commit(ctx, evt.SerializedResult{Events: events(over, 0, 98), Outcome: rejected("-over")})
+
+	var tooLarge *evt.CommitTooLargeError
+	require.ErrorAs(t, err, &tooLarge)
+	require.Empty(t, mustEvents(t, repo, over))
+
+	missing, err := repo.GetOutcome(ctx, evt.CommandID(ns+"-over"))
+	require.NoError(t, err)
+	require.Nil(t, missing)
+}
+
+// rejectedGroup is a one-operation projector group with no events behind it.
+type rejectedGroup struct{}
+
+func (rejectedGroup) Len() int { return 1 }
+func (rejectedGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
+	return rejectedGroup{}, nil
+}
+func (rejectedGroup) StorageType() evt.StorageType         { return "conformance" }
+func (rejectedGroup) TransactionType() evt.TransactionType { return "conformance" }
+func (rejectedGroup) HandleError(err error, _ int) error   { return err }
+
+// A conflict while committing a rejection with events re-prepares the command like any other, and
+// the final answer is decided on the fresh state. When every attempt loses, the stale-fence
+// rejection is recorded without the caller's events.
+func testRejectionWithEventsRetry(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newRetryEnv(t, repo, 3)
+	ran := counter()
+
+	env.deposit(t, env.id, 1)
+
+	// Another writer moves the stream between the load and the first commit. Still short of funds:
+	// the second attempt rejects again, on the fresh head, and its event follows the rival's.
+	env.interfere(true, hasEvents, func() { env.deposit(t, env.id, 1) })
+
+	id := env.commandID("reprepare")
+	entity := newLedger(env.id)
+
+	outcome, err := env.store.ExecuteWithOutcome(ctx, entity, env.id,
+		&ledgerCommand{Kind: "withdraw-flagged", Amount: 50, ran: ran}, withCommand(id))
+	require.NoError(t, err)
+	require.True(t, outcome.Rejected())
+	require.EqualValues(t, 2, ran.Load(), "the failed commit re-prepared the command")
+	require.Equal(t, []string{"deposited", "deposited", "flagged"}, kinds(t, env.events(t, env.id)),
+		"only the committing attempt's event was written")
+	require.Equal(t, []evt.EventID{evt.GetEventID(env.id, 3)}, outcome.EventIDs)
+	require.Equal(t, 2, entity.Total)
+	require.Equal(t, 1, entity.Seen["flagged"], "the failed attempt's event was not counted")
+
+	// The rival's move can change the decision: now the command is accepted and records no failure.
+	env.interfere(true, hasEvents, func() { env.deposit(t, env.id, 100) })
+	ran.Store(0)
+
+	flipped, err := env.run(t, &ledgerCommand{Kind: "withdraw-flagged", Amount: 50, ran: ran}, env.commandID("flipped"))
+	require.NoError(t, err)
+	require.True(t, flipped.Accepted(), "decided on the fresh state: %+v", flipped.Rejection)
+	require.EqualValues(t, 2, ran.Load())
+	require.Equal(t, []string{"deposited", "deposited", "flagged", "deposited", "withdrawn"}, kinds(t, env.events(t, env.id)))
+
+	// Every attempt loses: the stale-fence rejection is recorded with none of the caller's events.
+	before := len(env.events(t, env.id))
+	env.interfere(false, hasEvents, func() { env.deposit(t, env.id, 1) })
+	ran.Store(0)
+
+	exhausted := env.commandID("exhausted")
+	entity = newLedger(env.id)
+
+	lost, err := env.store.ExecuteWithOutcome(ctx, entity, env.id,
+		&ledgerCommand{Kind: "withdraw-flagged", Amount: 5000, ran: ran}, withCommand(exhausted))
+	require.NoError(t, err)
+	require.True(t, lost.Rejected())
+	require.Equal(t, evt.RejectionStaleFence, lost.Rejection.Code)
+	require.Equal(t, encodedRejection(t, evt.RetriesExhaustedRejection(3)), encodedRejection(t, *lost.Rejection))
+	require.Empty(t, lost.EventIDs)
+	require.Empty(t, lost.Events)
+	require.EqualValues(t, 3, ran.Load())
+
+	after := env.events(t, env.id)
+	require.Len(t, after, before+3, "three rival events and no flagged event from the command")
+	require.NotContains(t, kinds(t, after[before:]), "flagged")
+	require.Equal(t, 1, entity.Seen["flagged"], "the caller's entity reflects durable state: only the earlier refusal")
+
+	// The exhausted ID replays the stale-fence rejection.
+	env.faulty.Intercept = nil
+
+	replayed, err := env.store.ExecuteWithOutcome(ctx, newLedger(env.id), env.id,
+		&ledgerCommand{Kind: "withdraw-flagged", Amount: 5000, ran: ran}, withCommand(exhausted))
+	require.NoError(t, err)
+	require.True(t, replayed.Replayed)
+	require.Equal(t, lost.Outcome, replayed.Outcome)
+}
+
+// A caller-stamped fence that went stale beside a rejection's events records the stale-fence
+// rejection alone: the engine cannot know the caller's decision, failure events included, still
+// holds, so none of it is written, and the command is not prepared again.
+func testRejectionWithEventsCallerFence(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newRetryEnv(t, repo, 3)
+
+	referral, target := evt.EntityID(env.ns+"-referral"), evt.EntityID(env.ns+"-target")
+	env.deposit(t, referral, 1)
+
+	identity := evt.CommandIdentity{Type: "ledger:apply", Targets: []evt.EntityID{target}}
+	rejection := &domainRejection{evt.Rejection{Code: "apply-conflict", Message: "the base is stale"}}
+
+	var calls int
+
+	prepare := func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+		calls++
+
+		if err := tx.Read(ctx, newLedger(target), target); err != nil {
+			return nil, err
+		}
+
+		if err := tx.Append(target, &ledgerEvent{Kind: "flagged"}); err != nil {
+			return nil, err
+		}
+
+		// The caller decided on the referral at head 1.
+		if err := tx.Fence(evt.ReadFence{EntityID: referral, EntityType: ledgerType, Head: 1}); err != nil {
+			return nil, err
+		}
+
+		return nil, evt.RejectWithEvents(rejection)
+	}
+
+	env.interfere(true, hasEvents, func() { env.deposit(t, referral, 1) })
+
+	id := env.commandID("stamped")
+
+	outcome, err := env.store.ExecuteTransaction(ctx, identity, withCommand(id), prepare)
+	require.NoError(t, err, "a stale caller-stamped fence is a persisted rejection, not an error")
+	require.True(t, outcome.Rejected())
+	require.Equal(t, evt.RejectionStaleFence, outcome.Rejection.Code)
+	require.Equal(t, encodedRejection(t, evt.CallerFenceStaleRejection()), encodedRejection(t, *outcome.Rejection))
+	require.Empty(t, outcome.EventIDs)
+	require.Empty(t, outcome.Events)
+	require.Equal(t, 1, calls, "the command was not prepared again")
+	require.Empty(t, env.events(t, target), "nothing was written on the target")
+
+	stored, err := env.repo.GetOutcome(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, outcome.Outcome, *stored)
 }
