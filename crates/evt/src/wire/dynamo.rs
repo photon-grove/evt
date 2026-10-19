@@ -44,6 +44,7 @@ use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventV
 use crate::json;
 use crate::metadata::Metadata;
 use crate::outcome::{Outcome, OutcomeStatus, Rejection};
+use crate::projection::ViewRow;
 
 /// The sort key of the inline snapshot item.
 pub const SNAPSHOT_SORT_KEY: i64 = 0;
@@ -406,6 +407,207 @@ pub fn view_operation_item(operation: &crate::projection::ViewOperation) -> Resu
     );
 
     Ok(item)
+}
+
+/// The global secondary index over `entityType` that lists views by entity type (hash key
+/// `entityType`, no range key; it projects every attribute).
+pub const ENTITY_TYPE_INDEX: &str = "entityType-index";
+
+/// DynamoDB's limit on requests per `BatchWriteItem` call, the chunk size of
+/// [`put_views`](crate::ViewRepository::put_views).
+pub const MAX_VIEW_BATCH_WRITE: usize = 25;
+
+/// DynamoDB's limit on keys per `BatchGetItem` call, the chunk size of
+/// [`batch_get_views`](crate::ViewRepository::batch_get_views).
+pub const MAX_VIEW_BATCH_GET: usize = 100;
+
+/// Encodes a view row as Go's `dynamo.ViewRepository.PutView` writes it: the five attributes of a
+/// commit-wide view row, with an empty `sk` replaced by `"VIEW"` and a `ttl` (epoch seconds)
+/// written whenever it is not zero. The payload must be valid UTF-8.
+pub fn view_row_item(row: &ViewRow) -> Result<Item, Error> {
+    let mut item = Item::new();
+    item.insert("pk".into(), s(row.pk.as_str()));
+    item.insert(
+        "sk".into(),
+        s(if row.sk.is_empty() {
+            DEFAULT_VIEW_SORT_KEY
+        } else {
+            row.sk.as_str()
+        }),
+    );
+    item.insert("entityID".into(), s(row.entity_id.as_str()));
+    item.insert("entityType".into(), s(row.entity_type.as_str()));
+    item.insert("payload".into(), s(utf8(&row.payload, "view payload")?));
+
+    if row.ttl != 0 {
+        item.insert("ttl".into(), n(row.ttl));
+    }
+
+    Ok(item)
+}
+
+/// Decodes a views-table item as Go's reader does: an absent or `NULL` attribute is empty (or
+/// zero), a
+/// string attribute may hold a number (its text), and a `ttl` must be an integer.
+pub fn view_row_from_item(item: &Item) -> Result<ViewRow, Error> {
+    let text = |name: &str| -> Result<String, Error> {
+        match item.get(name) {
+            None | Some(AttributeValue::Null(_)) => Ok(String::new()),
+            Some(AttributeValue::S(value) | AttributeValue::N(value)) => Ok(value.clone()),
+            Some(_) => Err(Error::InvalidRecord(format!(
+                "view attribute {name} is not a string"
+            ))),
+        }
+    };
+
+    let ttl = match item.get("ttl") {
+        None | Some(AttributeValue::Null(_)) => 0,
+        Some(AttributeValue::N(value)) => value.parse().map_err(|_| {
+            Error::InvalidRecord(format!("view attribute ttl is not an integer: {value}"))
+        })?,
+        Some(_) => {
+            return Err(Error::InvalidRecord(
+                "view attribute ttl is not a number".into(),
+            ));
+        }
+    };
+
+    Ok(ViewRow {
+        pk: text("pk")?,
+        sk: text("sk")?,
+        entity_id: text("entityID")?,
+        entity_type: text("entityType")?,
+        payload: text("payload")?.into_bytes(),
+        ttl,
+    })
+}
+
+/// The primary key of a views-table item.
+pub fn view_key(pk: &str, sk: &str) -> Item {
+    Item::from([("pk".into(), s(pk)), ("sk".into(), s(sk))])
+}
+
+/// The `Query` a paged view list sends, independent of any SDK.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewQuery {
+    /// The index to query, or `None` for the table.
+    pub index: Option<&'static str>,
+    /// The key condition expression.
+    pub key_condition: &'static str,
+    /// The expression attribute values.
+    pub values: Item,
+    /// The page size (`Limit`), when bounded.
+    pub limit: Option<i32>,
+    /// The decoded cursor (`ExclusiveStartKey`), when continuing.
+    pub start_key: Option<Item>,
+}
+
+/// The query listing the rows of one partition, optionally bounded and continued from a cursor.
+/// A `limit` of `None` or `Some(0)` (or above `i32::MAX`) leaves the page to DynamoDB's size cap.
+pub fn view_query_by_pk(
+    pk: &str,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+) -> Result<ViewQuery, Error> {
+    view_query(
+        None,
+        "pk = :pk",
+        Item::from([(":pk".into(), s(pk))]),
+        limit,
+        cursor,
+        ("pk", pk),
+    )
+}
+
+/// The query listing the rows of one entity type through [`ENTITY_TYPE_INDEX`].
+pub fn view_query_by_entity_type(
+    entity_type: &str,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+) -> Result<ViewQuery, Error> {
+    view_query(
+        Some(ENTITY_TYPE_INDEX),
+        "entityType = :entityType",
+        Item::from([(":entityType".into(), s(entity_type))]),
+        limit,
+        cursor,
+        ("entityType", entity_type),
+    )
+}
+
+fn view_query(
+    index: Option<&'static str>,
+    key_condition: &'static str,
+    values: Item,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    (key_name, key_value): (&str, &str),
+) -> Result<ViewQuery, Error> {
+    let start_key = cursor
+        .filter(|cursor| !cursor.is_empty())
+        .map(decode_view_cursor)
+        .transpose()?;
+
+    // A cursor continues the listing that produced it; DynamoDB would refuse a foreign one with a
+    // validation error, so refuse it the same way on every backend.
+    if let Some(key) = &start_key
+        && key.get(key_name) != Some(&AttributeValue::S(key_value.to_owned()))
+    {
+        return Err(Error::InvalidArgument(
+            "invalid pagination cursor: it belongs to another listing".into(),
+        ));
+    }
+
+    Ok(ViewQuery {
+        index,
+        key_condition,
+        values,
+        limit: limit
+            .filter(|limit| *limit > 0)
+            .and_then(|limit| i32::try_from(limit).ok()),
+        start_key,
+    })
+}
+
+/// Encodes a `LastEvaluatedKey` as a pagination cursor: the key's string attributes as JSON
+/// (sorted by name, Go's escaping) in padded, URL-safe base64. Other attribute types are dropped.
+pub fn encode_view_cursor(key: &Item) -> Result<String, Error> {
+    let strings: BTreeMap<&str, &str> = key
+        .iter()
+        .filter_map(|(name, value)| match value {
+            AttributeValue::S(text) => Some((name.as_str(), text.as_str())),
+            _ => None,
+        })
+        .collect();
+
+    let encoded = json::base64_bytes::encode(&json::to_vec(&strings)?);
+
+    Ok(encoded.replace('+', "-").replace('/', "_"))
+}
+
+/// Decodes a pagination cursor into an `ExclusiveStartKey`. Unlike Go, which forwards whatever
+/// the JSON holds and lets DynamoDB refuse it, a key with no `pk` and `sk` string is refused here.
+pub fn decode_view_cursor(cursor: &str) -> Result<Item, Error> {
+    let invalid =
+        |reason: String| Error::InvalidArgument(format!("invalid pagination cursor: {reason}"));
+
+    if cursor.contains(['+', '/']) {
+        return Err(invalid("illegal base64url data".into()));
+    }
+
+    let bytes =
+        json::base64_bytes::decode(&cursor.replace('-', "+").replace('_', "/")).map_err(invalid)?;
+    let strings: BTreeMap<String, String> =
+        serde_json::from_slice(&bytes).map_err(|err| invalid(err.to_string()))?;
+
+    if !strings.contains_key("pk") || !strings.contains_key("sk") {
+        return Err(invalid("the key has no pk and sk".into()));
+    }
+
+    Ok(strings
+        .into_iter()
+        .map(|(name, value)| (name, AttributeValue::S(value)))
+        .collect())
 }
 
 /// The `ttl` for an item written at `now` under a retention of `retention`: `now + retention` in

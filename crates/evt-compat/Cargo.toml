@@ -25,6 +25,9 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util"] }
+
 [[bin]]
 name = "evt-compat"
 required-features = ["drivers"]
@@ -32,4 +35,9 @@ required-features = ["drivers"]
 # The conformance suite against live backends; see the file header for setup.
 [[test]]
 name = "conformance"
+required-features = ["drivers"]
+
+# The view repository's DynamoDB requests and retries against a canned local HTTP server.
+[[test]]
+name = "view_requests"
 required-features = ["drivers"]

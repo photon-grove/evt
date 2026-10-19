@@ -630,6 +630,7 @@ impl FeatureMarker for MemRepository {
 }
 
 mod enumerate;
+mod views;
 
 #[cfg(test)]
 mod tests {
@@ -653,6 +654,14 @@ mod tests {
         let repository = MemRepository::new();
 
         commit_view_cases(&repository, &repository.clone()).await;
+    }
+
+    #[tokio::test]
+    async fn conforms_to_the_view_repository() {
+        let repository = MemRepository::new();
+
+        crate::conformance::view_repository_cases(&repository).await;
+        crate::conformance::committed_view_cases(&repository, &repository.clone()).await;
     }
 
     #[tokio::test]
