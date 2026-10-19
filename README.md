@@ -199,8 +199,10 @@ item. A commit whose first sequence skips past the stream's stored head is refus
 `*evt.SequenceGapError`, and a stream whose head item disagrees with its log fails with
 `*evt.StreamHeadDriftError` (never retried). A store must declare the `stream-heads` feature before
 a writer writes to it; an empty store is declared by its first writer, and a store written before
-head items is migrated first (`*evt.StreamHeadsNotMigratedError` until then). The exact contract is
-specified in the [storage format](docs/spec/storage-format.md#writes).
+head items is migrated first (`*evt.StreamHeadsNotMigratedError` until then) with
+`evt-doctor migrate-heads`, a stop-the-world, one-way procedure documented in the [migration
+runbook](docs/migrating-to-stream-heads.md). The exact contract is specified in the [storage
+format](docs/spec/storage-format.md#writes).
 
 ### Command outcomes and rejections (v0.9, C3/C4)
 
@@ -471,7 +473,8 @@ backend.
 ## Documentation
 
 The [docs site](https://photon-grove.github.io/evt/) covers architecture, the
-integration cookbook, and runnable examples. Static docs live in [`docs/`](docs/);
+integration cookbook, the [stream-heads migration runbook](docs/migrating-to-stream-heads.md),
+and runnable examples. Static docs live in [`docs/`](docs/);
 the interactive site lives in [`website/`](website/).
 
 Architecture decision records live in [`docs/adr/`](docs/adr/): event-log compaction

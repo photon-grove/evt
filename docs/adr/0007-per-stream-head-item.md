@@ -5,8 +5,9 @@
 Accepted (2026-10-18). Tracking: matrix row C12 in
 [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md) and
 [#159](https://github.com/photon-grove/evt/issues/159). The core commit path is implemented in Go
-and Rust (the first of two changes); the migration tool (`evt-doctor migrate-heads`) and the
-real-DynamoDB billing measurement follow. The normative text is the
+and Rust, and the migration tool (`evt-doctor migrate-heads`, Go only; see the
+[runbook](../migrating-to-stream-heads.md)) is implemented; the real-DynamoDB billing measurement
+(`dynamo/awsmeasure`, run by a human) is still to be run. The normative text is the
 [Stream Heads](../spec/storage-format.md#stream-heads) section of the storage spec, and the
 sections of the spec that describe commits, fences, and failures follow it.
 
@@ -184,7 +185,8 @@ DynamoDB documents that every transactional action is two underlying writes of t
 the item's size rounded up to 1 KB, and that an `Update` is billed on the larger of the item before
 and after. The documentation does not say in so many words that a `ConditionCheck` bills by the size
 of the item it reads, and the numbers below assume it does. **The implementation spike must confirm it
-with `ReturnConsumedCapacity` against real DynamoDB** (the local emulator does not bill). The action
+with `ReturnConsumedCapacity` against real DynamoDB** (the local emulator does not bill; run
+`dynamo/awsmeasure`). The action
 counts above do not depend on it.
 
 Worked example, the ten-writes-and-five-reads command, with 12 KB reference snapshots, 4 KB written
@@ -714,8 +716,9 @@ them:
 2. **Condition-check billing: unconfirmed.** The WCU numbers assume a `ConditionCheck` bills by the
    size of the item it reads. They stay marked as unconfirmed until measured on real DynamoDB with
    `ReturnConsumedCapacity`; that measurement is on the
-   [#159](https://github.com/photon-grove/evt/issues/159) checklist. The action-count result stands
-   either way.
+   [#159](https://github.com/photon-grove/evt/issues/159) checklist. `dynamo/awsmeasure` is the
+   script for it (behind the `awsmeasure` build tag; a human runs it with AWS credentials that can
+   create a scratch table, and pastes its table here). The action-count result stands either way.
 3. **Retention: decided.** The head item carries `ttl` for retained types and fences stay refused
    (`RetentionConflict`). Lifting the refusal would need an incarnation token and is out of scope.
 4. **PostgreSQL: decided.** PostgreSQL gets the heads table, so the spec has one definition of head.

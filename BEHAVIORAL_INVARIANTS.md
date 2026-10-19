@@ -671,6 +671,25 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   marker, the rebuild fence, and command outcomes), on PostgreSQL with the two spec queries against
   the configured events and snapshots tables — and the upgrade note requires renaming (migrating)
   such streams before enabling the v0.9 features.
+- `evt-doctor migrate-heads` (Go only) migrates a v0.8 store to per-stream head items and is the
+  only code that writes head items outside a commit ([runbook](docs/migrating-to-stream-heads.md)):
+  - It refuses without `-confirm-writers-stopped` (nothing is written, `-dry-run` aside), and
+    refuses a store whose marker declares `journal` or any feature it does not model
+    (`*UnsupportedFeatureError`), or that holds a non-engine stream in a reserved namespace
+    (`*ReservedStreamsError`, before any write and again before declaring).
+  - DynamoDB: strongly consistent scan accumulating per partition across pages; expired-but-
+    undeleted items are ignored; reserved namespaces, a partition with nothing left, and a derived
+    head of 0 are skipped; each head item is written `attribute_not_exists(head)` (never
+    overwritten) with the largest `ttl` of the partition when every item has one; idempotent and
+    resumable. It verifies after the backfill, immediately before declaring, and after declaring,
+    and declares only after a clean verification (`*HeadsNotVerifiedError` otherwise).
+  - PostgreSQL: backfill, verification, and declaration are one transaction under the exclusive
+    feature lock (and a `SHARE` lock on the events and snapshots tables); any missing or unequal row
+    aborts it and leaves the database as it was.
+  - `-verify` is read-only; `-repair` raises, creates, and fixes a low `ttl` (each write conditioned
+    on the observed head, and on the observed `ttl` when it changes one); only `-repair -allow-lower`
+    lowers a head; none of them declares. A repair whose writes raced verifies again and fails if
+    any stream still disagrees with its log.
 
 ### Feature Marker (ADR-0004 C9)
 

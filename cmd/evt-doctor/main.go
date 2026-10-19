@@ -1,7 +1,12 @@
 // Command evt-doctor is a CLI for inspecting and diagnosing an evt event log: the table schema,
-// and the pre-existing streams in reserved namespaces that must be renamed (migrated) before the
-// v0.9 features are enabled (storage spec, Reserved Namespaces). It runs against DynamoDB by
+// the pre-existing streams in reserved namespaces that must be renamed (migrated) before the
+// v0.9 features are enabled (storage spec, Reserved Namespaces), and, once a store declares
+// stream-heads, drift between each stream's head item and its log. It runs against DynamoDB by
 // default, or against PostgreSQL with -backend postgres.
+//
+// The migrate-heads subcommand migrates a store written by v0.8 to per-stream head items (storage
+// spec, Stream Heads, Migration): backfill, verify, repair, and declare. Run
+// "evt-doctor migrate-heads -h" for its procedure and flags.
 package main
 
 import (
@@ -10,13 +15,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/photon-grove/evt/postgres"
 )
+
+// callTimeout bounds every AWS call the tool makes.
+const callTimeout = time.Minute
 
 type tableSpec struct {
 	Name       string   `json:"name"`
@@ -29,6 +41,10 @@ type tableSpec struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == migrateHeadsCommand {
+		os.Exit(runMigrateHeads(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	var (
 		region      = flag.String("region", envOr("AWS_REGION", "us-west-2"), "AWS region (DynamoDB backend)")
 		endpoint    = flag.String("endpoint", resolveLocalEndpoint(), "AWS emulator endpoint (DynamoDB backend)")
@@ -40,6 +56,10 @@ func main() {
 		printSchema = flag.Bool("schema", false, "print required DynamoDB table schema and exit")
 	)
 	flag.Parse()
+
+	if flag.NArg() > 0 {
+		exitf("unexpected argument %q; the %s subcommand must come first, before any flag", flag.Arg(0), migrateHeadsCommand)
+	}
 
 	if *printSchema {
 		if err := json.NewEncoder(os.Stdout).Encode(requiredSchema(*eventsTable, *viewsTable)); err != nil {
@@ -117,6 +137,10 @@ func checkDynamo(ctx context.Context, cfg checkConfig) {
 	}
 
 	reportReservedStreams(ids)
+
+	if !reportDynamoHeadDrift(ctx, client, cfg.eventsTable, os.Stdout) {
+		os.Exit(1)
+	}
 }
 
 // checkPostgres reports pre-existing streams in reserved namespaces against the configured events
@@ -145,6 +169,12 @@ func checkPostgres(ctx context.Context, cfg checkConfig) {
 	}
 
 	reportReservedStreams(ids)
+
+	repo := postgres.NewRepository(pool,
+		postgres.WithEventsTable(cfg.eventsTable), postgres.WithSnapshotsTable(cfg.snapshotsTable))
+	if !reportPostgresHeadDrift(ctx, repo, os.Stdout) {
+		os.Exit(1)
+	}
 }
 
 func envOr(name, fallback string) string {
@@ -164,8 +194,11 @@ func resolveLocalEndpoint() string {
 }
 
 func newAWSConfig(ctx context.Context, region, localEndpoint string) (*aws.Config, error) {
+	// No call outlives callTimeout: a stalled endpoint fails the run instead of hanging it.
+	httpClient := awshttp.NewBuildableClient().WithTimeout(callTimeout)
+
 	if localEndpoint == "" {
-		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region), config.WithHTTPClient(httpClient))
 		if err != nil {
 			return nil, err
 		}
@@ -176,6 +209,7 @@ func newAWSConfig(ctx context.Context, region, localEndpoint string) (*aws.Confi
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(region),
 		config.WithRetryMaxAttempts(1),
+		config.WithHTTPClient(httpClient),
 		config.WithCredentialsProvider(credentials.StaticCredentialsProvider{
 			Value: aws.Credentials{
 				AccessKeyID:     "test",

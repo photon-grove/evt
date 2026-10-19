@@ -36,7 +36,7 @@ keys are on every record, including `KEYS_ONLY` views:
 (`"0"` also drops the snapshot, which consumers already skip.) A `KEYS_ONLY` consumer that wakes on
 every record, such as a journal reader, fires on every head update unless it filters, so give it the
 filter above. Deploy the filter or the skip **before** the head migration: the backfill emits one
-record per stream.
+record per stream (see the [migration runbook](migrating-to-stream-heads.md)).
 
 Every consumer follows the same reliability contract: process records
 independently, return **partial-batch failures** so only affected records retry,

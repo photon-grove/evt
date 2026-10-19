@@ -49,7 +49,9 @@ lockstep with the Go types that read and write it:
   is `*evt.StreamHeadDriftError`. A store that holds data must declare the `stream-heads` feature
   before a writer writes (`*evt.StreamHeadsNotMigratedError`), and an empty one is declared by its
   first writer; entity heads read this table once it is declared, and the aggregate over events and
-  snapshots until then. Run `EnsureSchema` to create it.
+  snapshots until then. Run `EnsureSchema` to create it. A database written by v0.8 is migrated with
+  `evt-doctor migrate-heads -backend postgres`, which backfills, verifies, and declares in one
+  transaction: see the [migration runbook](migrating-to-stream-heads.md).
 - `evt_events__evt_command_outcomes` — one row per command (v0.9, C3), keyed by `command_id`:
   `status`, the identity `digest`, the stored `response`, the `events` the commit wrote, and a
   rejection's `rejection` and `code`. The row is inserted last in the commit transaction; a unique
