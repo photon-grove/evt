@@ -424,6 +424,16 @@ pub trait CommitProjector {
 pub enum ViewOperation { Put { pk: String, sk: String, payload: ... }, Delete { pk: String, sk: String } }
 ```
 
+_Implementation note (E2.6/E3.6)._ The commit path shipped with these shapes. Go: `evt.CommitProjector`
+(`Name`, `ProjectCommit(ctx, CommitView) ([]ViewOperation, error)`), `evt.ViewOperation` (`PutView`,
+`DeleteView`, `IfAbsent`, `IfPresent`, `OnConflict`), registered with
+`snapshots.Store.WithCommitProjectors` and carried to the repository as `SerializedResult.Views`.
+Rust: `CommitProjector`, `ViewOperation`, `CommitView`, `Store::with_commit_projector`. Operations are
+backend-neutral and the repository owns their execution (DynamoDB `WithViewsTable`, PostgreSQL
+`WithViewWriter`, in-memory); per-operation errors are `*evt.ProjectorOperationError` /
+`Error::ProjectorOperation`. The state entry point, the rebuilds that call it, and the
+history-dependent registration check are part of the rebuild ports (P4).
+
 ### C8 — Repository additions: `latest(n)` and reserved namespaces
 
 **Current state.** Go has `GetEvents`/`GetLatestEvents(lastSequence)` — unbounded, and

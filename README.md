@@ -141,9 +141,9 @@ replacement where one exists, and saying plainly where the feature is removed wi
   `*dynamo.Repository` `...ByExpression` methods), and handler-attached
   `CommandResult.Transaction` (K7) — direct store calls, `StreamFilter` (entity-type filtering
   only: raw server-side expressions have no like-for-like replacement, so apply richer
-  predicates client-side), projector-produced transaction groups, and (planned) commit-wide
-  projectors; for `dynamo.Delete`, delete fixture items with the AWS SDK or recreate the test
-  table
+  predicates client-side), projector-produced transaction groups (superseded by commit-wide
+  projectors: `snapshots.Store.WithCommitProjectors`, below); for `dynamo.Delete`, delete fixture
+  items with the AWS SDK or recreate the test table
 
 Three more D6-cut surfaces have **no warning-free migration path yet**, so they carry no
 `Deprecated:` notice in v0.9.0. They are planned for removal once the core reshape (C1–C11)
@@ -203,6 +203,43 @@ head items is migrated first (`*evt.StreamHeadsNotMigratedError` until then) wit
 `evt-doctor migrate-heads`, a stop-the-world, one-way procedure documented in the [migration
 runbook](docs/migrating-to-stream-heads.md). The exact contract is specified in the [storage
 format](docs/spec/storage-format.md#writes).
+
+### Commit-wide projectors (v0.9, C7)
+
+A commit-wide projector (`evt.CommitProjector`) is a pure function over everything one commit wrote
+— every stream's events and its state after the commit — that returns view operations: puts and
+deletes of rows at **any** `pk`/`sk`, with optional `IfAbsent`/`IfPresent` conditions and mapped
+errors. Register it with `snapshots.Store.WithCommitProjectors`; the rows commit in the same
+transaction as the events, so a cross-entity read model is never out of step with the streams behind
+it. Give the DynamoDB repository a views table (`WithViewsTable`) or the PostgreSQL repository a
+view writer (`WithViewWriter`); the in-memory repository keeps the rows for tests.
+
+```go
+store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{}) // evt.CommitProjector
+```
+
+- Operations land after the feature-marker check and before the written streams, in projector
+  declaration order then emission order, and count against the shared budget (a single-stream
+  commit leaves room for 98 events and view operations together, 97 with a snapshot).
+- A failed condition returns `*evt.ProjectorOperationError`, which names the projector and the
+  operation and wraps the operation's mapped error. It writes nothing, is not a conflict and not
+  transient, and is never retried or recorded as an outcome; stream conflicts, drift, gaps, and a
+  lost outcome row are reported ahead of it. A projector function's own error is
+  `*evt.ProjectorError`.
+- Before any write, on every backend: an empty, non-UTF-8, or NUL-bearing key is
+  `*evt.InvalidViewOperationError`, a `pk` over 2,048 or an `sk` over 1,024 UTF-8 bytes is
+  `*evt.ViewKeyTooLongError`, a repeated row is `*evt.DuplicateViewKeyError`, operations with no
+  event behind them are `*evt.ProjectorOnlyCommitError`, and a repository with nowhere to write
+  them is `*evt.ViewsNotConfiguredError` — operations are never dropped.
+- Projectors run again on every fence-aware re-preparation of a command and never for a command that
+  writes no event; a rejection that carries events projects them. A projector must be
+  deterministic in its `evt.CommitView`, so a rebuild can reproduce its rows by regrouping the
+  stored events with `evt.GroupCommits`. See [Commit-wide
+  projectors](docs/projections.md#commit-wide-projectors) and the [storage
+  format](docs/spec/storage-format.md#views).
+
+A custom `Repository` receives these operations as `SerializedResult.Views`; one that cannot write
+them in the commit's transaction **must return an error** rather than ignore them.
 
 ### Command outcomes and rejections (v0.9, C3/C4)
 
@@ -353,10 +390,10 @@ only once its `Commit` honors the full contract above. `snapshots.Store.Transact
 `Read` and `Commit` refuse a repository without the capability with
 `*evt.TransactionsUnsupportedError` (`errors.Is(err, evt.ErrTransactionsUnsupported)`) before
 anything is loaded or written. The in-memory, DynamoDB, and PostgreSQL repositories declare it.
-The Go PostgreSQL repository does not yet execute projector transaction groups (E2.6), so it
-declares the capability for event, snapshot, and fence commits but refuses a commit that carries
-any projector operation with `*evt.ProjectorOperationsUnsupportedError` before writing, instead of
-dropping the view writes. Use DynamoDB projectors, or no projectors, with Go PostgreSQL until then.
+The Go PostgreSQL repository executes commit-wide view operations through a view writer
+(`WithViewWriter`; see [PostgreSQL](docs/postgres.md#views)), and refuses the operations of a
+transaction group built for another storage type with `*evt.ProjectorOperationsUnsupportedError`
+before writing, instead of dropping the view writes.
 To use transactions on a custom backend, make `Commit` atomic over every stream, snapshot, and
 fence, then add the marker method. Wrapping a repository in a decorator type hides the capability
 unless the wrapper declares it too.

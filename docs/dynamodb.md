@@ -187,6 +187,14 @@ Read models live in their own table, separate from the log:
 - `entityType` (`S`) — backing the `entityType-index` GSI for type-wide queries
 - `ttl` (`N`) — when expiring derived rows is useful
 
+Commit-wide projectors write to this table too: configure the repository with
+`dynamo.NewRepository(client, events).WithViewsTable("views")` and every view operation of a commit
+becomes one `Put` or `Delete` in the commit's transaction, after the feature-marker check and
+before the written streams. A put carries all five attributes (`pk`, `sk`, `entityID`, `entityType`,
+`payload`) and never a `ttl`; an `IfAbsent` put is conditioned on `attribute_not_exists(pk)` and an
+`IfPresent` delete on `attribute_exists(pk)`. A failed condition is a
+`*evt.ProjectorOperationError`. See [commit-wide projectors](projections.md#commit-wide-projectors).
+
 Views are a **rebuildable cache, not a source of truth**. The `viewstore` package
 offers a typed JSON helper over `evt.ViewRepository` so projectors and readers
 share one codec — `viewstore.New[T]` for arbitrary pk/sk, or `viewstore.NewSingle`

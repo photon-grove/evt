@@ -106,7 +106,8 @@ In v0.9 (C7), commit-wide projectors may put or delete rows at any `pk`/`sk` —
 derived `{entityType}#{entityId}` / `VIEW` — with per-operation error mapping and shared
 key-length validation (`pk` ≤ 2,048 and `sk` ≤ 1,024 UTF-8 bytes, enforced before any write on
 both backends). The row shape and rules are specified in the
-[storage format](docs/spec/storage-format.md#views).
+[storage format](docs/spec/storage-format.md#views); the invariants are under
+[Commit-Wide Projectors](#commit-wide-projectors-v09-c7).
 
 ## Serialization Formats
 
@@ -277,8 +278,9 @@ error before any write and is never split.
 - Multi-stream transactions require a repository that declares `evt.TransactionalRepository`;
   `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
   before dispatching anything
-- Go PostgreSQL refuses a commit carrying projector operations with
-  `*ProjectorOperationsUnsupportedError` before any write until E2.6 lands; it never drops them
+- Go PostgreSQL executes a commit's view operations through its `ViewWriter`, and refuses the
+  operations of a transaction group built for another storage type with
+  `*ProjectorOperationsUnsupportedError` before any write; it never drops them
 - A commit that carries projector operations but writes no event is refused before any write
   (`ProjectorOnlyCommitError` / `Error::ProjectorWithoutEvents`): views are projections of
   committed events (ADR-0012). An empty command ID is treated as absent when deriving the commit ID
@@ -534,6 +536,64 @@ capability) seeds each entity from its `sk = 0` snapshot, then applies only even
 `sequence > snapshot.EventSequence`. Streams without a snapshot fall back to full replay from
 sequence 1. `RebuildProjections` uses this path when `RebuildConfig.SeedEntity` is set, and errors
 if `SeedEntity` is set on a repository that is not a `SnapshotStreamer`.
+
+## Commit-Wide Projectors (v0.9, C7)
+
+A `CommitProjector` is a pure function over one commit; its view operations commit in the same
+transaction as the events. The byte-level rules are in the
+[storage format](docs/spec/storage-format.md#views).
+
+**Contract**
+
+- It runs once per commit that writes at least one event, after every stream is staged and its
+  snapshot decided, over an `evt.CommitView`: the commit ID, and every written stream ascending by
+  entity-ID bytes with its entity type, this commit's events ascending by sequence, and its state
+  after the commit. Streams that were only read (fenced) are not in the view.
+- A command that writes no event (a plain rejection, an accepted no-op, an outcome-only commit)
+  runs no projector; a rejection that carries events projects them like an accepted command's. The
+  view carries no outcome context.
+- It runs again on every fence-aware re-preparation; the operations of a failed attempt are
+  discarded with it. A projector's own error (`*ProjectorError`) fails the command before any
+  write, records no outcome, and is not retried.
+- **Determinism.** The same `CommitView` must produce the same operations in the same
+  order, byte for byte: no clock, random source, environment, store reads, state kept between
+  calls, or map-iteration order. Views are derived state, so a wipe-and-replay — `GroupCommits` of
+  the stored events plus the state each stream had after that commit — must reproduce the rows. A
+  row that records something that happened only outside the event log (a mutable decision, an
+  external signal, a verdict) is a latent data-loss bug: event-source it first, then project it.
+
+**Operations**
+
+- A put (`pk`, `sk`, `entityID`, `entityType`, `payload`) overwrites unless it is `IfAbsent`; a delete
+  of an absent row succeeds unless it is `IfPresent`. `OnConflict(err)` names the error for a failed
+  condition and is never stored. View items never carry `ttl`.
+- Order: projector declaration order, each projector's operations in emission order, after the
+  operations of any transaction group, after the marker check, before the written streams. On
+  PostgreSQL the statements run after the events and before the snapshot upserts.
+- Before any write, on every backend: `InvalidViewOperation` (empty `pk` or `sk`, text that is not
+  UTF-8 or contains U+0000, an unknown kind, a condition the kind does not allow), then
+  `ViewKeyTooLong` (`pk` over 2,048 or `sk` over 1,024 UTF-8 bytes), then `DuplicateViewKey` (a
+  row an earlier operation of the commit already targets). Operations with no event behind them are
+  `ProjectorOnlyCommit` / `ProjectorWithoutEvents` first. A repository with nowhere to write the
+  operations refuses the commit with `ViewsNotConfigured`.
+- Each operation is one action in the 100-action budget and is sized as DynamoDB sizes it (a put its
+  item, a delete its key plus its condition expression); PostgreSQL sizes a statement by its SQL
+  text, so its byte estimate is a lower bound while its action count is exact.
+
+**Failure**
+
+- A failed condition (DynamoDB `ConditionalCheckFailed`, a unique violation of an `IfAbsent`
+  put or a delete of no row for an `IfPresent` delete on PostgreSQL, a failed in-memory check) is
+  `*ProjectorOperationError` / `Error::ProjectorOperation`, naming the projector (name and
+  declaration position) and the operation (index among its emitted operations, kind, `pk`, `sk`),
+  with the reason and the operation's mapped error. DynamoDB `ValidationError` and
+  `ItemCollectionSizeLimitExceeded` on a view item map the same way; `TransactionConflict` and
+  throttling keep their transient classification.
+- It is not an optimistic conflict and not transient: it is returned at once, never re-prepared,
+  and records no outcome. It ranks last: the marker check, the outcome put, `StreamHeadDrift`, a
+  gap, and any conflict on a written stream or a fence are reported first, so it surfaces only when
+  nothing above it failed. The first failed operation in transaction order is the one named.
+- Nothing from the commit is written: not its events, not its other rows.
 
 ## Projector System
 

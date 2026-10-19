@@ -82,6 +82,41 @@ entity's head with constant memory for change-detection rebuilds. The head folds
 in the snapshot's recorded sequence, so it stays correct for streams whose early
 events were compacted away.
 
+### Views
+
+evt defines no PostgreSQL view schema: your application owns its view tables and their DDL.
+Commit-wide projectors ([projections](projections.md#commit-wide-projectors)) still commit their
+rows atomically with the events, through a **view writer** that turns each view operation into the
+SQL statement for your table:
+
+```go
+repo := postgres.NewRepository(pool).WithViewWriter(func(op evt.ViewOperation) (postgres.ViewStatement, error) {
+    const insert = `INSERT INTO views (pk, sk, entity_id, entity_type, payload) VALUES ($1, $2, $3, $4, $5)`
+
+    switch {
+    case op.Kind == evt.ViewDelete:
+        return postgres.ViewStatement{SQL: `DELETE FROM views WHERE pk = $1 AND sk = $2`, Args: []any{op.PK, op.SK}}, nil
+    case op.Condition == evt.ViewAbsent:
+        // A plain INSERT: its unique violation is the failed condition.
+        return postgres.ViewStatement{SQL: insert, Args: viewArgs(op)}, nil
+    default:
+        return postgres.ViewStatement{SQL: insert + ` ON CONFLICT (pk, sk) DO UPDATE SET
+            entity_id = EXCLUDED.entity_id, entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload`,
+            Args: viewArgs(op)}, nil
+    }
+})
+```
+
+The statements run in the commit's transaction after the events and before the snapshots, so a
+writer that lost a race fails on its stream's head (a conflict) before it reaches a view row. The
+repository decides whether an operation's condition held from the statement: an `IfAbsent` put must
+raise a unique violation when the row exists, and an `IfPresent` delete must delete a row. A failed
+condition is a `*evt.ProjectorOperationError` (reason `ConditionalCheckFailed`), and so is any other
+error the database raises for a view statement (reason: its SQLSTATE); an integrity violation raised
+at `COMMIT`, which only a deferred constraint on your table can cause, is a `*evt.ProjectorError`.
+A commit that carries view operations and no writer fails with `*evt.ViewsNotConfiguredError` before
+any write. Each statement counts as one action in the commit budget, sized by its SQL text.
+
 ## Local Development
 
 The `infra/local-postgres` Terraform stack provisions the local database; the

@@ -10,8 +10,8 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 | `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes the C6 `metadata-extensions` handoff; remaining v0.9 scenarios (C1–C10) for E2.8/E3.8 are listed in the [storage format](../docs/spec/storage-format.md#compat-scenarios-to-add). |
 | `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
 | `fixtures/outcomes.json`  | Go generator | C3/C4 identity-digest vectors (canonical bytes and SHA-256, keyed by `targets`, including a rename whose write set comes from state), the encodings of outcome rows (DynamoDB item, budgeted item size, PostgreSQL row, rejection and event-ID JSON, including both stale-fence rejections and a rejection that lists the events it committed), the canonical text of rejection-detail numbers, and the C5 retry-policy defaults both languages assert. |
-| `fixtures/feature-marker.json` | Go generator | C9 canonical manifest JSON, complete DynamoDB marker items, PostgreSQL declaration rows, ordered commit requests, and schema-upgrade DDL. |
-| `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items (including the stream head item at `sk = -1`), the stream's `head` (the PostgreSQL heads row), SNS messages, sequences, and loaded state. |
+| `fixtures/feature-marker.json` | Go generator | C9 canonical manifest JSON, complete DynamoDB marker items, PostgreSQL declaration rows, ordered commit requests, stream-head requests, the C7 `commitViews` requests (the exact actions, tables, conditions, and values of a commit with commit-wide view operations, and their budget sizes), and schema-upgrade DDL. |
+| `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items (including the stream head item at `sk = -1`), the stream's `head` (the PostgreSQL heads row), SNS messages, sequences, and loaded state; the view rows commit-wide projectors left in the scenario's partitions (`views`); and the `TransactWriteItems` action order of each transaction step, where an action on the views table carries `table: "views"` and its string sort key in `skText`. |
 
 Both sides implement the same account domain: `internal/compat/account.go` and
 `crates/evt-compat/src/account.rs`. Keep them identical, field for field and rule for rule.
@@ -26,7 +26,7 @@ Both sides implement the same account domain: `internal/compat/account.go` and
 | `scripts/compat-integration.sh postgres` | The same against local PostgreSQL.                                                                             |
 
 The marker vectors include duplicate-input set canonicalization, the complete transaction order
-(marker check, projector puts, then per written stream its head update, event puts, and snapshot
+(marker check, projector operations, then per written stream its head update, event puts, and snapshot
 put), the marker row a writer stores when it declares `stream-heads` on a fresh table, and, under
 `streamHeads`, the exact actions, expressions, name placeholders, and values of every head request
 shape (create, append, later snapshot, fences, retained streams, and the out-of-band snapshot guard)
@@ -34,6 +34,12 @@ with the commit budget's item sizes. Rust consumes these
 vectors in its fixture tests and DynamoDB transaction tests. With `--features drivers`, the live
 PostgreSQL tests also compare declaration-row bytes and execute both languages' schema DDL in
 either creation/upgrade order.
+
+Live runs write view rows to the DynamoDB views table (`EVT_COMPAT_DYNAMO_VIEWS_TABLE`, default
+`evt-local-entity-views`, string `pk` and `sk`) or, on PostgreSQL, to the `evt_compat_views` table
+that each driver creates itself — evt defines no PostgreSQL view schema, so the harness owns this
+one, with the statements both drivers issue (a plain `INSERT` for an `absent` put, an upsert
+otherwise, and a `DELETE`).
 
 The live runs need the local stacks from the root [README](../README.md#local-development). Moon
 runs them, together with the Rust conformance suite, as `evt-rust:integration` and
@@ -66,6 +72,19 @@ changed, and update the spec.
    | `conflictProbe` | `sequence`                                                       | `conflict`, or `ok` when the sequence is free                |
    | `outcomeOnly`   | `identity` (`type`, `payload` object), `response`, `commandId`   | outcomes scenarios: an accepted outcome with no events       |
    | `resolveOutcome`| `command`, `commandId`                                           | outcomes scenarios: `absent`, a replayed outcome, or `reuse` |
+
+   A `transaction` step may also carry `projectors` (C7): a list of `{name, operations}` whose
+   operations (`op` `put` or `delete`, `pk`, `sk`, `entityId`, `entityType`, `payload`, `condition`
+   `absent` or `present`, `conflict` for a mapped error message, and `pkPad`/`skPad` to extend a key
+   with `x` to that many bytes) are the commit-wide view operations of the commit, in declaration
+   then emission order. `{id}` in a key, entity ID, or payload is the scenario's entity ID, so rows
+   are scoped to the run. The step's `expect` adds the results `projector` (a failed condition,
+   with the `projector` name, the `operation` index, and the `mapped` message), `projectorOnly`,
+   `viewKeyTooLong`, and `duplicateViewKey`.
+
+   A scenario with `"projector": true` registers the shared ledger projector (`ledger`, in both
+   account domains) on its stores, so every commit that writes events puts or deletes the
+   stream's row at `pk = "ledger"`, `sk` = the stream ID.
 
    A scenario with `"outcomes": true` runs on stores with command outcomes enabled (C3/C4): every
    step needs a `commandId`, and `execute` steps record and replay outcomes. Outcomes steps
