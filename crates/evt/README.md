@@ -463,6 +463,103 @@ repository.ensure_schema().await?;
 let store = Store::<Account, _>::new(repository, ());
 ```
 
+## Commit-wide projectors
+
+A `CommitProjector` is a pure function over everything one commit wrote, across every stream and
+aggregate type. It returns `ViewOperation`s, puts and deletes of rows at any `pk`/`sk`, optionally
+conditioned (`if_absent` on a put, `if_present` on a delete) and mapped to your own error
+(`on_conflict`). The rows commit in the same transaction as the events, so a read model that spans
+entities is atomic with the commit. Register projectors with `Store::with_commit_projector` (a
+store's transactions inherit them) or `Transaction::with_commit_projector`.
+
+```rust,ignore
+use std::sync::Arc;
+use photon_evt::{BoxError, CommitProjector, CommitView, ViewOperation};
+
+struct Directory;
+
+impl CommitProjector for Directory {
+    fn name(&self) -> &str {
+        "directory"
+    }
+
+    fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                ViewOperation::put(
+                    "directory",
+                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(), // the owner: the stream that owns the row
+                    stream.entity_type.as_str(),
+                    stream.state.clone(), // the aggregate's JSON after the commit
+                )
+            })
+            .collect())
+    }
+}
+
+let repository = DynamoRepository::new(client, "event-log").with_views_table("views");
+let store = Store::<Account, _>::new(repository, ()).with_commit_projector(Arc::new(Directory));
+```
+
+The repository decides where the rows go: `DynamoRepository::with_views_table`, a
+`PostgresRepository::with_view_writer` that turns each operation into a statement for your own
+table, or `MemRepository` (read back with `view` and `views`). A repository with nowhere to write
+them refuses the commit with `Error::ViewsNotConfigured`. A failed condition is
+`Error::ProjectorOperation`, naming the projector and the operation, with your mapped error as its
+`source()`; it is never retried and records no outcome. Keys over 2,048 bytes (`pk`) or 1,024 bytes
+(`sk`), a repeated key, and operations with no event are refused before any write.
+
+### Row owners
+
+Every operation names an **owner**: the stream the row belongs to, which is stored as the row's
+`entityID` attribute. The owner must be a stream the commit wrote. Every write to a row is
+conditioned on its owner, so a stream never overwrites or deletes a row another stream owns: the
+operation fails with `Error::ProjectorOperation` (reason `ConditionalCheckFailed`), and nothing of
+the commit is written. A row that does not exist yet can be written by anyone.
+
+**A row's owner must never change.** Never delete a row to hand its key to another stream: keep the
+row and rewrite it, as its owner, with a tombstone payload. A rebuild orders the writes to a row by
+its owner's sequence, the only commit order the log keeps, and `replay_views` refuses a row that
+two streams write (`Error::SharedViewKey`).
+
+**A PostgreSQL view writer must enforce the owner in SQL**; the engine cannot. The statements it
+returns must have these semantics (see `PostgresRepository::with_view_writer`):
+
+- a put with `if_absent` is a plain `INSERT` (no `ON CONFLICT`), and the statement names the
+  table's `(pk, sk)` key constraint with `PgStatement::with_key_constraint`: only a violation of
+  that constraint is a failed `if_absent` condition;
+- any other put is an upsert that only the owner may overwrite:
+  `INSERT ... ON CONFLICT (pk, sk) DO UPDATE SET ... WHERE <table>.entity_id = EXCLUDED.entity_id`.
+  A put that affects no row (the row is another stream's) fails its condition;
+- a delete with `if_present` removes the owner's row only:
+  `DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3`, and a delete that affects no row fails
+  its condition;
+- a delete without a condition succeeds on an absent row but refuses another stream's row, so its
+  statement reports the foreign rows it found rather than the rows it deleted:
+  `WITH gone AS (DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3) SELECT 1 FROM <table>
+  WHERE pk = $1 AND sk = $2 AND entity_id <> $3`. An affected-row count above zero fails its
+  condition (a plain `DELETE` would silently do nothing to another stream's row).
+
+### Current-state and history-dependent projectors
+
+A projector says which entity types it reads the *events* of with `history()`. The default, none,
+is a **current-state** projector: it is given an empty commit ID and streams without events, and
+the state of every stream, so a rebuild reproduces its rows from the final states alone. One that
+names types is **history-dependent**: it is given the commit ID, and the events and state of the
+streams of those types; every other stream arrives without events and without state. A
+history-dependent projector may only own rows by streams of the types it names. The store durably
+adds those types to the manifest's `historyDependent` set before the projector's first commit
+(`compact_below` then refuses them), so the repository must implement `declare_history_dependent`
+and `writes_views` (the in-memory, DynamoDB, and PostgreSQL ones do). A row keyed by the commit ID
+therefore needs a history-dependent projector.
+
+A projector must be deterministic: `group_commits` regroups stored events by commit ID in an order
+every stream agrees with, so a rebuild, or a test, can run the projector again over each commit
+(`replay_views`) and compare the rows.
+
 ## Enumerating the log
 
 `EventLog`, implemented by all three backends, is the Rust counterpart of Go's `StreamAllEvents`

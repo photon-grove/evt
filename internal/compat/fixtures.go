@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,7 +24,6 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/internal/eventjson"
-	"github.com/photon-grove/evt/snapshots"
 	"github.com/photon-grove/evt/stream"
 )
 
@@ -71,6 +71,18 @@ type ScenarioExpectation struct {
 	// Outcomes records the command-outcome rows an outcomes scenario leaves behind (C3), ordered
 	// by command ID. The digest in each row is the run-independent one (see NewOutcomeRunner).
 	Outcomes []OutcomeExpectation `json:"outcomes,omitempty"`
+
+	// Views records the view rows commit-wide projectors left behind (C7) in the scenario's own
+	// partitions, ordered by partition then sort key bytes. A live run reads the same partitions
+	// back and keeps the rows that belong to its run.
+	Views []ViewExpectation `json:"views,omitempty"`
+}
+
+// ViewExpectation is one stored view row, as its DynamoDB item.
+type ViewExpectation struct {
+	PK         string         `json:"pk"`
+	SK         string         `json:"sk"`
+	DynamoItem map[string]any `json:"dynamoItem"`
 }
 
 // OutcomeExpectation is one stored command-outcome row, as its DynamoDB item.
@@ -308,7 +320,7 @@ func SNSMessage(ctx context.Context, item map[string]types.AttributeValue) (stri
 // scenario with outcomes gets a store that records command outcomes.
 func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) {
 	fake := NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, fakeTable)
+	repo := dynamo.NewRepository(fake, fakeTable).WithViewsTable(ViewsTable)
 
 	if scenario.Outcomes {
 		runner := NewOutcomeRunner(repo, scenario, FixtureRun)
@@ -317,12 +329,10 @@ func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) 
 		return runner, fake, repo
 	}
 
-	return Runner{
-		Store:            snapshots.NewStore(repo, scenario.SnapshotInterval),
-		Repo:             repo,
-		SnapshotInterval: scenario.SnapshotInterval,
-		BypassHead:       DynamoBypassHead(fake, fakeTable),
-	}, fake, repo
+	runner := NewRunner(repo, scenario)
+	runner.BypassHead = DynamoBypassHead(fake, fakeTable)
+
+	return runner, fake, repo
 }
 
 // Observe reads a stream back through the repository and store: the stored events and snapshot,
@@ -470,6 +480,13 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 			}
 
 			calls := fake.Transactions()[sent:]
+
+			// A commit refused before any write (a key over the limit, a repeated key, operations
+			// with no event) sends nothing; every other transaction step sends exactly one request.
+			if len(calls) == 0 && refusedBeforeWrite(step.Expect.Result) {
+				continue
+			}
+
 			if len(calls) != 1 {
 				return fixtures, fmt.Errorf("%s step %d: transaction sent %d requests, want 1", scenario.Name, index, len(calls))
 			}
@@ -502,6 +519,7 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 		}
 
 		expectation.Transactions = transactions
+		expectation.Views = observeViews(fake, scenario, entityID)
 
 		if scenario.Outcomes {
 			var oerr error
@@ -529,6 +547,70 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 	}
 
 	return fixtures, nil
+}
+
+// refusedBeforeWrite reports whether a step result is a refusal that sends no request: the commit
+// is validated before the first write.
+func refusedBeforeWrite(result string) bool {
+	switch result {
+	case ResultViewKeyTooLong, ResultDuplicateViewKey, ResultProjectorOnly:
+		return true
+	}
+
+	return false
+}
+
+// ViewPartitions lists, ascending, the view partitions a scenario writes: those its transaction
+// steps name, and the ledger partitions when it registers the shared projector. Placeholders resolve
+// against the scenario's entity ID.
+func (s Scenario) ViewPartitions(base evt.EntityID) []string {
+	seen := map[string]bool{}
+
+	for _, step := range s.Steps {
+		for _, view := range viewsOf(base, step) {
+			if len(view.Op.PK) <= evt.MaxViewPKBytes {
+				seen[view.Op.PK] = true
+			}
+		}
+	}
+
+	if s.Projector {
+		seen[LedgerPK] = true
+	}
+
+	partitions := make([]string, 0, len(seen))
+	for pk := range seen {
+		partitions = append(partitions, pk)
+	}
+
+	slices.Sort(partitions)
+
+	return partitions
+}
+
+// OwnsViewRow reports whether a row of a shared view partition belongs to the run's scenario: its
+// partition or sort key contains the scenario's entity ID. Rows of other runs and scenarios share
+// the ledger partitions of a live table, so a verifier keeps only its own.
+func OwnsViewRow(base evt.EntityID, pk, sk string) bool {
+	return strings.Contains(pk, string(base)) || strings.Contains(sk, string(base))
+}
+
+// observeViews records the rows a scenario's view partitions hold in the fake views table.
+func observeViews(fake *FakeDynamo, scenario Scenario, base evt.EntityID) []ViewExpectation {
+	var views []ViewExpectation
+
+	for _, pk := range scenario.ViewPartitions(base) {
+		for _, item := range fake.Views(pk) {
+			sk, ok := item["sk"].(*types.AttributeValueMemberS)
+			if !ok || !OwnsViewRow(base, pk, sk.Value) {
+				continue
+			}
+
+			views = append(views, ViewExpectation{PK: pk, SK: sk.Value, DynamoItem: DynamoItemJSON(item)})
+		}
+	}
+
+	return views
 }
 
 // headOf reads the head item (sk = -1) out of a partition's items, or nil when it has none.

@@ -265,6 +265,35 @@ pub trait FeatureMarker: Send + Sync {
     }
 }
 
+/// Durably adds the entity types to the manifest's `historyDependent` set, once: types already
+/// declared are left alone and nothing is written. It is a repository's
+/// [`declare_history_dependent`](crate::Repository::declare_history_dependent).
+pub(crate) async fn declare_history<M: FeatureMarker>(
+    marker: &M,
+    types: &[EntityType],
+) -> Result<(), Error> {
+    let manifest = marker.read_manifest().await?;
+    let missing: Vec<String> = types
+        .iter()
+        .filter(|entity_type| {
+            !manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.is_history_dependent(entity_type))
+        })
+        .map(|entity_type| entity_type.as_str().to_owned())
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    marker
+        .update_manifest(move |manifest| {
+            manifest.history_dependent.extend(missing.iter().cloned());
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

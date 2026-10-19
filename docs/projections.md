@@ -16,6 +16,148 @@ groups. In dry-run mode, `evt` reports the work without writing rows.
 The rebuild contract deliberately makes writes explicit through `CommitGroup` so
 adopters can choose the safest commit strategy for their storage backend.
 
+## Commit-wide projectors
+
+An `EventProjector` sees one entity at a time. A **commit-wide projector** (v0.9, C7) is a pure
+function over everything one commit wrote, and it emits **view operations** that commit in the same
+transaction as the events. Use it for read models that span entities: a directory of unique names,
+a per-tenant ledger, an index that must never disagree with the streams behind it.
+
+The example is a directory of unique handles. Each handle name is a stream of its own,
+`handle:<name>`, and the handle stream owns the row for that name for good. A command that claims a
+name reads the handle stream and appends a `handle:claimed` event to it in the same transaction as
+the account's event; two accounts racing for one name both read the handle stream at one sequence,
+so one loses to optimistic concurrency and retries against the new state. Releasing a name appends
+`handle:released`, and the row is rewritten with a tombstone, never deleted.
+
+```go
+type handles struct{}
+
+func (handles) Name() string { return "handles" }
+
+// The directory reads the events of handle streams, so it is history-dependent on that type.
+func (handles) History() []evt.EntityType { return []evt.EntityType{"handle"} }
+
+func (handles) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
+    var operations []evt.ViewOperation
+
+    for _, stream := range commit.Streams { // ascending by entity ID bytes
+        if stream.EntityType != "handle" {
+            continue // an account stream appears by ID and type only: it is not declared
+        }
+
+        latest := stream.Events[len(stream.Events)-1] // this commit's events, ascending by sequence
+
+        // The row's owner is the handle stream. A release is a tombstone put, not a delete: the
+        // row stays where the stream put it, so the next claimant, a later commit of the same
+        // stream, rewrites it.
+        operations = append(operations,
+            evt.PutView("handles", nameOf(stream.EntityID), stream.EntityID, stream.EntityType, holderOf(latest)))
+    }
+
+    return operations, nil
+}
+
+store := snapshots.NewStore(repo, 5).WithCommitProjectors(handles{})
+```
+
+**What a projector sees.** An `evt.CommitView`: the commit ID and every stream the commit wrote,
+ascending by entity-ID bytes, each with its entity type, the commit's events for it, and its state
+after the commit (the JSON its snapshot would carry). Streams that were only read are fenced, not
+written, so they are not in the view. A command that writes no event — a plain rejection, an
+accepted no-op — runs no projector; a rejection that carries events projects them like an accepted
+command's. The view has no outcome context on purpose: a rebuild has no outcome row.
+
+**Current-state or history-dependent.** `History()` names the entity types whose *events* the
+projector reads, and the view each kind is given is what a rebuild of that kind can give it again:
+
+- A projector that returns none is **current-state**. It is given each stream's state after the
+  commit, and nothing else: no events and an **empty commit ID**, so it cannot key a row by commit,
+  count a commit's events, or otherwise depend on anything beyond the state the streams reach. Use
+  it for rows that are a function of current state, such as a per-entity summary.
+- A projector that returns types is **history-dependent**. It is given the commit ID, and the events
+  *and state* of the streams of those types only; every other stream appears by entity ID and type
+  with neither (its history may have been compacted, and the declaration does not cover it). Before
+  the first commit that runs it the store durably adds those types to the feature manifest's
+  `historyDependent` set, so `CompactBelow` refuses them in every process — the commits a rebuild
+  replays must stay. The repository must be able to declare (`evt.HistoryDeclarer`; the in-memory,
+  DynamoDB, and PostgreSQL repositories are) or the commit fails with
+  `*evt.HistoryDeclarationUnsupportedError`.
+
+**Owners.** Every operation of every projector names the stream that **owns** its row (the owner is
+an argument of `PutView` and `DeleteView`). It must be a stream the commit wrote; for a
+history-dependent projector it must also be of a type the projector declares in `History()`, so the
+row can be rebuilt from the history the declaration protects (`*evt.InvalidViewOperationError`
+otherwise). The repository stores the owner as the row's `entityID` and conditions **every** write
+to the row on it — puts and deletes, with or without a presence condition — so a write by any
+other stream fails the commit with a `*evt.ProjectorOperationError` (reason
+`ConditionalCheckFailed`) at the time it is made, not at a later rebuild.
+
+**A row's owner must never change.** The log keeps one commit order only: each stream's sequence
+order. The writes to a row can be put back in order only while they all come from commits that
+wrote the same stream. A key therefore never changes hands by delete-then-put from another stream:
+the delete leaves the row absent, so the second stream's put would pass the owner condition live,
+and a rebuild — which has no order between the two streams — could not tell which came last
+(`evt.ReplayViews` refuses it with `*evt.SharedViewKeyError`). To reuse a key, keep it with its
+owner and rewrite the row as a tombstone, or make the key belong to a stream every claimant writes,
+as the handle stream above does. Do not rely on commit IDs for ordering; they are not causal.
+
+**What it returns.** Puts and deletes of rows at any `pk`/`sk`, in the order they should be
+written. A put overwrites unless it is `IfAbsent`; a delete of a missing row succeeds unless it is
+`IfPresent`. `OnConflict(err)` names the error to return when the condition fails. Projectors are
+appended in the order `WithCommitProjectors` was called, each one's operations in emission order,
+after the marker check and before the written streams ([layout](spec/storage-format.md#writes)).
+Before any write, on every backend, the engine refuses an operation with an empty or non-UTF-8 key,
+a `pk` over 2,048 or an `sk` over 1,024 UTF-8 bytes (`*evt.ViewKeyTooLongError`), and two
+operations on the same row (`*evt.DuplicateViewKeyError`). Operations count against the
+`CommitTooLarge` budget, and a commit that carries operations but no event is refused
+(`*evt.ProjectorOnlyCommitError`): views are projections of committed events.
+
+**Where the rows go.** The repository writes them. Give the DynamoDB repository a views table
+with `repo.WithViewsTable("views")` (string `pk` and `sk`, the same table `NewViewRepository`
+reads); give the PostgreSQL repository a writer with `repo.WithViewWriter(fn)`, since evt defines
+no view schema — your `fn` turns each operation into the SQL for your own table (see
+[PostgreSQL](postgres.md#views)). The in-memory repository keeps them for tests
+(`mem.Repository.View`, `Views`). Without a place to write, the commit fails with
+`*evt.ViewsNotConfiguredError` before any write; operations are never dropped.
+
+**When a condition fails.** The commit writes nothing and returns `*evt.ProjectorOperationError`,
+which names the projector and the operation (and wraps the operation's mapped error, so
+`errors.Is(err, ErrHandleTaken)` works). It is not an optimistic-concurrency conflict and not
+transient: re-preparing the command cannot fix it, so fence-aware retry returns it at once and
+records no outcome. It ranks last among the ways a commit can fail: a lost outcome row, stream-head
+drift, a sequence gap, and any conflict on a written stream or a fence are reported first.
+
+**Purity is the rebuild contract.** A projector's rows must be a deterministic function of its
+`CommitView`: no clock, random source, environment, or store reads; no state kept between calls; no
+dependence on map iteration order. Mutable decisions, externally observed signals, and verdicts are
+event-sourced first and projected second; a view row that exists only because something happened
+outside the log cannot be rebuilt, and a rebuild would silently lose it.
+
+**What a rebuild reproduces today.** Only an in-memory replay exists: regroup the stored events
+with `evt.GroupCommits`, fold each stream's state after its commit yourself, and run the projectors
+over the groups with `evt.ReplayViews`. For a **history-dependent** projector that is the contract
+— the rows it returns equal the live rows — and it is how to test one (see the end-to-end test in
+`snapshots/projectors_test.go`). For a **current-state** projector the same replay works because
+the state is yours to supply, but there is no engine entry point yet that rebuilds current-state
+rows from the current state of the streams alone (the state-based rebuild is specified in the
+[storage format](spec/storage-format.md#views) and lands with the rebuild ports); until then,
+treat a current-state projector's rows as reproducible only by replaying with folded state.
+Nothing rebuilds the rows of a durable view table by itself today.
+
+```go
+groups, err := evt.GroupCommits(storedEvents) // ordered consistently with every stream's sequence
+for _, group := range groups {
+    for i, stream := range group.Streams {
+        group.Streams[i].State = foldState(storedEvents, stream) // the state after this commit
+    }
+}
+
+rows, err := evt.ReplayViews(ctx, projectors, groups)
+// rows must equal the live rows, or err is *evt.SharedViewKeyError: the replay refuses a row two
+// streams write instead of guessing the order.
+```
+
 ## Scanning the event log
 
 `RebuildProjections` reads the whole event log through `StreamEntities`, which is

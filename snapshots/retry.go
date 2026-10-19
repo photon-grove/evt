@@ -195,12 +195,19 @@ func load(err error) error {
 // classifyAttempt decides whether a failed attempt is worth another.
 func classifyAttempt(err error) retryKind {
 	var (
-		marked *internalFailure
-		loaded *loadFailure
+		marked    *internalFailure
+		loaded    *loadFailure
+		projector *evt.ProjectorError
 	)
 
 	switch {
 	case err == nil, errors.As(err, &marked):
+		return retryNever
+
+	case errors.Is(err, evt.ErrProjectorOperation), errors.As(err, &projector):
+		// A projector's failure is final whatever the error it maps or wraps looks like: an
+		// application may map a failed claim to a conflict-shaped error of its own, and re-preparing
+		// the command cannot fix it.
 		return retryNever
 
 	case errors.As(err, &loaded):

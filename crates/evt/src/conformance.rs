@@ -812,6 +812,7 @@ impl Stream {
             events,
             snapshot,
             operations: Vec::new(),
+            views: Vec::new(),
             outcome: None,
         })
         .await
@@ -1813,6 +1814,7 @@ fn write<Op>(entity: &Stream, sequences: RangeInclusive<i64>) -> Commit<Op> {
         events: entity.events(sequences),
         snapshot: None,
         operations: Vec::new(),
+        views: Vec::new(),
         outcome: None,
     }
 }
@@ -2381,6 +2383,7 @@ async fn reserved_namespaces<R: Repository>(repo: &R) -> CaseResult {
                 events,
                 snapshot: None,
                 operations: Vec::new(),
+                views: Vec::new(),
                 outcome: None,
             })
             .await,
@@ -2569,6 +2572,17 @@ impl<R: Repository> Interfering<'_, R> {
 impl<R: Repository> Repository for Interfering<'_, R> {
     type Operation = R::Operation;
 
+    fn writes_views(&self) -> bool {
+        self.inner.writes_views()
+    }
+
+    fn declare_history_dependent(
+        &self,
+        types: &[EntityType],
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        self.inner.declare_history_dependent(types)
+    }
+
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
         if self.fires(&Interference::CompetingCommit) {
             let competing = commit
@@ -2587,6 +2601,7 @@ impl<R: Repository> Repository for Interfering<'_, R> {
                     events: competing,
                     snapshot: None,
                     operations: Vec::new(),
+                    views: Vec::new(),
                     outcome: None,
                 })
                 .await?;
@@ -3784,6 +3799,17 @@ impl<R: Repository> FaultInjectingRepository<R> {
 
 impl<R: Repository> Repository for FaultInjectingRepository<R> {
     type Operation = R::Operation;
+
+    fn writes_views(&self) -> bool {
+        self.inner.writes_views()
+    }
+
+    fn declare_history_dependent(
+        &self,
+        types: &[EntityType],
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        self.inner.declare_history_dependent(types)
+    }
 
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
         if commit.outcome.is_some() {
@@ -5571,6 +5597,17 @@ impl<'a, R: Repository> Meddling<'a, R> {
 impl<R: Repository> Repository for Meddling<'_, R> {
     type Operation = R::Operation;
 
+    fn writes_views(&self) -> bool {
+        self.inner.writes_views()
+    }
+
+    fn declare_history_dependent(
+        &self,
+        types: &[EntityType],
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        self.inner.declare_history_dependent(types)
+    }
+
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
         self.meddle(false, !commit.events.is_empty()).await?;
 
@@ -7011,3 +7048,7 @@ async fn rejection_events_caller_fence<R: Repository>(repo: &R) -> CaseResult {
 
     Ok(())
 }
+
+mod views;
+
+pub use views::{CommitViewTarget, commit_view_cases};

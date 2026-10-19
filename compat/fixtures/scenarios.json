@@ -6098,6 +6098,1780 @@
           }
         }
       ]
+    },
+    {
+      "name": "commit-wide-views",
+      "entityId": "compat-fixture-commit-wide-views",
+      "sequence": 4,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":2100,\"deposits\":3,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":\"after-failures\"}",
+      "events": [
+        "{\"id\":\"compat-fixture-commit-wide-views:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiJ9\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-views:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAwLCJtZW1vIjoicHJpbWFyeSJ9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"compat-rust-c2\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-views:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"compat-go-c3\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-views:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwMCwibWVtbyI6ImFmdGVyLWZhaWx1cmVzIn0=\",\"metadata\":{\"commandId\":\"c11\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c11\",\"extensions\":{},\"commitId\":\"compat-go-c11\"}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "head": {
+            "N": "4"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-views"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Hedy Lamarr\",\"openedAt\":\"0001-01-01T00:00:00Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-views"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"compat-rust-c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":500,\"memo\":\"primary\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-views"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"compat-go-c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":600}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-views"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c11\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c11\",\"extensions\":{},\"commitId\":\"compat-go-c11\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":1000,\"memo\":\"after-failures\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-views"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-views:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-views:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiJ9\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-views:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-views:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAwLCJtZW1vIjoicHJpbWFyeSJ9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"compat-rust-c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-views:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-views:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"compat-go-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-views:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-views:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwMCwibWVtbyI6ImFmdGVyLWZhaWx1cmVzIn0=\",\"metadata\":{\"commandId\":\"c11\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c11\",\"extensions\":{},\"commitId\":\"compat-go-c11\"}}}"
+      ],
+      "head": 4,
+      "siblings": [
+        {
+          "entityId": "compat-fixture-commit-wide-views-ledger",
+          "sequence": 0,
+          "events": [
+            "{\"id\":\"compat-fixture-commit-wide-views-ledger:1\",\"sequence\":1,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views-ledger\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAsIm1lbW8iOiJzaWJsaW5nIn0=\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"compat-rust-c2\"}}",
+            "{\"id\":\"compat-fixture-commit-wide-views-ledger:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-views-ledger\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjB9\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"compat-go-c3\"}}"
+          ],
+          "snapshot": null,
+          "dynamoItems": [
+            {
+              "head": {
+                "N": "2"
+              },
+              "pk": {
+                "S": "compat-fixture-commit-wide-views-ledger"
+              },
+              "sk": {
+                "N": "-1"
+              }
+            },
+            {
+              "entityType": {
+                "S": "account"
+              },
+              "metadata": {
+                "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"compat-rust-c2\"}"
+              },
+              "payload": {
+                "S": "{\"amountCents\":50,\"memo\":\"sibling\"}"
+              },
+              "pk": {
+                "S": "compat-fixture-commit-wide-views-ledger"
+              },
+              "sk": {
+                "N": "1"
+              },
+              "type": {
+                "S": "account:deposited"
+              },
+              "version": {
+                "N": "1"
+              }
+            },
+            {
+              "entityType": {
+                "S": "account"
+              },
+              "metadata": {
+                "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"compat-go-c3\"}"
+              },
+              "payload": {
+                "S": "{\"amountCents\":60}"
+              },
+              "pk": {
+                "S": "compat-fixture-commit-wide-views-ledger"
+              },
+              "sk": {
+                "N": "2"
+              },
+              "type": {
+                "S": "account:deposited"
+              },
+              "version": {
+                "N": "1"
+              }
+            }
+          ],
+          "head": 2
+        }
+      ],
+      "transactions": [
+        {
+          "step": 1,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "account",
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "ledger",
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#audit",
+              "sk": 0,
+              "skText": "c2",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "2"
+                },
+                ":prev": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 2,
+              "condition": "attribute_not_exists(sk)"
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views-ledger",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "attribute_not_exists(head)",
+              "values": {
+                ":last": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views-ledger",
+              "sk": 1,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 2,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "account",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Delete",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "ledger",
+              "condition": "attribute_exists(pk) AND entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#audit",
+              "sk": 0,
+              "skText": "c3",
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "3"
+                },
+                ":prev": {
+                  "N": "2"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 3,
+              "condition": "attribute_not_exists(sk)"
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views-ledger",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "2"
+                },
+                ":prev": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views-ledger",
+              "sk": 2,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 3,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "fresh",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#claims",
+              "sk": 0,
+              "skText": "handle#hedy",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#audit",
+              "sk": 0,
+              "skText": "c3",
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "4"
+                },
+                ":prev": {
+                  "N": "3"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 4,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 4,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "fresh",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#claims",
+              "sk": 0,
+              "skText": "handle#hedy",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#audit",
+              "sk": 0,
+              "skText": "c3",
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "4"
+                },
+                ":prev": {
+                  "N": "3"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 4,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 5,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Delete",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "ledger",
+              "condition": "attribute_exists(pk) AND entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "4"
+                },
+                ":prev": {
+                  "N": "3"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 4,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 10,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Delete",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "fresh",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "account",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Delete",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#audit",
+              "sk": 0,
+              "skText": "c2",
+              "condition": "attribute_exists(pk) AND entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "4"
+                },
+                ":prev": {
+                  "N": "3"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 4,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 11,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "account",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views-other"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "5"
+                },
+                ":prev": {
+                  "N": "4"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 5,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 12,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Delete",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "account",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views-other"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "5"
+                },
+                ":prev": {
+                  "N": "4"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 5,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        }
+      ],
+      "views": [
+        {
+          "pk": "compat-fixture-commit-wide-views#audit",
+          "sk": "c3",
+          "dynamoItem": {
+            "entityID": {
+              "S": "compat-fixture-commit-wide-views"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"streams\":2}"
+            },
+            "pk": {
+              "S": "compat-fixture-commit-wide-views#audit"
+            },
+            "sk": {
+              "S": "c3"
+            }
+          }
+        },
+        {
+          "pk": "compat-fixture-commit-wide-views#directory",
+          "sk": "account",
+          "dynamoItem": {
+            "entityID": {
+              "S": "compat-fixture-commit-wide-views"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"balanceCents\":2800}"
+            },
+            "pk": {
+              "S": "compat-fixture-commit-wide-views#directory"
+            },
+            "sk": {
+              "S": "account"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "commit-wide-projector",
+      "entityId": "compat-fixture-commit-wide-projector",
+      "sequence": 9,
+      "snapshotSequence": 3,
+      "state": "{\"owner\":\"Grace Hopper\",\"status\":\"open\",\"balanceCents\":5,\"deposits\":5,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":[\"overdraft-attempted\",\"vip\"],\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-commit-wide-projector:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIEhvcHBlciIsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ==\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c1\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-projector:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c2\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-projector:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-projector:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-projector:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-projector:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm92ZXJkcmFmdC1hdHRlbXB0ZWQiXX0=\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c4\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-projector:7\",\"sequence\":7,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCJdfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c7\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c7\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-projector:8\",\"sequence\":8,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTYwfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c8\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c8\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c8\"}}",
+        "{\"id\":\"compat-fixture-commit-wide-projector:9\",\"sequence\":9,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c9\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c9\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c9\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-commit-wide-projector\",\"sequence\":3,\"eventSequence\":9,\"payload\":\"eyJvd25lciI6IkdyYWNlIEhvcHBlciIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjUsImRlcG9zaXRzIjo1LCJvcGVuZWRBdCI6IjAwMDEtMDEtMDFUMDA6MDA6MDBaIiwidGFncyI6WyJvdmVyZHJhZnQtYXR0ZW1wdGVkIiwidmlwIl0sImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOm51bGx9\"}",
+      "dynamoItems": [
+        {
+          "head": {
+            "N": "9"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "9"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Grace Hopper\",\"status\":\"open\",\"balanceCents\":5,\"deposits\":5,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":[\"overdraft-attempted\",\"vip\"],\"labels\":null,\"lastMemo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "seq": {
+            "N": "3"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Grace Hopper\",\"openedAt\":\"0001-01-01T00:00:00Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":10,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":20,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":30,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "5"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c4\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"overdraft-attempted\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "6"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c7\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c7\"}"
+          },
+          "payload": {
+            "S": "{\"tags\":[\"vip\"]}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "7"
+          },
+          "type": {
+            "S": "account:tagged"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c8\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c8\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c8\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":160}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "8"
+          },
+          "type": {
+            "S": "account:withdrawn"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-commit-wide-projector-c9\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c9\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c9\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":5,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-commit-wide-projector"
+          },
+          "sk": {
+            "N": "9"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkdyYWNlIEhvcHBlciIsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ==\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:6\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm92ZXJkcmFmdC1hdHRlbXB0ZWQiXX0=\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c4\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:7\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:7\",\"sequence\":7,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbInZpcCJdfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c7\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c7\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:8\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:8\",\"sequence\":8,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTYwfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c8\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c8\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c8\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-commit-wide-projector:9\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-commit-wide-projector:9\",\"sequence\":9,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-commit-wide-projector\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"compat-fixture-commit-wide-projector-c9\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-commit-wide-projector-c9\",\"extensions\":{},\"commitId\":\"compat-fixture-commit-wide-projector-c9\"}}}"
+      ],
+      "head": 9,
+      "transactions": [
+        {
+          "step": 0,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Delete",
+                "table": "views",
+                "pk": "ledger",
+                "sk": 0,
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "attribute_not_exists(head)",
+                "values": {
+                  ":last": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 1,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c1",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 1,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "table": "views",
+                "pk": "ledger",
+                "sk": 0,
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "2"
+                  },
+                  ":prev": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 2,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c2",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 2,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "table": "views",
+                "pk": "ledger",
+                "sk": 0,
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "5"
+                  },
+                  ":prev": {
+                    "N": "2"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 3,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 4,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 5,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 0,
+                "condition": "attribute_not_exists(seq)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c3",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 3,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "table": "views",
+                "pk": "ledger",
+                "sk": 0,
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "6"
+                  },
+                  ":prev": {
+                    "N": "5"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 6,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 0,
+                "condition": "seq = :seq",
+                "values": {
+                  ":seq": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c4",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 5,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c5",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 6,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c6",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 7,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "table": "views",
+                "pk": "ledger",
+                "sk": 0,
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "7"
+                  },
+                  ":prev": {
+                    "N": "6"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 7,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c7",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 8,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Delete",
+                "table": "views",
+                "pk": "ledger",
+                "sk": 0,
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "8"
+                  },
+                  ":prev": {
+                    "N": "7"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 8,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c8",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 9,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "table": "views",
+                "pk": "ledger",
+                "sk": 0,
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "9"
+                  },
+                  ":prev": {
+                    "N": "8"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 9,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-commit-wide-projector",
+                "sk": 0,
+                "condition": "seq = :seq",
+                "values": {
+                  ":seq": {
+                    "N": "2"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-commit-wide-projector-c9",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        }
+      ],
+      "outcomes": [
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c1",
+          "dynamoItem": {
+            "digest": {
+              "S": "641fc1b78337db90422b167906fa88a5dc113a09f80d3d236c6f2519ae21a088"
+            },
+            "events": {
+              "S": "[\"compat-fixture-commit-wide-projector:1\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c2",
+          "dynamoItem": {
+            "digest": {
+              "S": "417d6491f8094d7be4c17ea021f197c812783efab676e5cd98b093316612c950"
+            },
+            "events": {
+              "S": "[\"compat-fixture-commit-wide-projector:2\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c2"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjEwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c3",
+          "dynamoItem": {
+            "digest": {
+              "S": "e74f66211e9f3a0f7a89d59a5e2e0e5ea88323206d770caa1f0a94eef1647e3d"
+            },
+            "events": {
+              "S": "[\"compat-fixture-commit-wide-projector:3\",\"compat-fixture-commit-wide-projector:4\",\"compat-fixture-commit-wide-projector:5\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c3"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjE2MH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c4",
+          "dynamoItem": {
+            "code": {
+              "S": "insufficient-funds"
+            },
+            "digest": {
+              "S": "b86b4bf3bdbfb3cd2158b796350819f0688b22f657f3851a402ea2b457858dcc"
+            },
+            "events": {
+              "S": "[\"compat-fixture-commit-wide-projector:6\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c4"
+            },
+            "rejection": {
+              "S": "{\"code\":\"insufficient-funds\",\"message\":\"insufficient funds\",\"details\":{\"balanceCents\":160,\"requestedCents\":9999}}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c5",
+          "dynamoItem": {
+            "code": {
+              "S": "insufficient-funds"
+            },
+            "digest": {
+              "S": "3cbb5244b9f2827af278deff72e39d99bc7b268d07936e8355167efd119e7a75"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c5"
+            },
+            "rejection": {
+              "S": "{\"code\":\"insufficient-funds\",\"message\":\"insufficient funds\",\"details\":{\"balanceCents\":160,\"requestedCents\":9999}}"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "rejected"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c6",
+          "dynamoItem": {
+            "digest": {
+              "S": "7eeefe83db78d258d2af0d35f2587f90f2d297c244a7bab857d3fa8816666b91"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c6"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c7",
+          "dynamoItem": {
+            "digest": {
+              "S": "c17359d32d3adfb49761fa3dfc95e15128a7d1759ac9d9127f3750a85b9ab204"
+            },
+            "events": {
+              "S": "[\"compat-fixture-commit-wide-projector:7\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c7"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c8",
+          "dynamoItem": {
+            "digest": {
+              "S": "d0b93b43b7b9c2f1874741af9a2c987a08847b3564b3e648cb40a415e858d5ce"
+            },
+            "events": {
+              "S": "[\"compat-fixture-commit-wide-projector:8\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c8"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjB9"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-commit-wide-projector-c9",
+          "dynamoItem": {
+            "digest": {
+              "S": "2dabb41e013fe30116e4b6d4e845c043676d60904bfc1deaec74f9d719756ccc"
+            },
+            "events": {
+              "S": "[\"compat-fixture-commit-wide-projector:9\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-commit-wide-projector-c9"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjV9"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        }
+      ],
+      "views": [
+        {
+          "pk": "ledger",
+          "sk": "compat-fixture-commit-wide-projector",
+          "dynamoItem": {
+            "entityID": {
+              "S": "compat-fixture-commit-wide-projector"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"balanceCents\":5,\"status\":\"open\",\"tags\":2}"
+            },
+            "pk": {
+              "S": "ledger"
+            },
+            "sk": {
+              "S": "compat-fixture-commit-wide-projector"
+            }
+          }
+        }
+      ]
     }
   ]
 }

@@ -443,7 +443,8 @@ async fn scenarios_match_go_byte_for_byte() {
         // The memory repository stands in for a backend, including its raw access to the heads.
         let repository = MemRepository::new();
         let runner = Runner::for_scenario(repository.clone(), scenario, FIXTURE_RUN)
-            .with_head_access(repository);
+            .with_head_access(repository.clone())
+            .with_view_access(repository);
         let entity_id = scenario.entity_id(FIXTURE_RUN);
 
         for (index, step) in scenario.steps.iter().enumerate() {
@@ -500,6 +501,11 @@ async fn scenarios_match_go_byte_for_byte() {
             "{}: sibling streams",
             scenario.name
         );
+
+        // The view rows commit-wide projectors left in the scenario's partitions: the bytes Go
+        // stored, in the order a verifier reads them.
+        let views = runner.observe_views(scenario, &entity_id).await.unwrap();
+        assert_eq!(views, expected.views, "{}: view rows", scenario.name);
 
         // The outcome rows of an outcomes scenario: digests, event IDs, responses, and rejections
         // are the bytes Go stored.

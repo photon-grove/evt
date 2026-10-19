@@ -112,6 +112,7 @@ type Repository struct {
 	eventsTable    string
 	snapshotsTable string
 	features       *FeatureMarker // mandatory feature validation (C9)
+	viewWriter     ViewWriter     // writes commit-wide view operations (C7); nil refuses them
 }
 
 // Compile-time checks that the Repository satisfies the core contract and every optional capability
@@ -318,12 +319,12 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_stream_heads (
 // (entity_id, sequence) pair violates the primary key and is returned as an evt.ConflictError,
 // giving the optimistic-concurrency guarantee the contract requires.
 //
-// This backend is an event log only: it does not execute res.Transaction, since projector view
-// writes are backend-specific (the only TransactionGroup implementation today is DynamoDB's) and no
-// PostgreSQL view store exists yet. A result carrying any projector operation is refused with
-// *evt.ProjectorOperationsUnsupportedError before any write instead of dropping the operations.
-// Adding view support later would extend this to write the view rows in the same transaction as
-// the events, preserving atomicity.
+// Commit-wide view operations (ADR 0004, C7) execute in the same transaction, after the events and
+// before the snapshots, through the repository's ViewWriter (WithViewWriter): evt defines no
+// PostgreSQL view schema, so the application's writer turns each operation into its own SQL. A
+// commit that carries view operations and no writer is refused with *evt.ViewsNotConfiguredError.
+// The operations of a transaction group built for another storage type are refused with
+// *evt.ProjectorOperationsUnsupportedError before any write instead of being dropped.
 func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) error {
 	if err := repo.checkFeatureMarkerTable(); err != nil {
 		return err
@@ -335,9 +336,9 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 		return err
 	}
 
-	// This backend executes no projector groups until commit-wide projector support lands (E2.6).
-	// Fail closed rather than commit the events and silently drop the view writes.
-	if err := evt.CheckProjectorOperationsSupported("postgres", res); err != nil {
+	// This backend executes no transaction group: fail closed rather than commit the events and
+	// silently drop the operations of a group built for another storage type.
+	if err := evt.CheckLegacyProjectorOperationsSupported("postgres", res); err != nil {
 		return err
 	}
 
@@ -350,7 +351,14 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 		return err
 	}
 
-	if err = evt.PreflightCommit(normalized); err != nil {
+	// The statements are built before the budget so each view operation counts as one action sized
+	// by its SQL text, and before any write so a writer that refuses one fails the whole commit.
+	views, err := repo.buildViews(normalized.Views)
+	if err != nil {
+		return err
+	}
+
+	if err = commitBudget(normalized, views); err != nil {
 		return err
 	}
 
@@ -359,7 +367,7 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 		return err
 	}
 
-	err = repo.inTx(ctx, func(tx pgx.Tx) error { return repo.commitInTx(ctx, tx, normalized) })
+	err = repo.inTxMapping(ctx, func(tx pgx.Tx) error { return repo.commitInTx(ctx, tx, normalized, views) }, len(views) > 0)
 	if err == nil {
 		return nil
 	}
@@ -379,7 +387,12 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 // existing outcome row, every head statement and fence read (evaluated without stopping at the
 // first failure, then ranked), the event inserts, the snapshot upserts, and last the outcome
 // insert.
-func (repo *Repository) commitInTx(ctx context.Context, tx pgx.Tx, normalized evt.SerializedResult) error {
+func (repo *Repository) commitInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	normalized evt.SerializedResult,
+	views []builtView,
+) error {
 	// Every touched stream — written and fenced — takes its advisory lock in canonical
 	// (sorted) order, so concurrent multi-stream commits cannot deadlock.
 	if err := repo.lockTransactionEntities(ctx, tx, normalized); err != nil {
@@ -390,6 +403,9 @@ func (repo *Repository) commitInTx(ctx context.Context, tx pgx.Tx, normalized ev
 	if err != nil {
 		return err
 	}
+
+	// The rebuild-lock assertion (C10) joins the transaction here, right after the marker check
+	// and before anything is written, once the rebuild fence lands; until then none is emitted.
 
 	// Fences are refused for entity types durably declared with retention. The refusal consults
 	// the manifest in this transaction, not this instance's configuration.
@@ -409,6 +425,12 @@ func (repo *Repository) commitInTx(ctx context.Context, tx pgx.Tx, normalized ev
 
 	if err = repo.insertEvents(ctx, tx, normalized.Events); err != nil {
 		return repo.classifyInsertFailure(ctx, tx, normalized.Events, err)
+	}
+
+	// The view statements run after the events, so a writer that lost a race fails on its head
+	// statement (a conflict) before it reaches a view row, and before the snapshots.
+	if err = execViews(ctx, tx, views); err != nil {
+		return err
 	}
 
 	if err = repo.commitSnapshots(ctx, tx, normalized); err != nil {
@@ -534,7 +556,7 @@ func (repo *Repository) CommitWithSnapshot(
 		return err
 	}
 
-	if err := evt.CheckProjectorOperationsSupported("postgres", res); err != nil {
+	if err := evt.CheckLegacyProjectorOperationsSupported("postgres", res); err != nil {
 		return err
 	}
 
@@ -692,6 +714,13 @@ func (repo *Repository) checkFeaturesManifest(ctx context.Context, tx pgx.Tx) (*
 
 // inTx runs fn inside a transaction, committing on success and rolling back on error or panic.
 func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	return repo.inTxMapping(ctx, fn, false)
+}
+
+// inTxMapping is inTx for a transaction that may carry view operations: an integrity violation at
+// COMMIT of one is the projector's failure (a deferred constraint on its table), not the event log's
+// conflict.
+func (repo *Repository) inTxMapping(ctx context.Context, fn func(pgx.Tx) error, carriesViews bool) error {
 	tx, err := repo.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: begin: %w", err)
@@ -706,6 +735,12 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	}
 
 	if err := tx.Commit(ctx); err != nil {
+		if carriesViews {
+			if projectorFailure := viewCommitError(err); projectorFailure != nil {
+				return projectorFailure
+			}
+		}
+
 		failure := classifyWriteError(fmt.Errorf("postgres: commit: %w", err))
 
 		// A database error at COMMIT is a definitive refusal. Anything else — a lost connection, a

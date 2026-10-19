@@ -38,6 +38,10 @@ type memFeatures struct {
 	// outcomes holds the command-outcome rows (ADR 0004, C3), keyed by command ID. They share the
 	// lock with the manifest so an outcome is written in the same critical section as its events.
 	outcomes map[evt.CommandID]evt.Outcome
+
+	// views holds the rows commit-wide view operations write (ADR 0004, C7), keyed by pk and sk.
+	// They share the lock with the events, so a commit's rows appear in the same critical section.
+	views map[viewKey]evt.SerializedView
 }
 
 // NewRepository creates a new instance of the Repository
@@ -95,6 +99,9 @@ func (repo Repository) Commit(
 		return err
 	}
 
+	// The rebuild-lock check (C10) joins the checks here, right after the marker validation, once
+	// the rebuild fence lands; until then none is made.
+
 	// Fences are refused outright for entity types durably declared with retention, exactly as
 	// the durable backends refuse them.
 	if err := evt.CheckFenceRetention(normalized.Fences, repo.features.manifest); err != nil {
@@ -117,6 +124,12 @@ func (repo Repository) Commit(
 		return err
 	}
 
+	// A view operation's condition is the lowest-ranked failure: it is reported only when nothing
+	// above it failed, and nothing is written when it does.
+	if err := repo.checkViewConditions(normalized.Views); err != nil {
+		return err
+	}
+
 	for _, event := range normalized.Events {
 		id := string(event.EntityID)
 
@@ -132,6 +145,8 @@ func (repo Repository) Commit(
 	for _, snapshot := range normalized.Snapshots {
 		repo.snapshots[string(snapshot.EntityID)] = snapshot
 	}
+
+	repo.applyViews(normalized.Views)
 
 	if outcome := normalized.Outcome; outcome != nil {
 		if repo.features.outcomes == nil {

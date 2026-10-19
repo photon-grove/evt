@@ -15,9 +15,9 @@
 
 use std::process::ExitCode;
 
-use evt_compat::drivers::{self, DynamoHeads, PostgresHeads};
+use evt_compat::drivers::{self, DynamoHeads, DynamoViews, PostgresHeads, PostgresViews};
 use evt_compat::scenario::{Expectation, WRITER};
-use evt_compat::{HeadAccess, Runner, ScenarioFixtures, Scenarios};
+use evt_compat::{HeadAccess, Runner, ScenarioFixtures, Scenarios, ViewAccess};
 use futures_core::Stream;
 use photon_evt::dynamodb::DynamoRepository;
 use photon_evt::postgres::PostgresRepository;
@@ -131,10 +131,14 @@ async fn verify_common<R: Repository>(
     repository: &R,
     heads: impl HeadAccess + 'static,
     expected: &Expectation,
-    snapshot_interval: usize,
+    scenario: &evt_compat::Scenario,
+    views: impl ViewAccess + 'static,
     failures: &mut Failures,
 ) -> Result<(), BoxError> {
-    let runner = Runner::new(repository, snapshot_interval).with_head_access(heads);
+    let snapshot_interval = scenario.snapshot_interval;
+    let runner = Runner::new(repository, snapshot_interval)
+        .with_head_access(heads)
+        .with_view_access(views);
     let observed = runner
         .observe(&expected.name, &EntityId::new(&expected.entity_id))
         .await?;
@@ -172,6 +176,16 @@ async fn verify_common<R: Repository>(
     );
     // The stream's head: its `sk = -1` item on DynamoDB, its row in the heads table on PostgreSQL.
     check(failures, name, "head", observed.head, expected.head);
+
+    // The view rows commit-wide projectors left in the scenario's partitions, filtered to the rows
+    // this run owns (a live table is shared between runs): the raw items on DynamoDB, the rows on
+    // PostgreSQL. A scenario with no view partitions is skipped.
+    let entity_id = EntityId::new(&expected.entity_id);
+    if !scenario.view_partitions(&entity_id).is_empty() {
+        let observed = runner.observe_views(scenario, &entity_id).await?;
+
+        check(failures, name, "view rows", &observed, &expected.views);
+    }
 
     // Every other stream the scenario touches: written siblings and fenced read-only streams.
     let sibling_ids: Vec<EntityId> = expected
@@ -290,7 +304,8 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
                     repository,
                     DynamoHeads::of(repository),
                     &expected,
-                    scenario.snapshot_interval,
+                    scenario,
+                    DynamoViews::of(repository),
                     &mut failures,
                 )
                 .await?;
@@ -350,7 +365,8 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
                     repository,
                     PostgresHeads::default_tables(repository.pool().clone()),
                     &expected,
-                    scenario.snapshot_interval,
+                    scenario,
+                    PostgresViews::new(repository.pool().clone()),
                     &mut failures,
                 )
                 .await?;

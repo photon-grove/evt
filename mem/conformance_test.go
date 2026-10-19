@@ -20,6 +20,20 @@ func Test_RepositoryConformance(t *testing.T) {
 		SupportsTransactions:          true,
 		SupportsOutcomes:              true,
 		ProjectorGroup:                func(operations int) evt.TransactionGroup { return projectorGroup{size: operations} },
+		SupportsViews:                 true,
+		ReadView: func(_ context.Context, repo evt.Repository, pk, sk string) (*evt.SerializedView, error) {
+			memRepo, ok := repo.(*mem.Repository)
+			if !ok {
+				return nil, fmt.Errorf("unexpected repository type %T", repo)
+			}
+
+			view, found := memRepo.View(pk, sk)
+			if !found {
+				return nil, nil
+			}
+
+			return &view, nil
+		},
 		DeclareRetention: func(ctx context.Context, repo evt.Repository, entityType evt.EntityType) error {
 			memRepo, ok := repo.(*mem.Repository)
 			if !ok {

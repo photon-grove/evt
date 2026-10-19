@@ -40,6 +40,7 @@ mod mem;
 mod metadata;
 mod numbers;
 mod outcome;
+mod projection;
 mod repository;
 mod retry;
 mod sha256;
@@ -79,6 +80,12 @@ pub use outcome::{
     MAX_OUTCOME_BYTES, Outcome, OutcomeCommand, OutcomeConfig, OutcomeStatus, Rejection,
     RejectionCode, ToRejection, canonical_digest_bytes, canonical_json, check_command_id,
     check_outcome, decode_event_ids, default_digest, encode_event_ids,
+};
+pub use projection::{
+    CommitProjector, CommitStream, CommitView, MAX_VIEW_PK_BYTES, MAX_VIEW_SK_BYTES, ProjectedView,
+    ProjectorOperationError, REASON_CONDITION_FAILED, ViewCondition, ViewOperation,
+    ViewOperationKind, ViewRow, check_views, group_commits, project_commit, replay_views,
+    view_operation_size,
 };
 pub use repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,

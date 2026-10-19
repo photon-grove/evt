@@ -45,6 +45,13 @@ type SerializedResult struct {
 	Fences      []ReadFence          `json:"fences,omitempty"`
 	Outcome     *Outcome             `json:"outcome,omitempty"`
 	Transaction Transaction          `json:"transactions"`
+
+	// Views are the commit-wide projectors' view operations (ADR 0004, C7), in the order the commit
+	// writes them: projector declaration order, each projector's in emission order. They follow the
+	// operations of Transaction's groups. A repository that cannot write them fails closed with
+	// *ViewsNotConfiguredError; a commit that carries them and no event is refused with
+	// *ProjectorOnlyCommitError.
+	Views []ProjectedView `json:"views,omitempty"`
 }
 
 // SerializedSnapshot represents a snapshot of current Entity state that is ready

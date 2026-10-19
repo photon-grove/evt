@@ -206,6 +206,39 @@ produce the same view rows — because a view is rebuilt by re-running its proje
 over the log. That is what makes a projection table disposable. See
 [Projections and rebuilds](projections.md).
 
+### Commit-wide projectors
+
+An `EventProjector` sees one entity. A **commit-wide projector** (v0.9, C7) sees the whole commit
+— every stream it wrote, with each stream's events and its state after the commit — and returns
+**view operations**: puts and deletes of rows at any `pk`/`sk`, with optional conditions and
+mapped errors. The rows commit in the same transaction as the events, so a cross-entity read model
+(a unique-name directory, a per-tenant ledger) is never out of step with the events behind it.
+
+```go
+type CommitProjector interface {
+    Name() string
+    History() []EntityType // the entity types whose events it reads; none: current-state
+    ProjectCommit(context.Context, CommitView) ([]ViewOperation, error)
+}
+
+store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{})
+```
+
+A commit-wide projector must be a **pure function of its `CommitView`**: no clock, random source,
+environment, or store reads, and no state kept between calls. That is what lets a rebuild
+reproduce its rows by regrouping the stored events by commit ID (`evt.GroupCommits`). One that
+reads events declares their entity types in `History()`: the store durably marks them
+history-dependent so they are never compacted, and it is given events, state, and the commit ID of
+those types only. A projector that declares none is current-state and is given streams' state, with
+no events and no commit ID. Every operation names the stream that owns its row, and the repository
+refuses any write to the row by another stream; a row's owner never changes, because a stream's
+sequence is the only commit order the log keeps. It runs once
+per commit that writes at least one event, again each time fence-aware retry re-prepares the
+command, and not for commands that write no event. When an operation's condition fails the commit
+fails with a typed `*evt.ProjectorOperationError` naming the projector and the operation; it is not
+retried. See [Commit-wide projectors](projections.md#commit-wide-projectors) and the
+[storage format](spec/storage-format.md#views).
+
 ## Transaction
 
 A `Transaction` is `[]TransactionGroup`: a set of related writes committed together. A
@@ -218,9 +251,11 @@ commit and its `TransactionGroup` is merged into the same atomic write as the co
 *Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):*
 handler-attached `CommandResult.Transaction` — the pattern of a handler returning related writes
 on the command's result. Return zero transactions and let projectors produce the view writes
-instead; commit-wide projectors ([ADR 0004](adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md),
-C7) are the planned replacement that lets a projector emit writes for every event in a commit,
-not just one entity's.
+instead. [Commit-wide projectors](#commit-wide-projectors) ([ADR
+0004](adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7) are the replacement:
+backend-neutral operations, for every event in a commit, not just one entity's. The groups of
+`EventProjector` and the deprecated field stay until the next minor release; their operations come
+first in a commit, then the commit-wide projectors'.
 
 ## Upcaster
 

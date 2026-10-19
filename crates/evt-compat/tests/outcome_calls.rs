@@ -55,8 +55,9 @@ impl Intercept for Recorder {
 }
 
 /// One action in the fixtures' shape: operation, key, update expression, condition, names, and
-/// values.
-fn summarize(action: &Value) -> Value {
+/// values. An action on the views table also names it (`"table": "views"`) and records its string
+/// sort key as `skText`, with `sk` 0.
+fn summarize(action: &Value, views_table: &str) -> Value {
     let (operation, body) = action
         .as_object()
         .and_then(|map| map.iter().next())
@@ -70,8 +71,12 @@ fn summarize(action: &Value) -> Value {
     let mut summary = json!({
         "operation": operation,
         "pk": key["pk"]["S"],
-        "sk": key["sk"]["N"].as_str().unwrap().parse::<i64>().unwrap(),
+        "sk": key["sk"]["N"].as_str().map_or(0, |sk| sk.parse::<i64>().unwrap()),
     });
+    if body["TableName"] == views_table {
+        summary["table"] = json!("views");
+        summary["skText"] = key["sk"]["S"].clone();
+    }
     if let Some(update) = body.get("UpdateExpression") {
         summary["update"] = update.clone();
     }
@@ -105,6 +110,7 @@ async fn outcome_scenarios_send_the_requests_go_recorded() {
         .as_nanos();
     let run = format!("calls{nanos:x}");
     let table = format!("evt-calls-{}-{nanos}", std::process::id());
+    let views_table = format!("evt-calls-views-{}-{nanos}", std::process::id());
 
     let endpoint =
         std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "http://localhost:4566".into());
@@ -156,9 +162,46 @@ async fn outcome_scenarios_send_the_requests_go_recorded() {
         .await
         .unwrap();
 
+    client
+        .create_table()
+        .table_name(&views_table)
+        .billing_mode(BillingMode::PayPerRequest)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
     let mut checked = 0;
     for scenario in scenarios.scenarios.iter().filter(|s| s.outcomes) {
-        let repository = DynamoRepository::new(client.clone(), &table);
+        let repository =
+            DynamoRepository::new(client.clone(), &table).with_views_table(&views_table);
         // Every step runs through the Rust store, whichever language the scenario assigns it to:
         // the requests are the same.
         let runner = Runner::for_scenario(repository, scenario, &run)
@@ -178,7 +221,7 @@ async fn outcome_scenarios_send_the_requests_go_recorded() {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .map(summarize)
+                        .map(|action| summarize(action, &views_table))
                         .collect()
                 })
                 .collect();
@@ -218,6 +261,10 @@ async fn outcome_scenarios_send_the_requests_go_recorded() {
     }
 
     assert!(checked >= 20, "checked {checked} requests");
+
+    for name in [&table, &views_table] {
+        client.delete_table().table_name(name).send().await.unwrap();
+    }
 }
 
 /// Runs the outcomes scenarios through the Rust store on PostgreSQL and compares the stored

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use deadpool_postgres::{GenericClient, Pool, PoolError};
 use tokio_postgres::error::SqlState;
@@ -20,6 +20,10 @@ use crate::features::{
 use crate::heads::{self, Probe};
 use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::outcome::Outcome;
+use crate::projection::{
+    ProjectedView, ProjectorOperationError, REASON_CONDITION_FAILED, ViewCondition, ViewOperation,
+    ViewOperationKind,
+};
 use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 use crate::wire::postgres::{
     DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, FEATURES_LOCK_EXCLUSIVE,
@@ -27,6 +31,12 @@ use crate::wire::postgres::{
     features_table, insert_outcome_sql, outcomes_table, schema_ddl, select_outcome_sql,
     stream_heads_table,
 };
+
+/// Turns one commit-wide view operation (v0.9, C7) into the statement that writes it. evt defines
+/// no PostgreSQL view schema: the application owns its view tables and their DDL, so a repository
+/// executes whatever statement its writer returns, inside the commit's transaction, after the
+/// events and before the snapshots (see [`PostgresRepository::with_view_writer`]).
+pub type ViewWriter = Arc<dyn Fn(&ViewOperation) -> Result<PgStatement, Error> + Send + Sync>;
 
 /// A SQL statement that an in-band projector adds to a commit. It runs in the same transaction
 /// as the events, after the head statements and the event inserts and before the snapshot upsert,
@@ -36,6 +46,12 @@ pub struct PgStatement {
     pub sql: String,
     /// The parameters.
     pub params: Vec<Box<dyn ToSql + Sync + Send>>,
+    /// For a [view writer](PostgresRepository::with_view_writer)'s statement: the name of the
+    /// table's unique or primary-key constraint on `(pk, sk)`. It is required for a put with
+    /// [`ViewCondition::Absent`]: only a violation of this constraint means the row already
+    /// exists. A unique violation of any other constraint says nothing about the requested row, so
+    /// it is an ordinary failure of the statement, with the SQLSTATE as its reason.
+    pub key_constraint: Option<String>,
 }
 
 impl PgStatement {
@@ -44,7 +60,16 @@ impl PgStatement {
         Self {
             sql: sql.into(),
             params,
+            key_constraint: None,
         }
+    }
+
+    /// Names the unique or primary-key constraint on `(pk, sk)` of a view statement; see
+    /// [`key_constraint`](PgStatement::key_constraint).
+    #[must_use]
+    pub fn with_key_constraint(mut self, constraint: impl Into<String>) -> Self {
+        self.key_constraint = Some(constraint.into());
+        self
     }
 
     /// The statement's size in the shared commit budget: one action, sized by its SQL text. The
@@ -70,6 +95,8 @@ pub struct PostgresRepository {
     pool: Pool,
     events_table: String,
     snapshots_table: String,
+    /// Turns a commit-wide view operation into its statement, when configured.
+    view_writer: Option<ViewWriter>,
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
     /// its own writer: clones validate independently, like separate processes.
     validated_marker: Mutex<CachedMarker>,
@@ -81,6 +108,7 @@ impl Clone for PostgresRepository {
             pool: self.pool.clone(),
             events_table: self.events_table.clone(),
             snapshots_table: self.snapshots_table.clone(),
+            view_writer: self.view_writer.clone(),
             validated_marker: Mutex::new(*self.validated_marker()),
         }
     }
@@ -91,6 +119,7 @@ impl fmt::Debug for PostgresRepository {
         f.debug_struct("PostgresRepository")
             .field("events_table", &self.events_table)
             .field("snapshots_table", &self.snapshots_table)
+            .field("view_writer", &self.view_writer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -105,8 +134,89 @@ impl PostgresRepository {
             pool,
             events_table: DEFAULT_EVENTS_TABLE.to_owned(),
             snapshots_table: DEFAULT_SNAPSHOTS_TABLE.to_owned(),
+            view_writer: None,
             validated_marker: Mutex::new(None),
         }
+    }
+
+    /// Writes commit-wide view operations (v0.9, C7) with `writer`. Without one, a commit that
+    /// carries view operations is refused with [`Error::ViewsNotConfigured`] before any write.
+    ///
+    /// **The writer must enforce ownership in SQL.** Every operation names an
+    /// [owner](crate::ViewOperation::owner), the stream that owns the row and the value of its
+    /// `entity_id` column; no operation may overwrite or delete a row another stream owns, and the
+    /// engine cannot check that for you. The repository decides whether an operation's condition
+    /// held from its statement's outcome, so the writer's statements must have these semantics:
+    ///
+    /// - a put with [`ViewCondition::Absent`] must raise a unique violation (`23505`) of the
+    ///   `(pk, sk)` key constraint when the row exists: write a plain `INSERT`, with no
+    ///   `ON CONFLICT` clause, and name the constraint with [`PgStatement::with_key_constraint`];
+    /// - any other put is an upsert that only the owner may overwrite:
+    ///   `INSERT ... ON CONFLICT (pk, sk) DO UPDATE SET ... WHERE <table>.entity_id =
+    ///   EXCLUDED.entity_id`. A put that affects no row (the row belongs to another stream) fails
+    ///   its condition;
+    /// - a delete with [`ViewCondition::Present`] must delete the owner's row:
+    ///   `DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3`. A delete that affects no row
+    ///   (the row is absent, or another stream's) fails the condition;
+    /// - a delete without a condition succeeds whether or not it deleted a row, and refuses
+    ///   another stream's row. Its statement reports the foreign rows it found instead of the rows
+    ///   it deleted: `WITH gone AS (DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3)
+    ///   SELECT 1 FROM <table> WHERE pk = $1 AND sk = $2 AND entity_id <> $3`. An affected-row
+    ///   count above zero fails the condition. A plain `DELETE` is wrong here: it would silently
+    ///   do nothing to another stream's row, and the engine could not tell.
+    ///
+    /// **A row's owner must never change.** Never delete a row to hand its key to another stream;
+    /// keep the row and rewrite it, as its owner, with a tombstone payload.
+    ///
+    /// A failed condition is an [`Error::ProjectorOperation`] with the reason
+    /// [`REASON_CONDITION_FAILED`]; any other error the database raises from a view statement is
+    /// one too, with its SQLSTATE as the reason. A serialization failure or deadlock (`40xxx`)
+    /// passes through as [`Error::Transient`], as for every other statement of the commit.
+    #[must_use]
+    pub fn with_view_writer(mut self, writer: ViewWriter) -> Self {
+        self.view_writer = Some(writer);
+        self
+    }
+
+    /// Builds the statements of a commit's view operations, in execution order. It runs before the
+    /// budget is checked and before any write, so a repository with no writer, or a writer that
+    /// refuses an operation, fails the whole commit with nothing written.
+    fn view_statements(&self, views: &[ProjectedView]) -> Result<Vec<PgStatement>, Error> {
+        if views.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(writer) = &self.view_writer else {
+            return Err(Error::ViewsNotConfigured {
+                backend: "postgres",
+            });
+        };
+
+        views
+            .iter()
+            .map(|view| {
+                let statement = writer(&view.op)?;
+                if statement.sql.trim().is_empty() {
+                    return Err(Error::InvalidViewOperation(format!(
+                        "projector {:?} (#{}) operation {}: the view writer returned an empty \
+                         statement",
+                        view.projector, view.projector_index, view.operation
+                    )));
+                }
+
+                if view.op.kind == ViewOperationKind::Put
+                    && view.op.condition == ViewCondition::Absent
+                    && statement.key_constraint.is_none()
+                {
+                    return Err(Error::InvalidViewOperation(format!(
+                        "projector {:?} (#{}) operation {}: the view writer must name the key \
+                         constraint of a put that requires the row to be absent",
+                        view.projector, view.projector_index, view.operation
+                    )));
+                }
+
+                Ok(statement)
+            })
+            .collect()
     }
 
     /// Uses other table names, so several logical event logs can share a database. Names must be
@@ -687,13 +797,14 @@ impl PostgresRepository {
     /// 5. the ranking of any failures (drift, then gap, then conflicts), by the same probe as
     ///    DynamoDB;
     /// 6. the event inserts (an event that already exists after the head statement passed is
-    ///    drift, because the locks make it certain), the projector statements, the snapshot
-    ///    upserts, and the outcome insert.
+    ///    drift, because the locks make it certain), the legacy projector statements, the
+    ///    commit-wide view statements, the snapshot upserts, and the outcome insert.
     async fn write_commit(
         &self,
         streams: &[&Commit<PgStatement>],
         fences: &[ReadFence],
         operations: &[&PgStatement],
+        views: &[(&ProjectedView, &PgStatement)],
         outcome: Option<&Outcome>,
         check_retention: impl FnOnce(Option<&FeatureManifest>) -> Result<(), Error>,
     ) -> Result<(), Error> {
@@ -857,6 +968,27 @@ impl PostgresRepository {
                 .map_err(projector_error)?;
         }
 
+        // The view statements follow the legacy ones, in declaration then emission order. The
+        // statement's outcome decides whether the operation's condition held; any failure maps to
+        // the operation, and the transaction rolls back when `tx` drops.
+        for (view, statement) in views {
+            let params: Vec<&(dyn ToSql + Sync)> = statement
+                .params
+                .iter()
+                .map(|param| param.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            let affected = tx
+                .execute(&statement.sql, &params)
+                .await
+                .map_err(|err| view_error(view, statement.key_constraint.as_deref(), err))?;
+
+            if view_condition_failed(&view.op, affected) {
+                return Err(Error::ProjectorOperation(Box::new(
+                    ProjectorOperationError::condition_failed(view),
+                )));
+            }
+        }
+
         // Commit snapshots are written in the same transaction as their events, under the same
         // conditions the DynamoDB snapshot put expresses. The commit raised the head to the
         // snapshot's event sequence, so the snapshot is covered (H3).
@@ -896,6 +1028,14 @@ impl PostgresRepository {
 impl Repository for PostgresRepository {
     type Operation = PgStatement;
 
+    fn writes_views(&self) -> bool {
+        true
+    }
+
+    async fn declare_history_dependent(&self, types: &[EntityType]) -> Result<(), Error> {
+        crate::features::declare_history(self, types).await
+    }
+
     async fn commit(&self, commit: Commit<PgStatement>) -> Result<(), Error> {
         commit.validate()?;
         features::check_not_reserved(&commit.entity_id)?;
@@ -908,14 +1048,25 @@ impl Repository for PostgresRepository {
 
         // The budget is backend-neutral, so an oversized commit is refused before any write,
         // identically to the other backends. Each projector statement counts as one action.
+        // The view statements are built first, so a missing writer fails before the budget and
+        // before any write, and each counts as one action sized by its SQL text.
+        let view_statements = self.view_statements(&commit.views)?;
         let mut sizes = commit.sizes(|_| None)?;
         sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
+        sizes.extend(view_statements.iter().map(PgStatement::budget_size));
         crate::repository::check_budget(sizes)?;
 
         let operations: Vec<&PgStatement> = commit.operations.iter().collect();
 
-        self.write_commit(&[&commit], &[], &operations, outcome.as_ref(), |_| Ok(()))
-            .await
+        self.write_commit(
+            &[&commit],
+            &[],
+            &operations,
+            &view_writes(&commit.views, &view_statements),
+            outcome.as_ref(),
+            |_| Ok(()),
+        )
+        .await
     }
 
     async fn commit_transaction(
@@ -933,8 +1084,11 @@ impl Repository for PostgresRepository {
 
         // Budget parity: an oversized commit fails identically on every backend, before any write.
         // Each projector statement counts as one action.
+        // The view statements are built first, as for a single-stream commit.
+        let view_statements = self.view_statements(&commit.views)?;
         let mut sizes = commit.sizes(|_| None)?;
         sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
+        sizes.extend(view_statements.iter().map(PgStatement::budget_size));
         crate::repository::check_budget(sizes)?;
 
         let streams: Vec<&Commit<PgStatement>> = commit.streams.iter().collect();
@@ -944,6 +1098,7 @@ impl Repository for PostgresRepository {
             &streams,
             &commit.fences,
             &operations,
+            &view_writes(&commit.views, &view_statements),
             outcome.as_ref(),
             |manifest| commit.check_retention(manifest, |_| false),
         )
@@ -1258,6 +1413,69 @@ fn projector_error(err: tokio_postgres::Error) -> Error {
     }
 }
 
+/// Reads a view statement's affected-row count (see
+/// [`with_view_writer`](PostgresRepository::with_view_writer)): a put without a presence condition
+/// and a delete that requires the row affect no row when the owner's condition fails; a delete
+/// without a condition reports (affects) a row only when another stream's holds the key; a put that
+/// requires the row to be absent fails with a unique violation instead, mapped by [`view_error`].
+fn view_condition_failed(op: &ViewOperation, affected: u64) -> bool {
+    match (op.kind, op.condition) {
+        (ViewOperationKind::Put, ViewCondition::Absent) => false,
+        (ViewOperationKind::Put, _) | (ViewOperationKind::Delete, ViewCondition::Present) => {
+            affected == 0
+        }
+        (ViewOperationKind::Delete, _) => affected > 0,
+    }
+}
+
+/// Pairs each view operation with the statement its writer built.
+fn view_writes<'a>(
+    views: &'a [ProjectedView],
+    statements: &'a [PgStatement],
+) -> Vec<(&'a ProjectedView, &'a PgStatement)> {
+    views.iter().zip(statements).collect()
+}
+
+/// Maps an error a view statement raised. A violation of the `(pk, sk)` key constraint on a put
+/// that requires the row to be absent is its failed condition; a unique violation of any other
+/// constraint is an ordinary failure of the statement. Any other error the database raised belongs
+/// to the statement, so it is the operation's failure with the SQLSTATE as its reason, except a
+/// transaction rollback (serialization failure, deadlock), which is not the projector's doing and
+/// passes through as transient like for every other statement of the commit. A lost connection or
+/// pool timeout is a backend failure.
+fn view_error(
+    view: &ProjectedView,
+    key_constraint: Option<&str>,
+    err: tokio_postgres::Error,
+) -> Error {
+    if transient(&err) {
+        return Error::Transient(Box::new(err));
+    }
+    let Some(code) = err.code().map(|code| code.code().to_owned()) else {
+        return Error::backend(err);
+    };
+
+    let condition_failed = err.code() == Some(&SqlState::UNIQUE_VIOLATION)
+        && view.op.kind == ViewOperationKind::Put
+        && view.op.condition == ViewCondition::Absent
+        && key_constraint.is_some_and(|key| {
+            err.as_db_error()
+                .and_then(|db| db.constraint())
+                .is_some_and(|violated| violated.eq_ignore_ascii_case(key))
+        });
+    let reason = if condition_failed {
+        REASON_CONDITION_FAILED.to_owned()
+    } else {
+        code
+    };
+
+    Error::ProjectorOperation(Box::new(ProjectorOperationError::for_view(
+        view,
+        reason,
+        Some(Box::new(err)),
+    )))
+}
+
 /// Maps a failed `COMMIT`. The event inserts and the snapshot upsert check their own keys, so an
 /// integrity violation raised at commit comes from a deferred constraint on a projector's table.
 /// An error the database did not raise (the connection dropped while `COMMIT` was in flight) leaves
@@ -1347,5 +1565,224 @@ mod tests {
 
         assert!(repository().with_tables("a_events", "a_snapshots").is_ok());
         assert!(repository().with_tables(&events_max, "a_snapshots").is_ok());
+    }
+    // ----- commit-wide view operations (v0.9, C7) -----
+
+    fn event(id: &str, sequence: i64) -> SerializedEvent {
+        SerializedEvent {
+            id: format!("{id}:{sequence}").into(),
+            sequence: EventSequence(sequence),
+            event_type: "account:credited".into(),
+            version: crate::EventVersion(1),
+            entity_id: id.into(),
+            entity_type: "account".into(),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn view(operation: usize, op: ViewOperation) -> ProjectedView {
+        ProjectedView::new("projector", 0, operation, op)
+    }
+
+    /// A writer that records the operations it was asked for, in order, as one `SELECT` each.
+    fn recording_writer(seen: Arc<Mutex<Vec<String>>>) -> ViewWriter {
+        Arc::new(move |operation: &ViewOperation| {
+            seen.lock()
+                .unwrap()
+                .push(format!("{} {}", operation.pk, operation.sk));
+
+            Ok(PgStatement::new("SELECT 1", Vec::new()))
+        })
+    }
+
+    fn views(count: usize) -> Vec<ProjectedView> {
+        (0..count)
+            .map(|index| {
+                view(
+                    index,
+                    ViewOperation::put("p", format!("row-{index:03}"), "o", "", "{}"),
+                )
+            })
+            .collect()
+    }
+
+    /// Views are refused without a writer, built before the budget, and budgeted by their SQL
+    /// text, all before the first request: the pool of this repository could not serve one.
+    #[tokio::test]
+    async fn views_are_built_and_budgeted_before_any_request() {
+        let commit = |views| Commit::<PgStatement>::new("a", vec![event("a", 1)]).with_views(views);
+        let transaction = |views| {
+            TransactionCommit::<PgStatement>::new(vec![Commit::new("a", vec![event("a", 1)])])
+                .with_views(views)
+        };
+
+        // No writer.
+        let bare = repository();
+        for result in [
+            bare.commit(commit(views(1))).await,
+            bare.commit_transaction(transaction(views(1))).await,
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::ViewsNotConfigured {
+                        backend: "postgres"
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+
+        // The writer is asked for every operation, in declaration then emission order, before the
+        // budget is checked: 98 statements are one action too many beside the marker, the head
+        // update, and the event.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let repository = repository().with_view_writer(recording_writer(seen.clone()));
+        let result = repository.commit(commit(views(98))).await;
+        assert!(
+            matches!(result, Err(Error::CommitTooLarge { actions: 101, .. })),
+            "{result:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 98);
+        assert_eq!(seen.lock().unwrap()[0], "p row-000");
+        assert_eq!(seen.lock().unwrap()[97], "p row-097");
+
+        let result = repository.commit_transaction(transaction(views(98))).await;
+        assert!(
+            matches!(result, Err(Error::CommitTooLarge { actions: 101, .. })),
+            "{result:?}"
+        );
+
+        // 97 fit the budget (the commit then needs a database, which this pool lacks).
+        let result = repository.commit(commit(views(97))).await;
+        assert!(
+            !matches!(result, Err(Error::CommitTooLarge { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_view_statement_is_sized_by_its_sql_text() {
+        let statement_of = |size: usize| -> ViewWriter {
+            Arc::new(move |_: &ViewOperation| {
+                Ok(PgStatement::new(
+                    format!("SELECT '{}'", "x".repeat(size)),
+                    Vec::new(),
+                ))
+            })
+        };
+
+        // The bound parameters are opaque: only the SQL text counts toward the bytes.
+        let commit = Commit::<PgStatement>::new("a", vec![event("a", 1)]).with_views(views(12));
+        let result = repository()
+            .with_view_writer(statement_of(330_000))
+            .commit(commit)
+            .await;
+        match result {
+            Err(Error::CommitTooLarge {
+                actions,
+                bytes,
+                largest_item,
+            }) => {
+                assert_eq!(actions, 15);
+                assert!(
+                    bytes > 3_800_000 && largest_item < 380_000,
+                    "{bytes} {largest_item}"
+                );
+            }
+            other => panic!("expected CommitTooLarge, got {other:?}"),
+        }
+
+        let commit = Commit::<PgStatement>::new("a", vec![event("a", 1)]).with_views(views(1));
+        let result = repository()
+            .with_view_writer(statement_of(400_000))
+            .commit(commit)
+            .await;
+        assert!(
+            matches!(&result, Err(Error::CommitTooLarge { largest_item, .. }) if *largest_item > 380_000),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_refuses_or_returns_nothing_fails_the_commit_before_any_write() {
+        let commit = || Commit::<PgStatement>::new("a", vec![event("a", 1)]).with_views(views(2));
+
+        let empty: ViewWriter =
+            Arc::new(|_: &ViewOperation| Ok(PgStatement::new(" \n", Vec::new())));
+        let result = repository().with_view_writer(empty).commit(commit()).await;
+        assert!(
+            matches!(&result, Err(Error::InvalidViewOperation(message)) if message.contains("operation 0")),
+            "{result:?}"
+        );
+
+        let refusing: ViewWriter = Arc::new(|operation: &ViewOperation| {
+            if operation.sk == "row-001" {
+                return Err(Error::InvalidArgument("no table for that row".into()));
+            }
+
+            Ok(PgStatement::new("SELECT 1", Vec::new()))
+        });
+        let result = repository()
+            .with_view_writer(refusing)
+            .commit(commit())
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn views_are_checked_before_the_writer_runs() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let repository = repository().with_view_writer(recording_writer(seen.clone()));
+
+        let long = vec![view(
+            0,
+            ViewOperation::put("p".repeat(2049), "s", "o", "", "{}"),
+        )];
+        let result = repository
+            .commit(Commit::<PgStatement>::new("a", vec![event("a", 1)]).with_views(long))
+            .await;
+        assert!(
+            matches!(result, Err(Error::ViewKeyTooLong { .. })),
+            "{result:?}"
+        );
+
+        let repeated = vec![
+            view(0, ViewOperation::put("p", "s", "o", "", "{}")),
+            view(1, ViewOperation::delete("p", "s", "o")),
+        ];
+        let result = repository
+            .commit_transaction(
+                TransactionCommit::<PgStatement>::new(vec![Commit::new("a", vec![event("a", 1)])])
+                    .with_views(repeated),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::DuplicateViewKey { .. })),
+            "{result:?}"
+        );
+
+        let orphan = repository
+            .commit(Commit::<PgStatement>::new("a", Vec::new()).with_views(views(1)))
+            .await;
+        assert!(
+            matches!(orphan, Err(Error::ProjectorWithoutEvents { operations: 1 })),
+            "{orphan:?}"
+        );
+        let orphan = repository
+            .commit_transaction(
+                TransactionCommit::<PgStatement>::new(Vec::new()).with_views(views(1)),
+            )
+            .await;
+        assert!(
+            matches!(orphan, Err(Error::ProjectorWithoutEvents { operations: 1 })),
+            "{orphan:?}"
+        );
+
+        assert!(seen.lock().unwrap().is_empty(), "the writer never ran");
     }
 }

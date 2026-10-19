@@ -461,10 +461,23 @@ func (store *Store) prepareEvents(
 		return evt.SerializedResult{}, internal(err)
 	}
 
+	state, err := store.stateAfterCommit(entity, snapshots)
+	if err != nil {
+		return evt.SerializedResult{}, internal(err)
+	}
+
+	// The commit-wide projectors run over the staged commit on every attempt, so a re-prepared
+	// command derives its operations again from the state it was re-decided on.
+	views, err := store.projectCommit(ctx, serialized, map[evt.EntityID][]byte{entityID: state})
+	if err != nil {
+		return evt.SerializedResult{}, internal(err)
+	}
+
 	return evt.SerializedResult{
 		Events:      serialized,
 		Snapshots:   snapshots,
 		Transaction: evt.MergeTransactions(result.Transaction, projectorTransaction), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		Views:       views,
 	}, nil
 }
 
@@ -727,6 +740,11 @@ func (c *command) settle(ctx context.Context, commitErr error) (*evt.CommandOutc
 
 	case errors.Is(commitErr, evt.ErrAmbiguousWrite):
 		return c.recover(ctx, commitErr)
+
+	case errors.Is(commitErr, evt.ErrProjectorOperation):
+		// A projector's failed operation says nothing about another writer's outcome row, and the
+		// error it maps may look like a conflict; it is returned as is.
+		return nil, commitErr
 
 	case evt.IsConflictErr(commitErr) || policy.IsTransient(commitErr):
 		// A concurrent writer of this same command may have won with its events and outcome. If a

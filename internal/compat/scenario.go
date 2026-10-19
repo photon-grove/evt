@@ -47,6 +47,14 @@ const (
 	// disagrees with its log (ADR 0007).
 	ResultDrift = "drift"
 
+	// Commit-wide view results (ADR 0004, C7). ResultProjector is *evt.ProjectorOperationError: a
+	// view operation's condition failed (the outcome names the projector and the operation, and the
+	// mapped error when the operation carried one); the others are refused before any write.
+	ResultProjector        = "projector"
+	ResultProjectorOnly    = "projectorOnly"
+	ResultViewKeyTooLong   = "viewKeyTooLong"
+	ResultDuplicateViewKey = "duplicateViewKey"
+
 	// Outcome-store results (ADR 0004, C3/C4).
 	ResultReuse     = "reuse"     // IdempotencyKeyReuse
 	ResultIDTooLong = "idTooLong" // CommandIdTooLong, before any write
@@ -76,8 +84,13 @@ type Scenario struct {
 
 	// Outcomes runs the scenario on stores with command outcomes enabled: every step carries a
 	// command ID, and execute steps record and replay outcomes.
-	Outcomes bool   `json:"outcomes,omitempty"`
-	Steps    []Step `json:"steps"`
+	Outcomes bool `json:"outcomes,omitempty"`
+
+	// Projector registers the shared LedgerProjector (a commit-wide projector) on the scenario's
+	// stores, so every commit that writes events also writes ledger rows.
+	Projector bool `json:"projector,omitempty"`
+
+	Steps []Step `json:"steps"`
 }
 
 // Step is one operation against the scenario's stream.
@@ -100,6 +113,10 @@ type Step struct {
 	Streams     []TransactionStream `json:"streams,omitempty"`
 	Fences      []TransactionFence  `json:"fences,omitempty"`
 	Suffix      string              `json:"suffix,omitempty"`
+
+	// Projectors are the commit-wide projectors' view operations of a transaction step, in
+	// declaration order.
+	Projectors []StepProjector `json:"projectors,omitempty"`
 
 	// InjectCommitFault makes the step's commit fail indeterminately: FaultApplyThenFail or
 	// FaultFailWithoutApplying (execute steps of outcomes scenarios).
@@ -140,10 +157,18 @@ type Outcome struct {
 	// read back from a stored row rather than produced by the step (outcomes scenarios).
 	Code     string `json:"code,omitempty"`
 	Replayed bool   `json:"replayed,omitempty"`
+
+	// Projector and Operation name the failed view operation of a ResultProjector (the projector's
+	// name and the operation's index among those it emitted), and Mapped is the message of the
+	// operation's mapped error when it carried one.
+	Projector string `json:"projector,omitempty"`
+	Operation int    `json:"operation,omitempty"`
+	Mapped    string `json:"mapped,omitempty"`
 }
 
 func (o Outcome) String() string {
-	return fmt.Sprintf("%s(events=%d, deleted=%d, code=%q, replayed=%t)", o.Result, o.Events, o.Deleted, o.Code, o.Replayed)
+	return fmt.Sprintf("%s(events=%d, deleted=%d, code=%q, replayed=%t, projector=%q, operation=%d, mapped=%q)",
+		o.Result, o.Events, o.Deleted, o.Code, o.Replayed, o.Projector, o.Operation, o.Mapped)
 }
 
 // Dir returns the repository's compat/ directory.
@@ -227,6 +252,10 @@ type Runner struct {
 	Repo             evt.Repository
 	SnapshotInterval int
 
+	// Projector registers the shared LedgerProjector on the stores the runner builds for itself
+	// (the outcome stores of fault-injecting steps).
+	Projector bool
+
 	// Outcomes is the store with command outcomes enabled; it is set for outcomes scenarios and
 	// nil otherwise.
 	Outcomes *snapshots.Store
@@ -258,22 +287,42 @@ func (r Runner) metadata(step Step) evt.Metadata {
 // the same in every run and the golden fixtures' digests hold against live backends.
 func NewOutcomeRunner(repo evt.Repository, scenario Scenario, run string) Runner {
 	interval := scenario.SnapshotInterval
-	store := outcomeStore(repo, interval, run)
+	store := outcomeStore(repo, interval, run, scenario.Projector)
 
-	return Runner{Store: store, Repo: repo, SnapshotInterval: interval, Outcomes: store, Run: run, Scenario: scenario.Name}
+	return Runner{
+		Store: store, Repo: repo, SnapshotInterval: interval, Outcomes: store, Run: run, Scenario: scenario.Name,
+		Projector: scenario.Projector,
+	}
 }
 
-func outcomeStore(repo evt.Repository, interval int, run string) *snapshots.Store {
+// NewRunner returns a runner over a plain store, with the shared ledger projector registered when
+// the scenario asks for it.
+func NewRunner(repo evt.Repository, scenario Scenario) Runner {
+	store := snapshots.NewStore(repo, scenario.SnapshotInterval)
+	if scenario.Projector {
+		store.WithCommitProjectors(LedgerProjector{})
+	}
+
+	return Runner{Store: store, Repo: repo, SnapshotInterval: scenario.SnapshotInterval, Projector: scenario.Projector}
+}
+
+func outcomeStore(repo evt.Repository, interval int, run string, projector bool) *snapshots.Store {
 	// A short recovery window keeps the dropped-commit step quick; the step still ends in the
 	// retryable ambiguous result because the row never appears. One attempt per step: a scenario
 	// step pins what a single attempt returns, so the engine must not run the command again on its
 	// own (fence-aware retry has its own conformance cases).
-	return snapshots.NewStore(repo, interval).
+	store := snapshots.NewStore(repo, interval).
 		WithOutcomes(
 			snapshots.WithDigester(runIndependentDigest(run)),
 			snapshots.WithRecoveryWait(100*time.Millisecond),
 		).
 		WithRetry(snapshots.RetryPolicy{MaxAttempts: 1})
+
+	if projector {
+		store.WithCommitProjectors(LedgerProjector{})
+	}
+
+	return store
 }
 
 // runIndependentDigest is the default digest with the run name in each target stream ID replaced
@@ -525,7 +574,7 @@ func (r Runner) storeFor(step Step) (*snapshots.Store, error) {
 		return nil, fmt.Errorf("unknown injectCommitFault %q", step.InjectCommitFault)
 	}
 
-	return outcomeStore(fault, r.SnapshotInterval, r.Run), nil
+	return outcomeStore(fault, r.SnapshotInterval, r.Run, r.Projector), nil
 }
 
 func (r Runner) executeWithOutcome(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
@@ -614,8 +663,28 @@ func classify(err error) (Outcome, bool) {
 		return Outcome{}, false
 	}
 
-	var rejected *RejectedError
+	var (
+		rejected   *RejectedError
+		projection *evt.ProjectorOperationError
+		keyTooLong *evt.ViewKeyTooLongError
+		duplicate  *evt.DuplicateViewKeyError
+		onlyViews  *evt.ProjectorOnlyCommitError
+	)
+
 	switch {
+	case errors.As(err, &projection):
+		outcome := Outcome{Result: ResultProjector, Projector: projection.Projector, Operation: projection.Operation}
+		if projection.Err != nil {
+			outcome.Mapped = projection.Err.Error()
+		}
+
+		return outcome, true
+	case errors.As(err, &onlyViews):
+		return Outcome{Result: ResultProjectorOnly}, true
+	case errors.As(err, &keyTooLong):
+		return Outcome{Result: ResultViewKeyTooLong}, true
+	case errors.As(err, &duplicate):
+		return Outcome{Result: ResultDuplicateViewKey}, true
 	case evt.IsStreamHeadDriftErr(err):
 		return Outcome{Result: ResultDrift}, true
 	case errors.As(err, &rejected):

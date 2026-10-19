@@ -406,3 +406,69 @@ impl Aggregate for Account {
         &UPCASTERS
     }
 }
+
+/// The payload of a ledger row: the account's state after the commit. Declared in this order, it
+/// encodes the same bytes as Go's `ledgerRow`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerRow {
+    balance_cents: i64,
+    status: String,
+    tags: usize,
+}
+
+/// The partition the shared ledger projector writes. It names no entity, and its sort keys are
+/// stream IDs, so the rows of different runs in a live table are told apart by run.
+pub const LEDGER_PK: &str = "ledger";
+
+/// The shared commit-wide projector of the account domain (name `ledger`), the twin of Go's
+/// `compat.LedgerProjector`, a current-state projector: it reads each stream's state after the
+/// commit and never its events or its commit ID, so it declares no history. For every stream the
+/// commit wrote it puts a ledger row (`pk` `ledger`, `sk` the stream ID, owned by the stream) from
+/// the stream's state after the commit, or deletes it when the balance is zero. Every byte is a
+/// function of the commit view, so both languages write the same rows.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LedgerProjector;
+
+impl photon_evt::CommitProjector for LedgerProjector {
+    fn name(&self) -> &str {
+        "ledger"
+    }
+
+    fn project(
+        &self,
+        commit: &photon_evt::CommitView,
+    ) -> Result<Vec<photon_evt::ViewOperation>, BoxError> {
+        let mut operations = Vec::new();
+
+        for stream in &commit.streams {
+            let state: Account = serde_json::from_slice(&stream.state)?;
+
+            if state.balance_cents == 0 {
+                operations.push(photon_evt::ViewOperation::delete(
+                    LEDGER_PK,
+                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(),
+                ));
+
+                continue;
+            }
+
+            let payload = json::to_vec(&LedgerRow {
+                balance_cents: state.balance_cents,
+                status: state.status,
+                tags: state.tags.map_or(0, |tags| tags.len()),
+            })?;
+
+            operations.push(photon_evt::ViewOperation::put(
+                LEDGER_PK,
+                stream.entity_id.as_str(),
+                stream.entity_id.clone(),
+                stream.entity_type.as_str(),
+                payload,
+            ));
+        }
+
+        Ok(operations)
+    }
+}

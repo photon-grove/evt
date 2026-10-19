@@ -82,6 +82,68 @@ entity's head with constant memory for change-detection rebuilds. The head folds
 in the snapshot's recorded sequence, so it stays correct for streams whose early
 events were compacted away.
 
+### Views
+
+evt defines no PostgreSQL view schema: your application owns its view tables and their DDL.
+Commit-wide projectors ([projections](projections.md#commit-wide-projectors)) still commit their
+rows atomically with the events, through a **view writer** that turns each view operation into the
+SQL statement for your table:
+
+```go
+repo := postgres.NewRepository(pool).WithViewWriter(func(op evt.ViewOperation) (postgres.ViewStatement, error) {
+    // The table's entity_id column holds the row's owner, the stream it belongs to.
+    const insert = `INSERT INTO views (pk, sk, entity_id, entity_type, payload) VALUES ($1, $2, $3, $4, $5)`
+
+    switch {
+    case op.Kind == evt.ViewDelete && op.Condition == evt.ViewPresent:
+        // Deletes the owner's row; affecting no row (absent, or another owner's) fails the condition.
+        return postgres.ViewStatement{
+            SQL: `DELETE FROM views WHERE pk = $1 AND sk = $2 AND entity_id = $3`,
+            Args: []any{op.PK, op.SK, string(op.Owner)},
+        }, nil
+    case op.Kind == evt.ViewDelete:
+        // Deletes the owner's row if there is one, and reports another owner's: any row it
+        // affects is a failed condition.
+        return postgres.ViewStatement{
+            SQL: `WITH gone AS (DELETE FROM views WHERE pk = $1 AND sk = $2 AND entity_id = $3)
+                  SELECT 1 FROM views WHERE pk = $1 AND sk = $2 AND entity_id <> $3`,
+            Args: []any{op.PK, op.SK, string(op.Owner)},
+        }, nil
+    case op.Condition == evt.ViewAbsent:
+        // A plain INSERT: a violation of the (pk, sk) key constraint is the failed condition.
+        return postgres.ViewStatement{SQL: insert, Args: viewArgs(op), KeyConstraint: "views_pkey"}, nil
+    default:
+        // Overwrites the owner's row only; a row of another owner leaves the upsert affecting none.
+        return postgres.ViewStatement{SQL: insert + ` ON CONFLICT (pk, sk) DO UPDATE SET
+            entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload
+            WHERE views.entity_id = EXCLUDED.entity_id`, Args: viewArgs(op)}, nil
+    }
+})
+```
+
+The statements run in the commit's transaction after the events and before the snapshots, so a
+writer that lost a race fails on its stream's head (a conflict) before it reaches a view row.
+
+**Your writer enforces the owner.** evt cannot see your table, so it reads whether an operation's
+condition held from the statement's outcome, and every statement must keep a row's owner from ever
+changing (DynamoDB and the in-memory repository condition every write on the owner themselves):
+
+- an `IfAbsent` put is a plain `INSERT` that raises a unique violation of the `(pk, sk)` key
+  constraint when the row exists; name the constraint in `ViewStatement.KeyConstraint` (a unique
+  violation of any other constraint is an ordinary failure);
+- any other put is an upsert guarded by the owner (`... DO UPDATE ... WHERE table.entity_id =
+  EXCLUDED.entity_id`); affecting no row means another stream owns it, which fails the condition;
+- an `IfPresent` delete deletes the owner's row; affecting no row fails the condition;
+- any other delete succeeds if the row is absent and fails if another stream owns it. Its statement
+  reports the foreign rows it found, as above: affecting a row fails the condition.
+
+A failed
+condition is a `*evt.ProjectorOperationError` (reason `ConditionalCheckFailed`), and so is any other
+error the database raises for a view statement (reason: its SQLSTATE); an integrity violation raised
+at `COMMIT`, which only a deferred constraint on your table can cause, is a `*evt.ProjectorError`.
+A commit that carries view operations and no writer fails with `*evt.ViewsNotConfiguredError` before
+any write. Each statement counts as one action in the commit budget, sized by its SQL text.
+
 ## Local Development
 
 The `infra/local-postgres` Terraform stack provisions the local database; the

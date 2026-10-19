@@ -216,11 +216,13 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
    yet implement the rebuild fence (C10) emits no action here, every later action moves up by
    one, and the commit budget below does not count it. The budget counts exactly the actions
    emitted.
-3. Projector operations, in projector declaration order; within one projector, in emission order.
-   A commit that carries projector operations must also write at least one event: views are
-   projections of committed events, so operations with no backing event are refused with a typed
-   error (`ProjectorOnlyCommit` in Go, `ProjectorWithoutEvents` in Rust) before any write, on
-   every backend.
+3. Projector operations, in projector declaration order; within one projector, in emission order
+   ([Views](#views)). In Go, the operations of the deprecated handler-attached and per-entity
+   transaction groups (K7) come first, then those of the commit-wide projectors. A commit that
+   carries projector operations must also write at least one event: views are projections of
+   committed events, so operations with no backing event are refused with a typed error
+   (`ProjectorOnlyCommit` in Go, `ProjectorWithoutEvents` in Rust) before any write, on every
+   backend.
 4. The written streams, in ascending entity-ID byte order. Each stream is one contiguous group,
    in this order:
    1. the **head update**, an `Update` of the stream's head item ([Stream Heads](#stream-heads));
@@ -313,13 +315,17 @@ and is never split.
 The preflight counts projector operations **on every backend that writes them**. DynamoDB sizes
 each projector item exactly: a put counts its item, and an update, delete, or condition check
 counts its key attributes plus its expression strings, attribute-name placeholders (both the
-placeholder and the name), and attribute values. A PostgreSQL repository that executes projector statements counts
-each statement as one action sized by its SQL text; the bound parameters are opaque, so the byte
-estimate is a lower bound while the action count is exact. Rust's PostgreSQL repository does this
-today. Go's PostgreSQL repository executes no projector operations until commit-wide projector
-support lands (E2.6): a commit carrying any projector operation is refused before any write with
-`ProjectorOperationsUnsupported`, never silently dropped, so there is nothing to count. When that
-support lands it must count its statements the same way.
+placeholder and the name), and attribute values. A commit-wide view put therefore counts its five
+attributes (its owner is the `entityID`; the owner condition on the put is not budgeted, like the
+condition of any put), and a view delete counts its two key attributes plus its condition
+expression string (`attribute_not_exists(pk) OR entityID = :owner`, or `attribute_exists(pk) AND
+entityID = :owner`) and the `:owner` placeholder with the owner's bytes. The in-memory repository sizes view operations the same way. A PostgreSQL
+repository counts each statement as one action sized by its SQL text; the bound parameters are
+opaque, so the byte estimate is a lower bound while the action count is exact. Both languages'
+PostgreSQL repositories execute commit-wide view operations and count them this way. A Go commit
+that carries operations of a transaction group no backend-specific executor handles (a group
+built for another storage type) is refused before any write with `ProjectorOperationsUnsupported`,
+never silently dropped.
 
 | Write                                       | Condition                                                        |
 | ------------------------------------------- | ---------------------------------------------------------------- |
@@ -419,7 +425,7 @@ The languages report the other cancellations differently:
 | Cancellation                                         | Go                                    | Rust                            |
 | ---------------------------------------------------- | ------------------------------------- | ------------------------------- |
 | head, event, or snapshot condition                   | `dynamo.ErrSnapshotRaceCondition`     | `Error::Conflict`               |
-| projector condition                                  | the transaction group's `HandleError` | `Error::Projector`, not retried |
+| projector operation condition                        | `*evt.ProjectorOperationError`, not retried (a legacy transaction group's `HandleError`) | `Error::ProjectorOperation`, not retried |
 | `TransactionConflict`                                | classified as transient               | `Error::Conflict`, retried      |
 | `ThrottlingError` or `ProvisionedThroughputExceeded` | classified as transient               | `Error::Transient`, retried     |
 
@@ -451,35 +457,89 @@ one item per entity to a separate views table, in the same transaction as the ev
 | `entityType` | S    | entity type               |
 | `payload`    | S    | aggregate state JSON      |
 
-**Commit-wide view rows (v0.9, C7).** A commit-wide projector is a pure function over every event
-in the commit, and its rows are no longer constrained to the derived `pk` or `sk = "VIEW"`: a
-projector may put — or delete — rows at **any `pk`/`sk` it chooses**, including partitions that do
-not name an entity, which is what makes cross-entity read models atomic with the commit. The
-attribute set is unchanged:
+**Commit-wide projectors (v0.9, C7).** A commit-wide projector is a pure function over the whole
+commit: the engine calls it once for every commit that writes at least one event, after every
+stream of the commit is staged and its snapshot decided, so a fence-aware retry derives its
+operations again with the rest of the commit ([Re-preparing](#re-preparing)). It receives a
+**commit view** and returns **view operations** in emission order. The view holds:
 
-| Attribute    | Type | Notes                                          |
-| ------------ | ---- | ---------------------------------------------- |
-| `pk`         | S    | chosen by the projector                        |
-| `sk`         | S    | chosen by the projector                        |
-| `entityID`   | S    | projector-supplied; readers never interpret it |
-| `entityType` | S    | projector-supplied; readers never interpret it |
-| `payload`    | S    | view state JSON                                |
+| Field      | Meaning                                                                                       |
+| ---------- | --------------------------------------------------------------------------------------------- |
+| `commitId` | The one `commitId` every event of the commit carries ([Metadata](#metadata)).                 |
+| `streams`  | Every written stream, ascending by entity-ID bytes (the order of the transaction's groups).  |
 
-`entityID` and `entityType` are always written. For a row that belongs to no single entity — a
-projection over the whole commit — the projector repeats the commit's primary stream's type and
-ID, or any stable label it chooses; both are informational. Puts are unconditional. A delete
-operation is a transaction `Delete`; it carries no condition unless the projector supplies one,
-and deleting an absent row succeeds. Two operations in one commit may not target the same
-`(pk, sk)` item: the engine rejects such a commit with a typed error before any write, since
-DynamoDB would otherwise fail the whole transaction with an unclassified `ValidationException`.
-The chosen keys are themselves bounded **before any write** in both languages: a `pk` over
-**2,048 UTF-8 bytes** or an `sk` over **1,024 UTF-8 bytes** — DynamoDB's key limits — fails
-with a typed `ViewKeyTooLong` error, so a projector whose keys fit PostgreSQL but not DynamoDB
-fails identically on both backends instead of committing on one and raising a validation error
-on the other. Each projector operation carries the cancellation reason it
-maps to, replacing the single per-group `HandleError(error, int)` callback. The per-entity
-`VIEW` row above remains the special case "one entity's events"; the commit-wide form is the
-general API. View items never carry `ttl`.
+and each stream holds its entity ID, its entity type, the commit's events for it in ascending
+sequence (serialized: type, version, payload, metadata), and its **state after the commit** — the
+JSON the aggregate's snapshot would carry. Which of these a projector is given depends on its
+kind, below. Streams that were only read (fenced) are not in the
+view. A command that writes no event (a plain rejection, an accepted no-op, an outcome-only
+commit) runs no projector, and a rejection that [carries events](#rejections-that-carry-events)
+projects them exactly like an accepted command's. The view carries **no outcome context**: a
+rebuild regroups stored events by `commitId` and has no outcome row to read, so a row that
+depended on the outcome's status could not be rebuilt.
+
+**Two kinds of projector, declared (v0.9, C7, C9).** A projector states which entity types it reads
+the *events* of (`History` in Go, `history` in Rust). The view it is given is what a rebuild of its
+kind can give it again, and the declaration is enforced, not trusted:
+
+- A **current-state** projector states none. It is given every written stream's entity ID, entity
+  type, and **state after the commit**, and nothing else: no events and an **empty `commitId`**. A
+  row it writes can depend only on the states the commit's streams reach, never on which commit
+  produced them.
+- A **history-dependent** projector states the entity types whose events it reads. It is given the
+  `commitId`, and the events *and state* of the streams of those types only. Every other written
+  stream is present by entity ID and entity type, with no events and no state: its history is not
+  covered by the declaration, and may have been compacted.
+
+Before the first commit that runs a history-dependent projector, the store durably adds its entity
+types to the manifest's `historyDependent` set ([Feature Marker](#feature-marker)) — a repository
+that cannot declare (Go `evt.HistoryDeclarer`, Rust `Repository::declare_history_dependent`)
+refuses the commit with `HistoryDeclarationUnsupported` before any write, and so does a repository
+whose feature-marker table does not match its events table — so `CompactBelow` refuses those types
+in every process, whether or not it registered the projector.
+
+**Ownership (v0.9, C7).** The log keeps one commit order only: the sequence order of each stream.
+Commit IDs and timestamps are not causal, so a replay cannot order two commits on different streams
+that write the same row. Every operation of **every** projector therefore names the **owner** of
+its row: a stream the commit wrote (`ViewOperation.Owner`, `owner`). The engine checks it before
+any write (`InvalidViewOperation`: no owner, an owner the commit did not write, or, for a
+history-dependent projector, an owner whose entity type the projector did not declare in `History`,
+since its row is rebuilt from the events of the declared types alone). The repository stores the
+owner as the row's `entityID` and conditions **every** write to the row on it — puts and deletes,
+with or without a presence condition (see the conditions below) — so a write by any other stream
+fails the commit with `ProjectorOperation`/`ConditionalCheckFailed` when it is made.
+
+**A row's owner must never change.** The writes to one row can be put back in order only while they
+all come from commits that wrote the same stream, ordered by that stream's sequence. A key does
+not change hands by a delete by one stream and a put by another: the delete leaves the row absent,
+so the second owner's put would pass its condition live, and a replay, which has no order between
+the two streams, would have to guess which came last; it refuses with `SharedViewKey` instead. To
+reuse a key, keep the row with its owner and rewrite it with a tombstone payload (a **tombstone
+put**), or give the key to a stream every claimant writes. Deleting a row is for the owner's own
+end of life: a later put by the same owner is fine, by another is the handoff this rule forbids.
+
+A projector's operations are appended to the commit in projector **declaration order**, each
+projector's in its **emission order**, after the marker check and before the written streams
+([Writes](#writes)). Operations are backend-neutral; each is a put or a delete of one row at the
+`pk`/`sk` the projector chooses, including partitions that do not name an entity, which is what
+makes cross-entity read models atomic with the commit:
+
+| Operation | Fields                                                        | Optional                                                    |
+| --------- | ------------------------------------------------------------- | ----------------------------------------------------------- |
+| put       | `pk`, `sk`, `owner`, `entityType`, `payload`                  | condition `absent` (the row must not exist), a mapped error |
+| delete    | `pk`, `sk`, `owner`                                           | condition `present` (the row must exist), a mapped error    |
+
+`owner` is written as the row's `entityID` attribute; `entityType` is informational — readers never
+interpret it — and always written. `payload` is the view state JSON. A put overwrites the owner's
+row unless it carries the `absent` condition, and a delete of an absent row succeeds unless it
+carries the `present` condition. In either case, a row that exists and belongs to another owner
+fails the operation. The **mapped error** is the projector's own error value for the case where the
+operation's condition fails (a claim that is already taken, say); it is in-memory commit data and
+is never stored. View items never carry `ttl`.
+
+Stored as a DynamoDB item (the views table is the one the repository is configured with), a put
+is a transaction `Put` of the item. Its condition is `attribute_not_exists(pk)` for `absent`, and
+otherwise `attribute_not_exists(pk) OR entityID = :owner` with `:owner` bound to the owner:
 
 ```json
 {
@@ -491,8 +551,77 @@ general API. View items never carry `ttl`.
 }
 ```
 
-A commit-wide row at a `pk` outside any `{entityType}#{entityId}` pattern, written in the same
-transaction as the events that produced it.
+A delete is a transaction `Delete` of the `(pk, sk)` key, with the condition
+`attribute_exists(pk) AND entityID = :owner` for `present` and `attribute_not_exists(pk) OR
+entityID = :owner` otherwise, with `:owner` bound to the owner. The row above is a commit-wide row at a `pk` outside any `{entityType}#{entityId}`
+pattern, written in the same transaction as the events that produced it. The per-entity `VIEW`
+row above remains the special case "one entity's events".
+
+**Engine checks (v0.9, C7).** Before any write, on every backend, the engine checks each
+operation in order and returns the first failure as a typed error:
+
+1. `InvalidViewOperation`: a `pk`, `sk`, or `owner` that is empty, or any text field (`pk`, `sk`,
+   `owner`, and on a put `entityType` and `payload`) that is not valid UTF-8 or contains U+0000 (PostgreSQL cannot store
+   it), so a commit has the same result on every backend;
+2. `ViewKeyTooLong`: a `pk` over **2,048 UTF-8 bytes** or an `sk` over **1,024 UTF-8 bytes** —
+   DynamoDB's key limits — so a projector whose keys fit PostgreSQL but not DynamoDB fails
+   identically on both backends instead of committing on one and raising a validation error on
+   the other;
+3. `DuplicateViewKey`: an operation whose `(pk, sk)` an earlier operation of the commit already
+   targets, since DynamoDB would otherwise fail the whole transaction with an unclassified
+   `ValidationException`.
+
+An operation whose owner the commit did not write, or (history-dependent) whose owner's type is not
+declared, is `InvalidViewOperation`, reported when the projector returns.
+
+A commit that carries operations but no event is `ProjectorOnlyCommit` / `ProjectorWithoutEvents`
+first ([Writes](#writes)). Operations count against `CommitTooLarge` ([Budget](#writes)) and are
+sized as described there. A repository that was given view operations but has no place to write
+them (no views table, no view writer) refuses the commit before any write with
+`ViewsNotConfigured`, never dropping them. A repository that has not declared it writes view
+operations at all (Go `evt.ViewWritingRepository`, Rust `Repository::writes_views`) — a custom
+backend written before v0.9 — is refused by the store before any write with `ViewsUnsupported`, and
+Go's `CheckProjectorOperationsSupported` guard stays fail-closed for view operations.
+
+**Failure mapping (v0.9, C7).** A projector operation fails when its condition fails — or, on
+PostgreSQL, when the database rejects its statement. The failure maps to a typed error that names
+**the projector** (its name and its position in declaration order) **and the operation** (its
+index among that projector's emitted operations, with its kind, `pk`, and `sk`), plus the
+backend's reason: `ProjectorOperationError` in Go, `Error::ProjectorOperation` in Rust. When the
+operation carried a mapped error, the typed error wraps it (`errors.Is` in Go, `source()` in
+Rust), so the application matches its own error value. A projector operation failure is **not a
+conflict and not transient**: re-preparing the command cannot fix it, so it is returned at once,
+never retried, and records no outcome (internal failures write none). The reasons are:
+
+| Backend    | Reason                                                                                                  |
+| ---------- | ------------------------------------------------------------------------------------------------------- |
+| DynamoDB   | The item's cancellation reason code: `ConditionalCheckFailed`, `ValidationError`, or `ItemCollectionSizeLimitExceeded`. |
+| PostgreSQL | `ConditionalCheckFailed` for an `absent` put (a violation of the named `(pk, sk)` key constraint, `23505`), for any other put or `present` delete that affects no row, and for an unconditional delete that reports a row of another owner; otherwise the SQLSTATE the database raised. |
+| In-memory  | `ConditionalCheckFailed`.                                                                                |
+
+Where several items of a cancelled DynamoDB transaction failed, the failure classification ranks
+them ([Failure classification](#failure-classification)): the marker check, the outcome put,
+`StreamHeadDrift`, a gap, any conflict on a written stream or a fence, and only then projector
+operations — a projector condition is reported only when nothing ranked above it failed, and the
+first failed projector operation in transaction order is the one named. PostgreSQL runs its
+projector statements after the head statements and the event inserts
+([PostgreSQL](#postgresql)), so a writer that lost a race fails on its head first, which is the
+same order. A projector function that itself returns an error fails the command before any
+write, as an internal failure (Go `*ProjectorError`, Rust `Error::Projector`).
+
+**Determinism (v0.9, C7).** A projector must be a **pure function of its commit view**: the same
+view always yields the same operations, in the same order, byte for byte. It may not read a
+clock, a random source, the environment, or the stores; it may not depend on the order of a hash
+map's iteration; it may not remember anything between calls. This is what keeps views derived
+state that can be wiped and rebuilt by replaying events: every row a projector writes must be a
+projection of the events already committed, never a record of something that happened only
+outside the event log, and a mutable decision, an externally observed signal, or an
+accept-or-reject verdict is event-sourced first and projected second. A commit that carries
+operations but no event is refused for the same reason. The engine does not police purity, but
+the contract is testable: grouping stored events by `commitId` (see "Rebuilding a
+history-dependent projector" below) and running the projector over each group, with the state each
+stream had after that commit, must reproduce the operations the live commit produced, and replaying
+them must reproduce the rows.
 
 **Commit boundaries (v0.9, C6, C7).** The only durable record of which events belong to one
 commit is the events' metadata: every event of a commit carries the same `commitId`
@@ -516,8 +645,14 @@ projectors are recorded in the feature manifest's `historyDependent` set
   Their entity types are declared in the `historyDependent` set, which forbids compaction for
   them (below), and their rebuild replays every commit grouped by `commitId`.
 
-**State entry point (v0.9, C7).** Every commit-wide projector implements a second entry point
-alongside the per-commit one: the **state entry point**, called with a lookup by stream ID over
+**State entry point (v0.9, C7).** *Not implemented in this release.* The design below is the target
+for the rebuild ports (P4, E4.4); no interface, entry point, or rebuild for it exists in either
+language, and nothing in the commit path uses it. Until it lands, **the only rebuild this engine
+reproduces is the in-memory replay of history-dependent projectors** (Go `GroupCommits` and
+`ReplayViews`, Rust `group_commits` and `replay_views`): a current-state projector's rows are
+reproducible by that same replay only with the caller supplying each commit's post-commit state,
+and no durable view table is rebuilt by the engine. The target: every commit-wide projector
+implements a second entry point alongside the per-commit one: the **state entry point**, called with a lookup by stream ID over
 the final state of every aggregate in scope and returning the projector's **complete current row
 set**. "Final state" is what a load at the head returns — the snapshot plus the events after it,
 for each stream. Because the entry point sees _all_ the final states at once, a row that combines
@@ -525,7 +660,7 @@ several aggregates' states is derived from the complete, consistent input, not f
 snapshot: this is what keeps cross-entity rows reproducible when the commits that produced them
 have been compacted away.
 
-**Rebuilding a current-state projector (v0.9, C7).** A wipe-and-rebuild never replays history
+**Rebuilding a current-state projector (v0.9, C7) — target design, not implemented.** A wipe-and-rebuild never replays history
 for one. It loads the final state of every aggregate of the entity types in scope, calls the
 projector's state entry point once with the by-stream-ID lookup over all of them, deletes the
 rows the projector owns, and writes the returned set. Ownership is declared at registration:
@@ -542,7 +677,16 @@ never refuses these entity types.
 **Rebuilding a history-dependent projector (v0.9, C7, C9).** A wipe-and-rebuild replays every
 commit grouped by `commitId` — each group's events, ordered by stream ID bytewise then by
 sequence (the same pinned order as the commit's transaction), form one `CommitView`, and the
-projector runs once per group, exactly as it did at commit time. Nothing may have deleted the
+projector runs once per group, exactly as it did at commit time, with the state each stream had
+after that commit. The groups are applied in an order **every stream agrees with**: a commit that
+wrote a stream's sequence 3 precedes the commit that wrote its sequence 4, for every stream (Go
+`GroupCommits`, Rust `group_commits`; commits that no stream relates come in the order of their
+first event's stream ID bytes and sequence, which carries no meaning). Events whose commits cannot
+be ordered that way — a cycle — are not a log this engine wrote and fail with `CommitOrder`. The
+replay applies each operation to the rows, and refuses with `SharedViewKey` (Go
+`ReplayViews`, Rust `replay_views`) when two operations of different owner streams touch one row,
+because the final row would then depend on an order the log does not keep. Conditions are not
+evaluated in a replay: it applies what the live commits wrote. Nothing may have deleted the
 history, so compaction is **forbidden for the entity types in the manifest's `historyDependent`
 set**, and the prohibition is durable ([Feature Marker](#feature-marker)):
 
@@ -554,7 +698,9 @@ set**, and the prohibition is durable ([Feature Marker](#feature-marker)):
 
 Pre-v0.9 events, whose metadata has no `commitId`, replay as single-event commits — one
 `CommitView` per event, in stream and sequence order — which reproduces the per-entity projector
-behaviour an old log was written under.
+behaviour an old log was written under. The events of a live `CommitView` carry the metadata a
+stored event has (the command ID as the effective `causationId`), so a projector reads the same
+metadata live and on replay.
 
 ## Read Fences
 
@@ -1843,7 +1989,12 @@ items failed the engine ranks them (highest first), identically on every backend
 3. `StreamHeadDrift`;
 4. `SequenceGapError` / `Error::SequenceGap`;
 5. any other conflict: a head update, an event put, a snapshot put, or a fence check (with its
-   provenance), then projector conditions.
+   provenance);
+6. projector operations ([Views](#views)): the first failed one in transaction order, as a
+   `ProjectorOperationError` / `Error::ProjectorOperation` naming the projector and the operation.
+   Its reason is the item's cancellation reason code (`ConditionalCheckFailed`, `ValidationError`,
+   or `ItemCollectionSizeLimitExceeded`); `TransactionConflict` and throttling on a projector item
+   keep their transient classification.
 
 `TransactionConflict`, throttling, and indeterminate writes are unchanged. Every failed written
 stream and fence is evaluated before the ranking, so the result does not depend on which failed
@@ -2263,12 +2414,26 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   one insert per event, projector statements, the snapshot upserts, then the outcome insert.
   Projector statements run after the events, so a writer that lost a race fails on its head
   statement (a conflict) before it reaches a view row. Commit-wide
-  projector operations execute inside the commit transaction in **both** languages in v0.9:
-  Go's `postgres.Repository` ignores projector transaction groups today, and executing them is a
-  v0.9 behaviour change, implemented with the commit-wide projector (E2.6). A projector statement
-  that the database rejects is a projector error (a lost
-  connection is a backend error), and so is an integrity
-  violation raised at `COMMIT`, which only a deferred constraint on a projector's table can cause.
+  view operations execute inside the commit transaction in **both** languages in v0.9. evt
+  defines no PostgreSQL view schema — applications own their view tables — so each repository is
+  configured with a **view writer** that turns one view operation into one SQL statement (Go
+  `postgres.Repository.WithViewWriter`, Rust `PostgresRepository::with_view_writer`), and a
+  repository without one refuses a commit that carries view operations with `ViewsNotConfigured`.
+  The engine executes the statement the writer returns, in the pinned order, and decides whether
+  the operation's condition held: an `absent` put must raise a unique violation (`23505`) of the
+  table's `(pk, sk)` key constraint when the row exists, which is the failed condition, and the
+  writer names that constraint with the statement (Go `ViewStatement.KeyConstraint`, Rust
+  `PgStatement::with_key_constraint`; an `absent` put without one is `InvalidViewOperation`). A
+  unique violation of any other constraint of the table says nothing about the requested row, so
+  it is an ordinary failure of the statement, with the SQLSTATE as its reason. Because the owner never changes, the
+  writer must enforce it in SQL, and the engine reads the outcome from the affected-row count: a put
+  without `absent` is an upsert guarded by the owner, whose count is zero when another stream owns
+  the row; a `present` delete deletes the owner's row, and a count of zero fails the condition; a
+  delete without a condition reports the rows of another owner instead of the rows it deleted (a
+  count above zero fails the condition). The engine hands the writer the owner with the operation. A projector statement that the database rejects is a projector
+  operation failure (a lost connection is a backend error), and so is an integrity violation
+  raised at `COMMIT`, which only a deferred constraint on a projector's table can cause (it
+  names no operation: Go `*evt.ProjectorError`, Rust `Error::Projector`).
 - A failed head statement is an optimistic-concurrency conflict (or drift or a gap, by the
   [failure-path probe](#failure-classification)). In Go, conflicts are `evt.ConflictError`s wrapped in a
   transient `policy.ClassifiedError`, so `policy.ExecuteWithRetry` retries them as it does on
@@ -2535,6 +2700,29 @@ These differences are deliberate and covered by tests. Keep them documented here
   sequence. In a multi-stream commit where another stream also fails its head statement as a gap or
   conflict, PostgreSQL reports that failure instead of the drift. A single stream, and every drift
   the probe finds, rank identically on every backend.
+- **Snapshot conflicts against view operations (PostgreSQL).** PostgreSQL runs its view statements
+  before the snapshot upserts, as the order above pins. A stale snapshot sequence, which DynamoDB
+  and the in-memory repository rank as a conflict ahead of any projector operation, is therefore
+  reported on PostgreSQL only if no view statement failed first. Head, gap, drift, fence, and outcome
+  failures rank identically on every backend.
+- **Projector kind declaration (C7).** Go's `CommitProjector.History()` is a required method; Rust's
+  `CommitProjector::history()` defaults to empty, a current-state projector. In both, a projector
+  that declares no history is given no events and no commit ID, so a Rust projector that forgets
+  the declaration sees an empty `events` list and an empty commit ID rather than reading undeclared
+  history.
+- **Row ownership on PostgreSQL (C7).** DynamoDB and the in-memory repository evaluate the owner
+  condition themselves. PostgreSQL cannot see the application's table, so the application's view
+  writer enforces it in SQL, and the engine reads the outcome from the affected-row count (above).
+  A writer that ignores the owner commits a handoff that the other backends refuse; the same
+  conformance suite exercises the rule against the writer it is given.
+- **View-writing capability (C7).** Go's `ViewWritingRepository.WritesViews()` returns a bool and
+  Rust's `Repository::writes_views()` does too, so a decorator reports the capability of the
+  repository it wraps instead of claiming it unconditionally.
+- **Projector operation errors (C7).** Go's `*evt.ProjectorOperationError` exposes the operation's
+  mapped error (`Err`) and the backend's cause (`Cause`), both matchable with `errors.Is`; Rust's
+  `Error::ProjectorOperation` exposes them as `mapped()` and `cause()`, and its `source()` is the
+  mapped error when there is one, else the cause. The fields that name the projector and the
+  operation, and the reasons, are the same.
 - **PostgreSQL metadata.** Stored as `jsonb`, so its bytes differ from the encoded JSON. Compare it
   as JSON.
 
@@ -2555,15 +2743,17 @@ and the live interleaved runs (`scripts/compat-integration.sh dynamo|postgres`) 
 steps on real backends. **E2.8** (Go conformance suite + fixtures) and **E3.8** (Rust conformance
 suite + the live runs) must implement every scenario in this list; the names are the shared keys
 in `compat/scenarios.json`. The `metadata-extensions` case is implemented for C6 (E2.1/E3.1)
-in the current single-stream harness; it does not enable outcomes. The five `outcomes-*` scenarios
+in the current single-stream harness; it does not enable outcomes. `commit-wide-views` and
+`commit-wide-projector` are implemented with C7 (E2.6/E3.6). The five `outcomes-*` scenarios
 are implemented with C3/C4 (E2.4/E3.4): they set `"outcomes": true`, so both writers run them on
 stores with outcomes enabled and a command ID on every step, and the fixtures pin each stored
 outcome row and the `TransactWriteItems` request order of every step. The other scenarios are
 unchanged. The harness grew the ops and fields the outcomes scenarios need (`resolveOutcome`, an
 outcome-only commit, and `injectCommitFault`, which makes a commit apply — or drop — while the
 caller observes an indeterminate error, so `outcomes-ambiguous` exercises the real ambiguous path
-rather than only the re-read branches); the remaining scenarios need more (`declareFeature`,
-`acquireRebuildLock`, `releaseRebuildLock`, `forceReleaseRebuildLock`, `readLatest`,
+rather than only the re-read branches); the C7 scenarios add `projectors` on transaction steps and
+a shared commit-wide projector on the account domain; the remaining scenarios need more
+(`declareFeature`, `acquireRebuildLock`, `releaseRebuildLock`, `forceReleaseRebuildLock`, `readLatest`,
 `rebuildViews`, a multi-stream execute). [`compat/README.md`](../../compat/README.md) holds the op
 table. The harness scopes command IDs to the run and scenario, because outcome rows are global to
 the table, and uses a digest that replaces the run name in the target stream IDs, so a command
@@ -2584,7 +2774,8 @@ encodings of the outcome rows (DynamoDB item, its budgeted size, PostgreSQL row)
 | `fence-aware-retry`    | C2, C5 | Classification is per failing item: a head-update or event-put failure in a commit that also carries caller-stamped fences still re-prepares and succeeds; a failed caller-stamped fence produces the persisted `stale-fence` rejection at once, without preparing again, whose only remedy is a new command ID — the old ID replays the rejection; an engine-filled conflict re-prepares and only the committing attempt writes; exhausted attempts persist the `retries exhausted` rejection, which replays identically; a command whose write set changes between attempts keeps one identity. Both languages run these cases in their conformance suites on every backend; the fixtures pin the rejection bytes, the rename digest, and the policy defaults. |
 | `metadata-extensions`  | C6     | `principalId`, `causationId`, and `extensions` round-trip in both directions, including the defaults: `causationId` written as the command ID when unset, `extensions` written as `{}`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `commit-grouping`      | C6, C7 | A multi-stream commit's events carry one `commitId` across all its streams. A rebuild of a **history-dependent** projector replays every commit grouped by `commitId`, each group's events in the pinned (stream ID, sequence) order, and pre-v0.9 events without `commitId` replay as single-event commits; a rebuild of a **current-state** projector never replays — it loads every aggregate's final state and derives the complete row set through the state entry point, producing the same rows over a compacted prefix as over a full log. `CompactBelow` refuses an entity type in the durable `historyDependent` set — including from a process that never registered the projector. |
-| `commit-wide-views`    | C7     | A commit-wide projector writes rows at a `pk` outside `{entityType}#{entityId}` and deletes a row; the other language reads the rows after the commit; a `pk` over 2,048 or an `sk` over 1,024 UTF-8 bytes fails with `ViewKeyTooLong` before any write.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `commit-wide-views`    | C7     | Multi-stream transactions carry projector operations: puts at a `pk` outside `{entityType}#{entityId}`, deletes, and conditioned operations. The fixture pins each transaction's action order (the marker check, the projector operations in declaration then emission order, then the written streams' groups) and the final view rows, which the other language reads. A failed condition is a projector operation failure in both languages, names the projector and the operation, and writes no event; a `pk` over 2,048 or an `sk` over 1,024 UTF-8 bytes fails with `ViewKeyTooLong`, a repeated `(pk, sk)` with `DuplicateViewKey`, and operations with no event with the projector-only refusal, all before any write. |
+| `commit-wide-projector` | C7    | The shared account domain registers a commit-wide projector on its stores. Commands executed by either language, alone and in a multi-stream transaction, produce byte-identical view rows from the same commit view (the events and the state each stream had after the commit), including a rejection that carries events. |
 | `latest-n`             | C8     | With more than `n` events on a stream, both languages read the last `n` events newest-first, excluding the snapshot item.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `feature-marker`       | C9     | A declaration bumps `version`; the other language's cached version fails its condition and revalidates; a bump of a feature's format version fails the older writer the same way; a writer that does not support a declared `(name, formatVersion)` pair refuses to commit; adding or removing an entity type from `historyDependent` or `retention` bumps `version` the same way, and the refusals those sets drive hold across independently configured instances.                                                                                                                                                                                                                           |
 | `stream-heads-snapshot-guard` | C12 | An out-of-band snapshot never covers more than its stream's head: a snapshot ahead of the head, or on a stream with no head item, is refused as `StreamHeadDrift` in either language and writes nothing, so the stream stays writable; a snapshot at or below the head is written, a regressing one is a silent no-op, and a snapshot of an empty stream (event sequence 0) needs no head item. |
