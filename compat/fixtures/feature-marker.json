@@ -1851,6 +1851,539 @@
       ]
     }
   ],
+  "commitViews": [
+    {
+      "name": "views-before-the-streams",
+      "request": {
+        "eventsTable": "evt-compat",
+        "viewsTable": "evt-compat-views",
+        "seeded": [
+          {
+            "entityId": "a",
+            "head": 7,
+            "snapshotSequence": 1,
+            "snapshotEventSequence": 6
+          },
+          {
+            "entityId": "m",
+            "head": 3
+          }
+        ],
+        "seededViews": [
+          [
+            "handles",
+            "grace"
+          ]
+        ],
+        "streams": [
+          {
+            "entityId": "b",
+            "entityType": "account",
+            "first": 1,
+            "count": 1
+          },
+          {
+            "entityId": "a",
+            "entityType": "account",
+            "first": 8,
+            "count": 1,
+            "snapshotSequence": 2
+          }
+        ],
+        "fences": [
+          {
+            "entityId": "z",
+            "head": 0
+          },
+          {
+            "entityId": "m",
+            "head": 3
+          }
+        ],
+        "projectors": [
+          {
+            "name": "directory",
+            "operations": [
+              {
+                "op": "put",
+                "pk": "directory",
+                "sk": "acct#a",
+                "entityId": "a",
+                "entityType": "account",
+                "payload": "{\"status\":\"open\"}"
+              },
+              {
+                "op": "put",
+                "pk": "handles",
+                "sk": "ada",
+                "entityId": "a",
+                "entityType": "account",
+                "payload": "{\"owner\":\"a\"}",
+                "condition": "absent"
+              },
+              {
+                "op": "delete",
+                "pk": "handles",
+                "sk": "grace",
+                "condition": "present"
+              }
+            ]
+          },
+          {
+            "name": "audit",
+            "operations": [
+              {
+                "op": "delete",
+                "pk": "audit",
+                "sk": "pending"
+              },
+              {
+                "op": "put",
+                "pk": "audit",
+                "sk": "c1",
+                "payload": "{\"streams\":2}"
+              }
+            ]
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat-views",
+          "item": {
+            "entityID": {
+              "S": "a"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"status\":\"open\"}"
+            },
+            "pk": {
+              "S": "directory"
+            },
+            "sk": {
+              "S": "acct#a"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat-views",
+          "item": {
+            "entityID": {
+              "S": "a"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"owner\":\"a\"}"
+            },
+            "pk": {
+              "S": "handles"
+            },
+            "sk": {
+              "S": "ada"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
+        },
+        {
+          "operation": "Delete",
+          "tableName": "evt-compat-views",
+          "key": {
+            "pk": {
+              "S": "handles"
+            },
+            "sk": {
+              "S": "grace"
+            }
+          },
+          "conditionExpression": "attribute_exists(pk)"
+        },
+        {
+          "operation": "Delete",
+          "tableName": "evt-compat-views",
+          "key": {
+            "pk": {
+              "S": "audit"
+            },
+            "sk": {
+              "S": "pending"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat-views",
+          "item": {
+            "entityID": {
+              "S": ""
+            },
+            "entityType": {
+              "S": ""
+            },
+            "payload": {
+              "S": "{\"streams\":2}"
+            },
+            "pk": {
+              "S": "audit"
+            },
+            "sk": {
+              "S": "c1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "a"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "head = :prev",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "8"
+            },
+            ":prev": {
+              "N": "7"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "a"
+            },
+            "sk": {
+              "N": "8"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "8"
+            },
+            "payload": {
+              "S": "{}"
+            },
+            "pk": {
+              "S": "a"
+            },
+            "seq": {
+              "N": "2"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "seq = :seq",
+          "expressionAttributeValues": {
+            ":seq": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "b"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "b"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "m"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "conditionExpression": "head = :head",
+          "expressionAttributeValues": {
+            ":head": {
+              "N": "3"
+            }
+          }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "z"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(head)"
+        }
+      ],
+      "sizes": [
+        20,
+        286,
+        286,
+        45,
+        47,
+        55,
+        33,
+        25,
+        69,
+        60,
+        36,
+        16,
+        49
+      ]
+    },
+    {
+      "name": "single-stream",
+      "request": {
+        "eventsTable": "evt-compat",
+        "viewsTable": "evt-compat-views",
+        "streams": [
+          {
+            "entityId": "acct-1",
+            "entityType": "account",
+            "first": 1,
+            "count": 2
+          }
+        ],
+        "projectors": [
+          {
+            "name": "ledger",
+            "operations": [
+              {
+                "op": "put",
+                "pk": "ledger",
+                "sk": "acct-1",
+                "entityId": "acct-1",
+                "entityType": "account",
+                "payload": "{\"events\":2}"
+              }
+            ]
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat-views",
+          "item": {
+            "entityID": {
+              "S": "acct-1"
+            },
+            "entityType": {
+              "S": "account"
+            },
+            "payload": {
+              "S": "{\"events\":2}"
+            },
+            "pk": {
+              "S": "ledger"
+            },
+            "sk": {
+              "S": "acct-1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "2"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "2"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        }
+      ],
+      "sizes": [
+        20,
+        291,
+        291,
+        60,
+        66
+      ]
+    }
+  ],
   "postgresSchemas": [
     {
       "eventsTable": "orders",

@@ -20,8 +20,12 @@ func Test_RepositoryConformance(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(ctx, t)
 
+	// Commit-wide view operations go to a table the application owns; evt defines no view schema.
+	// This one is private to the run and dropped afterwards.
+	views := newViewTable(ctx, t, pool)
+
 	newRepo := func() evt.Repository {
-		return postgres.NewRepository(pool)
+		return postgres.NewRepository(pool).WithViewWriter(views.writer)
 	}
 
 	marker := postgres.NewRepository(pool).FeatureMarker(nil)
@@ -31,6 +35,11 @@ func Test_RepositoryConformance(t *testing.T) {
 		EnforcesOptimisticConcurrency: true,
 		SupportsTransactions:          true,
 		SupportsOutcomes:              true,
+		SupportsViews:                 true,
+		ViewsSizedBySQL:               true,
+		ReadView: func(ctx context.Context, _ evt.Repository, pk, sk string) (*evt.SerializedView, error) {
+			return views.read(ctx, pk, sk)
+		},
 		DeclareRetention: func(ctx context.Context, _ evt.Repository, entityType evt.EntityType) error {
 			_, err := marker.Declare(ctx, func(manifest *evt.FeatureManifest) {
 				manifest.Retention = append(manifest.Retention, entityType)

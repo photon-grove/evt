@@ -371,6 +371,8 @@ func (tx *Transaction) prepare(ctx context.Context, metadata evt.Metadata) (evt.
 		}
 	}
 
+	states := map[evt.EntityID][]byte{}
+
 	for _, entityID := range tx.order {
 		stream := tx.streams[entityID]
 
@@ -400,10 +402,26 @@ func (tx *Transaction) prepare(ctx context.Context, metadata evt.Metadata) (evt.
 			return evt.SerializedResult{}, err
 		}
 
+		state, serr := tx.store.stateAfterCommit(stream.entity, snapshots)
+		if serr != nil {
+			return evt.SerializedResult{}, serr
+		}
+
+		states[entityID] = state
+
 		result.Transaction = evt.MergeTransactions(result.Transaction, projectorTransaction)
 		result.Events = append(result.Events, serialized...)
 		result.Snapshots = append(result.Snapshots, snapshots...)
 	}
+
+	// The commit-wide projectors see the whole commit, every written stream at once, and run on
+	// every preparation of it.
+	views, err := tx.store.projectCommit(ctx, result.Events, states)
+	if err != nil {
+		return evt.SerializedResult{}, err
+	}
+
+	result.Views = views
 
 	return result, nil
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/conformance"
@@ -28,8 +29,11 @@ func Test_RepositoryConformance(t *testing.T) {
 	events, marker := newIsolatedEventLog(ctx, t)
 	client := isolatedClient
 
+	// Commit-wide view operations go to a views table of their own, which the suite reads back.
+	viewsTable := newIsolatedViewsTable(ctx, t, client)
+
 	newRepo := func() evt.Repository {
-		return dynamo.NewRepository(client, events.EventsTable)
+		return dynamo.NewRepository(client, events.EventsTable).WithViewsTable(viewsTable)
 	}
 
 	conformance.RunRepositorySuite(t, newRepo, conformance.SuiteOptions{
@@ -37,6 +41,33 @@ func Test_RepositoryConformance(t *testing.T) {
 		EnforcesOptimisticConcurrency: true,
 		SupportsTransactions:          true,
 		SupportsOutcomes:              true,
+		SupportsViews:                 true,
+		ReadView: func(ctx context.Context, _ evt.Repository, pk, sk string) (*evt.SerializedView, error) {
+			output, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+				TableName:      aws.String(viewsTable),
+				ConsistentRead: aws.Bool(true),
+				Key: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: pk},
+					"sk": &types.AttributeValueMemberS{Value: sk},
+				},
+			})
+			if err != nil || len(output.Item) == 0 {
+				return nil, err
+			}
+
+			text := func(name string) string {
+				if value, ok := output.Item[name].(*types.AttributeValueMemberS); ok {
+					return value.Value
+				}
+
+				return ""
+			}
+
+			return &evt.SerializedView{
+				PK: pk, SK: sk, EntityID: evt.EntityID(text("entityID")), EntityType: evt.EntityType(text("entityType")),
+				Payload: []byte(text("payload")),
+			}, nil
+		},
 		ProjectorGroup: func(operations int) evt.TransactionGroup {
 			items := make([]types.TransactWriteItem, 0, operations)
 			for i := range operations {

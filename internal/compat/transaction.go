@@ -83,6 +83,7 @@ func transactionResult(base evt.EntityID, step Step) evt.SerializedResult {
 			})
 		}
 	}
+	result.Views = viewsOf(base, step)
 	for _, fence := range step.Fences {
 		result.Fences = append(result.Fences, evt.ReadFence{EntityID: transactionID(base, fence.Suffix), EntityType: AccountType, Head: evt.EventSequence(fence.Head), CallerStamped: fence.CallerStamped})
 	}

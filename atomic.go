@@ -94,9 +94,14 @@ func (e *ProjectorOnlyCommitError) Error() string {
 	return fmt.Sprintf("commit carries %d projector operations but no events; views must be projections of committed events", e.Operations)
 }
 
-// ProjectorOperationCount returns the number of projector operations the result carries across all
-// of its transaction groups.
+// ProjectorOperationCount returns the number of projector operations the result carries: those of
+// its transaction groups and its commit-wide view operations.
 func ProjectorOperationCount(result SerializedResult) int {
+	return legacyOperationCount(result) + len(result.Views)
+}
+
+// legacyOperationCount counts the operations of the result's transaction groups.
+func legacyOperationCount(result SerializedResult) int {
 	operations := 0
 	for _, group := range result.Transaction {
 		if group != nil {
@@ -141,9 +146,11 @@ func (e *ProjectorOperationsUnsupportedError) Error() string {
 }
 
 // CheckProjectorOperationsSupported returns *ProjectorOperationsUnsupportedError when the result
-// carries any projector operation. A backend without projector support calls it before writing.
+// carries any operation of a transaction group. A backend that executes no such group calls it
+// before writing. Commit-wide view operations are not groups: a backend with a place to write them
+// handles them, and one without refuses them with *ViewsNotConfiguredError.
 func CheckProjectorOperationsSupported(backend string, result SerializedResult) error {
-	if operations := ProjectorOperationCount(result); operations > 0 {
+	if operations := legacyOperationCount(result); operations > 0 {
 		return &ProjectorOperationsUnsupportedError{Backend: backend, Operations: operations}
 	}
 
@@ -243,6 +250,12 @@ func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
 		return result, err
 	}
 
+	// View operations are validated before anything else is derived, so an invalid, oversized-key,
+	// or duplicated operation fails the commit before any write on every backend.
+	if err := CheckViews(result.Views); err != nil {
+		return result, err
+	}
+
 	if result.Outcome != nil {
 		// The outcome is checked before anything else is derived: a bad command ID, an oversized
 		// response, or an oversized rejection fails the commit before any write.
@@ -259,6 +272,7 @@ func NormalizeCommit(result SerializedResult) (SerializedResult, error) {
 	}
 
 	result.Events = slices.Clone(result.Events)
+	result.Views = slices.Clone(result.Views)
 	result.Snapshots = slices.Clone(result.Snapshots)
 	result.Fences = slices.Clone(result.Fences)
 	slices.SortStableFunc(result.Events, func(a, b SerializedEvent) int { return compareID(a.EntityID, b.EntityID) })
@@ -540,8 +554,8 @@ type SizedTransactionGroup interface {
 
 // ProjectorOperationSizes returns one budget entry per projector operation the result carries:
 // the group's reported sizes when it is a SizedTransactionGroup, otherwise zero bytes per
-// operation. The action count is exact either way, which is what makes CommitTooLarge fire at the
-// same boundary on every backend.
+// operation, then ViewOperationSize for each commit-wide view operation. The action count is exact
+// either way, which is what makes CommitTooLarge fire at the same boundary on every backend.
 func ProjectorOperationSizes(result SerializedResult) []int {
 	var sizes []int
 
@@ -564,6 +578,10 @@ func ProjectorOperationSizes(result SerializedResult) []int {
 			}
 			sizes = append(sizes, size)
 		}
+	}
+
+	for _, view := range result.Views {
+		sizes = append(sizes, ViewOperationSize(view.Op))
 	}
 
 	return sizes

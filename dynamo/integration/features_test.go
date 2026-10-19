@@ -63,6 +63,41 @@ func newIsolatedEventLog(ctx context.Context, t *testing.T) (*dynamo.Repository,
 	return repo, repo.FeatureMarker(nil)
 }
 
+// newIsolatedViewsTable creates a fresh views table (string pk and sk, no stream) for one test and
+// deletes it when the test finishes.
+func newIsolatedViewsTable(ctx context.Context, t *testing.T, client *dynamodb.Client) string {
+	t.Helper()
+
+	name := fmt.Sprintf("evt-it-views-%d", time.Now().UnixNano())
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(name),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = client.DeleteTable(cleanupCtx, &dynamodb.DeleteTableInput{TableName: aws.String(name)}) //nolint:errcheck // best-effort teardown of a test-only table
+	})
+
+	require.Eventually(t, func() bool {
+		out, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(name)})
+		return err == nil && out.Table != nil && out.Table.TableStatus == types.TableStatusActive
+	}, 10*time.Second, 100*time.Millisecond)
+
+	return name
+}
+
 // isolatedClient holds the client of the most recently created isolated event log, so follow-up
 // assertions in the same test can address its items.
 var isolatedClient *dynamodb.Client

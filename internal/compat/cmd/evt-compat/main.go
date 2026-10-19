@@ -38,14 +38,14 @@ import (
 	"github.com/photon-grove/evt/internal/compat"
 	"github.com/photon-grove/evt/internal/eventjson"
 	"github.com/photon-grove/evt/postgres"
-	"github.com/photon-grove/evt/snapshots"
 )
 
 type backend struct {
-	repo     evt.Repository
-	dynamo   *dynamodb.Client
-	table    string
-	postgres *pgxpool.Pool
+	repo       evt.Repository
+	dynamo     *dynamodb.Client
+	table      string
+	viewsTable string
+	postgres   *pgxpool.Pool
 }
 
 func main() {
@@ -146,6 +146,7 @@ func connect(ctx context.Context, name string) (backend, error) {
 	case "dynamo":
 		endpoint := envOr("AWS_ENDPOINT_URL", "http://localhost:4566")
 		table := envOr("EVT_COMPAT_DYNAMO_TABLE", "evt-local-event-log")
+		viewsTable := envOr("EVT_COMPAT_DYNAMO_VIEWS_TABLE", "evt-local-entity-views")
 
 		cfg, err := config.LoadDefaultConfig(ctx,
 			config.WithRegion("us-west-2"),
@@ -159,7 +160,10 @@ func connect(ctx context.Context, name string) (backend, error) {
 
 		client := dynamodb.NewFromConfig(cfg)
 
-		return backend{repo: dynamo.NewRepository(client, table), dynamo: client, table: table}, nil
+		return backend{
+			repo:   dynamo.NewRepository(client, table).WithViewsTable(viewsTable),
+			dynamo: client, table: table, viewsTable: viewsTable,
+		}, nil
 
 	case "postgres":
 		pool, err := pgxpool.New(ctx, envOr("DATABASE_URL", "postgres://evt:evt@localhost:5432/evt_local?sslmode=disable"))
@@ -167,8 +171,13 @@ func connect(ctx context.Context, name string) (backend, error) {
 			return backend{}, err
 		}
 
-		repo := postgres.NewRepository(pool)
+		repo := postgres.NewRepository(pool).WithViewWriter(compat.PostgresViewWriter)
 		if err := repo.EnsureSchema(ctx); err != nil {
+			return backend{}, err
+		}
+
+		// evt defines no view schema: the application owns its view tables, and so does this driver.
+		if _, err := pool.Exec(ctx, compat.PostgresViewDDL); err != nil {
 			return backend{}, err
 		}
 
@@ -336,6 +345,13 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 			}
 		}
 
+		viewFailures, viewErr := verifyViews(ctx, b, scenario, expected)
+		if viewErr != nil {
+			return nil, viewErr
+		}
+
+		failures = append(failures, viewFailures...)
+
 		if scenario.Outcomes {
 			outcomeFailures, err := verifyOutcomes(ctx, b, scenario, expected)
 			if err != nil {
@@ -360,7 +376,7 @@ func newRunner(b backend, scenario compat.Scenario, run string) compat.Runner {
 	if scenario.Outcomes {
 		runner = compat.NewOutcomeRunner(b.repo, scenario, run)
 	} else {
-		runner = compat.Runner{Store: snapshots.NewStore(b.repo, scenario.SnapshotInterval), Repo: b.repo}
+		runner = compat.NewRunner(b.repo, scenario)
 	}
 
 	switch {
@@ -406,6 +422,103 @@ func postgresHead(ctx context.Context, pool *pgxpool.Pool, entityID evt.EntityID
 	}
 
 	return &head, nil
+}
+
+// verifyViews checks the view rows commit-wide projectors left in the scenario's partitions: the raw
+// DynamoDB items, or the PostgreSQL rows. Partitions shared between runs are filtered to the rows
+// that belong to this run.
+func verifyViews(
+	ctx context.Context,
+	b backend,
+	scenario compat.Scenario,
+	expected compat.ScenarioExpectation,
+) ([]string, error) {
+	partitions := scenario.ViewPartitions(expected.EntityID)
+	if len(partitions) == 0 {
+		return nil, nil
+	}
+
+	owns := func(pk, sk string) bool { return compat.OwnsViewRow(expected.EntityID, pk, sk) }
+
+	var (
+		got  any
+		want any
+	)
+
+	switch {
+	case b.dynamo != nil:
+		var items []map[string]types.AttributeValue
+
+		for _, pk := range partitions {
+			rows, err := partitionItemsIn(ctx, b, b.viewsTable, pk)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, item := range rows {
+				if sk, ok := item["sk"].(*types.AttributeValueMemberS); ok && owns(pk, sk.Value) {
+					items = append(items, item)
+				}
+			}
+		}
+
+		var wantItems []map[string]any
+		for _, view := range expected.Views {
+			wantItems = append(wantItems, view.DynamoItem)
+		}
+
+		got, want = normalize(items), normalize(wantItems)
+
+	case b.postgres != nil:
+		rows, err := postgresViews(ctx, b.postgres, partitions, owns)
+		if err != nil {
+			return nil, err
+		}
+
+		wantRows := []compat.ViewRow{}
+		for _, view := range expected.Views {
+			wantRows = append(wantRows, view.Row())
+		}
+
+		got, want = rows, wantRows
+	}
+
+	if reflect.DeepEqual(got, want) {
+		return nil, nil
+	}
+
+	return []string{fmt.Sprintf("%s: view rows\n  got:  %v\n  want: %v", scenario.Name, got, want)}, nil
+}
+
+// postgresViews reads the view rows of the given partitions that the run owns, ordered by partition
+// then sort key bytes.
+func postgresViews(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	partitions []string,
+	owns func(pk, sk string) bool,
+) ([]compat.ViewRow, error) {
+	rows, err := pool.Query(ctx, `SELECT pk, sk, entity_id, entity_type, payload FROM `+compat.PostgresViewTable+`
+		WHERE pk = ANY($1) ORDER BY pk COLLATE "C", sk COLLATE "C"`, partitions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	views := []compat.ViewRow{}
+
+	for rows.Next() {
+		var view compat.ViewRow
+		if err = rows.Scan(&view.PK, &view.SK, &view.EntityID, &view.EntityType, &view.Payload); err != nil {
+			return nil, err
+		}
+
+		if owns(view.PK, view.SK) {
+			views = append(views, view)
+		}
+	}
+
+	return views, rows.Err()
 }
 
 // verifyOutcomes checks the command-outcome rows of an outcomes scenario against the fixtures:
@@ -537,8 +650,12 @@ func expectedOutcomeRow(outcome compat.OutcomeExpectation) (*outcomeRow, error) 
 }
 
 func partitionItems(ctx context.Context, b backend, pk string) ([]map[string]types.AttributeValue, error) {
+	return partitionItemsIn(ctx, b, b.table, pk)
+}
+
+func partitionItemsIn(ctx context.Context, b backend, table, pk string) ([]map[string]types.AttributeValue, error) {
 	paginator := dynamodb.NewQueryPaginator(b.dynamo, &dynamodb.QueryInput{
-		TableName:                 aws.String(b.table),
+		TableName:                 aws.String(table),
 		ConsistentRead:            aws.Bool(true),
 		KeyConditionExpression:    aws.String("pk = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: pk}},

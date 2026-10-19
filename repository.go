@@ -61,10 +61,10 @@ type Store interface {
 type Repository interface {
 	// Commit new Events for an Entity instance, or for several streams at once.
 	//
-	// Since v0.9 (ADR 0004, C1/C2) a SerializedResult may also carry Snapshots (per-stream
-	// snapshot puts) and Fences (read-only streams pinned to an observed head). An implementation
-	// that cannot honor Snapshots or Fences atomically with the Events MUST return an error
-	// rather than ignore them: silently dropping a fence commits a decision made on a stale read
+	// Since v0.9 (ADR 0004, C1/C2/C7) a SerializedResult may also carry Snapshots (per-stream
+	// snapshot puts), Fences (read-only streams pinned to an observed head), and Views (the
+	// commit-wide projectors' view operations). An implementation that cannot honor Snapshots,
+	// Fences, or Views atomically with the Events MUST return an error rather than ignore them: silently dropping a fence commits a decision made on a stale read
 	// with no isolation guarantee, and silently dropping a snapshot loses a snapshot the engine
 	// believes is durable. An implementation that accepts them must write every stream, snapshot,
 	// and projector operation in one transaction (all or nothing), refuse an oversized commit

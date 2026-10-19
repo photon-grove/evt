@@ -26,6 +26,10 @@ type Store struct {
 
 	// retry bounds fence-aware retry on a store with outcomes (ADR 0004, C5); see WithRetry.
 	retry RetryPolicy
+
+	// commitProjectors are the commit-wide projectors (ADR 0004, C7), in declaration order; see
+	// WithCommitProjectors.
+	commitProjectors []evt.CommitProjector
 }
 
 // NewStore creates a new Store with the given Repository and Snapshot size
@@ -164,7 +168,16 @@ func (store *Store) Commit(
 	serializedResult := evt.SerializedResult{Events: serializedEvents, Transaction: result.Transaction} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	if commitSnapshotToEvent == 0 {
-		// If not needed, execute a simple commit
+		// If not needed, execute a simple commit, with the commit-wide projectors' operations.
+		state, serr := store.commitState(eventContext.Entity)
+		if serr != nil {
+			return nil, serr
+		}
+
+		if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{eventContext.EntityID: state}); err != nil {
+			return nil, err
+		}
+
 		if err = store.repo.Commit(ctx, serializedResult); err != nil {
 			return nil, err
 		}
@@ -178,6 +191,11 @@ func (store *Store) Commit(
 		&eventContext,
 	)
 	if err != nil {
+		return nil, err
+	}
+
+	// The snapshot payload is the stream's state after the commit, the same bytes the projectors see.
+	if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{eventContext.EntityID: payload}); err != nil {
 		return nil, err
 	}
 

@@ -53,11 +53,23 @@ type SuiteOptions struct {
 	// The declaration refuses every later fence for that type.
 	DeclareRetention func(ctx context.Context, repo evt.Repository, entityType evt.EntityType) error
 
+	// SupportsViews indicates the backend writes commit-wide view operations (ADR 0004, C7) in the
+	// commit transaction, so the view cases run. ReadView is then mandatory.
+	SupportsViews bool
+
+	// ReadView reads back a view row from the repository under test.
+	ReadView ViewReader
+
+	// ViewsSizedBySQL indicates the backend sizes a view operation by its SQL text (PostgreSQL),
+	// so the bound arguments are not budgeted and the byte-budget cases for views are skipped; the
+	// action count is exact either way.
+	ViewsSizedBySQL bool
+
 	// ProjectorGroup, when non-nil, builds a projector transaction group of exactly the given
 	// number of operations that the backend under test accepts, enabling the projector-budget
 	// case: every backend that executes projector operations counts each one in the shared
-	// 100-action budget, so CommitTooLarge fires at the same boundary. A backend that refuses
-	// projector operations outright (Go PostgreSQL until E2.6) leaves it nil.
+	// 100-action budget, so CommitTooLarge fires at the same boundary. A backend that executes no
+	// transaction group (Go PostgreSQL: its view operations go through SupportsViews) leaves it nil.
 	ProjectorGroup func(operations int) evt.TransactionGroup
 
 	// BypassHead appends one event to the repository's log without maintaining the stream's head
@@ -187,6 +199,10 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		t.Run("RejectsProjectorOnlyCommits", func(t *testing.T) {
 			testRejectsProjectorOnlyCommits(t, newRepo())
 		})
+
+		if opts.SupportsViews {
+			runViewCases(t, newRepo, opts)
+		}
 
 		t.Run("RejectsFencesForRetention", func(t *testing.T) {
 			require.NotNil(t, opts.DeclareRetention,

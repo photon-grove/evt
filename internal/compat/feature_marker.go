@@ -25,6 +25,7 @@ type FeatureMarkerFixtures struct {
 	Declarations    []FeatureDeclarationVector `json:"declarations"`
 	Commits         []FeatureCommitVector      `json:"commits"`
 	StreamHeads     []StreamHeadVector         `json:"streamHeads"`
+	CommitViews     []CommitViewVector         `json:"commitViews"`
 	PostgresSchemas []FeatureSchemaVector      `json:"postgresSchemas"`
 }
 
@@ -121,6 +122,9 @@ func (c *featureCaptureDynamo) TransactWriteItems(ctx context.Context, in *dynam
 		case item.Put != nil:
 			p := item.Put
 			out = FeatureWriteItem{Operation: "Put", TableName: aws.ToString(p.TableName), Item: DynamoItemJSON(p.Item), ConditionExpression: aws.ToString(p.ConditionExpression), ExpressionAttributeNames: p.ExpressionAttributeNames, ExpressionAttributeValues: DynamoItemJSON(p.ExpressionAttributeValues)}
+		case item.Delete != nil:
+			p := item.Delete
+			out = FeatureWriteItem{Operation: "Delete", TableName: aws.ToString(p.TableName), Key: DynamoItemJSON(p.Key), ConditionExpression: aws.ToString(p.ConditionExpression), ExpressionAttributeNames: p.ExpressionAttributeNames, ExpressionAttributeValues: DynamoItemJSON(p.ExpressionAttributeValues)}
 		case item.ConditionCheck != nil:
 			p := item.ConditionCheck
 			out = FeatureWriteItem{Operation: "ConditionCheck", TableName: aws.ToString(p.TableName), Key: DynamoItemJSON(p.Key), ConditionExpression: aws.ToString(p.ConditionExpression), ExpressionAttributeNames: p.ExpressionAttributeNames, ExpressionAttributeValues: DynamoItemJSON(p.ExpressionAttributeValues)}
@@ -133,22 +137,7 @@ func (c *featureCaptureDynamo) TransactWriteItems(ctx context.Context, in *dynam
 		c.writes = append(c.writes, out)
 	}
 
-	// The event-log fake requires numeric sk keys; the real view projector uses a
-	// single hash key. Preserve its Put in the fixture, but execute only event-log
-	// actions against FakeDynamo. These unconditional view puts cannot reject a commit.
-	request := *in
-	request.TransactItems = nil
-	for _, item := range in.TransactItems {
-		if item.Put != nil && aws.ToString(item.Put.TableName) == "views" {
-			if item.Put.ConditionExpression != nil {
-				return nil, fmt.Errorf("feature fixture: conditional view puts need fake support")
-			}
-			continue
-		}
-		request.TransactItems = append(request.TransactItems, item)
-	}
-
-	return c.FakeDynamo.TransactWriteItems(ctx, &request, opts...)
+	return c.FakeDynamo.TransactWriteItems(ctx, in, opts...)
 }
 
 // featurePG captures the declaration's SQL and bound values. Embedded interfaces deliberately
@@ -288,6 +277,13 @@ func GenerateFeatureMarkerFixtures(ctx context.Context) (FeatureMarkerFixtures, 
 		return fixtures, err
 	}
 	fixtures.StreamHeads = streamHeads
+
+	commitViews, err := GenerateCommitViewVectors(ctx)
+	if err != nil {
+		return fixtures, err
+	}
+
+	fixtures.CommitViews = commitViews
 
 	for _, tables := range [][2]string{{"orders", "orders_entity_type_idx"}, {"evt_events", "evt_snapshots"}} {
 		capture := &featureSchemaCapture{}

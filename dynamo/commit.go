@@ -84,6 +84,9 @@ type commitLayout struct {
 	streams []streamLayout
 	// fences are the fence checks in transaction order.
 	fences []fenceLayout
+	// views are the commit-wide view operations, which follow the transaction groups' operations
+	// and precede the stream items.
+	views []evt.ProjectedView
 	// outcomeIndex is the outcome put's index among the stream items; outcomeID is its command.
 	// The outcome put is the last action of the transaction.
 	outcomeIndex int
@@ -366,6 +369,11 @@ func (repo *Repository) commitStreamItems(
 		return err
 	}
 
+	viewItems, err := repo.buildViewItems(result.Views)
+	if err != nil {
+		return err
+	}
+
 	// The preflight covers every item the transaction carries, with the projector operations
 	// sized exactly from the items this backend will write.
 	sizes, serr := evt.TransactionItemSizesWithTTL(result, repo.ttlFor)
@@ -375,16 +383,21 @@ func (repo *Repository) commitStreamItems(
 	for _, item := range transactItems {
 		sizes = append(sizes, transactItemSize(item))
 	}
+	for _, item := range viewItems {
+		sizes = append(sizes, transactItemSize(item))
+	}
 	if berr := evt.CommitBudget(sizes); berr != nil {
 		return berr
 	}
+
+	layout.views = result.Views
 
 	return repo.commitTransactionItems(ctx, result.Transaction, streamItems, layout)
 }
 
 // commitTransactionItems assembles the final transaction — feature-marker check first, then the
-// projector operations, then the stream and fence items — checks the full budget, sends it, and
-// classifies a failure by the item that failed.
+// projector operations (the transaction groups', then the commit-wide views'), then the stream and
+// fence items — checks the full budget, sends it, and classifies a failure by the item that failed.
 func (repo *Repository) commitTransactionItems(
 	ctx context.Context,
 	transaction evt.Transaction,
@@ -396,6 +409,11 @@ func (repo *Repository) commitTransactionItems(
 		return err
 	}
 
+	viewItems, err := repo.buildViewItems(layout.views)
+	if err != nil {
+		return err
+	}
+
 	// Every v0.9 commit carries the feature-marker ConditionCheck, ordered before every other
 	// item so the transaction layout stays pinned across implementations (storage spec, Writes).
 	check, cerr := repo.features.checkItem(ctx)
@@ -403,11 +421,14 @@ func (repo *Repository) commitTransactionItems(
 		return cerr
 	}
 
+	// The rebuild-lock check (C10, action group 2) will sit here, between the marker check and the
+	// projector operations, once the rebuild fence lands; until then no action is emitted for it.
 	control := []types.TransactWriteItem{check}
 
-	combined := make([]types.TransactWriteItem, 0, len(control)+len(transactItems)+len(streamItems))
+	combined := make([]types.TransactWriteItem, 0, len(control)+len(transactItems)+len(viewItems)+len(streamItems))
 	combined = append(combined, control...)
 	combined = append(combined, transactItems...)
+	combined = append(combined, viewItems...)
 	combined = append(combined, streamItems...)
 
 	count := len(combined)
@@ -427,9 +448,11 @@ func (repo *Repository) commitTransactionItems(
 }
 
 // classifyCommitFailure routes a failed commit by the transaction items that failed, ranked
-// marker, outcome put, stream head drift, sequence gap, then any other conflict. Control items (the
-// feature-marker check) are prepended to the transaction, so their failure is classified
-// separately and the remaining indices shift by their count.
+// marker, outcome put, stream head drift, sequence gap, any other conflict on a stream or a fence,
+// then projector operations. Control items (the feature-marker check) are prepended to the
+// transaction, so their failure is classified separately and the remaining indices shift by their
+// count. The projector items — the transaction groups', then the commit-wide views' — sit between
+// the control items and the stream items.
 func (repo *Repository) classifyCommitFailure(
 	ctx context.Context,
 	transaction evt.Transaction,
@@ -439,6 +462,12 @@ func (repo *Repository) classifyCommitFailure(
 ) error {
 	ok, i := HasConditionalCheckFailure(err)
 	if !ok {
+		// A view item can fail for a reason that is not a condition (an invalid item); no retry can
+		// fix it, so it is the projector's typed error.
+		if failure := viewReasonFailure(layout.views, 1+len(transactItems), cancellationCodes(err), err); failure != nil {
+			return failure
+		}
+
 		// Another transaction was writing the same items: an optimistic-concurrency conflict, as
 		// in Rust, so fence-aware retry re-prepares the command.
 		if hasTransactionConflict(err) {
@@ -460,7 +489,8 @@ func (repo *Repository) classifyCommitFailure(
 
 	// The layout's indexes are relative to the stream items, which sit after the control items
 	// and the projector operations in the combined transaction.
-	base := len(transactItems) + 1
+	viewBase := 1 + len(transactItems)
+	base := viewBase + len(layout.views)
 	codes := cancellationCodes(err)
 
 	// A lost outcome put outranks every other item's failure but the marker: the command already
@@ -476,17 +506,40 @@ func (repo *Repository) classifyCommitFailure(
 		return classified
 	}
 
-	// Projector items sit between the control items and the stream items.
-	offset := 1
-	if i-offset < len(transactItems) {
+	// Only projector operations failed: the first in transaction order is reported, so a projector
+	// condition surfaces only when nothing ranked above it did.
+	if i-1 < len(transactItems) {
+		offset := 1
 		for _, group := range transaction {
 			if i-offset < group.Len() {
 				return group.HandleError(err, i-offset)
 			}
 			offset += group.Len()
 		}
+
 		return wrapClassifiedError(err)
 	}
 
+	if failure := viewReasonFailure(layout.views, viewBase, codes, err); failure != nil {
+		return failure
+	}
+
 	return wrapClassifiedError(ErrSnapshotRaceCondition)
+}
+
+// viewReasonFailure returns the typed error of the first view operation, in transaction order,
+// whose item failed for a reason a retry cannot fix, or nil. base is the index of the first view
+// item in the combined transaction.
+func viewReasonFailure(views []evt.ProjectedView, base int, codes []string, cause error) error {
+	for index, view := range views {
+		if base+index >= len(codes) {
+			break
+		}
+
+		if failure := viewFailure(view, codes[base+index], cause); failure != nil {
+			return failure
+		}
+	}
+
+	return nil
 }

@@ -25,6 +25,10 @@ type FakeDynamo struct {
 	mu    sync.Mutex
 	items map[string]map[int64]map[string]types.AttributeValue
 
+	// views holds the rows of a views table, whose sort key is a string (commit-wide view
+	// operations, ADR 0004 C7): partition key, then sort key.
+	views map[string]map[string]map[string]types.AttributeValue
+
 	// transactions records the actions of every TransactWriteItems call in request order,
 	// including calls the table then cancels.
 	transactions [][]TransactionAction
@@ -36,8 +40,13 @@ type FakeDynamo struct {
 // identical.
 type TransactionAction struct {
 	Operation string `json:"operation"`
-	PK        string `json:"pk"`
-	SK        int64  `json:"sk"`
+
+	// Table is "views" for an action on the views table (commit-wide view operations) and absent
+	// for the events table. A views row's sort key is a string, carried in SKText with SK zero.
+	Table  string `json:"table,omitempty"`
+	PK     string `json:"pk"`
+	SK     int64  `json:"sk"`
+	SKText string `json:"skText,omitempty"`
 
 	// Update is an Update action's update expression (the head update of a written stream).
 	Update    string            `json:"update,omitempty"`
@@ -50,7 +59,10 @@ var _ dynamo.Client = (*FakeDynamo)(nil)
 
 // NewFakeDynamo returns an empty table.
 func NewFakeDynamo() *FakeDynamo {
-	return &FakeDynamo{items: make(map[string]map[int64]map[string]types.AttributeValue)}
+	return &FakeDynamo{
+		items: make(map[string]map[int64]map[string]types.AttributeValue),
+		views: make(map[string]map[string]map[string]types.AttributeValue),
+	}
 }
 
 // Transactions returns the actions of every TransactWriteItems call so far, in request order.
@@ -59,6 +71,41 @@ func (f *FakeDynamo) Transactions() [][]TransactionAction {
 	defer f.mu.Unlock()
 
 	return slices.Clone(f.transactions)
+}
+
+// Views returns every row of the views table in a partition, ascending by sort key bytes.
+func (f *FakeDynamo) Views(pk string) []map[string]types.AttributeValue {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	partition := f.views[pk]
+	keys := make([]string, 0, len(partition))
+	for sk := range partition {
+		keys = append(keys, sk)
+	}
+
+	sort.Strings(keys)
+
+	out := make([]map[string]types.AttributeValue, 0, len(keys))
+	for _, sk := range keys {
+		out = append(out, partition[sk])
+	}
+
+	return out
+}
+
+// SeedView stores a views row directly, as a fixture's starting state.
+func (f *FakeDynamo) SeedView(pk, sk string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.putViewLocked(pk, sk, map[string]types.AttributeValue{
+		"pk":         &types.AttributeValueMemberS{Value: pk},
+		"sk":         &types.AttributeValueMemberS{Value: sk},
+		"entityID":   &types.AttributeValueMemberS{Value: ""},
+		"entityType": &types.AttributeValueMemberS{Value: ""},
+		"payload":    &types.AttributeValueMemberS{Value: "{}"},
+	})
 }
 
 // Items returns every item in a partition, ascending by sort key (the snapshot at sk=0 first).
@@ -110,6 +157,22 @@ func keyOf(item map[string]types.AttributeValue) (string, int64, error) {
 	return pk.Value, sk, nil
 }
 
+// textKeyOf returns the keys of an item or key whose sort key is a string, as a views row's is, and
+// false when the sort key is not a string.
+func textKeyOf(item map[string]types.AttributeValue) (string, string, bool) {
+	pk, ok := item["pk"].(*types.AttributeValueMemberS)
+	if !ok {
+		return "", "", false
+	}
+
+	sk, ok := item["sk"].(*types.AttributeValueMemberS)
+	if !ok {
+		return "", "", false
+	}
+
+	return pk.Value, sk.Value, true
+}
+
 func number(values map[string]types.AttributeValue, name string) (int64, error) {
 	attr, ok := values[name].(*types.AttributeValueMemberN)
 	if !ok {
@@ -147,8 +210,11 @@ func conditionHolds(
 	case "":
 		return true, nil
 
-	case "attribute_not_exists(sk)", "attribute_not_exists(pk)":
+	case "attribute_not_exists(sk)", dynamo.ViewAbsentCondition:
 		return existing == nil, nil
+
+	case dynamo.ViewPresentCondition:
+		return existing != nil, nil
 
 	case "attribute_not_exists(pk) OR version = :v":
 		return compareIfExists(existing, "version", values, ":v", equal)
@@ -230,8 +296,12 @@ func compareIfExists(
 
 // transactTarget is the item a transaction action touches and the condition it carries.
 type transactTarget struct {
-	pk        string
-	sk        int64
+	pk string
+	sk int64
+
+	// skText is set, with views, for an action on the views table.
+	skText    string
+	views     bool
 	put       map[string]types.AttributeValue
 	condition string
 	values    map[string]types.AttributeValue
@@ -243,22 +313,50 @@ type transactTarget struct {
 }
 
 func targetOf(write types.TransactWriteItem) (transactTarget, error) {
+	// An action whose sort key is a string touches the views table.
+	if view, ok := viewTargetOf(write); ok {
+		return view, nil
+	}
+
 	switch {
 	case write.Put != nil:
 		pk, sk, err := keyOf(write.Put.Item)
-		return transactTarget{pk, sk, write.Put.Item, aws.ToString(write.Put.ConditionExpression), write.Put.ExpressionAttributeValues, false, "", nil}, err
+		return transactTarget{pk: pk, sk: sk, put: write.Put.Item, condition: aws.ToString(write.Put.ConditionExpression), values: write.Put.ExpressionAttributeValues}, err
 	case write.ConditionCheck != nil:
 		pk, sk, err := keyOf(write.ConditionCheck.Key)
-		return transactTarget{pk, sk, nil, aws.ToString(write.ConditionCheck.ConditionExpression), write.ConditionCheck.ExpressionAttributeValues, false, "", write.ConditionCheck.ExpressionAttributeNames}, err
+		return transactTarget{pk: pk, sk: sk, condition: aws.ToString(write.ConditionCheck.ConditionExpression), values: write.ConditionCheck.ExpressionAttributeValues, names: write.ConditionCheck.ExpressionAttributeNames}, err
 	case write.Delete != nil:
 		pk, sk, err := keyOf(write.Delete.Key)
-		return transactTarget{pk, sk, nil, aws.ToString(write.Delete.ConditionExpression), write.Delete.ExpressionAttributeValues, true, "", write.Delete.ExpressionAttributeNames}, err
+		return transactTarget{pk: pk, sk: sk, condition: aws.ToString(write.Delete.ConditionExpression), values: write.Delete.ExpressionAttributeValues, delete: true, names: write.Delete.ExpressionAttributeNames}, err
 	case write.Update != nil:
 		pk, sk, err := keyOf(write.Update.Key)
-		return transactTarget{pk, sk, nil, aws.ToString(write.Update.ConditionExpression), write.Update.ExpressionAttributeValues, false, aws.ToString(write.Update.UpdateExpression), write.Update.ExpressionAttributeNames}, err
+		return transactTarget{pk: pk, sk: sk, condition: aws.ToString(write.Update.ConditionExpression), values: write.Update.ExpressionAttributeValues, update: aws.ToString(write.Update.UpdateExpression), names: write.Update.ExpressionAttributeNames}, err
 	}
 
 	return transactTarget{}, errors.New("fake dynamo: unsupported transaction action")
+}
+
+// viewTargetOf recognizes a Put or Delete on the views table, whose sort key is a string.
+func viewTargetOf(write types.TransactWriteItem) (transactTarget, bool) {
+	switch {
+	case write.Put != nil:
+		if pk, sk, ok := textKeyOf(write.Put.Item); ok {
+			return transactTarget{
+				pk: pk, skText: sk, views: true, put: write.Put.Item,
+				condition: aws.ToString(write.Put.ConditionExpression), values: write.Put.ExpressionAttributeValues,
+			}, true
+		}
+
+	case write.Delete != nil:
+		if pk, sk, ok := textKeyOf(write.Delete.Key); ok {
+			return transactTarget{
+				pk: pk, skText: sk, views: true, delete: true,
+				condition: aws.ToString(write.Delete.ConditionExpression), values: write.Delete.ExpressionAttributeValues,
+			}, true
+		}
+	}
+
+	return transactTarget{}, false
 }
 
 // action summarizes the target for the recorded transaction order.
@@ -274,6 +372,9 @@ func (t transactTarget) action(write types.TransactWriteItem) TransactionAction 
 	}
 
 	action := TransactionAction{Operation: operation, PK: t.pk, SK: t.sk, Update: t.update, Condition: t.condition}
+	if t.views {
+		action.Table, action.SKText = "views", t.skText
+	}
 	if len(t.names) > 0 {
 		action.Names = t.names
 	}
@@ -308,6 +409,9 @@ func (f *FakeDynamo) TransactWriteItems(
 
 		// DynamoDB rejects a transaction that touches one item twice.
 		key := fmt.Sprintf("%s/%d", target.pk, target.sk)
+		if target.views {
+			key = fmt.Sprintf("views/%s/%s", target.pk, target.skText)
+		}
 		if touched[key] {
 			return nil, fmt.Errorf("fake dynamo: transaction touches %s more than once", key)
 		}
@@ -316,7 +420,7 @@ func (f *FakeDynamo) TransactWriteItems(
 		recorded = append(recorded, target.action(write))
 
 		reasons[i] = types.CancellationReason{Code: aws.String("None")}
-		ok, err := conditionHolds(f.items[target.pk][target.sk], target.condition, target.values)
+		ok, err := conditionHolds(f.existingLocked(target), target.condition, target.values)
 		if err != nil {
 			return nil, err
 		}
@@ -337,6 +441,12 @@ func (f *FakeDynamo) TransactWriteItems(
 
 	for _, target := range targets {
 		switch {
+		case target.views && target.put != nil:
+			f.putViewLocked(target.pk, target.skText, target.put)
+
+		case target.views:
+			delete(f.views[target.pk], target.skText)
+
 		case target.put != nil:
 			f.putLocked(target.pk, target.sk, target.put)
 
@@ -351,6 +461,28 @@ func (f *FakeDynamo) TransactWriteItems(
 	}
 
 	return &dynamodb.TransactWriteItemsOutput{}, nil
+}
+
+// existingLocked returns the stored item a target touches, or nil.
+func (f *FakeDynamo) existingLocked(target transactTarget) map[string]types.AttributeValue {
+	if target.views {
+		return f.views[target.pk][target.skText]
+	}
+
+	return f.items[target.pk][target.sk]
+}
+
+func (f *FakeDynamo) putViewLocked(pk, sk string, item map[string]types.AttributeValue) {
+	if f.views[pk] == nil {
+		f.views[pk] = make(map[string]map[string]types.AttributeValue)
+	}
+
+	copied := make(map[string]types.AttributeValue, len(item))
+	for name, value := range item {
+		copied[name] = value
+	}
+
+	f.views[pk][sk] = copied
 }
 
 // updateLocked applies an update expression of the form `SET lhs = :value[, lhs = :value]`, the

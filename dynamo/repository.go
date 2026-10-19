@@ -14,6 +14,8 @@ import (
 type Repository struct {
 	EventsTable string
 
+	viewsTable string // table of commit-wide view operations (C7); empty refuses them
+
 	client         Client
 	encoder        *attributevalue.Encoder
 	decoder        *attributevalue.Decoder
