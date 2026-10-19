@@ -17,6 +17,18 @@
 //! | `eventSeq`   | N    |                          | last event sequence covered     |
 //! | `ttl`        | N    | optional, epoch seconds  | optional, epoch seconds         |
 //!
+//!
+//! Every stream also has one small **head item** at `sk = -1` (ADR 0007), which records the
+//! highest event sequence ever committed to the stream and is the only item a commit conditions on
+//! for concurrency:
+//!
+//! | Attribute | Type | Head item (`sk = -1`)                                         |
+//! |-----------|------|---------------------------------------------------------------|
+//! | `pk`      | S    | entity ID                                                     |
+//! | `sk`      | N    | `-1`                                                          |
+//! | `head`    | N    | the highest event sequence ever committed to the stream       |
+//! | `ttl`     | N    | optional, epoch seconds; only for entity types with retention |
+//!
 //! Items are modeled with [`AttributeValue`], whose serde encoding is DynamoDB JSON
 //! (`{"S": "..."}`), so they can be compared against fixtures and converted to SDK types.
 
@@ -42,42 +54,60 @@ pub const DEFAULT_VIEW_SORT_KEY: &str = "VIEW";
 /// Condition for event puts: the `(pk, sk)` must not exist yet.
 pub const EVENT_CONDITION: &str = "attribute_not_exists(sk)";
 
-/// Condition for the snapshot-item check in a commit without a snapshot: the commit's first event
-/// (`:first`) is above the stored snapshot's `eventSeq`. Compaction deletes the events a snapshot
-/// covers, so [`EVENT_CONDITION`] alone would let a writer that loaded before the snapshot recreate
-/// a compacted sequence.
-pub const FLOOR_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq < :first";
-
-/// Condition for a written stream's continuation check: the event just before the commit's first
-/// still exists, so with [`EVENT_CONDITION`] the commit continues exactly from the stored head and
-/// skips no sequence.
-pub const CONTINUATION_CONDITION: &str = "attribute_exists(sk)";
-
-/// Condition for the snapshot-item check when compaction deleted the stream's head event: the
-/// snapshot's `eventSeq` is the head, so it must still equal the sequence before the commit's
-/// first (`:prev`).
-pub const PINNED_FLOOR_CONDITION: &str = "eventSeq = :prev";
-
-/// [`NEXT_SNAPSHOT_CONDITION`] for the same compacted-head case.
-pub const PINNED_NEXT_SNAPSHOT_CONDITION: &str = "seq = :seq AND eventSeq = :prev";
-
 /// Condition for the first snapshot put in a commit (snapshot sequence 1): no snapshot exists yet.
 pub const FIRST_SNAPSHOT_CONDITION: &str = "attribute_not_exists(seq)";
 
 /// Condition for later snapshot puts in a commit: the stored snapshot sequence is the one the
-/// writer loaded (`:seq`), and the commit starts above its floor (`:first`). It folds in
-/// [`FLOOR_CONDITION`] because a transaction cannot touch the snapshot item twice.
-pub const NEXT_SNAPSHOT_CONDITION: &str = "seq = :seq AND eventSeq < :first";
+/// writer loaded (`:seq`). It is the whole condition: the head update's `head = :prev` already
+/// implies the snapshot lies at or below the commit's first sequence (ADR 0007, H3).
+pub const NEXT_SNAPSHOT_CONDITION: &str = "seq = :seq";
 
-/// Condition for a fenced read-only stream's slot check: `(pk, sk = head + 1)` must be free, so
-/// no writer has appended past the head the reader saw (ADR 0004, C2).
-pub const FENCE_SLOT_CONDITION: &str = "attribute_not_exists(sk)";
+/// The sort key of a stream's head item (ADR 0007): below the snapshot at `0` and the events from
+/// `1`, so no events query, `latest(n)`, or compaction range returns it.
+pub const HEAD_SORT_KEY: i64 = -1;
 
-/// Condition for a fenced read-only stream's snapshot companion on `(pk, sk = 0)`: the stored
-/// snapshot must not cover past the fenced head (`:head`), which closes the compaction ABA. It
-/// passes on a stream with no snapshot item. Always included — any store instance can snapshot
-/// the stream and compaction deletes whatever a durable snapshot covers.
-pub const FENCE_COMPANION_CONDITION: &str = "attribute_not_exists(sk) OR eventSeq <= :head";
+/// The update expression of a head update on a stream without retention.
+pub const HEAD_UPDATE: &str = "SET head = :last";
+
+/// The update expression of a head update on a stream with retention: it raises `ttl` with the
+/// head. `ttl` is a DynamoDB reserved word, so the expression goes through `#ttl`.
+pub const HEAD_UPDATE_RETAINED: &str = "SET head = :last, #ttl = :t";
+
+/// Condition for the head update of a stream the commit creates (first sequence 1).
+pub const HEAD_CREATE_CONDITION: &str = "attribute_not_exists(head)";
+
+/// Condition for the head update of a stream the commit appends to (first sequence above 1):
+/// the stored head is the sequence before the commit's first (`:prev`).
+pub const HEAD_APPEND_CONDITION: &str = "head = :prev";
+
+/// [`HEAD_APPEND_CONDITION`] for a stream with retention: the head's `ttl` is raised by value and
+/// never lowered (the never-lower rule), so an unseen writer that raised it above `:t` fails the
+/// condition as an ordinary conflict.
+pub const HEAD_APPEND_RETAINED_CONDITION: &str =
+    "head = :prev AND (attribute_not_exists(#ttl) OR #ttl <= :t)";
+
+/// Condition for a fenced read-only stream the reader saw at head `:head` (at least 1): no commit
+/// has written the stream since.
+pub const HEAD_FENCE_CONDITION: &str = "head = :head";
+
+/// Condition for a fenced read-only stream the reader saw with no events (head 0).
+pub const HEAD_FENCE_ABSENT_CONDITION: &str = "attribute_not_exists(head)";
+
+/// Condition for the head item in an out-of-band snapshot write (H3): the stream's head covers the
+/// snapshot's event sequence (`:new`).
+pub const HEAD_COVERS_CONDITION: &str = "head >= :new";
+
+/// [`HEAD_COVERS_CONDITION`] when the snapshot's event sequence is 0: a snapshot of an empty
+/// stream may have no head item at all.
+pub const HEAD_COVERS_OR_ABSENT_CONDITION: &str = "attribute_not_exists(head) OR head >= :new";
+
+/// The update expression of an out-of-band snapshot write's head refresh on a stream with
+/// retention: the head's `ttl` is raised to the snapshot's own (`:t`).
+pub const HEAD_REFRESH_UPDATE: &str = "SET #ttl = :t";
+
+/// Condition for the head refresh: [`HEAD_COVERS_CONDITION`] and the never-lower rule for `ttl`.
+pub const HEAD_REFRESH_CONDITION: &str =
+    "head >= :new AND (attribute_not_exists(#ttl) OR #ttl <= :t)";
 
 /// Condition for out-of-band snapshot puts: never lower the stored `eventSeq` (`:new`).
 pub const PUT_SNAPSHOT_CONDITION: &str = "attribute_not_exists(eventSeq) OR eventSeq <= :new";
@@ -349,6 +379,182 @@ pub fn expiry(now: SystemTime, retention: Duration) -> Option<i64> {
 fn insert_ttl(item: &mut Item, ttl: Option<i64>) {
     if let Some(ttl) = ttl.filter(|ttl| *ttl > 0) {
         item.insert("ttl".into(), n(ttl));
+    }
+}
+
+/// Encodes a stream's head item (`sk = -1`). `ttl` (epoch seconds) is written only when positive.
+pub fn head_item(entity_id: &EntityId, head: EventSequence, ttl: Option<i64>) -> Item {
+    let mut item = Item::new();
+    item.insert("pk".into(), s(entity_id.as_str()));
+    item.insert("sk".into(), n(HEAD_SORT_KEY));
+    item.insert("head".into(), n(head.0));
+    insert_ttl(&mut item, ttl);
+
+    item
+}
+
+/// Decodes a head item into its `head` and optional `ttl`.
+pub fn head_from_item(item: &Item) -> Result<(EventSequence, Option<i64>), Error> {
+    Ok((
+        EventSequence(required_number(item, "head")?),
+        optional_number(item, "ttl")?,
+    ))
+}
+
+/// The numeric sort key of an item, if it has one.
+pub fn sort_key(item: &Item) -> Option<i64> {
+    match item.get("sk") {
+        Some(AttributeValue::N(sk)) => sk.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The `ttl` attribute of an item, if it carries a numeric one.
+pub fn item_ttl(item: &Item) -> Option<i64> {
+    match item.get("ttl") {
+        Some(AttributeValue::N(ttl)) => ttl.parse().ok(),
+        _ => None,
+    }
+}
+
+/// A DynamoDB `Update` or `ConditionCheck` on a stream's head item, independent of any SDK: the
+/// single source of the head item's expression strings, which the writer builds its actions from
+/// and the commit budget sizes (ADR 0007).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadAction {
+    /// The stream the head item belongs to.
+    pub entity_id: EntityId,
+    /// The update expression, or `None` for a `ConditionCheck`.
+    pub update_expression: Option<&'static str>,
+    /// The condition expression.
+    pub condition_expression: &'static str,
+    /// `ExpressionAttributeNames`: placeholder and attribute name.
+    pub names: Vec<(&'static str, &'static str)>,
+    /// `ExpressionAttributeValues`: placeholder and number.
+    pub values: Vec<(&'static str, i64)>,
+}
+
+impl HeadAction {
+    /// The head update of a written stream whose commit writes events `first` to `last`. A first
+    /// sequence of 1 creates the head item. `ttl` is the largest `ttl` the head item must carry
+    /// (the `:t` of the never-lower rule) and is `Some` only for a stream with retention.
+    pub fn update(
+        entity_id: &EntityId,
+        first: EventSequence,
+        last: EventSequence,
+        ttl: Option<i64>,
+    ) -> Self {
+        let create = first <= EventSequence(1);
+        let mut values = vec![(":last", last.0)];
+        let mut names = Vec::new();
+
+        if !create {
+            values.push((":prev", first.0 - 1));
+        }
+        if let Some(ttl) = ttl {
+            names.push(("#ttl", "ttl"));
+            values.push((":t", ttl));
+        }
+
+        Self {
+            entity_id: entity_id.clone(),
+            update_expression: Some(if ttl.is_some() {
+                HEAD_UPDATE_RETAINED
+            } else {
+                HEAD_UPDATE
+            }),
+            condition_expression: match (create, ttl.is_some()) {
+                (true, _) => HEAD_CREATE_CONDITION,
+                (false, false) => HEAD_APPEND_CONDITION,
+                (false, true) => HEAD_APPEND_RETAINED_CONDITION,
+            },
+            names,
+            values,
+        }
+    }
+
+    /// The fence of a read-only stream the reader saw at `head`.
+    pub fn fence(entity_id: &EntityId, head: EventSequence) -> Self {
+        if head <= EventSequence::ZERO {
+            return Self {
+                entity_id: entity_id.clone(),
+                update_expression: None,
+                condition_expression: HEAD_FENCE_ABSENT_CONDITION,
+                names: Vec::new(),
+                values: Vec::new(),
+            };
+        }
+
+        Self {
+            entity_id: entity_id.clone(),
+            update_expression: None,
+            condition_expression: HEAD_FENCE_CONDITION,
+            names: Vec::new(),
+            values: vec![(":head", head.0)],
+        }
+    }
+
+    /// The head item's part of an out-of-band snapshot write whose snapshot covers events up to
+    /// `new`: a `ConditionCheck` on `head >= :new`, or, for a stream with retention (`ttl` is
+    /// `Some`, the snapshot's own) and `new` above 0, an `Update` that also refreshes the head's
+    /// `ttl`. When `new` is 0 the head item may be absent, and the check never becomes an update:
+    /// an `Update` would create a head item with no `head` attribute.
+    pub fn snapshot_guard(entity_id: &EntityId, new: EventSequence, ttl: Option<i64>) -> Self {
+        match ttl {
+            Some(ttl) if new > EventSequence::ZERO => Self {
+                entity_id: entity_id.clone(),
+                update_expression: Some(HEAD_REFRESH_UPDATE),
+                condition_expression: HEAD_REFRESH_CONDITION,
+                names: vec![("#ttl", "ttl")],
+                values: vec![(":new", new.0), (":t", ttl)],
+            },
+            _ => Self::snapshot_cover(entity_id, new),
+        }
+    }
+
+    /// The `ConditionCheck` form of [`snapshot_guard`](Self::snapshot_guard) with no `ttl`
+    /// refresh, which an out-of-band snapshot write falls back to when only the refresh's `ttl`
+    /// condition failed.
+    pub fn snapshot_cover(entity_id: &EntityId, new: EventSequence) -> Self {
+        Self {
+            entity_id: entity_id.clone(),
+            update_expression: None,
+            condition_expression: if new > EventSequence::ZERO {
+                HEAD_COVERS_CONDITION
+            } else {
+                HEAD_COVERS_OR_ABSENT_CONDITION
+            },
+            names: Vec::new(),
+            values: vec![(":new", new.0)],
+        }
+    }
+
+    /// The action's key.
+    pub fn key(&self) -> Item {
+        Item::from([
+            ("pk".into(), s(self.entity_id.as_str())),
+            ("sk".into(), n(HEAD_SORT_KEY)),
+        ])
+    }
+
+    /// The action's size in the commit budget, by the rule for any update, delete, or condition
+    /// check: its key attributes plus its expression strings, name placeholders (the placeholder
+    /// and the name), and attribute values (the placeholder and the number's text).
+    pub fn size(&self) -> usize {
+        let expressions =
+            self.update_expression.map_or(0, str::len) + self.condition_expression.len();
+        let names: usize = self
+            .names
+            .iter()
+            .map(|(placeholder, name)| placeholder.len() + name.len())
+            .sum();
+        let values: usize = self
+            .values
+            .iter()
+            .map(|(placeholder, number)| placeholder.len() + number.to_string().len())
+            .sum();
+
+        crate::repository::item_size(&self.key()) + expressions + names + values
     }
 }
 

@@ -686,8 +686,8 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// When the commit conflicts with another writer, the command is re-prepared: `prepare` runs
     /// again, from scratch, against freshly loaded state, after a backoff on the repository's
     /// timer, up to the store's [`RetryPolicy`] ([`OutcomeConfig::with_retry`]), provided the
-    /// failed item is one the engine can re-derive: an event put, a floor or snapshot condition, a
-    /// continuity check, or an engine-filled fence. A failed caller-stamped fence is not retried:
+    /// failed item is one the engine can re-derive: a head update, an event put, a snapshot
+    /// condition, or an engine-filled fence. Stream head drift is never retried. A failed caller-stamped fence is not retried:
     /// the engine records the stale-fence rejection at once ([`Transaction::commit_with_outcome`]).
     /// When the last attempt also conflicts, it records a stale-fence rejection
     /// ([`Rejection::retries_exhausted`](crate::Rejection::retries_exhausted)) as the outcome

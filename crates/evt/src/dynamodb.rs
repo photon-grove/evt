@@ -5,7 +5,8 @@
 //! `aws-config` with its defaults). The table needs a string partition key `pk` and a number sort
 //! key `sk`. See [`crate::wire::dynamo`] for the item layout.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::Range;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
@@ -15,7 +16,9 @@ use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::{self as sdk, ConditionCheck, Delete, Put, TransactWriteItem};
+use aws_sdk_dynamodb::types::{
+    self as sdk, ConditionCheck, Delete, Put, TransactWriteItem, Update,
+};
 
 use crate::aggregate::{Aggregate, Projector};
 use crate::error::{BoxError, Error};
@@ -24,11 +27,12 @@ use crate::features::{
     self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
     ValidatedMarker,
 };
+use crate::heads::{self, Probe};
 use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::json;
 use crate::outcome::Outcome;
-use crate::repository::{Commit, Repository, TransactionCommit};
-use crate::wire::dynamo::{self as wire, AttributeValue, Item};
+use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
+use crate::wire::dynamo::{self as wire, AttributeValue, HeadAction, Item};
 
 /// DynamoDB's limit on actions per transaction.
 pub const MAX_TRANSACTION_ITEMS: usize = 100;
@@ -47,6 +51,44 @@ const COMPACTION_BATCH_SIZE: usize = MAX_TRANSACTION_ITEMS - 1;
 /// Bound allocation and SDK limits independently of the caller's `usize` count.
 const LATEST_PAGE_SIZE: usize = 100;
 
+/// How many streams' loaded `ttl`s a repository instance remembers (see [`LoadedTtls`]).
+const LOADED_TTL_CAPACITY: usize = 1024;
+
+/// The largest `ttl` this repository instance has seen on the items of a stream, from its own
+/// snapshot and event reads and from the failure-path probe's head read. A retained stream's head
+/// update raises the head's `ttl` to at least this (the never-lower rule), and the load API does
+/// not expose item `ttl`s, so the repository remembers them itself. It is bounded: the oldest
+/// stream is forgotten first, and a forgotten stream only costs an ordinary conflict, because the
+/// retry reloads the stream and sees the larger `ttl`.
+#[derive(Debug, Default)]
+struct LoadedTtls {
+    ttls: HashMap<EntityId, i64>,
+    order: VecDeque<EntityId>,
+}
+
+impl LoadedTtls {
+    fn note(&mut self, entity_id: &EntityId, ttl: i64) {
+        if let Some(known) = self.ttls.get_mut(entity_id) {
+            *known = (*known).max(ttl);
+
+            return;
+        }
+
+        if self.ttls.len() >= LOADED_TTL_CAPACITY
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.ttls.remove(&oldest);
+        }
+
+        self.ttls.insert(entity_id.clone(), ttl);
+        self.order.push_back(entity_id.clone());
+    }
+
+    fn get(&self, entity_id: &EntityId) -> Option<i64> {
+        self.ttls.get(entity_id).copied()
+    }
+}
+
 /// A DynamoDB-backed [`Repository`]. Clones share the client.
 #[derive(Debug)]
 pub struct DynamoRepository {
@@ -59,6 +101,8 @@ pub struct DynamoRepository {
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
     /// its own writer: clones validate independently, like separate processes.
     validated_marker: Mutex<CachedMarker>,
+    /// The `ttl`s this instance loaded, for the head update of a stream with retention.
+    loaded_ttls: Mutex<LoadedTtls>,
 }
 
 impl Clone for DynamoRepository {
@@ -71,6 +115,8 @@ impl Clone for DynamoRepository {
             retention: self.retention.clone(),
             clock: self.clock,
             validated_marker: Mutex::new(*self.validated_marker()),
+            // Like a separate process, a clone remembers nothing it did not load itself.
+            loaded_ttls: Mutex::new(LoadedTtls::default()),
         }
     }
 }
@@ -87,6 +133,7 @@ impl DynamoRepository {
             retention: BTreeMap::new(),
             clock: SystemTime::now,
             validated_marker: Mutex::new(None),
+            loaded_ttls: Mutex::new(LoadedTtls::default()),
         }
     }
 
@@ -157,22 +204,109 @@ impl DynamoRepository {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn loaded_ttls(&self) -> MutexGuard<'_, LoadedTtls> {
+        self.loaded_ttls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Remembers an item `ttl` this instance read, for the head update of a retained stream.
+    fn note_ttl(&self, entity_id: &EntityId, ttl: i64) {
+        self.loaded_ttls().note(entity_id, ttl);
+    }
+
+    /// The current time in whole Unix seconds, by the repository's clock.
+    fn now(&self) -> i64 {
+        (self.clock)()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            })
+    }
+
     /// Returns the marker version this handle validated, reading and validating the manifest at
     /// first write. The read is strongly consistent regardless of `with_consistent_read`, so a
     /// declaration another writer just wrote cannot be missed. The returned non-optional snapshot
     /// is used for the entire transaction check, even if a concurrent declaration invalidates the
     /// cache afterwards. A stale snapshot is safe: the transaction condition forces revalidation.
+    ///
+    /// A writer requires the `stream-heads` feature (ADR 0007). A table whose manifest lacks it is
+    /// declared by the writer itself, but only after a strongly consistent scan finds no
+    /// non-reserved item in the table; a populated table is refused with
+    /// [`Error::StreamHeadsNotMigrated`].
     async fn ensure_manifest_validated(&self) -> Result<ValidatedMarker, Error> {
         if let Some(cached) = *self.validated_marker() {
             return Ok(cached);
         }
 
-        let observed = self.read_manifest().await?;
-        let validated = features::validate_marker(observed.as_ref())?;
+        let mut declared = false;
+        let validated = loop {
+            let observed = self.read_manifest().await?;
+
+            match features::validate_marker_for_write(observed.as_ref()) {
+                Ok(validated) => break validated,
+                Err(Error::StreamHeadsNotMigrated) if !declared => {
+                    // Boxed: a first write is rare, and its scan and declaration must not widen
+                    // every commit's future.
+                    Box::pin(self.declare_on_empty_table()).await?;
+                    declared = true;
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         let mut cached = self.validated_marker();
 
         Ok(*cached.get_or_insert(validated))
+    }
+
+    /// Declares `stream-heads` on a table with no data: a strongly consistent scan must find no
+    /// item outside the reserved namespaces, or the table is refused with
+    /// [`Error::StreamHeadsNotMigrated`].
+    async fn declare_on_empty_table(&self) -> Result<(), Error> {
+        if self.holds_stream_data().await? {
+            return Err(Error::StreamHeadsNotMigrated);
+        }
+
+        self.declare_stream_heads().await
+    }
+
+    /// Reports whether the table holds any item outside the reserved namespaces, with a strongly
+    /// consistent Scan that reads only `pk` and stops at the first such item. A table is fresh
+    /// only if this returns `false`.
+    async fn holds_stream_data(&self) -> Result<bool, Error> {
+        let mut start = None;
+
+        loop {
+            let page = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .consistent_read(true)
+                .projection_expression("pk")
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(sdk_error)?;
+
+            let found = page.items().iter().any(|item| {
+                item.get("pk").is_some_and(|pk| match pk {
+                    sdk::AttributeValue::S(pk) => {
+                        !pk.starts_with(SYSTEM_PREFIX) && !pk.starts_with(COMMAND_OUTCOME_PREFIX)
+                    }
+                    // Not a string key: not ours, so not a reserved row either.
+                    _ => true,
+                })
+            });
+            if found {
+                return Ok(true);
+            }
+
+            match page.last_evaluated_key {
+                Some(key) if !key.is_empty() => start = Some(key),
+                _ => return Ok(false),
+            }
+        }
     }
 
     /// Drops the cached validation, so the next write re-reads and re-validates the manifest.
@@ -246,6 +380,21 @@ impl DynamoRepository {
         ))
     }
 
+    /// Declares `stream-heads: 1` in the feature manifest through the ordinary declaration
+    /// transaction (one version bump), **without** checking that the table is empty or that
+    /// every stream has a head item.
+    ///
+    /// This is the hook for a migration tool: after it has backfilled and verified a head item
+    /// for every stream, with every writer that predates stream heads stopped, it declares the
+    /// feature with this call. A fresh table needs no call: the first writer declares the
+    /// feature itself after confirming the table is empty. Declaring on a populated table whose
+    /// streams have no head items makes every later commit to those streams fail with
+    /// [`Error::StreamHeadDrift`].
+    pub async fn declare_stream_heads(&self) -> Result<(), Error> {
+        self.update_manifest(FeatureManifest::declare_stream_heads)
+            .await
+    }
+
     /// Builds the feature-marker check every commit carries: the validated version must still be
     /// the stored one, or the row must still be absent.
     fn marker_check(&self, validated: ValidatedMarker) -> Result<TransactWriteItem, Error> {
@@ -266,21 +415,60 @@ impl DynamoRepository {
             .build())
     }
 
-    /// Builds the commit's transaction items in the pinned order: the feature-marker check, the
-    /// projector operations, then the stream's group (see [`stream_group`](Self::stream_group)).
-    /// An outcome-only commit has no group; the outcome put is appended by the caller.
+    /// Builds a single-stream commit's transaction items in the pinned order: the feature-marker
+    /// check, the projector operations, then the stream's group (see
+    /// [`stream_group`](Self::stream_group)). An outcome-only commit has no group; the outcome put
+    /// is appended by the caller. The layout records each item's index so a failed commit is
+    /// classified by the item that failed.
     fn transaction_items(
         &self,
         commit: &Commit<TransactWriteItem>,
         validated: ValidatedMarker,
-        pin: Option<Continuation>,
-    ) -> Result<Vec<TransactWriteItem>, Error> {
+    ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
         let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 3);
+        let mut layout = TransactionLayout::new(commit.entity_id.clone());
+
         items.push(self.marker_check(validated)?);
         items.extend(commit.operations.iter().cloned());
-        items.extend(self.stream_group(commit, pin)?);
+        layout.operations = items.len() - 1;
+        self.push_group(commit, &mut items, &mut layout)?;
 
-        Ok(items)
+        Ok((items, layout))
+    }
+
+    /// Builds a multi-stream commit's transaction items in the pinned order: the feature-marker
+    /// check, the projector operations, then per written stream in bytewise stream-ID order its
+    /// group (head update, event puts, snapshot put), then per fenced read-only stream its head
+    /// check. The layout records each item's index so a failed commit is classified by the item
+    /// that failed.
+    fn transaction_stream_items(
+        &self,
+        commit: &TransactionCommit<TransactWriteItem>,
+        validated: ValidatedMarker,
+    ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
+        let mut items = Vec::new();
+        let mut layout = TransactionLayout::new(commit.streams.first().map_or_else(
+            || EntityId::new("unknown"),
+            |stream| stream.entity_id.clone(),
+        ));
+
+        items.push(self.marker_check(validated)?);
+        items.extend(commit.operations.iter().cloned());
+        layout.operations = items.len() - 1;
+
+        for stream in &commit.streams {
+            self.push_group(stream, &mut items, &mut layout)?;
+        }
+
+        for fence in &commit.fences {
+            items.push(head_action(
+                &self.table,
+                &HeadAction::fence(&fence.entity_id, fence.head),
+            )?);
+            layout.fences.push((items.len() - 1, fence.clone()));
+        }
+
+        Ok((items, layout))
     }
 
     /// Builds the command-outcome put: the last action of every commit that records one, written
@@ -291,51 +479,90 @@ impl DynamoRepository {
         put(&self.table, item, Some(wire::OUTCOME_CONDITION), &[])
     }
 
-    /// Builds one written stream's contiguous group: the continuation check on the event just
-    /// before its first (when the first sequence is above 1 and the head event exists), the event
-    /// puts, then the snapshot put or floor check.
+    /// Appends one written stream's group to the transaction and records where it sits.
+    fn push_group(
+        &self,
+        stream: &Commit<TransactWriteItem>,
+        items: &mut Vec<TransactWriteItem>,
+        layout: &mut TransactionLayout,
+    ) -> Result<(), Error> {
+        let Some(first) = stream.events.first() else {
+            return Ok(());
+        };
+
+        let start = items.len();
+        // One reading of the clock for the whole group, so the head's `ttl` is never below the
+        // events' or the snapshot's.
+        let ttl = self.ttl_for(&first.entity_type);
+        let head_ttl = self.head_ttl(stream, ttl);
+        items.extend(self.stream_group(stream, ttl, head_ttl)?);
+
+        let events = start + 1..start + 1 + stream.events.len();
+        layout.streams.push(StreamLayout {
+            entity_id: stream.entity_id.clone(),
+            entity_type: first.entity_type.clone(),
+            first: first.sequence,
+            head: start,
+            snapshot: stream.snapshot.is_some().then_some(events.end),
+            events,
+            head_ttl,
+        });
+
+        Ok(())
+    }
+
+    /// The `ttl` a stream's head update carries (`:t`), `Some` only for a stream with retention.
+    /// It is the commit's own `ttl`; on an append it is raised to the largest `ttl` this
+    /// repository instance loaded for the stream, because the head's `ttl` is never lowered (the
+    /// update's condition fails otherwise, as an ordinary conflict the retry heals).
+    fn head_ttl(&self, stream: &Commit<TransactWriteItem>, own: Option<i64>) -> Option<i64> {
+        let first = stream.events.first()?;
+        let own = own?;
+
+        if first.sequence <= EventSequence(1) {
+            return Some(own);
+        }
+
+        Some(own.max(self.loaded_ttls().get(&stream.entity_id).unwrap_or(own)))
+    }
+
+    /// Builds one written stream's contiguous group: the head update, the event puts, then the
+    /// snapshot put when the commit writes one. There is no continuation check and no floor
+    /// check: the head update's condition (`head = first - 1`, or `attribute_not_exists(head)`
+    /// when the stream is created) is the stream's only concurrency control beyond the per-item
+    /// `attribute_not_exists` conditions (ADR 0007).
     ///
-    /// Compaction can delete every event a snapshot covers, including the head, so a stream whose
-    /// snapshot ends exactly at the head is pinned through the snapshot instead: the group then
-    /// carries no continuation check, and the snapshot put or floor check requires the snapshot's
-    /// `eventSeq` to still equal the sequence before the commit's first.
+    /// The events and the snapshot carry the commit's own `ttl`; only the head takes the larger
+    /// `head_ttl`.
     fn stream_group(
         &self,
         stream: &Commit<TransactWriteItem>,
-        pin: Option<Continuation>,
+        ttl: Option<i64>,
+        head_ttl: Option<i64>,
     ) -> Result<Vec<TransactWriteItem>, Error> {
-        let (Some(first), Some(last_sequence)) = (
-            stream.events.first().map(|event| n(event.sequence.0)),
-            stream.events.last().map(|event| event.sequence),
-        ) else {
+        let (Some(first), Some(last)) = (stream.events.first(), stream.events.last()) else {
             return Ok(Vec::new());
         };
 
         let mut items = Vec::with_capacity(stream.events.len() + 2);
 
-        if let Some(pin) = pin.filter(|pin| !pin.via_snapshot) {
-            items.push(continuation_check(
-                &self.table,
-                &stream.entity_id,
-                pin.previous,
-            )?);
-        }
+        items.push(head_action(
+            &self.table,
+            &HeadAction::update(&stream.entity_id, first.sequence, last.sequence, head_ttl),
+        )?);
 
         for event in &stream.events {
-            let item = wire::event_item(event, self.ttl_for(&event.entity_type))?;
+            let item = wire::event_item(event, ttl)?;
             items.push(put(&self.table, item, Some(wire::EVENT_CONDITION), &[])?);
         }
 
-        let via_snapshot = pin.filter(|pin| pin.via_snapshot);
-
         if let Some(snapshot) = &stream.snapshot {
-            let ttl = self.ttl_for(&snapshot.entity_type);
             let item = wire::snapshot_item(
                 &SerializedSnapshot {
                     entity_type: snapshot.entity_type.clone(),
                     entity_id: stream.entity_id.clone(),
                     sequence: snapshot.sequence,
-                    event_sequence: last_sequence,
+                    event_sequence: last.sequence,
                     payload: snapshot.payload.clone(),
                 },
                 ttl,
@@ -344,155 +571,23 @@ impl DynamoRepository {
             let expected = snapshot.sequence.0 - 1;
             items.push(if expected == 0 {
                 put(&self.table, item, Some(wire::FIRST_SNAPSHOT_CONDITION), &[])?
-            } else if let Some(pin) = via_snapshot {
-                put(
-                    &self.table,
-                    item,
-                    Some(wire::PINNED_NEXT_SNAPSHOT_CONDITION),
-                    &[(":seq", n(expected)), (":prev", n(pin.previous.0))],
-                )?
             } else {
                 put(
                     &self.table,
                     item,
                     Some(wire::NEXT_SNAPSHOT_CONDITION),
-                    &[(":seq", n(expected)), (":first", first)],
+                    &[(":seq", n(expected))],
                 )?
             });
-        } else if let Some(pin) = via_snapshot {
-            items.push(pinned_floor_check(
-                &self.table,
-                &stream.entity_id,
-                pin.previous,
-            )?);
-        } else {
-            items.push(floor_check(&self.table, &stream.entity_id, first)?);
         }
 
         Ok(items)
     }
 
-    /// Reads, strongly consistent, how each written stream whose first sequence is above 1
-    /// continues from its stored head, and refuses a gap with [`Error::SequenceGap`] before any
-    /// write. The returned pins are applied as conditions, so a head that moves between this read
-    /// and the write fails the transaction as a conflict instead of committing a gap.
-    ///
-    /// Which item pins the head depends on the snapshot. Compaction deletes events `[1, through]`
-    /// where `through` can equal the snapshot's `eventSeq`, so a head event the snapshot covers
-    /// can vanish at any moment: a stream whose snapshot ends exactly at the head is pinned
-    /// through the snapshot, which compaction never changes. Otherwise the head event lies above
-    /// the snapshot, compaction cannot touch it, and an existence check pins it.
-    async fn observe_continuations<'c>(
-        &self,
-        streams: impl IntoIterator<Item = &'c Commit<TransactWriteItem>>,
-    ) -> Result<HashMap<EntityId, Continuation>, Error> {
-        let mut pins = HashMap::new();
-
-        for stream in streams {
-            let Some(first) = stream.events.first().map(|event| event.sequence) else {
-                continue;
-            };
-            if first <= EventSequence(1) {
-                continue;
-            }
-
-            let previous = EventSequence(first.0 - 1);
-            let snapshot = self.read_snapshot(&stream.entity_id, true).await?;
-            let snapshot_head = snapshot.as_ref().map(|snapshot| snapshot.event_sequence);
-
-            let via_snapshot = match snapshot_head {
-                Some(head) if head == previous => true,
-                Some(head) if head > previous => {
-                    // The stream moved past the writer's head; the floor check would refuse the
-                    // commit.
-                    return Err(Error::Conflict {
-                        entity_id: stream.entity_id.clone(),
-                        message: "the stream's snapshot is ahead of the commit's first sequence"
-                            .to_owned(),
-                    });
-                }
-                _ => {
-                    let head = self
-                        .client
-                        .get_item()
-                        .table_name(&self.table)
-                        .consistent_read(true)
-                        .key("pk", s(stream.entity_id.as_str()))
-                        .key("sk", n(previous.0))
-                        .projection_expression("sk")
-                        .send()
-                        .await
-                        .map_err(sdk_error)?;
-
-                    if head.item.is_none_or(|item| item.is_empty()) {
-                        let stored = self.max_sequence(&stream.entity_id).await?;
-
-                        return Err(Error::SequenceGap {
-                            entity_id: stream.entity_id.clone(),
-                            after: stored.max(snapshot_head.unwrap_or_default()),
-                            found: first,
-                        });
-                    }
-
-                    false
-                }
-            };
-
-            pins.insert(
-                stream.entity_id.clone(),
-                Continuation {
-                    previous,
-                    via_snapshot,
-                },
-            );
-        }
-
-        Ok(pins)
-    }
-
-    /// Builds a multi-stream commit's transaction items in the pinned order: the feature-marker
-    /// check, the projector operations, then per written stream in bytewise stream-ID order its
-    /// group (continuation check, event puts, snapshot put or floor check), then per fenced
-    /// read-only stream its slot check and snapshot companion. The layout records each item's index so a failed
-    /// commit is classified by the item that failed.
-    fn transaction_stream_items(
-        &self,
-        commit: &TransactionCommit<TransactWriteItem>,
-        validated: ValidatedMarker,
-        pins: &HashMap<EntityId, Continuation>,
-    ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
-        let mut items = Vec::new();
-        let mut layout = TransactionLayout::default();
-
-        items.push(self.marker_check(validated)?);
-        items.extend(commit.operations.iter().cloned());
-        layout.operations = items.len() - 1;
-
-        for stream in &commit.streams {
-            if stream.events.is_empty() {
-                continue;
-            }
-
-            let group_start = items.len();
-            items.extend(self.stream_group(stream, pins.get(&stream.entity_id).copied())?);
-
-            layout
-                .streams
-                .push((group_start..items.len(), stream.entity_id.clone()));
-        }
-
-        for fence in &commit.fences {
-            items.extend(fence_checks(&self.table, fence)?);
-            let base = items.len() - 2;
-            layout.fences.push((base, fence.clone()));
-            layout.fences.push((base + 1, fence.clone()));
-        }
-
-        Ok((items, layout))
-    }
-
-    /// Returns every item in an entity's partition, including the snapshot at `sk = 0`, in sort
-    /// key order. Intended for diagnostics and compatibility checks.
+    /// Returns every item in an entity's partition, in sort key order: the stream's head item
+    /// at `sk = -1` (ADR 0007), the snapshot at `sk = 0`, and the events. The head item is
+    /// returned like any other row, so a caller that wants only events or the snapshot skips
+    /// `sk < 1` or `sk < 0`. Intended for diagnostics and compatibility checks.
     pub async fn partition_items(&self, entity_id: &EntityId) -> Result<Vec<Item>, Error> {
         let mut items = Vec::new();
         let mut start = None;
@@ -521,11 +616,20 @@ impl DynamoRepository {
 
     /// Returns the highest event sequence for an entity without reading payloads (0 if none).
     pub async fn max_sequence(&self, entity_id: &EntityId) -> Result<EventSequence, Error> {
+        self.highest_event(entity_id, self.consistent_read).await
+    }
+
+    /// The highest event `sk` of a stream: a `Query` of `sk > 0`, descending, limit 1.
+    async fn highest_event(
+        &self,
+        entity_id: &EntityId,
+        consistent: bool,
+    ) -> Result<EventSequence, Error> {
         let page = self
             .client
             .query()
             .table_name(&self.table)
-            .consistent_read(self.consistent_read)
+            .consistent_read(consistent)
             .key_condition_expression("pk = :pk AND sk > :sk")
             .expression_attribute_values(":pk", s(entity_id.as_str()))
             .expression_attribute_values(":sk", n(0))
@@ -543,6 +647,336 @@ impl DynamoRepository {
         Ok(EventSequence(
             number_attribute(item, "sk")?.unwrap_or_default(),
         ))
+    }
+
+    /// Derives a stream's head with strongly consistent reads (H4): the larger of its snapshot's
+    /// `eventSeq` and its highest event `sk`.
+    async fn derive_head(&self, entity_id: &EntityId) -> Result<EventSequence, Error> {
+        let snapshot = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .key("pk", s(entity_id.as_str()))
+            .key("sk", n(wire::SNAPSHOT_SORT_KEY))
+            .projection_expression("eventSeq")
+            .send()
+            .await
+            .map_err(sdk_error)?;
+        let covered = match &snapshot.item {
+            Some(item) => number_attribute(item, "eventSeq")?.unwrap_or_default(),
+            None => 0,
+        };
+
+        Ok(self
+            .highest_event(entity_id, true)
+            .await?
+            .max(EventSequence(covered)))
+    }
+
+    /// Reads a stream's head item with a strongly consistent `GetItem`: its `head` and `ttl`, or
+    /// `None` when the stream has no head item. The `ttl` is remembered for the stream's next
+    /// head update.
+    async fn read_head(&self, entity_id: &EntityId) -> Result<Option<EventSequence>, Error> {
+        let output = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .key("pk", s(entity_id.as_str()))
+            .key("sk", n(wire::HEAD_SORT_KEY))
+            .send()
+            .await
+            .map_err(sdk_error)?;
+
+        let Some(item) = output.item.filter(|item| !item.is_empty()) else {
+            return Ok(None);
+        };
+
+        let item = from_sdk_item(&item);
+        if let Some(ttl) = wire::item_ttl(&item) {
+            self.note_ttl(entity_id, ttl);
+        }
+
+        let (head, _) = wire::head_from_item(&item)?;
+
+        Ok(Some(head))
+    }
+
+    /// Reports whether every item remaining in a stream (its snapshot, and the events from
+    /// `sk > 0`, each read with its `ttl`) has a `ttl` that has passed: the stream is only
+    /// waiting for DynamoDB's lazy TTL deletion. A stream with no items left is trivially
+    /// expired. An item with no `ttl` is not.
+    async fn remaining_items_expired(&self, entity_id: &EntityId) -> Result<bool, Error> {
+        let now = self.now();
+        let expired = |item: &HashMap<String, sdk::AttributeValue>| {
+            wire::item_ttl(&from_sdk_item(item)).is_some_and(|ttl| ttl <= now)
+        };
+
+        let snapshot = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .key("pk", s(entity_id.as_str()))
+            .key("sk", n(wire::SNAPSHOT_SORT_KEY))
+            .projection_expression("#ttl")
+            .expression_attribute_names("#ttl", "ttl")
+            .send()
+            .await
+            .map_err(sdk_error)?;
+        if snapshot
+            .item
+            .as_ref()
+            .is_some_and(|item| !item.is_empty() && !expired(item))
+        {
+            return Ok(false);
+        }
+
+        let mut start = None;
+        loop {
+            let page = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .consistent_read(true)
+                .key_condition_expression("pk = :pk AND sk > :sk")
+                .expression_attribute_values(":pk", s(entity_id.as_str()))
+                .expression_attribute_values(":sk", n(0))
+                .projection_expression("sk, #ttl")
+                .expression_attribute_names("#ttl", "ttl")
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(sdk_error)?;
+
+            if page.items().iter().any(|item| !expired(item)) {
+                return Ok(false);
+            }
+
+            match page.last_evaluated_key {
+                Some(key) if !key.is_empty() => start = Some(key),
+                _ => return Ok(true),
+            }
+        }
+    }
+
+    /// The failure-path probe for a failed head update or fence check on a stream (ADR 0007): no
+    /// `ReturnValues` on the transaction, a few strongly consistent reads instead.
+    ///
+    /// Derive the head `D1`, then read the stored head `S`. `S < D1` is drift, and `S = D1`
+    /// means no drift. For `S > D1`, derive again as `D2`: `D2 < S` is drift, otherwise a commit
+    /// landed between the reads, an ordinary conflict. The order (derive, then read the head,
+    /// then re-derive only when the head is ahead) is what keeps a concurrent commit from
+    /// reading as drift.
+    ///
+    /// A stream with retention (this repository's `with_retention` configuration) treats a head
+    /// above the derived head as the expired-tail transient and not drift, and so is an absent
+    /// head item with items remaining if every remaining item's `ttl` has passed: TTL deletion is
+    /// lazy and unordered.
+    async fn probe_stream(&self, entity_id: &EntityId, retained: bool) -> Result<Probed, Error> {
+        let derived = Box::pin(self.derive_head(entity_id)).await?;
+        let stored = Box::pin(self.read_head(entity_id))
+            .await?
+            .unwrap_or_default();
+
+        let derived = match Probe::first(stored, derived) {
+            Probe::Settled => return Ok(Probed::Settled(stored)),
+            // A head item that exists but is behind its log is never an expiry artifact: TTL
+            // deletes the head item whole, not down to a lower value.
+            Probe::Drift if stored > EventSequence::ZERO => {
+                return Ok(Probed::Drift(heads::drift(entity_id, stored, derived)));
+            }
+            Probe::Drift => derived,
+            // For a type with retention, a head above the derived head is the expired-tail
+            // transient: TTL deleted the tail the head counted. It heals; it is not drift.
+            Probe::Ahead if retained => return Ok(Probed::Conflict),
+            Probe::Ahead => {
+                let rederived = Box::pin(self.derive_head(entity_id)).await?;
+                if Probe::after_rederive(stored, rederived) == Probe::Settled {
+                    return Ok(Probed::Conflict);
+                }
+
+                rederived
+            }
+        };
+
+        if retained && Box::pin(self.remaining_items_expired(entity_id)).await? {
+            return Ok(Probed::Conflict);
+        }
+
+        Ok(Probed::Drift(heads::drift(entity_id, stored, derived)))
+    }
+
+    /// The case where a stream's head update passed and one of its event puts failed: an event
+    /// exists above the head, which is drift. A stream with retention reads its remaining items
+    /// first, because TTL can delete the head item before an expired event: if every one has a
+    /// `ttl` in the past, it is a transient conflict.
+    async fn certain_drift(&self, entity_id: &EntityId, retained: bool) -> Result<Error, Error> {
+        if retained && Box::pin(self.remaining_items_expired(entity_id)).await? {
+            return Ok(heads::conflict(entity_id));
+        }
+
+        let derived = Box::pin(self.derive_head(entity_id)).await?;
+        let stored = Box::pin(self.read_head(entity_id))
+            .await?
+            .unwrap_or_default();
+
+        Ok(heads::drift(entity_id, stored, derived))
+    }
+
+    /// The two parts of an out-of-band snapshot write besides the marker check: the head item's
+    /// guard (H3, see [`HeadAction::snapshot_guard`]) and the snapshot put. Both carry the
+    /// snapshot's own `ttl`, read from the clock once.
+    fn snapshot_parts(
+        &self,
+        snapshot: &SerializedSnapshot,
+    ) -> Result<(HeadAction, TransactWriteItem), Error> {
+        let ttl = self.ttl_for(&snapshot.entity_type);
+        let item = wire::snapshot_item(snapshot, ttl)?;
+        let snapshot_put = put(
+            &self.table,
+            item,
+            Some(wire::PUT_SNAPSHOT_CONDITION),
+            &[(":new", n(snapshot.event_sequence.0))],
+        )?;
+
+        Ok((
+            HeadAction::snapshot_guard(&snapshot.entity_id, snapshot.event_sequence, ttl),
+            snapshot_put,
+        ))
+    }
+
+    /// An out-of-band snapshot write's transaction: the feature-marker check, the head item, then
+    /// the snapshot put.
+    fn snapshot_items(
+        &self,
+        validated: ValidatedMarker,
+        guard: &HeadAction,
+        snapshot_put: &TransactWriteItem,
+    ) -> Result<Vec<TransactWriteItem>, Error> {
+        Ok(vec![
+            self.marker_check(validated)?,
+            head_action(&self.table, guard)?,
+            snapshot_put.clone(),
+        ])
+    }
+
+    /// Remembers the `ttl` a committed stream's head now carries, so this instance's next head
+    /// update for the stream never lowers it.
+    fn note_committed(&self, layout: &TransactionLayout) {
+        for stream in &layout.streams {
+            if let Some(ttl) = stream.head_ttl {
+                self.note_ttl(&stream.entity_id, ttl);
+            }
+        }
+    }
+
+    /// The error a failed written stream contributes to the ranking, or `None` when none of its
+    /// actions failed. The head update's cancellation reason decides how: a failed head update
+    /// is classified by the probe; a head update that passed while an event put failed is certain
+    /// drift; a failed snapshot put alone is an ordinary conflict.
+    async fn stream_verdict(
+        &self,
+        stream: &StreamLayout,
+        codes: &[Option<&str>],
+    ) -> Result<Option<Error>, Error> {
+        let failed =
+            |index: usize| codes.get(index).copied().flatten() == Some("ConditionalCheckFailed");
+        let retained = self.retains(&stream.entity_type);
+
+        if failed(stream.head) {
+            let verdict = match Box::pin(self.probe_stream(&stream.entity_id, retained)).await? {
+                Probed::Drift(drift) => drift,
+                Probed::Settled(stored) => {
+                    heads::gap_or_conflict(&stream.entity_id, stream.first, stored)
+                }
+                Probed::Conflict => heads::conflict(&stream.entity_id),
+            };
+
+            return Ok(Some(verdict));
+        }
+
+        if stream.events.clone().any(failed) {
+            if codes.get(stream.head).copied().flatten() == Some("None") {
+                return Box::pin(self.certain_drift(&stream.entity_id, retained))
+                    .await
+                    .map(Some);
+            }
+
+            return Ok(Some(heads::conflict(&stream.entity_id)));
+        }
+
+        if stream.snapshot.is_some_and(failed) {
+            // The head update passed (or was not the failing item): an out-of-band snapshot can
+            // bump the snapshot sequence without moving the head, an ordinary conflict.
+            return Ok(Some(heads::conflict(&stream.entity_id)));
+        }
+
+        Ok(None)
+    }
+
+    /// Maps a cancelled commit (whose marker check and outcome put held) to the error it
+    /// reports. Every failed stream and fence item is classified before any is reported, and the
+    /// ranking is: `StreamHeadDrift`, then `SequenceGap`, then any other conflict (stream items
+    /// and fences in transaction order, a fence with its provenance), then projector conditions.
+    /// Throttling and `TransactionConflict` keep their classification.
+    async fn classify_commit_failure<R>(
+        &self,
+        layout: &TransactionLayout,
+        carries_outcome: bool,
+        err: SdkError<TransactWriteItemsError, R>,
+    ) -> Error
+    where
+        R: HttpStatus + std::fmt::Debug + Send + Sync + 'static,
+    {
+        let codes = cancellation_reasons(&err);
+        let failed =
+            |index: usize| codes.get(index).copied().flatten() == Some("ConditionalCheckFailed");
+
+        let mut verdicts = Vec::new();
+
+        for stream in &layout.streams {
+            match Box::pin(self.stream_verdict(stream, &codes)).await {
+                Ok(Some(verdict)) => verdicts.push(verdict),
+                Ok(None) => {}
+                Err(error) => return error,
+            }
+        }
+
+        for (index, fence) in &layout.fences {
+            if !failed(*index) {
+                continue;
+            }
+
+            match Box::pin(self.probe_stream(&fence.entity_id, false)).await {
+                Ok(Probed::Drift(drift)) => verdicts.push(drift),
+                Ok(Probed::Settled(_) | Probed::Conflict) => {
+                    verdicts.push(heads::fence_conflict(fence));
+                }
+                Err(error) => return error,
+            }
+        }
+
+        if let Some(error) = heads::rank(verdicts) {
+            return error;
+        }
+
+        // Only projector conditions failed, which reloading cannot fix.
+        if failed_items(&codes, "ConditionalCheckFailed")
+            .next()
+            .is_some()
+        {
+            return Error::Projector(Box::new(err));
+        }
+
+        // A concurrent transaction is reported on the item it collided with.
+        let colliding = failed_items(&codes, "TransactionConflict").next();
+        let entity = colliding
+            .and_then(|index| layout.entity_at(index))
+            .unwrap_or_else(|| layout.fallback.clone());
+
+        classify_transaction_error(&entity, layout.operations, carries_outcome, err)
     }
 
     async fn query_events(
@@ -569,6 +1003,9 @@ impl DynamoRepository {
 
             for item in page.items() {
                 let item = from_sdk_item(item);
+                if let Some(ttl) = wire::item_ttl(&item) {
+                    self.note_ttl(entity_id, ttl);
+                }
                 if !wire::is_snapshot_item(&item) {
                     events.push(wire::event_from_item(&item)?);
                 }
@@ -599,7 +1036,12 @@ impl DynamoRepository {
 
         match output.item {
             Some(item) if !item.is_empty() => {
-                Ok(Some(wire::snapshot_from_item(&from_sdk_item(&item))?))
+                let item = from_sdk_item(&item);
+                if let Some(ttl) = wire::item_ttl(&item) {
+                    self.note_ttl(entity_id, ttl);
+                }
+
+                Ok(Some(wire::snapshot_from_item(&item)?))
             }
             _ => Ok(None),
         }
@@ -655,7 +1097,9 @@ impl DynamoRepository {
         snapshot: &SerializedSnapshot,
     ) -> Result<TransactWriteItem, Error> {
         let manifest = self.read_manifest().await?;
-        let observed = features::validate_marker(manifest.as_ref())?;
+        // Compaction is a write path: it refuses an unsupported feature and a table that is not
+        // migrated to stream heads. It never touches a head item.
+        let observed = features::validate_marker_for_write(manifest.as_ref())?;
         if manifest
             .as_ref()
             .is_some_and(|manifest| manifest.is_history_dependent(&snapshot.entity_type))
@@ -753,7 +1197,6 @@ impl Repository for DynamoRepository {
             return Ok(());
         }
 
-        let operations = commit.operations.len();
         let outcome = commit.stored_outcome();
         let mut revalidations = 0;
 
@@ -766,25 +1209,16 @@ impl Repository for DynamoRepository {
         }
         crate::repository::check_budget(sizes)?;
 
-        // The stream must continue exactly from its stored head; a gap is refused before any
-        // write, and what was observed is pinned in the transaction.
-        let pins = self.observe_continuations([&commit]).await?;
-        let pin = pins.get(&commit.entity_id).copied();
-
         loop {
             let cached = self.ensure_manifest_validated().await?;
-            let mut items = self.transaction_items(&commit, cached, pin)?;
+            let (mut items, mut layout) = self.transaction_items(&commit, cached)?;
 
             // The outcome row is the last action. Its index is how a failed condition on it is
             // told apart from a stream's.
-            let outcome_index = match &outcome {
-                Some(outcome) => {
-                    items.push(self.outcome_put(outcome)?);
-
-                    Some(items.len() - 1)
-                }
-                None => None,
-            };
+            if let Some(outcome) = &outcome {
+                items.push(self.outcome_put(outcome)?);
+                layout.outcome = Some(items.len() - 1);
+            }
 
             match self
                 .client
@@ -793,10 +1227,16 @@ impl Repository for DynamoRepository {
                 .send()
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.note_committed(&layout);
+
+                    return Ok(());
+                }
                 Err(err) => {
                     let codes = cancellation_reasons(&err);
-                    if classify_cancellation(operations, &codes) == Some(Cancellation::Marker) {
+                    if classify_cancellation(layout.operations, &codes)
+                        == Some(Cancellation::Marker)
+                    {
                         // The feature set changed under this writer: re-validate it, then
                         // retry. Re-validating refuses a feature this writer does not support.
                         if revalidations >= MAX_MARKER_REVALIDATIONS {
@@ -811,19 +1251,22 @@ impl Repository for DynamoRepository {
                     // A lost outcome put outranks every other failure: the command already ran, and
                     // the writer resolves it through the winner's row. It is never a conflict.
                     if let Some(outcome) = &outcome
-                        && outcome_failed(outcome_index, &codes)
+                        && outcome_failed(layout.outcome, &codes)
                     {
                         return Err(Error::OutcomeConflict {
                             command_id: outcome.command_id.clone(),
                         });
                     }
 
-                    return Err(classify_transaction_error(
-                        &commit.entity_id,
-                        operations,
+                    // Boxed: the failure path is rare, and its reads must not widen every
+                    // commit's future (the conformance cases chain many commits in debug builds
+                    // on a default test-thread stack).
+                    return Err(Box::pin(self.classify_commit_failure(
+                        &layout,
                         outcome.is_some(),
                         err,
-                    ));
+                    ))
+                    .await);
                 }
             }
         }
@@ -847,10 +1290,6 @@ impl Repository for DynamoRepository {
         // and the refusal is the union of the two.
         commit.check_retention(None, |entity_type| self.retains(entity_type))?;
 
-        // Each written stream must continue exactly from its stored head; a gap is refused before
-        // any write, and what was observed is pinned in the transaction.
-        let pins = self.observe_continuations(&commit.streams).await?;
-
         let mut revalidations = 0;
 
         loop {
@@ -867,7 +1306,7 @@ impl Repository for DynamoRepository {
                     .check_retention(manifest.as_ref(), |entity_type| self.retains(entity_type))?;
             }
 
-            let (mut items, mut layout) = self.transaction_stream_items(&commit, cached, &pins)?;
+            let (mut items, mut layout) = self.transaction_stream_items(&commit, cached)?;
             if let Some(outcome) = &outcome {
                 items.push(self.outcome_put(outcome)?);
                 layout.outcome = Some(items.len() - 1);
@@ -886,15 +1325,15 @@ impl Repository for DynamoRepository {
                 .send()
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.note_committed(&layout);
+
+                    return Ok(());
+                }
                 Err(err) => {
                     let codes = cancellation_reasons(&err);
 
-                    let failed_check = failed_items(&codes, "ConditionalCheckFailed").next();
-                    let fence_conflict =
-                        failed_check.and_then(|index| layout.fence_at(index).cloned());
-
-                    if failed_check == Some(0) {
+                    if failed_items(&codes, "ConditionalCheckFailed").next() == Some(0) {
                         // The feature set changed under this writer: re-validate it, then
                         // retry. Re-validating refuses a feature this writer does not support.
                         if revalidations >= MAX_MARKER_REVALIDATIONS {
@@ -917,51 +1356,15 @@ impl Repository for DynamoRepository {
                         });
                     }
 
-                    // The stream whose action failed, when the cancellation index maps back to
-                    // one; the first stream is only a fallback for an index that does not.
-                    let fallback_entity = || {
-                        commit.streams.first().map_or_else(
-                            || EntityId::new("unknown"),
-                            |stream| stream.entity_id.clone(),
-                        )
-                    };
-                    let entity_at = |index: Option<usize>| {
-                        index
-                            .and_then(|index| layout.stream_at(index).cloned())
-                            .unwrap_or_else(fallback_entity)
-                    };
-
-                    if let Some(fence) = fence_conflict {
-                        return Err(Error::FenceConflict {
-                            entity_id: fence.entity_id,
-                            head: fence.head,
-                            provenance: fence.provenance,
-                        });
-                    }
-
-                    if let Some(index) = failed_check {
-                        if index > 0 && index <= layout.operations {
-                            // Projector conditions are not retried by reloading.
-                            return Err(Error::Projector(Box::new(err)));
-                        }
-
-                        return Err(Error::Conflict {
-                            entity_id: entity_at(Some(index)),
-                            message:
-                                "conditional check failed: the sequence or snapshot changed since it was read"
-                                    .to_owned(),
-                        });
-                    }
-
-                    // A concurrent transaction is reported on the item it collided with.
-                    let colliding = failed_items(&codes, "TransactionConflict").next();
-
-                    return Err(classify_transaction_error(
-                        &entity_at(colliding),
-                        layout.operations,
+                    // Boxed: the failure path is rare, and its reads must not widen every
+                    // commit's future (the conformance cases chain many commits in debug builds
+                    // on a default test-thread stack).
+                    return Err(Box::pin(self.classify_commit_failure(
+                        &layout,
                         outcome.is_some(),
                         err,
-                    ));
+                    ))
+                    .await);
                 }
             }
         }
@@ -1063,6 +1466,9 @@ impl Repository for DynamoRepository {
 
             for item in page.items() {
                 let item = from_sdk_item(item);
+                if let Some(ttl) = wire::item_ttl(&item) {
+                    self.note_ttl(entity_id, ttl);
+                }
                 if !wire::is_snapshot_item(&item) {
                     events.push(wire::event_from_item(&item)?);
                 }
@@ -1087,19 +1493,16 @@ impl Repository for DynamoRepository {
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
         features::check_not_reserved(&snapshot.entity_id)?;
 
-        let item = wire::snapshot_item(snapshot, self.ttl_for(&snapshot.entity_type))?;
-
-        let snapshot_put = put(
-            &self.table,
-            item,
-            Some(wire::PUT_SNAPSHOT_CONDITION),
-            &[(":new", n(snapshot.event_sequence.0))],
-        )?;
+        // H3: the stream's head item must cover the snapshot, and a stream with retention
+        // refreshes the head's `ttl` to the snapshot's own in the same transaction, because the
+        // snapshot would otherwise outlive the head item.
+        let (mut guard, snapshot_put) = self.snapshot_parts(snapshot)?;
+        let mut refreshed_without_ttl = false;
 
         let mut revalidations = 0;
         loop {
             let cached = self.ensure_manifest_validated().await?;
-            let items = vec![self.marker_check(cached)?, snapshot_put.clone()];
+            let items = self.snapshot_items(cached, &guard, &snapshot_put)?;
             match self
                 .client
                 .transact_write_items()
@@ -1110,8 +1513,12 @@ impl Repository for DynamoRepository {
                 Ok(_) => return Ok(true),
                 Err(err) => {
                     let codes = cancellation_reasons(&err);
+                    let failed = |index: usize| {
+                        codes.get(index).copied().flatten() == Some("ConditionalCheckFailed")
+                    };
+
                     // A failed marker takes precedence over a stale snapshot condition.
-                    if codes.first().copied().flatten() == Some("ConditionalCheckFailed") {
+                    if failed(0) {
                         self.invalidate_manifest();
                         if revalidations >= MAX_MARKER_REVALIDATIONS {
                             return Err(sdk_error(err));
@@ -1119,7 +1526,38 @@ impl Repository for DynamoRepository {
                         revalidations += 1;
                         continue;
                     }
-                    if codes.get(1).copied().flatten() == Some("ConditionalCheckFailed") {
+
+                    // A failed head condition means the snapshot is ahead of the stream, or the
+                    // stream has no head item. It ranks above the snapshot's own condition,
+                    // which keeps its meaning: a newer snapshot already covers this write.
+                    if failed(1) {
+                        // Only the refresh's `ttl` condition failed when the head already covers
+                        // the snapshot: retry once as a plain check, which needs no refresh.
+                        if guard.update_expression.is_some() && !refreshed_without_ttl {
+                            let stored = self.read_head(&snapshot.entity_id).await?;
+                            if stored.is_some_and(|head| head >= snapshot.event_sequence) {
+                                guard = HeadAction::snapshot_cover(
+                                    &snapshot.entity_id,
+                                    snapshot.event_sequence,
+                                );
+                                refreshed_without_ttl = true;
+
+                                continue;
+                            }
+                        }
+
+                        let stored = self
+                            .read_head(&snapshot.entity_id)
+                            .await?
+                            .unwrap_or_default();
+                        let derived = Box::pin(self.derive_head(&snapshot.entity_id))
+                            .await?
+                            .max(snapshot.event_sequence);
+
+                        return Err(heads::drift(&snapshot.entity_id, stored, derived));
+                    }
+
+                    if failed(2) {
                         return Ok(false);
                     }
 
@@ -1149,6 +1587,11 @@ impl Repository for DynamoRepository {
         if through < EventSequence(1) {
             return Ok(0);
         }
+
+        // Compaction is a write path: a table that does not declare `stream-heads` (or declares a
+        // feature this build does not model) is refused before anything is read, so the refusal
+        // wins over `CompactionUncovered`. It never declares the feature itself.
+        features::validate_marker_for_write(self.read_manifest().await?.as_ref())?;
 
         // Strongly consistent regardless of `with_consistent_read`, like the key query below.
         let snapshot = self.read_snapshot(entity_id, true).await?;
@@ -1286,66 +1729,122 @@ fn put(
         .build())
 }
 
-/// Where each kind of item sits in a multi-stream transaction, for failure classification.
-#[derive(Default)]
+/// What the failure-path probe concluded about a stream (see
+/// [`DynamoRepository::probe_stream`]).
+enum Probed {
+    /// The stream's head item disagrees with its log.
+    Drift(Error),
+    /// The head matches the log; the stored head decides between a gap and a conflict.
+    Settled(EventSequence),
+    /// An ordinary conflict: a commit landed between the probe's reads, or a stream with
+    /// retention is waiting for TTL deletion.
+    Conflict,
+}
+
+/// Where each kind of item sits in a transaction, for failure classification.
 struct TransactionLayout {
     /// Number of projector operations, which start at index 1 after the marker check.
     operations: usize,
-    /// Fences by their slot-check and companion-check item indexes.
-    fences: Vec<(usize, crate::repository::ReadFence)>,
-    /// Each written stream's contiguous run of action indexes (event puts and the snapshot put or
-    /// floor check), so a failed action maps back to the stream that owns it.
-    streams: Vec<(std::ops::Range<usize>, EntityId)>,
+    /// Each written stream's group, in transaction order.
+    streams: Vec<StreamLayout>,
+    /// Fences by their head-check item index, in transaction order.
+    fences: Vec<(usize, ReadFence)>,
     /// The index of the command-outcome put, the last action, when the commit records one.
     outcome: Option<usize>,
+    /// The entity a failure is attributed to when its index maps to no stream.
+    fallback: EntityId,
+}
+
+/// One written stream's contiguous group of actions.
+struct StreamLayout {
+    entity_id: EntityId,
+    entity_type: EntityType,
+    /// The commit's first sequence for the stream.
+    first: EventSequence,
+    /// The head update's index.
+    head: usize,
+    /// The event puts' indexes.
+    events: Range<usize>,
+    /// The snapshot put's index, when the commit writes one.
+    snapshot: Option<usize>,
+    /// The `ttl` the head update carries, for a stream with retention.
+    head_ttl: Option<i64>,
+}
+
+impl StreamLayout {
+    fn contains(&self, index: usize) -> bool {
+        index >= self.head
+            && index
+                < self
+                    .snapshot
+                    .map_or(self.events.end, |snapshot| snapshot + 1)
+    }
 }
 
 impl TransactionLayout {
-    fn fence_at(&self, index: usize) -> Option<&crate::repository::ReadFence> {
-        self.fences
-            .iter()
-            .find(|(item_index, _)| *item_index == index)
-            .map(|(_, fence)| fence)
+    fn new(fallback: EntityId) -> Self {
+        Self {
+            operations: 0,
+            streams: Vec::new(),
+            fences: Vec::new(),
+            outcome: None,
+            fallback,
+        }
     }
 
-    /// The written stream whose action sits at `index`, if the index is one of a stream's.
-    fn stream_at(&self, index: usize) -> Option<&EntityId> {
+    /// The stream or fenced stream whose action sits at `index`, if it is one of theirs.
+    fn entity_at(&self, index: usize) -> Option<EntityId> {
         self.streams
             .iter()
-            .find(|(range, _)| range.contains(&index))
-            .map(|(_, entity_id)| entity_id)
+            .find(|stream| stream.contains(index))
+            .map(|stream| stream.entity_id.clone())
+            .or_else(|| {
+                self.fences
+                    .iter()
+                    .find(|(fence_index, _)| *fence_index == index)
+                    .map(|(_, fence)| fence.entity_id.clone())
+            })
     }
 }
 
-/// Builds a fenced read-only stream's two ConditionChecks: the slot check on
-/// `(pk, sk = head + 1)` and the snapshot companion on `(pk, sk = 0)`, which is always included.
-fn fence_checks(
-    table: &str,
-    fence: &crate::repository::ReadFence,
-) -> Result<[TransactWriteItem; 2], Error> {
-    let slot = ConditionCheck::builder()
-        .table_name(table)
-        .key("pk", s(fence.entity_id.as_str()))
-        .key("sk", n(fence.head.next().0))
-        .condition_expression(wire::FENCE_SLOT_CONDITION)
-        .build()
-        .map_err(Error::backend)?;
+/// Builds the transaction action for a head-item [`HeadAction`]: an `Update` or a
+/// `ConditionCheck` on `(pk, sk = -1)`. The expression strings, name placeholders, and values come
+/// from the action, the single source the commit budget also sizes.
+fn head_action(table: &str, action: &HeadAction) -> Result<TransactWriteItem, Error> {
+    let key = to_sdk_item(&action.key());
 
-    let companion = ConditionCheck::builder()
-        .table_name(table)
-        .key("pk", s(fence.entity_id.as_str()))
-        .key("sk", n(wire::SNAPSHOT_SORT_KEY))
-        .condition_expression(wire::FENCE_COMPANION_CONDITION)
-        .expression_attribute_values(":head", n(fence.head.0))
-        .build()
-        .map_err(Error::backend)?;
+    if let Some(update_expression) = action.update_expression {
+        let mut update = Update::builder()
+            .table_name(table)
+            .set_key(Some(key))
+            .update_expression(update_expression)
+            .condition_expression(action.condition_expression);
+        for (placeholder, name) in &action.names {
+            update = update.expression_attribute_names(*placeholder, *name);
+        }
+        for (placeholder, number) in &action.values {
+            update = update.expression_attribute_values(*placeholder, n(*number));
+        }
 
-    Ok([
-        TransactWriteItem::builder().condition_check(slot).build(),
-        TransactWriteItem::builder()
-            .condition_check(companion)
-            .build(),
-    ])
+        return Ok(TransactWriteItem::builder()
+            .update(update.build().map_err(Error::backend)?)
+            .build());
+    }
+
+    let mut check = ConditionCheck::builder()
+        .table_name(table)
+        .set_key(Some(key))
+        .condition_expression(action.condition_expression);
+    for (placeholder, name) in &action.names {
+        check = check.expression_attribute_names(*placeholder, *name);
+    }
+    for (placeholder, number) in &action.values {
+        check = check.expression_attribute_values(*placeholder, n(*number));
+    }
+
+    Ok(TransactWriteItem::builder()
+        .condition_check(check.build().map_err(Error::backend)?)
+        .build())
 }
 
 /// A projector operation's DynamoDB-encoded request size. A put counts its item. An update,
@@ -1410,72 +1909,11 @@ fn sdk_item_size(operation: &TransactWriteItem) -> usize {
     0
 }
 
-/// How a written stream's first sequence was tied to its stored head.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Continuation {
-    /// The commit's first sequence minus one: the head the writer believes in.
-    previous: EventSequence,
-    /// The snapshot ends exactly at the head, so compaction may delete the head event at any time;
-    /// the snapshot's `eventSeq` (equal to `previous`) pins the head instead of the event item.
-    via_snapshot: bool,
-}
-
-/// Checks that the event just before a stream's first new event still exists.
-fn continuation_check(
-    table: &str,
-    entity_id: &EntityId,
-    previous: EventSequence,
-) -> Result<TransactWriteItem, Error> {
-    let check = ConditionCheck::builder()
-        .table_name(table)
-        .key("pk", s(entity_id.as_str()))
-        .key("sk", n(previous.0))
-        .condition_expression(wire::CONTINUATION_CONDITION)
-        .build()
-        .map_err(Error::backend)?;
-
-    Ok(TransactWriteItem::builder().condition_check(check).build())
-}
-
-/// Checks that a compacted stream's snapshot still ends exactly at the sequence before the commit.
-fn pinned_floor_check(
-    table: &str,
-    entity_id: &EntityId,
-    previous: EventSequence,
-) -> Result<TransactWriteItem, Error> {
-    let check = ConditionCheck::builder()
-        .table_name(table)
-        .key("pk", s(entity_id.as_str()))
-        .key("sk", n(wire::SNAPSHOT_SORT_KEY))
-        .condition_expression(wire::PINNED_FLOOR_CONDITION)
-        .expression_attribute_values(":prev", n(previous.0))
-        .build()
-        .map_err(Error::backend)?;
-
-    Ok(TransactWriteItem::builder().condition_check(check).build())
-}
-
-/// Checks that a commit starting at `first` is above the entity's snapshot floor.
-fn floor_check(
-    table: &str,
-    entity_id: &EntityId,
-    first: sdk::AttributeValue,
-) -> Result<TransactWriteItem, Error> {
-    let check = ConditionCheck::builder()
-        .table_name(table)
-        .key("pk", s(entity_id.as_str()))
-        .key("sk", n(wire::SNAPSHOT_SORT_KEY))
-        .condition_expression(wire::FLOOR_CONDITION)
-        .expression_attribute_values(":first", first)
-        .build()
-        .map_err(Error::backend)?;
-
-    Ok(TransactWriteItem::builder().condition_check(check).build())
-}
-
 /// Reads an entity-heads scan item: an event's `sk`, or a snapshot's `eventSeq`. Like Go's
 /// `headSeqFromItem`, it skips an item whose key or sequence is missing or not a number, so one bad
-/// row does not stop a rebuild.
+/// row does not stop a rebuild. It also skips a stream's head item (`sk = -1`): the heads scan
+/// derives each head from the events and the snapshot, and the head item would otherwise
+/// contribute `-1`.
 fn item_head(item: &HashMap<String, sdk::AttributeValue>) -> Option<(&str, i64)> {
     let number = |name| match item.get(name) {
         Some(sdk::AttributeValue::N(value)) => value.parse::<i64>().ok(),
@@ -1486,6 +1924,7 @@ fn item_head(item: &HashMap<String, sdk::AttributeValue>) -> Option<(&str, i64)>
     };
 
     let head = match number("sk")? {
+        sk if sk < wire::SNAPSHOT_SORT_KEY => return None,
         wire::SNAPSHOT_SORT_KEY => number("eventSeq")?,
         sk => sk,
     };
@@ -1966,7 +2405,9 @@ mod tests {
             }
             let declaration = input["markerDeclaration"].as_str().unwrap();
             let observed = if declaration.is_empty() {
-                ValidatedMarker::Absent
+                // A fresh table: the first writer declared `stream-heads` itself, which created
+                // the marker row at version 1.
+                ValidatedMarker::Version(1)
             } else {
                 let declared = fixture["declarations"]
                     .as_array()
@@ -1984,49 +2425,214 @@ mod tests {
             let mut repository = offline_repository();
             repository.table = input["eventsTable"].as_str().unwrap().into();
             let actual = repository
-                .transaction_items(&commit, observed, None)
+                .transaction_items(&commit, observed)
                 .unwrap()
+                .0
                 .iter()
-                .map(|action| {
-                    let (mut value, condition, values, names) = if let Some(put) = action.put() {
-                        assert!(put.return_values_on_condition_check_failure().is_none());
-                        (
-                            json!({"operation": "Put", "tableName": put.table_name(),
-                            "item": from_sdk_item(put.item())}),
-                            put.condition_expression(),
-                            put.expression_attribute_values(),
-                            put.expression_attribute_names(),
-                        )
-                    } else {
-                        let check = action.condition_check().expect("only puts and checks");
-                        assert!(check.return_values_on_condition_check_failure().is_none());
-                        (
-                            json!({"operation": "ConditionCheck", "tableName": check.table_name(),
-                            "key": from_sdk_item(check.key())}),
-                            Some(check.condition_expression()),
-                            check.expression_attribute_values(),
-                            check.expression_attribute_names(),
-                        )
-                    };
-                    if let Some(condition) = condition {
-                        value["conditionExpression"] = json!(condition);
-                    }
-                    if let Some(values) = values {
-                        value["expressionAttributeValues"] = json!(from_sdk_item(values));
-                    }
-                    if let Some(names) = names {
-                        value["expressionAttributeNames"] = json!(names);
-                    }
-                    assert!(action.delete().is_none() && action.update().is_none());
-                    value
-                })
+                .map(fixture_action)
                 .collect::<Vec<_>>();
             assert_eq!(json!(actual), case["output"], "{}", case["name"]);
         }
     }
 
-    /// Summarizes a transaction action the way the Go fixtures record it: operation, key, and
-    /// the condition with its expression values.
+    /// An action in the shape of the shared fixtures (`feature-marker.json`): operation, table,
+    /// key or item, expressions, names, and values.
+    fn fixture_action(action: &TransactWriteItem) -> serde_json::Value {
+        use serde_json::json;
+
+        let (mut value, condition, values, names) = if let Some(put) = action.put() {
+            assert!(put.return_values_on_condition_check_failure().is_none());
+            (
+                json!({"operation": "Put", "tableName": put.table_name(),
+                "item": from_sdk_item(put.item())}),
+                put.condition_expression(),
+                put.expression_attribute_values(),
+                put.expression_attribute_names(),
+            )
+        } else if let Some(update) = action.update() {
+            assert!(update.return_values_on_condition_check_failure().is_none());
+            (
+                json!({"operation": "Update", "tableName": update.table_name(),
+                "key": from_sdk_item(update.key()),
+                "updateExpression": update.update_expression()}),
+                update.condition_expression(),
+                update.expression_attribute_values(),
+                update.expression_attribute_names(),
+            )
+        } else {
+            let check = action
+                .condition_check()
+                .expect("only puts, updates, and checks");
+            assert!(check.return_values_on_condition_check_failure().is_none());
+            (
+                json!({"operation": "ConditionCheck", "tableName": check.table_name(),
+                "key": from_sdk_item(check.key())}),
+                Some(check.condition_expression()),
+                check.expression_attribute_values(),
+                check.expression_attribute_names(),
+            )
+        };
+        if let Some(condition) = condition {
+            value["conditionExpression"] = json!(condition);
+        }
+        if let Some(values) = values {
+            value["expressionAttributeValues"] = json!(from_sdk_item(values));
+        }
+        if let Some(names) = names {
+            value["expressionAttributeNames"] = json!(names);
+        }
+        assert!(action.delete().is_none());
+
+        value
+    }
+
+    static VECTOR_CLOCK_SECONDS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn vector_clock() -> SystemTime {
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(VECTOR_CLOCK_SECONDS.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// The head-item vectors Go recorded (`streamHeads` in `feature-marker.json`): the exact
+    /// actions, expression strings, names, and values of each commit shape, and the budgeted
+    /// size of every action. The head update's budgeted size is the size of the action built.
+    #[test]
+    fn stream_head_actions_and_sizes_match_the_go_vectors() {
+        use serde_json::Value;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compat/fixtures/feature-marker.json");
+        let fixture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let cases = fixture["streamHeads"].as_array().unwrap();
+        assert!(cases.len() >= 7, "the vectors cover every commit shape");
+
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let request = &case["request"];
+            let expected = case["output"].as_array().unwrap();
+
+            let seconds = request["clockUnixNano"].as_u64().unwrap_or(0) / 1_000_000_000;
+            VECTOR_CLOCK_SECONDS.store(seconds, std::sync::atomic::Ordering::SeqCst);
+            let mut repository = offline_repository().with_clock(vector_clock);
+            repository.table = "evt-compat".into();
+            for (entity_type, nanos) in request["retentionNanos"].as_object().into_iter().flatten()
+            {
+                repository = repository.with_retention(
+                    entity_type.as_str(),
+                    Duration::from_nanos(nanos.as_u64().unwrap()),
+                );
+            }
+            for seeded in request["seeded"].as_array().into_iter().flatten() {
+                if let Some(ttl) = seeded["ttl"].as_i64() {
+                    repository.note_ttl(&EntityId::new(seeded["entityId"].as_str().unwrap()), ttl);
+                }
+            }
+
+            // An out-of-band snapshot write: the marker check, the head item, the snapshot put.
+            if let Some(write) = request.get("putSnapshot") {
+                let snapshot = SerializedSnapshot {
+                    entity_type: write["entityType"].as_str().unwrap().into(),
+                    entity_id: EntityId::new(write["entityId"].as_str().unwrap()),
+                    sequence: EventSequence(write["snapshotSequence"].as_i64().unwrap()),
+                    event_sequence: EventSequence(write["eventSequence"].as_i64().unwrap()),
+                    payload: b"{}".to_vec(),
+                };
+                let (guard, snapshot_put) = repository.snapshot_parts(&snapshot).unwrap();
+                let items = repository
+                    .snapshot_items(ValidatedMarker::Version(1), &guard, &snapshot_put)
+                    .unwrap();
+                let actual: Vec<_> = items.iter().map(fixture_action).collect();
+                assert_eq!(serde_json::Value::Array(actual), case["output"], "{name}");
+
+                continue;
+            }
+
+            // The events are not in the request: they are the vectors' fixed event, with the
+            // metadata and payload of the first event put Go recorded.
+            let sample = expected
+                .iter()
+                .find(|action| action["operation"] == "Put" && action["item"]["sk"]["N"] != "0")
+                .map(|action| &action["item"])
+                .unwrap_or_else(|| panic!("{name}: an event put"));
+            let text = |key: &str| sample[key]["S"].as_str().unwrap().to_owned();
+            let snapshot_payload = expected
+                .iter()
+                .find(|action| action["operation"] == "Put" && action["item"]["sk"]["N"] == "0")
+                .map(|action| action["item"]["payload"]["S"].as_str().unwrap().to_owned());
+
+            let streams = request["streams"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|stream| {
+                    let id = EntityId::new(stream["entityId"].as_str().unwrap());
+                    let entity_type = stream["entityType"].as_str().unwrap();
+                    let first = stream["first"].as_i64().unwrap();
+                    let events = (first..first + stream["count"].as_i64().unwrap())
+                        .map(|sequence| SerializedEvent {
+                            id: crate::EventId::for_event(&id, EventSequence(sequence)),
+                            sequence: EventSequence(sequence),
+                            event_type: text("type").into(),
+                            version: crate::EventVersion(1),
+                            entity_id: id.clone(),
+                            entity_type: entity_type.into(),
+                            payload: text("payload").into_bytes(),
+                            metadata: serde_json::from_str(&text("metadata")).unwrap(),
+                        })
+                        .collect();
+                    let mut commit = Commit::new(id, events);
+                    if let Some(sequence) = stream["snapshotSequence"].as_i64() {
+                        commit = commit.with_snapshot(crate::NewSnapshot::new(
+                            entity_type,
+                            EventSequence(sequence),
+                            snapshot_payload.clone().unwrap().into_bytes(),
+                        ));
+                    }
+
+                    commit
+                })
+                .collect();
+            let mut commit = TransactionCommit::new(streams);
+            commit.fences = request["fences"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|fence| {
+                    crate::ReadFence::new(
+                        fence["entityId"].as_str().unwrap(),
+                        "account",
+                        EventSequence(fence["head"].as_i64().unwrap()),
+                        crate::FenceProvenance::Engine,
+                    )
+                })
+                .collect();
+            commit.normalize().unwrap();
+
+            let (items, _) = repository
+                .transaction_stream_items(&commit, ValidatedMarker::Version(1))
+                .unwrap();
+            let actual: Vec<_> = items.iter().map(fixture_action).collect();
+            assert_eq!(serde_json::Value::Array(actual), case["output"], "{name}");
+
+            // The same actions, as the budget counts them (order aside).
+            let mut sizes = commit
+                .sizes(|entity_type| repository.ttl_for(entity_type))
+                .unwrap();
+            let mut recorded: Vec<usize> = case["sizes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|size| size.as_u64().unwrap() as usize)
+                .collect();
+            sizes.sort_unstable();
+            recorded.sort_unstable();
+            assert_eq!(sizes, recorded, "{name}: budgeted sizes");
+        }
+    }
+
+    /// Summarizes a transaction action the way the Go fixtures record it: operation, key, the
+    /// update expression of an `Update`, and the condition with its expression names and values.
     fn action_summary(action: &TransactWriteItem) -> serde_json::Value {
         use serde_json::json;
 
@@ -2034,18 +2640,34 @@ mod tests {
             item["sk"].as_n().unwrap().parse::<i64>().unwrap()
         };
 
-        let (operation, key, condition, values) = if let Some(put) = action.put() {
+        let (operation, key, update, condition, names, values) = if let Some(put) = action.put() {
             (
                 "Put",
                 (
                     put.item()["pk"].as_s().unwrap().clone(),
                     key_number(put.item()),
                 ),
+                None,
                 put.condition_expression(),
+                put.expression_attribute_names(),
                 put.expression_attribute_values(),
             )
+        } else if let Some(update) = action.update() {
+            (
+                "Update",
+                (
+                    update.key()["pk"].as_s().unwrap().clone(),
+                    key_number(update.key()),
+                ),
+                Some(update.update_expression()),
+                update.condition_expression(),
+                update.expression_attribute_names(),
+                update.expression_attribute_values(),
+            )
         } else {
-            let check = action.condition_check().expect("only puts and checks");
+            let check = action
+                .condition_check()
+                .expect("only puts, updates, and checks");
 
             (
                 "ConditionCheck",
@@ -2053,14 +2675,22 @@ mod tests {
                     check.key()["pk"].as_s().unwrap().clone(),
                     key_number(check.key()),
                 ),
+                None,
                 Some(check.condition_expression()),
+                check.expression_attribute_names(),
                 check.expression_attribute_values(),
             )
         };
 
         let mut summary = json!({"operation": operation, "pk": key.0, "sk": key.1});
+        if let Some(update) = update {
+            summary["update"] = json!(update);
+        }
         if let Some(condition) = condition {
             summary["condition"] = json!(condition);
+        }
+        if let Some(names) = names.filter(|names| !names.is_empty()) {
+            summary["names"] = json!(names);
         }
         if let Some(values) = values.filter(|values| !values.is_empty()) {
             summary["values"] = json!(from_sdk_item(values));
@@ -2095,6 +2725,11 @@ mod tests {
         let mut transactions = 0;
         for scenario in scenarios["scenarios"].as_array().unwrap() {
             let name = scenario["name"].as_str().unwrap();
+            // Outcome scenarios record every request they sent (`calls`), including the ones the
+            // table cancelled; the evt-compat tests assert those against a live run.
+            if scenario["outcomes"].as_bool().unwrap_or(false) {
+                continue;
+            }
             let base = format!("compat-{run}-{name}");
             let expected = fixtures["scenarios"]
                 .as_array()
@@ -2194,28 +2829,10 @@ mod tests {
                     .unwrap_or_default();
                 commit.normalize().unwrap();
 
-                // The scenarios declare no features, so every writer validated an absent marker.
-                // Every transaction step continues from an existing head event (none of the
-                // recorded steps writes a compacted stream), so each stream above sequence 1 is
-                // pinned through its head event.
-                let pins: HashMap<EntityId, Continuation> = commit
-                    .streams
-                    .iter()
-                    .filter_map(|stream| {
-                        let first = stream.events.first()?.sequence;
-                        (first > EventSequence(1)).then(|| {
-                            (
-                                stream.entity_id.clone(),
-                                Continuation {
-                                    previous: EventSequence(first.0 - 1),
-                                    via_snapshot: false,
-                                },
-                            )
-                        })
-                    })
-                    .collect();
+                // The scenarios start on a fresh table, so the first writer declared
+                // `stream-heads` itself, which created the marker row at version 1.
                 let (items, _) = offline_repository()
-                    .transaction_stream_items(&commit, ValidatedMarker::Absent, &pins)
+                    .transaction_stream_items(&commit, ValidatedMarker::Version(1))
                     .unwrap();
                 let actual: Vec<_> = items.iter().map(action_summary).collect();
 
@@ -2407,73 +3024,6 @@ mod tests {
         }
     }
 
-    /// A stream pins its head through the item compaction cannot delete: the head event when it
-    /// lies above the snapshot, the snapshot when it ends exactly at the head.
-    #[test]
-    fn a_stream_pins_its_head_through_the_item_compaction_cannot_delete() {
-        let repository = offline_repository();
-        let event = SerializedEvent {
-            id: "pin-a:5".into(),
-            entity_id: "pin-a".into(),
-            entity_type: "account".into(),
-            sequence: EventSequence(5),
-            event_type: "account:opened".into(),
-            version: crate::EventVersion(1),
-            payload: b"{}".to_vec(),
-            ..Default::default()
-        };
-        let commit: Commit<TransactWriteItem> = Commit::new("pin-a", vec![event]);
-        let conditions = |commit: &Commit<TransactWriteItem>, pin: Option<Continuation>| {
-            repository
-                .stream_group(commit, pin)
-                .unwrap()
-                .iter()
-                .map(|action| match (action.put(), action.condition_check()) {
-                    (Some(put), _) => put.condition_expression().unwrap().to_owned(),
-                    (_, Some(check)) => check.condition_expression().to_owned(),
-                    _ => unreachable!("only puts and checks"),
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let event_pin = Continuation {
-            previous: EventSequence(4),
-            via_snapshot: false,
-        };
-        assert_eq!(
-            conditions(&commit, Some(event_pin)),
-            vec![
-                wire::CONTINUATION_CONDITION,
-                wire::EVENT_CONDITION,
-                wire::FLOOR_CONDITION
-            ]
-        );
-
-        let snapshot_pin = Continuation {
-            previous: EventSequence(4),
-            via_snapshot: true,
-        };
-        assert_eq!(
-            conditions(&commit, Some(snapshot_pin)),
-            vec![wire::EVENT_CONDITION, wire::PINNED_FLOOR_CONDITION],
-            "no event check: compaction may delete the head event the snapshot covers"
-        );
-
-        // A stream creating itself carries neither.
-        assert_eq!(
-            conditions(&commit, None),
-            vec![wire::EVENT_CONDITION, wire::FLOOR_CONDITION]
-        );
-
-        // A later snapshot put pins through the snapshot too.
-        let with_snapshot = Commit::new("pin-a", commit.events.clone())
-            .with_snapshot(crate::NewSnapshot::new("account", EventSequence(2), "{}"));
-        assert_eq!(
-            conditions(&with_snapshot, Some(snapshot_pin)),
-            vec![wire::EVENT_CONDITION, wire::PINNED_NEXT_SNAPSHOT_CONDITION]
-        );
-    }
-
     #[test]
     fn entity_heads_skip_malformed_items() {
         let item = |sk: sdk::AttributeValue, event_seq: Option<sdk::AttributeValue>| {
@@ -2487,6 +3037,11 @@ mod tests {
         assert_eq!(item_head(&item(n(0), Some(s("five")))), None);
         assert_eq!(item_head(&item(n(0), None)), None);
         assert_eq!(item_head(&item(s("seven"), None)), None);
+
+        // A stream's head item (`sk = -1`) is not an event and not a snapshot: it contributes
+        // nothing, whatever its other attributes say.
+        assert_eq!(item_head(&item(n(-1), None)), None);
+        assert_eq!(item_head(&item(n(-1), Some(n(9)))), None);
     }
 
     #[test]
@@ -2596,7 +3151,7 @@ mod tests {
         const CHECK: Option<&str> = Some("ConditionalCheckFailed");
         const NONE: Option<&str> = Some("None");
 
-        // marker, event put, floor check, outcome put
+        // marker, head update, event put, outcome put
         assert!(outcome_failed(Some(3), &[NONE, NONE, NONE, CHECK]));
         assert!(outcome_failed(Some(3), &[NONE, CHECK, NONE, CHECK]));
         assert!(!outcome_failed(Some(3), &[NONE, CHECK, NONE, NONE]));
@@ -2613,7 +3168,7 @@ mod tests {
         let mut commit = TransactionCommit::new(Vec::new()).with_outcome(outcome.clone());
         commit.normalize().unwrap();
         let (mut items, mut layout) = repository
-            .transaction_stream_items(&commit, ValidatedMarker::Absent, &HashMap::new())
+            .transaction_stream_items(&commit, ValidatedMarker::Absent)
             .unwrap();
         items.push(
             repository
@@ -2659,7 +3214,7 @@ mod tests {
         )];
         commit.normalize().unwrap();
         let (mut items, _) = repository
-            .transaction_stream_items(&commit, ValidatedMarker::Absent, &HashMap::new())
+            .transaction_stream_items(&commit, ValidatedMarker::Absent)
             .unwrap();
         items.push(
             repository
@@ -2681,14 +3236,435 @@ mod tests {
             keys,
             vec![
                 ("SYSTEM#FEATURES".to_owned(), 0),
+                ("a".to_owned(), -1),
                 ("a".to_owned(), 1),
-                ("a".to_owned(), 0),
-                ("f".to_owned(), 3),
-                ("f".to_owned(), 0),
+                ("f".to_owned(), -1),
                 ("command-outcome#cmd".to_owned(), 1),
             ]
         );
         let outcome_put = items.last().unwrap().put().unwrap();
         assert_eq!(outcome_put.item()["events"].as_s().unwrap(), r#"["a:1"]"#);
+    }
+
+    fn account_event(id: &str, sequence: i64) -> SerializedEvent {
+        SerializedEvent {
+            id: format!("{id}:{sequence}").into(),
+            sequence: EventSequence(sequence),
+            event_type: "account:credited".into(),
+            version: crate::EventVersion(1),
+            entity_id: id.into(),
+            entity_type: "account".into(),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn stream_commit(
+        id: &str,
+        sequences: std::ops::RangeInclusive<i64>,
+    ) -> Commit<TransactWriteItem> {
+        Commit::new(id, sequences.map(|n| account_event(id, n)).collect())
+    }
+
+    fn built(
+        repository: &DynamoRepository,
+        streams: Vec<Commit<TransactWriteItem>>,
+        fences: Vec<(&str, i64)>,
+    ) -> Vec<serde_json::Value> {
+        let mut commit = TransactionCommit::new(streams);
+        commit.fences = fences
+            .into_iter()
+            .map(|(id, head)| {
+                crate::ReadFence::new(
+                    id,
+                    "account",
+                    EventSequence(head),
+                    crate::FenceProvenance::Engine,
+                )
+            })
+            .collect();
+        commit.normalize().unwrap();
+
+        let (items, _) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Absent)
+            .unwrap();
+
+        items.iter().map(action_summary).collect()
+    }
+
+    #[test]
+    fn a_commit_sends_head_updates_events_snapshots_and_fences_in_the_pinned_order() {
+        use serde_json::json;
+
+        let repository = offline_repository();
+        let snapshot = crate::NewSnapshot::new("account", EventSequence(2), "{}");
+
+        // The spec's worked example: appends to `b` (a new stream) and `a` (a snapshot-bearing
+        // append at head 7), fencing `z` (never written) and `m` (at head 3).
+        let actual = built(
+            &repository,
+            vec![
+                stream_commit("b", 1..=1),
+                stream_commit("a", 8..=9).with_snapshot(snapshot),
+            ],
+            vec![("z", 0), ("m", 3)],
+        );
+
+        assert_eq!(
+            actual,
+            vec![
+                json!({"operation": "ConditionCheck", "pk": "SYSTEM#FEATURES", "sk": 0,
+                    "condition": "attribute_not_exists(pk)"}),
+                json!({"operation": "Update", "pk": "a", "sk": -1,
+                    "update": "SET head = :last", "condition": "head = :prev",
+                    "values": {":last": {"N": "9"}, ":prev": {"N": "7"}}}),
+                json!({"operation": "Put", "pk": "a", "sk": 8, "condition": "attribute_not_exists(sk)"}),
+                json!({"operation": "Put", "pk": "a", "sk": 9, "condition": "attribute_not_exists(sk)"}),
+                json!({"operation": "Put", "pk": "a", "sk": 0, "condition": "seq = :seq",
+                    "values": {":seq": {"N": "1"}}}),
+                json!({"operation": "Update", "pk": "b", "sk": -1,
+                    "update": "SET head = :last", "condition": "attribute_not_exists(head)",
+                    "values": {":last": {"N": "1"}}}),
+                json!({"operation": "Put", "pk": "b", "sk": 1, "condition": "attribute_not_exists(sk)"}),
+                json!({"operation": "ConditionCheck", "pk": "m", "sk": -1, "condition": "head = :head",
+                    "values": {":head": {"N": "3"}}}),
+                json!({"operation": "ConditionCheck", "pk": "z", "sk": -1,
+                    "condition": "attribute_not_exists(head)"}),
+            ],
+            "marker; per written stream in byte order the head update, event puts, and snapshot \
+             put; the fences in byte order; no continuation or floor check, no companion"
+        );
+
+        // A first snapshot in a commit carries the first-snapshot condition and nothing else.
+        let first = built(
+            &repository,
+            vec![
+                stream_commit("c", 1..=2).with_snapshot(crate::NewSnapshot::new(
+                    "account",
+                    EventSequence(1),
+                    "{}",
+                )),
+            ],
+            vec![],
+        );
+        assert_eq!(first[4]["condition"], "attribute_not_exists(seq)");
+        assert!(first[4].get("values").is_none());
+    }
+
+    #[test]
+    fn a_retained_streams_head_update_raises_its_ttl_and_never_lowers_it() {
+        use serde_json::json;
+
+        fn clock() -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000)
+        }
+
+        let repository = offline_repository()
+            .with_clock(clock)
+            .with_retention("account", Duration::from_secs(100));
+        let id = EntityId::new("a");
+
+        // A create stamps the commit's own ttl on the head, under `attribute_not_exists(head)`.
+        let created = built(&repository, vec![stream_commit("a", 1..=2)], vec![]);
+        assert_eq!(
+            created[1],
+            json!({"operation": "Update", "pk": "a", "sk": -1,
+                "update": "SET head = :last, #ttl = :t",
+                "condition": "attribute_not_exists(head)",
+                "names": {"#ttl": "ttl"},
+                "values": {":last": {"N": "2"}, ":t": {"N": "1100"}}})
+        );
+
+        // An append guards the ttl by value.
+        let appended = built(&repository, vec![stream_commit("a", 3..=3)], vec![]);
+        assert_eq!(
+            appended[1],
+            json!({"operation": "Update", "pk": "a", "sk": -1,
+                "update": "SET head = :last, #ttl = :t",
+                "condition": "head = :prev AND (attribute_not_exists(#ttl) OR #ttl <= :t)",
+                "names": {"#ttl": "ttl"},
+                "values": {":last": {"N": "3"}, ":prev": {"N": "2"}, ":t": {"N": "1100"}}})
+        );
+
+        // The events keep the commit's own ttl, whatever the head takes.
+        repository.note_ttl(&id, 5_000);
+        let (items, layout) = repository
+            .transaction_stream_items(
+                &{
+                    let mut commit = TransactionCommit::new(vec![stream_commit("a", 3..=3)]);
+                    commit.normalize().unwrap();
+                    commit
+                },
+                ValidatedMarker::Absent,
+            )
+            .unwrap();
+        let head = items[layout.streams[0].head].update().unwrap();
+        assert_eq!(head.expression_attribute_values().unwrap()[":t"], n(5_000));
+        assert_eq!(layout.streams[0].head_ttl, Some(5_000));
+        let event = items[layout.streams[0].events.start].put().unwrap();
+        assert_eq!(event.item()["ttl"], n(1_100), "the event keeps its own ttl");
+
+        // A smaller remembered ttl never lowers the head below the commit's own.
+        repository.note_ttl(&EntityId::new("small"), 10);
+        let small = built(&repository, vec![stream_commit("small", 2..=2)], vec![]);
+        assert_eq!(small[1]["values"][":t"], json!({"N": "1100"}));
+
+        // A stream without retention writes neither the name nor `:t`.
+        let plain = built(
+            &offline_repository().with_clock(clock),
+            vec![stream_commit("p", 2..=2)],
+            vec![],
+        );
+        assert!(plain[1].get("names").is_none() && plain[1]["values"].get(":t").is_none());
+    }
+
+    #[test]
+    fn remembered_ttls_are_bounded_and_only_ever_grow() {
+        let mut ttls = LoadedTtls::default();
+        let first = EntityId::new("s0");
+
+        ttls.note(&first, 50);
+        ttls.note(&first, 20);
+        assert_eq!(
+            ttls.get(&first),
+            Some(50),
+            "a smaller ttl does not lower it"
+        );
+        ttls.note(&first, 70);
+        assert_eq!(ttls.get(&first), Some(70));
+
+        for n in 1..=LOADED_TTL_CAPACITY {
+            ttls.note(&EntityId::new(format!("s{n}")), 1);
+        }
+        assert_eq!(ttls.ttls.len(), LOADED_TTL_CAPACITY);
+        assert_eq!(
+            ttls.get(&first),
+            None,
+            "the oldest stream is forgotten first"
+        );
+        assert_eq!(
+            ttls.get(&EntityId::new(format!("s{LOADED_TTL_CAPACITY}"))),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn out_of_band_snapshot_writes_guard_the_head_item() {
+        use serde_json::json;
+
+        let id = EntityId::new("a");
+        let guard = |action: &HeadAction| action_summary(&head_action("events", action).unwrap());
+
+        assert_eq!(
+            guard(&HeadAction::snapshot_guard(&id, EventSequence(7), None)),
+            json!({"operation": "ConditionCheck", "pk": "a", "sk": -1,
+                "condition": "head >= :new", "values": {":new": {"N": "7"}}})
+        );
+        assert_eq!(
+            guard(&HeadAction::snapshot_guard(&id, EventSequence(0), None)),
+            json!({"operation": "ConditionCheck", "pk": "a", "sk": -1,
+                "condition": "attribute_not_exists(head) OR head >= :new",
+                "values": {":new": {"N": "0"}}})
+        );
+        assert_eq!(
+            guard(&HeadAction::snapshot_guard(
+                &id,
+                EventSequence(7),
+                Some(1_100)
+            )),
+            json!({"operation": "Update", "pk": "a", "sk": -1,
+                "update": "SET #ttl = :t",
+                "condition": "head >= :new AND (attribute_not_exists(#ttl) OR #ttl <= :t)",
+                "names": {"#ttl": "ttl"},
+                "values": {":new": {"N": "7"}, ":t": {"N": "1100"}}})
+        );
+        assert_eq!(
+            guard(&HeadAction::snapshot_guard(
+                &id,
+                EventSequence(0),
+                Some(1_100)
+            )),
+            json!({"operation": "ConditionCheck", "pk": "a", "sk": -1,
+                "condition": "attribute_not_exists(head) OR head >= :new",
+                "values": {":new": {"N": "0"}}}),
+            "an Update would create a head item with no head attribute"
+        );
+        assert_eq!(
+            guard(&HeadAction::snapshot_cover(&id, EventSequence(7))),
+            guard(&HeadAction::snapshot_guard(&id, EventSequence(7), None)),
+            "the fallback after a failed ttl condition is the plain check"
+        );
+    }
+
+    /// The ADR's worked examples, counted from the actions this repository really builds: the
+    /// marker check, the groups and fences, and the outcome put.
+    #[test]
+    fn the_built_actions_match_the_adr_action_counts_and_the_budget() {
+        let repository = offline_repository();
+        let outcome = Outcome::accepted("cmd", "digest");
+        let snapshot = |sequence| crate::NewSnapshot::new("account", EventSequence(sequence), "{}");
+
+        let count = |streams: Vec<Commit<TransactWriteItem>>, fences: Vec<(&str, i64)>| {
+            let mut commit = TransactionCommit::new(streams).with_outcome(outcome.clone());
+            commit.fences = fences
+                .into_iter()
+                .map(|(id, head)| {
+                    crate::ReadFence::new(
+                        id,
+                        "account",
+                        EventSequence(head),
+                        crate::FenceProvenance::Engine,
+                    )
+                })
+                .collect();
+            commit.normalize().unwrap();
+
+            let (items, _) = repository
+                .transaction_stream_items(&commit, ValidatedMarker::Absent)
+                .unwrap();
+            let sizes = commit.sizes(|_| None).unwrap();
+            assert_eq!(
+                sizes.len(),
+                items.len() + 1,
+                "the estimator counts the outcome put"
+            );
+
+            // The estimator budgets every action by the size of the action it builds.
+            for (item, size) in items.iter().zip(&sizes).skip(1) {
+                if item.put().is_none() {
+                    assert_eq!(sdk_item_size(item), *size, "{item:?}");
+                }
+            }
+
+            items.len() + 1
+        };
+
+        assert_eq!(count(vec![stream_commit("a", 1..=1)], vec![]), 4, "create");
+        assert_eq!(count(vec![stream_commit("a", 2..=2)], vec![]), 4, "append");
+        assert_eq!(
+            count(
+                vec![stream_commit("a", 2..=2).with_snapshot(snapshot(2))],
+                vec![]
+            ),
+            5,
+            "append with a snapshot"
+        );
+        assert_eq!(
+            count(
+                vec![stream_commit("a", 1..=5).with_snapshot(snapshot(1))],
+                vec![]
+            ),
+            9,
+            "create five events with a snapshot"
+        );
+
+        let appends = |count: usize| -> Vec<Commit<TransactWriteItem>> {
+            (0..count)
+                .map(|n| stream_commit(&format!("w{n:02}"), 2..=2))
+                .collect()
+        };
+        let reads = |count: usize| -> Vec<(String, i64)> {
+            (0..count).map(|n| (format!("r{n:02}"), 3)).collect()
+        };
+        let fenced = |count: usize| -> Vec<(&'static str, i64)> {
+            reads(count)
+                .into_iter()
+                .map(|(id, head)| (&*Box::leak(id.into_boxed_str()), head))
+                .collect()
+        };
+        assert_eq!(count(appends(10), fenced(5)), 27);
+        assert_eq!(count(appends(12), fenced(9)), 35);
+        assert_eq!(count(appends(1), fenced(30)), 34);
+    }
+
+    #[test]
+    fn single_stream_capacity_holds_the_documented_numbers() {
+        // Marker counted, outcome not: create 98, append 98, create with a snapshot 97, append
+        // with a snapshot 97 event and projector operations.
+        let fits = |first: i64, events: i64, snapshot: bool| {
+            let mut commit = stream_commit("a", first..=first + events - 1);
+            if snapshot {
+                commit = commit.with_snapshot(crate::NewSnapshot::new(
+                    "account",
+                    EventSequence(if first == 1 { 1 } else { 2 }),
+                    "{}",
+                ));
+            }
+            let sizes = commit.sizes(|_| None).unwrap();
+
+            crate::repository::check_budget(sizes).is_ok()
+        };
+
+        for (first, snapshot, capacity) in
+            [(1, false, 98), (2, false, 98), (1, true, 97), (2, true, 97)]
+        {
+            assert!(
+                fits(first, capacity, snapshot),
+                "first {first}, snapshot {snapshot}"
+            );
+            assert!(
+                !fits(first, capacity + 1, snapshot),
+                "first {first}, snapshot {snapshot}: one more is too large"
+            );
+        }
+    }
+
+    #[test]
+    fn the_layout_maps_every_index_back_to_its_stream_or_fence() {
+        let repository = offline_repository();
+        let mut commit = TransactionCommit::new(vec![
+            stream_commit("b", 1..=2),
+            stream_commit("a", 4..=4).with_snapshot(crate::NewSnapshot::new(
+                "account",
+                EventSequence(1),
+                "{}",
+            )),
+        ]);
+        commit.fences = vec![crate::ReadFence::new(
+            "f",
+            "account",
+            EventSequence(0),
+            crate::FenceProvenance::Caller,
+        )];
+        commit.normalize().unwrap();
+
+        let (items, layout) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Absent)
+            .unwrap();
+
+        // marker, a: head + event + snapshot, b: head + 2 events, fence f
+        assert_eq!(items.len(), 1 + 3 + 3 + 1);
+        let [a, b] = &layout.streams[..] else {
+            panic!("two written streams")
+        };
+        assert_eq!((a.head, a.events.clone(), a.snapshot), (1, 2..3, Some(3)));
+        assert_eq!((b.head, b.events.clone(), b.snapshot), (4, 5..7, None));
+        assert_eq!(a.first, EventSequence(4));
+        assert_eq!(layout.fences[0].0, 7);
+
+        for (index, want) in [(1, "a"), (3, "a"), (4, "b"), (6, "b"), (7, "f")] {
+            assert_eq!(
+                layout.entity_at(index),
+                Some(EntityId::new(want)),
+                "{index}"
+            );
+        }
+        assert_eq!(
+            layout.entity_at(0),
+            None,
+            "the marker check belongs to no stream"
+        );
+    }
+
+    #[test]
+    fn a_negative_sort_key_is_never_an_event() {
+        let head = wire::head_item(&EntityId::new("a"), EventSequence(3), Some(1_100));
+
+        assert_eq!(wire::sort_key(&head), Some(-1));
+        assert!(!wire::is_snapshot_item(&head));
+        assert_eq!(
+            wire::head_from_item(&head).unwrap(),
+            (EventSequence(3), Some(1_100))
+        );
     }
 }

@@ -659,7 +659,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
     /// - a failed **caller-stamped** fence persists a `stale-fence` rejection instead of
     ///   retrying, and returns it as the command's (rejected) outcome. The old command ID stays
     ///   terminal: the caller re-reads, re-decides, and submits a new command ID;
-    /// - an engine-filled fence, event, floor, or snapshot conflict is an ordinary retryable
+    /// - an engine-filled fence, head, event, or snapshot conflict is an ordinary retryable
     ///   conflict: build a new transaction and call [`begin_command`](Transaction::begin_command)
     ///   again.
     pub async fn commit_with_outcome(

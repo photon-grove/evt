@@ -7,17 +7,20 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
-use crate::features::{self, CachedMarker, FeatureManifest, FeatureMarker};
+use crate::features::{self, CachedMarker, FeatureManifest, FeatureMarker, ValidatedMarker};
+use crate::heads::{self, Probe};
 use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::outcome::Outcome;
-use crate::repository::{Commit, Repository, TransactionCommit};
+use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 
 /// An in-memory [`Repository`]. Clones share the same storage.
 ///
 /// Unlike Go's in-memory test double, it enforces optimistic concurrency the same way the
-/// DynamoDB backend does, so tests catch conflicts. A clone is an independent writer over the
-/// shared storage: it keeps its own feature-marker cache, like a second handle on a live
-/// backend, so a declaration one clone writes refuses the other on its next commit.
+/// DynamoDB backend does, so tests catch conflicts: every stream has a head (ADR 0007) that a
+/// commit raises and a read fence compares, and a failed commit is classified (drift, gap, then
+/// conflict) exactly as on the live backends. A clone is an independent writer over the shared
+/// storage: it keeps its own feature-marker cache, like a second handle on a live backend, so a
+/// declaration one clone writes refuses the other on its next commit.
 #[derive(Debug, Default)]
 pub struct MemRepository {
     streams: Arc<Mutex<BTreeMap<EntityId, Stream>>>,
@@ -44,6 +47,9 @@ impl Clone for MemRepository {
 struct Stream {
     events: BTreeMap<EventSequence, SerializedEvent>,
     snapshot: Option<SerializedSnapshot>,
+    /// The stream's head item: the highest event sequence ever committed to it, 0 while the
+    /// stream has none. Compaction never touches it.
+    head: EventSequence,
 }
 
 impl Stream {
@@ -55,7 +61,9 @@ impl Stream {
             .or_else(|| self.snapshot.as_ref().map(|snapshot| &snapshot.entity_type))
     }
 
-    fn head(&self) -> EventSequence {
+    /// The derived head (H4): the larger of the highest event sequence and the snapshot's event
+    /// sequence.
+    fn derived_head(&self) -> EventSequence {
         let last_event = self.events.keys().next_back().copied().unwrap_or_default();
         let snapshot = self
             .snapshot
@@ -65,32 +73,66 @@ impl Stream {
 
         last_event.max(snapshot)
     }
-}
 
-/// Refuses a first sequence that skips past the stored head. The head is the stream's highest
-/// event or, once compaction deleted every covered event, its snapshot's event sequence. A first
-/// sequence at or below the head is left to the event and floor checks, which report it as an
-/// ordinary conflict.
-fn check_continuation(
-    entity_id: &EntityId,
-    head: EventSequence,
-    first: EventSequence,
-) -> Result<(), Error> {
-    if first > head.next() {
-        return Err(Error::SequenceGap {
-            entity_id: entity_id.clone(),
-            after: head,
-            found: first,
-        });
+    fn holds_data(&self) -> bool {
+        !self.events.is_empty() || self.snapshot.is_some()
     }
 
-    Ok(())
+    /// Classifies a failed head update or fence the way the failure-path probe does: the stored
+    /// head against the derived head. Memory has no concurrent reads, so deriving again changes
+    /// nothing and a stored head ahead of the log is always drift.
+    fn probe(&self, entity_id: &EntityId, healthy: impl FnOnce(EventSequence) -> Error) -> Error {
+        let (stored, derived) = (self.head, self.derived_head());
+        let verdict = match Probe::first(stored, derived) {
+            Probe::Ahead => Probe::after_rederive(stored, self.derived_head()),
+            other => other,
+        };
+
+        match verdict {
+            Probe::Settled if stored == derived => healthy(stored),
+            _ => heads::drift(entity_id, stored, derived),
+        }
+    }
 }
 
 impl MemRepository {
     /// Creates an empty repository.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Appends an event to its stream **without** touching the stream's head, as a writer that
+    /// predates stream heads (or a corrupted store) would. The stream then drifts (ADR 0007): the
+    /// next commit, fence, or snapshot write that probes it fails with
+    /// [`Error::StreamHeadDrift`]. For the conformance suite; nothing else should call it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "conformance"))]
+    pub fn append_bypassing_head(&self, event: SerializedEvent) {
+        self.lock()
+            .entry(event.entity_id.clone())
+            .or_default()
+            .events
+            .insert(event.sequence, event);
+    }
+
+    /// Deletes the stream's head item, leaving its events and snapshot. For the conformance
+    /// suite.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "conformance"))]
+    pub fn delete_head(&self, entity_id: &EntityId) {
+        if let Some(stream) = self.lock().get_mut(entity_id) {
+            stream.head = EventSequence::ZERO;
+        }
+    }
+
+    /// The stream's stored head, if it has a head item. For the conformance suite.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "conformance"))]
+    pub fn stored_head(&self, entity_id: &EntityId) -> Option<EventSequence> {
+        self.lock()
+            .get(entity_id)
+            .map(|stream| stream.head)
+            .filter(|head| *head > EventSequence::ZERO)
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<EntityId, Stream>> {
@@ -121,15 +163,163 @@ impl MemRepository {
 
     /// Re-validates the writer's cached marker state against the stored manifest. Every commit
     /// checks the version, as the live backends' condition does: a manifest that changed under
-    /// this writer is re-validated here, refusing an unsupported declared feature.
-    fn check_manifest(&self, stored: Option<&FeatureManifest>) -> Result<(), Error> {
+    /// this writer is re-validated here, refusing an unsupported declared feature, and a writer
+    /// requires `stream-heads` (ADR 0007).
+    ///
+    /// A manifest without the feature is declared by the writer itself, but only when the
+    /// repository holds no events and no snapshots; otherwise the write is refused with
+    /// [`Error::StreamHeadsNotMigrated`]. The caller holds the manifest and stream locks, so the
+    /// emptiness check and the declaration are atomic.
+    fn check_manifest(
+        &self,
+        stored: &mut Option<FeatureManifest>,
+        streams: &BTreeMap<EntityId, Stream>,
+    ) -> Result<(), Error> {
         let mut validated = self.validated();
 
-        if features::marker_matches(*validated, stored) {
+        if features::marker_matches(*validated, stored.as_ref()) {
             return Ok(());
         }
 
-        *validated = Some(features::validate_marker(stored)?);
+        match features::validate_marker_for_write(stored.as_ref()) {
+            Ok(marker) => *validated = Some(marker),
+            Err(Error::StreamHeadsNotMigrated) if !streams.values().any(Stream::holds_data) => {
+                let mut next = stored.clone().unwrap_or_default();
+                next.declare_stream_heads();
+                next.version = stored.as_ref().map_or(1, |manifest| manifest.version + 1);
+
+                *validated = Some(ValidatedMarker::Version(next.version));
+                *stored = Some(next);
+            }
+            Err(error) => return Err(error),
+        }
+
+        Ok(())
+    }
+
+    /// Writes the streams, fences, and outcome of one commit atomically. Streams are in
+    /// ascending entity-ID order, as `TransactionCommit::normalize` leaves them.
+    fn write(
+        &self,
+        streams: &[&Commit<Infallible>],
+        fences: &[ReadFence],
+        outcome: Option<Outcome>,
+        check_retention: impl FnOnce(Option<&FeatureManifest>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        // Both locks are held through the write, so a manifest change cannot slip between the
+        // version check and the events, mirroring the live backends' transaction condition.
+        let mut stored_manifest = self.manifest_lock();
+        let mut stored = self.lock();
+        self.check_manifest(&mut stored_manifest, &stored)?;
+
+        // Fences are refused for entity types durably declared with retention.
+        check_retention(stored_manifest.as_ref())?;
+
+        let mut outcomes = self.outcomes_lock();
+
+        // A recorded outcome outranks every other failure: the command already ran.
+        if let Some(outcome) = &outcome
+            && outcomes.contains_key(&outcome.command_id)
+        {
+            return Err(Error::OutcomeConflict {
+                command_id: outcome.command_id.clone(),
+            });
+        }
+
+        // Validate every stream, snapshot, and fence before writing anything, so a failure leaves
+        // every stream unchanged. Reads use get: a failed commit must not create empty streams.
+        // A stream with no stored rows validates against an empty one. Every failed item is
+        // evaluated before ranking, as on DynamoDB.
+        let absent = Stream::default();
+        let mut failures = Vec::new();
+
+        for stream in streams.iter().filter(|stream| !stream.events.is_empty()) {
+            let held = stored.get(&stream.entity_id).unwrap_or(&absent);
+            let first = stream.events[0].sequence;
+
+            // The head update: a create needs no head item, an append needs the head to be the
+            // sequence before the commit's first.
+            let head_passes = if first <= EventSequence(1) {
+                held.head == EventSequence::ZERO
+            } else {
+                held.head.0 == first.0 - 1
+            };
+            let events_pass = stream
+                .events
+                .iter()
+                .all(|event| !held.events.contains_key(&event.sequence));
+
+            if !head_passes {
+                failures.push(held.probe(&stream.entity_id, |stored| {
+                    heads::gap_or_conflict(&stream.entity_id, first, stored)
+                }));
+            } else if !events_pass {
+                // The head update passed and an event put failed: an event exists above the head.
+                failures.push(heads::drift(
+                    &stream.entity_id,
+                    held.head,
+                    held.derived_head(),
+                ));
+            } else if let Some(new) = &stream.snapshot {
+                let stored_sequence = held
+                    .snapshot
+                    .as_ref()
+                    .map_or(EventSequence::ZERO, |existing| existing.sequence);
+
+                if stored_sequence.next() != new.sequence {
+                    failures.push(Error::Conflict {
+                        entity_id: stream.entity_id.clone(),
+                        message: format!(
+                            "snapshot sequence moved: stored {stored_sequence}, commit writes {}",
+                            new.sequence
+                        ),
+                    });
+                }
+            }
+        }
+
+        for fence in fences {
+            if streams
+                .iter()
+                .any(|stream| !stream.events.is_empty() && stream.entity_id == fence.entity_id)
+            {
+                // A written stream's head update supersedes its fence.
+                continue;
+            }
+
+            let held = stored.get(&fence.entity_id).unwrap_or(&absent);
+            if held.head != fence.head {
+                failures.push(held.probe(&fence.entity_id, |_| heads::fence_conflict(fence)));
+            }
+        }
+
+        if let Some(error) = heads::rank(failures) {
+            return Err(error);
+        }
+
+        for stream in streams.iter().filter(|stream| !stream.events.is_empty()) {
+            let last_sequence = stream.events.last().map(|event| event.sequence);
+            let held = stored.entry(stream.entity_id.clone()).or_default();
+
+            for event in &stream.events {
+                held.events.insert(event.sequence, event.clone());
+            }
+            if let Some(last) = last_sequence {
+                held.head = held.head.max(last);
+            }
+
+            if let (Some(snapshot), Some(event_sequence)) = (&stream.snapshot, last_sequence) {
+                held.snapshot = Some(SerializedSnapshot {
+                    entity_type: snapshot.entity_type.clone(),
+                    entity_id: stream.entity_id.clone(),
+                    sequence: snapshot.sequence,
+                    event_sequence,
+                    payload: snapshot.payload.clone(),
+                });
+            }
+        }
+
+        outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
 
         Ok(())
     }
@@ -149,102 +339,7 @@ impl Repository for MemRepository {
         // write.
         crate::repository::check_budget(commit.sizes(|_| None)?)?;
 
-        // Both locks are held through the write, so a manifest change cannot slip between the
-        // version check and the events, mirroring the live backends' transaction condition.
-        let stored_manifest = self.manifest_lock();
-        self.check_manifest(stored_manifest.as_ref())?;
-
-        let mut streams = self.lock();
-        let mut outcomes = self.outcomes_lock();
-
-        // A recorded outcome outranks every other failure: the command already ran.
-        let outcome = commit.stored_outcome();
-        if let Some(outcome) = &outcome
-            && outcomes.contains_key(&outcome.command_id)
-        {
-            return Err(Error::OutcomeConflict {
-                command_id: outcome.command_id.clone(),
-            });
-        }
-
-        // An outcome-only commit writes the outcome row and nothing else.
-        if commit.events.is_empty() {
-            outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
-
-            return Ok(());
-        }
-
-        // The stream must continue from its stored head; a gap is refused before anything is
-        // created or written.
-        if let Some(first) = commit.events.first() {
-            let head = streams
-                .get(&commit.entity_id)
-                .map_or(EventSequence::ZERO, Stream::head);
-            check_continuation(&commit.entity_id, head, first.sequence)?;
-        }
-
-        let stream = streams.entry(commit.entity_id.clone()).or_default();
-
-        for (index, event) in commit.events.iter().enumerate() {
-            let reused = commit.events[..index]
-                .iter()
-                .any(|e| e.sequence == event.sequence);
-            if reused || stream.events.contains_key(&event.sequence) {
-                return Err(Error::Conflict {
-                    entity_id: commit.entity_id,
-                    message: format!("event sequence {} already exists", event.sequence),
-                });
-            }
-        }
-
-        if let (Some(first), Some(existing)) = (commit.events.first(), &stream.snapshot)
-            && first.sequence <= existing.event_sequence
-        {
-            return Err(Error::Conflict {
-                entity_id: commit.entity_id,
-                message: format!(
-                    "event sequence {} is at or below the snapshot floor {}",
-                    first.sequence, existing.event_sequence
-                ),
-            });
-        }
-
-        if let Some(new) = &commit.snapshot {
-            let stored = stream
-                .snapshot
-                .as_ref()
-                .map_or(EventSequence::ZERO, |existing| existing.sequence);
-
-            if stored.next() != new.sequence {
-                return Err(Error::Conflict {
-                    entity_id: commit.entity_id,
-                    message: format!(
-                        "snapshot sequence moved: stored {stored}, commit writes {}",
-                        new.sequence
-                    ),
-                });
-            }
-        }
-
-        let last_sequence = commit.events.last().map(|event| event.sequence);
-
-        for event in commit.events {
-            stream.events.insert(event.sequence, event);
-        }
-
-        if let (Some(snapshot), Some(event_sequence)) = (commit.snapshot, last_sequence) {
-            stream.snapshot = Some(SerializedSnapshot {
-                entity_type: snapshot.entity_type,
-                entity_id: commit.entity_id,
-                sequence: snapshot.sequence,
-                event_sequence,
-                payload: snapshot.payload,
-            });
-        }
-
-        outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
-
-        Ok(())
+        self.write(&[&commit], &[], commit.stored_outcome(), |_| Ok(()))
     }
 
     async fn commit_transaction(&self, commit: TransactionCommit<Infallible>) -> Result<(), Error> {
@@ -258,137 +353,14 @@ impl Repository for MemRepository {
         // Budget parity: an oversized commit fails identically on every backend.
         crate::repository::check_budget(commit.sizes(|_| None)?)?;
 
-        // Both locks are held through the write, so a manifest change cannot slip between the
-        // version check and the events, mirroring the live backends' transaction condition.
-        let stored_manifest = self.manifest_lock();
-        self.check_manifest(stored_manifest.as_ref())?;
+        let streams: Vec<&Commit<Infallible>> = commit.streams.iter().collect();
 
-        // Fences are refused for entity types durably declared with retention.
-        commit.check_retention(stored_manifest.as_ref(), |_| false)?;
-
-        let mut streams = self.lock();
-        let mut outcomes = self.outcomes_lock();
-
-        // A recorded outcome outranks every other failure: the command already ran.
-        let outcome = commit.stored_outcome();
-        if let Some(outcome) = &outcome
-            && outcomes.contains_key(&outcome.command_id)
-        {
-            return Err(Error::OutcomeConflict {
-                command_id: outcome.command_id.clone(),
-            });
-        }
-
-        // Validate every stream, snapshot, and fence before writing anything, so a failure leaves
-        // every stream unchanged. Reads use get: a failed commit must not create empty streams.
-        // A stream with no stored rows validates against an empty one, so a first snapshot must
-        // be sequence 1, as on DynamoDB and PostgreSQL.
-        let absent = Stream::default();
-        for stream in &commit.streams {
-            let stored = streams.get(&stream.entity_id).unwrap_or(&absent);
-
-            if let Some(first) = stream.events.first() {
-                check_continuation(&stream.entity_id, stored.head(), first.sequence)?;
-            }
-
-            for (index, event) in stream.events.iter().enumerate() {
-                let reused = stream.events[..index]
-                    .iter()
-                    .any(|e| e.sequence == event.sequence);
-                if reused || stored.events.contains_key(&event.sequence) {
-                    return Err(Error::Conflict {
-                        entity_id: stream.entity_id.clone(),
-                        message: format!("event sequence {} already exists", event.sequence),
-                    });
-                }
-            }
-
-            if let (Some(first), Some(existing)) = (stream.events.first(), &stored.snapshot)
-                && first.sequence <= existing.event_sequence
-            {
-                return Err(Error::Conflict {
-                    entity_id: stream.entity_id.clone(),
-                    message: format!(
-                        "event sequence {} is at or below the snapshot floor {}",
-                        first.sequence, existing.event_sequence
-                    ),
-                });
-            }
-
-            if let Some(new) = &stream.snapshot {
-                let stored_sequence = stored
-                    .snapshot
-                    .as_ref()
-                    .map_or(EventSequence::ZERO, |existing| existing.sequence);
-
-                if stored_sequence.next() != new.sequence {
-                    return Err(Error::Conflict {
-                        entity_id: stream.entity_id.clone(),
-                        message: format!(
-                            "snapshot sequence moved: stored {stored_sequence}, commit writes {}",
-                            new.sequence
-                        ),
-                    });
-                }
-            }
-        }
-
-        for fence in &commit.fences {
-            if commit
-                .streams
-                .iter()
-                .any(|stream| stream.entity_id == fence.entity_id)
-            {
-                // A written stream's event put supersedes its fence.
-                continue;
-            }
-
-            let Some(stored) = streams.get(&fence.entity_id) else {
-                continue;
-            };
-
-            let event_head = stored
-                .events
-                .keys()
-                .next_back()
-                .copied()
-                .unwrap_or(EventSequence::ZERO);
-            let snapshot_head = stored
-                .snapshot
-                .as_ref()
-                .map_or(EventSequence::ZERO, |snapshot| snapshot.event_sequence);
-
-            if event_head > fence.head || snapshot_head > fence.head {
-                return Err(Error::FenceConflict {
-                    entity_id: fence.entity_id.clone(),
-                    head: fence.head,
-                    provenance: fence.provenance,
-                });
-            }
-        }
-
-        for stream in commit.streams {
-            let last_sequence = stream.events.last().map(|event| event.sequence);
-            let stored = streams.entry(stream.entity_id.clone()).or_default();
-
-            for event in stream.events {
-                stored.events.insert(event.sequence, event);
-            }
-
-            if let (Some(snapshot), Some(event_sequence)) = (stream.snapshot, last_sequence) {
-                stored.snapshot = Some(SerializedSnapshot {
-                    entity_type: snapshot.entity_type,
-                    entity_id: stream.entity_id,
-                    sequence: snapshot.sequence,
-                    event_sequence,
-                    payload: snapshot.payload,
-                });
-            }
-        }
-
-        outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
-
-        Ok(())
+        self.write(
+            &streams,
+            &commit.fences,
+            commit.stored_outcome(),
+            |manifest| commit.check_retention(manifest, |_| false),
+        )
     }
 
     async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
@@ -447,21 +419,33 @@ impl Repository for MemRepository {
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
         features::check_not_reserved(&snapshot.entity_id)?;
 
-        let manifest = self.manifest_lock();
-        self.check_manifest(manifest.as_ref())?;
-
+        let mut manifest = self.manifest_lock();
         let mut streams = self.lock();
-        let stream = streams.entry(snapshot.entity_id.clone()).or_default();
+        self.check_manifest(&mut manifest, &streams)?;
 
-        if stream
-            .snapshot
-            .as_ref()
+        // H3: the stream's head must cover the snapshot. A snapshot of an empty stream (event
+        // sequence 0) may have no head item at all.
+        let held = streams.get(&snapshot.entity_id);
+        let head = held.map_or(EventSequence::ZERO, |stream| stream.head);
+        if snapshot.event_sequence > EventSequence::ZERO && head < snapshot.event_sequence {
+            let derived = held
+                .map_or(EventSequence::ZERO, Stream::derived_head)
+                .max(snapshot.event_sequence);
+
+            return Err(heads::drift(&snapshot.entity_id, head, derived));
+        }
+
+        if held
+            .and_then(|stream| stream.snapshot.as_ref())
             .is_some_and(|existing| existing.event_sequence > snapshot.event_sequence)
         {
             return Ok(false);
         }
 
-        stream.snapshot = Some(snapshot.clone());
+        streams
+            .entry(snapshot.entity_id.clone())
+            .or_default()
+            .snapshot = Some(snapshot.clone());
 
         Ok(true)
     }
@@ -477,9 +461,11 @@ impl Repository for MemRepository {
         }
 
         let manifest = self.manifest_lock();
-        if let Some(manifest) = manifest.as_ref() {
-            manifest.validate_supported()?;
-        }
+        // Compaction is a write path: a store that does not declare `stream-heads` (or declares a
+        // feature this build does not model) is refused before the stream is read, so the refusal
+        // wins over `CompactionUncovered`. It never declares the feature itself, and never
+        // touches a head.
+        features::validate_marker_for_write(manifest.as_ref())?;
 
         let mut streams = self.lock();
         let Some(stream) = streams.get_mut(entity_id) else {
@@ -530,7 +516,7 @@ impl Repository for MemRepository {
             .filter(|(_, stream)| {
                 entity_type.is_none_or(|wanted| stream.entity_type() == Some(wanted))
             })
-            .map(|(id, stream)| (id.clone(), stream.head()))
+            .map(|(id, stream)| (id.clone(), stream.derived_head()))
             .filter(|(_, head)| *head > EventSequence::ZERO)
             .collect())
     }
@@ -563,11 +549,23 @@ mod enumerate;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conformance::{Suite, feature_marker_cases, outcome_cases};
+    use crate::conformance::{Suite, feature_marker_cases, fresh_store_cases, outcome_cases};
 
     #[tokio::test]
     async fn conforms() {
-        Suite::new(&MemRepository::new()).run().await;
+        let repository = MemRepository::new();
+
+        Suite::new(&repository)
+            .with_head_fixtures(repository.clone())
+            .run()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_fresh_store_declares_stream_heads_on_the_first_write() {
+        let first = MemRepository::new();
+
+        fresh_store_cases(&first, &first.clone()).await;
     }
 
     #[tokio::test]

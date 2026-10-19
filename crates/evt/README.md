@@ -19,6 +19,17 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
 - Upcasters migrate old payload versions on read. `compact_below` deletes only events a snapshot
   covers.
 - In-band projectors write views in the same transaction as the events.
+- **Stream heads (ADR 0007).** Every stream has one small head item (DynamoDB `sk = -1`, or a row
+  in `{events}__evt_stream_heads` on PostgreSQL) recording the highest event sequence committed to
+  it. A commit raises the head with an `Update` conditioned on the head it saw, and a read fence is
+  one check on it, so appends no longer carry a continuation or floor check and fences cost one
+  action instead of two. A stream whose head disagrees with its events or snapshot fails with
+  `Error::StreamHeadDrift`, which is never retried and never recorded as a rejection. Every writer
+  requires the `stream-heads` feature in the marker: a table written before stream heads is
+  refused with `Error::StreamHeadsNotMigrated` until `evt-doctor migrate-heads` has backfilled it
+  and declared the feature (`FeatureMarker::declare_stream_heads` is the hook for that call), and
+  a fresh table is declared by its first writer. DynamoDB scanners skip the head item (`sk < 1`),
+  and a Streams consumer must skip its records (see the storage format spec).
 - `latest(n)` reads a stream's last `n` events newest-first. The `SYSTEM#` and `command-outcome#`
   namespaces are reserved for engine rows: writes to them are refused, entity heads skip them,
   and a `SYSTEM#FEATURES` marker row declares the extensions a table uses — a writer that does
