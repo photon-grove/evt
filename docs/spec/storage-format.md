@@ -1917,9 +1917,14 @@ for the stream (the snapshot and the events after it). On create the update is
 event items keep the commit's own `ttl`; only the head takes the maximum. If an unseen writer (an
 out-of-band snapshot) raised the stored `ttl` above `:t`, the condition fails as an ordinary
 conflict, and the retry reloads, sees the larger `ttl`, and passes. An out-of-band snapshot write
-uses the same `ttl` condition with `:t` its snapshot's `ttl`; when only that condition fails, it
-reads the head item once and retries as a `ConditionCheck` on `head >= :new`, which needs no
-refresh.
+uses the same `ttl` condition with `:t` its snapshot's `ttl`. The condition can fail on either
+clause, so it reads the head item back and decides from the stored values: a head at or above
+`:new` whose stored `ttl` is at least the snapshot's needs no refresh and is retried as a
+`ConditionCheck` on `head >= :new`; a head at or above `:new` whose `ttl` is lower or absent (the head
+was behind when the update failed, and a concurrent writer advanced it with a shorter `ttl`) is
+retried as the refreshing update, so the snapshot never outlives the head item. The retry is
+bounded (four times), after which the write fails as a transient error; a head below `:new` or
+absent is `StreamHeadDrift`.
 
 ### Snapshot writes outside a commit
 
@@ -2008,14 +2013,27 @@ a row without it) may be declared by the writer itself, but only after it finds 
 in the store. On DynamoDB that is a **strongly consistent** scan that reads until it finds one item
 outside the `SYSTEM#` and `command-outcome#` namespaces or the table ends, so a populated table stops
 it at once; the declaration is the ordinary declaration transaction (`version` created at 1, or
-bumped by one), and the writer's first commit conditions on the version it declared. On PostgreSQL
+bumped by one), and the writer's first commit conditions on the version it declared. The scan and
+the declaration are two steps, and no transaction can exclude a writer that never reads the marker,
+so the order closes the window instead: the declaration is committed **first**, and the table is then
+scanned once more, strongly consistently, for a **headless stream** (a partition with a snapshot or
+event items and no head item, confirmed by a strongly consistent read of its head item because a scan
+is not atomic across items). From the declaration on, a marker-reading writer fails its per-commit
+check or refuses the table; one that committed before it is durable by the second scan. A headless
+stream means the table was not fresh after all: the writer **retracts** the declaration (removes
+`stream-heads` from the manifest in a further declaration transaction, so every cached validation is
+dropped) and refuses with `StreamHeadsNotMigrated`. A stream that has a head item is another
+head-aware writer's and never causes a retraction. A writer that predates the marker cannot be
+excluded by any protocol: the **operator obligation** is that no writer older than the first
+head-aware writer touches the store once that writer has run, and `migrate-heads` verifies the store
+for headless streams before it declares. On PostgreSQL
 the declaration transaction, under the exclusive feature lock, first checks that the events and
 snapshots tables hold no non-reserved row; a log whose schema predates the marker has no features
 table and no head table, so it cannot write until `EnsureSchema` upgrades it. The in-memory
 repository declares when it holds no events and no snapshots. A pure validation of a marker (Go
 `FeatureMarker.Validate`) applies the same refusal but never writes. A writer that does not
 implement this section refuses a table that declares `stream-heads`, by the existing rule. The
-declaration is never removed, so a pre-heads build cannot be returned to. The migration tool
+declaration is never removed once a writer has committed under it (the retraction above happens before any commit), so a pre-heads build cannot be returned to. The migration tool
 declares a populated store with `FeatureMarker.DeclareStreamHeads` (Go) after it has backfilled and
 verified every head.
 

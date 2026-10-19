@@ -58,8 +58,11 @@ emits.
 **Permissions and billing.** The head update is an `Update` action inside `TransactWriteItems`, so a
 writer's role needs `dynamodb:UpdateItem` on the event-log table as well as `PutItem`,
 `ConditionCheckItem` and `TransactWriteItems`. The first write to a table that does not declare
-`stream-heads` runs one strongly consistent `Scan` to prove the table holds no data
-(`dynamodb:Scan`), and a writer to a table that already declares the feature never scans. Every
+`stream-heads` runs a strongly consistent `Scan` to prove the table holds no data, declares the
+feature, and scans once more to prove no stream without a head item slipped in before the
+declaration (`dynamodb:Scan`); a writer to a table that already declares the feature never scans.
+Writers older than the head item never read the marker, so they must be stopped before the first
+head-aware writer runs against a table ([the obligation](spec/storage-format.md#required-feature)). Every
 transactional action is billed as two writes of the checked or written item's size, rounded up to
 1 KB; the head item stays well under 1 KB, so a head update or a fence is the cheapest action a commit
 can send, and it no longer scales with the size of a snapshot. (Whether a `ConditionCheck` bills by
