@@ -9,8 +9,8 @@ importers:
   .:
     devDependencies:
       '@moonrepo/cli':
-        specifier: 2.6.1
-        version: 2.6.1
+        specifier: 2.6.2
+        version: 2.6.2
       prettier:
         specifier: ^3.9.10
         version: 3.9.10
@@ -19,17 +19,17 @@ importers:
     dependencies:
       '@xyflow/react':
         specifier: ^12.12.0
-        version: 12.12.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+        version: 12.12.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       elkjs:
-        specifier: ^0.9.3
-        version: 0.9.3
+        specifier: ^0.12.0
+        version: 0.12.0
     devDependencies:
       '@testing-library/jest-dom':
         specifier: ^6.9.1
         version: 6.9.1
       '@testing-library/react':
         specifier: ^16.3.3
-        version: 16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+        version: 16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@types/node':
         specifier: ^25.9.9
         version: 25.9.9
@@ -46,11 +46,11 @@ importers:
         specifier: ^25.0.1
         version: 25.0.1
       react:
-        specifier: ^19.3.0
-        version: 19.3.0
+        specifier: ^19.3.1
+        version: 19.3.1
       react-dom:
-        specifier: ^19.3.0
-        version: 19.3.0(react@19.3.0)
+        specifier: ^19.3.1
+        version: 19.3.1(react@19.3.1)
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
@@ -65,7 +65,7 @@ importers:
         version: link:../packages/react-flow-diagrams
       '@xyflow/react':
         specifier: ^12.12.0
-        version: 12.12.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+        version: 12.12.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       marked:
         specifier: ^18.1.1
         version: 18.1.1
@@ -73,11 +73,11 @@ importers:
         specifier: ^11.17.2
         version: 11.17.2
       react:
-        specifier: ^19.3.0
-        version: 19.3.0
+        specifier: ^19.3.1
+        version: 19.3.1
       react-dom:
-        specifier: ^19.3.0
-        version: 19.3.0(react@19.3.0)
+        specifier: ^19.3.1
+        version: 19.3.1(react@19.3.1)
     devDependencies:
       '@types/react':
         specifier: ^19.3.0
@@ -411,42 +411,46 @@ packages:
   '@mermaid-js/parser@1.2.1':
     resolution: {integrity: sha512-n12NohV3mrUyUL2o93IgG/ifeW9FTyeJn3zDxkhwa8MJ9Fxg3HQMlA3RiGmD/3UnJvheztkjjQAjA2T4LmUcpw==}
 
-  '@moonrepo/cli@2.6.1':
-    resolution: {integrity: sha512-gnS8UbCl6Pd7sMN5rGNbehy32W3ybHJqBYVjUX/Hfxe+0QPWIVgKiIObZZfU9IruPiqqG35tYwcI5MrE/m2PpQ==}
+  '@moonrepo/cli@2.6.2':
+    resolution: {integrity: sha512-P+iqrVlYBLJb5CK+OFTXDu8AJ72kGT+dOdzsEFzC1hwx2N34RUvxXlaxBRBhRTkYIHL9Zg0SyN6EGoF1l++wjA==}
     hasBin: true
 
-  '@moonrepo/core-linux-arm64-gnu@2.6.1':
-    resolution: {integrity: sha512-oBohc4GhVu+EETh6IMMccew05wm923wPcw0mYMxrBm9MqdZVAFtOCFUXqbV6Si+++wsjnGA6xhTQ/kqr907fCQ==}
+  '@moonrepo/core-linux-arm64-gnu@2.6.2':
+    resolution: {integrity: sha512-u3nYPxD5Zr+FKmdAG/GDSPEwAkVwxCDhhYx0eIbRApry/vlNm1SYidoP3B5LFSQubtfP63fk2RP0LYzBMk2tFw==}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
-  '@moonrepo/core-linux-arm64-musl@2.6.1':
-    resolution: {integrity: sha512-gl32BFWLbRDxIFvagNNiaXHBBy/qRw0x64yil9qmFlT3cuvXSQCeeuJ20T3VSjsH+2H/kxpQLSqoYlZLG7ExCw==}
+  '@moonrepo/core-linux-arm64-musl@2.6.2':
+    resolution: {integrity: sha512-0Xq9JnJ0FjRmM47OZe0d35W+Vm5SJD/V4DxG0TqkVLFVpwijqYtNyrzrBde3ay/FBkkZ+psLy4OIaa7z10S24g==}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
-  '@moonrepo/core-linux-x64-gnu@2.6.1':
-    resolution: {integrity: sha512-LbKYe40mIyMgKvtbTyQ1vXduwXf9Bo0cePCTFfQoIKR0A0tPmfMh/weP3oNU+DFMvGo30cPy+xDJMLN0mqgo4w==}
+  '@moonrepo/core-linux-x64-gnu@2.6.2':
+    resolution: {integrity: sha512-Ocb3m2ogfHCmX1DzEuWXctNRdf7qgiMVW4eE0wN5gxD663xUndgiR+hj07ed/32/0MNo3rXI79V4C4scLvvNLA==}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
-  '@moonrepo/core-linux-x64-musl@2.6.1':
-    resolution: {integrity: sha512-xGvBpS5SPzwX/fjTz6T7dLoi2sde1SC0LysI17u8YuNVcgZCBAQplqY1jdev4ZDaci+ppGy/kXP1qFIvK6Ou3Q==}
+  '@moonrepo/core-linux-x64-musl@2.6.2':
+    resolution: {integrity: sha512-BDAFwAppz2lMd/zcKqA9BIbL8eX2NceuJN0UNyLy2DWopqyguAA0fbkxOmYXTOtIMllK6Q7zX6fRT38I06Kp1A==}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
-  '@moonrepo/core-macos-arm64@2.6.1':
-    resolution: {integrity: sha512-TbFZZhNkOztG0TW/fpltUiAO8jOSP+lQS/bRyFm+R//OVcW770oAzZk4XCeMOfLZP3fuvx25wSyv/zXTI/bh+A==}
+  '@moonrepo/core-macos-arm64@2.6.2':
+    resolution: {integrity: sha512-B5zVp9Wr0MJ4kgjJFJpUOPCNFKJblUzON4TA+SnlhuqC3X8ep6FBCszpsyc5YKCFa4sIJcKUt4CJGfOtvSrrbA==}
     cpu: [arm64]
     os: [darwin]
 
-  '@moonrepo/core-macos-x64@2.6.1':
-    resolution: {integrity: sha512-dcrjHFT4l6YXmG6piV9hOGHkRg1AfKbpc8nH1eM6+7iNT2XtzKoEACBbsiTArXrdeI4ixiDcQ+46MRtixtDmpw==}
+  '@moonrepo/core-macos-x64@2.6.2':
+    resolution: {integrity: sha512-Rj4gUI3SJwhgu8tCaixbqAyYBiXTzNVlXXhv9xcUoAm9pYQUoAluPh7FLPd5ubXGpDnHReftT58Miq3sI5SilA==}
     cpu: [x64]
     os: [darwin]
 
-  '@moonrepo/core-windows-x64-msvc@2.6.1':
-    resolution: {integrity: sha512-WDaVwaGgBPLewvBFb/9K1gIDH+aODM5cmYiB11FyuLG7hkISfRtW5thN9t7PQvnGOCFqtDzGrPEPNtWZsp1KPg==}
+  '@moonrepo/core-windows-x64-msvc@2.6.2':
+    resolution: {integrity: sha512-ABfBlco/Qbn8ed6SvTL4bqqD5dMUrbCCkIthaWfNrviM8WHjnbaFt8oYpGwInC/S2zmyWuxoEroV3gjkFNfrTg==}
     cpu: [x64]
     os: [win32]
 
@@ -455,6 +459,7 @@ packages:
     engines: {node: ^22.20 || ^24.12 || >=25}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@rolldown/pluginutils@1.0.0-rc.3':
     resolution: {integrity: sha512-eybk3TjzzzV97Dlj5c+XrBFW57eTNhzod66y9HrBlzJ6NsCrWCp/2kaPS3K9wJmurBC0Tdw4yPjXKZqlznim3Q==}
@@ -493,66 +498,79 @@ packages:
     resolution: {integrity: sha512-uPo3IvnONjhbFXwWgroBeFwOicuhT7ZwQrnzkzmOtBJzeQbkUJUE1SJDfDI31ijQ5+ZUIA6sPrdUMxTSnxUWAg==}
     cpu: [arm]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-arm-musleabihf@4.64.5':
     resolution: {integrity: sha512-ywI8Jyuc4LyHYTjC0mw4yA1ulvZBkHusdpWnoiEBsmBuHvSnt90btTBGCZ+s/2y+YNNfVAEKy33nPo5UI9zTmg==}
     cpu: [arm]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-arm64-gnu@4.64.5':
     resolution: {integrity: sha512-tmuXJoQ/3ovSr637aykZMdQteU/CB2APAz2CrvsbibuoHZi1BS1Db13cVViBdEARGwXCLn1DSJ8wsjoThLJPGA==}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-arm64-musl@4.64.5':
     resolution: {integrity: sha512-5FMjSYNcUOHx7oW8Qu9KB6jGPpvF/8sG7+BDHwU/Ihh1/6FMJ9ySmsFG4tJ1qbNRuP8OLzCBDso4sF0mQaLuFQ==}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-loong64-gnu@4.64.5':
     resolution: {integrity: sha512-K8ZJ+neLDbUkIrL8dqF/5LtuVCrKwo27kREgOlxjBEjlOXwHvDnHLU8Z/UKv/B49qi7e8hsSDOyoJwhwqhvX4w==}
     cpu: [loong64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-loong64-musl@4.64.5':
     resolution: {integrity: sha512-NlVxsq7PFPv0DBKGuNWRDKixQYQCjM53zl04mxEcKMBmJbCBIUm1JdPfIWDRHyOOFzzYPmLQzfeEwh4716ayQg==}
     cpu: [loong64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-ppc64-gnu@4.64.5':
     resolution: {integrity: sha512-ARhRHJYs5eCFet5azfrHD97vOkD8OzNW2RSMlvo5CcBqXaTOLfp0OHDtUQh7/K5AL5fUYoFp2fgC9KDg4vVYMQ==}
     cpu: [ppc64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-ppc64-musl@4.64.5':
     resolution: {integrity: sha512-atSgreM5C7jpxd9aEXN+6vJ5wTd05iYw+S3FiQpw7VsoEl8B90llbq35ARON+GOHj5QlVQEq2vOKWCHTob/BSQ==}
     cpu: [ppc64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-riscv64-gnu@4.64.5':
     resolution: {integrity: sha512-vmlmwBFGnjVWxSRoVabNkyYuscSmg52Pd0fM8jEbNT3Jmka4A6HcB84x4uAmuumznWfBVaxKOqU6jbEgomWKCA==}
     cpu: [riscv64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-riscv64-musl@4.64.5':
     resolution: {integrity: sha512-hhJrP6S9WkbsbcHgUkvCBS5Cn8IdsG8XjlLZyxjnv9+NdoYfbbZE4TWJYr8apdaj1M5t5Y1id2StnEslxpNFyA==}
     cpu: [riscv64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-s390x-gnu@4.64.5':
     resolution: {integrity: sha512-NNVCyN9pGrwFmQa4bf+Cnf5aVH3g6ZpnlOg1Cs/H9swIHT9bRixijfzUqyEIWm1WtiAuR1LJ+rJH6zpBm8kgQA==}
     cpu: [s390x]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-x64-gnu@4.64.5':
     resolution: {integrity: sha512-dR9nd6OKnvSS60Ifz/L7Mj5zzYyoqyRn2NwTuaOONKaa3xsVGXyp8YusMbvFyEOR94DxnwgcbgsFqkHd29ZSzQ==}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-x64-musl@4.64.5':
     resolution: {integrity: sha512-1tzsMjaqhsh3bAO6SJiJqh8hIr9sSPRd+i2vPPxJHod8/XYnf9TEnK0z/u3r1z1AkI347X0KbRSg9dWcxeGahw==}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-openbsd-x64@4.64.5':
     resolution: {integrity: sha512-01mWMQblKoXXsmk28KXtpbA96w7g/aOWUoV3AC16fdHdqkykGalqyyM+5u8M7uP5/MEMiiPv69Hv7iv/hEH/dA==}
@@ -1085,8 +1103,8 @@ packages:
   electron-to-chromium@1.5.452:
     resolution: {integrity: sha512-cVvk1YBSj6571VmV6hdJTqj94Y79xSu8cj6Y9t6ae4Y4431z8/7EJFvu3rVp90xhfuv9BpPKUmaLfTo4+FOGBg==}
 
-  elkjs@0.9.3:
-    resolution: {integrity: sha512-f/ZeWvW/BCXbhGEf1Ujp29EASo/lk1FDnETgNKwJrsVvGZhUWCZyg3xLJjAsxfOmt8KjswHmI5EwCQcPMpOYhQ==}
+  elkjs@0.12.0:
+    resolution: {integrity: sha512-YZcKynxVxYoKIOEpywEPwCFdg+BTbxQRNf3pbwdDCvc8O3kQD8bmIwSxKU1eOTVc4Xo+VG9Te+575mlfvOrhEQ==}
 
   entities@6.0.1:
     resolution: {integrity: sha512-aN97NXWF6AWBTahfVOIrB/NShkzi5H7F9r1s9mD3cDj4Ko5f2qhhVoYMibXF7GlLveb/D2ioWay8lxI97Ven3g==}
@@ -1359,10 +1377,10 @@ packages:
     resolution: {integrity: sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg==}
     engines: {node: '>=6'}
 
-  react-dom@19.3.0:
-    resolution: {integrity: sha512-JDk8dgif51OjFoDE70+OT9ICyYr+69HlmihNwp1+Nsfbna3t5sIiCa9ZJktDmQ4/1b/rn26hIAR2uYXDMr5r0Q==}
+  react-dom@19.3.1:
+    resolution: {integrity: sha512-Y0bARz53lhEC1NMCASs0/j+faB/zqt3R8hpvg1e8+61ZVJ4UL0UdC4cBbXfZMcIuhrfgeILTLe+ZeBCavQPtKQ==}
     peerDependencies:
-      react: ^19.3.0
+      react: ^19.3.1
 
   react-is@17.0.2:
     resolution: {integrity: sha512-w2GsyukL62IJnlaff/nRegPQR94C/XXamvMWmSHRJ4y7Ts/4ocGRmTHvOs8PSE6pB3dWOrD/nueuU5sduBsQ4w==}
@@ -1371,8 +1389,8 @@ packages:
     resolution: {integrity: sha512-QgT5//D3jfjJb6Gsjxv0Slpj23ip+HtOpnNgnb2S5zU3CB26G/IDPGoy4RJB42wzFE46DRsstbW6tKHoKbhAxw==}
     engines: {node: '>=0.10.0'}
 
-  react@19.3.0:
-    resolution: {integrity: sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog==}
+  react@19.3.1:
+    resolution: {integrity: sha512-QNhWdt7nrgVWWQG58QuGsAR3jv3Hbe4mb4vz7w2csnHavciZJgda1CPNaldF6eVxv90ud3jUXpKlHL69gO38yw==}
     engines: {node: '>=0.10.0'}
 
   redent@3.0.0:
@@ -1898,37 +1916,37 @@ snapshots:
     dependencies:
       '@chevrotain/types': 11.1.2
 
-  '@moonrepo/cli@2.6.1':
+  '@moonrepo/cli@2.6.2':
     dependencies:
       detect-libc: 2.1.2
     optionalDependencies:
-      '@moonrepo/core-linux-arm64-gnu': 2.6.1
-      '@moonrepo/core-linux-arm64-musl': 2.6.1
-      '@moonrepo/core-linux-x64-gnu': 2.6.1
-      '@moonrepo/core-linux-x64-musl': 2.6.1
-      '@moonrepo/core-macos-arm64': 2.6.1
-      '@moonrepo/core-macos-x64': 2.6.1
-      '@moonrepo/core-windows-x64-msvc': 2.6.1
+      '@moonrepo/core-linux-arm64-gnu': 2.6.2
+      '@moonrepo/core-linux-arm64-musl': 2.6.2
+      '@moonrepo/core-linux-x64-gnu': 2.6.2
+      '@moonrepo/core-linux-x64-musl': 2.6.2
+      '@moonrepo/core-macos-arm64': 2.6.2
+      '@moonrepo/core-macos-x64': 2.6.2
+      '@moonrepo/core-windows-x64-msvc': 2.6.2
 
-  '@moonrepo/core-linux-arm64-gnu@2.6.1':
+  '@moonrepo/core-linux-arm64-gnu@2.6.2':
     optional: true
 
-  '@moonrepo/core-linux-arm64-musl@2.6.1':
+  '@moonrepo/core-linux-arm64-musl@2.6.2':
     optional: true
 
-  '@moonrepo/core-linux-x64-gnu@2.6.1':
+  '@moonrepo/core-linux-x64-gnu@2.6.2':
     optional: true
 
-  '@moonrepo/core-linux-x64-musl@2.6.1':
+  '@moonrepo/core-linux-x64-musl@2.6.2':
     optional: true
 
-  '@moonrepo/core-macos-arm64@2.6.1':
+  '@moonrepo/core-macos-arm64@2.6.2':
     optional: true
 
-  '@moonrepo/core-macos-x64@2.6.1':
+  '@moonrepo/core-macos-x64@2.6.2':
     optional: true
 
-  '@moonrepo/core-windows-x64-msvc@2.6.1':
+  '@moonrepo/core-windows-x64-msvc@2.6.2':
     optional: true
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
@@ -2033,12 +2051,12 @@ snapshots:
       picocolors: 1.1.1
       redent: 3.0.0
 
-  '@testing-library/react@16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+  '@testing-library/react@16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
     dependencies:
       '@babel/runtime': 7.29.10
       '@testing-library/dom': 10.4.1
-      react: 19.3.0
-      react-dom: 19.3.0(react@19.3.0)
+      react: 19.3.1
+      react-dom: 19.3.1(react@19.3.1)
     optionalDependencies:
       '@types/react': 19.3.0
       '@types/react-dom': 19.3.0(@types/react@19.3.0)
@@ -2267,13 +2285,13 @@ snapshots:
       convert-source-map: 2.0.0
       tinyrainbow: 3.2.0
 
-  '@xyflow/react@12.12.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+  '@xyflow/react@12.12.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
     dependencies:
       '@xyflow/system': 0.0.83
       classcat: 5.0.5
-      react: 19.3.0
-      react-dom: 19.3.0(react@19.3.0)
-      zustand: 4.5.7(@types/react@19.3.0)(react@19.3.0)
+      react: 19.3.1
+      react-dom: 19.3.1(react@19.3.1)
+      zustand: 4.5.7(@types/react@19.3.0)(react@19.3.1)
     optionalDependencies:
       '@types/react': 19.3.0
       '@types/react-dom': 19.3.0(@types/react@19.3.0)
@@ -2579,7 +2597,7 @@ snapshots:
 
   electron-to-chromium@1.5.452: {}
 
-  elkjs@0.9.3: {}
+  elkjs@0.12.0: {}
 
   entities@6.0.1: {}
 
@@ -2870,16 +2888,16 @@ snapshots:
 
   punycode@2.3.1: {}
 
-  react-dom@19.3.0(react@19.3.0):
+  react-dom@19.3.1(react@19.3.1):
     dependencies:
-      react: 19.3.0
+      react: 19.3.1
       scheduler: 0.28.0
 
   react-is@17.0.2: {}
 
   react-refresh@0.18.0: {}
 
-  react@19.3.0: {}
+  react@19.3.1: {}
 
   redent@3.0.0:
     dependencies:
@@ -2998,9 +3016,9 @@ snapshots:
       escalade: 3.2.0
       picocolors: 1.1.1
 
-  use-sync-external-store@1.7.0(react@19.3.0):
+  use-sync-external-store@1.7.0(react@19.3.1):
     dependencies:
-      react: 19.3.0
+      react: 19.3.1
 
   uuid@14.0.3: {}
 
@@ -3074,9 +3092,9 @@ snapshots:
 
   yallist@3.1.1: {}
 
-  zustand@4.5.7(@types/react@19.3.0)(react@19.3.0):
+  zustand@4.5.7(@types/react@19.3.0)(react@19.3.1):
     dependencies:
-      use-sync-external-store: 1.7.0(react@19.3.0)
+      use-sync-external-store: 1.7.0(react@19.3.1)
     optionalDependencies:
       '@types/react': 19.3.0
-      react: 19.3.0
+      react: 19.3.1
