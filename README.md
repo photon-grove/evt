@@ -122,7 +122,9 @@ The v0.9.0 core reshape deprecates the features cut by plan decision D6
 deleted in the next minor release. Each carries a `Deprecated:` godoc notice — pointing at its
 replacement where one exists, and saying plainly where the feature is removed without one:
 
-- `CommitStream` (K1) — commit batched commands through the normal commit path
+- `CommitStream` (K1) — commit batched commands through the normal commit path. The DynamoDB
+  `CommitStream` is already refused (`*dynamo.CommitStreamRefusedError`): its batches write events
+  without maintaining the stream head items
 - snapshot freshness observer / replay estimate / budget (K2) — removed without a Go
   replacement; wrap `Load` with your own metrics (Rust gains structured load telemetry, P9)
 - `StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` (K3) —
@@ -189,12 +191,16 @@ and fences for entity types with retention are refused (the union of the reposit
 types in the marker so every process refuses them). Every commit, single
 or multi-stream, is checked against the shared 100-item / 3.8 MB / 380 KB budget and fails with
 `*evt.CommitTooLargeError` before any write, on every backend. The budget counts the actions a
-commit actually emits, so a single-stream commit leaves room for 98 events and projector
-operations when it creates its stream and 97 when it appends to one (the append adds a
-continuation check on the stream's head); both drop by one when the rebuild-lock check (C10)
-starts being emitted. A commit whose first sequence skips past the stream's stored head is refused
-with `*evt.SequenceGapError`. The exact contract is specified
-in the [storage format](docs/spec/storage-format.md#writes).
+commit actually emits. Every written stream is protected by one conditional update of its **head
+item** (ADR 0007), so a single-stream commit leaves room for 98 events and projector operations
+whether it creates its stream or appends to it, and 97 when it also writes a snapshot; all drop by
+one when the rebuild-lock check (C10) starts being emitted. A fence is one check of the same head
+item. A commit whose first sequence skips past the stream's stored head is refused with
+`*evt.SequenceGapError`, and a stream whose head item disagrees with its log fails with
+`*evt.StreamHeadDriftError` (never retried). A store must declare the `stream-heads` feature before
+a writer writes to it; an empty store is declared by its first writer, and a store written before
+head items is migrated first (`*evt.StreamHeadsNotMigratedError` until then). The exact contract is
+specified in the [storage format](docs/spec/storage-format.md#writes).
 
 ### Command outcomes and rejections (v0.9, C3/C4)
 

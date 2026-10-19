@@ -37,10 +37,19 @@ lockstep with the Go types that read and write it:
   key. The unique key gives optimistic concurrency: a duplicate
   `(entity_id, sequence)` insert fails and surfaces as an `evt.ConflictError`,
   classified as transient, so fence-aware retry re-prepares the command.
-  Because compaction deletes keys, a commit also fails with a conflict when its first
-  sequence is at or below the entity's snapshot `event_sequence`.
+  The commit conditions on the stream's row in the head table below, so a commit whose first
+  sequence is at or below the entity's snapshot `event_sequence` also fails with a conflict even
+  though compaction deleted the keys.
   An `entity_type` index backs `StreamFilter` narrowing.
 - `evt_snapshots` — one durable snapshot per entity, keyed by `entity_id`.
+- `evt_events__evt_stream_heads` — one row per written stream (ADR 0007), keyed by `entity_id`:
+  `entity_type` and `head`, the highest event sequence ever committed to the stream. A commit
+  inserts the row (a new stream) or advances it with `UPDATE … WHERE head = first − 1`, and a fence
+  is one read of it, all under the per-entity advisory locks. A head row that disagrees with the log
+  is `*evt.StreamHeadDriftError`. A store that holds data must declare the `stream-heads` feature
+  before a writer writes (`*evt.StreamHeadsNotMigratedError`), and an empty one is declared by its
+  first writer; entity heads read this table once it is declared, and the aggregate over events and
+  snapshots until then. Run `EnsureSchema` to create it.
 - `evt_events__evt_command_outcomes` — one row per command (v0.9, C3), keyed by `command_id`:
   `status`, the identity `digest`, the stored `response`, the `events` the commit wrote, and a
   rejection's `rejection` and `code`. The row is inserted last in the commit transaction; a unique

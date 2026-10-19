@@ -11,9 +11,32 @@ event log ──DynamoDB Stream──▶ publisher ──▶ SNS topic ──┬
 ```
 
 Use SNS fan-out: one publisher reads the DynamoDB Stream and republishes each
-**`INSERT`** to SNS. Consumers subscribe, usually through SNS→SQS with raw delivery,
+**`INSERT`** of an event to SNS. Consumers subscribe, usually through SNS→SQS with raw delivery,
 and can scale and fail independently while the publisher remains the only stream
 reader. The `publishers` and `projectors` packages provide the Lambda runtimes.
+
+### Head items are not events
+
+Every written stream also has a **head item** at `sk = -1` (ADR 0007, [storage
+format](spec/storage-format.md#stream-heads)), updated by every commit that writes the stream. The
+stream therefore carries one `INSERT` for it with a stream's first commit, one `MODIFY` per later
+commit, and one record per stream from the head migration. They are concurrency metadata, not
+events, and a consumer skips them. The consumers in this module do: `stream.DynamoDBHandler` drops
+such `INSERT` records, `stream.SNSPublisher` counts them as skipped (not as malformed events), and
+`projectors.NewLambdaHandler` skips any record whose sort key is below 1 (as it does the
+snapshot at `sk = 0`). A consumer you write decodes `NEW_IMAGE`, so skip `sk < 1` the same way.
+
+An event source mapping or EventBridge Pipe filter can drop them before your function runs. The
+keys are on every record, including `KEYS_ONLY` views:
+
+```json
+{ "dynamodb": { "Keys": { "sk": { "N": [{ "anything-but": ["-1", "0"] }] } } } }
+```
+
+(`"0"` also drops the snapshot, which consumers already skip.) A `KEYS_ONLY` consumer that wakes on
+every record, such as a journal reader, fires on every head update unless it filters, so give it the
+filter above. Deploy the filter or the skip **before** the head migration: the backfill emits one
+record per stream.
 
 Every consumer follows the same reliability contract: process records
 independently, return **partial-batch failures** so only affected records retry,

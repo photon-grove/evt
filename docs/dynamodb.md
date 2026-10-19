@@ -36,27 +36,47 @@ A single table holds events and inline snapshots for every entity.
 - `sk` (`N`) — the event sequence (`1, 2, 3, …`)
 - `sk = 0` — the inline **snapshot** row for that entity
 - plus `type`, `version`, `entityType`, `payload`, and `metadata` attributes
+- `sk = -1` — the stream's **head item** (`head`, and `ttl` for retained types), the one item a
+  commit conditions on for concurrency ([Stream Heads](spec/storage-format.md#stream-heads))
 - optional `ttl` (`N`) when a [retention](#retention) policy applies
 - **DynamoDB Streams** with `NEW_IMAGE` when using async [projectors](streams.md)
 
 Event rows are **append-only and protected by conditional writes** — a commit only
 succeeds if the next sequence is unclaimed, which is how concurrent writers on one
-entity stay correctly ordered. Each commit also checks the `sk = 0` snapshot row: a
-commit that starts at or below the snapshot's `eventSequence` is rejected, so a writer
-that loaded before a compaction cannot recreate the deleted events. Every v0.9 commit also carries a
-feature-marker check, and a commit that appends to an existing stream also pins the stream's head
-with a continuation check, so no sequence is ever skipped ([Continuity](spec/storage-format.md#continuity)).
-Of the 100 transaction items, a single-stream commit that creates its stream reserves two (floor +
-marker), leaving **98 event/projector operations**, and one that appends to an existing stream
-reserves three (continuation + floor + marker), leaving **97**. A commit with a snapshot leaves
-the same numbers: the snapshot put replaces the floor check. These checks are billed as writes. The
-commit budget counts only the actions a commit actually emits.
+entity stay correctly ordered. Each written stream also starts its group with one conditional
+`Update` of its head item: `head = first − 1` (or `attribute_not_exists(head)` for a stream that
+starts at 1), so no sequence is ever skipped and a commit that starts at or below a snapshot's
+`eventSequence` is rejected, which keeps a writer that loaded before a compaction from recreating the
+deleted events ([Continuity](spec/storage-format.md#continuity)). Compaction never moves the head,
+so a writer whose load is current never conflicts with it. Every v0.9 commit also carries a
+feature-marker check. Of the 100 transaction items, a single-stream commit reserves two (head
+update + marker), leaving **98 event/projector operations** whether it creates its stream or appends
+to it, and **97** when it also writes a snapshot (the snapshot put sits beside the head update).
+These actions are billed as writes. The commit budget counts only the actions a commit actually
+emits.
+
+**Permissions and billing.** The head update is an `Update` action inside `TransactWriteItems`, so a
+writer's role needs `dynamodb:UpdateItem` on the event-log table as well as `PutItem`,
+`ConditionCheckItem` and `TransactWriteItems`. The first write to a table that does not declare
+`stream-heads` runs one strongly consistent `Scan` to prove the table holds no data
+(`dynamodb:Scan`), and a writer to a table that already declares the feature never scans. Every
+transactional action is billed as two writes of the checked or written item's size, rounded up to
+1 KB; the head item stays well under 1 KB, so a head update or a fence is the cheapest action a commit
+can send, and it no longer scales with the size of a snapshot. (Whether a `ConditionCheck` bills by
+the size of the item it reads is documented only indirectly, and is still to be measured on real
+DynamoDB: [#159](https://github.com/photon-grove/evt/issues/159).)
+
+There are no reads before a commit. A failed commit is told apart by reading the stream on the
+failure path only ([Classification](spec/storage-format.md#failure-classification)). A head item
+that disagrees with its log is `*evt.StreamHeadDriftError`, and a store that holds data without
+declaring the `stream-heads` feature is refused with `*evt.StreamHeadsNotMigratedError` until it is
+migrated; an empty table is declared by its first writer, so a fresh table needs no step.
 
 The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C2/C3/C10) is:
 
 ```text
-items = Σ(events per written stream + 1 snapshot/floor + 1 continuation if first sequence > 1)
-      + 2 × read-only fenced streams
+items = Σ(events per written stream + 1 head update + 1 snapshot put if the commit writes one)
+      + 1 × read-only fenced streams (one head check each)
       + outcome put (when the store records command outcomes)
       + feature-marker check
       + rebuild-lock check (once C10 emits it)
@@ -64,8 +84,8 @@ items = Σ(events per written stream + 1 snapshot/floor + 1 continuation if firs
 ```
 
 With command outcomes enabled (C3), the outcome row is the last action of every commit and counts
-as one more item, so a single-stream commit that creates its stream leaves **97** event/projector
-operations (96 when it appends to an existing stream). The outcome is a `Put` on
+as one more item, so a single-stream commit leaves **97** event/projector operations, creating or
+appending (96 when it also writes a snapshot). The outcome is a `Put` on
 `(command-outcome#<id>, sk = 1)` conditioned on `attribute_not_exists(pk)`; it is read back with a
 strongly consistent `GetItem`, whatever the repository's read-consistency setting. An outcome-only
 commit (an accepted no-op or a persisted rejection) is the feature-marker check plus that put.
@@ -132,13 +152,21 @@ repo := dynamo.NewRepository(client, eventsTable).
     WithRetention(dynamo.Retention{"scratch_job": 24 * time.Hour})
 ```
 
-Only policed types receive `ttl`; durable types never expire. TTL expires items
+Only policed types receive `ttl`; durable types never expire. A retained stream's head item
+carries a `ttl` too, at least that of every other item of the stream and never lowered: each commit
+raises it to the larger of its own and the largest `ttl` this repository loaded for the stream
+(a writer that has not loaded the stream conflicts on the `ttl` condition and passes on its retry),
+and an out-of-band `PutSnapshot` refreshes it in the same transaction. TTL deletion is lazy and
+unordered, so a stream can be partly deleted for a while; a commit that finds a head item absent
+while every remaining item has expired gets a conflict that heals once they are deleted, not
+`StreamHeadDriftError`. TTL expires items
 individually, so an older prefix can disappear while newer events remain. Use
 retention only for streams never replayed and never appended after becoming
 terminal. For accumulating streams, keep a snapshot and use [compaction](#compaction).
 
-**Read fences refuse retained types.** TTL deletion reopens a fenced slot without leaving a
-successor snapshot, so a fence on a retained entity type is refused with a retention conflict.
+**Read fences refuse retained types.** TTL deletion is lazy, so a fence on a retained stream is not
+incarnation-proof (the stream can expire and be created again at the same head), and a fence on a
+retained entity type is refused with a retention conflict.
 The refusal is the union of two sources: this repository's own `WithRetention` configuration
 (checked without any I/O) and the retention set in the durable feature marker. Local
 configuration alone protects only this process. Also declare each retained type in the marker

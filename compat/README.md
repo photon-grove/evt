@@ -11,7 +11,7 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 | `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
 | `fixtures/outcomes.json`  | Go generator | C3/C4 identity-digest vectors (canonical bytes and SHA-256, keyed by `targets`, including a rename whose write set comes from state), the encodings of outcome rows (DynamoDB item, budgeted item size, PostgreSQL row, rejection and event-ID JSON, including both stale-fence rejections and a rejection that lists the events it committed), the canonical text of rejection-detail numbers, and the C5 retry-policy defaults both languages assert. |
 | `fixtures/feature-marker.json` | Go generator | C9 canonical manifest JSON, complete DynamoDB marker items, PostgreSQL declaration rows, ordered commit requests, and schema-upgrade DDL. |
-| `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items, SNS messages, sequences, and loaded state.                                                                                             |
+| `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items (including the stream head item at `sk = -1`), the stream's `head` (the PostgreSQL heads row), SNS messages, sequences, and loaded state. |
 
 Both sides implement the same account domain: `internal/compat/account.go` and
 `crates/evt-compat/src/account.rs`. Keep them identical, field for field and rule for rule.
@@ -25,8 +25,12 @@ Both sides implement the same account domain: `internal/compat/account.go` and
 | `scripts/compat-integration.sh dynamo`   | Go and Rust take turns writing the same streams in the local DynamoDB emulator, then both verify every stream. |
 | `scripts/compat-integration.sh postgres` | The same against local PostgreSQL.                                                                             |
 
-The marker vectors include duplicate-input set canonicalization and the complete transaction
-order (marker check, projector puts, event puts, snapshot put or floor check). Rust consumes these
+The marker vectors include duplicate-input set canonicalization, the complete transaction order
+(marker check, projector puts, then per written stream its head update, event puts, and snapshot
+put), the marker row a writer stores when it declares `stream-heads` on a fresh table, and, under
+`streamHeads`, the exact actions, expressions, name placeholders, and values of every head request
+shape (create, append, later snapshot, fences, retained streams, and the out-of-band snapshot guard)
+with the commit budget's item sizes. Rust consumes these
 vectors in its fixture tests and DynamoDB transaction tests. With `--features drivers`, the live
 PostgreSQL tests also compare declaration-row bytes and execute both languages' schema DDL in
 either creation/upgrade order.
@@ -57,6 +61,8 @@ changed, and update the spec.
    | `execute`       | `command`, optional `commandId`, `principalId`, `causationId`, `extensions`, `trace`, `address`, `timestamp` | `ok` (with `events`), `rejected`, `duplicate`, or `conflict` |
    | `appendRaw`     | `event` (`type`, `version`, `payload`), optional metadata as above     | `ok` (with `events`) or `conflict`                           |
    | `compact`       | `through`                                                        | `compacted` (with `deleted`) or `uncovered`                  |
+   | `putSnapshot`   | `snapshot` (`sequence`, `payload`), `eventSequence`, optional `suffix` | `ok` (also a no-op regression) or `drift` (the snapshot is ahead of the head, or the stream has no head item) |
+   | `appendRawBypassingHead` | `event` (`type`, `version`, `payload`), optional `suffix`, `commitId` | `ok`: the event is stored and the stream's head item is not updated |
    | `conflictProbe` | `sequence`                                                       | `conflict`, or `ok` when the sequence is free                |
    | `outcomeOnly`   | `identity` (`type`, `payload` object), `response`, `commandId`   | outcomes scenarios: an accepted outcome with no events       |
    | `resolveOutcome`| `command`, `commandId`                                           | outcomes scenarios: `absent`, a replayed outcome, or `reuse` |

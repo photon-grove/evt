@@ -46,6 +46,12 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
 - `pk` + `sk` combination must be unique (enforced by conditional write)
 - `sk` (sequence) starts at 1 and increments monotonically per entity
 - `sk` = 0 is reserved for inline snapshots (filtered out by event queries)
+- `sk` = -1 is reserved for the stream's **head item** (ADR-0007): `pk`, `sk`, `head` (the highest
+  event sequence ever committed to the stream), and `ttl` for retained types only. It is written
+  only by the commit transaction that writes the events it counts (and by the migration), it only
+  increases, and it equals the stream's derived head (the larger of its highest event and its
+  snapshot's `eventSeq`). No event or snapshot query, `latest(n)`, or compaction range returns it,
+  and every scan, enumeration, heads read, and stream consumer skips `sk < 1`
 - `ttl` is written **only** for entity types covered by a `Repository` retention policy
   (`WithRetention`); every other row omits the attribute entirely (`json:"ttl,omitempty"`) and is
   never auto-expired. It is a no-op unless the table has DynamoDB TTL enabled on the `ttl` attribute.
@@ -82,6 +88,10 @@ Snapshots are stored inline in the events table at `sk=0` for each entity:
 - `eventSeq >= seq` always (usually `eventSeq >> seq`)
 - Conditional write checks `seq` to prevent race conditions
 - Event queries filter out `sk=0` rows automatically
+- A snapshot never covers more than its stream's head item: a commit raises `head` to at least
+  every snapshot it writes, and an out-of-band snapshot write (`PutSnapshot`) adds the head item to
+  its transaction (`head >= :new`, or the head item absent for `:new = 0`) and refuses a snapshot
+  ahead of the stream with `*StreamHeadDriftError`
 
 ### Views Table
 
@@ -193,6 +203,25 @@ Error() → err.Error()  // Returns underlying error message
 - Returns `(bool, int)` where int is the index of the failed item
 - Race condition message: `"race condition - sequence number updated since it was read, try again"`
 
+### StreamHeadDriftError and StreamHeadsNotMigratedError (ADR-0007)
+
+- `*StreamHeadDriftError` (`evt.ErrStreamHeadDrift`; Rust `Error::StreamHeadDrift`) carries the
+  stream ID, the stored head (or absent), and the derived head. It means a stream's head item
+  disagrees with its log: a writer appended without maintaining the head, events were deleted, or a
+  snapshot is ahead of the head. It is **not** a conflict and not transient; fence-aware retry
+  returns it at once, writes no outcome row, and never records a `stale-fence` rejection for it
+- Failures rank: feature-marker check, rebuild-lock check, outcome put (`OutcomeConflictError`),
+  `StreamHeadDriftError`, `SequenceGapError`, then any other conflict (a head update, an event put,
+  a snapshot put, or a fence check, then projector conditions), identically on every backend. A
+  failed head update or fence is classified by reading the stream (derive the head, read the head
+  item, re-derive when the head is ahead); a head update that passed beside a failed event put is
+  drift
+- `*StreamHeadsNotMigratedError` (`evt.ErrStreamHeadsNotMigrated`; Rust
+  `Error::StreamHeadsNotMigrated`) refuses a write to a store whose feature marker does not declare
+  `stream-heads` while the store holds data: every write path that validates the marker (commits,
+  including outcome-only and rejection commits, `PutSnapshot`, `CompactBelow`) returns it. A store
+  with no data is declared by its first writer. It is not a conflict and not transient
+
 ## Transaction System
 
 ### TransactionGroup Interface
@@ -220,11 +249,11 @@ type TransactionGroup interface {
 ### Transaction Limits
 
 - DynamoDB supports up to 100 items per transaction
-- A commit without a snapshot adds one `ConditionCheck` on the entity's `sk = 0` item (the floor
-  check). It counts toward the 100 items and is billed as a write
-- `CommitStream` (deprecated in v0.9.0, K1) batches items to stay under this limit, counting one
-  floor `ConditionCheck` per
-  entity, at the lowest sequence the batch commits for it, whatever order results arrive in
+- Every written stream adds one `Update` of its head item (`sk = -1`) to the commit, whether it
+  creates the stream or appends to it, and whether or not it writes a snapshot. It counts toward
+  the 100 items and is billed as a write
+- The DynamoDB `CommitStream` (deprecated in v0.9.0, K1) is refused with
+  `*dynamo.CommitStreamRefusedError`: its batches would write events with no head update
 
 The v0.9 core reshape adds further transaction items — read-fence checks, the command-outcome row,
 and the feature-marker and rebuild-lock checks — with a pinned item ordering and budget formula in
@@ -237,13 +266,14 @@ error before any write and is never split.
   `.Snapshots` for more than one entity ID), plus projector operations, in a single transaction:
   all streams land or none does
 - The engine pins the write order bytewise by stream ID regardless of declaration order; each
-  stream keeps its own ascending sequences and its own snapshot-put-or-floor-check suffix
+  stream keeps its own ascending sequences, preceded by its own head update and followed by its
+  snapshot put when it writes one
 - Every event of the commit carries one `commitId` (see Metadata Structure)
-- Each written stream continues exactly from its stored head (the larger of its highest event and
-  its snapshot's event sequence): a first sequence that skips ahead is refused with
-  `*SequenceGapError` / `Error::SequenceGap` before any write, and on DynamoDB the observed head is
-  pinned in the transaction (a continuation check on the head event, or the snapshot's `eventSeq`
-  once compaction deleted it)
+- Each written stream continues exactly from its stored head: a first sequence that skips ahead
+  is refused with `*SequenceGapError` / `Error::SequenceGap`, and on DynamoDB the head item is
+  conditioned in the transaction (`head = first - 1`, or `attribute_not_exists(head)` for a stream
+  that starts at 1), so nothing is read before the commit. The gap is told apart from a conflict
+  only when that condition fails, by the failure-path probe
 - Multi-stream transactions require a repository that declares `evt.TransactionalRepository`;
   `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
   before dispatching anything
@@ -253,15 +283,16 @@ error before any write and is never split.
   (`ProjectorOnlyCommitError` / `Error::ProjectorWithoutEvents`): views are projections of
   committed events (ADR-0012). An empty command ID is treated as absent when deriving the commit ID
   in both languages
-- The shared budget counts the whole commit — every stream's events, snapshot/floor items, fence
-  checks, projector operations, and the control checks — and a commit over any limit fails with
+- The shared budget counts the whole commit — every stream's events, head update and snapshot,
+  fence checks, projector operations, and the control checks — and a commit over any limit fails with
   `CommitTooLargeError` before any write, identically on every backend and in both languages
 
 ### Read Fences (v0.9, C2)
 
-- A read-only stream observed during a transaction is fenced with a `ConditionCheck` on
-  `(pk, sk = head + 1)` plus a mandatory snapshot companion on `(pk, sk = 0)`, so a compaction
-  that deletes the checked slot (the append → snapshot → compact ABA) still fails a stale fence
+- A read-only stream observed during a transaction is fenced with one `ConditionCheck` on its head
+  item (`head = :head`, or `attribute_not_exists(head)` for a stream the reader saw empty). The head
+  only increases, so the append → snapshot → compact ABA cannot pass a stale fence: there is no
+  snapshot companion
 - A fence conflict fails the whole commit and surfaces as `*FenceConflictError` carrying the
   fenced stream ID, its fenced head, and the fence's provenance — never a transaction item
   index, which is internal and differs by backend. It unwraps to a conflict. An engine-filled
@@ -271,8 +302,7 @@ error before any write and is never split.
 - Fences for entity types in the feature manifest's durable `retention` set are refused with
   `*RetentionConflictError` — the refusal consults the manifest, so it binds writers that
   configured no retention themselves
-- A written stream's event put at `head + 1` supersedes its own fence; no fence check is emitted
-  for it
+- A written stream's head update supersedes its own fence; no fence check is emitted for it
 
 ### Command Outcomes (v0.9, C3)
 
@@ -378,7 +408,7 @@ error before any write and is never split.
   (`Reject`, `Decision::reject`) keep discarding staged events, and a rejection without events is
   byte-for-byte the plain rejection
 - The events and the rejected row are one atomic commit under the rules of an accepted commit:
-  continuity, floor and snapshot checks, read fences, reserved streams refused, projector
+  the head condition, snapshot checks, read fences, reserved streams refused, projector
   operations only with an event behind them, the budget counting the outcome item. The rejected
   row lists the event IDs it wrote (same order as an accepted row), a conflict writes neither, and
   no response is stored with a rejection
@@ -405,7 +435,7 @@ error before any write and is never split.
   `compat/fixtures/outcomes.json`. There is no wait after the last attempt, and a Go wait ends with
   the context's error
 - A failure is classified by the transaction item that failed. An optimistic-concurrency conflict
-  at commit time (event put, floor or snapshot condition, continuity check, engine-filled fence,
+  at commit time (head update, event put, snapshot condition, engine-filled fence,
   DynamoDB `TransactionConflict`) re-prepares the command: the outcome row is read again, the
   aggregates are loaded again, and the handler or prepare step runs again from scratch. Throttling,
   an ambiguous write whose row never appeared, and a load that found a sequence gap are retried
@@ -585,19 +615,20 @@ evt.Metadata{
 
 - Empty events: no-op, returns nil
 - Rejects events whose sequences are not contiguous for an entity, before writing
-- Builds `TransactWriteItem` with conditional expression `attribute_not_exists(sk)`
-- Adds a `ConditionCheck` on the entity's `sk = 0` item: `attribute_not_exists(eventSeq) OR
-eventSeq < :first`, so a commit cannot write at or below a snapshot's floor after compaction
-  deleted those keys
+- Builds `TransactWriteItem` with conditional expression `attribute_not_exists(sk)` per event put
+- Starts each written stream's group with an `Update` of its head item (`sk = -1`):
+  `attribute_not_exists(head)` when the stream starts at 1, `head = :prev` (the first sequence minus
+  one) otherwise, so a commit cannot write at or below a snapshot's floor after compaction deleted
+  those keys, and cannot skip a sequence. Nothing is read before the commit
 - Includes any transaction groups from projectors
 
 ### CommitWithSnapshot
 
 - Same as Commit, plus snapshot item
 - Snapshot conditional for the first snapshot (sequence 1): `attribute_not_exists(seq)`
-- Snapshot conditional for later snapshots: `seq = :seq AND eventSeq < :first`, where `:seq` is the
-  new sequence minus one. The floor check is folded into the snapshot put because a transaction
-  cannot touch `sk = 0` twice
+- Snapshot conditional for later snapshots: `seq = :seq`, where `:seq` is the new sequence minus
+  one. Continuity and the floor are the head update's, so the snapshot put carries the sequence
+  chain only
 
 ### GetEvents
 
@@ -660,7 +691,7 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   derived `{events}__evt_features` table and holds the same JSON text.
 - Any writer that does not support a declared `(name, formatVersion)` pair refuses to write, with a
   typed `evt.UnsupportedFeatureError`.
-- Every DynamoDB commit, including each `CommitStream` batch, carries a mandatory `ConditionCheck` on the marker
+- Every DynamoDB commit carries a mandatory `ConditionCheck` on the marker
   (`attribute_not_exists(pk) OR version = :v`; a store that never declared features validates
   against `attribute_not_exists(pk)`), ordered first in the transaction. A writer validates the
   feature set once, at first write, and caches the version; a declaration bumps the version in the
@@ -729,7 +760,10 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 - Deletes events with `sequence` in `[1, throughSequence]`
 - Refuses with `evt.ErrCompactionUncovered` unless a snapshot covers the range
   (`snapshot.EventSequence >= throughSequence`)
-- Never deletes the `sk = 0` snapshot; `throughSequence < 1` is a no-op; idempotent
+- Never deletes the `sk = 0` snapshot or the stream's head item, and never moves the head, so a
+  writer whose load is still current never conflicts with a compaction; `throughSequence < 1` is a
+  no-op; idempotent
+- Refuses a store that does not declare `stream-heads` with `*StreamHeadsNotMigratedError`
 - Refuses unsupported feature declarations and history-dependent entity types from the durable
   feature marker, including declarations made by other repository handles
 - DynamoDB: strongly consistent key-only range query + `TransactWriteItems` batches of at most
@@ -743,7 +777,8 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 
 ### Delete (build-tagged `//go:build !prod`)
 
-- Raw, snapshot-unsafe point-delete by `(pk, sk)`; for local/staging fixtures only
+- Raw, snapshot-unsafe point-delete by `(pk, sk)`; for local/staging fixtures only. It also deletes
+  the head item of every stream it names, or the stream could not be created again
 - Excluded from production builds (`-tags prod`); released binaries set this tag
 - Use `CompactBelow` for principled, snapshot-verified truncation instead
 
@@ -759,10 +794,11 @@ DynamoDB and PostgreSQL both run it with `SupportsSnapshots` and `EnforcesOptimi
 - **Per-entity sequence uniqueness** — for a given entity, each `EventSequence` is written at most
   once. Sequences start at 1 and increase by 1 per committed event.
 - **Optimistic concurrency on commit** — a commit that reuses an already-committed `(EntityID,
-EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with a conditional
-  write (`attribute_not_exists(sk)`); PostgreSQL with the `(entity_id, sequence)` primary key, whose
-  unique violation surfaces as an `evt.ConflictError`, classified as transient so retry
-  re-prepares it. A backend must report every such conflict so that `evt.IsOptimisticConflict`
+EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this with the head item's
+  conditional update (`head = first - 1`, or `attribute_not_exists(head)`) and the event puts'
+  `attribute_not_exists(sk)`; PostgreSQL with its head statement under the entity lock and the
+  `(entity_id, sequence)` primary key, whose conflict surfaces as an `evt.ConflictError`, classified
+  as transient so retry re-prepares it. A backend must report every such conflict so that `evt.IsOptimisticConflict`
   matches (`evt.ErrOptimisticConflict` or a `ConflictError`): fence-aware retry keys off it. (The in-memory backend is a permissive test
   double and does not enforce this — `SuiteOptions.EnforcesOptimisticConcurrency` is false for it.)
 - **Stable event ordering** — `GetEvents` returns an entity's events in ascending sequence order,

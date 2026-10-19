@@ -2,11 +2,13 @@
 
 ## Status
 
-Proposed (2026-10-18). Design only: no code lands until this ADR is accepted. Tracking: matrix row
-C12 in [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md) and
-[#159](https://github.com/photon-grove/evt/issues/159). The normative draft is the
-[Stream Heads](../spec/storage-format.md#stream-heads-proposed-adr-0007) section of the storage
-spec, which is marked proposed and leaves every existing paragraph untouched.
+Accepted (2026-10-18). Tracking: matrix row C12 in
+[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md) and
+[#159](https://github.com/photon-grove/evt/issues/159). The core commit path is implemented in Go
+and Rust (the first of two changes); the migration tool (`evt-doctor migrate-heads`) and the
+real-DynamoDB billing measurement follow. The normative text is the
+[Stream Heads](../spec/storage-format.md#stream-heads) section of the storage spec, and the
+sections of the spec that describe commits, fences, and failures follow it.
 
 **Decided:** the migration from v0.8 storage is a stop-the-world procedure (stop writers, backfill,
 verify, declare the marker feature, start the new writers). The project is greenfield, so there is

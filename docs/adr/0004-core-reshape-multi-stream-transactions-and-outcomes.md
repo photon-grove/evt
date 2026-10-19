@@ -8,7 +8,7 @@ commit-wide projectors, `latest(n)` and reserved namespaces, the feature marker,
 fence, and shared conformance. Tracking:
 [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
 
-_Amended by [ADR 0007](0007-per-stream-head-item.md) (proposed): a per-stream head item replaces the
+_Amended by [ADR 0007](0007-per-stream-head-item.md): a per-stream head item replaces the
 continuation check, the floor check, and the fence's snapshot companion in C1 and C2._
 
 ## Context

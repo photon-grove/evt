@@ -122,6 +122,11 @@ consumer repos). Backends opt in by implementing the methods; `dynamo` and `mem`
   next sequence is always above the floor. Durable commit-side floor enforcement (e.g. a tombstone
   the commit path checks) is noted as future hardening for deployments that hold load contexts open
   across a snapshot and a compaction.
+- **Amendment (ADR 0007): the head item enforces the floor.** The floor check and the snapshot put's
+  `eventSeq < :first` term below are superseded by the stream's head item: a commit conditions on
+  `head = first - 1`, and a snapshot never covers more than the head, so a commit at or below the
+  snapshot's `eventSeq` still conflicts without any transaction item on `sk = 0`. Compaction never
+  touches the head item. See `docs/spec/storage-format.md`, Stream Heads.
 - **Amendment (2026-10-12): the floor is enforced on commit.** The stale-context window also let the
   stale commit's projector operations apply, regressing views. Commits now reject a first sequence at
   or below the snapshot's `eventSeq`. DynamoDB adds a `ConditionCheck` on the `sk = 0` item
