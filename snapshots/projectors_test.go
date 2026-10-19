@@ -112,6 +112,10 @@ type summary struct {
 
 func (s *summary) Name() string { return "summary" }
 
+// History: summary reads each stream's events, so the counter type is history-dependent and every
+// row it writes is owned by a stream the commit wrote.
+func (s *summary) History() []evt.EntityType { return []evt.EntityType{counterType} }
+
 func (s *summary) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
 	s.calls = append(s.calls, commit)
 
@@ -122,7 +126,8 @@ func (s *summary) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt
 
 	for _, stream := range commit.Streams {
 		events += len(stream.Events)
-		operations = append(operations, evt.PutView("totals", string(stream.EntityID), stream.EntityID, stream.EntityType, stream.State))
+		operations = append(operations,
+			evt.PutView("totals", string(stream.EntityID), stream.EntityID, stream.EntityType, stream.State).OwnedBy(stream.EntityID))
 	}
 
 	row, err := json.Marshal(map[string]int{"streams": len(commit.Streams), "events": events})
@@ -130,13 +135,15 @@ func (s *summary) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt
 		return nil, err
 	}
 
-	return append(operations, evt.PutView("commits", commit.CommitID, "", "", row)), nil
+	return append(operations, evt.PutView("commits", commit.CommitID, "", "", row).OwnedBy(commit.Streams[0].EntityID)), nil
 }
 
 // auditor is a second projector, to pin declaration order.
 type auditor struct{}
 
 func (auditor) Name() string { return "auditor" }
+
+func (auditor) History() []evt.EntityType { return nil }
 
 func (auditor) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
 	return []evt.ViewOperation{evt.PutView("audit", commit.CommitID, "", "", []byte(`{}`))}, nil
@@ -147,11 +154,26 @@ func (auditor) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.Vi
 type recording struct {
 	evt.OutcomeRepository
 
-	results []evt.SerializedResult
-	before  func()
+	results  []evt.SerializedResult
+	declared []evt.EntityType
+	before   func()
 }
 
 func (r *recording) AtomicTransactions() {}
+
+// WritesViews and DeclareHistoryDependent forward the capabilities a decorator would otherwise hide.
+func (r *recording) WritesViews() {}
+
+func (r *recording) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
+	r.declared = append(r.declared, types...)
+
+	declarer, ok := r.OutcomeRepository.(evt.HistoryDeclarer)
+	if !ok {
+		return &evt.HistoryDeclarationUnsupportedError{Repository: "recording"}
+	}
+
+	return declarer.DeclareHistoryDependent(ctx, types...)
+}
 
 func (r *recording) Commit(ctx context.Context, result evt.SerializedResult) error {
 	if r.before != nil {
@@ -410,7 +432,8 @@ func TestCommitProjectors_AProjectorFailureIsAnInternalFailure(t *testing.T) {
 
 type failing struct{ err error }
 
-func (failing) Name() string { return "failing" }
+func (failing) Name() string              { return "failing" }
+func (failing) History() []evt.EntityType { return nil }
 func (f failing) ProjectCommit(context.Context, evt.CommitView) ([]evt.ViewOperation, error) {
 	return nil, f.err
 }
@@ -444,7 +467,8 @@ func TestCommitProjectors_AFailedConditionIsNotRetriedAndRecordsNoOutcome(t *tes
 // claimer claims the handle "ada" for whichever stream it projects: the second claim fails.
 type claimer struct{ taken error }
 
-func (claimer) Name() string { return "claims" }
+func (claimer) Name() string              { return "claims" }
+func (claimer) History() []evt.EntityType { return nil }
 func (c claimer) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
 	return []evt.ViewOperation{
 		evt.PutView("handles", "ada", commit.Streams[0].EntityID, counterType, []byte(`{}`)).IfAbsent().OnConflict(c.taken),
@@ -478,12 +502,13 @@ func TestCommitProjectors_ReplayingTheStoredEventsReproducesTheOperations(t *tes
 	// after the commit, and run the projectors again. They must write the same operations.
 	var stored []evt.SerializedEvent
 	for _, id := range []evt.EntityID{"a", "b"} {
-		events, err := repo.GetEvents(ctx, id)
-		require.NoError(t, err)
+		events, gerr := repo.GetEvents(ctx, id)
+		require.NoError(t, gerr)
 		stored = append(stored, events...)
 	}
 
-	groups := evt.GroupCommits(stored)
+	groups, err := evt.GroupCommits(stored)
+	require.NoError(t, err)
 	require.Len(t, groups, 6)
 
 	replayed := &summary{}
@@ -559,4 +584,116 @@ func TestCommitProjectors_AMappedErrorThatLooksLikeAConflictIsNotRetried(t *test
 	outcome, err := repo.GetOutcome(ctx, "second")
 	require.NoError(t, err)
 	require.Nil(t, outcome)
+}
+
+func TestCommitProjectors_AHistoryDependentProjectorIsDeclaredDurablyBeforeItsFirstCommit(t *testing.T) {
+	recorder, repo := newRecording(t)
+	store := snapshots.NewStore(recorder, 1).WithCommitProjectors(&summary{}, auditor{})
+	ctx := context.Background()
+
+	require.NoError(t, store.Execute(ctx, &counter{}, "c-1", &bump{By: 1}, commandID("cmd-1")))
+	require.NoError(t, store.Execute(ctx, &counter{}, "c-1", &bump{By: 1}, commandID("cmd-2")))
+
+	require.Equal(t, []evt.EntityType{counterType}, recorder.declared, "declared once, not on every commit")
+
+	manifest, err := repo.Manifest(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []evt.EntityType{counterType}, manifest.HistoryDependent)
+
+	// The declaration is durable and shared: a writer that never registered the projector is
+	// refused compaction of the type, because the commits a rebuild replays must stay.
+	_, err = repo.CompactBelow(ctx, "c-1", 1)
+	require.True(t, evt.IsHistoryDependentProjectionErr(err), "got %v", err)
+}
+
+func TestCommitProjectors_ACurrentStateProjectorDeclaresNothingAndSeesNoEvents(t *testing.T) {
+	recorder, repo := newRecording(t)
+	store := snapshots.NewStore(recorder, 1).WithCommitProjectors(auditor{})
+	ctx := context.Background()
+
+	require.NoError(t, store.Execute(ctx, &counter{}, "c-1", &bump{By: 1}, commandID("cmd-1")))
+	require.NoError(t, store.Execute(ctx, &counter{}, "c-1", &bump{By: 1}, commandID("cmd-2")))
+
+	require.Empty(t, recorder.declared)
+
+	deleted, err := repo.CompactBelow(ctx, "c-1", 1)
+	require.NoError(t, err, "no history is declared, so compaction is free")
+	require.Equal(t, 1, deleted)
+}
+
+// bare is a repository written before v0.9: it declares neither view writing nor history.
+type bare struct{ evt.OutcomeRepository }
+
+func (bare) AtomicTransactions() {}
+
+func TestCommitProjectors_ARepositoryThatDoesNotWriteViewsIsRefusedBeforeAnyWrite(t *testing.T) {
+	inner, repo := newRecording(t)
+	store := snapshots.NewStore(bare{inner}, 0).WithCommitProjectors(auditor{})
+
+	err := store.Execute(context.Background(), &counter{}, "c-1", &bump{By: 1}, commandID("cmd-1"))
+
+	var unsupported *evt.ViewsUnsupportedError
+
+	require.ErrorAs(t, err, &unsupported)
+	require.Empty(t, inner.results)
+
+	events, gerr := repo.GetEvents(context.Background(), "c-1")
+	require.NoError(t, gerr)
+	require.Empty(t, events, "the events were not committed without their views")
+}
+
+// viewsOnly writes views but cannot declare history.
+type viewsOnly struct{ bare }
+
+func (viewsOnly) WritesViews() {}
+
+func TestCommitProjectors_ARepositoryThatCannotDeclareHistoryRefusesAHistoryDependentProjector(t *testing.T) {
+	inner, _ := newRecording(t)
+	store := snapshots.NewStore(viewsOnly{bare{inner}}, 0).WithCommitProjectors(&summary{})
+
+	err := store.Execute(context.Background(), &counter{}, "c-1", &bump{By: 1}, commandID("cmd-1"))
+
+	var unsupported *evt.HistoryDeclarationUnsupportedError
+
+	require.ErrorAs(t, err, &unsupported)
+	require.Empty(t, inner.results)
+}
+
+// unmarshalable cannot be encoded as JSON, so serializing its state fails.
+type unmarshalable struct {
+	counter
+
+	Broken func() `json:"broken"`
+}
+
+func (u *unmarshalable) Handle(ctx context.Context, command evt.Command) (evt.CommandResult, error) {
+	if _, ok := command.(*ping); ok {
+		return evt.CommandResult{}, nil // accepted, with no events
+	}
+
+	return u.counter.Handle(ctx, command)
+}
+
+type ping struct{}
+
+func (*ping) Type() evt.CommandType      { return "counter:ping" }
+func (*ping) EntityType() evt.EntityType { return counterType }
+
+func TestCommitProjectors_ACommitThatWritesNoEventNeverEncodesState(t *testing.T) {
+	recorder, repo := newRecording(t)
+	store := snapshots.NewStore(recorder, 0).WithCommitProjectors(auditor{})
+	ctx := context.Background()
+
+	// Encoding this aggregate's state fails. A no-op writes no event, so no projector runs and no
+	// state is encoded: the command succeeds, as it does without projectors.
+	require.NoError(t, store.Execute(ctx, &unmarshalable{}, "c-1", &ping{}, commandID("noop")))
+
+	for _, result := range recorder.results {
+		require.Empty(t, result.Views)
+		require.Empty(t, result.Events)
+	}
+
+	events, err := repo.GetEvents(ctx, "c-1")
+	require.NoError(t, err)
+	require.Empty(t, events)
 }

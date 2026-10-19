@@ -217,6 +217,7 @@ mapped errors. The rows commit in the same transaction as the events, so a cross
 ```go
 type CommitProjector interface {
     Name() string
+    History() []EntityType // the entity types whose events it reads; none: current-state
     ProjectCommit(context.Context, CommitView) ([]ViewOperation, error)
 }
 
@@ -225,7 +226,10 @@ store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{})
 
 A commit-wide projector must be a **pure function of its `CommitView`**: no clock, random source,
 environment, or store reads, and no state kept between calls. That is what lets a rebuild
-reproduce its rows by regrouping the stored events by commit ID (`evt.GroupCommits`). It runs once
+reproduce its rows by regrouping the stored events by commit ID (`evt.GroupCommits`). One that
+reads events declares their entity types in `History()`: the store durably marks them
+history-dependent so they are never compacted, and each of its operations names the stream that
+owns its row, because a stream's sequence is the only commit order the log keeps. It runs once
 per commit that writes at least one event, again each time fence-aware retry re-prepares the
 command, and not for commands that write no event. When an operation's condition fails the commit
 fails with a typed `*evt.ProjectorOperationError` naming the projector and the operation; it is not

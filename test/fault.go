@@ -4,6 +4,7 @@ package test
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/photon-grove/evt"
 )
@@ -29,6 +30,21 @@ func NewFaultRepository(repo evt.Repository) (*FaultRepository, error) {
 	}
 
 	return &FaultRepository{OutcomeRepository: outcomes}, nil
+}
+
+// WritesViews forwards the capability of the wrapped repository (evt.ViewWritingRepository): a
+// decorator hides it unless it declares it too.
+func (f *FaultRepository) WritesViews() {}
+
+// DeclareHistoryDependent forwards to the wrapped repository (evt.HistoryDeclarer), or refuses when
+// it cannot declare.
+func (f *FaultRepository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
+	declarer, ok := f.OutcomeRepository.(evt.HistoryDeclarer)
+	if !ok {
+		return &evt.HistoryDeclarationUnsupportedError{Repository: fmt.Sprintf("%T", f.OutcomeRepository)}
+	}
+
+	return declarer.DeclareHistoryDependent(ctx, types...)
 }
 
 // Commit runs the interceptor, or the real commit when none is set.

@@ -562,6 +562,21 @@ transaction as the events. The byte-level rules are in the
   row that records something that happened only outside the event log (a mutable decision, an
   external signal, a verdict) is a latent data-loss bug: event-source it first, then project it.
 
+**Kinds, history, and ownership**
+
+- `History()` names the entity types whose events the projector reads. None: current-state, given
+  views without events. Otherwise history-dependent: given the events of those types only, and the
+  store durably adds them to the manifest's `historyDependent` set before the first commit that runs
+  it (`CompactBelow` then refuses them in every process). A repository that cannot declare
+  (`evt.HistoryDeclarer`) refuses the commit (`HistoryDeclarationUnsupportedError`).
+- Every operation of a history-dependent projector names an owner stream the commit wrote. A
+  stream's sequence is the only commit order the log keeps (commit IDs are not causal), so writes
+  to a row are ordered by its owner's sequence; `GroupCommits` returns an order every stream agrees
+  with, and `ReplayViews` refuses a row two streams write (`SharedViewKeyError`).
+- A repository must declare `evt.ViewWritingRepository` (Rust `Repository::writes_views`) or the
+  store refuses a commit-wide projector (`ViewsUnsupportedError`); `CheckProjectorOperationsSupported`
+  stays fail-closed for view operations.
+
 **Operations**
 
 - A put (`pk`, `sk`, `entityID`, `entityType`, `payload`) overwrites unless it is `IfAbsent`; a delete

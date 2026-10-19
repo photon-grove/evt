@@ -97,8 +97,8 @@ repo := postgres.NewRepository(pool).WithViewWriter(func(op evt.ViewOperation) (
     case op.Kind == evt.ViewDelete:
         return postgres.ViewStatement{SQL: `DELETE FROM views WHERE pk = $1 AND sk = $2`, Args: []any{op.PK, op.SK}}, nil
     case op.Condition == evt.ViewAbsent:
-        // A plain INSERT: its unique violation is the failed condition.
-        return postgres.ViewStatement{SQL: insert, Args: viewArgs(op)}, nil
+        // A plain INSERT: a violation of the (pk, sk) key constraint is the failed condition.
+        return postgres.ViewStatement{SQL: insert, Args: viewArgs(op), KeyConstraint: "views_pkey"}, nil
     default:
         return postgres.ViewStatement{SQL: insert + ` ON CONFLICT (pk, sk) DO UPDATE SET
             entity_id = EXCLUDED.entity_id, entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload`,
@@ -110,7 +110,9 @@ repo := postgres.NewRepository(pool).WithViewWriter(func(op evt.ViewOperation) (
 The statements run in the commit's transaction after the events and before the snapshots, so a
 writer that lost a race fails on its stream's head (a conflict) before it reaches a view row. The
 repository decides whether an operation's condition held from the statement: an `IfAbsent` put must
-raise a unique violation when the row exists, and an `IfPresent` delete must delete a row. A failed
+raise a unique violation of the `(pk, sk)` key constraint when the row exists (name it in
+`ViewStatement.KeyConstraint`; a unique violation of any other constraint is an ordinary failure),
+and an `IfPresent` delete must delete a row. A failed
 condition is a `*evt.ProjectorOperationError` (reason `ConditionalCheckFailed`), and so is any other
 error the database raises for a view statement (reason: its SQLSTATE); an integrity violation raised
 at `COMMIT`, which only a deferred constraint on your table can cause, is a `*evt.ProjectorError`.

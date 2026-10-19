@@ -146,10 +146,23 @@ func (e *ProjectorOperationsUnsupportedError) Error() string {
 }
 
 // CheckProjectorOperationsSupported returns *ProjectorOperationsUnsupportedError when the result
-// carries any operation of a transaction group. A backend that executes no such group calls it
-// before writing. Commit-wide view operations are not groups: a backend with a place to write them
-// handles them, and one without refuses them with *ViewsNotConfiguredError.
+// carries any projector operation, whether an operation of a transaction group or a commit-wide
+// view operation. A backend that executes neither calls it before writing, so it commits nothing
+// instead of dropping the operations. A backend that executes view operations but no transaction
+// group calls CheckLegacyProjectorOperationsSupported instead.
 func CheckProjectorOperationsSupported(backend string, result SerializedResult) error {
+	if operations := ProjectorOperationCount(result); operations > 0 {
+		return &ProjectorOperationsUnsupportedError{Backend: backend, Operations: operations}
+	}
+
+	return nil
+}
+
+// CheckLegacyProjectorOperationsSupported returns *ProjectorOperationsUnsupportedError when the
+// result carries any operation of a transaction group. A backend that executes commit-wide view
+// operations (SerializedResult.Views) but no transaction group calls it before writing; the view
+// operations are its own to write or refuse (*ViewsNotConfiguredError).
+func CheckLegacyProjectorOperationsSupported(backend string, result SerializedResult) error {
 	if operations := legacyOperationCount(result); operations > 0 {
 		return &ProjectorOperationsUnsupportedError{Backend: backend, Operations: operations}
 	}

@@ -194,7 +194,8 @@ func Test_GroupCommits_RegroupsStoredEventsByCommitID(t *testing.T) {
 		event("a", 4, ""),
 	}
 
-	groups := evt.GroupCommits(stored)
+	groups, err := evt.GroupCommits(stored)
+	require.NoError(t, err)
 	require.Len(t, groups, 5, "two pre-v0.9 events are two commits")
 
 	byID := map[string]evt.CommitView{}
@@ -217,22 +218,32 @@ func Test_GroupCommits_RegroupsStoredEventsByCommitID(t *testing.T) {
 		reversed[len(stored)-1-i] = e
 	}
 
-	require.Equal(t, groups, evt.GroupCommits(reversed))
-	require.Empty(t, evt.GroupCommits(nil))
+	regrouped, err := evt.GroupCommits(reversed)
+	require.NoError(t, err)
+	require.Equal(t, groups, regrouped)
+
+	none, err := evt.GroupCommits(nil)
+	require.NoError(t, err)
+	require.Empty(t, none)
 }
 
 // directory is a commit-wide projector that records how it was called.
 type directory struct {
-	name  string
-	calls int
-	err   error
-	ops   func(evt.CommitView) []evt.ViewOperation
+	name    string
+	history []evt.EntityType
+	calls   int
+	err     error
+	ops     func(evt.CommitView) []evt.ViewOperation
+	seen    []evt.CommitView
 }
 
 func (d *directory) Name() string { return d.name }
 
+func (d *directory) History() []evt.EntityType { return d.history }
+
 func (d *directory) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
 	d.calls++
+	d.seen = append(d.seen, commit)
 
 	if d.err != nil {
 		return nil, d.err
@@ -333,7 +344,13 @@ func Test_ProjectorOperationCount_CountsViewsAndTheCommitIsRefusedWithoutEvents(
 
 	result.Events = []evt.SerializedEvent{event("a", 1, "c")}
 	require.NoError(t, evt.CheckProjectorOperations(result))
-	require.NoError(t, evt.CheckProjectorOperationsSupported("backend", result), "views are not transaction groups")
+	require.NoError(t, evt.CheckLegacyProjectorOperationsSupported("backend", result), "views are not transaction groups")
+
+	var unsupported *evt.ProjectorOperationsUnsupportedError
+
+	require.ErrorAs(t, evt.CheckProjectorOperationsSupported("backend", result), &unsupported,
+		"the guard stays fail-closed for views: a backend that calls it never drops them")
+	require.Equal(t, 2, unsupported.Operations)
 
 	normalized, err := evt.NormalizeCommit(result)
 	require.NoError(t, err)
@@ -381,4 +398,151 @@ func Test_NewCommitView_GivesEventsTheMetadataAStoredEventHas(t *testing.T) {
 	require.Equal(t, command, *got.CausationID, "the effective causation is the command ID")
 	require.NotNil(t, got.Extensions, "extensions are an empty map, as stored")
 	require.Nil(t, live.Metadata.CausationID, "the caller's event is not changed")
+}
+
+func Test_GroupCommits_OrdersCommitsByEachStreamsSequencesNotByEntityID(t *testing.T) {
+	// Commit x wrote z:1. Commit y wrote z:2 and a:1. Commit w wrote a:2.
+	// Sorted by first event alone, y (a:1) would replay before x (z:1), though z orders x first.
+	groups, err := evt.GroupCommits([]evt.SerializedEvent{
+		event("z", 1, "x"), event("z", 2, "y"), event("a", 1, "y"), event("a", 2, "w"),
+	})
+	require.NoError(t, err)
+
+	order := make([]string, 0, len(groups))
+	for _, group := range groups {
+		order = append(order, group.CommitID)
+	}
+
+	require.Equal(t, []string{"x", "y", "w"}, order, "z orders x before y, and a orders y before w")
+
+	// Commits no stream relates come in a fixed order: by their first event's entity ID and sequence.
+	groups, err = evt.GroupCommits([]evt.SerializedEvent{event("m", 1, "late"), event("b", 1, "early")})
+	require.NoError(t, err)
+	require.Equal(t, "early", groups[0].CommitID)
+	require.Equal(t, "late", groups[1].CommitID)
+}
+
+func Test_GroupCommits_RefusesEventsNoOrderFits(t *testing.T) {
+	// c1 wrote a:1 and b:2; c2 wrote a:2 and b:1. a puts c1 first, b puts c2 first: no live system
+	// writes that.
+	_, err := evt.GroupCommits([]evt.SerializedEvent{
+		event("a", 1, "c1"), event("a", 2, "c2"), event("b", 1, "c2"), event("b", 2, "c1"),
+	})
+
+	var unordered *evt.CommitOrderError
+
+	require.ErrorAs(t, err, &unordered)
+	require.Equal(t, []string{"c1", "c2"}, unordered.Commits)
+}
+
+func Test_ProjectCommit_ACurrentStateProjectorSeesNoEventsAndAHistoryOneOnlyItsTypes(t *testing.T) {
+	commit := evt.NewCommitView([]evt.SerializedEvent{event("a", 1, "c"), event("b", 1, "c")}, nil)
+	commit.Streams[1].EntityType = "other"
+	commit.Streams[1].Events[0].EntityType = "other"
+
+	current := &directory{name: "current", ops: func(evt.CommitView) []evt.ViewOperation { return nil }}
+	reads := &directory{name: "reads", history: []evt.EntityType{"account"}, ops: func(evt.CommitView) []evt.ViewOperation {
+		return []evt.ViewOperation{put("pk", "a").OwnedBy("a")}
+	}}
+
+	_, err := evt.ProjectCommit(context.Background(), []evt.CommitProjector{current, reads}, commit)
+	require.NoError(t, err)
+
+	for _, stream := range current.seen[0].Streams {
+		require.Empty(t, stream.Events, "a current-state projector reads state only")
+	}
+
+	require.Len(t, reads.seen[0].Streams[0].Events, 1, "the account stream's events are visible")
+	require.Empty(t, reads.seen[0].Streams[1].Events, "an undeclared type's events are not")
+	require.Len(t, commit.Streams[0].Events, 1, "the caller's view is not changed")
+}
+
+func Test_ProjectCommit_AHistoryDependentOperationNamesAnOwnerTheCommitWrote(t *testing.T) {
+	commit := evt.NewCommitView([]evt.SerializedEvent{event("a", 1, "c")}, nil)
+	project := func(op evt.ViewOperation) error {
+		_, err := evt.ProjectCommit(context.Background(), []evt.CommitProjector{&directory{
+			name: "reads", history: []evt.EntityType{"account"},
+			ops: func(evt.CommitView) []evt.ViewOperation { return []evt.ViewOperation{op} },
+		}}, commit)
+
+		return err
+	}
+
+	require.NoError(t, project(put("pk", "sk").OwnedBy("a")))
+
+	var invalid *evt.InvalidViewOperationError
+
+	require.ErrorAs(t, project(put("pk", "sk")), &invalid, "no owner")
+	require.ErrorAs(t, project(put("pk", "sk").OwnedBy("elsewhere")), &invalid, "an owner the commit did not write")
+
+	// A current-state projector needs no owner.
+	_, err := evt.ProjectCommit(context.Background(), []evt.CommitProjector{&directory{
+		name: "state", ops: func(evt.CommitView) []evt.ViewOperation { return []evt.ViewOperation{put("pk", "sk")} },
+	}}, commit)
+	require.NoError(t, err)
+}
+
+// shared writes one row, "shared", for whichever stream a commit wrote, owned by that stream: the
+// projector Codex described, whose final row depends on the order its commits replay in.
+func shared(owner func(evt.CommitView) evt.EntityID) *directory {
+	return &directory{
+		name: "shared", history: []evt.EntityType{"account"},
+		ops: func(c evt.CommitView) []evt.ViewOperation {
+			id := owner(c)
+
+			return []evt.ViewOperation{evt.PutView("shared", "row", id, "account", []byte(`"`+c.CommitID+`"`)).OwnedBy(id)}
+		},
+	}
+}
+
+func Test_ReplayViews_ReproducesTheLiveRowWhenOneStreamOwnsIt(t *testing.T) {
+	// The row belongs to z. Commit x wrote z:1; commit y wrote z:2 and a:1. Live, y wrote last.
+	// The old order (by first event) replayed y before x and left x's value.
+	stored := []evt.SerializedEvent{event("z", 1, "x"), event("z", 2, "y"), event("a", 1, "y")}
+
+	groups, err := evt.GroupCommits(stored)
+	require.NoError(t, err)
+
+	rows, err := evt.ReplayViews(context.Background(),
+		[]evt.CommitProjector{shared(func(evt.CommitView) evt.EntityID { return "z" })}, groups)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, `"y"`, string(rows[0].Payload), "the later commit of the owner stream wins, as it did live")
+}
+
+func Test_ReplayViews_RefusesARowTwoStreamsWrite(t *testing.T) {
+	// Commit x (stream z) puts the shared row, and the later commit y (stream a) overwrites it. The
+	// log keeps no order between z and a, and entity ID order would replay y first: the final row
+	// would differ from the live one, so the replay is refused instead of guessed.
+	groups, err := evt.GroupCommits([]evt.SerializedEvent{event("z", 1, "x"), event("a", 1, "y")})
+	require.NoError(t, err)
+
+	byStream := func(c evt.CommitView) evt.EntityID { return c.Streams[0].EntityID }
+
+	_, err = evt.ReplayViews(context.Background(), []evt.CommitProjector{shared(byStream)}, groups)
+
+	var sharedKey *evt.SharedViewKeyError
+
+	require.ErrorAs(t, err, &sharedKey)
+	require.Equal(t, "shared", sharedKey.PK)
+	require.ElementsMatch(t, []evt.EntityID{"a", "z"}, []evt.EntityID{sharedKey.First, sharedKey.Second})
+}
+
+func Test_ReplayViews_AppliesDeletesAndSortsTheRows(t *testing.T) {
+	groups, err := evt.GroupCommits([]evt.SerializedEvent{event("a", 1, "c1"), event("a", 2, "c2")})
+	require.NoError(t, err)
+
+	rows, err := evt.ReplayViews(context.Background(), []evt.CommitProjector{&directory{
+		name: "p", history: []evt.EntityType{"account"},
+		ops: func(c evt.CommitView) []evt.ViewOperation {
+			if c.CommitID == "c2" {
+				return []evt.ViewOperation{evt.DeleteView("pk", "gone").OwnedBy("a")}
+			}
+
+			return []evt.ViewOperation{put("pk", "kept").OwnedBy("a"), put("pk", "gone").OwnedBy("a")}
+		},
+	}}, groups)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "kept", rows[0].SK)
 }

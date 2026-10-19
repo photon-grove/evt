@@ -28,6 +28,9 @@ type directory struct{}
 
 func (directory) Name() string { return "directory" }
 
+// The directory reads account events, so it is history-dependent on that type.
+func (directory) History() []evt.EntityType { return []evt.EntityType{"account"} }
+
 func (directory) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
     var operations []evt.ViewOperation
 
@@ -37,11 +40,11 @@ func (directory) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.
                 continue
             }
 
-            // A claim at a partition that names no entity. It fails the whole commit, with this
-            // error, when another account holds the handle.
+            // A claim at a partition that names no entity, owned by the stream that holds the
+            // handle. It fails the whole commit, with this error, when another account holds it.
             operations = append(operations,
                 evt.PutView("handles", handleOf(event), stream.EntityID, stream.EntityType, stream.State).
-                    IfAbsent().OnConflict(ErrHandleTaken))
+                    OwnedBy(stream.EntityID).IfAbsent().OnConflict(ErrHandleTaken))
         }
     }
 
@@ -57,6 +60,25 @@ after the commit (the JSON its snapshot would carry). Streams that were only rea
 written, so they are not in the view. A command that writes no event — a plain rejection, an
 accepted no-op — runs no projector; a rejection that carries events projects them like an accepted
 command's. The view has no outcome context on purpose: a rebuild has no outcome row.
+
+**Current-state or history-dependent.** `History()` names the entity types whose *events* the
+projector reads. A projector that returns none is **current-state**: it is given the view without
+any events and computes its rows from each stream's state after the commit, so a rebuild never
+replays history for it and compaction is irrelevant to it. A projector that returns types is
+**history-dependent**: it is given the events of the streams of those types only (never an event it
+did not declare), and before the first commit that runs it the store durably adds those types to the
+feature manifest's `historyDependent` set, so `CompactBelow` refuses them in every process — the
+commits a rebuild replays must stay. The repository must be able to declare
+(`evt.HistoryDeclarer`; the in-memory, DynamoDB, and PostgreSQL repositories are) or the commit fails
+with `*evt.HistoryDeclarationUnsupportedError`.
+
+**Owners.** The log keeps one commit order only: each stream's sequence order. So every operation of
+a history-dependent projector names the stream that **owns** its row (`OwnedBy`), which must be a
+stream the commit wrote. Every write to a row then comes from a commit that wrote its owner, the
+writes to one row are ordered by that stream's sequence, and `evt.GroupCommits` returns commits in
+an order every stream agrees with. A row written on behalf of two different streams has no durable
+order: `evt.ReplayViews` refuses it (`*evt.SharedViewKeyError`) rather than guess a final row that
+may differ from the live one. Do not rely on commit IDs for ordering; they are not causal.
 
 **What it returns.** Puts and deletes of rows at any `pk`/`sk`, in the order they should be
 written. A put overwrites unless it is `IfAbsent`; a delete of a missing row succeeds unless it is
@@ -94,14 +116,16 @@ event-sourced first and projected second; a view row that exists only because so
 outside the log cannot be rebuilt, and a rebuild would silently lose it.
 
 ```go
-for _, group := range evt.GroupCommits(storedEvents) {
+groups, err := evt.GroupCommits(storedEvents) // ordered consistently with every stream's sequence
+for _, group := range groups {
     for i, stream := range group.Streams {
         group.Streams[i].State = foldState(storedEvents, stream) // the state after this commit
     }
-
-    replayed, err := evt.ProjectCommit(ctx, projectors, group)
-    // replayed must equal the operations the live commit produced for group.CommitID
 }
+
+rows, err := evt.ReplayViews(ctx, projectors, groups)
+// rows must equal the live rows, or err is *evt.SharedViewKeyError: the replay refuses a row two
+// streams write instead of guessing the order.
 ```
 
 The rebuild entry points that call a projector's second, state-based entry point, and the durable

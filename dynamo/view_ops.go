@@ -1,6 +1,8 @@
 package dynamo
 
 import (
+	"context"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
@@ -100,4 +102,27 @@ func viewFailure(view evt.ProjectedView, code string, cause error) error {
 	}
 
 	return nil
+}
+
+// WritesViews declares that Commit writes commit-wide view operations, or refuses them with
+// *evt.ViewsNotConfiguredError when no views table is configured (evt.ViewWritingRepository).
+func (repo *Repository) WritesViews() {}
+
+// DeclareHistoryDependent durably adds the entity types to the feature manifest's historyDependent
+// set, so CompactBelow refuses them in every process (evt.HistoryDeclarer). Types already declared
+// are left alone and nothing is written.
+func (repo *Repository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
+	manifest, err := repo.features.Manifest(ctx)
+	if err != nil {
+		return err
+	}
+
+	missing := evt.MissingHistoryDependent(manifest, types)
+	if len(missing) == 0 {
+		return nil
+	}
+
+	_, err = repo.features.Declare(ctx, func(m *evt.FeatureManifest) { m.AddHistoryDependent(missing...) })
+
+	return err
 }

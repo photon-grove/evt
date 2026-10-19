@@ -22,10 +22,22 @@ use photon_evt::wire::dynamo::DEFAULT_VIEW_SORT_KEY;
 use photon_evt::wire::postgres::ENTITY_LOCK;
 use photon_evt::{
     Aggregate, BoxError, Commit, CommitProjector, CommitView, EntityId, Error, EventId, EventLog,
-    EventSequence, EventType, EventVersion, Metadata, Projector, Repository, RetryPolicy,
-    SerializedEvent, SerializedSnapshot, Store, StreamFilter, ViewCondition, ViewOperation,
-    ViewOperationKind, ViewRow, json,
+    EventSequence, EventType, EventVersion, Metadata, Projector, REASON_CONDITION_FAILED,
+    Repository, RetryPolicy, SerializedEvent, SerializedSnapshot, Store, StreamFilter,
+    ViewCondition, ViewOperation, ViewOperationKind, ViewRow, json,
 };
+
+/// A projector's own error for a claim that is already taken.
+#[derive(Debug)]
+struct NameTaken(String);
+
+impl std::fmt::Display for NameTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the name {} is taken", self.0)
+    }
+}
+
+impl std::error::Error for NameTaken {}
 
 /// The table the commit-wide view cases write to on PostgreSQL: the application's own schema, which
 /// evt does not define.
@@ -1595,6 +1607,7 @@ fn postgres_view_writer() -> ViewWriter {
                         Box::new(String::from_utf8_lossy(&operation.payload).into_owned()),
                     ],
                 )
+                .with_key_constraint(format!("{PG_COMMIT_VIEWS_TABLE}_pkey"))
             }
             ViewOperationKind::Delete => PgStatement::new(
                 format!("DELETE FROM {PG_COMMIT_VIEWS_TABLE} WHERE pk = $1 AND sk = $2"),
@@ -1777,6 +1790,130 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository) {
         );
         assert!(repository.events(&refused).await.unwrap().is_empty());
     }
+
+    // A put that requires the row to be absent: only a violation of the (pk, sk) key constraint is
+    // its failed condition. A unique violation of another constraint (here, a unique payload) is an
+    // ordinary failure of the statement, with the SQLSTATE as its reason and no mapped error.
+    let unique = format!("{PG_COMMIT_VIEWS_TABLE}_unique");
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {unique} (
+                 pk text NOT NULL, sk text NOT NULL, entity_id text NOT NULL,
+                 entity_type text NOT NULL, payload text NOT NULL UNIQUE, PRIMARY KEY (pk, sk))"
+        ))
+        .await
+        .expect("create the unique-payload view table");
+    let table = unique.clone();
+    let constrained = repository.clone().with_view_writer(std::sync::Arc::new(
+        move |operation: &ViewOperation| {
+            Ok(PgStatement::new(
+                format!(
+                    "INSERT INTO {table} (pk, sk, entity_id, entity_type, payload) \
+                     VALUES ($1, $2, '', '', $3)"
+                ),
+                vec![
+                    Box::new(operation.pk.clone()),
+                    Box::new(operation.sk.clone()),
+                    Box::new(String::from_utf8_lossy(&operation.payload).into_owned()),
+                ],
+            )
+            .with_key_constraint(format!("{table}_pkey")))
+        },
+    ));
+    let claims = |name: &'static str, rows: Vec<ViewOperation>| {
+        let rows = std::sync::Arc::new(rows);
+
+        Store::<Ledger, _>::new(&constrained, ()).with_commit_projector(std::sync::Arc::new(
+            FixedRows::new(name, move |_| rows.to_vec()),
+        ))
+    };
+    claims(
+        "first",
+        vec![ViewOperation::put("pk", "a", "", "", "same").if_absent()],
+    )
+    .execute(&id("unique-first"), Add(1), Metadata::new("local"))
+    .await
+    .expect("the first row");
+
+    let other = id("unique-other");
+    let error = claims(
+        "second",
+        vec![
+            ViewOperation::put("pk", "b", "", "", "same")
+                .if_absent()
+                .on_conflict(NameTaken("b".into())),
+        ],
+    )
+    .execute(&other, Add(1), Metadata::new("local"))
+    .await
+    .expect_err("the payload collides");
+    match error.as_store_error() {
+        Some(Error::ProjectorOperation(failed)) => {
+            assert_eq!(
+                failed.reason, "23505",
+                "the SQLSTATE, not a failed condition"
+            );
+            assert!(failed.mapped().is_none());
+            assert!(failed.cause().is_some());
+        }
+        other => panic!("want a projector operation failure, got {other:?}"),
+    }
+    assert!(repository.events(&other).await.unwrap().is_empty());
+
+    let taken = id("unique-key");
+    let error = claims(
+        "third",
+        vec![
+            ViewOperation::put("pk", "a", "", "", "different")
+                .if_absent()
+                .on_conflict(NameTaken("a".into())),
+        ],
+    )
+    .execute(&taken, Add(1), Metadata::new("local"))
+    .await
+    .expect_err("the key exists");
+    match error.as_store_error() {
+        Some(Error::ProjectorOperation(failed)) => {
+            assert_eq!(failed.reason, REASON_CONDITION_FAILED);
+            assert!(failed.mapped().is_some());
+        }
+        other => panic!("want a failed condition, got {other:?}"),
+    }
+
+    // The writer must name the key constraint of an absent put.
+    let unnamed =
+        repository
+            .clone()
+            .with_view_writer(std::sync::Arc::new(|operation: &ViewOperation| {
+                Ok(PgStatement::new(
+                    "INSERT INTO nowhere VALUES ($1)",
+                    vec![Box::new(operation.pk.clone())],
+                ))
+            }));
+    let store = Store::<Ledger, _>::new(&unnamed, ()).with_commit_projector(std::sync::Arc::new(
+        FixedRows::new("unnamed", |_| {
+            vec![ViewOperation::put("p", "s", "", "", "{}").if_absent()]
+        }),
+    ));
+    let refused = id("unnamed");
+    let error = store
+        .execute(&refused, Add(1), Metadata::new("local"))
+        .await
+        .expect_err("no key constraint named");
+    assert!(
+        matches!(error.as_store_error(), Some(Error::InvalidViewOperation(_))),
+        "{error:?}"
+    );
+    assert!(repository.events(&refused).await.unwrap().is_empty());
+
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!("DROP TABLE {unique}"))
+        .await
+        .expect("drop the unique-payload view table");
 
     pool.get()
         .await

@@ -407,15 +407,13 @@ impl Aggregate for Account {
     }
 }
 
-/// The payload of a ledger row: the account's state after the commit and what the commit did to
-/// it. Declared in this order, it encodes the same bytes as Go's `ledgerRow`.
+/// The payload of a ledger row: the account's state after the commit. Declared in this order, it encodes the same bytes as Go's `ledgerRow`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LedgerRow {
     balance_cents: i64,
     status: String,
     tags: usize,
-    events: usize,
 }
 
 /// The partition the shared ledger projector writes. It names no entity, and its sort keys are
@@ -423,7 +421,8 @@ struct LedgerRow {
 pub const LEDGER_PK: &str = "ledger";
 
 /// The shared commit-wide projector of the account domain (name `ledger`), the twin of Go's
-/// `compat.LedgerProjector`. For every stream the commit wrote it puts a ledger row (`pk` `ledger`,
+/// `compat.LedgerProjector`, a current-state projector: it reads each stream's state after the
+/// commit and never its events, so it declares no history. For every stream the commit wrote it puts a ledger row (`pk` `ledger`,
 /// `sk` the stream ID) from the stream's state after the commit, or deletes it when the balance is
 /// zero. Every byte is a function of the commit view, so both languages write the same rows.
 #[derive(Clone, Copy, Debug, Default)]
@@ -456,7 +455,6 @@ impl photon_evt::CommitProjector for LedgerProjector {
                 balance_cents: state.balance_cents,
                 status: state.status,
                 tags: state.tags.map_or(0, |tags| tags.len()),
-                events: stream.events.len(),
             })?;
 
             operations.push(photon_evt::ViewOperation::put(

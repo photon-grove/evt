@@ -86,23 +86,27 @@ func viewsOf(base evt.EntityID, step Step) []evt.ProjectedView {
 	return views
 }
 
-// ledgerRow is the payload of a ledger row: the account's state after the commit and what the
-// commit did to it. Declared in this order, it encodes the same bytes as the Rust struct.
+// ledgerRow is the payload of a ledger row: the account's state after the commit. Declared in this order, it encodes the same bytes as the Rust struct.
 type ledgerRow struct {
 	BalanceCents int64  `json:"balanceCents"`
 	Status       string `json:"status"`
 	Tags         int    `json:"tags"`
-	Events       int    `json:"events"`
 }
 
-// LedgerProjector is the shared commit-wide projector of the account domain (name "ledger"). For
-// every stream the commit wrote it puts a ledger row (pk "ledger", sk the stream ID) from the
+// LedgerProjector is the shared commit-wide projector of the account domain (name "ledger"), a
+// current-state projector. For every stream the commit wrote it puts a ledger row (pk "ledger", sk
+// the stream ID) from the
 // stream's state after the commit, or deletes it when the balance is zero. Every byte is a function
 // of the commit view, so Rust must write the same rows.
 type LedgerProjector struct{}
 
 // Name implements evt.CommitProjector.
 func (LedgerProjector) Name() string { return "ledger" }
+
+// History implements evt.CommitProjector. The ledger is a current-state projector: it reads each
+// stream's state after the commit and never its events, so it declares no history and a rebuild
+// needs no commit it could lose to compaction.
+func (LedgerProjector) History() []evt.EntityType { return nil }
 
 // ProjectCommit implements evt.CommitProjector.
 func (LedgerProjector) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
@@ -121,7 +125,7 @@ func (LedgerProjector) ProjectCommit(_ context.Context, commit evt.CommitView) (
 		}
 
 		payload, err := json.Marshal(ledgerRow{
-			BalanceCents: state.BalanceCents, Status: state.Status, Tags: len(state.Tags), Events: len(stream.Events),
+			BalanceCents: state.BalanceCents, Status: state.Status, Tags: len(state.Tags),
 		})
 		if err != nil {
 			return nil, err
@@ -166,6 +170,10 @@ func (v ViewExpectation) Row() ViewRow {
 // defines no view schema; the drivers of both languages create this one.
 const PostgresViewTable = "evt_compat_views"
 
+// PostgresViewKeyConstraint is the name of PostgresViewTable's primary key, the constraint whose
+// violation means a row already exists.
+const PostgresViewKeyConstraint = "evt_compat_views_pkey"
+
 // PostgresViewDDL creates PostgresViewTable.
 const PostgresViewDDL = `CREATE TABLE IF NOT EXISTS evt_compat_views (
     pk          text NOT NULL,
@@ -192,7 +200,7 @@ func PostgresViewWriter(op evt.ViewOperation) (postgres.ViewStatement, error) {
 	insert := "INSERT INTO evt_compat_views (pk, sk, entity_id, entity_type, payload) VALUES ($1, $2, $3, $4, $5)"
 
 	if op.Condition == evt.ViewAbsent {
-		return postgres.ViewStatement{SQL: insert, Args: args}, nil
+		return postgres.ViewStatement{SQL: insert, Args: args, KeyConstraint: PostgresViewKeyConstraint}, nil
 	}
 
 	return postgres.ViewStatement{

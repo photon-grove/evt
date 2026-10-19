@@ -2572,6 +2572,17 @@ impl<R: Repository> Interfering<'_, R> {
 impl<R: Repository> Repository for Interfering<'_, R> {
     type Operation = R::Operation;
 
+    fn writes_views(&self) -> bool {
+        self.inner.writes_views()
+    }
+
+    fn declare_history_dependent(
+        &self,
+        types: &[EntityType],
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        self.inner.declare_history_dependent(types)
+    }
+
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
         if self.fires(&Interference::CompetingCommit) {
             let competing = commit
@@ -3788,6 +3799,17 @@ impl<R: Repository> FaultInjectingRepository<R> {
 
 impl<R: Repository> Repository for FaultInjectingRepository<R> {
     type Operation = R::Operation;
+
+    fn writes_views(&self) -> bool {
+        self.inner.writes_views()
+    }
+
+    fn declare_history_dependent(
+        &self,
+        types: &[EntityType],
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        self.inner.declare_history_dependent(types)
+    }
 
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
         if commit.outcome.is_some() {
@@ -5574,6 +5596,17 @@ impl<'a, R: Repository> Meddling<'a, R> {
 
 impl<R: Repository> Repository for Meddling<'_, R> {
     type Operation = R::Operation;
+
+    fn writes_views(&self) -> bool {
+        self.inner.writes_views()
+    }
+
+    fn declare_history_dependent(
+        &self,
+        types: &[EntityType],
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        self.inner.declare_history_dependent(types)
+    }
 
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
         self.meddle(false, !commit.events.is_empty()).await?;

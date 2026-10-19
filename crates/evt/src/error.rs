@@ -260,6 +260,55 @@ pub enum Error {
         second: (String, usize),
     },
 
+    /// Stored events whose commits cannot be put in an order that respects every stream's own
+    /// sequence: one commit wrote a stream before another, which wrote a second stream before the
+    /// first. No live system writes that.
+    #[error("commits {commits:?} cannot be ordered consistently with their streams' sequences")]
+    CommitOrder {
+        /// The commit IDs involved, ascending.
+        commits: Vec<String>,
+    },
+
+    /// A row was written on behalf of two different streams. Their commits have no order the log
+    /// keeps, so a replay cannot tell which write came last and refuses rather than guess.
+    #[error(
+        "view row {pk:?}/{sk:?} is written for streams {first:?} and {second:?}, whose commits \
+         have no durable order"
+    )]
+    SharedViewKey {
+        /// The row's partition key.
+        pk: String,
+        /// The row's sort key.
+        sk: String,
+        /// The owner streams, in the order the replay met them.
+        first: String,
+        /// The second owner stream.
+        second: String,
+    },
+
+    /// A commit-wide projector was registered over a repository that has not declared it writes
+    /// view operations ([`Repository::writes_views`](crate::Repository::writes_views)); it would
+    /// commit the events and silently drop the rows. Nothing was written.
+    #[error(
+        "repository {repository} does not write view operations; refusing a commit-wide projector"
+    )]
+    ViewsUnsupported {
+        /// The refusing repository's Rust type.
+        repository: String,
+    },
+
+    /// A history-dependent projector was registered over a repository that cannot declare history
+    /// dependence durably; compaction could then delete the commits its rebuild replays. Nothing
+    /// was written.
+    #[error(
+        "repository {repository} cannot declare history-dependent entity types; refusing a \
+         history-dependent projector"
+    )]
+    HistoryDeclarationUnsupported {
+        /// The refusing repository's Rust type.
+        repository: String,
+    },
+
     /// A commit carries view operations, but the repository has no place to write them (no views
     /// table, no view writer). Dropping them would commit the events without the rows meant to be
     /// atomic with them, so the repository fails closed. Nothing was written.

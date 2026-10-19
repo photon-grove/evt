@@ -2,6 +2,7 @@ package mem
 
 import (
 	"bytes"
+	"context"
 	"slices"
 	"strings"
 
@@ -84,4 +85,23 @@ func (repo Repository) applyViews(views []evt.ProjectedView) {
 			Payload: bytes.Clone(view.Op.Payload),
 		}
 	}
+}
+
+// WritesViews declares that Commit writes commit-wide view operations (evt.ViewWritingRepository).
+func (Repository) WritesViews() {}
+
+// DeclareHistoryDependent durably adds the entity types to the manifest's historyDependent set, so
+// CompactBelow refuses them (evt.HistoryDeclarer). Types already declared are left alone.
+func (repo Repository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
+	repo.features.mu.Lock()
+	missing := evt.MissingHistoryDependent(repo.features.manifest, types)
+	repo.features.mu.Unlock()
+
+	if len(missing) == 0 {
+		return nil
+	}
+
+	_, err := repo.Declare(ctx, func(manifest *evt.FeatureManifest) { manifest.AddHistoryDependent(missing...) })
+
+	return err
 }

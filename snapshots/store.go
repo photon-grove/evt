@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"math"
+	"sync"
 
 	"github.com/photon-grove/evt"
 )
@@ -30,6 +31,11 @@ type Store struct {
 	// commitProjectors are the commit-wide projectors (ADR 0004, C7), in declaration order; see
 	// WithCommitProjectors.
 	commitProjectors []evt.CommitProjector
+
+	// historyDeclared are the entity types this store has already durably declared
+	// history-dependent for its projectors, so it declares each once.
+	historyMu       sync.Mutex
+	historyDeclared map[evt.EntityType]struct{}
 }
 
 // NewStore creates a new Store with the given Repository and Snapshot size
@@ -169,13 +175,16 @@ func (store *Store) Commit(
 
 	if commitSnapshotToEvent == 0 {
 		// If not needed, execute a simple commit, with the commit-wide projectors' operations.
-		state, serr := store.commitState(eventContext.Entity)
-		if serr != nil {
-			return nil, serr
-		}
+		// A commit that writes no event runs no projector, so its state is never encoded.
+		if len(serializedEvents) > 0 {
+			state, serr := store.commitState(eventContext.Entity)
+			if serr != nil {
+				return nil, serr
+			}
 
-		if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{eventContext.EntityID: state}); err != nil {
-			return nil, err
+			if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{eventContext.EntityID: state}); err != nil {
+				return nil, err
+			}
 		}
 
 		if err = store.repo.Commit(ctx, serializedResult); err != nil {

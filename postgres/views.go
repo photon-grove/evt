@@ -17,6 +17,13 @@ import (
 type ViewStatement struct {
 	SQL  string
 	Args []any
+
+	// KeyConstraint is the name of the table's unique or primary-key constraint on (pk, sk). It is
+	// required for a put with evt.ViewAbsent: only a violation of this constraint means the row
+	// already exists. A unique violation of any other constraint of the table (a unique payload
+	// field, say) says nothing about the requested row, so it is an ordinary failure of the
+	// statement, with the SQLSTATE as its reason.
+	KeyConstraint string
 }
 
 // ViewWriter turns one commit-wide view operation (ADR 0004, C7) into the statement that writes it.
@@ -27,8 +34,9 @@ type ViewStatement struct {
 // The repository decides whether the operation's condition held from the statement's outcome, so
 // the statement must have these semantics:
 //
-//   - a put with evt.ViewAbsent must raise a unique violation when the row exists: write a plain
-//     INSERT, with no ON CONFLICT clause;
+//   - a put with evt.ViewAbsent must raise a unique violation of the (pk, sk) key constraint when
+//     the row exists: write a plain INSERT, with no ON CONFLICT clause, and name the constraint in
+//     ViewStatement.KeyConstraint;
 //   - a put without a condition overwrites: an INSERT ... ON CONFLICT DO UPDATE;
 //   - a delete with evt.ViewPresent must delete a row: a DELETE whose affected-row count is zero
 //     fails the condition;
@@ -77,6 +85,15 @@ func (repo *Repository) buildViews(views []evt.ProjectedView) ([]builtView, erro
 			}, err)
 		}
 
+		if view.Op.Kind == evt.ViewPut && view.Op.Condition == evt.ViewAbsent && statement.KeyConstraint == "" {
+			return nil, &evt.InvalidViewOperationError{
+				ProjectorOperationRef: evt.ProjectorOperationRef{
+					Projector: view.Projector, ProjectorIndex: view.ProjectorIndex, Operation: view.Operation,
+				},
+				Reason: "the view writer must name the key constraint of a put that requires the row to be absent",
+			}
+		}
+
 		if strings.TrimSpace(statement.SQL) == "" {
 			return nil, &evt.InvalidViewOperationError{
 				ProjectorOperationRef: evt.ProjectorOperationRef{
@@ -98,7 +115,7 @@ func execViews(ctx context.Context, tx pgx.Tx, built []builtView) error {
 	for _, item := range built {
 		tag, err := tx.Exec(ctx, item.statement.SQL, item.statement.Args...)
 		if err != nil {
-			return mapViewError(item.view, err)
+			return mapViewError(item.view, item.statement.KeyConstraint, err)
 		}
 
 		if item.view.Op.Kind == evt.ViewDelete && item.view.Op.Condition == evt.ViewPresent && tag.RowsAffected() == 0 {
@@ -109,19 +126,21 @@ func execViews(ctx context.Context, tx pgx.Tx, built []builtView) error {
 	return nil
 }
 
-// mapViewError maps an error a view statement raised. A unique violation on a put that requires the
-// row to be absent is its failed condition. Any other error the database raised belongs to the
+// mapViewError maps an error a view statement raised. A violation of the (pk, sk) key constraint on
+// a put that requires the row to be absent is its failed condition; a unique violation of any other
+// constraint is an ordinary failure of the statement. Any other error the database raised belongs to the
 // statement, so it is the operation's failure with the SQLSTATE as its reason, except a transaction
 // rollback (serialization failure, deadlock), which is not the projector's doing and passes through
 // like it does for every other statement of the commit. A connection error passes through too.
-func mapViewError(view evt.ProjectedView, err error) error {
+func mapViewError(view evt.ProjectedView, keyConstraint string, err error) error {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return fmt.Errorf("postgres: view statement: %w", err)
 	}
 
 	switch {
-	case pgErr.Code == uniqueViolation && view.Op.Kind == evt.ViewPut && view.Op.Condition == evt.ViewAbsent:
+	case pgErr.Code == uniqueViolation && view.Op.Kind == evt.ViewPut && view.Op.Condition == evt.ViewAbsent &&
+		keyConstraint != "" && strings.EqualFold(pgErr.ConstraintName, keyConstraint):
 		return evt.NewProjectorOperationError(view, evt.ReasonConditionFailed, err)
 
 	case strings.HasPrefix(pgErr.Code, "40"):
@@ -163,4 +182,27 @@ func commitBudget(normalized evt.SerializedResult, views []builtView) error {
 	}
 
 	return evt.CommitBudget(sizes)
+}
+
+// WritesViews declares that Commit writes commit-wide view operations, or refuses them with
+// *evt.ViewsNotConfiguredError when no view writer is configured (evt.ViewWritingRepository).
+func (repo *Repository) WritesViews() {}
+
+// DeclareHistoryDependent durably adds the entity types to the feature manifest's historyDependent
+// set, so CompactBelow refuses them in every process (evt.HistoryDeclarer). Types already declared
+// are left alone and nothing is written.
+func (repo *Repository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
+	manifest, err := repo.features.Manifest(ctx)
+	if err != nil {
+		return err
+	}
+
+	missing := evt.MissingHistoryDependent(manifest, types)
+	if len(missing) == 0 {
+		return nil
+	}
+
+	_, err = repo.features.Declare(ctx, func(m *evt.FeatureManifest) { m.AddHistoryDependent(missing...) })
+
+	return err
 }

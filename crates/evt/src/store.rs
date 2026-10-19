@@ -18,7 +18,7 @@ use crate::outcome::{
     CommandIdentity, CommandOutcome, DigestInput, Outcome, OutcomeCommand, OutcomeConfig,
     Rejection, Settled, ToRejection, pre_check, principal, require_command_id, settle,
 };
-use crate::projection::{CommitProjector, CommitStream, CommitView, project_commit};
+use crate::projection::{CommitProjector, CommitStream, CommitView, HistoryLedger, project_commit};
 use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
 use crate::retry::{Budget, Failed, Retry, RetryPolicy};
 use crate::transaction::{Begin, PendingCommand, Transaction, freeze_command, persist_rejection};
@@ -42,6 +42,7 @@ pub struct Store<A: Aggregate, R: Repository> {
     pub(crate) snapshot_interval: usize,
     pub(crate) projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
     pub(crate) commit_projectors: Vec<Arc<dyn CommitProjector>>,
+    pub(crate) history_declared: HistoryLedger,
     pub(crate) commit_ids: CommitIdGenerator,
     pub(crate) outcomes: Option<OutcomeConfig>,
 }
@@ -59,6 +60,7 @@ where
             snapshot_interval: self.snapshot_interval,
             projectors: self.projectors.clone(),
             commit_projectors: self.commit_projectors.clone(),
+            history_declared: self.history_declared.clone(),
             commit_ids: self.commit_ids.clone(),
             outcomes: self.outcomes.clone(),
         }
@@ -86,6 +88,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             projectors: Vec::new(),
             commit_projectors: Vec::new(),
+            history_declared: HistoryLedger::default(),
             commit_ids: commit_id::default_generator(),
             outcomes: None,
         }
@@ -287,11 +290,25 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             return Ok((loaded, Vec::new()));
         }
 
+        self.ready_projectors().await?;
+
         let (loaded, serialized, commit) = self.stage(loaded, events, metadata)?;
 
         self.repository.commit(commit).await?;
 
         Ok((loaded, serialized))
+    }
+
+    /// Readies the repository for the commit-wide projectors before a commit that runs them: it
+    /// must write view operations, and the entity types the projectors read events of are durably
+    /// declared history-dependent (once each).
+    async fn ready_projectors(&self) -> Result<(), Error> {
+        crate::projection::ready_projectors(
+            &self.repository,
+            &self.commit_projectors,
+            &self.history_declared,
+        )
+        .await
     }
 
     fn refuse_outcomes(&self, method: &str) -> Result<(), Error> {
@@ -600,6 +617,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 }
 
                 let decided = failure_events.clone();
+                self.ready_projectors().await.map_err(Failed::internal)?;
                 let (_, serialized, mut commit) = self
                     .stage(loaded, failure_events, metadata)
                     .map_err(Failed::internal)?;
@@ -627,6 +645,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 .map_err(Failed::committing);
         }
 
+        self.ready_projectors().await.map_err(Failed::internal)?;
         let (loaded, serialized, mut commit) = self
             .stage(loaded, events, metadata)
             .map_err(Failed::internal)?;
@@ -1302,6 +1321,10 @@ mod tests {
 
         impl<R: crate::Repository> crate::Repository for Gapped<R> {
             type Operation = R::Operation;
+
+            fn writes_views(&self) -> bool {
+                self.0.writes_views()
+            }
 
             async fn commit(&self, commit: crate::Commit<R::Operation>) -> Result<(), Error> {
                 self.0.commit(commit).await

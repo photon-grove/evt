@@ -101,6 +101,10 @@ where
         Box::pin(view_determinism(repo, target)).await,
     );
     record(
+        "a history-dependent projector is declared durably and its type is never compacted",
+        Box::pin(view_history_declaration(repo, target)).await,
+    );
+    record(
         "a failing projector is an internal failure: nothing written, nothing recorded, no retry",
         Box::pin(view_projector_failure(repo, target)).await,
     );
@@ -119,18 +123,33 @@ type Script = Box<dyn Fn(&CommitView) -> Vec<ViewOperation> + Send + Sync>;
 /// A projector over a closure, counting its calls and recording what it returned, per commit ID.
 struct Scripted {
     name: String,
+    history: Vec<EntityType>,
     script: Script,
     calls: AtomicUsize,
     emitted: Mutex<Vec<(CommitView, Vec<ViewOperation>)>>,
 }
 
 impl Scripted {
+    /// A current-state projector: it is given views without events.
     fn new(
         name: &str,
         script: impl Fn(&CommitView) -> Vec<ViewOperation> + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::reading(name, &[], script)
+    }
+
+    /// A history-dependent projector over the events of the given entity types.
+    fn reading(
+        name: &str,
+        history: &[&str],
+        script: impl Fn(&CommitView) -> Vec<ViewOperation> + Send + Sync + 'static,
+    ) -> Arc<Self> {
         Arc::new(Self {
             name: name.to_owned(),
+            history: history
+                .iter()
+                .map(|entity_type| EntityType::new(*entity_type))
+                .collect(),
             script: Box::new(script),
             calls: AtomicUsize::new(0),
             emitted: Mutex::new(Vec::new()),
@@ -152,6 +171,10 @@ impl Scripted {
 impl CommitProjector for Scripted {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn history(&self) -> &[EntityType] {
+        &self.history
     }
 
     fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
@@ -192,9 +215,9 @@ async fn row<R: Repository, T: CommitViewTarget<R>>(
 
 fn summary(view: &CommitView) -> Vec<u8> {
     format!(
-        r#"{{"commitId":"{}","events":{}}}"#,
+        r#"{{"commitId":"{}","streams":{}}}"#,
         view.commit_id,
-        view.event_count()
+        view.streams.len()
     )
     .into_bytes()
 }
@@ -225,6 +248,35 @@ fn directory(ns: &str) -> Arc<Scripted> {
             "",
             summary(view),
         ));
+
+        operations
+    })
+}
+
+/// The determinism case's projector: like [`directory`], but history-dependent, so it reads the
+/// commit's events and owns each row by its stream.
+fn directory_reading(ns: &str) -> Arc<Scripted> {
+    let ns = ns.to_owned();
+
+    Scripted::reading("directory", &[Ledger::TYPE, Claim::TYPE], move |view| {
+        let mut operations: Vec<ViewOperation> = view
+            .streams
+            .iter()
+            .map(|stream| {
+                ViewOperation::put(
+                    format!("{ns}-directory"),
+                    stream.entity_id.as_str(),
+                    stream.entity_id.as_str(),
+                    stream.entity_type.as_str(),
+                    stream.state.clone(),
+                )
+                .owned_by(stream.entity_id.clone())
+            })
+            .collect();
+        operations.push(
+            ViewOperation::put(format!("{ns}-summary"), "commit", "", "", summary(view))
+                .owned_by(view.streams[0].entity_id.clone()),
+        );
 
         operations
     })
@@ -359,7 +411,7 @@ where
         row(target, &summary_pk, "commit")
             .await?
             .map(|row| String::from_utf8_lossy(&row.payload).into_owned()),
-        Some(format!(r#"{{"commitId":"{commit_id}","events":2}}"#)),
+        Some(format!(r#"{{"commitId":"{commit_id}","streams":2}}"#)),
         "the commit-wide summary row saw the final stamped commit ID and both streams"
     );
 
@@ -1320,7 +1372,7 @@ where
     let log = {
         let pk = pk.clone();
 
-        Scripted::new("log", move |view| {
+        Scripted::reading("log", &[Wallet::TYPE], move |view| {
             view.streams
                 .iter()
                 .map(|stream| {
@@ -1337,6 +1389,7 @@ where
                         "",
                         types.join(","),
                     )
+                    .owned_by(stream.entity_id.clone())
                 })
                 .collect()
         })
@@ -1449,7 +1502,7 @@ where
     let ns = namespace();
     let (ledger, claim) = (ledger_id(), claim_id());
 
-    let live = directory(&ns);
+    let live = directory_reading(&ns);
     let store = Store::<Ledger, _>::new(repo, ())
         .with_snapshot_interval(2)
         .with_commit_projector(live.clone());
@@ -1477,7 +1530,7 @@ where
 
     let mut stored = repo.events(&ledger).await?;
     stored.extend(repo.events(&claim).await?);
-    let mut groups = group_commits(stored.clone());
+    let mut groups = group_commits(stored.clone())?;
     ensure_eq!(
         groups.len(),
         3,
@@ -1486,7 +1539,7 @@ where
 
     // The replay runs a fresh projector over each regrouped commit, with the state each stream
     // had after it.
-    let replay = directory(&ns);
+    let replay = directory_reading(&ns);
     for group in &mut groups {
         for stream in &mut group.streams {
             let events: Vec<SerializedEvent> = stored
@@ -1522,6 +1575,63 @@ where
             "the replayed operations are the live operations"
         );
     }
+
+    Ok(())
+}
+
+async fn view_history_declaration<R, T>(repo: &R, target: &T) -> CaseResult
+where
+    R: Repository,
+    T: CommitViewTarget<R>,
+{
+    let ns = namespace();
+    let ledger = ledger_id();
+
+    // The projector reads Ledger events, so the store declares the type durably before its first
+    // commit. A snapshot after every event makes each one coverable by a compaction.
+    let reader = Scripted::reading("counter", &[Ledger::TYPE], {
+        let pk = format!("{ns}-counter");
+
+        move |view| {
+            view.streams
+                .iter()
+                .map(|stream| {
+                    ViewOperation::put(
+                        pk.clone(),
+                        stream.entity_id.as_str(),
+                        "",
+                        "",
+                        stream.events.len().to_string(),
+                    )
+                    .owned_by(stream.entity_id.clone())
+                })
+                .collect()
+        }
+    });
+    let store = Store::<Ledger, _>::new(repo, ())
+        .with_snapshot_interval(1)
+        .with_commit_projector(reader.clone());
+
+    store.execute(&ledger, Add(1), metadata()).await?;
+    store.execute(&ledger, Add(1), metadata()).await?;
+
+    ensure_eq!(
+        row(target, &format!("{ns}-counter"), ledger.as_str())
+            .await?
+            .map(|row| String::from_utf8_lossy(&row.payload).into_owned()),
+        Some("1".to_owned()),
+        "the projector saw its type's events"
+    );
+
+    let error = error_of(
+        repo.compact_below(&ledger, EventSequence(1)).await,
+        "compaction of a history-dependent type",
+    )?;
+    ensure!(
+        matches!(error, Error::HistoryDependentProjection { .. }),
+        "the declaration refuses compaction: {error:?}"
+    );
+    ensure_eq!(repo.events(&ledger).await?.len(), 2, "nothing was deleted");
 
     Ok(())
 }

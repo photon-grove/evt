@@ -7656,7 +7656,7 @@
               "S": "account"
             },
             "payload": {
-              "S": "{\"balanceCents\":5,\"status\":\"open\",\"tags\":2,\"events\":1}"
+              "S": "{\"balanceCents\":5,\"status\":\"open\",\"tags\":2}"
             },
             "pk": {
               "S": "ledger"

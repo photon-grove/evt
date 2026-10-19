@@ -16,10 +16,10 @@ func projectedView(op evt.ViewOperation) evt.ProjectedView {
 
 func Test_mapViewError_AUniqueViolationOnAnAbsentPutIsItsFailedCondition(t *testing.T) {
 	taken := errors.New("taken")
-	cause := &pgconn.PgError{Code: "23505"}
+	cause := &pgconn.PgError{Code: "23505", ConstraintName: "views_pkey"}
 	view := projectedView(evt.PutView("pk", "sk", "", "", nil).IfAbsent().OnConflict(taken))
 
-	err := mapViewError(view, cause)
+	err := mapViewError(view, "views_pkey", cause)
 
 	var failed *evt.ProjectorOperationError
 
@@ -41,13 +41,13 @@ func Test_mapViewError_AnyOtherDatabaseErrorIsTheStatementsFailureWithItsSQLStat
 
 	var failed *evt.ProjectorOperationError
 
-	require.ErrorAs(t, mapViewError(view, cause), &failed)
+	require.ErrorAs(t, mapViewError(view, "views_pkey", cause), &failed)
 	require.Equal(t, "23514", failed.Reason)
 	require.Nil(t, failed.Err)
 	require.ErrorIs(t, failed, cause)
 
 	// A unique violation on an unconditioned put is the same: it is a constraint the table has.
-	require.ErrorAs(t, mapViewError(view, &pgconn.PgError{Code: "23505"}), &failed)
+	require.ErrorAs(t, mapViewError(view, "views_pkey", &pgconn.PgError{Code: "23505", ConstraintName: "views_pkey"}), &failed)
 	require.Equal(t, "23505", failed.Reason)
 }
 
@@ -59,7 +59,7 @@ func Test_mapViewError_ATransactionRollbackOrAConnectionErrorIsNotTheProjectors(
 		"deadlock":              &pgconn.PgError{Code: "40P01"},
 		"connection":            errors.New("connection reset"),
 	} {
-		err := mapViewError(view, cause)
+		err := mapViewError(view, "views_pkey", cause)
 		require.NotErrorIs(t, err, evt.ErrProjectorOperation, name)
 		require.ErrorIs(t, err, cause, name)
 	}
@@ -113,4 +113,46 @@ func Test_buildViews_RefusesWithoutAWriterAndWrapsAWriterFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, built, 1)
 	require.Nil(t, repo.viewWriter, "WithViewWriter returns a copy")
+}
+
+func Test_mapViewError_AUniqueViolationOfAnotherConstraintIsNotTheFailedCondition(t *testing.T) {
+	taken := errors.New("taken")
+	view := projectedView(evt.PutView("pk", "sk", "", "", nil).IfAbsent().OnConflict(taken))
+	cause := &pgconn.PgError{Code: "23505", ConstraintName: "views_payload_key"}
+
+	var failed *evt.ProjectorOperationError
+
+	err := mapViewError(view, "views_pkey", cause)
+	require.ErrorAs(t, err, &failed)
+	require.Equal(t, "23505", failed.Reason, "the SQLSTATE, not a failed condition")
+	require.Nil(t, failed.Err, "the mapped error belongs to a failed condition only")
+	require.NotErrorIs(t, err, taken)
+	require.ErrorIs(t, err, cause)
+
+	// The constraint name compares case-insensitively, as PostgreSQL folds unquoted names.
+	require.ErrorIs(t, mapViewError(view, "Views_PKey", &pgconn.PgError{Code: "23505", ConstraintName: "views_pkey"}), taken)
+}
+
+func Test_buildViews_AnAbsentPutNeedsTheKeyConstraintNamed(t *testing.T) {
+	views := []evt.ProjectedView{projectedView(evt.PutView("pk", "sk", "", "", nil).IfAbsent())}
+
+	unnamed := NewRepository(nil).WithViewWriter(func(evt.ViewOperation) (ViewStatement, error) {
+		return ViewStatement{SQL: "INSERT INTO v VALUES ($1)"}, nil
+	})
+
+	var invalid *evt.InvalidViewOperationError
+
+	_, err := unnamed.buildViews(views)
+	require.ErrorAs(t, err, &invalid)
+
+	named := NewRepository(nil).WithViewWriter(func(evt.ViewOperation) (ViewStatement, error) {
+		return ViewStatement{SQL: "INSERT INTO v VALUES ($1)", KeyConstraint: "v_pkey"}, nil
+	})
+
+	_, err = named.buildViews(views)
+	require.NoError(t, err)
+
+	// An unconditioned put needs no constraint: it overwrites.
+	_, err = unnamed.buildViews([]evt.ProjectedView{projectedView(evt.PutView("pk", "sk", "", "", nil))})
+	require.NoError(t, err)
 }

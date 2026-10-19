@@ -13,14 +13,16 @@
 //! or [`Transaction::with_commit_projector`](crate::Transaction::with_commit_projector). The older
 //! per-aggregate [`Projector`](crate::Projector) keeps working beside them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{BoxError, Error};
 use crate::event::SerializedEvent;
-use crate::ids::{EntityId, EntityType};
+use crate::ids::{EntityId, EntityType, EventSequence};
+use crate::repository::Repository;
 
 /// The longest view partition key, in UTF-8 bytes (DynamoDB's own limit), so a projector fails
 /// identically on every backend instead of committing on PostgreSQL and failing on DynamoDB.
@@ -95,6 +97,12 @@ pub struct ViewOperation {
     /// The projector's own error for the case where the condition fails. The commit's
     /// [`ProjectorOperationError`] reports it as its [`source`](StdError::source).
     pub conflict: Option<Arc<dyn StdError + Send + Sync + 'static>>,
+    /// The stream the row belongs to. A history-dependent projector (one whose
+    /// [`history`](CommitProjector::history) is not empty) must name one for every operation, and
+    /// it must be a stream the commit wrote: then every write to a row is ordered by that stream's
+    /// own sequence, the only commit order the log keeps, and a replay can apply them in that
+    /// order. A current-state projector needs no owner. In-memory commit data, never stored.
+    pub owner: Option<EntityId>,
 }
 
 impl ViewOperation {
@@ -115,6 +123,7 @@ impl ViewOperation {
             payload: payload.into(),
             condition: ViewCondition::None,
             conflict: None,
+            owner: None,
         }
     }
 
@@ -129,6 +138,7 @@ impl ViewOperation {
             payload: Vec::new(),
             condition: ViewCondition::None,
             conflict: None,
+            owner: None,
         }
     }
 
@@ -145,6 +155,13 @@ impl ViewOperation {
     #[must_use]
     pub fn if_present(mut self) -> Self {
         self.condition = ViewCondition::Present;
+        self
+    }
+
+    /// Names the stream the row belongs to; see [`owner`](ViewOperation::owner).
+    #[must_use]
+    pub fn owned_by(mut self, owner: impl Into<EntityId>) -> Self {
+        self.owner = Some(owner.into());
         self
     }
 
@@ -167,6 +184,7 @@ impl PartialEq for ViewOperation {
             && self.entity_type == other.entity_type
             && self.payload == other.payload
             && self.condition == other.condition
+            && self.owner == other.owner
             && self.conflict.as_ref().map(|error| error.to_string())
                 == other.conflict.as_ref().map(|error| error.to_string())
     }
@@ -316,6 +334,20 @@ impl CommitView {
     pub fn event_count(&self) -> usize {
         self.streams.iter().map(|stream| stream.events.len()).sum()
     }
+
+    /// The view a projector is given: the events of the streams whose entity type it names, and
+    /// none of any other stream. A current-state projector names no type, so it reads state only;
+    /// that is what makes a rebuild from state alone reproduce its rows.
+    fn visible_to(&self, history: &[EntityType]) -> CommitView {
+        let mut view = self.clone();
+        for stream in &mut view.streams {
+            if !history.contains(&stream.entity_type) {
+                stream.events = Vec::new();
+            }
+        }
+
+        view
+    }
 }
 
 /// A pure function over every event of a commit, emitting view operations that commit atomically
@@ -326,9 +358,26 @@ impl CommitView {
 /// clock, a random source, the environment, a store, or state remembered between calls, and must
 /// not be ordered by a hash map's iteration. The operations it returns are appended to the commit
 /// in the projector's declaration order, each projector's in emission order.
+///
+/// A projector is one of two kinds, and [`history`](CommitProjector::history) says which. A
+/// current-state projector computes its rows from the state each stream has after the commit; a
+/// rebuild never replays history for it. A history-dependent projector also reads the commit's
+/// events; a rebuild replays every commit for it, so the commits it reads must never be compacted
+/// away, and its rows must be ordered by something a replay has.
 pub trait CommitProjector: Send + Sync {
     /// Identifies the projector in errors. It should be unique within a store.
     fn name(&self) -> &str;
+
+    /// The entity types whose events the projector reads. Empty (the default) for a current-state
+    /// projector, which is then given views whose streams carry no events. A history-dependent
+    /// projector is given the events of the streams of these types only, and no others. The store
+    /// declares these types in the feature manifest's `historyDependent` set before the first
+    /// commit that runs the projector, so `compact_below` refuses them in every process, and each
+    /// of its operations must name the stream that owns its row
+    /// ([`ViewOperation::owned_by`]).
+    fn history(&self) -> &[EntityType] {
+        &[]
+    }
 
     /// Returns the commit's view operations. An error fails the command before any write, as an
     /// internal failure ([`Error::Projector`]).
@@ -388,6 +437,7 @@ impl ProjectedView {
                 payload: Vec::new(),
                 condition: self.op.condition,
                 conflict: self.op.conflict.clone(),
+                owner: None,
             },
         }
     }
@@ -516,9 +566,63 @@ impl StdError for CommitProjectorFailed {
     }
 }
 
+/// The entity types a store (or transaction) has already durably declared history-dependent, so it
+/// declares each once. Clones of a store share it.
+pub(crate) type HistoryLedger = Arc<Mutex<HashSet<EntityType>>>;
+
+/// Readies a repository for the commit-wide projectors before a commit that runs them: it must
+/// write view operations ([`Repository::writes_views`]), and the entity types the projectors read
+/// events of are durably added to the feature manifest's `historyDependent` set (once each), so
+/// `compact_below` refuses them in every process. It does nothing when there are no projectors.
+pub(crate) async fn ready_projectors<R: Repository>(
+    repository: &R,
+    projectors: &[Arc<dyn CommitProjector>],
+    declared: &HistoryLedger,
+) -> Result<(), Error> {
+    if projectors.is_empty() {
+        return Ok(());
+    }
+
+    if !repository.writes_views() {
+        return Err(Error::ViewsUnsupported {
+            repository: std::any::type_name::<R>().to_owned(),
+        });
+    }
+
+    let pending: Vec<EntityType> = {
+        let done = declared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pending: Vec<EntityType> = Vec::new();
+        for entity_type in projectors.iter().flat_map(|projector| projector.history()) {
+            if !done.contains(entity_type) && !pending.contains(entity_type) {
+                pending.push(entity_type.clone());
+            }
+        }
+
+        pending
+    };
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    repository.declare_history_dependent(&pending).await?;
+
+    declared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(pending);
+
+    Ok(())
+}
+
 /// Runs the projectors over a commit view, in declaration order, and returns their operations with
 /// provenance in the order the commit writes them. A view with no events runs no projector. A
-/// projector's error is an [`Error::Projector`] naming it (an internal failure: nothing is
+/// current-state projector (empty [`history`](CommitProjector::history)) sees the view without
+/// events; a history-dependent one sees the events of the entity types it names, and each of its
+/// operations must name an owner stream the commit wrote ([`Error::InvalidViewOperation`]
+/// otherwise). A projector's error is an [`Error::Projector`] naming it (an internal failure: nothing is
 /// written, nothing is retried); the combined operations are then validated with [`check_views`].
 pub fn project_commit(
     projectors: &[Arc<dyn CommitProjector>],
@@ -530,20 +634,29 @@ pub fn project_commit(
 
     let mut projected = Vec::new();
     for (index, projector) in projectors.iter().enumerate() {
-        let operations = projector.project(view).map_err(|source| {
-            Error::Projector(Box::new(CommitProjectorFailed {
-                projector: projector.name().to_owned(),
-                source,
-            }))
-        })?;
+        let history = projector.history();
+        let operations = projector
+            .project(&view.visible_to(history))
+            .map_err(|source| {
+                Error::Projector(Box::new(CommitProjectorFailed {
+                    projector: projector.name().to_owned(),
+                    source,
+                }))
+            })?;
 
         for (operation, op) in operations.into_iter().enumerate() {
-            projected.push(ProjectedView {
+            let item = ProjectedView {
                 projector: projector.name().to_owned(),
                 projector_index: index,
                 operation,
                 op,
-            });
+            };
+
+            if !history.is_empty() {
+                check_owner(&item, view)?;
+            }
+
+            projected.push(item);
         }
     }
 
@@ -644,28 +757,31 @@ fn invalid_reason(op: &ViewOperation) -> Option<String> {
 /// history-dependent projector (storage spec, "Rebuilding a history-dependent projector"): events
 /// sharing a commit ID form one [`CommitView`], its streams ascending by entity-ID bytes and each
 /// stream's events by sequence. An event with an empty commit ID (written before v0.9) is a
-/// single-event commit.
+/// single-event commit. `state` is left empty: the caller folds each stream's state after the
+/// commit and fills it in before running a projector that reads it.
 ///
-/// The returned views ascend by their first event in (entity-ID bytes, sequence) order; the order
-/// carries no meaning, because a projector's output depends only on its own commit. `state` is left
-/// empty: the caller folds each stream's state after the commit and fills it in before running a
-/// projector that reads it.
-pub fn group_commits(events: impl IntoIterator<Item = SerializedEvent>) -> Vec<CommitView> {
+/// The views come back in an order every stream agrees with: a commit that wrote a stream's
+/// sequence 3 precedes the commit that wrote its sequence 4, for every stream. That is the only
+/// commit order the log keeps (commit IDs and timestamps are not causal), and it is the order of
+/// every write to a row owned by one stream ([`ViewOperation::owner`]), so replaying in it
+/// reproduces the rows of a history-dependent projector. Commits no stream orders relative to each
+/// other come in a fixed arbitrary order, by their first event's (entity-ID bytes, sequence); a
+/// projector whose rows depend on that order shares a row between owners, which [`replay_views`]
+/// refuses. It returns [`Error::CommitOrder`] when no such order exists.
+pub fn group_commits(
+    events: impl IntoIterator<Item = SerializedEvent>,
+) -> Result<Vec<CommitView>, Error> {
     let mut sorted: Vec<SerializedEvent> = events.into_iter().collect();
-    sorted.sort_by(|a, b| {
-        a.entity_id
-            .as_str()
-            .as_bytes()
-            .cmp(b.entity_id.as_str().as_bytes())
-            .then_with(|| a.sequence.cmp(&b.sequence))
-    });
+    sorted.sort_by(compare_events);
 
     let mut groups: Vec<Vec<SerializedEvent>> = Vec::new();
     let mut by_commit: BTreeMap<String, usize> = BTreeMap::new();
+    let mut members: Vec<usize> = Vec::with_capacity(sorted.len());
 
-    for event in sorted {
+    for event in &sorted {
         if event.metadata.commit_id.is_empty() {
-            groups.push(vec![event]);
+            members.push(groups.len());
+            groups.push(vec![event.clone()]);
 
             continue;
         }
@@ -677,10 +793,157 @@ pub fn group_commits(events: impl IntoIterator<Item = SerializedEvent>) -> Vec<C
 
                 groups.len() - 1
             });
-        groups[index].push(event);
+        members.push(index);
+        groups[index].push(event.clone());
     }
 
-    groups.into_iter().map(commit_view_of).collect()
+    // Each stream orders the commits that wrote it: an edge from one commit to the next.
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
+    let mut waiting: Vec<usize> = vec![0; groups.len()];
+
+    for i in 1..sorted.len() {
+        let (previous, current) = (members[i - 1], members[i]);
+        if sorted[i - 1].entity_id != sorted[i].entity_id || previous == current {
+            continue;
+        }
+
+        successors[previous].push(current);
+        waiting[current] += 1;
+    }
+
+    let key = |group: usize| {
+        let first = &groups[group][0];
+
+        (first.entity_id.as_str().as_bytes().to_vec(), first.sequence)
+    };
+
+    let mut ready: BinaryHeap<Reverse<(CommitKey, usize)>> = BinaryHeap::new();
+    for (group, count) in waiting.iter().enumerate() {
+        if *count == 0 {
+            ready.push(Reverse((key(group), group)));
+        }
+    }
+
+    let mut order = Vec::with_capacity(groups.len());
+    while let Some(Reverse((_, group))) = ready.pop() {
+        order.push(group);
+
+        for &successor in &successors[group] {
+            waiting[successor] -= 1;
+            if waiting[successor] == 0 {
+                ready.push(Reverse((key(successor), successor)));
+            }
+        }
+    }
+
+    if order.len() < groups.len() {
+        let mut commits: Vec<String> = (0..groups.len())
+            .filter(|&group| waiting[group] > 0)
+            .map(|group| groups[group][0].metadata.commit_id.clone())
+            .collect();
+        commits.sort();
+
+        return Err(Error::CommitOrder { commits });
+    }
+
+    let mut taken: Vec<Option<Vec<SerializedEvent>>> = groups.into_iter().map(Some).collect();
+
+    Ok(order
+        .into_iter()
+        .filter_map(|group| taken[group].take())
+        .map(commit_view_of)
+        .collect())
+}
+
+/// A commit's place among commits no stream relates: its first event's (entity-ID bytes, sequence).
+type CommitKey = (Vec<u8>, EventSequence);
+
+fn compare_events(a: &SerializedEvent, b: &SerializedEvent) -> Ordering {
+    a.entity_id
+        .as_str()
+        .as_bytes()
+        .cmp(b.entity_id.as_str().as_bytes())
+        .then_with(|| a.sequence.cmp(&b.sequence))
+}
+
+/// A rebuild of history-dependent projectors in memory: runs the projectors over the commits, in
+/// the given order ([`group_commits`]' order, with each stream's state after its commit in
+/// [`CommitStream::state`]), applies their operations to an empty set of rows, and returns the rows
+/// ordered by `pk` then `sk` bytes. Conditions are not evaluated: a replay applies what the live
+/// commits wrote. It returns [`Error::SharedViewKey`] when two operations of different owner
+/// streams touch one row, because the final row would then depend on an order the log does not
+/// keep.
+pub fn replay_views(
+    projectors: &[Arc<dyn CommitProjector>],
+    commits: &[CommitView],
+) -> Result<Vec<ViewRow>, Error> {
+    let mut rows: BTreeMap<(Vec<u8>, Vec<u8>), ViewRow> = BTreeMap::new();
+    let mut owners: HashMap<(String, String), EntityId> = HashMap::new();
+
+    for commit in commits {
+        for item in project_commit(projectors, commit)? {
+            let op = item.op;
+            let target = (op.pk.clone(), op.sk.clone());
+
+            if let Some(owner) = op.owner {
+                match owners.get(&target) {
+                    Some(first) if *first != owner => {
+                        return Err(Error::SharedViewKey {
+                            pk: target.0,
+                            sk: target.1,
+                            first: first.to_string(),
+                            second: owner.to_string(),
+                        });
+                    }
+                    _ => {
+                        owners.insert(target.clone(), owner);
+                    }
+                }
+            }
+
+            let key = (op.pk.as_bytes().to_vec(), op.sk.as_bytes().to_vec());
+            match op.kind {
+                ViewOperationKind::Delete => {
+                    rows.remove(&key);
+                }
+                ViewOperationKind::Put => {
+                    rows.insert(
+                        key,
+                        ViewRow::new(op.pk, op.sk, op.entity_id, op.entity_type, op.payload),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(rows.into_values().collect())
+}
+
+/// Requires a history-dependent projector's operation to name an owner stream the commit wrote.
+fn check_owner(view: &ProjectedView, commit: &CommitView) -> Result<(), Error> {
+    let invalid = |reason: String| {
+        Err(Error::InvalidViewOperation(format!(
+            "projector {:?} (#{}) operation {}: {reason}",
+            view.projector, view.projector_index, view.operation
+        )))
+    };
+
+    match &view.op.owner {
+        None => {
+            invalid("a history-dependent projector's operation must name an owner stream".into())
+        }
+        Some(owner)
+            if !commit
+                .streams
+                .iter()
+                .any(|stream| &stream.entity_id == owner) =>
+        {
+            invalid(format!(
+                "the owner stream {owner:?} was not written by this commit"
+            ))
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 /// The view of one commit's events, already in (entity-ID bytes, sequence) order.
@@ -709,6 +972,7 @@ fn commit_view_of(events: Vec<SerializedEvent>) -> CommitView {
 #[cfg(test)]
 mod tests {
     use std::fmt;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::ids::EventSequence;
@@ -786,7 +1050,7 @@ mod tests {
     }
 
     fn view_of(events: Vec<SerializedEvent>) -> CommitView {
-        group_commits(events).remove(0)
+        group_commits(events).unwrap().remove(0)
     }
 
     fn projected(projector: &str, operation: usize, op: ViewOperation) -> ProjectedView {
@@ -1070,7 +1334,7 @@ mod tests {
             event("a", 3, ""),
         ];
 
-        let views = group_commits(events);
+        let views = group_commits(events).unwrap();
 
         // Ordered by each group's first event in (stream bytes, sequence) order.
         let shape: Vec<_> = views
@@ -1111,13 +1375,216 @@ mod tests {
                 .flat_map(|view| &view.streams)
                 .all(|stream| stream.state.is_empty())
         );
-        assert!(group_commits(Vec::new()).is_empty());
+        assert!(group_commits(Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn group_commits_orders_commits_by_each_streams_sequences_not_by_entity_id() {
+        // Commit x wrote z:1. Commit y wrote z:2 and a:1. Commit w wrote a:2. Sorted by first
+        // event alone, y (a:1) would replay before x (z:1), though z orders x first.
+        let views = group_commits(vec![
+            event("z", 1, "x"),
+            event("z", 2, "y"),
+            event("a", 1, "y"),
+            event("a", 2, "w"),
+        ])
+        .unwrap();
+
+        let order: Vec<_> = views.iter().map(|view| view.commit_id.as_str()).collect();
+        assert_eq!(
+            order,
+            ["x", "y", "w"],
+            "z orders x before y, and a orders y before w"
+        );
+
+        // Commits no stream relates come in a fixed order, by their first event.
+        let views = group_commits(vec![event("m", 1, "late"), event("b", 1, "early")]).unwrap();
+        assert_eq!(views[0].commit_id, "early");
+        assert_eq!(views[1].commit_id, "late");
+    }
+
+    #[test]
+    fn group_commits_refuses_events_no_order_fits() {
+        // c1 wrote a:1 and b:2; c2 wrote a:2 and b:1: a puts c1 first, b puts c2 first.
+        let error = group_commits(vec![
+            event("a", 1, "c1"),
+            event("a", 2, "c2"),
+            event("b", 1, "c2"),
+            event("b", 2, "c1"),
+        ])
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::CommitOrder { commits } if commits == &["c1", "c2"]),
+            "{error:?}"
+        );
+    }
+
+    fn reading(
+        history: &[&str],
+        script: impl Fn(&CommitView) -> Vec<ViewOperation> + Send + Sync + 'static,
+    ) -> Arc<dyn CommitProjector> {
+        type Script = Box<dyn Fn(&CommitView) -> Vec<ViewOperation> + Send + Sync>;
+
+        struct Reading(Vec<EntityType>, Script);
+
+        impl CommitProjector for Reading {
+            fn name(&self) -> &str {
+                "reading"
+            }
+
+            fn history(&self) -> &[EntityType] {
+                &self.0
+            }
+
+            fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+                Ok((self.1)(commit))
+            }
+        }
+
+        Arc::new(Reading(
+            history
+                .iter()
+                .map(|entity_type| EntityType::new(*entity_type))
+                .collect(),
+            Box::new(script),
+        ))
+    }
+
+    fn row_for(commit_id: &str, owner: &str) -> ViewOperation {
+        ViewOperation::put("shared", "row", owner, "t", format!("\"{commit_id}\"")).owned_by(owner)
+    }
+
+    #[test]
+    fn a_current_state_projector_sees_no_events_and_a_history_one_only_its_types() {
+        let mut view = view_of(vec![event("a", 1, "c"), event("b", 1, "c")]);
+        view.streams[1].entity_type = EntityType::new("other");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = |name: &'static str, history: &'static [&'static str]| {
+            let seen = seen.clone();
+
+            reading(history, move |commit| {
+                seen.lock().unwrap().push((
+                    name,
+                    commit
+                        .streams
+                        .iter()
+                        .map(|stream| stream.events.len())
+                        .collect::<Vec<_>>(),
+                ));
+
+                if history.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ViewOperation::put("pk", "sk", "", "", "{}").owned_by("a")]
+                }
+            })
+        };
+
+        project_commit(&[record("current", &[]), record("reads", &["t"])], &view).unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen[0], ("current", vec![0, 0]), "state only");
+        assert_eq!(
+            seen[1],
+            ("reads", vec![1, 0]),
+            "its type's events, not the other type's"
+        );
+        assert_eq!(
+            view.streams[1].events.len(),
+            1,
+            "the caller's view is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_history_dependent_operation_names_an_owner_the_commit_wrote() {
+        let view = view_of(vec![event("a", 1, "c")]);
+        let run = |op: ViewOperation| {
+            project_commit(&[reading(&["t"], move |_| vec![op.clone()])], &view)
+        };
+
+        assert!(run(ViewOperation::put("pk", "sk", "", "", "{}").owned_by("a")).is_ok());
+        assert!(matches!(
+            run(ViewOperation::put("pk", "sk", "", "", "{}")),
+            Err(Error::InvalidViewOperation(_))
+        ));
+        assert!(matches!(
+            run(ViewOperation::put("pk", "sk", "", "", "{}").owned_by("elsewhere")),
+            Err(Error::InvalidViewOperation(_))
+        ));
+
+        // A current-state projector needs no owner.
+        let state = reading(&[], |_| vec![ViewOperation::put("pk", "sk", "", "", "{}")]);
+        assert!(project_commit(&[state], &view).is_ok());
+    }
+
+    #[test]
+    fn replay_reproduces_the_live_row_when_one_stream_owns_it() {
+        // The row belongs to z. Commit x wrote z:1; commit y wrote z:2 and a:1. Live, y wrote
+        // last. The old order (by first event) replayed y before x and kept x's value.
+        let groups = group_commits(vec![
+            event("z", 1, "x"),
+            event("z", 2, "y"),
+            event("a", 1, "y"),
+        ])
+        .unwrap();
+        let projector = reading(&["t"], |commit| vec![row_for(&commit.commit_id, "z")]);
+
+        let rows = replay_views(&[projector], &groups).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].payload, b"\"y\"",
+            "the later commit of the owner stream wins"
+        );
+    }
+
+    #[test]
+    fn replay_refuses_a_row_two_streams_write() {
+        // Commit x (stream z) puts the shared row; the later commit y (stream a) overwrites it. The
+        // log keeps no order between z and a, and entity-ID order would replay y first.
+        let groups = group_commits(vec![event("z", 1, "x"), event("a", 1, "y")]).unwrap();
+        let projector = reading(&["t"], |commit| {
+            vec![row_for(
+                &commit.commit_id,
+                commit.streams[0].entity_id.as_str(),
+            )]
+        });
+
+        let error = replay_views(&[projector], &groups).unwrap_err();
+
+        assert!(
+            matches!(&error, Error::SharedViewKey { pk, sk, .. } if pk == "shared" && sk == "row"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn replay_applies_deletes_and_sorts_the_rows() {
+        let groups = group_commits(vec![event("a", 1, "c1"), event("a", 2, "c2")]).unwrap();
+        let projector = reading(&["t"], |commit| {
+            if commit.commit_id == "c2" {
+                vec![ViewOperation::delete("pk", "gone").owned_by("a")]
+            } else {
+                vec![
+                    ViewOperation::put("pk", "kept", "", "", "{}").owned_by("a"),
+                    ViewOperation::put("pk", "gone", "", "", "{}").owned_by("a"),
+                ]
+            }
+        });
+
+        let rows = replay_views(&[projector], &groups).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sk, "kept");
     }
 
     #[test]
     fn group_commits_orders_stream_ids_by_bytes() {
         // "B" (0x42) sorts before "a" (0x61) bytewise, unlike a locale-aware comparison.
-        let views = group_commits(vec![event("a", 1, "c"), event("B", 1, "c")]);
+        let views = group_commits(vec![event("a", 1, "c"), event("B", 1, "c")]).unwrap();
 
         let ids: Vec<_> = views[0]
             .streams

@@ -46,6 +46,12 @@ pub struct PgStatement {
     pub sql: String,
     /// The parameters.
     pub params: Vec<Box<dyn ToSql + Sync + Send>>,
+    /// For a [view writer](PostgresRepository::with_view_writer)'s statement: the name of the
+    /// table's unique or primary-key constraint on `(pk, sk)`. It is required for a put with
+    /// [`ViewCondition::Absent`]: only a violation of this constraint means the row already
+    /// exists. A unique violation of any other constraint says nothing about the requested row, so
+    /// it is an ordinary failure of the statement, with the SQLSTATE as its reason.
+    pub key_constraint: Option<String>,
 }
 
 impl PgStatement {
@@ -54,7 +60,16 @@ impl PgStatement {
         Self {
             sql: sql.into(),
             params,
+            key_constraint: None,
         }
+    }
+
+    /// Names the unique or primary-key constraint on `(pk, sk)` of a view statement; see
+    /// [`key_constraint`](PgStatement::key_constraint).
+    #[must_use]
+    pub fn with_key_constraint(mut self, constraint: impl Into<String>) -> Self {
+        self.key_constraint = Some(constraint.into());
+        self
     }
 
     /// The statement's size in the shared commit budget: one action, sized by its SQL text. The
@@ -130,8 +145,9 @@ impl PostgresRepository {
     /// The repository decides whether an operation's condition held from its statement's outcome,
     /// so the writer's statements must have these semantics:
     ///
-    /// - a put with [`ViewCondition::Absent`] must raise a unique violation (`23505`) when the row
-    ///   exists: write a plain `INSERT`, with no `ON CONFLICT` clause;
+    /// - a put with [`ViewCondition::Absent`] must raise a unique violation (`23505`) of the
+    ///   `(pk, sk)` key constraint when the row exists: write a plain `INSERT`, with no
+    ///   `ON CONFLICT` clause, and name the constraint with [`PgStatement::with_key_constraint`];
     /// - a put without a condition overwrites: an `INSERT ... ON CONFLICT DO UPDATE`;
     /// - a delete with [`ViewCondition::Present`] must delete a row: a `DELETE` that affects no
     ///   row fails the condition;
@@ -168,6 +184,17 @@ impl PostgresRepository {
                     return Err(Error::InvalidViewOperation(format!(
                         "projector {:?} (#{}) operation {}: the view writer returned an empty \
                          statement",
+                        view.projector, view.projector_index, view.operation
+                    )));
+                }
+
+                if view.op.kind == ViewOperationKind::Put
+                    && view.op.condition == ViewCondition::Absent
+                    && statement.key_constraint.is_none()
+                {
+                    return Err(Error::InvalidViewOperation(format!(
+                        "projector {:?} (#{}) operation {}: the view writer must name the key \
+                         constraint of a put that requires the row to be absent",
                         view.projector, view.projector_index, view.operation
                     )));
                 }
@@ -938,7 +965,7 @@ impl PostgresRepository {
             let affected = tx
                 .execute(&statement.sql, &params)
                 .await
-                .map_err(|err| view_error(view, err))?;
+                .map_err(|err| view_error(view, statement.key_constraint.as_deref(), err))?;
 
             if view.op.kind == ViewOperationKind::Delete
                 && view.op.condition == ViewCondition::Present
@@ -988,6 +1015,14 @@ impl PostgresRepository {
 
 impl Repository for PostgresRepository {
     type Operation = PgStatement;
+
+    fn writes_views(&self) -> bool {
+        true
+    }
+
+    async fn declare_history_dependent(&self, types: &[EntityType]) -> Result<(), Error> {
+        crate::features::declare_history(self, types).await
+    }
 
     async fn commit(&self, commit: Commit<PgStatement>) -> Result<(), Error> {
         commit.validate()?;
@@ -1374,13 +1409,18 @@ fn view_writes<'a>(
     views.iter().zip(statements).collect()
 }
 
-/// Maps an error a view statement raised. A unique violation on a put that requires the row to be
-/// absent is its failed condition. Any other error the database raised belongs to the statement, so
+/// Maps an error a view statement raised. A violation of the `(pk, sk)` key constraint on a put that
+/// requires the row to be absent is its failed condition; a unique violation of any other
+/// constraint is an ordinary failure of the statement. Any other error the database raised belongs to the statement, so
 /// it is the operation's failure with the SQLSTATE as its reason, except a transaction rollback
 /// (serialization failure, deadlock), which is not the projector's doing and passes through as
 /// transient like for every other statement of the commit. A lost connection or pool timeout is a
 /// backend failure.
-fn view_error(view: &ProjectedView, err: tokio_postgres::Error) -> Error {
+fn view_error(
+    view: &ProjectedView,
+    key_constraint: Option<&str>,
+    err: tokio_postgres::Error,
+) -> Error {
     if transient(&err) {
         return Error::Transient(Box::new(err));
     }
@@ -1390,7 +1430,12 @@ fn view_error(view: &ProjectedView, err: tokio_postgres::Error) -> Error {
 
     let condition_failed = err.code() == Some(&SqlState::UNIQUE_VIOLATION)
         && view.op.kind == ViewOperationKind::Put
-        && view.op.condition == ViewCondition::Absent;
+        && view.op.condition == ViewCondition::Absent
+        && key_constraint.is_some_and(|key| {
+            err.as_db_error()
+                .and_then(|db| db.constraint())
+                .is_some_and(|violated| violated.eq_ignore_ascii_case(key))
+        });
     let reason = if condition_failed {
         REASON_CONDITION_FAILED.to_owned()
     } else {

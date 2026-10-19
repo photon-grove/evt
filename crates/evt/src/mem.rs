@@ -391,6 +391,14 @@ impl MemRepository {
 impl Repository for MemRepository {
     type Operation = Infallible;
 
+    fn writes_views(&self) -> bool {
+        true
+    }
+
+    async fn declare_history_dependent(&self, types: &[EntityType]) -> Result<(), Error> {
+        crate::features::declare_history(self, types).await
+    }
+
     async fn commit(&self, commit: Commit<Infallible>) -> Result<(), Error> {
         commit.validate()?;
         features::check_not_reserved(&commit.entity_id)?;
@@ -835,6 +843,153 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    /// A repository written before v0.9: it commits through the in-memory one but declares neither
+    /// view writing (unless `VIEWS`) nor history declaration.
+    struct Bare<const VIEWS: bool>(MemRepository);
+
+    impl<const VIEWS: bool> Repository for Bare<VIEWS> {
+        type Operation = Infallible;
+
+        fn writes_views(&self) -> bool {
+            VIEWS
+        }
+
+        async fn commit(&self, commit: Commit<Infallible>) -> Result<(), Error> {
+            self.0.commit(commit).await
+        }
+
+        async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
+            self.0.events(entity_id).await
+        }
+
+        async fn events_after(
+            &self,
+            entity_id: &EntityId,
+            after: EventSequence,
+        ) -> Result<Vec<SerializedEvent>, Error> {
+            self.0.events_after(entity_id, after).await
+        }
+
+        async fn latest(
+            &self,
+            entity_id: &EntityId,
+            n: usize,
+        ) -> Result<Vec<SerializedEvent>, Error> {
+            self.0.latest(entity_id, n).await
+        }
+
+        async fn snapshot(
+            &self,
+            entity_id: &EntityId,
+        ) -> Result<Option<SerializedSnapshot>, Error> {
+            self.0.snapshot(entity_id).await
+        }
+
+        async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+            self.0.put_snapshot(snapshot).await
+        }
+
+        async fn compact_below(
+            &self,
+            entity_id: &EntityId,
+            through: EventSequence,
+        ) -> Result<usize, Error> {
+            self.0.compact_below(entity_id, through).await
+        }
+
+        async fn entity_heads(
+            &self,
+            entity_type: Option<&EntityType>,
+        ) -> Result<BTreeMap<EntityId, EventSequence>, Error> {
+            self.0.entity_heads(entity_type).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_does_not_write_views_is_refused_before_any_write() {
+        use crate::conformance::{Add, Ledger};
+        use crate::{Metadata, Store};
+
+        let inner = MemRepository::new();
+        let store = Store::<Ledger, _>::new(Bare::<false>(inner.clone()), ())
+            .with_commit_projector(std::sync::Arc::new(Directory));
+
+        let error = store
+            .execute("one", Add(1), Metadata::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                crate::ExecuteError::Store(Error::ViewsUnsupported { .. })
+            ),
+            "{error:?}"
+        );
+        assert!(inner.events(&"one".into()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_cannot_declare_history_refuses_a_history_dependent_projector() {
+        use crate::conformance::{Add, Ledger};
+        use crate::{Aggregate, Metadata, Store};
+
+        struct Reads;
+
+        impl CommitProjector for Reads {
+            fn name(&self) -> &str {
+                "reads"
+            }
+
+            fn history(&self) -> &[EntityType] {
+                static LEDGER: std::sync::OnceLock<Vec<EntityType>> = std::sync::OnceLock::new();
+
+                LEDGER.get_or_init(|| vec![EntityType::new(Ledger::TYPE)])
+            }
+
+            fn project(&self, _: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let inner = MemRepository::new();
+        let store = Store::<Ledger, _>::new(Bare::<true>(inner.clone()), ())
+            .with_commit_projector(std::sync::Arc::new(Reads));
+
+        let error = store
+            .execute("one", Add(1), Metadata::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                crate::ExecuteError::Store(Error::HistoryDeclarationUnsupported { .. })
+            ),
+            "{error:?}"
+        );
+        assert!(inner.events(&"one".into()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_writes_no_event_runs_no_projector_and_declares_nothing() {
+        use crate::conformance::Ledger;
+        use crate::{Metadata, Store};
+
+        let repository = MemRepository::new();
+        let store = Store::<Ledger, _>::new(Bare::<false>(repository.clone()), ())
+            .with_commit_projector(std::sync::Arc::new(Directory));
+
+        // A repository that cannot write views is not even consulted for a commit with no event.
+        let loaded = store.load("one").await.unwrap();
+        store
+            .commit(loaded, Vec::new(), &Metadata::default())
+            .await
+            .unwrap();
+
+        assert!(repository.views().is_empty());
     }
 
     #[tokio::test]

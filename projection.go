@@ -1,6 +1,7 @@
 package evt
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -87,6 +88,13 @@ type ViewOperation struct {
 	// Condition is the operation's condition, if any.
 	Condition ViewCondition `json:"condition,omitempty"`
 
+	// Owner is the stream the row belongs to. A history-dependent projector (one whose History
+	// is not empty) must name one for every operation, and it must be a stream the commit wrote:
+	// then every write to a row is ordered by that stream's own sequence, which is the only commit
+	// order the log keeps, and a replay can apply them in that order. A current-state projector
+	// needs no owner. It is in-memory commit data and is never stored.
+	Owner EntityID `json:"-"`
+
 	// Conflict is the projector's own error for the case where Condition fails. The commit's
 	// *ProjectorOperationError wraps it, so errors.Is matches the projector's value. It is
 	// in-memory commit data and is never stored.
@@ -113,6 +121,13 @@ func (op ViewOperation) IfAbsent() ViewOperation {
 // IfPresent returns the operation requiring that a row exists at its key. It is valid on a delete.
 func (op ViewOperation) IfPresent() ViewOperation {
 	op.Condition = ViewPresent
+
+	return op
+}
+
+// OwnedBy returns the operation owned by the given stream; see ViewOperation.Owner.
+func (op ViewOperation) OwnedBy(owner EntityID) ViewOperation {
+	op.Owner = owner
 
 	return op
 }
@@ -191,9 +206,24 @@ func (v CommitView) EventCount() int {
 // a clock, a random source, the environment, a store, or state remembered between calls, and must
 // not be ordered by map iteration. It must not modify the view. The operations it returns are
 // appended to the commit in the projector's declaration order, each projector's in emission order.
+//
+// A projector is one of two kinds, and History says which. A current-state projector computes its
+// rows from the state each stream has after the commit; a rebuild never replays history for it. A
+// history-dependent projector also reads the commit's events; a rebuild replays every commit for it,
+// so the commits it reads must never be compacted away, and its rows must be ordered by something a
+// replay has.
 type CommitProjector interface {
 	// Name identifies the projector in errors. It should be unique within a store.
 	Name() string
+
+	// History returns the entity types whose events the projector reads. It returns nil for a
+	// current-state projector, which is then given views whose streams carry no events. A
+	// history-dependent projector is given the events of the streams of these types only, and no
+	// others. The store declares these types in the feature manifest's historyDependent set
+	// before the first commit that runs the projector, so CompactBelow refuses them in every
+	// process, and each of its operations must name the stream that owns its row (see
+	// ViewOperation.Owner).
+	History() []EntityType
 
 	// ProjectCommit returns the commit's view operations.
 	ProjectCommit(ctx context.Context, commit CommitView) ([]ViewOperation, error)
@@ -490,8 +520,11 @@ func invalidViewReason(op ViewOperation) string {
 
 // ProjectCommit runs the projectors over a commit view, in declaration order, and returns their
 // operations with provenance in the order the commit writes them. A commit that wrote no event
-// runs no projector. A projector's error is a *ProjectorError; the combined operations are
-// validated with CheckViews. A nil projector is skipped but keeps its position.
+// runs no projector. A current-state projector (History is empty) sees the view without events; a
+// history-dependent one sees the events of the entity types it names, and its operations must each
+// name an owner stream the commit wrote (*InvalidViewOperationError otherwise). A projector's
+// error is a *ProjectorError; the combined operations are validated with CheckViews. A nil
+// projector is skipped but keeps its position.
 func ProjectCommit(ctx context.Context, projectors []CommitProjector, view CommitView) ([]ProjectedView, error) {
 	if len(projectors) == 0 || view.EventCount() == 0 {
 		return nil, nil
@@ -504,15 +537,23 @@ func ProjectCommit(ctx context.Context, projectors []CommitProjector, view Commi
 			continue
 		}
 
-		operations, err := projector.ProjectCommit(ctx, view)
+		history := projector.History()
+
+		operations, err := projector.ProjectCommit(ctx, view.visibleTo(history))
 		if err != nil {
 			return nil, &ProjectorError{Projector: projector.Name(), Err: err}
 		}
 
 		for operation, op := range operations {
-			projected = append(projected, ProjectedView{
-				Projector: projector.Name(), ProjectorIndex: index, Operation: operation, Op: op,
-			})
+			item := ProjectedView{Projector: projector.Name(), ProjectorIndex: index, Operation: operation, Op: op}
+
+			if len(history) > 0 {
+				if err := checkOwner(item, view); err != nil {
+					return nil, err
+				}
+			}
+
+			projected = append(projected, item)
 		}
 	}
 
@@ -521,6 +562,46 @@ func ProjectCommit(ctx context.Context, projectors []CommitProjector, view Commi
 	}
 
 	return projected, nil
+}
+
+// visibleTo returns the view a projector is given: the events of the streams whose entity type it
+// names, and none of any other stream. A current-state projector names no type, so it reads state
+// only; that is what makes a rebuild from state alone reproduce its rows.
+func (v CommitView) visibleTo(history []EntityType) CommitView {
+	streams := make([]CommitStream, len(v.Streams))
+
+	for i, stream := range v.Streams {
+		if !slices.Contains(history, stream.EntityType) {
+			stream.Events = nil
+		}
+
+		streams[i] = stream
+	}
+
+	v.Streams = streams
+
+	return v
+}
+
+// checkOwner requires a history-dependent projector's operation to name an owner stream the commit
+// wrote.
+func checkOwner(view ProjectedView, commit CommitView) error {
+	ref := ProjectorOperationRef{Projector: view.Projector, ProjectorIndex: view.ProjectorIndex, Operation: view.Operation}
+
+	if view.Op.Owner == "" {
+		return &InvalidViewOperationError{ProjectorOperationRef: ref, Reason: "a history-dependent projector's operation must name an owner stream"}
+	}
+
+	for _, stream := range commit.Streams {
+		if stream.EntityID == view.Op.Owner {
+			return nil
+		}
+	}
+
+	return &InvalidViewOperationError{
+		ProjectorOperationRef: ref,
+		Reason:                fmt.Sprintf("the owner stream %q was not written by this commit", view.Op.Owner),
+	}
 }
 
 // NewCommitView builds the view of one commit from its events: streams ascending by entity-ID
@@ -557,46 +638,224 @@ func NewCommitView(events []SerializedEvent, states map[EntityID][]byte) CommitV
 	return view
 }
 
+// CommitOrderError reports stored events whose commits cannot be put in an order that respects
+// every stream's own sequence: commit A wrote a stream before commit B, and B wrote another stream
+// before A. No live system produces that, so the events are not a log this engine wrote.
+type CommitOrderError struct {
+	// Commits are the commit IDs involved, ascending.
+	Commits []string
+}
+
+// Error describes the cycle.
+func (e *CommitOrderError) Error() string {
+	return fmt.Sprintf("commits %v cannot be ordered consistently with their streams' sequences", e.Commits)
+}
+
 // GroupCommits regroups stored events into the commits that wrote them, the way a rebuild replays a
 // history-dependent projector (storage spec, Views): events sharing a commit ID form one
 // CommitView, its streams ascending by entity-ID bytes and its events by sequence. An event with
-// no commit ID (written before v0.9) is a single-event commit. The views are ordered by their
-// first event in (entity ID bytes, sequence) order, which carries no meaning: a projector's output
-// depends only on its own commit. State is left nil; the caller folds it.
-func GroupCommits(events []SerializedEvent) []CommitView {
+// no commit ID (written before v0.9) is a single-event commit. State is left nil; the caller folds
+// it.
+//
+// The views come back in an order every stream agrees with: a commit that wrote a stream's
+// sequence 3 precedes the commit that wrote its sequence 4, for every stream. That is the only
+// commit order the log keeps — commit IDs and timestamps are not causal — and it is the order of
+// every write to a row owned by one stream (ViewOperation.Owner), so replaying in it reproduces
+// the rows of a history-dependent projector. Commits no stream orders relative to each other
+// (streams that never met) come in a fixed arbitrary order, by their first event's (entity ID
+// bytes, sequence); a projector whose rows depend on that order shares a row between owners, which
+// ReplayViews refuses. It returns *CommitOrderError when no such order exists.
+func GroupCommits(events []SerializedEvent) ([]CommitView, error) {
 	sorted := slices.Clone(events)
 	slices.SortStableFunc(sorted, compareEvents)
 
 	var (
-		groups []*[]SerializedEvent
-		byID   = map[string]*[]SerializedEvent{}
+		groups  [][]SerializedEvent
+		byID    = map[string]int{}
+		members = make([]int, len(sorted))
 	)
 
-	for _, event := range sorted {
+	for i, event := range sorted {
 		id := event.Metadata.CommitID
 		if id == "" {
-			group := []SerializedEvent{event}
-			groups = append(groups, &group)
+			members[i] = len(groups)
+			groups = append(groups, []SerializedEvent{event})
 
 			continue
 		}
 
-		group, ok := byID[id]
+		index, ok := byID[id]
 		if !ok {
-			group = &[]SerializedEvent{}
-			byID[id] = group
-			groups = append(groups, group)
+			index = len(groups)
+			byID[id] = index
+			groups = append(groups, nil)
 		}
 
-		*group = append(*group, event)
+		members[i] = index
+		groups[index] = append(groups[index], event)
+	}
+
+	// Each stream orders the commits that wrote it: an edge from one commit to the next.
+	successors := make([][]int, len(groups))
+	waiting := make([]int, len(groups))
+
+	for i := 1; i < len(sorted); i++ {
+		previous, current := members[i-1], members[i]
+		if sorted[i-1].EntityID != sorted[i].EntityID || previous == current {
+			continue
+		}
+
+		successors[previous] = append(successors[previous], current)
+		waiting[current]++
+	}
+
+	ready := &commitHeap{groups: groups}
+	for i := range groups {
+		if waiting[i] == 0 {
+			heap.Push(ready, i)
+		}
 	}
 
 	views := make([]CommitView, 0, len(groups))
-	for _, group := range groups {
-		views = append(views, NewCommitView(*group, nil))
+
+	for ready.Len() > 0 {
+		next, ok := heap.Pop(ready).(int)
+		if !ok {
+			break
+		}
+
+		views = append(views, NewCommitView(groups[next], nil))
+
+		for _, successor := range successors[next] {
+			if waiting[successor]--; waiting[successor] == 0 {
+				heap.Push(ready, successor)
+			}
+		}
 	}
 
-	return views
+	if len(views) < len(groups) {
+		return nil, unorderedCommits(groups, waiting)
+	}
+
+	return views, nil
+}
+
+func unorderedCommits(groups [][]SerializedEvent, waiting []int) error {
+	var stuck []string
+
+	for i, count := range waiting {
+		if count > 0 {
+			stuck = append(stuck, groups[i][0].Metadata.CommitID)
+		}
+	}
+
+	slices.Sort(stuck)
+
+	return &CommitOrderError{Commits: stuck}
+}
+
+// commitHeap orders ready commits by their first event's (entity ID bytes, sequence).
+type commitHeap struct {
+	groups [][]SerializedEvent
+	items  []int
+}
+
+func (h *commitHeap) Len() int { return len(h.items) }
+
+func (h *commitHeap) Less(i, j int) bool {
+	return compareEvents(h.groups[h.items[i]][0], h.groups[h.items[j]][0]) < 0
+}
+
+func (h *commitHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *commitHeap) Push(x any) {
+	if index, ok := x.(int); ok {
+		h.items = append(h.items, index)
+	}
+}
+
+func (h *commitHeap) Pop() any {
+	last := h.items[len(h.items)-1]
+	h.items = h.items[:len(h.items)-1]
+
+	return last
+}
+
+// SharedViewKeyError reports a row written on behalf of two different streams. Their commits have
+// no order the log keeps, so a replay cannot tell which write came last, and it refuses rather than
+// guess a final view that may differ from the live one.
+type SharedViewKeyError struct {
+	PK string
+	SK string
+
+	// First and Second are the owner streams, in the order the replay met them.
+	First  EntityID
+	Second EntityID
+}
+
+// Error describes the shared row.
+func (e *SharedViewKeyError) Error() string {
+	return fmt.Sprintf("view row %q/%q is written for streams %q and %q, whose commits have no durable order",
+		e.PK, e.SK, e.First, e.Second)
+}
+
+// ReplayViews is a rebuild of history-dependent projectors in memory: it runs the projectors over
+// the commits, in the given order (GroupCommits' order, with each stream's state after its commit
+// in CommitView.State), applies their operations to an empty set of rows, and returns the rows
+// ordered by pk then sk bytes. Conditions are not evaluated: a replay applies what the live
+// commits wrote. It returns *SharedViewKeyError when two operations of different owner streams
+// touch one row, because the final row would then depend on an order the log does not keep.
+func ReplayViews(ctx context.Context, projectors []CommitProjector, commits []CommitView) ([]SerializedView, error) {
+	type key struct{ pk, sk string }
+
+	var (
+		rows   = map[key]SerializedView{}
+		owners = map[key]EntityID{}
+	)
+
+	for _, commit := range commits {
+		projected, err := ProjectCommit(ctx, projectors, commit)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, item := range projected {
+			target := key{item.Op.PK, item.Op.SK}
+
+			if owner := item.Op.Owner; owner != "" {
+				if first, seen := owners[target]; seen && first != owner {
+					return nil, &SharedViewKeyError{PK: target.pk, SK: target.sk, First: first, Second: owner}
+				}
+
+				owners[target] = owner
+			}
+
+			if item.Op.Kind == ViewDelete {
+				delete(rows, target)
+
+				continue
+			}
+
+			rows[target] = SerializedView{
+				PK: item.Op.PK, SK: item.Op.SK, EntityID: item.Op.EntityID, EntityType: item.Op.EntityType,
+				Payload: slices.Clone(item.Op.Payload),
+			}
+		}
+	}
+
+	replayed := make([]SerializedView, 0, len(rows))
+	for _, row := range rows {
+		replayed = append(replayed, row)
+	}
+
+	slices.SortFunc(replayed, func(a, b SerializedView) int {
+		if byPK := strings.Compare(a.PK, b.PK); byPK != 0 {
+			return byPK
+		}
+
+		return strings.Compare(a.SK, b.SK)
+	})
+
+	return replayed, nil
 }
 
 // compareEvents orders events by entity-ID bytes, then sequence: the pinned order of a commit's

@@ -467,13 +467,37 @@ operations again with the rest of the commit ([Re-preparing](#re-preparing)). It
 | `streams`  | Every written stream, ascending by entity-ID bytes (the order of the transaction's groups).  |
 
 and each stream holds its entity ID, its entity type, the commit's events for it in ascending
-sequence (serialized: type, version, payload, metadata), and its **state after the commit** — the
+sequence (serialized: type, version, payload, metadata; present only as the projector's declared
+history allows, below), and its **state after the commit** — the
 JSON the aggregate's snapshot would carry. Streams that were only read (fenced) are not in the
 view. A command that writes no event (a plain rejection, an accepted no-op, an outcome-only
 commit) runs no projector, and a rejection that [carries events](#rejections-that-carry-events)
 projects them exactly like an accepted command's. The view carries **no outcome context**: a
 rebuild regroups stored events by `commitId` and has no outcome row to read, so a row that
 depended on the outcome's status could not be rebuilt.
+
+**Two kinds of projector, declared (v0.9, C7, C9).** A projector states which entity types it reads
+the *events* of (`History` in Go, `history` in Rust). A **current-state** projector states none: the
+engine gives it the commit view with every stream's events removed, so it can compute rows from
+each stream's state after the commit and nothing else, which is what lets a rebuild reproduce its
+rows from final states alone. A **history-dependent** projector states the entity types whose events
+it reads, and is given the events of the streams of those types only. The declaration is enforced,
+not trusted: an event a projector did not declare never reaches it. Before the first commit that
+runs a history-dependent projector, the store durably adds its entity types to the manifest's
+`historyDependent` set ([Feature Marker](#feature-marker)) — a repository that cannot declare
+(Go `evt.HistoryDeclarer`, Rust `Repository::declare_history_dependent`) refuses the commit with
+`HistoryDeclarationUnsupported` before any write — so `CompactBelow` refuses those types in every
+process, whether or not it registered the projector.
+
+**Ownership (v0.9, C7).** The log keeps one commit order only: the sequence order of each stream.
+Commit IDs and timestamps are not causal, so a replay cannot order two commits on different streams
+that write the same row. A history-dependent projector therefore names, for every operation, the
+**owner** of the row: a stream the commit wrote (`ViewOperation.Owner`, `owner`). The engine checks
+it before any write (`InvalidViewOperation`: no owner, or an owner the commit did not write). Every
+write to a row is then made by a commit that wrote its owner stream, so the writes to one row are
+ordered by that stream's sequence, and a replay applies them in that order. A row written on behalf
+of two different streams has no order the log keeps: the replay refuses it (below) instead of
+guessing. A current-state projector needs no owner, because its rebuild never replays history.
 
 A projector's operations are appended to the commit in projector **declaration order**, each
 projector's in its **emission order**, after the marker check and before the written streams
@@ -526,11 +550,18 @@ operation in order and returns the first failure as a typed error:
    targets, since DynamoDB would otherwise fail the whole transaction with an unclassified
    `ValidationException`.
 
+A history-dependent projector's operation without an owner the commit wrote is
+`InvalidViewOperation`, reported when the projector returns (the owner is in-memory commit data;
+repositories never see it).
+
 A commit that carries operations but no event is `ProjectorOnlyCommit` / `ProjectorWithoutEvents`
 first ([Writes](#writes)). Operations count against `CommitTooLarge` ([Budget](#writes)) and are
 sized as described there. A repository that was given view operations but has no place to write
 them (no views table, no view writer) refuses the commit before any write with
-`ViewsNotConfigured`, never dropping them.
+`ViewsNotConfigured`, never dropping them. A repository that has not declared it writes view
+operations at all (Go `evt.ViewWritingRepository`, Rust `Repository::writes_views`) — a custom
+backend written before v0.9 — is refused by the store before any write with `ViewsUnsupported`, and
+Go's `CheckProjectorOperationsSupported` guard stays fail-closed for view operations.
 
 **Failure mapping (v0.9, C7).** A projector operation fails when its condition fails — or, on
 PostgreSQL, when the database rejects its statement. The failure maps to a typed error that names
@@ -545,7 +576,7 @@ never retried, and records no outcome (internal failures write none). The reason
 | Backend    | Reason                                                                                                  |
 | ---------- | ------------------------------------------------------------------------------------------------------- |
 | DynamoDB   | The item's cancellation reason code: `ConditionalCheckFailed`, `ValidationError`, or `ItemCollectionSizeLimitExceeded`. |
-| PostgreSQL | `ConditionalCheckFailed` for an `absent` put (a unique violation, `23505`) and a `present` delete (no row deleted); otherwise the SQLSTATE the database raised. |
+| PostgreSQL | `ConditionalCheckFailed` for an `absent` put (a violation of the named `(pk, sk)` key constraint, `23505`) and a `present` delete (no row deleted); otherwise the SQLSTATE the database raised. |
 | In-memory  | `ConditionalCheckFailed`.                                                                                |
 
 Where several items of a cancelled DynamoDB transaction failed, the failure classification ranks
@@ -620,7 +651,16 @@ never refuses these entity types.
 **Rebuilding a history-dependent projector (v0.9, C7, C9).** A wipe-and-rebuild replays every
 commit grouped by `commitId` — each group's events, ordered by stream ID bytewise then by
 sequence (the same pinned order as the commit's transaction), form one `CommitView`, and the
-projector runs once per group, exactly as it did at commit time. Nothing may have deleted the
+projector runs once per group, exactly as it did at commit time, with the state each stream had
+after that commit. The groups are applied in an order **every stream agrees with**: a commit that
+wrote a stream's sequence 3 precedes the commit that wrote its sequence 4, for every stream (Go
+`GroupCommits`, Rust `group_commits`; commits that no stream relates come in the order of their
+first event's stream ID bytes and sequence, which carries no meaning). Events whose commits cannot
+be ordered that way — a cycle — are not a log this engine wrote and fail with `CommitOrder`. The
+replay applies each operation to the rows, and refuses with `SharedViewKey` (Go
+`ReplayViews`, Rust `replay_views`) when two operations of different owner streams touch one row,
+because the final row would then depend on an order the log does not keep. Conditions are not
+evaluated in a replay: it applies what the live commits wrote. Nothing may have deleted the
 history, so compaction is **forbidden for the entity types in the manifest's `historyDependent`
 set**, and the prohibition is durable ([Feature Marker](#feature-marker)):
 
@@ -632,7 +672,9 @@ set**, and the prohibition is durable ([Feature Marker](#feature-marker)):
 
 Pre-v0.9 events, whose metadata has no `commitId`, replay as single-event commits — one
 `CommitView` per event, in stream and sequence order — which reproduces the per-entity projector
-behaviour an old log was written under.
+behaviour an old log was written under. The events of a live `CommitView` carry the metadata a
+stored event has (the command ID as the effective `causationId`), so a projector reads the same
+metadata live and on replay.
 
 ## Read Fences
 
@@ -2352,9 +2394,13 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   `postgres.Repository.WithViewWriter`, Rust `PostgresRepository::with_view_writer`), and a
   repository without one refuses a commit that carries view operations with `ViewsNotConfigured`.
   The engine executes the statement the writer returns, in the pinned order, and decides whether
-  the operation's condition held: an `absent` put must raise a unique violation (`23505`) when the
-  row exists, which is the failed condition, and a `present` delete fails its condition when the
-  statement deletes no row. A projector statement that the database rejects is a projector
+  the operation's condition held: an `absent` put must raise a unique violation (`23505`) of the
+  table's `(pk, sk)` key constraint when the row exists, which is the failed condition, and the
+  writer names that constraint with the statement (Go `ViewStatement.KeyConstraint`, Rust
+  `PgStatement::with_key_constraint`; an `absent` put without one is `InvalidViewOperation`). A
+  unique violation of any other constraint of the table says nothing about the requested row, so
+  it is an ordinary failure of the statement, with the SQLSTATE as its reason. A `present` delete
+  fails its condition when the statement deletes no row. A projector statement that the database rejects is a projector
   operation failure (a lost connection is a backend error), and so is an integrity violation
   raised at `COMMIT`, which only a deferred constraint on a projector's table can cause (it
   names no operation: Go `*evt.ProjectorError`, Rust `Error::Projector`).
@@ -2629,6 +2675,10 @@ These differences are deliberate and covered by tests. Keep them documented here
   and the in-memory repository rank as a conflict ahead of any projector operation, is therefore
   reported on PostgreSQL only if no view statement failed first. Head, gap, drift, fence, and outcome
   failures rank identically on every backend.
+- **Projector kind declaration (C7).** Go's `CommitProjector.History()` is a required method; Rust's
+  `CommitProjector::history()` defaults to empty, a current-state projector. In both, a projector
+  that declares no history is given no events, so a Rust projector that forgets the declaration
+  sees an empty `events` list rather than reading undeclared history.
 - **Projector operation errors (C7).** Go's `*evt.ProjectorOperationError` exposes the operation's
   mapped error (`Err`) and the backend's cause (`Cause`), both matchable with `errors.Is`; Rust's
   `Error::ProjectorOperation` exposes them as `mapped()` and `cause()`, and its `source()` is the

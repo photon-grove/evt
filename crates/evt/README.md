@@ -512,6 +512,18 @@ them refuses the commit with `Error::ViewsNotConfigured`. A failed condition is
 `source()`; it is never retried and records no outcome. Keys over 2,048 bytes (`pk`) or 1,024 bytes
 (`sk`), a repeated key, and operations with no event are refused before any write.
 
+A projector says which entity types it reads the *events* of with `history()`. The default, none, is a
+current-state projector, given the view without events; one that names types is given those types'
+events, and the store durably adds them to the manifest's `historyDependent` set before its first
+commit (`compact_below` then refuses them), so the repository must implement
+`declare_history_dependent` and `writes_views` (the in-memory, DynamoDB, and PostgreSQL ones do).
+Each operation of a history-dependent projector names the stream that owns its row with
+`owned_by`, which must be a stream the commit wrote: a stream's sequence is the only commit order the
+log keeps, `group_commits` orders commits consistently with it, and `replay_views` refuses a row two
+streams write (`Error::SharedViewKey`). A PostgreSQL view writer names the table's `(pk, sk)` key
+constraint with `PgStatement::with_key_constraint`, so only a violation of that constraint is a
+failed `if_absent` condition.
+
 A projector must be deterministic: `group_commits` regroups stored events by commit ID so a
 rebuild, or a test, can run it again over each commit and compare.
 

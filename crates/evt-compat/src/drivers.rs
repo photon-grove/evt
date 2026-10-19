@@ -84,6 +84,10 @@ pub fn postgres_pool() -> Result<Pool, BoxError> {
 /// defines no view schema; the drivers of both languages create this one.
 pub const POSTGRES_VIEW_TABLE: &str = "evt_compat_views";
 
+/// The name of [`POSTGRES_VIEW_TABLE`]'s primary key, the constraint whose violation means a row
+/// already exists.
+pub const POSTGRES_VIEW_KEY_CONSTRAINT: &str = "evt_compat_views_pkey";
+
 /// Creates [`POSTGRES_VIEW_TABLE`]; the twin of Go's `compat.PostgresViewDDL`.
 pub const POSTGRES_VIEW_DDL: &str = "CREATE TABLE IF NOT EXISTS evt_compat_views (
     pk          text NOT NULL,
@@ -114,7 +118,8 @@ pub fn postgres_view_writer() -> ViewWriter {
             .map_err(|err| Error::InvalidViewOperation(format!("payload: {err}")))?;
         let insert = "INSERT INTO evt_compat_views (pk, sk, entity_id, entity_type, payload) \
                       VALUES ($1, $2, $3, $4, $5)";
-        let sql = if operation.condition == ViewCondition::Absent {
+        let absent = operation.condition == ViewCondition::Absent;
+        let sql = if absent {
             insert.to_owned()
         } else {
             format!(
@@ -132,7 +137,8 @@ pub fn postgres_view_writer() -> ViewWriter {
                 Box::new(operation.entity_type.clone()),
                 Box::new(payload),
             ],
-        ))
+        )
+        .with_key_constraint(POSTGRES_VIEW_KEY_CONSTRAINT))
     })
 }
 

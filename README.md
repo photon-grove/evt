@@ -218,6 +218,12 @@ view writer (`WithViewWriter`); the in-memory repository keeps the rows for test
 store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{}) // evt.CommitProjector
 ```
 
+- A projector declares the entity types whose events it reads (`History()`); with none it is
+  current-state and is given no events. The store durably adds declared types to the manifest's
+  `historyDependent` set before the first commit that runs it, so `CompactBelow` refuses them, and
+  each of its operations names the stream that owns its row (`OwnedBy`). A repository must declare
+  `evt.ViewWritingRepository` (and `evt.HistoryDeclarer` for history-dependent projectors) or the
+  commit is refused.
 - Operations land after the feature-marker check and before the written streams, in projector
   declaration order then emission order, and count against the shared budget (a single-stream
   commit leaves room for 98 events and view operations together, 97 with a snapshot).
@@ -234,7 +240,8 @@ store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{}) // evt.Co
 - Projectors run again on every fence-aware re-preparation of a command and never for a command that
   writes no event; a rejection that carries events projects them. A projector must be
   deterministic in its `evt.CommitView`, so a rebuild can reproduce its rows by regrouping the
-  stored events with `evt.GroupCommits`. See [Commit-wide
+  stored events with `evt.GroupCommits` (ordered by each stream's sequence) and `evt.ReplayViews`,
+  which refuses a row two streams write. See [Commit-wide
   projectors](docs/projections.md#commit-wide-projectors) and the [storage
   format](docs/spec/storage-format.md#views).
 

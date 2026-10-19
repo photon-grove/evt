@@ -684,6 +684,34 @@ pub trait Repository: Send + Sync {
         }
     }
 
+    /// Whether the repository writes the commit-wide view operations of [`Commit::views`] and
+    /// [`TransactionCommit::views`] atomically with the events (or refuses them with
+    /// [`Error::ViewsNotConfigured`] when it has nowhere to write them). The default is `false`: a
+    /// repository written before v0.9 would silently drop them, so a [`Store`](crate::Store) or
+    /// [`Transaction`](crate::Transaction) refuses to run a commit-wide projector over it with
+    /// [`Error::ViewsUnsupported`]. The in-memory, DynamoDB, and PostgreSQL repositories return
+    /// `true`. A wrapper must forward it.
+    fn writes_views(&self) -> bool {
+        false
+    }
+
+    /// Durably adds the entity types to the feature manifest's `historyDependent` set, so
+    /// compaction refuses them in every process; types already declared are left alone and nothing
+    /// is written. The default refuses with [`Error::HistoryDeclarationUnsupported`]. The
+    /// in-memory, DynamoDB, and PostgreSQL repositories implement it. A wrapper must forward it.
+    fn declare_history_dependent(
+        &self,
+        types: &[EntityType],
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        let _ = types;
+
+        async {
+            Err(Error::HistoryDeclarationUnsupported {
+                repository: std::any::type_name::<Self>().to_owned(),
+            })
+        }
+    }
+
     /// Waits `duration` on the repository's runtime timer, between the polls of ambiguous-write
     /// recovery. The core is runtime-agnostic, so a backend that has a timer (the DynamoDB SDK's,
     /// Tokio's) overrides it; the default returns at once, which keeps in-memory and test
@@ -812,6 +840,17 @@ macro_rules! forward_repository {
 
             fn commit_transaction(&self, commit: TransactionCommit<Self::Operation>) -> impl Future<Output = Result<(), Error>> + Send {
                 (**self).commit_transaction(commit)
+            }
+
+            fn writes_views(&self) -> bool {
+                (**self).writes_views()
+            }
+
+            fn declare_history_dependent(
+                &self,
+                types: &[EntityType],
+            ) -> impl Future<Output = Result<(), Error>> + Send {
+                (**self).declare_history_dependent(types)
             }
 
             fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {

@@ -1465,6 +1465,14 @@ impl DynamoRepository {
 impl Repository for DynamoRepository {
     type Operation = TransactWriteItem;
 
+    fn writes_views(&self) -> bool {
+        true
+    }
+
+    async fn declare_history_dependent(&self, types: &[EntityType]) -> Result<(), Error> {
+        crate::features::declare_history(self, types).await
+    }
+
     async fn commit(&self, commit: Commit<TransactWriteItem>) -> Result<(), Error> {
         commit.validate()?;
         features::check_not_reserved(&commit.entity_id)?;

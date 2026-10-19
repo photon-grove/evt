@@ -23,7 +23,9 @@ use crate::outcome::{
     CommandIdentity, CommandOutcome, Outcome, OutcomeConfig, Rejection, Settled, pre_check,
     require_command_id, settle,
 };
-use crate::projection::{CommitProjector, CommitStream, CommitView, project_commit};
+use crate::projection::{
+    CommitProjector, CommitStream, CommitView, HistoryLedger, project_commit, ready_projectors,
+};
 use crate::repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
     snapshot_events_due,
@@ -187,6 +189,9 @@ pub struct Transaction<'a, R: Repository> {
     /// The commit-wide projectors, in declaration order. [`Store::transaction`] carries the
     /// store's.
     commit_projectors: Vec<Arc<dyn CommitProjector>>,
+    /// The entity types already durably declared history-dependent; [`Store::transaction`] shares
+    /// the store's.
+    history_declared: HistoryLedger,
     /// Set when a commit projector was added after a stream already had events appended: that
     /// stream's state after the commit was never captured for it.
     late_commit_projector: bool,
@@ -217,6 +222,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         );
         transaction.outcomes = self.outcomes.clone();
         transaction.commit_projectors = self.commit_projectors.clone();
+        transaction.history_declared = self.history_declared.clone();
 
         transaction
     }
@@ -258,6 +264,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             streams: Vec::new(),
             fences: Vec::new(),
             commit_projectors: Vec::new(),
+            history_declared: HistoryLedger::default(),
             late_commit_projector: false,
             poisoned: false,
             finished: false,
@@ -685,6 +692,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
             ));
         }
 
+        self.ready_projectors().await?;
+
         let (commit, committed) = self.prepare(metadata)?;
 
         self.repository.commit_transaction(commit).await?;
@@ -715,6 +724,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
         response: Option<Vec<u8>>,
     ) -> Result<CommandOutcome, Error> {
         let pending = self.take_command()?;
+        self.ready_projectors().await?;
+
         let (mut commit, committed) = self.prepare(&pending.metadata)?;
 
         let mut outcome = Outcome::accepted(pending.command_id.clone(), pending.digest.clone());
@@ -821,6 +832,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
         rejection: Rejection,
     ) -> Result<CommandOutcome, Error> {
         let pending = self.take_command()?;
+        self.ready_projectors().await?;
+
         let (commit, committed) = self.prepare(&pending.metadata)?;
 
         self.commit_rejection(&pending, rejection, commit, committed)
@@ -899,6 +912,22 @@ impl<'a, R: Repository> Transaction<'a, R> {
             &pending.digest,
             self.recovery_wait(),
             Rejection::stale_fence(),
+        )
+        .await
+    }
+
+    /// Readies the repository for the commit-wide projectors before a commit that writes events:
+    /// it must write view operations, and the entity types the projectors read events of are
+    /// durably declared history-dependent (once each).
+    async fn ready_projectors(&self) -> Result<(), Error> {
+        if !self.streams.iter().any(|stream| !stream.events.is_empty()) {
+            return Ok(());
+        }
+
+        ready_projectors(
+            self.repository,
+            &self.commit_projectors,
+            &self.history_declared,
         )
         .await
     }

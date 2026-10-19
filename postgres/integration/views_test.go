@@ -55,7 +55,7 @@ func (v viewTable) writer(op evt.ViewOperation) (postgres.ViewStatement, error) 
 	args := []any{op.PK, op.SK, string(op.EntityID), string(op.EntityType), string(op.Payload)}
 
 	if op.Condition == evt.ViewAbsent {
-		return postgres.ViewStatement{SQL: insert, Args: args}, nil
+		return postgres.ViewStatement{SQL: insert, Args: args, KeyConstraint: v.name + "_pkey"}, nil
 	}
 
 	return postgres.ViewStatement{
@@ -211,4 +211,43 @@ func Test_AViewWriterThatRefusesAnOperationFailsTheWholeCommit(t *testing.T) {
 	events, err := repo.GetEvents(ctx, id)
 	require.NoError(t, err)
 	require.Empty(t, events)
+}
+
+func Test_AUniqueViolationOfAnotherConstraintIsNotAFailedAbsentCondition(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(ctx, t)
+
+	views := newConstrainedViewTable(ctx, t, pool, "CONSTRAINT one_payload UNIQUE (payload)")
+	repo := postgres.NewRepository(pool).WithViewWriter(views.writer)
+	suffix := time.Now().UnixNano()
+	first, second := evt.EntityID(fmt.Sprintf("view-unique-a-%d", suffix)), evt.EntityID(fmt.Sprintf("view-unique-b-%d", suffix))
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events: viewEvents(first),
+		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "a", "", "", []byte("same"))}},
+	}))
+
+	// (pk, sk) is free, but the payload collides with the other row's: a violation of the payload's
+	// constraint, not of the key's. The row the condition asked about does not exist.
+	taken := errors.New("row taken")
+	err := repo.Commit(ctx, evt.SerializedResult{
+		Events: viewEvents(second),
+		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "b", "", "", []byte("same")).IfAbsent().OnConflict(taken)}},
+	})
+
+	var failed *evt.ProjectorOperationError
+
+	require.ErrorAs(t, err, &failed)
+	require.Equal(t, "23505", failed.Reason)
+	require.NotEqual(t, evt.ReasonConditionFailed, failed.Reason)
+	require.NotErrorIs(t, err, taken)
+
+	// The same collision on the key itself is the failed condition.
+	err = repo.Commit(ctx, evt.SerializedResult{
+		Events: viewEvents(evt.EntityID(fmt.Sprintf("view-unique-c-%d", suffix))),
+		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "a", "", "", []byte("other")).IfAbsent().OnConflict(taken)}},
+	})
+	require.ErrorAs(t, err, &failed)
+	require.Equal(t, evt.ReasonConditionFailed, failed.Reason)
+	require.ErrorIs(t, err, taken)
 }

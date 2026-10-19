@@ -263,3 +263,28 @@ func sortedFeatureNames(features map[string]FeatureFormat) []string {
 
 	return names
 }
+
+// MissingHistoryDependent returns, in order and without duplicates, the entity types not yet in the
+// manifest's historyDependent set. A nil manifest declares nothing, so every type is missing.
+func MissingHistoryDependent(manifest *FeatureManifest, types []EntityType) []EntityType {
+	var missing []EntityType
+
+	for _, entityType := range types {
+		declared := manifest != nil && slices.Contains(manifest.HistoryDependent, entityType)
+		if !declared && !slices.Contains(missing, entityType) {
+			missing = append(missing, entityType)
+		}
+	}
+
+	return missing
+}
+
+// AddHistoryDependent adds the entity types to the manifest's historyDependent set, leaving
+// those already there. It is the callback of a declaration.
+func (m *FeatureManifest) AddHistoryDependent(types ...EntityType) {
+	for _, entityType := range types {
+		if !slices.Contains(m.HistoryDependent, entityType) {
+			m.HistoryDependent = append(m.HistoryDependent, entityType)
+		}
+	}
+}

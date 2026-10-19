@@ -338,7 +338,7 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 
 	// This backend executes no transaction group: fail closed rather than commit the events and
 	// silently drop the operations of a group built for another storage type.
-	if err := evt.CheckProjectorOperationsSupported("postgres", res); err != nil {
+	if err := evt.CheckLegacyProjectorOperationsSupported("postgres", res); err != nil {
 		return err
 	}
 
@@ -556,7 +556,7 @@ func (repo *Repository) CommitWithSnapshot(
 		return err
 	}
 
-	if err := evt.CheckProjectorOperationsSupported("postgres", res); err != nil {
+	if err := evt.CheckLegacyProjectorOperationsSupported("postgres", res); err != nil {
 		return err
 	}
 

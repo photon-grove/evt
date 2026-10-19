@@ -154,6 +154,62 @@ type TransactionalRepository interface {
 	AtomicTransactions()
 }
 
+// ViewWritingRepository is the explicit capability a Repository declares when its Commit writes
+// the commit-wide view operations of SerializedResult.Views atomically with the events (ADR 0004,
+// C7), or refuses them with *ViewsNotConfiguredError when it has nowhere to write them. A
+// repository written before v0.9 does not implement it and would silently drop the operations, so
+// snapshots.Store refuses to run a commit-wide projector over one. The in-memory, DynamoDB, and
+// PostgreSQL repositories implement it.
+//
+// Implement it only when Commit honors that contract. A decorator type hides the capability unless
+// it declares it too.
+type ViewWritingRepository interface {
+	Repository
+
+	// WritesViews is a marker: implementing it asserts the capability above.
+	WritesViews()
+}
+
+// ViewsUnsupportedError refuses a commit-wide projector over a repository that has not declared
+// evt.ViewWritingRepository: it would commit the events and silently drop the view operations.
+// Nothing was written.
+type ViewsUnsupportedError struct {
+	// Repository is the refusing repository's Go type.
+	Repository string
+}
+
+func (e *ViewsUnsupportedError) Error() string {
+	return fmt.Sprintf(
+		"repository %s does not implement evt.ViewWritingRepository; refusing a commit-wide projector",
+		e.Repository,
+	)
+}
+
+// HistoryDeclarer is the capability of a Repository that keeps the durable feature manifest and can
+// add entity types to its historyDependent set: those types' commits are never compacted away,
+// because a rebuild of a history-dependent projector replays them. The in-memory, DynamoDB, and
+// PostgreSQL repositories implement it.
+type HistoryDeclarer interface {
+	// DeclareHistoryDependent durably adds the entity types to the manifest's historyDependent
+	// set. A type already declared is left alone, and declaring nothing new writes nothing.
+	DeclareHistoryDependent(ctx context.Context, types ...EntityType) error
+}
+
+// HistoryDeclarationUnsupportedError refuses a history-dependent projector over a repository that
+// cannot declare history dependence durably. Running it anyway would let CompactBelow delete the
+// commits its rebuild replays, so the commit fails before any write.
+type HistoryDeclarationUnsupportedError struct {
+	// Repository is the refusing repository's Go type.
+	Repository string
+}
+
+func (e *HistoryDeclarationUnsupportedError) Error() string {
+	return fmt.Sprintf(
+		"repository %s does not implement evt.HistoryDeclarer; refusing a history-dependent projector",
+		e.Repository,
+	)
+}
+
 // RequireTransactions returns *TransactionsUnsupportedError unless repo implements
 // TransactionalRepository.
 func RequireTransactions(repo Repository) error {

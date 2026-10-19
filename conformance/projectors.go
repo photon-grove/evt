@@ -84,6 +84,9 @@ type rollup struct {
 
 func (r *rollup) Name() string { return "rollup" }
 
+// History: the rollup reads each stream's state after the commit, never its events.
+func (r *rollup) History() []evt.EntityType { return nil }
+
 func (r *rollup) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
 	r.calls++
 
@@ -123,6 +126,7 @@ func runProjectorCases(t *testing.T, newRepo func() evt.Repository, opts SuiteOp
 		{"Projectors/ProjectEveryCommitOfAnAggregateAndATransaction", testProjectorsProjectCommits},
 		{"Projectors/AFailedOperationIsTypedNotRetriedAndRecordsNoOutcome", testProjectorFailureIsTyped},
 		{"Projectors/APreparationDerivesItsOperationsAgain", testProjectorsRunAgainOnReprepare},
+		{"Projectors/AHistoryDependentProjectorIsDeclaredAndRefusesCompaction", testProjectorsDeclareHistory},
 	}
 
 	for _, c := range cases {
@@ -230,6 +234,19 @@ type hookRepository struct {
 
 func (h *hookRepository) AtomicTransactions() {}
 
+// WritesViews and DeclareHistoryDependent forward what the wrapped repository does, which a
+// decorator would otherwise hide.
+func (h *hookRepository) WritesViews() {}
+
+func (h *hookRepository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
+	declarer, ok := h.OutcomeRepository.(evt.HistoryDeclarer)
+	if !ok {
+		return &evt.HistoryDeclarationUnsupportedError{Repository: fmt.Sprintf("%T", h.OutcomeRepository)}
+	}
+
+	return declarer.DeclareHistoryDependent(ctx, types...)
+}
+
 func (h *hookRepository) Commit(ctx context.Context, result evt.SerializedResult) error {
 	if hook := h.before; hook != nil {
 		h.before = nil
@@ -299,4 +316,57 @@ func testProjectorsRunAgainOnReprepare(t *testing.T, newRepo func() evt.Reposito
 	view, err = read(ctx, repo, ns+"#commits", ns+"-mine")
 	require.NoError(t, err)
 	require.NotNil(t, view)
+}
+
+// eventCounter is a history-dependent projector: it counts the events a commit wrote, per stream,
+// and owns each row by its stream.
+type eventCounter struct{ namespace string }
+
+func (eventCounter) Name() string { return "event-counter" }
+
+func (eventCounter) History() []evt.EntityType { return []evt.EntityType{tallyType} }
+
+func (e eventCounter) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
+	operations := make([]evt.ViewOperation, 0, len(commit.Streams))
+
+	for _, stream := range commit.Streams {
+		operations = append(operations, evt.PutView(
+			e.namespace+"#events", string(stream.EntityID), stream.EntityID, stream.EntityType,
+			fmt.Appendf(nil, `{"events":%d,"last":%d}`, len(stream.Events), stream.Events[len(stream.Events)-1].Sequence),
+		).OwnedBy(stream.EntityID))
+	}
+
+	return operations, nil
+}
+
+func testProjectorsDeclareHistory(t *testing.T, newRepo func() evt.Repository, read ViewReader) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	repo := newRepo()
+	id := evt.EntityID(ns + "-a")
+	store := snapshots.NewStore(repo, 1).WithCommitProjectors(eventCounter{namespace: ns})
+
+	require.NoError(t, store.Execute(ctx, &tally{}, id, &tallyUp{By: 1}, tallyMetadata(ns+"-one")))
+	require.NoError(t, store.Execute(ctx, &tally{}, id, &tallyUp{By: 1}, tallyMetadata(ns+"-two")))
+
+	view, err := read(ctx, repo, ns+"#events", string(id))
+	require.NoError(t, err)
+	require.NotNil(t, view)
+	require.JSONEq(t, `{"events":1,"last":2}`, string(view.Payload), "the projector saw its type's events")
+
+	// The registration declared the type durably, before the first commit, so a compaction from any
+	// process is refused: the commits a rebuild replays stay.
+	compactor, ok := repo.(evt.Compactor)
+	if !ok {
+		t.Skip("repository does not compact")
+	}
+
+	_, err = compactor.CompactBelow(ctx, id, 1)
+	require.True(t, evt.IsHistoryDependentProjectionErr(err), "got %v", err)
+
+	stored, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, stored, 2, "nothing was deleted")
 }
