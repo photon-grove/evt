@@ -2,15 +2,18 @@
 //! (`compat/fixtures/scenarios.json`), and a runner that executes steps against any repository.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use photon_evt::conformance::FaultInjectingRepository;
+use photon_evt::conformance::{FaultInjectingRepository, HeadFixtures};
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Begin, CommandIdentity, CommandOutcome, Commit, DigestInput, EntityId, EntityType, Error,
     EventId, EventSequence, EventType, EventVersion, ExecuteError, FenceProvenance, Metadata,
-    NewSnapshot, OutcomeConfig, ReadFence, Repository, RetryPolicy, SerializedEvent, Store,
-    TransactionCommit, default_digest, json,
+    NewSnapshot, OutcomeConfig, ReadFence, Repository, RetryPolicy, SerializedEvent,
+    SerializedSnapshot, Store, TransactionCommit, default_digest, json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +153,12 @@ pub struct Step {
     /// The response an `outcomeOnly` step stores.
     #[serde(default)]
     pub response: Option<String>,
+    /// The snapshot a `putSnapshot` step writes outside a commit.
+    #[serde(default)]
+    pub snapshot: Option<TransactionSnapshot>,
+    /// The event sequence a `putSnapshot` step's snapshot covers. Present even when 0.
+    #[serde(default)]
+    pub event_sequence: Option<i64>,
 }
 
 /// The command identity of an `outcomeOnly` step: its type string and payload object.
@@ -325,6 +334,9 @@ pub struct Expectation {
     pub state: String,
     pub events: Vec<String>,
     pub snapshot: Option<String>,
+    /// The stream's head (its `sk = -1` item, or its PostgreSQL heads row), absent when it has none.
+    #[serde(default)]
+    pub head: Option<i64>,
     #[serde(default, deserialize_with = "null_to_empty")]
     pub dynamo_items: Vec<serde_json::Value>,
     #[serde(default, deserialize_with = "null_to_empty")]
@@ -366,6 +378,9 @@ pub struct SiblingExpectation {
     pub entity_id: String,
     pub events: Vec<String>,
     pub snapshot: Option<String>,
+    /// The stream's head, absent when it has none.
+    #[serde(default)]
+    pub head: Option<i64>,
     #[serde(default, deserialize_with = "null_to_empty")]
     pub dynamo_items: Vec<serde_json::Value>,
 }
@@ -405,6 +420,32 @@ pub struct Runner<R: Repository> {
     store: Store<Account, R>,
     snapshot_interval: usize,
     outcomes: Option<OutcomeRun>,
+    heads: Option<Arc<dyn HeadAccess>>,
+}
+
+/// A boxed future of a head access.
+pub type HeadFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
+
+/// Raw access to a backend's stream heads (ADR 0007): the `appendRawBypassingHead` step writes an
+/// event without its head update, and `observe` reads the stored head back.
+pub trait HeadAccess: Send + Sync {
+    /// Stores the event without touching its stream's head.
+    fn append_bypassing_head<'a>(&'a self, event: &'a SerializedEvent) -> HeadFuture<'a, ()>;
+
+    /// The stream's stored head, `None` when it has no head item or row.
+    fn stored_head<'a>(&'a self, entity_id: &'a EntityId) -> HeadFuture<'a, Option<EventSequence>>;
+}
+
+impl HeadAccess for photon_evt::MemRepository {
+    fn append_bypassing_head<'a>(&'a self, event: &'a SerializedEvent) -> HeadFuture<'a, ()> {
+        Box::pin(HeadFixtures::<photon_evt::MemRepository>::append_bypassing_head(self, event))
+    }
+
+    fn stored_head<'a>(&'a self, entity_id: &'a EntityId) -> HeadFuture<'a, Option<EventSequence>> {
+        Box::pin(HeadFixtures::<photon_evt::MemRepository>::stored_head(
+            self, entity_id,
+        ))
+    }
 }
 
 impl<R: Repository> Runner<R> {
@@ -413,7 +454,17 @@ impl<R: Repository> Runner<R> {
             store: Store::new(repository, ()).with_snapshot_interval(snapshot_interval),
             snapshot_interval,
             outcomes: None,
+            heads: None,
         }
+    }
+
+    /// Gives the runner raw access to the backend's stream heads, which the
+    /// `appendRawBypassingHead` step and the `head` observations need.
+    #[must_use]
+    pub fn with_head_access(mut self, heads: impl HeadAccess + 'static) -> Self {
+        self.heads = Some(Arc::new(heads));
+
+        self
     }
 
     /// A runner for a scenario in a run: a store with command outcomes for an outcomes scenario,
@@ -490,6 +541,8 @@ impl<R: Repository> Runner<R> {
                 self.commit_raw(entity_id, EventSequence(step.sequence), &probe, step)
                     .await
             }
+            "appendRawBypassingHead" => self.append_bypassing_head(entity_id, step).await,
+            "putSnapshot" => self.put_snapshot(entity_id, step).await,
             "transaction" => self.transaction(entity_id, step).await,
             "outcomeOnly" => self.outcome_only(step).await,
             "resolveOutcome" => self.resolve_outcome(entity_id, step).await,
@@ -510,6 +563,60 @@ impl<R: Repository> Runner<R> {
                 }
             }
             other => Err(StepError::UnknownOp(other.to_owned())),
+        }
+    }
+
+    /// Writes the stream's next event straight to the backend, as a writer that does not
+    /// maintain the stream's head item would: the head is left one behind the log.
+    async fn append_bypassing_head(
+        &self,
+        entity_id: &EntityId,
+        step: &Step,
+    ) -> Result<Outcome, StepError> {
+        let raw = step.event.as_ref().ok_or(StepError::Missing("event"))?;
+        let heads = self
+            .heads
+            .as_ref()
+            .ok_or(StepError::Missing("a way to bypass the head item"))?;
+        let id = transaction_id(entity_id, step.suffix.as_deref().unwrap_or(""));
+        let sequence = self.store.load(&id).await?.sequence().next();
+        let event = raw_event(&id, sequence, raw, &step.metadata());
+
+        heads.append_bypassing_head(&event).await?;
+
+        Ok(Outcome {
+            events: 1,
+            ..Outcome::of("ok")
+        })
+    }
+
+    /// Writes a snapshot outside a commit. A snapshot ahead of the stream's head is drift; one
+    /// that regresses is a silent no-op, and both a write and a no-op are `ok`.
+    async fn put_snapshot(&self, entity_id: &EntityId, step: &Step) -> Result<Outcome, StepError> {
+        let snapshot = step
+            .snapshot
+            .as_ref()
+            .ok_or(StepError::Missing("snapshot"))?;
+        let event_sequence = step
+            .event_sequence
+            .ok_or(StepError::Missing("eventSequence"))?;
+
+        let result = self
+            .store
+            .repository()
+            .put_snapshot(&SerializedSnapshot {
+                entity_type: EntityType::new("account"),
+                entity_id: transaction_id(entity_id, step.suffix.as_deref().unwrap_or("")),
+                sequence: EventSequence(snapshot.sequence),
+                event_sequence: EventSequence(event_sequence),
+                payload: snapshot.payload.as_bytes().to_vec(),
+            })
+            .await;
+
+        match result {
+            Ok(_) => Ok(Outcome::of("ok")),
+            Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -584,6 +691,9 @@ impl<R: Repository> Runner<R> {
                         "failed transaction left partial events: {error}"
                     )));
                 }
+                if matches!(error, Error::StreamHeadDrift { .. }) {
+                    return Ok(Outcome::of("drift"));
+                }
                 if error.is_conflict() {
                     return Ok(Outcome::of("conflict"));
                 }
@@ -631,6 +741,7 @@ impl<R: Repository> Runner<R> {
             Err(ExecuteError::Rejected(_)) => Ok(Outcome::of("rejected")),
             Err(err) if err.is_duplicate_command() => Ok(Outcome::of("duplicate")),
             Err(err) if err.is_conflict() => Ok(Outcome::of("conflict")),
+            Err(ExecuteError::Store(Error::StreamHeadDrift { .. })) => Ok(Outcome::of("drift")),
             Err(ExecuteError::Store(err)) => Err(err.into()),
             Err(other) => Err(StepError::Unexpected(other.to_string())),
         }
@@ -783,7 +894,17 @@ impl<R: Repository> Runner<R> {
                 ..Outcome::of("ok")
             }),
             Err(err) if err.is_conflict() => Ok(Outcome::of("conflict")),
+            Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
             Err(err) => Err(err.into()),
+        }
+    }
+
+    /// The stream's stored head, read through the backend's head fixtures. A runner without them
+    /// observes no heads.
+    async fn stored_head(&self, entity_id: &EntityId) -> Result<Option<EventSequence>, Error> {
+        match &self.heads {
+            Some(heads) => heads.stored_head(entity_id).await,
+            None => Ok(None),
         }
     }
 
@@ -811,7 +932,13 @@ impl<R: Repository> Runner<R> {
             None => (String::new(), 0, 0),
         };
 
+        let head = self.stored_head(entity_id).await?;
         let mut dynamo_items = Vec::new();
+        if let Some(head) = head {
+            dynamo_items.push(serde_json::to_value(dynamo::head_item(
+                entity_id, head, None,
+            ))?);
+        }
         if let Some(snapshot) = &snapshot {
             dynamo_items.push(serde_json::to_value(dynamo::snapshot_item(
                 snapshot, None,
@@ -834,6 +961,7 @@ impl<R: Repository> Runner<R> {
             state,
             events: encoded_events,
             snapshot: snapshot.map(|s| s.to_json()).transpose()?.map(utf8),
+            head: head.map(|head| head.0),
             dynamo_items,
             sns_messages,
             siblings: Vec::new(),
@@ -855,7 +983,13 @@ impl<R: Repository> Runner<R> {
             let events = repository.events(entity_id).await?;
             let snapshot = repository.snapshot(entity_id).await?;
 
+            let head = self.stored_head(entity_id).await?;
             let mut dynamo_items = Vec::new();
+            if let Some(head) = head {
+                dynamo_items.push(serde_json::to_value(dynamo::head_item(
+                    entity_id, head, None,
+                ))?);
+            }
             if let Some(snapshot) = &snapshot {
                 dynamo_items.push(serde_json::to_value(dynamo::snapshot_item(
                     snapshot, None,
@@ -875,6 +1009,7 @@ impl<R: Repository> Runner<R> {
                     .as_ref()
                     .map(|snapshot| snapshot.to_json().map(utf8))
                     .transpose()?,
+                head: head.map(|head| head.0),
                 dynamo_items,
             });
         }
@@ -914,6 +1049,7 @@ fn classify<E>(result: Result<CommandOutcome<E>, Error>) -> Result<Outcome, Step
         Err(Error::AmbiguousWrite { .. }) => Ok(Outcome::of("ambiguous")),
         Err(Error::DuplicateCommand(_)) => Ok(Outcome::of("duplicate")),
         Err(error) if error.is_conflict() => Ok(Outcome::of("conflict")),
+        Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
         Err(error) => Err(error.into()),
     }
 }

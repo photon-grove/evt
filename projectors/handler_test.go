@@ -157,3 +157,25 @@ func TestLambdaHandler_SkipsRecordsMissingRequiredFields(t *testing.T) {
 	assert.Empty(t, resp.BatchItemFailures)
 	assert.Equal(t, 0, proj.called, "projector should not be called for records missing required fields")
 }
+
+// A stream's first commit inserts its head item (sk = -1, ADR 0007); it is not an event, and a
+// projector never sees it.
+func TestLambdaHandler_SkipsHeadItems(t *testing.T) {
+	proj := &stubProjector{name: "handler-test"}
+	handler := projectors.NewLambdaHandler(newTestRuntime(proj))
+
+	image := map[string]events.DynamoDBAttributeValue{
+		"pk":   events.NewStringAttribute("entity-1"),
+		"sk":   events.NewNumberAttribute("-1"),
+		"head": events.NewNumberAttribute("1"),
+		// Even an image that looks like an event is skipped by its sort key.
+		"type": events.NewStringAttribute("universe:created"),
+	}
+
+	resp, err := handler(context.Background(), events.DynamoDBEvent{Records: []events.DynamoDBEventRecord{
+		{EventID: "head", EventName: "INSERT", Change: events.DynamoDBStreamRecord{Keys: image, NewImage: image}},
+	}})
+	require.NoError(t, err)
+	assert.Empty(t, resp.BatchItemFailures)
+	assert.Equal(t, 0, proj.called)
+}

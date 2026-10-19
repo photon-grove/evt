@@ -59,6 +59,22 @@ type SuiteOptions struct {
 	// 100-action budget, so CommitTooLarge fires at the same boundary. A backend that refuses
 	// projector operations outright (Go PostgreSQL until E2.6) leaves it nil.
 	ProjectorGroup func(operations int) evt.TransactionGroup
+
+	// BypassHead appends one event to the repository's log without maintaining the stream's head
+	// item: the writer a head-aware build must detect (ADR 0007). It enables the drift and
+	// precedence cases. Leave it nil for a backend that cannot be bypassed.
+	BypassHead func(ctx context.Context, repo evt.Repository, event evt.SerializedEvent) error
+
+	// Unmigrate puts the store behind the repository into the state of one written before stream
+	// heads: the feature manifest no longer declares stream-heads while the store holds data. It
+	// returns a function that declares the feature again, which the case also calls on cleanup, so a
+	// shared durable store is left migrated for the cases that follow. It enables the
+	// StreamHeadsNotMigrated case.
+	Unmigrate func(ctx context.Context, repo evt.Repository) (restore func(), err error)
+
+	// RefusesCommitStream indicates the deprecated batch path is refused outright because it
+	// writes events without maintaining head items (the DynamoDB backend).
+	RefusesCommitStream bool
 }
 
 // RunRepositorySuite runs the full backend-neutral contract suite against the repository produced by
@@ -100,9 +116,11 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		testStreamEntitiesHonorsFilter(t, newRepo())
 	})
 
-	t.Run("CommitStream", func(t *testing.T) {
-		testCommitStream(t, newRepo())
-	})
+	if !opts.RefusesCommitStream {
+		t.Run("CommitStream", func(t *testing.T) {
+			testCommitStream(t, newRepo())
+		})
+	}
 
 	if opts.SupportsSnapshots {
 		t.Run("SnapshotRoundTrip", func(t *testing.T) {
@@ -176,6 +194,8 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 
 			testRejectsFencesForRetention(t, newRepo(), opts.DeclareRetention)
 		})
+
+		runStreamHeadCases(t, newRepo, opts)
 	}
 
 	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
@@ -582,7 +602,7 @@ func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
 	_, err := compactor.CompactBelow(ctx, id, 2)
 	require.NoError(t, err)
 
-	// The floor check reads the first event, so [3, 2] would recreate compacted sequence 2.
+	// The head condition checks the first event's sequence, so [3, 2] would recreate compacted sequence 2.
 	later := serialize(t, id, "test", 1,
 		&test.EntityUpdated{ID: id, Value: "a"},
 		&test.EntityUpdated{ID: id, Value: "b"},
@@ -592,7 +612,7 @@ func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
 	require.Error(t, repo.Commit(ctx, reversed), "a commit out of order")
 
 	// Loads reject a stream with a gap, so a commit must not create one. A fresh entity keeps the
-	// floor check out of the way.
+	// compacted floor out of the way.
 	fresh := evt.EntityID(ns + "-gap")
 	gapped := serialize(t, fresh, "test", 0,
 		&test.EntityCreated{ID: fresh, Value: "one"},
@@ -883,7 +903,7 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 	ctx := context.Background()
 	ns := newNamespace()
 
-	// The feature-marker check, 98 event puts, and the floor check are exactly 100 actions, so a
+	// The feature-marker check, the head update, and 98 event puts are exactly 100 actions, so a
 	// 98-event commit fits on every backend. Only emitted actions count against the budget.
 	idFits := evt.EntityID(ns + "-fits")
 	fitting := make([]evt.Event, 0, 98)
@@ -892,8 +912,8 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 	}
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idFits, "test", 0, fitting...)}))
 
-	// Appending to an existing stream adds a continuation check on its head event, so the marker
-	// check, that check, 97 event puts, and the floor check fill the 100 actions: 97 fit, 98 do not.
+	// Appending to an existing stream costs the same single head update as creating it, so the
+	// marker check, the head update, and 98 event puts fill the 100 actions: 98 fit, 99 do not.
 	idGrows := evt.EntityID(ns + "-grows")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 		Events: serialize(t, idGrows, "test", 0, &test.EntityCreated{ID: idGrows, Value: "first"}),
@@ -908,15 +928,15 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 		return out
 	}
 
-	tooMany := repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(98)...)})
+	tooMany := repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(99)...)})
 	var tooLargeAppend *evt.CommitTooLargeError
 	require.ErrorAs(t, tooMany, &tooLargeAppend)
 	require.Equal(t, 101, tooLargeAppend.Items)
 
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(97)...)}))
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(98)...)}))
 
 	idA := evt.EntityID(ns + "-a")
-	// 101 event puts plus the control checks and the floor check exceed the 100-item budget.
+	// 101 event puts plus the marker check and the head update exceed the 100-item budget.
 	events := make([]evt.Event, 0, 101)
 	for i := range 101 {
 		events = append(events, &test.EntityUpdated{ID: idA, Value: fmt.Sprintf("value-%d", i)})
@@ -952,8 +972,8 @@ func testFenceCompactionABA(t *testing.T, repo evt.Repository) {
 	require.NoError(t, err)
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "test", idA, payload, 1))
 
-	// Compaction deletes the events the snapshot covers, which empties the slot a stale fence
-	// checks — the companion on the snapshot item must catch the move.
+	// Compaction deletes the events the snapshot covers, which empties the slot a slot check would
+	// read — but the head only increases, so the stale fence still fails against the head.
 	_, err = compactor.CompactBelow(ctx, idA, 3)
 	require.NoError(t, err)
 
@@ -1065,7 +1085,7 @@ func testProjectorBudget(t *testing.T, repo evt.Repository, group func(int) evt.
 	ctx := context.Background()
 	ns := newNamespace()
 
-	// The feature-marker check, one event put, and the floor check leave 97 actions for
+	// The feature-marker check, one event put, and the head update leave 97 actions for
 	// projector operations: 97 fit exactly and 98 do not.
 	idFits, idOver := evt.EntityID(ns+"-fits"), evt.EntityID(ns+"-over")
 

@@ -363,7 +363,11 @@ fn ttl_matches_go() {
         let ttl = dynamo::expiry(clock, Duration::from_nanos(stream.retention_nanos));
 
         let snapshot = SerializedSnapshot::from_json(stream.snapshot.as_bytes()).unwrap();
-        let mut items = vec![dynamo::snapshot_item(&snapshot, ttl).unwrap()];
+        // The head item comes first (`sk = -1`) and carries the same ttl as the stream's items.
+        let mut items = vec![
+            dynamo::head_item(&snapshot.entity_id, snapshot.event_sequence, ttl),
+            dynamo::snapshot_item(&snapshot, ttl).unwrap(),
+        ];
         for event in &stream.events {
             let event = SerializedEvent::from_json(event.as_bytes()).unwrap();
             items.push(dynamo::event_item(&event, ttl).unwrap());
@@ -436,7 +440,10 @@ async fn scenarios_match_go_byte_for_byte() {
     );
 
     for scenario in &scenarios.scenarios {
-        let runner = Runner::for_scenario(MemRepository::new(), scenario, FIXTURE_RUN);
+        // The memory repository stands in for a backend, including its raw access to the heads.
+        let repository = MemRepository::new();
+        let runner = Runner::for_scenario(repository.clone(), scenario, FIXTURE_RUN)
+            .with_head_access(repository);
         let entity_id = scenario.entity_id(FIXTURE_RUN);
 
         for (index, step) in scenario.steps.iter().enumerate() {
@@ -470,6 +477,7 @@ async fn scenarios_match_go_byte_for_byte() {
             "{}: snapshot",
             scenario.name
         );
+        assert_eq!(observed.head, expected.head, "{}: head", scenario.name);
         assert_eq!(
             observed.dynamo_items, expected.dynamo_items,
             "{}: dynamo items",
@@ -889,5 +897,67 @@ fn malformed_outcome_rows_are_refused_as_corrupt_like_go() {
             "{}: a malformed row must be refused, never replayed: {decoded:?}",
             row.name
         );
+    }
+}
+
+/// The marker row a writer stores when it declares `stream-heads` on a fresh table (ADR 0007)
+/// is the item Go recorded: the first commit to an empty table creates it at version 1.
+#[tokio::test]
+async fn the_marker_a_fresh_table_declares_matches_go() {
+    use photon_evt::{Commit, FeatureMarker, Repository};
+
+    let data = std::fs::read(compat_dir().join("fixtures/feature-marker.json")).unwrap();
+    let fixtures: Value = serde_json::from_slice(&data).unwrap();
+    let declared: Vec<_> = fixtures["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case.get("declared").is_some())
+        .collect();
+    assert!(
+        !declared.is_empty(),
+        "the vectors record a fresh declaration"
+    );
+
+    for case in declared {
+        let repo = MemRepository::new();
+        let id = EntityId::new("fresh-declaration");
+        let event = SerializedEvent {
+            id: EventId::for_event(&id, EventSequence(1)),
+            sequence: EventSequence(1),
+            event_type: "account:opened".into(),
+            version: photon_evt::EventVersion(1),
+            entity_id: id.clone(),
+            entity_type: "account".into(),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        };
+        repo.commit(Commit::new(id, vec![event])).await.unwrap();
+
+        let manifest = repo.read_manifest().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(dynamo::feature_marker_item(&manifest).unwrap()).unwrap(),
+            case["declared"],
+            "{}: the declared marker item",
+            case["name"]
+        );
+    }
+}
+
+/// Go's schema DDL and Rust's create the same relations; the live PostgreSQL tests execute both in
+/// either order. Offline, both define the heads table with the same columns.
+#[test]
+fn the_schema_ddl_defines_the_heads_table_like_go() {
+    let data = std::fs::read(compat_dir().join("fixtures/feature-marker.json")).unwrap();
+    let fixtures: Value = serde_json::from_slice(&data).unwrap();
+
+    for vector in fixtures["postgresSchemas"].as_array().unwrap() {
+        let events = vector["eventsTable"].as_str().unwrap();
+        let snapshots = vector["snapshotsTable"].as_str().unwrap();
+        let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let go = squash(vector["ddl"].as_str().unwrap());
+        let rust = squash(&photon_evt::wire::postgres::schema_ddl(events, snapshots));
+
+        assert_eq!(rust, go, "{events}: the DDL, whitespace aside");
     }
 }

@@ -5,46 +5,32 @@ package integration
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/conformance"
 	"github.com/photon-grove/evt/dynamo"
-	"github.com/stretchr/testify/require"
+	"github.com/photon-grove/evt/internal/compat"
 )
 
 // Test_RepositoryConformance runs the backend-neutral storage contract suite against the DynamoDB
-// repository via the local AWS emulator. The suite namespaces its data per run, so it is safe to
-// share the integration event-log table with the other integration tests. DynamoDB enforces
-// optimistic concurrency through conditional writes and supports snapshots, so both options are on.
+// repository via the local AWS emulator. The suite namespaces its data per run, and it has an
+// event-log table to itself. DynamoDB enforces optimistic concurrency through conditional writes
+// and supports snapshots, so both options are on.
 func Test_RepositoryConformance(t *testing.T) {
 	ctx := context.Background()
 
-	region := os.Getenv("AWS_REGION")
-	if region == "" {
-		region = "us-west-2"
-	}
-
-	endpoint := resolveLocalEndpoint()
-	if endpoint == "" {
-		endpoint = "http://localhost:4566"
-	}
-
-	cfg, err := newAWSConfig(ctx, region, endpoint)
-	require.NoError(t, err)
-
-	client := dynamodb.NewFromConfig(*cfg)
+	// The suite runs against an event log of its own, with no stream (see SetupTest on the
+	// integration suite for why).
+	events, marker := newIsolatedEventLog(ctx, t)
+	client := isolatedClient
 
 	newRepo := func() evt.Repository {
-		return dynamo.NewRepository(client, "evt-local-event-log")
+		return dynamo.NewRepository(client, events.EventsTable)
 	}
-
-	marker := dynamo.NewRepository(client, "evt-local-event-log").FeatureMarker(nil)
 
 	conformance.RunRepositorySuite(t, newRepo, conformance.SuiteOptions{
 		SupportsSnapshots:             true,
@@ -71,6 +57,20 @@ func Test_RepositoryConformance(t *testing.T) {
 			})
 
 			return err
+		},
+		RefusesCommitStream: true,
+		BypassHead: func(ctx context.Context, _ evt.Repository, event evt.SerializedEvent) error {
+			return compat.DynamoBypassHead(client, events.EventsTable)(ctx, event)
+		},
+		Unmigrate: func(ctx context.Context, _ evt.Repository) (func(), error) {
+			_, err := marker.Declare(ctx, func(manifest *evt.FeatureManifest) {
+				delete(manifest.Features, evt.FeatureStreamHeads)
+			})
+
+			return func() {
+				// Declared again, the store is migrated: the cases that follow write to it.
+				_, _ = marker.DeclareStreamHeads(context.Background()) //nolint:errcheck // best-effort restore of the shared test table
+			}, err
 		},
 	})
 }

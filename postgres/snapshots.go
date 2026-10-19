@@ -11,6 +11,11 @@ import (
 
 // PutSnapshot advances a durable snapshot without regressing its floor. The shared feature lock
 // is held in the write transaction so an unsupported declaration cannot race the maintenance write.
+//
+// The write also keeps invariant H3 (a snapshot never covers more than the stream's head): under
+// the entity lock the stream's head row must be at least eventSequence, or absent when that is 0.
+// A snapshot ahead of the stream is refused with *evt.StreamHeadDriftError instead of being written
+// (ADR 0007).
 func (repo *Repository) PutSnapshot(
 	ctx context.Context,
 	entityType evt.EntityType,
@@ -27,12 +32,20 @@ func (repo *Repository) PutSnapshot(
 		return err
 	}
 
+	if err := repo.ensureStreamHeads(ctx); err != nil {
+		return err
+	}
+
 	return repo.inTx(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, entityLockQuery, string(entityID)); err != nil {
 			return classifyWriteError(fmt.Errorf("postgres: lock snapshot: %w", err))
 		}
 
 		if err := repo.checkFeatures(ctx, tx); err != nil {
+			return err
+		}
+
+		if err := repo.guardSnapshotHead(ctx, tx, entityID, eventSequence); err != nil {
 			return err
 		}
 

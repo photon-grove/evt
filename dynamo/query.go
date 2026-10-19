@@ -36,12 +36,15 @@ func (repo *Repository) GetEvents(
 	return serializedEvents, nil
 }
 
-// GetLatestEvents returns events after the given sequence for an entity instance.
+// GetLatestEvents returns events after the given sequence for an entity instance. A negative
+// sequence reads as 0: the query's lower bound never reaches the head item at sk = -1 (ADR 0007).
 func (repo *Repository) GetLatestEvents(
 	ctx context.Context,
 	entityID evt.EntityID,
 	lastSequence evt.EventSequence,
 ) ([]evt.SerializedEvent, error) {
+	lastSequence = max(lastSequence, 0)
+
 	input := dynamodb.QueryInput{
 		TableName:              &repo.EventsTable,
 		ConsistentRead:         aws.Bool(repo.consistentRead),
@@ -206,9 +209,13 @@ func (repo *Repository) decodeQueryPage(items []map[string]types.AttributeValue)
 			return nil, err
 		}
 
-		if event.SK == 0 {
+		if event.SK < 1 {
 			continue
 		}
+
+		// A retained stream's head item carries a ttl at least that of every other item, so the
+		// next commit needs the largest one this reader saw.
+		repo.ttlFloors.observe(event.PK, event.TTL)
 
 		var metadata evt.Metadata
 		if err := eventjson.UnmarshalMetadata([]byte(event.Metadata), &metadata); err != nil {

@@ -50,8 +50,8 @@ pub struct Commit<Op> {
     /// The snapshot to write, if the commit crosses a snapshot boundary.
     pub snapshot: Option<NewSnapshot>,
     /// Extra backend operations from in-band projectors, written in order in the same
-    /// transaction. DynamoDB puts them before the events. PostgreSQL runs them after the event
-    /// inserts and the floor check, so a racing writer fails on the event key first.
+    /// transaction. DynamoDB puts them before the events. PostgreSQL runs them after the head
+    /// statement and the event inserts, so a racing writer fails on its stream's head first.
     pub operations: Vec<Op>,
     /// The command outcome to record in the same transaction (C3), after every other write. With
     /// no events it is an outcome-only commit: a rejection or an accepted no-op.
@@ -99,71 +99,33 @@ impl<Op> Commit<Op> {
         self
     }
 
-    /// Exact backend-neutral event/snapshot/check representation, matching Dynamo item sizes,
-    /// for the shared commit budget: the feature-marker check, the event puts, then the snapshot put
-    /// or floor check. Backend projector operations are opaque here and sized by the backend.
+    /// Exact backend-neutral event/snapshot/action representation, matching Dynamo item sizes,
+    /// for the shared commit budget: the feature-marker check, then the written stream's head
+    /// update, event puts, and snapshot put (see [`stream_sizes`]), then the outcome put. Backend
+    /// projector operations are opaque here and sized by the backend.
     pub(crate) fn sizes(
         &self,
         ttl: impl Fn(&EntityType) -> Option<i64>,
     ) -> Result<Vec<usize>, Error> {
-        use crate::wire::dynamo::{self as wire, AttributeValue as V};
-        let key = |id: &str, seq: i64| {
-            wire::Item::from([
-                ("pk".into(), V::S(id.into())),
-                ("sk".into(), V::N(seq.to_string())),
-            ])
-        };
         // Only actions a commit actually emits are budgeted: the feature-marker check today. The
         // rebuild-lock check (C10) joins this list in the change that starts emitting it.
-        let mut sizes = vec![item_size(&key(crate::features::FEATURES_ID, 0))];
-        for event in &self.events {
-            sizes.push(item_size(&wire::event_item(
-                event,
-                ttl(&event.entity_type),
-            )?));
-        }
-        // A stream continuing from an existing head carries a continuation check on the event
-        // just before its first. It is budgeted for every such stream, also on the compacted-head
-        // path that pins the snapshot instead, so CommitTooLarge fires identically everywhere.
-        if let Some(first) = self
-            .events
-            .first()
-            .filter(|event| event.sequence > EventSequence(1))
-        {
-            sizes.push(item_size(&key(
-                self.entity_id.as_str(),
-                first.sequence.0 - 1,
-            )));
-        }
-        if let Some(snapshot) = &self.snapshot
-            && let Some(last) = self.events.last()
-        {
-            sizes.push(item_size(&wire::snapshot_item(
-                &SerializedSnapshot {
-                    entity_type: snapshot.entity_type.clone(),
-                    entity_id: self.entity_id.clone(),
-                    sequence: snapshot.sequence,
-                    event_sequence: last.sequence,
-                    payload: snapshot.payload.clone(),
-                },
-                ttl(&snapshot.entity_type),
-            )?));
-        } else if !self.events.is_empty() {
-            sizes.push(item_size(&key(self.entity_id.as_str(), 0)));
-        }
+        let mut sizes = vec![marker_check_size()];
+        stream_sizes(self, &ttl, &mut sizes)?;
         // The outcome row comes last, and an outcome-only commit carries nothing else.
         if let Some(outcome) = self.stored_outcome() {
-            sizes.push(item_size(&wire::outcome_item(&outcome)?));
+            sizes.push(item_size(&crate::wire::dynamo::outcome_item(&outcome)?));
         }
+
         Ok(sizes)
     }
 
     /// Checks that the events can be stored as written: each belongs to the commit's entity and
     /// has the ID `{entity_id}:{sequence}`, they share one entity type, the first sequence is at
     /// least 1, and sequences are contiguous. A snapshot must have the events' entity type and a
-    /// sequence of at least 1. Repositories call it before writing, because the floor and snapshot
-    /// checks only look at `entity_id` and the first event's sequence, loads reject streams with
-    /// gaps, typed scans read each row's entity type, and DynamoDB does not store the event ID.
+    /// sequence of at least 1. Repositories call it before writing, because the head update
+    /// conditions only look at `entity_id` and the first and last events' sequences, loads reject
+    /// streams with gaps, typed scans read each row's entity type, and DynamoDB does not store the
+    /// event ID.
     ///
     /// A commit with an [outcome](Commit::with_outcome) is validated first: the command ID and the
     /// response and rejection bounds. A rejected outcome may carry events, under the rules of an
@@ -275,7 +237,8 @@ pub struct ReadFence {
     pub entity_id: EntityId,
     /// Aggregate type (used for durable retention checks).
     pub entity_type: EntityType,
-    /// Observed head, including the snapshot floor.
+    /// Observed head: the stream's derived head, the larger of its highest event sequence and its
+    /// snapshot's event sequence. The fence passes while the stream's head item still equals it.
     pub head: EventSequence,
     /// Origin of the observation.
     pub provenance: FenceProvenance,
@@ -298,8 +261,8 @@ impl ReadFence {
     }
 }
 
-/// One atomic transaction. Stream-local operations flatten in declaration order; events and
-/// floors normalize by stream ID. Empty stream commits retain the legacy no-op semantics.
+/// One atomic transaction. Stream-local operations flatten in declaration order; streams and
+/// fences normalize by stream ID. Empty stream commits retain the legacy no-op semantics.
 #[derive(Debug)]
 pub struct TransactionCommit<Op> {
     /// Stream appends, in projector declaration order.
@@ -447,7 +410,7 @@ impl<Op> TransactionCommit<Op> {
                 .as_bytes()
                 .cmp(b.entity_id.as_str().as_bytes())
         });
-        // A written stream's event put at head + 1 supersedes its fence.
+        // A written stream's head update supersedes its fence.
         self.fences.retain(|fence| {
             !self
                 .streams
@@ -489,70 +452,96 @@ impl<Op> TransactionCommit<Op> {
             && self.outcome.is_none()
     }
 
-    /// Exact backend-neutral event/snapshot/check representation, matching Dynamo item sizes.
+    /// Exact backend-neutral event/snapshot/action representation, matching Dynamo item sizes.
+    ///
+    /// ```text
+    /// items = Σ over written streams (events + 1 head update + [snapshot put])
+    ///       + fenced read-only streams × 1
+    ///       + 1 outcome put, when the commit records one
+    ///       + 1 feature-marker check
+    ///       + projector operations (sized by the backend)
+    /// ```
     pub(crate) fn sizes(
         &self,
         ttl: impl Fn(&EntityType) -> Option<i64>,
     ) -> Result<Vec<usize>, Error> {
-        use crate::wire::dynamo::{self as wire, AttributeValue as V};
-        let key = |id: &str, seq: i64| {
-            wire::Item::from([
-                ("pk".into(), V::S(id.into())),
-                ("sk".into(), V::N(seq.to_string())),
-            ])
-        };
+        use crate::wire::dynamo::{self as wire, HeadAction};
+
         // Only actions a commit actually emits are budgeted: the feature-marker check today. The
         // rebuild-lock check (C10) joins this list in the change that starts emitting it.
-        let mut sizes = vec![item_size(&key(crate::features::FEATURES_ID, 0))];
+        let mut sizes = vec![marker_check_size()];
         for stream in &self.streams {
-            for event in &stream.events {
-                sizes.push(item_size(&wire::event_item(
-                    event,
-                    ttl(&event.entity_type),
-                )?));
-            }
-            // The continuation check of a stream continuing from an existing head (see
-            // `Commit::sizes`).
-            if let Some(first) = stream
-                .events
-                .first()
-                .filter(|event| event.sequence > EventSequence(1))
-            {
-                sizes.push(item_size(&key(
-                    stream.entity_id.as_str(),
-                    first.sequence.0 - 1,
-                )));
-            }
-        }
-        for stream in &self.streams {
-            if let Some(snapshot) = &stream.snapshot {
-                sizes.push(item_size(&wire::snapshot_item(
-                    &SerializedSnapshot {
-                        entity_type: snapshot.entity_type.clone(),
-                        entity_id: stream.entity_id.clone(),
-                        sequence: snapshot.sequence,
-                        event_sequence: stream.events.last().expect("normalized stream").sequence,
-                        payload: snapshot.payload.clone(),
-                    },
-                    ttl(&snapshot.entity_type),
-                )?));
-            } else {
-                sizes.push(item_size(&key(stream.entity_id.as_str(), 0)));
-            }
+            stream_sizes(stream, &ttl, &mut sizes)?;
         }
         for fence in self.read_only_fences() {
-            sizes.push(item_size(&key(
-                fence.entity_id.as_str(),
-                fence.head.next().0,
-            )));
-            sizes.push(item_size(&key(fence.entity_id.as_str(), 0)));
+            sizes.push(HeadAction::fence(&fence.entity_id, fence.head).size());
         }
         // The outcome row comes last, and an outcome-only commit carries nothing else.
         if let Some(outcome) = self.stored_outcome() {
             sizes.push(item_size(&wire::outcome_item(&outcome)?));
         }
+
         Ok(sizes)
     }
+}
+
+/// The feature-marker check's budgeted size: its key.
+fn marker_check_size() -> usize {
+    use crate::wire::dynamo::{AttributeValue as V, Item};
+
+    item_size(&Item::from([
+        ("pk".into(), V::S(crate::features::FEATURES_ID.into())),
+        (
+            "sk".into(),
+            V::N(crate::features::FEATURES_SORT_KEY.to_string()),
+        ),
+    ]))
+}
+
+/// Appends the budgeted sizes of one written stream's group: the head update (budgeted as its
+/// action is built: key, expression strings, name placeholders, and attribute values), the event
+/// puts, and the snapshot put when the commit writes one. A stream with no events contributes
+/// nothing. The head update's `:t` is the commit's own `ttl` for a stream with retention.
+fn stream_sizes<Op>(
+    stream: &Commit<Op>,
+    ttl: &impl Fn(&EntityType) -> Option<i64>,
+    sizes: &mut Vec<usize>,
+) -> Result<(), Error> {
+    use crate::wire::dynamo::{self as wire, HeadAction};
+
+    let (Some(first), Some(last)) = (stream.events.first(), stream.events.last()) else {
+        return Ok(());
+    };
+
+    sizes.push(
+        HeadAction::update(
+            &stream.entity_id,
+            first.sequence,
+            last.sequence,
+            ttl(&first.entity_type),
+        )
+        .size(),
+    );
+    for event in &stream.events {
+        sizes.push(item_size(&wire::event_item(
+            event,
+            ttl(&event.entity_type),
+        )?));
+    }
+    if let Some(snapshot) = &stream.snapshot {
+        sizes.push(item_size(&wire::snapshot_item(
+            &SerializedSnapshot {
+                entity_type: snapshot.entity_type.clone(),
+                entity_id: stream.entity_id.clone(),
+                sequence: snapshot.sequence,
+                event_sequence: last.sequence,
+                payload: snapshot.payload.clone(),
+            },
+            ttl(&snapshot.entity_type),
+        )?));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn check_budget(sizes: impl IntoIterator<Item = usize>) -> Result<(), Error> {
@@ -593,21 +582,30 @@ pub(crate) fn item_size(item: &crate::wire::dynamo::Item) -> usize {
         .sum()
 }
 
-/// An append-only event log with one optional snapshot per entity.
+/// An append-only event log with one optional snapshot per entity and one head per stream (ADR
+/// 0007).
 ///
 /// Implementations must:
 ///
 /// - reject a commit whose events belong to another entity, have non-canonical IDs, mix entity
 ///   types, start below sequence 1, or are not contiguous, or whose snapshot has another entity
 ///   type or a sequence below 1, with [`Error::InvalidCommit`] (see [`Commit::validate`]);
-/// - reject a commit that reuses an existing `(entity_id, sequence)` with [`Error::Conflict`];
-/// - reject a commit whose first event is at or below the stored snapshot's event sequence with
-///   [`Error::Conflict`], because compaction may have deleted the events that sequence would
-///   collide with;
+/// - keep a head per stream, the highest event sequence ever committed to it, which a commit
+///   raises to its last event and compaction never touches (H1 to H4);
+/// - reject a commit whose first event does not follow the stored head (a stale writer, or an
+///   event sequence that already exists) with [`Error::Conflict`], and one that skips past it with
+///   [`Error::SequenceGap`], which is a conflict;
+/// - report a stream whose head disagrees with its events or snapshot as
+///   [`Error::StreamHeadDrift`], never retried, ranked above a gap and any other conflict;
 /// - reject a snapshot whose sequence is not the stored snapshot's sequence plus one (or 1 when
 ///   there is no stored snapshot) with [`Error::Conflict`] (DynamoDB), or keep the stored snapshot's event sequence monotonic
-///   (PostgreSQL, where the event-sequence conflict already covers racing writers);
-/// - write events, snapshot, and operations atomically;
+///   (PostgreSQL, where the head conflict already covers racing writers);
+/// - write events, head, snapshot, and operations atomically;
+/// - refuse an out-of-band snapshot that the stream's head does not cover with
+///   [`Error::StreamHeadDrift`] (a snapshot of event sequence 0 needs no head);
+/// - refuse every write path that validates the feature marker (commits, `put_snapshot`,
+///   `compact_below`) with [`Error::StreamHeadsNotMigrated`] when the table does not declare
+///   `stream-heads`, after declaring it themselves on a table that holds no data;
 /// - return events in ascending sequence order, and `latest` in descending order;
 /// - refuse an entity ID in a reserved namespace (`SYSTEM#`, `command-outcome#`) on every
 ///   entity-addressed write path (commit, `put_snapshot`, `compact_below`) with
@@ -725,6 +723,11 @@ pub trait Repository: Send + Sync {
     /// Writes a snapshot outside a commit (for background catch-up). The write never lowers the
     /// stored snapshot's event sequence: it replaces a snapshot whose event sequence is lower or
     /// equal and returns `true`, or leaves a newer snapshot in place and returns `false`.
+    ///
+    /// The stream's head must cover the snapshot (H3): a snapshot whose event sequence is above
+    /// the stored head, or above 0 on a stream with no head, is [`Error::StreamHeadDrift`], not
+    /// the `false` of a newer snapshot already in place. A stream with retention also refreshes
+    /// the head's `ttl` to the snapshot's own in the same transaction.
     fn put_snapshot(
         &self,
         snapshot: &SerializedSnapshot,
@@ -741,7 +744,9 @@ pub trait Repository: Send + Sync {
 
     /// Returns each entity's head: the larger of its highest event sequence and its snapshot's
     /// event sequence. Optionally narrowed to one entity type. This reads the whole log on some
-    /// backends. Use it for rebuilds and diagnostics, not request paths.
+    /// backends (a DynamoDB Scan; on PostgreSQL the heads table once the table declares
+    /// `stream-heads`, and an aggregate over events and snapshots until then). Use it for
+    /// rebuilds and diagnostics, not request paths.
     fn entity_heads(
         &self,
         entity_type: Option<&EntityType>,
@@ -935,7 +940,8 @@ mod tests {
 
     #[test]
     fn the_budget_counts_only_emitted_actions() {
-        // marker check + events + floor check: 98 events fill the 100 actions exactly.
+        // marker check + head update + events: 98 events fill the 100 actions exactly, whether the
+        // commit creates the stream or appends to it. There is no continuation or floor check.
         let fits = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect());
         assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
         check_budget(fits.sizes(|_| None).unwrap()).unwrap();
@@ -946,33 +952,96 @@ mod tests {
             Err(Error::CommitTooLarge { actions: 101, .. })
         ));
 
-        // The same holds for a transaction over one stream, and a snapshot put replaces the floor.
-        let snapshotted = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect())
+        // A snapshot put is one more action beside the head update, so 97 events fill the
+        // budget with a snapshot, for a transaction over one stream as for a single commit.
+        let snapshotted = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
             .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
+        assert_eq!(snapshotted.sizes(|_| None).unwrap().len(), 100);
         let transaction = TransactionCommit::new(vec![snapshotted]);
         assert_eq!(transaction.sizes(|_| None).unwrap().len(), 100);
+
+        let over = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect())
+            .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
+        assert_eq!(over.sizes(|_| None).unwrap().len(), 101);
     }
 
     #[test]
-    fn appending_to_an_existing_stream_budgets_a_continuation_check() {
-        // marker + continuation check + 97 events + floor check: 97 appended events fill 100.
-        let fits = Commit::<u8>::new("a", (2..=98).map(|n| event("a", n)).collect());
+    fn appending_to_an_existing_stream_budgets_no_continuation_check() {
+        // An append costs the same as a create: marker + head update + 98 events fill 100.
+        let fits = Commit::<u8>::new("a", (2..=99).map(|n| event("a", n)).collect());
         assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
         check_budget(fits.sizes(|_| None).unwrap()).unwrap();
 
-        let over = Commit::<u8>::new("a", (2..=99).map(|n| event("a", n)).collect());
+        let over = Commit::<u8>::new("a", (2..=100).map(|n| event("a", n)).collect());
         assert!(matches!(
             check_budget(over.sizes(|_| None).unwrap()),
             Err(Error::CommitTooLarge { actions: 101, .. })
         ));
 
-        // The transaction estimator agrees, per stream.
+        // The transaction estimator agrees, per stream: a stream without a snapshot pays
+        // exactly one action beyond its events.
         let transaction = TransactionCommit::new(vec![
             Commit::<u8>::new("a", (2..=3).map(|n| event("a", n)).collect()),
             Commit::<u8>::new("b", vec![event("b", 1)]),
         ]);
-        // marker + a: check + 2 events + floor, b: 1 event + floor
-        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 1 + 4 + 2);
+        // marker + a: head + 2 events, b: head + 1 event
+        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 1 + 3 + 2);
+    }
+
+    /// The ADR's worked examples ("Action counts"), each with the marker check and the outcome
+    /// put, as the shared estimator counts them.
+    #[test]
+    fn the_adr_action_counts_hold() {
+        let append = |id: &str| Commit::<u8>::new(id, vec![event(id, 2)]);
+        let fence = |id: &str| ReadFence::new(id, "t", EventSequence(3), FenceProvenance::Engine);
+        let counted = |streams: Vec<Commit<u8>>, fences: Vec<ReadFence>| {
+            let mut commit = TransactionCommit::new(streams)
+                .with_fences(fences)
+                .with_outcome(outcome("c"));
+            commit.normalize().unwrap();
+
+            commit.sizes(|_| None).unwrap().len()
+        };
+        let snapshot = || NewSnapshot::new("t", EventSequence(2), "{}");
+
+        // create one stream, one event, no snapshot
+        let created = Commit::<u8>::new("a", vec![event("a", 1)]).with_outcome(outcome("c"));
+        assert_eq!(created.sizes(|_| None).unwrap().len(), 4);
+        assert_eq!(
+            counted(vec![Commit::new("a", vec![event("a", 1)])], vec![]),
+            4
+        );
+
+        // append one event, no snapshot
+        let appended = append("a").with_outcome(outcome("c"));
+        assert_eq!(appended.sizes(|_| None).unwrap().len(), 4);
+        assert_eq!(counted(vec![append("a")], vec![]), 4);
+
+        // append one event that writes a snapshot
+        assert_eq!(
+            counted(vec![append("a").with_snapshot(snapshot())], vec![]),
+            5
+        );
+
+        // create with five events and a snapshot
+        let five = Commit::<u8>::new("a", (1..=5).map(|n| event("a", n)).collect())
+            .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
+        assert_eq!(counted(vec![five], vec![]), 9);
+
+        // ten single-event appends and five fenced reads
+        let appends = |count: usize| {
+            (0..count)
+                .map(|n| append(&format!("w{n:02}")))
+                .collect::<Vec<_>>()
+        };
+        let fences = |count: usize| {
+            (0..count)
+                .map(|n| fence(&format!("r{n:02}")))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(counted(appends(10), fences(5)), 27);
+        assert_eq!(counted(appends(12), fences(9)), 35);
+        assert_eq!(counted(appends(1), fences(30)), 34);
     }
 
     #[test]
@@ -1009,7 +1078,7 @@ mod tests {
 
     #[test]
     fn the_outcome_item_counts_against_the_commit_budget() {
-        // marker + 97 events + floor + outcome = 100 actions; 98 events are one too many.
+        // marker + head update + 97 events + outcome = 100 actions; 98 events are one too many.
         let fits = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
             .with_outcome(outcome("c"));
         assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
@@ -1022,13 +1091,13 @@ mod tests {
             Err(Error::CommitTooLarge { actions: 101, .. })
         ));
 
-        // Appending adds the continuation check: 96 events fit, 97 do not.
+        // Appending costs the same: there is no continuation check. 97 events fit, 98 do not.
         let appends = |last| {
             Commit::<u8>::new("a", (2..=last).map(|n| event("a", n)).collect())
                 .with_outcome(outcome("c"))
         };
-        assert_eq!(appends(97).sizes(|_| None).unwrap().len(), 100);
-        assert_eq!(appends(98).sizes(|_| None).unwrap().len(), 101);
+        assert_eq!(appends(98).sizes(|_| None).unwrap().len(), 100);
+        assert_eq!(appends(99).sizes(|_| None).unwrap().len(), 101);
 
         // The same arithmetic for a transaction.
         let transaction = |last| {
@@ -1045,12 +1114,12 @@ mod tests {
     #[test]
     fn an_outcome_only_commit_budgets_the_marker_check_and_the_outcome() {
         let single = Commit::<u8>::new("a", Vec::new()).with_outcome(outcome("c"));
-        assert_eq!(single.sizes(|_| None).unwrap().len(), 2, "no floor check");
+        assert_eq!(single.sizes(|_| None).unwrap().len(), 2, "no head update");
 
         let transaction = TransactionCommit::<u8>::new(Vec::new()).with_outcome(outcome("c"));
         assert_eq!(transaction.sizes(|_| None).unwrap().len(), 2);
 
-        // Fences are budgeted between the marker and the outcome.
+        // A fence is one check, budgeted between the marker and the outcome.
         let mut fenced = TransactionCommit::<u8>::new(Vec::new()).with_outcome(outcome("c"));
         fenced.fences = vec![ReadFence::new(
             "f",
@@ -1058,11 +1127,71 @@ mod tests {
             EventSequence(1),
             FenceProvenance::Engine,
         )];
-        assert_eq!(fenced.sizes(|_| None).unwrap().len(), 4);
+        assert_eq!(fenced.sizes(|_| None).unwrap().len(), 3);
 
         // Without an outcome it is still a no-op.
         assert!(TransactionCommit::<u8>::new(Vec::new()).is_empty());
         assert!(!transaction.is_empty());
+    }
+
+    #[test]
+    fn the_head_update_and_the_fence_are_budgeted_by_their_expressions() {
+        use crate::wire::dynamo::HeadAction;
+
+        // pk + "acct" + sk + "-1"
+        let key = 2 + 4 + 2 + 2;
+        let id = EntityId::new("acct");
+        let at = EventSequence;
+
+        // A create: "SET head = :last" + "attribute_not_exists(head)" + ":last" + "2"
+        let create = HeadAction::update(&id, at(1), at(2), None);
+        assert_eq!(
+            create.size(),
+            key + "SET head = :last".len() + "attribute_not_exists(head)".len() + ":last".len() + 1
+        );
+
+        // An append adds `:prev` and its condition.
+        let append = HeadAction::update(&id, at(8), at(9), None);
+        assert_eq!(
+            append.size(),
+            key + "SET head = :last".len()
+                + "head = :prev".len()
+                + ":last".len()
+                + 1
+                + ":prev".len()
+                + 1
+        );
+
+        // A retained append adds the `ttl` name placeholder and `:t`.
+        let retained = HeadAction::update(&id, at(8), at(9), Some(1_760_086_400));
+        assert_eq!(
+            retained.size(),
+            key + "SET head = :last, #ttl = :t".len()
+                + "head = :prev AND (attribute_not_exists(#ttl) OR #ttl <= :t)".len()
+                + "#ttl".len()
+                + "ttl".len()
+                + ":last".len()
+                + 1
+                + ":prev".len()
+                + 1
+                + ":t".len()
+                + 10
+        );
+
+        // A fence is its key, one expression, and (from head 1) one value.
+        assert_eq!(
+            HeadAction::fence(&id, at(0)).size(),
+            key + "attribute_not_exists(head)".len()
+        );
+        assert_eq!(
+            HeadAction::fence(&id, at(12)).size(),
+            key + "head = :head".len() + ":head".len() + 2
+        );
+
+        // The estimator uses the commit's own ttl for `:t` and `:prev` only above sequence 1.
+        let commit = Commit::<u8>::new("acct", vec![event("acct", 8), event("acct", 9)]);
+        let sizes = commit.sizes(|_| Some(1_760_086_400)).unwrap();
+        assert_eq!(sizes[1], retained.size());
     }
 
     #[test]

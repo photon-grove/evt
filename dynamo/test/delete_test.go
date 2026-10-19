@@ -29,6 +29,7 @@ func (s *RepositorySuite) Test_Delete_Success() {
 		},
 	}
 
+	// Deleting a stream's events also deletes its head item, or the stream could not be recreated.
 	expected := []types.TransactWriteItem{
 		{
 			Delete: &types.Delete{
@@ -39,9 +40,18 @@ func (s *RepositorySuite) Test_Delete_Success() {
 				},
 			},
 		},
+		{
+			Delete: &types.Delete{
+				TableName: &s.repo.EventsTable,
+				Key: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: "test-id"},
+					"sk": &types.AttributeValueMemberN{Value: "-1"},
+				},
+			},
+		},
 	}
 
-	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{absentMarkerCheck(s.repo.EventsTable)}, expected...)}
+	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{markerCheck(s.repo.EventsTable)}, expected...)}
 
 	output := new(dynamodb.TransactWriteItemsOutput)
 	s.client.On("TransactWriteItems", mock.Anything, &input, mock.Anything).Return(output, nil)

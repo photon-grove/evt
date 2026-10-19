@@ -7,8 +7,10 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -19,6 +21,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
+
+// callTimeout bounds every DynamoDB call the integration tests make.
+const callTimeout = 30 * time.Second
 
 // DynamoEventsIntegrationSuite tests DynamoDB against the local AWS emulator
 type DynamoEventsIntegrationSuite struct {
@@ -59,8 +64,14 @@ func (s *DynamoEventsIntegrationSuite) SetupSuite() {
 	s.client = client
 }
 
+// SetupTest gives every test an event log of its own. The emulator copies each table a
+// transaction touches so it can roll the transaction back, which makes every commit cost the size
+// of the whole table: tests sharing one table (and the stream the Terraform table enables) slow
+// each other down and balloon the emulator's memory.
 func (s *DynamoEventsIntegrationSuite) SetupTest() {
-	s.repo = dynamo.NewRepository(s.client, "evt-local-event-log")
+	repo, _ := newIsolatedEventLog(context.Background(), s.T())
+	s.repo = repo
+	s.client = isolatedClient
 }
 
 func (s *DynamoEventsIntegrationSuite) SetupEntity(entityID evt.EntityID, snapshotSize int) {
@@ -111,6 +122,8 @@ func newAWSConfig(ctx context.Context, region, localEndpoint string) (*aws.Confi
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(region),
 		config.WithRetryMaxAttempts(1),
+		// No call outlives callTimeout: a stalled emulator fails the test that hit it.
+		config.WithHTTPClient(awshttp.NewBuildableClient().WithTimeout(callTimeout)),
 		config.WithCredentialsProvider(credentials.StaticCredentialsProvider{
 			Value: aws.Credentials{
 				AccessKeyID:     "test",

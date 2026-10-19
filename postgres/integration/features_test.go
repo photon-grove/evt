@@ -38,7 +38,7 @@ func newIsolatedEventLog(ctx context.Context, t *testing.T) (*postgres.Repositor
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		pool := newPool(cleanupCtx, t)
-		for _, table := range []string{name, name + "_snapshots", name + "__evt_features"} {
+		for _, table := range []string{name, name + "_snapshots", name + "__evt_features", name + "__evt_stream_heads"} {
 			// Best-effort teardown of a test-only log.
 			_, _ = pool.Exec(cleanupCtx, "DROP TABLE IF EXISTS "+table) //nolint:errcheck // best-effort teardown
 		}

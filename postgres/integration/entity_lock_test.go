@@ -16,7 +16,7 @@ import (
 
 // Test_CommitWaitsForEntityLock verifies that a commit takes the per-entity advisory lock that the
 // Rust crate's commits and snapshot writes also take, so a snapshot cannot raise the floor under a
-// commit that already passed its floor check.
+// commit that already passed its head statement.
 func Test_CommitWaitsForEntityLock(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(ctx, t)

@@ -10,11 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use deadpool_postgres::Pool;
-use evt_compat::drivers;
+use evt_compat::drivers::{self, DynamoHeads, PostgresHeads};
 use futures_core::Stream as _;
 use photon_evt::conformance::{
-    Add, Ledger, LedgerEvent, Suite, ViewTarget, enumeration_cases, feature_marker_cases,
-    outcome_cases,
+    Add, HeadFixtures, Ledger, LedgerEvent, Suite, ViewTarget, enumeration_cases,
+    feature_marker_cases, fresh_store_cases, outcome_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository};
@@ -131,13 +131,14 @@ impl ViewTarget<PostgresRepository> for PostgresViews {
     }
 }
 
-/// Clears the feature manifest a previous run may have left features in, so unsupported
-/// declarations cannot refuse this run's writers, and validates that this build supports
-/// whatever remains (nothing).
+/// Resets the feature manifest a previous run may have left features in, so unsupported
+/// declarations cannot refuse this run's writers. Every writer requires `stream-heads` (ADR 0007),
+/// so the reset keeps it declared and nothing else.
 async fn clear_manifest<R: photon_evt::FeatureMarker>(repository: &R) {
     repository
         .update_manifest(|manifest| {
             manifest.features.clear();
+            manifest.declare_stream_heads();
             manifest.history_dependent.clear();
             manifest.retention.clear();
         })
@@ -150,14 +151,56 @@ async fn clear_manifest<R: photon_evt::FeatureMarker>(repository: &R) {
 // does not, but the projector-condition case deliberately fails a transaction.
 #[tokio::test]
 async fn dynamo_conforms() {
-    let repository = drivers::dynamo().await;
+    // A private, stream-less table of its own: the emulator copies every table a transaction
+    // touches (and its change-stream history) to be able to roll it back, so a table shared with
+    // other suites, or one with a stream enabled, makes every commit slower than the last and
+    // balloons the emulator's memory. A new table also starts empty, so the writer declares
+    // `stream-heads` itself the way a fresh deployment does.
+    let client = drivers::dynamo_client().await;
+    let table = format!(
+        "evt-conformance-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    create_dynamo_table(&client, &table).await;
+
+    // The whole run is bounded: a case that loops without making progress fails the test rather
+    // than holding the job until its timeout.
+    tokio::time::timeout(
+        Duration::from_secs(CONFORMANCE_BUDGET_SECS),
+        Box::pin(run_dynamo_conformance(client.clone(), &table)),
+    )
+    .await
+    .expect("the DynamoDB conformance run exceeded its time budget");
+
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .expect("delete the conformance table");
+}
+
+/// The longest the DynamoDB conformance run may take (about 25 s on a laptop-class machine).
+const CONFORMANCE_BUDGET_SECS: u64 = 300;
+
+async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
+    let repository = DynamoRepository::new(client, table);
     let views = DynamoViews {
         client: repository.client().clone(),
         table: drivers::views_table(),
     };
 
     clear_manifest(&repository).await;
-    Suite::new(&repository).with_views(views).run().await;
+    let heads = DynamoHeads::new(repository.client().clone(), repository.table().to_owned());
+    Suite::new(&repository)
+        .with_views(views)
+        .with_head_fixtures(heads)
+        .run()
+        .await;
 
     // A second handle over the same table is a second writer with its own marker cache.
     let second = DynamoRepository::new(repository.client().clone(), repository.table());
@@ -170,6 +213,559 @@ async fn dynamo_conforms() {
     dynamo_refuses_projector_only_transactions(&repository).await;
     dynamo_legacy_reserved_reads(&repository).await;
     dynamo_enumeration(&repository).await;
+    Box::pin(dynamo_fresh_and_unmigrated_tables(&repository)).await;
+    Box::pin(dynamo_retained_stream_heads(&repository)).await;
+}
+
+/// A new, empty table for a case that needs a store nothing has written to.
+async fn create_dynamo_table(client: &aws_sdk_dynamodb::Client, name: &str) {
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+
+    client
+        .create_table()
+        .table_name(name)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(ScalarAttributeType::N)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .expect("create the table");
+}
+
+/// Writes a stream with no head item just before the first `PutItem` a client sends (the marker's
+/// declaration), as a writer that never reads the feature marker committing between the empty-table
+/// check and the declaration.
+#[derive(Debug)]
+struct HeadlessAfterDeclare {
+    fired: AtomicBool,
+    raw: DynamoHeads,
+    event: SerializedEvent,
+}
+
+impl aws_sdk_dynamodb::config::Intercept for HeadlessAfterDeclare {
+    fn name(&self) -> &'static str {
+        "HeadlessAfterDeclare"
+    }
+
+    fn read_before_transmit(
+        &self,
+        context: &aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+        _runtime_components: &aws_sdk_dynamodb::config::RuntimeComponents,
+        _cfg: &mut aws_sdk_dynamodb::config::ConfigBag,
+    ) -> Result<(), BoxError> {
+        let is_put_item = context
+            .request()
+            .headers()
+            .get("x-amz-target")
+            .is_some_and(|target| target.ends_with(".PutItem"));
+
+        if is_put_item && !self.fired.swap(true, Ordering::SeqCst) {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    HeadFixtures::<DynamoRepository>::append_bypassing_head(&self.raw, &self.event),
+                )
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
+/// The empty-table check and the declaration are two steps, and a writer that never reads the
+/// marker can commit a stream between them. The declaration is committed first and the table is
+/// looked at again afterward: a stream with no head item retracts the declaration and the table
+/// is refused, rather than being left declared over a stream the heads cannot guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_retracts_a_declaration_over_a_headless_stream() {
+    let client = drivers::dynamo_client().await;
+    let table = format!(
+        "evt-window-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    create_dynamo_table(&client, &table).await;
+
+    let id = EntityId::new("early-stream");
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: Ledger::TYPE.into(),
+        payload: br#"{"amount":1}"#.to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    let config = client
+        .config()
+        .to_builder()
+        .interceptor(HeadlessAfterDeclare {
+            fired: AtomicBool::new(false),
+            raw: DynamoHeads::new(client.clone(), table.clone()),
+            event,
+        })
+        .build();
+    let writer = DynamoRepository::new(aws_sdk_dynamodb::Client::from_conf(config), &table);
+
+    let late = SerializedEvent {
+        id: EventId::for_event(&EntityId::new("late-stream"), EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: EntityId::new("late-stream"),
+        entity_type: Ledger::TYPE.into(),
+        payload: br#"{"amount":2}"#.to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    let error = writer
+        .commit(Commit::new("late-stream", vec![late]))
+        .await
+        .expect_err("the table held a headless stream");
+    assert!(
+        matches!(error, Error::StreamHeadsNotMigrated),
+        "refused as unmigrated, got {error:?}"
+    );
+
+    let manifest = DynamoRepository::new(client.clone(), &table)
+        .read_manifest()
+        .await
+        .unwrap()
+        .expect("the retraction leaves a manifest");
+    assert!(
+        !manifest.declares_stream_heads(),
+        "the declaration is retracted"
+    );
+
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .unwrap();
+}
+
+/// A clock in the past, so the `ttl`s it stamps have already expired by the time anything reads.
+fn long_ago() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+/// The `ttl` of a stream's head item, read with the raw client.
+async fn head_ttl(
+    client: &aws_sdk_dynamodb::Client,
+    table: &str,
+    id: &EntityId,
+) -> (Option<i64>, Option<i64>) {
+    let output = client
+        .get_item()
+        .table_name(table)
+        .consistent_read(true)
+        .key("pk", AttributeValue::S(id.to_string()))
+        .key("sk", AttributeValue::N("-1".into()))
+        .send()
+        .await
+        .unwrap();
+    let Some(item) = output.item else {
+        return (None, None);
+    };
+    let item = photon_evt::dynamodb::from_sdk_item(&item);
+    let (head, ttl) = photon_evt::wire::dynamo::head_from_item(&item).unwrap();
+
+    (Some(head.0), ttl)
+}
+
+/// Retained streams (ADR 0007, "Retention"): the head item carries a `ttl` at least that of every
+/// other item and never lowered; a head item that TTL deleted before its events is the transient
+/// expired-tail conflict when everything left has expired, and drift otherwise; and an
+/// out-of-band snapshot refreshes the head's `ttl`. Moto does not delete expired items, so a
+/// stream whose `ttl`s have passed stays readable, as one awaiting DynamoDB's lazy deletion.
+async fn dynamo_retained_stream_heads(repository: &DynamoRepository) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let client = repository.client();
+    let table = repository.table();
+    let entity_type = format!("scratch-{nanos}");
+    let event = |id: &EntityId, sequence: i64| SerializedEvent {
+        id: EventId::for_event(id, EventSequence(sequence)),
+        sequence: EventSequence(sequence),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: entity_type.as_str().into(),
+        payload: br#"{"amount":1}"#.to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    let commit = |id: &EntityId, range: std::ops::RangeInclusive<i64>| {
+        Commit::new(id.clone(), range.map(|n| event(id, n)).collect())
+    };
+    let handle = |retention: u64, clock: fn() -> SystemTime| {
+        DynamoRepository::new(client.clone(), table)
+            .with_clock(clock)
+            .with_retention(entity_type.as_str(), Duration::from_secs(retention))
+    };
+    let at = 1_700_000_000_i64;
+
+    // The head is stamped with the commit's ttl, and only ever raised.
+    let id = EntityId::new(format!("retained-{nanos}-ttl"));
+    handle(3600, long_ago)
+        .commit(commit(&id, 1..=2))
+        .await
+        .unwrap();
+    assert_eq!(
+        head_ttl(client, table, &id).await,
+        (Some(2), Some(at + 3600))
+    );
+
+    // A second writer configured with a shorter retention has not loaded the stream, so its head
+    // update would lower the ttl: the condition fails as an ordinary conflict, and the retry,
+    // having loaded the stream, passes without lowering it.
+    let short = handle(60, long_ago);
+    let lowered = short.commit(commit(&id, 3..=3)).await;
+    assert!(
+        matches!(lowered, Err(Error::Conflict { .. })),
+        "a head update that would lower the ttl is a conflict: {lowered:?}"
+    );
+    assert_eq!(
+        head_ttl(client, table, &id).await,
+        (Some(2), Some(at + 3600))
+    );
+    short.events(&id).await.unwrap();
+    short.commit(commit(&id, 3..=3)).await.unwrap();
+    assert_eq!(
+        head_ttl(client, table, &id).await,
+        (Some(3), Some(at + 3600)),
+        "the head keeps the larger ttl; only the event takes the commit's own"
+    );
+
+    // A longer retention raises it.
+    let long = handle(7200, long_ago);
+    long.events(&id).await.unwrap();
+    long.commit(commit(&id, 4..=4)).await.unwrap();
+    assert_eq!(
+        head_ttl(client, table, &id).await,
+        (Some(4), Some(at + 7200))
+    );
+
+    // An out-of-band snapshot refreshes the head's ttl to its own, and a later one with a smaller
+    // ttl falls back to a plain check and leaves the larger ttl in place.
+    let id = EntityId::new(format!("retained-{nanos}-snapshot"));
+    handle(60, long_ago)
+        .commit(commit(&id, 1..=3))
+        .await
+        .unwrap();
+    assert_eq!(head_ttl(client, table, &id).await, (Some(3), Some(at + 60)));
+    let snapshot = |sequence: i64| SerializedSnapshot {
+        entity_type: entity_type.as_str().into(),
+        entity_id: id.clone(),
+        sequence: EventSequence(sequence),
+        event_sequence: EventSequence(3),
+        payload: b"{}".to_vec(),
+    };
+    assert!(
+        handle(3600, long_ago)
+            .put_snapshot(&snapshot(1))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        head_ttl(client, table, &id).await,
+        (Some(3), Some(at + 3600))
+    );
+    assert!(
+        handle(60, long_ago)
+            .put_snapshot(&snapshot(2))
+            .await
+            .unwrap(),
+        "only the ttl condition failed, so the write retries as a plain check"
+    );
+    assert_eq!(
+        head_ttl(client, table, &id).await,
+        (Some(3), Some(at + 3600))
+    );
+
+    // TTL deleted the head item but not the events. Everything left expired: a conflict that
+    // heals once DynamoDB deletes it, not drift.
+    let expired = EntityId::new(format!("retained-{nanos}-expired"));
+    handle(3600, long_ago)
+        .commit(commit(&expired, 1..=2))
+        .await
+        .unwrap();
+    let heads = DynamoHeads::new(client.clone(), table.to_owned());
+    HeadFixtures::<DynamoRepository>::delete_head(&heads, &expired)
+        .await
+        .unwrap();
+    let live = handle(3600, SystemTime::now);
+    for (what, result) in [
+        ("an append", live.commit(commit(&expired, 3..=3)).await),
+        (
+            "a create over the residue",
+            live.commit(commit(&expired, 1..=1)).await,
+        ),
+    ] {
+        assert!(
+            matches!(result, Err(Error::Conflict { .. })),
+            "{what} over an expired residue is a transient conflict: {result:?}"
+        );
+    }
+
+    // The same with a residue that has not expired is drift.
+    let residue = EntityId::new(format!("retained-{nanos}-residue"));
+    live.commit(commit(&residue, 1..=2)).await.unwrap();
+    HeadFixtures::<DynamoRepository>::delete_head(&heads, &residue)
+        .await
+        .unwrap();
+    for (what, result) in [
+        ("an append", live.commit(commit(&residue, 3..=3)).await),
+        (
+            "a create over the residue",
+            live.commit(commit(&residue, 1..=1)).await,
+        ),
+    ] {
+        assert!(
+            matches!(
+                &result,
+                Err(Error::StreamHeadDrift {
+                    stored: None,
+                    derived: EventSequence(2),
+                    ..
+                })
+            ),
+            "{what} over a live residue is drift: {result:?}"
+        );
+    }
+
+    // A head above the derived head: TTL deleted the tail events the head counted. For a type
+    // with retention that is the expired-tail transient, a conflict that heals, whether or not
+    // the items that remain have expired.
+    let tail = EntityId::new(format!("retained-{nanos}-tail"));
+    handle(3600, long_ago)
+        .commit(commit(&tail, 1..=4))
+        .await
+        .unwrap();
+    for sequence in 3..=4 {
+        client
+            .delete_item()
+            .table_name(table)
+            .key("pk", AttributeValue::S(tail.to_string()))
+            .key("sk", AttributeValue::N(sequence.to_string()))
+            .send()
+            .await
+            .unwrap();
+    }
+    let result = live.commit(commit(&tail, 3..=3)).await;
+    assert!(
+        matches!(result, Err(Error::Conflict { .. })),
+        "a head above an expired log is a transient conflict: {result:?}"
+    );
+    let live_tail = EntityId::new(format!("retained-{nanos}-live-tail"));
+    live.commit(commit(&live_tail, 1..=4)).await.unwrap();
+    for sequence in 3..=4 {
+        client
+            .delete_item()
+            .table_name(table)
+            .key("pk", AttributeValue::S(live_tail.to_string()))
+            .key("sk", AttributeValue::N(sequence.to_string()))
+            .send()
+            .await
+            .unwrap();
+    }
+    let result = live.commit(commit(&live_tail, 3..=3)).await;
+    assert!(
+        matches!(result, Err(Error::Conflict { .. })),
+        "a head above the log of a retained type is the expired-tail transient, expired or not: {result:?}"
+    );
+}
+
+/// Fresh and unmigrated tables (ADR 0007): the first write to an empty table declares
+/// `stream-heads` itself, a table that holds only reserved rows is still empty, and a table with
+/// an event item and no marker row is refused by every write path.
+async fn dynamo_fresh_and_unmigrated_tables(repository: &DynamoRepository) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let client = repository.client();
+
+    // An empty table.
+    let table = format!("evt-fresh-{nanos}");
+    create_dynamo_table(client, &table).await;
+    let fresh = DynamoRepository::new(client.clone(), &table);
+    let other = DynamoRepository::new(client.clone(), &table);
+    fresh_store_cases(&fresh, &other).await;
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .unwrap();
+
+    // A table holding only a reserved row is empty: the Scan skips `command-outcome#` rows.
+    let table = format!("evt-reserved-{nanos}");
+    create_dynamo_table(client, &table).await;
+    let reserved = DynamoRepository::new(client.clone(), &table);
+    reserved
+        .commit(Commit::new("reserved-only", Vec::new()).with_outcome(
+            photon_evt::Outcome::accepted(format!("reserved-{nanos}"), "digest"),
+        ))
+        .await
+        .expect("an outcome-only commit declares on a table with no streams");
+    assert!(
+        reserved
+            .read_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .declares_stream_heads(),
+        "the outcome-only commit declared the feature"
+    );
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .unwrap();
+
+    // A populated table with no marker row, as a v0.8 writer left it.
+    let table = format!("evt-legacy-{nanos}");
+    create_dynamo_table(client, &table).await;
+    let legacy = DynamoRepository::new(client.clone(), &table);
+    let heads = DynamoHeads::new(client.clone(), table.clone());
+    let id = EntityId::new("legacy-stream");
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: Ledger::TYPE.into(),
+        payload: br#"{"amount":1}"#.to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    HeadFixtures::<DynamoRepository>::append_bypassing_head(&heads, &event)
+        .await
+        .unwrap();
+    // A snapshot a writer without heads wrote, so that compaction reaches the marker check.
+    let covering = SerializedSnapshot {
+        entity_type: Ledger::TYPE.into(),
+        entity_id: id.clone(),
+        sequence: EventSequence(1),
+        event_sequence: EventSequence(1),
+        payload: b"{}".to_vec(),
+    };
+    client
+        .put_item()
+        .table_name(&table)
+        .set_item(Some(photon_evt::dynamodb::to_sdk_item(
+            &photon_evt::wire::dynamo::snapshot_item(&covering, None).unwrap(),
+        )))
+        .send()
+        .await
+        .unwrap();
+
+    let next = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(2)),
+        sequence: EventSequence(2),
+        ..event.clone()
+    };
+    for result in [
+        legacy.commit(Commit::new(id.clone(), vec![next])).await,
+        legacy
+            .put_snapshot(&SerializedSnapshot {
+                entity_type: Ledger::TYPE.into(),
+                entity_id: id.clone(),
+                sequence: EventSequence(1),
+                event_sequence: EventSequence(0),
+                payload: b"{}".to_vec(),
+            })
+            .await
+            .map(|_| ()),
+        legacy
+            .compact_below(&id, EventSequence(1))
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(Error::StreamHeadsNotMigrated)),
+            "an unmigrated table refuses writes: {result:?}"
+        );
+    }
+    assert!(
+        legacy.read_manifest().await.unwrap().is_none(),
+        "a refused writer declares nothing on a populated table"
+    );
+    assert_eq!(legacy.events(&id).await.unwrap(), vec![event]);
+    assert_eq!(
+        legacy.entity_heads(None).await.unwrap().get(&id),
+        Some(&EventSequence(1)),
+        "entity heads scan the log, which needs no head items"
+    );
+
+    // The migration declares the feature after backfilling; here the head item is written by
+    // hand, as the backfill would.
+    client
+        .put_item()
+        .table_name(&table)
+        .item("pk", AttributeValue::S(id.to_string()))
+        .item("sk", AttributeValue::N("-1".into()))
+        .item("head", AttributeValue::N("1".into()))
+        .send()
+        .await
+        .unwrap();
+    legacy.declare_stream_heads().await.unwrap();
+    legacy
+        .commit(Commit::new(
+            id.clone(),
+            vec![SerializedEvent {
+                id: EventId::for_event(&id, EventSequence(2)),
+                sequence: EventSequence(2),
+                event_type: EventType::new("ledger:added"),
+                version: EventVersion(1),
+                entity_id: id.clone(),
+                entity_type: Ledger::TYPE.into(),
+                payload: br#"{"amount":1}"#.to_vec(),
+                metadata: Metadata::new("local"),
+            }],
+        ))
+        .await
+        .expect("a migrated table accepts writes");
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .unwrap();
 }
 
 /// Reads an outcome row back through the raw client and asserts it is byte-for-byte the item the
@@ -303,8 +899,8 @@ async fn dynamo_marker_row_matches_the_wire_format(repository: &DynamoRepository
     );
     assert_eq!(
         manifest.features_json(),
-        "{}",
-        "the cleared manifest stores an empty sorted JSON object"
+        r#"{"stream-heads":1}"#,
+        "the reset manifest declares stream-heads alone, as a sorted JSON object"
     );
 }
 
@@ -564,9 +1160,9 @@ async fn postgres_deferred_projector_violation_is_not_a_conflict() {
     assert!(repository.events(&id).await.unwrap().is_empty());
 }
 
-/// Commits and snapshot writes for one entity take the same advisory lock, so a snapshot cannot
-/// raise the floor under a commit that already passed its floor check. The other language runs the
-/// same statement, so holding it here must block both kinds of write.
+/// Commits and snapshot writes for one entity take the same advisory lock, so a snapshot write
+/// cannot check the stream's head while a commit is moving it. The other language runs the same
+/// statement, so holding it here must block both kinds of write.
 #[tokio::test]
 async fn postgres_writes_wait_for_the_entity_lock() {
     let repository = drivers::postgres().await.expect("connect to PostgreSQL");
@@ -590,7 +1186,7 @@ async fn postgres_writes_wait_for_the_entity_lock() {
         entity_type: Ledger::TYPE.into(),
         entity_id: id.clone(),
         sequence: EventSequence(1),
-        event_sequence: EventSequence(10),
+        event_sequence: EventSequence(0),
         payload: b"{}".to_vec(),
     };
     let event = SerializedEvent {
@@ -619,13 +1215,9 @@ async fn postgres_writes_wait_for_the_entity_lock() {
 
     lock.rollback().await.expect("release the lock");
 
+    // A snapshot of the empty stream needs no head item, so it is written in either order.
     assert!(put.await.unwrap().expect("the snapshot is written"));
-    // Either order is consistent: the commit lands first, or the floor check rejects it.
-    let committed = commit.await.unwrap();
-    assert!(
-        matches!(committed, Ok(()) | Err(Error::Conflict { .. })),
-        "{committed:?}"
-    );
+    commit.await.unwrap().expect("the commit lands");
 }
 
 /// Inserts one view row per ledger version with a plain `INSERT`, so two writers committing from
@@ -712,7 +1304,7 @@ async fn postgres_schema_setup_is_concurrent_safe() {
         .await
         .unwrap()
         .batch_execute(&format!(
-            "DROP TABLE IF EXISTS {events}, {snapshots}, {events}__evt_features"
+            "DROP TABLE IF EXISTS {events}, {snapshots}, {events}__evt_features, {events}__evt_stream_heads"
         ))
         .await
         .unwrap();
@@ -746,9 +1338,11 @@ async fn postgres_conforms() {
 
     // PostgreSQL does not check snapshot sequences: the event-sequence conflict already rejects
     // racing writers, and the snapshot upsert keeps the event sequence monotonic.
+    let heads = PostgresHeads::new(repository.pool().clone(), events.clone());
     Suite::new(&repository)
         .snapshot_sequence_conflicts(false)
         .with_views(views)
+        .with_head_fixtures(heads)
         .run()
         .await;
 
@@ -763,16 +1357,145 @@ async fn postgres_conforms() {
     postgres_refuses_projector_only_transactions(&repository).await;
     postgres_legacy_reserved_reads(&repository, &events, &snapshots).await;
     postgres_enumeration(&repository, &events).await;
+    Box::pin(postgres_fresh_and_unmigrated_databases()).await;
     repository
         .pool()
         .get()
         .await
         .unwrap()
         .batch_execute(&format!(
-            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes"
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads"
         ))
         .await
         .expect("drop the isolated event log");
+}
+
+/// Fresh and unmigrated databases (ADR 0007): the first write to empty tables declares
+/// `stream-heads`, and tables with an event row and no marker are refused by every write path
+/// while `entity_heads` keeps aggregating the log until the feature is declared.
+async fn postgres_fresh_and_unmigrated_databases() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let pool = drivers::postgres_pool().unwrap();
+    let handle = |events: &str| {
+        PostgresRepository::new(pool.clone())
+            .with_tables(events, &format!("{events}s"))
+            .unwrap()
+    };
+    let drop_tables = |events: String| {
+        let pool = pool.clone();
+        async move {
+            pool.get()
+                .await
+                .unwrap()
+                .batch_execute(&format!(
+                    "DROP TABLE {events}, {events}s, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads"
+                ))
+                .await
+                .unwrap();
+        }
+    };
+
+    // Empty tables.
+    let events = format!("fr_{nanos:x}");
+    let fresh = handle(&events);
+    fresh.ensure_schema().await.unwrap();
+    fresh_store_cases(&fresh, &handle(&events)).await;
+    drop_tables(events).await;
+
+    // Tables with an event row and no marker.
+    let events = format!("um_{nanos:x}");
+    let legacy = handle(&events);
+    legacy.ensure_schema().await.unwrap();
+    let heads = PostgresHeads::new(pool.clone(), events.clone());
+    let id = EntityId::new("legacy-stream");
+    let event = |sequence: i64| SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(sequence)),
+        sequence: EventSequence(sequence),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: Ledger::TYPE.into(),
+        payload: br#"{"amount":1}"#.to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    HeadFixtures::<PostgresRepository>::append_bypassing_head(&heads, &event(1))
+        .await
+        .unwrap();
+    // A snapshot a writer without heads wrote, so that compaction reaches the marker check.
+    legacy
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            &format!(
+                "INSERT INTO {events}s (entity_id, entity_type, sequence, event_sequence, payload) \
+                 VALUES ($1, $2, 1, 1, $3)"
+            ),
+            &[&id.as_str(), &Ledger::TYPE, &b"{}".to_vec()],
+        )
+        .await
+        .unwrap();
+
+    for result in [
+        legacy.commit(Commit::new(id.clone(), vec![event(2)])).await,
+        legacy
+            .put_snapshot(&SerializedSnapshot {
+                entity_type: Ledger::TYPE.into(),
+                entity_id: id.clone(),
+                sequence: EventSequence(1),
+                event_sequence: EventSequence(0),
+                payload: b"{}".to_vec(),
+            })
+            .await
+            .map(|_| ()),
+        legacy
+            .compact_below(&id, EventSequence(1))
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(Error::StreamHeadsNotMigrated)),
+            "an unmigrated database refuses writes: {result:?}"
+        );
+    }
+    assert!(legacy.read_manifest().await.unwrap().is_none());
+    assert_eq!(
+        legacy.entity_heads(None).await.unwrap().get(&id),
+        Some(&EventSequence(1)),
+        "until stream-heads is declared, entity heads aggregate the log"
+    );
+
+    // After the declaration entity heads read the heads table, which the (hand-run) backfill
+    // fills; without a heads row the stream is not listed.
+    legacy.declare_stream_heads().await.unwrap();
+    assert_eq!(legacy.entity_heads(None).await.unwrap().get(&id), None);
+    legacy
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            &format!(
+                "INSERT INTO {}__evt_stream_heads (entity_id, entity_type, head) VALUES ($1, $2, 1)",
+                events
+            ),
+            &[&id.as_str(), &Ledger::TYPE],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy.entity_heads(None).await.unwrap().get(&id),
+        Some(&EventSequence(1))
+    );
+    legacy
+        .commit(Commit::new(id.clone(), vec![event(2)]))
+        .await
+        .expect("a migrated database accepts writes");
+    drop_tables(events).await;
 }
 
 /// Reads outcome rows back through raw SQL: bytea response, jsonb events and rejection, and the
@@ -1070,8 +1793,8 @@ async fn postgres_features_text_matches_the_manifest(
     );
     assert_eq!(
         manifest.features_json(),
-        "{}",
-        "the cleared manifest stores an empty sorted JSON object"
+        r#"{"stream-heads":1}"#,
+        "the reset manifest declares stream-heads alone, as a sorted JSON object"
     );
 }
 
@@ -1134,8 +1857,52 @@ async fn dynamo_enumeration(repository: &DynamoRepository) {
         .await
         .unwrap();
 
+    // A head item with no events or snapshot (an orphan) is neither an event nor an entity: the
+    // unfiltered Scan skips every row below `sk = 1`, and the heads scan skips `sk < 0`.
+    let orphan = EntityId::new(format!("orphan-head-{}", std::process::id()));
+    repository
+        .client()
+        .put_item()
+        .table_name(repository.table())
+        .set_item(Some(photon_evt::dynamodb::to_sdk_item(
+            &photon_evt::wire::dynamo::head_item(&orphan, EventSequence(3), None),
+        )))
+        .send()
+        .await
+        .unwrap();
     enumeration_cases(repository).await;
     assert_no_reserved(&batches(repository.stream_all_events(StreamFilter::all())).await);
+    assert!(
+        batches(repository.stream_all_events(StreamFilter::all()))
+            .await
+            .iter()
+            .flatten()
+            .all(|event| event.entity_id != orphan),
+        "an orphan head item is not an event"
+    );
+    assert!(
+        !repository
+            .entity_heads(None)
+            .await
+            .unwrap()
+            .contains_key(&orphan),
+        "an orphan head item is not an entity"
+    );
+    let partition = repository.partition_items(&orphan).await.unwrap();
+    assert_eq!(
+        partition.len(),
+        1,
+        "the partition listing returns the head item like any other row"
+    );
+    repository
+        .client()
+        .delete_item()
+        .table_name(repository.table())
+        .key("pk", AttributeValue::S(orphan.to_string()))
+        .key("sk", AttributeValue::N("-1".into()))
+        .send()
+        .await
+        .unwrap();
 
     // A small Scan page forces pagination: 120 events cannot fit in one page of at most 50 items,
     // so the stream must continue across pages without dropping or repeating one.
@@ -1201,13 +1968,13 @@ async fn dynamo_enumeration(repository: &DynamoRepository) {
                 .unwrap();
         }
     }
-    for event in &events {
+    for sequence in std::iter::once(-1).chain(events.iter().map(|event| event.sequence.0)) {
         repository
             .client()
             .delete_item()
             .table_name(repository.table())
             .key("pk", AttributeValue::S(id.to_string()))
-            .key("sk", AttributeValue::N(event.sequence.0.to_string()))
+            .key("sk", AttributeValue::N(sequence.to_string()))
             .send()
             .await
             .unwrap();

@@ -42,6 +42,42 @@ pub enum Error {
     #[error("duplicate command: {0}")]
     DuplicateCommand(CommandId),
 
+    /// A stream's head item disagrees with its events or snapshot (ADR 0007, invariants H2 to
+    /// H4): a writer appended without maintaining the head, events were deleted, a snapshot is
+    /// ahead of the head, or a stream has data and no head item. It is raised by the failure-path
+    /// probe, by a commit whose head update passed while an event put failed, and by an
+    /// out-of-band snapshot write that finds the snapshot ahead of the head.
+    ///
+    /// It is **not retryable** and is never exhausted into a `stale-fence` rejection: it writes no
+    /// outcome row, and running the command again would fail the same way. Repair is offline
+    /// (`evt-doctor migrate-heads --repair`).
+    #[error(
+        "stream head drift on entity {entity_id}: stored head {}, derived head {derived}",
+        stored.map_or_else(|| "absent".to_owned(), |head| head.to_string())
+    )]
+    StreamHeadDrift {
+        /// The stream whose head item disagrees with its events and snapshot.
+        entity_id: EntityId,
+        /// The head item's `head`, or `None` when the stream has no head item.
+        stored: Option<EventSequence>,
+        /// The head derived from the stream's events and snapshot: the larger of the highest
+        /// event sequence and the snapshot's event sequence.
+        derived: EventSequence,
+    },
+
+    /// The table's feature manifest does not declare `stream-heads` at format version 1, so this
+    /// writer refuses to write (ADR 0007). The table was written by a build without stream heads
+    /// and has not been migrated (`evt-doctor migrate-heads`). Every write path that validates the
+    /// feature marker refuses with it: commits (outcome-only and rejection commits included),
+    /// [`Repository::put_snapshot`](crate::Repository::put_snapshot), and
+    /// [`Repository::compact_below`](crate::Repository::compact_below). Reads do not need the
+    /// feature. Nothing was written.
+    #[error(
+        "the table is not migrated to stream heads: the feature manifest does not declare \
+         stream-heads at stored-format version 1"
+    )]
+    StreamHeadsNotMigrated,
+
     /// Compaction was refused because no durable snapshot covers the requested range.
     #[error(
         "compaction refused: no durable snapshot covers the requested range (entity {entity_id}, \

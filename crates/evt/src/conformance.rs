@@ -37,6 +37,7 @@ use crate::features::{self, FeatureMarker};
 use crate::ids::{
     CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion,
 };
+use crate::mem::MemRepository;
 use crate::metadata::Metadata;
 use crate::outcome::Outcome;
 use crate::outcome::{
@@ -435,11 +436,71 @@ impl<R: Repository> ViewTarget<R> for NoViews {
     }
 }
 
+/// Backend-specific access to a stream's head item (ADR 0007), for the cases that must put a
+/// stream in a state no conforming writer can: an event appended **without** its head update, as a
+/// writer that predates stream heads would, and a stream whose head item is gone. Implement it
+/// for a backend with a raw handle on its storage and pass it to [`Suite::with_head_fixtures`];
+/// the cases that need it are skipped without one.
+pub trait HeadFixtures<R: Repository>: Send + Sync {
+    /// Stores the event in its stream **without** touching the stream's head item: a DynamoDB
+    /// event item with no head update, or a PostgreSQL event row with no heads row.
+    fn append_bypassing_head(
+        &self,
+        event: &SerializedEvent,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Deletes the stream's head item or row, leaving its events and snapshot.
+    fn delete_head(&self, entity_id: &EntityId) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Reads the stream's stored head, `None` when it has no head item or row.
+    fn stored_head(
+        &self,
+        entity_id: &EntityId,
+    ) -> impl Future<Output = Result<Option<EventSequence>, Error>> + Send;
+}
+
+/// The placeholder [`HeadFixtures`] for suites without raw storage access. Its cases are skipped.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoHeadFixtures;
+
+impl<R: Repository> HeadFixtures<R> for NoHeadFixtures {
+    async fn append_bypassing_head(&self, _: &SerializedEvent) -> Result<(), Error> {
+        Err(Error::InvalidConfig("no head fixtures".into()))
+    }
+
+    async fn delete_head(&self, _: &EntityId) -> Result<(), Error> {
+        Err(Error::InvalidConfig("no head fixtures".into()))
+    }
+
+    async fn stored_head(&self, _: &EntityId) -> Result<Option<EventSequence>, Error> {
+        Err(Error::InvalidConfig("no head fixtures".into()))
+    }
+}
+
+impl HeadFixtures<crate::MemRepository> for crate::MemRepository {
+    async fn append_bypassing_head(&self, event: &SerializedEvent) -> Result<(), Error> {
+        MemRepository::append_bypassing_head(self, event.clone());
+
+        Ok(())
+    }
+
+    async fn delete_head(&self, entity_id: &EntityId) -> Result<(), Error> {
+        MemRepository::delete_head(self, entity_id);
+
+        Ok(())
+    }
+
+    async fn stored_head(&self, entity_id: &EntityId) -> Result<Option<EventSequence>, Error> {
+        Ok(MemRepository::stored_head(self, entity_id))
+    }
+}
+
 /// Runs the conformance cases against one repository.
-pub struct Suite<'a, R, V = NoViews> {
+pub struct Suite<'a, R, V = NoViews, H = NoHeadFixtures> {
     repository: &'a R,
     snapshot_sequence_conflicts: bool,
     views: Option<V>,
+    head_fixtures: Option<H>,
 }
 
 impl<'a, R: Repository> Suite<'a, R> {
@@ -449,11 +510,12 @@ impl<'a, R: Repository> Suite<'a, R> {
             repository,
             snapshot_sequence_conflicts: true,
             views: None,
+            head_fixtures: None,
         }
     }
 }
 
-impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
+impl<'a, R: Repository, V: ViewTarget<R>, H: HeadFixtures<R>> Suite<'a, R, V, H> {
     /// Whether a commit whose snapshot sequence is not the stored one plus one is rejected
     /// (default `true`). PostgreSQL relies on the event-sequence conflict instead, so it opts out.
     pub fn snapshot_sequence_conflicts(mut self, enforced: bool) -> Self {
@@ -462,11 +524,23 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
     }
 
     /// Adds the view storage for the projector case.
-    pub fn with_views<W: ViewTarget<R>>(self, views: W) -> Suite<'a, R, W> {
+    pub fn with_views<W: ViewTarget<R>>(self, views: W) -> Suite<'a, R, W, H> {
         Suite {
             repository: self.repository,
             snapshot_sequence_conflicts: self.snapshot_sequence_conflicts,
             views: Some(views),
+            head_fixtures: self.head_fixtures,
+        }
+    }
+
+    /// Adds raw access to the stream heads, for the drift, ranking, and head-guard cases that put
+    /// a stream in a state no conforming writer can.
+    pub fn with_head_fixtures<G: HeadFixtures<R>>(self, fixtures: G) -> Suite<'a, R, V, G> {
+        Suite {
+            repository: self.repository,
+            snapshot_sequence_conflicts: self.snapshot_sequence_conflicts,
+            views: self.views,
+            head_fixtures: Some(fixtures),
         }
     }
 
@@ -511,7 +585,15 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             );
         }
         record("put snapshot is monotonic", put_snapshot(repo).await);
+        record(
+            "an out-of-band snapshot must be covered by the stream's head",
+            Box::pin(snapshot_guard(repo)).await,
+        );
         record("compact below a snapshot", compact_below(repo).await);
+        record(
+            "compaction never moves the head and never conflicts with a current writer",
+            Box::pin(head_survives_compaction(repo)).await,
+        );
         record(
             "reject a commit below the compacted floor",
             compacted_floor(repo).await,
@@ -549,6 +631,20 @@ impl<'a, R: Repository, V: ViewTarget<R>> Suite<'a, R, V> {
             fence_compaction_aba(repo).await,
         );
         record("entity heads", entity_heads(repo).await);
+        record(
+            "racing writers lose with conflicts, never with drift",
+            Box::pin(racing_writers_never_read_as_drift(repo)).await,
+        );
+        if let Some(fixtures) = &self.head_fixtures {
+            record(
+                "a stream whose head disagrees with its log is drift, which is never retried or recorded",
+                Box::pin(stream_head_drift(repo, fixtures)).await,
+            );
+            record(
+                "failures rank outcome conflict, drift, gap, then conflict",
+                Box::pin(failure_ranking(repo, fixtures)).await,
+            );
+        }
         record(
             "latest(n) reads the newest events first",
             latest_n(repo).await,
@@ -1079,6 +1175,10 @@ async fn snapshot_sequence_conflict<R: Repository>(repo: &R) -> CaseResult {
 async fn put_snapshot<R: Repository>(repo: &R) -> CaseResult {
     let stream = Stream::new(&namespace(), "1", "ledger");
 
+    // An out-of-band snapshot must be covered by the stream's head (H3), so the stream has events
+    // up to the highest snapshot below.
+    stream.commit(repo, stream.events(1..=7), None).await?;
+
     ensure!(
         repo.put_snapshot(&stream.snapshot(1, 5, r#"{"v":1}"#))
             .await?,
@@ -1113,6 +1213,473 @@ async fn put_snapshot<R: Repository>(repo: &R) -> CaseResult {
     );
 
     Ok(())
+}
+
+fn is_drift(error: &Error, id: &EntityId, stored: Option<i64>, derived: i64) -> bool {
+    matches!(
+        error,
+        Error::StreamHeadDrift { entity_id, stored: found_stored, derived: found_derived }
+            if entity_id == id
+                && *found_stored == stored.map(EventSequence)
+                && *found_derived == EventSequence(derived)
+    )
+}
+
+fn expect_drift<T: fmt::Debug>(
+    result: Result<T, Error>,
+    what: &str,
+    id: &EntityId,
+    stored: Option<i64>,
+    derived: i64,
+) -> CaseResult {
+    match result {
+        Err(error) if is_drift(&error, id, stored, derived) => {
+            ensure!(
+                !error.is_retryable() && !error.is_conflict(),
+                "{what}: drift is neither retryable nor a conflict: {error:?}"
+            );
+
+            Ok(())
+        }
+        other => Err(Failure(format!(
+            "{what}: want StreamHeadDrift (stored {stored:?}, derived {derived}) on {id}, got {other:?}"
+        ))),
+    }
+}
+
+/// An out-of-band snapshot write conditions on the stream's head (ADR 0007, H3).
+async fn snapshot_guard<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    a.commit(repo, a.events(1..=3), None).await?;
+
+    // A snapshot ahead of the stream would let a writer that loaded earlier pass `head = 3` and
+    // append events 4 and 5 beneath a snapshot that already covers them.
+    expect_drift(
+        repo.put_snapshot(&a.snapshot(1, 5, "{}")).await,
+        "a snapshot ahead of the head",
+        &a.id,
+        Some(3),
+        5,
+    )?;
+    ensure!(
+        repo.snapshot(&a.id).await?.is_none(),
+        "the refused snapshot is not written"
+    );
+
+    // One at the head, and below it, is covered.
+    ensure!(
+        repo.put_snapshot(&a.snapshot(1, 3, "{}")).await?,
+        "a snapshot at the head is written"
+    );
+
+    // A stream that was never written has no head item: a snapshot above 0 is drift with an
+    // absent stored head, but a snapshot of the empty stream (event sequence 0) is allowed.
+    let empty = Stream::new(&ns, "empty", "ledger");
+    expect_drift(
+        repo.put_snapshot(&empty.snapshot(1, 2, "{}")).await,
+        "a snapshot of a stream with no head item",
+        &empty.id,
+        None,
+        2,
+    )?;
+    ensure!(
+        repo.put_snapshot(&empty.snapshot(1, 0, "{}")).await?,
+        "a snapshot at event sequence 0 needs no head item"
+    );
+    ensure_eq!(
+        repo.snapshot(&empty.id).await?,
+        Some(empty.snapshot(1, 0, "{}")),
+        "the empty-stream snapshot is stored"
+    );
+
+    // The stream then writes its first events normally.
+    empty.commit(repo, empty.events(1..=2), None).await?;
+    ensure_eq!(
+        repo.events(&empty.id).await?,
+        empty.events(1..=2),
+        "the stream with an empty-stream snapshot accepts its first events"
+    );
+
+    Ok(())
+}
+
+/// Compaction deletes events but never touches the head (ADR 0007): a writer whose load is
+/// current still appends, and a negative `after` is clamped to the events.
+async fn head_survives_compaction<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let c = Stream::new(&ns, "c", "ledger");
+
+    a.commit(repo, a.events(1..=4), Some(a.new_snapshot(1, "{}")))
+        .await?;
+    ensure_eq!(
+        repo.compact_below(&a.id, EventSequence(4)).await?,
+        4,
+        "the head event is compacted away with the rest"
+    );
+
+    // The writer that loaded at head 4 before the compaction is still current.
+    a.commit(repo, a.events(5..=5), None).await?;
+    ensure_eq!(
+        repo.events(&a.id).await?,
+        a.events(5..=5),
+        "the append after compaction"
+    );
+    ensure_eq!(
+        repo.entity_heads(Some(&a.entity_type)).await?,
+        BTreeMap::from([(a.id.clone(), EventSequence(5))]),
+        "compaction did not move the head"
+    );
+
+    // A fence at the head passes, and a fence at the compacted head fails: heads only increase.
+    let fence = |head| {
+        let mut commit = TransactionCommit::new(vec![write(&c, 1..=1)]);
+        commit.fences = vec![ReadFence::new(
+            a.id.clone(),
+            a.entity_type.clone(),
+            EventSequence(head),
+            FenceProvenance::Engine,
+        )];
+
+        commit
+    };
+    expect_conflict(
+        repo.commit_transaction(fence(4)).await,
+        "a fence at the head before the append",
+    )?;
+    repo.commit_transaction(fence(5)).await?;
+
+    // A negative lower bound never reaches the snapshot or the head item.
+    ensure_eq!(
+        repo.events_after(&a.id, EventSequence(-5)).await?,
+        a.events(5..=5),
+        "a negative `after` returns the events only"
+    );
+
+    Ok(())
+}
+
+/// A stream whose head disagrees with its log is drift (ADR 0007): never retried, never an
+/// outcome or a rejection, and ranked above a gap and an ordinary conflict.
+async fn stream_head_drift<R: Repository, H: HeadFixtures<R>>(
+    repo: &R,
+    fixtures: &H,
+) -> CaseResult {
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let c = Stream::new(&ns, "c", "ledger");
+
+    // Head 2, then an event 3 stored without its head update.
+    a.commit(repo, a.events(1..=2), None).await?;
+    fixtures.append_bypassing_head(&a.event(3, 3)).await?;
+    ensure_eq!(
+        fixtures.stored_head(&a.id).await?,
+        Some(EventSequence(2)),
+        "the bypassed event left the head behind"
+    );
+
+    // The head update passes (`head = 2`) and the event put fails: certain drift.
+    expect_drift(
+        a.commit(repo, vec![a.event(3, 9)], None).await,
+        "an append whose head update passes over an event already above the head",
+        &a.id,
+        Some(2),
+        3,
+    )?;
+
+    // The head update fails (`head = 3` against 2) and the probe finds the log ahead: drift, not
+    // a gap and not a conflict.
+    expect_drift(
+        a.commit(repo, vec![a.event(4, 9)], None).await,
+        "an append past a drifted head",
+        &a.id,
+        Some(2),
+        3,
+    )?;
+    ensure_eq!(
+        repo.events(&a.id).await?.len(),
+        3,
+        "the refused appends wrote nothing"
+    );
+
+    // A fence at the stored head still passes, which is why writers must be stopped before a
+    // migration; a fence at the derived head fails the check and the probe reports the drift.
+    let fenced = |head| {
+        let mut commit = TransactionCommit::new(vec![write(&c, 1..=1)]);
+        commit.fences = vec![ReadFence::new(
+            a.id.clone(),
+            a.entity_type.clone(),
+            EventSequence(head),
+            FenceProvenance::Engine,
+        )];
+
+        commit
+    };
+    expect_drift(
+        repo.commit_transaction(fenced(3)).await,
+        "a fence at the derived head of a drifted stream",
+        &a.id,
+        Some(2),
+        3,
+    )?;
+    repo.commit_transaction(fenced(2)).await?;
+
+    // An out-of-band snapshot at the derived head is ahead of the stored head.
+    expect_drift(
+        repo.put_snapshot(&a.snapshot(1, 3, "{}")).await,
+        "a snapshot over a drifted stream",
+        &a.id,
+        Some(2),
+        3,
+    )?;
+
+    // Drift writes no outcome row and no rejection, even with retries available.
+    let command = command_id();
+    let result = a
+        .commit_with_outcome(
+            repo,
+            vec![a.event(4, 9)],
+            Outcome::accepted(command.clone(), "digest"),
+        )
+        .await;
+    expect_drift(
+        result,
+        "a drifted commit that carries an outcome",
+        &a.id,
+        Some(2),
+        3,
+    )?;
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "drift records no outcome"
+    );
+
+    let id = ledger_id();
+    let store = outcome_store(repo);
+    store
+        .execute_with_outcome(&id, Add(1), command_metadata(&command_id()))
+        .await?;
+    store
+        .execute_with_outcome(&id, Add(1), command_metadata(&command_id()))
+        .await?;
+    fixtures
+        .append_bypassing_head(&SerializedEvent {
+            id: EventId::for_event(&id, EventSequence(3)),
+            sequence: EventSequence(3),
+            event_type: EventType::new("ledger:added"),
+            version: EventVersion(1),
+            entity_id: id.clone(),
+            entity_type: EntityType::new(Ledger::TYPE),
+            payload: br#"{"amount":1}"#.to_vec(),
+            metadata: Metadata::default(),
+        })
+        .await?;
+    let command = command_id();
+    let result = store
+        .execute_with_outcome(&id, Add(1), command_metadata(&command))
+        .await;
+    expect_drift(
+        result,
+        "a store command over a drifted stream",
+        &id,
+        Some(2),
+        3,
+    )?;
+    ensure!(
+        repo.outcome(&command).await?.is_none(),
+        "drift is never exhausted into a stale-fence rejection"
+    );
+
+    // A head item that is gone while the log remains is drift too, with an absent stored head.
+    let b = Stream::new(&ns, "b", "ledger");
+    b.commit(repo, b.events(1..=2), None).await?;
+    fixtures.delete_head(&b.id).await?;
+    ensure_eq!(fixtures.stored_head(&b.id).await?, None, "the head is gone");
+    expect_drift(
+        b.commit(repo, vec![b.event(3, 3)], None).await,
+        "an append to a stream with no head item",
+        &b.id,
+        None,
+        2,
+    )?;
+    expect_drift(
+        b.commit(repo, b.events(1..=1), None).await,
+        "a create over a stream with events and no head item",
+        &b.id,
+        None,
+        2,
+    )?;
+
+    Ok(())
+}
+
+/// Several failed items rank, identically on every backend: an outcome conflict above drift,
+/// drift above a gap, a gap above any other conflict (ADR 0007).
+async fn failure_ranking<R: Repository, H: HeadFixtures<R>>(repo: &R, fixtures: &H) -> CaseResult {
+    let ns = namespace();
+    // Sorted by ID, the conflict stream comes first, then the gap, then the drift.
+    let conflict = Stream::new(&ns, "a-conflict", "ledger");
+    let gap = Stream::new(&ns, "b-gap", "ledger");
+    let drift = Stream::new(&ns, "c-drift", "ledger");
+
+    conflict.commit(repo, conflict.events(1..=2), None).await?;
+    gap.commit(repo, gap.events(1..=1), None).await?;
+    drift.commit(repo, drift.events(1..=2), None).await?;
+    fixtures.append_bypassing_head(&drift.event(3, 3)).await?;
+
+    // Each commit below fails on every stream it names.
+    let stale = || write(&conflict, 2..=2); // head is 2, not 1
+    let skipping = || write(&gap, 3..=3); // head is 1, not 2
+    let drifted = || write(&drift, 4..=4); // head is 2 but the log reaches 3
+
+    expect_conflict(
+        repo.commit_transaction(TransactionCommit::new(vec![stale()]))
+            .await,
+        "a stale append alone",
+    )?;
+
+    let result = repo
+        .commit_transaction(TransactionCommit::new(vec![stale(), skipping()]))
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::SequenceGap { entity_id, after: EventSequence(1), found: EventSequence(3) }) if *entity_id == gap.id),
+        "a gap outranks a conflict that comes first: {result:?}"
+    );
+
+    expect_drift(
+        repo.commit_transaction(TransactionCommit::new(vec![stale(), skipping(), drifted()]))
+            .await,
+        "drift outranks a gap and a conflict",
+        &drift.id,
+        Some(2),
+        3,
+    )?;
+
+    // A stale fence is a conflict like a stale append, and ranks below a gap.
+    let mut fenced = TransactionCommit::new(vec![skipping()]);
+    fenced.fences = vec![ReadFence::new(
+        conflict.id.clone(),
+        conflict.entity_type.clone(),
+        EventSequence(1),
+        FenceProvenance::Engine,
+    )];
+    let result = repo.commit_transaction(fenced).await;
+    ensure!(
+        matches!(&result, Err(Error::SequenceGap { entity_id, .. }) if *entity_id == gap.id),
+        "a gap outranks a stale fence: {result:?}"
+    );
+
+    // Among conflicts, the first failed item in transaction order is reported: written streams
+    // in byte order, then the fences.
+    let mut fenced = TransactionCommit::new(vec![stale()]);
+    fenced.fences = vec![ReadFence::new(
+        gap.id.clone(),
+        gap.entity_type.clone(),
+        EventSequence(0),
+        FenceProvenance::Engine,
+    )];
+    let result = repo.commit_transaction(fenced).await;
+    ensure!(
+        matches!(&result, Err(Error::Conflict { entity_id, .. }) if *entity_id == conflict.id),
+        "a stale append is reported before a stale fence: {result:?}"
+    );
+
+    // A recorded outcome outranks all of it: the command already ran.
+    let command = command_id();
+    repo.commit_transaction(
+        TransactionCommit::<R::Operation>::new(Vec::new())
+            .with_outcome(Outcome::accepted(command.clone(), "digest")),
+    )
+    .await?;
+    let result = repo
+        .commit_transaction(
+            TransactionCommit::new(vec![stale(), skipping(), drifted()])
+                .with_outcome(Outcome::accepted(command.clone(), "digest")),
+        )
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::OutcomeConflict { command_id }) if *command_id == command),
+        "an existing outcome outranks drift, gap, and conflict: {result:?}"
+    );
+
+    Ok(())
+}
+
+/// Writers that race on one stream lose with conflicts only: the failure-path probe never reads a
+/// commit that landed between its reads as drift.
+async fn racing_writers_never_read_as_drift<R: Repository>(repo: &R) -> CaseResult {
+    let a = Stream::new(&namespace(), "race", "ledger");
+
+    for round in 0..4 {
+        let first = round * 6 + 1;
+        // Six writers compete for the same sequence of the same stream, all at once.
+        let attempts: Vec<_> = (0..6)
+            .map(|writer| {
+                let event = a.event(first, 100 + writer);
+
+                Box::pin(a.commit(repo, vec![event], None))
+                    as std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + '_>>
+            })
+            .collect();
+        let results = join_all(attempts).await;
+
+        let winners = results.iter().filter(|result| result.is_ok()).count();
+        ensure_eq!(winners, 1, "exactly one racing writer commits");
+        for result in results {
+            if let Err(error) = result {
+                ensure!(
+                    error.is_conflict(),
+                    "a losing writer sees a conflict, not drift: {error:?}"
+                );
+            }
+        }
+
+        // The next round continues from the winner.
+        a.commit(repo, vec![a.event(first + 1, 1)], None).await?;
+        for tail in 2..6 {
+            a.commit(repo, vec![a.event(first + tail, 1)], None).await?;
+        }
+    }
+
+    ensure_eq!(
+        repo.events(&a.id).await?.len(),
+        24,
+        "every round committed six events"
+    );
+
+    Ok(())
+}
+
+/// Drives futures concurrently on the current task and returns their outputs in order.
+async fn join_all<'f, T>(
+    mut futures: Vec<std::pin::Pin<Box<dyn Future<Output = T> + 'f>>>,
+) -> Vec<T> {
+    let mut outputs: Vec<Option<T>> = futures.iter().map(|_| None).collect();
+
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => *output = Some(value),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+
+    outputs
+        .into_iter()
+        .map(|output| output.expect("polled to completion"))
+        .collect()
 }
 
 async fn compact_below<R: Repository>(repo: &R) -> CaseResult {
@@ -1552,30 +2119,50 @@ async fn read_fences<R: Repository>(repo: &R) -> CaseResult {
         "a failed fenced commit writes nothing"
     );
 
+    // A fence at head 0 is `attribute_not_exists(head)`: it holds while the stream has never been
+    // written and fails once anyone creates it.
+    absent.commit(repo, absent.events(1..=1), None).await?;
+    let mut commit = TransactionCommit::new(vec![write(&c, 2..=2)]);
+    commit.fences = vec![ReadFence::new(
+        absent.id.clone(),
+        absent.entity_type.clone(),
+        EventSequence::ZERO,
+        FenceProvenance::Engine,
+    )];
+    let result = repo.commit_transaction(commit).await;
+    ensure!(
+        matches!(&result, Err(Error::FenceConflict { entity_id, head: EventSequence(0), .. }) if *entity_id == absent.id),
+        "a fence at head 0 fails once the stream exists: {result:?}"
+    );
+    ensure_eq!(
+        repo.events(&c.id).await?.len(),
+        before,
+        "the commit with the stale head-0 fence wrote nothing"
+    );
+
     Ok(())
 }
 
 async fn commit_too_large<R: Repository>(repo: &R) -> CaseResult {
     let stream = Stream::new(&namespace(), "large", "ledger");
 
-    // Appending to an existing stream adds a continuation check on its head event, so the marker
-    // check, that check, 97 event puts, and the floor check fill the 100 actions exactly.
+    // An append costs the same as a create (ADR 0007): the marker check, the head update, and 98
+    // event puts are exactly 100 actions. There is no continuation check.
     let grows = Stream::new(&namespace(), "grows", "ledger");
     grows.commit(repo, grows.events(1..=1), None).await?;
-    let result = grows.commit(repo, grows.events(2..=99), None).await;
+    let result = grows.commit(repo, grows.events(2..=100), None).await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "98 appended events are one action too many: {result:?}"
+        "99 appended events are one action too many: {result:?}"
     );
-    grows.commit(repo, grows.events(2..=98), None).await?;
+    grows.commit(repo, grows.events(2..=99), None).await?;
     ensure_eq!(
         repo.events(&grows.id).await?.len(),
-        98,
-        "97 appended events fit"
+        99,
+        "98 appended events fit"
     );
 
-    // The feature-marker check, 98 event puts, and the floor check are exactly 100 actions, so a
-    // 98-event commit fits on every backend. Only emitted actions count against the budget.
+    // The same 98 events fit when the commit creates the stream. Only emitted actions count.
     let fits = Stream::new(&namespace(), "fits", "ledger");
     fits.commit(repo, fits.events(1..=98), None).await?;
     ensure_eq!(
@@ -1584,7 +2171,29 @@ async fn commit_too_large<R: Repository>(repo: &R) -> CaseResult {
         "a commit that fills the budget exactly is accepted"
     );
 
-    // 101 event puts plus the control rows and the floor check exceed the 100-item budget.
+    // A snapshot put is one more action beside the head update, so a commit that creates a stream
+    // and writes its first snapshot holds 97 events, not 98: the one case that costs more.
+    let snapshotted = Stream::new(&namespace(), "snapshotted", "ledger");
+    let result = snapshotted
+        .commit(
+            repo,
+            snapshotted.events(1..=98),
+            Some(snapshotted.new_snapshot(1, "{}")),
+        )
+        .await;
+    ensure!(
+        matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
+        "98 events and a snapshot are one action too many: {result:?}"
+    );
+    snapshotted
+        .commit(
+            repo,
+            snapshotted.events(1..=97),
+            Some(snapshotted.new_snapshot(1, "{}")),
+        )
+        .await?;
+
+    // 101 event puts plus the control rows and the head update exceed the 100-item budget.
     let result = stream.commit(repo, stream.events(1..=101), None).await;
 
     ensure!(
@@ -1607,8 +2216,9 @@ async fn fence_compaction_aba<R: Repository>(repo: &R) -> CaseResult {
     a.commit(repo, a.events(1..=3), Some(a.new_snapshot(1, "{}")))
         .await?;
 
-    // Compaction deletes the events the snapshot covers, which empties the slot a stale fence
-    // checks — the companion on the snapshot item must catch the move.
+    // Compaction deletes the events the snapshot covers, which once emptied the slot a stale
+    // fence checked. The fence is now a condition on the stream's head, which only increases and
+    // which compaction never touches, so there is nothing to mitigate: the stale fence fails.
     repo.compact_below(&a.id, EventSequence(3)).await?;
 
     let mut commit = TransactionCommit::new(vec![write(&c, 1..=1)]);
@@ -2462,8 +3072,10 @@ async fn enumerate_cancellation<R: Repository + EventLog>(repo: &R) -> CaseResul
 
 /// Runs the feature-marker cases (v0.9, C9) against a repository that stores the
 /// `SYSTEM#FEATURES` marker row. Like [`Suite`], it tolerates a table that holds data from
-/// earlier runs: it clears the manifest first, so features a previous run left behind cannot
-/// brick the table, and it leaves the manifest empty at the end.
+/// earlier runs: it resets the manifest first, so features a previous run left behind cannot
+/// brick the table, and it leaves the manifest declaring only `stream-heads` at the end. The table
+/// must already be head-aware (ADR 0007): a table whose data predates stream heads is refused by
+/// every writer until it is migrated.
 ///
 /// The cases use two writers — `first` and `second` — because the refusal binds a writer whose
 /// cached validation predates a declaration made by another writer. Pass two handles over the
@@ -2486,8 +3098,12 @@ where
     };
 
     record(
-        "the manifest starts empty",
+        "the manifest starts with stream-heads alone",
         clear_manifest(repo, other).await,
+    );
+    record(
+        "a table that does not declare stream-heads refuses every write path until it is declared",
+        unmigrated_store(repo, other).await,
     );
     record(
         "a declaration refuses commits and snapshots from both writers, then revalidates",
@@ -2526,12 +3142,15 @@ where
     }
 }
 
-/// Clears every declaration, so the run starts and ends with a manifest no writer refuses.
+/// Clears every declaration except `stream-heads`, so the run starts and ends with a manifest no
+/// writer refuses. The feature is required of every writer (ADR 0007), and every table these
+/// cases write to is head-aware.
 async fn clear_manifest<R: FeatureMarker>(repo: &R, other: &R) -> CaseResult {
     for repository in [repo, other] {
         repository
             .update_manifest(|manifest| {
                 manifest.features.clear();
+                manifest.declare_stream_heads();
                 manifest.history_dependent.clear();
                 manifest.retention.clear();
             })
@@ -2541,11 +3160,11 @@ async fn clear_manifest<R: FeatureMarker>(repo: &R, other: &R) -> CaseResult {
     let manifest = repo.read_manifest().await?;
     ensure!(
         manifest.is_some_and(|manifest| {
-            manifest.features.is_empty()
+            manifest.features_json() == r#"{"stream-heads":1}"#
                 && manifest.history_dependent.is_empty()
                 && manifest.retention.is_empty()
         }),
-        "the cleared manifest stores an empty feature set"
+        "the cleared manifest declares stream-heads and nothing else"
     );
 
     Ok(())
@@ -2791,6 +3410,203 @@ where
     );
 
     Ok(())
+}
+
+/// A table whose manifest does not declare `stream-heads` is refused by every write path that
+/// validates the marker, however populated it is (ADR 0007), and reads keep working. Declaring
+/// the feature unconditionally (the migration's hook) lifts the refusal.
+async fn unmigrated_store<R>(repo: &R, other: &R) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+{
+    let ns = namespace();
+    let stream = Stream::new(&ns, "unmigrated", "ledger");
+    stream
+        .commit(
+            repo,
+            stream.events(1..=3),
+            Some(stream.new_snapshot(1, "{}")),
+        )
+        .await?;
+
+    // A stream with no snapshot: its compaction is uncovered once the table is migrated, but
+    // an unmigrated table refuses before the snapshot is read.
+    let plain = Stream::new(&ns, "unmigrated-plain", "ledger");
+    plain.commit(repo, plain.events(1..=2), None).await?;
+
+    // As if the data had been written by a build without stream heads: the feature is not
+    // declared. Both writers' cached validations predate the change.
+    other
+        .update_manifest(|manifest| {
+            manifest.features.remove(features::STREAM_HEADS_FEATURE);
+        })
+        .await?;
+
+    let not_migrated = |err: &Error| matches!(err, Error::StreamHeadsNotMigrated);
+    for (name, writer) in [("the declaring writer", other), ("the cached writer", repo)] {
+        expect_err(
+            stream.commit(writer, stream.events(4..=4), None).await,
+            &format!("a commit by {name}"),
+            not_migrated,
+        )?;
+        expect_err(
+            writer.put_snapshot(&stream.snapshot(2, 3, "{}")).await,
+            &format!("a snapshot write by {name}"),
+            not_migrated,
+        )?;
+        expect_err(
+            writer.compact_below(&stream.id, EventSequence(3)).await,
+            &format!("compaction by {name}"),
+            not_migrated,
+        )?;
+
+        expect_err(
+            writer.compact_below(&plain.id, EventSequence(1)).await,
+            &format!("compaction of an uncovered stream by {name}"),
+            not_migrated,
+        )?;
+
+        // Outcome-only and fence-only commits validate the marker too.
+        expect_err(
+            writer
+                .commit(
+                    Commit::new(stream.id.clone(), Vec::new())
+                        .with_outcome(Outcome::accepted(command_id(), "digest")),
+                )
+                .await,
+            &format!("an outcome-only commit by {name}"),
+            not_migrated,
+        )?;
+        let mut rejected = TransactionCommit::<R::Operation>::new(Vec::new())
+            .with_outcome(Outcome::accepted(command_id(), "digest"));
+        rejected.fences = vec![ReadFence::new(
+            stream.id.clone(),
+            stream.entity_type.clone(),
+            EventSequence(3),
+            FenceProvenance::Engine,
+        )];
+        expect_err(
+            writer.commit_transaction(rejected).await,
+            &format!("an outcome-only transaction by {name}"),
+            not_migrated,
+        )?;
+    }
+
+    // Reads need nothing, and the refused writes changed nothing.
+    ensure_eq!(
+        writer_events(repo, &stream).await?,
+        stream.events(1..=3),
+        "the refused writes left the events alone"
+    );
+    ensure_eq!(
+        repo.snapshot(&stream.id).await?,
+        Some(stream.snapshot(1, 3, "{}")),
+        "the refused writes left the snapshot alone"
+    );
+    let heads = repo.entity_heads(Some(&stream.entity_type)).await?;
+    ensure_eq!(
+        heads.get(&stream.id),
+        Some(&EventSequence(3)),
+        "entity heads are readable before the migration"
+    );
+
+    // The unconditional declaration is the hook a migration performs after it has backfilled and
+    // verified the heads.
+    other.declare_stream_heads().await?;
+    ensure!(
+        other
+            .read_manifest()
+            .await?
+            .is_some_and(|manifest| manifest.declares_stream_heads()),
+        "the declaration"
+    );
+    stream.commit(repo, stream.events(4..=4), None).await?;
+    stream.commit(other, stream.events(5..=5), None).await?;
+    ensure_eq!(
+        writer_events(repo, &stream).await?,
+        stream.events(1..=5),
+        "both writers commit once the feature is declared"
+    );
+    expect_err(
+        repo.compact_below(&plain.id, EventSequence(1)).await,
+        "compaction of an uncovered stream once the feature is declared",
+        |err| matches!(err, Error::CompactionUncovered { .. }),
+    )?;
+
+    Ok(())
+}
+
+async fn writer_events<R: Repository>(
+    repo: &R,
+    stream: &Stream,
+) -> Result<Vec<SerializedEvent>, Failure> {
+    Ok(repo.events(&stream.id).await?)
+}
+
+/// Runs against two handles over an **empty** store that has never been written to: no events, no
+/// snapshots, no marker row. The first write declares `stream-heads` itself (ADR 0007), because
+/// the store holds nothing a writer without heads could have written; later writers, including a
+/// second handle, find it declared.
+///
+/// The store must be fresh: a durable backend needs its own empty table or schema for this case.
+pub async fn fresh_store_cases<R>(fresh: &R, other: &R)
+where
+    R: FeatureMarker + Repository,
+{
+    let result: CaseResult = async {
+        ensure!(
+            fresh.read_manifest().await?.is_none(),
+            "the store starts with no marker row"
+        );
+
+        // An outcome-only commit writes no stream, and an empty store may still declare.
+        fresh
+            .commit(
+                Commit::new("fresh-outcome-only", Vec::new())
+                    .with_outcome(Outcome::accepted(command_id(), "digest")),
+            )
+            .await?;
+        let manifest = fresh
+            .read_manifest()
+            .await?
+            .ok_or(Failure("the first write declared nothing".into()))?;
+        ensure_eq!(
+            manifest.version,
+            1,
+            "the declaration creates the row at version 1"
+        );
+        ensure_eq!(
+            manifest.features_json(),
+            r#"{"stream-heads":1}"#.to_owned(),
+            "the declared features"
+        );
+
+        let ns = namespace();
+        let stream = Stream::new(&ns, "fresh", "ledger");
+        stream.commit(fresh, stream.events(1..=2), None).await?;
+        stream.commit(other, stream.events(3..=3), None).await?;
+        ensure_eq!(
+            fresh
+                .read_manifest()
+                .await?
+                .map(|manifest| manifest.version),
+            Some(1),
+            "a second writer finds the feature declared and declares nothing"
+        );
+        ensure_eq!(
+            fresh.events(&stream.id).await?,
+            stream.events(1..=3),
+            "both writers wrote"
+        );
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(Failure(message)) = result {
+        panic!("fresh store case failed: {message}");
+    }
+    println!("ok   a fresh store declares stream-heads on the first write");
 }
 
 /// The refusal must consult the manifest, not the calling instance's configuration: retention is
@@ -5585,7 +6401,7 @@ async fn outcome_atomicity<R: Repository>(repo: &R) -> CaseResult {
 async fn outcome_budget<R: Repository>(repo: &R) -> CaseResult {
     let accepted = |command| Outcome::accepted(command, "digest");
 
-    // marker check + 97 event puts + floor check + outcome put = 100 actions.
+    // marker check + head update + 97 event puts + outcome put = 100 actions.
     let creates = Stream::new(&namespace(), "creates", "ledger");
     let command = command_id();
     let result = creates
@@ -5610,23 +6426,24 @@ async fn outcome_budget<R: Repository>(repo: &R) -> CaseResult {
         "97 events fill the budget with the outcome"
     );
 
-    // Appending adds a continuation check: marker + check + 96 puts + floor + outcome.
+    // Appending costs the same as creating: the head update replaces the continuation check, so
+    // marker + head update + 97 puts + outcome fill the budget.
     let grows = Stream::new(&namespace(), "grows", "ledger");
     grows.commit(repo, grows.events(1..=1), None).await?;
     let result = grows
-        .commit_with_outcome(repo, grows.events(2..=98), accepted(command_id()))
+        .commit_with_outcome(repo, grows.events(2..=99), accepted(command_id()))
         .await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "97 appended events plus the outcome are one too many: {result:?}"
+        "98 appended events plus the outcome are one too many: {result:?}"
     );
     grows
-        .commit_with_outcome(repo, grows.events(2..=97), accepted(command_id()))
+        .commit_with_outcome(repo, grows.events(2..=98), accepted(command_id()))
         .await?;
     ensure_eq!(
         repo.events(&grows.id).await?.len(),
-        97,
-        "96 appended events fit"
+        98,
+        "97 appended events fit"
     );
 
     // The same arithmetic holds for a transaction.

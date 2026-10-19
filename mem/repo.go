@@ -20,6 +20,10 @@ type Repository struct {
 	events    map[string][]evt.SerializedEvent
 	snapshots map[string]evt.SerializedSnapshot
 
+	// heads holds the per-stream head (ADR 0007): the highest event sequence ever committed to
+	// the stream, maintained by every commit and never lowered. A stream with no entry has head 0.
+	heads map[string]evt.EventSequence
+
 	// features holds the durable feature manifest. Shared through a pointer, like the maps
 	// above, so copies of the handle (and clones of it) see one manifest.
 	features *memFeatures
@@ -39,9 +43,10 @@ type memFeatures struct {
 // NewRepository creates a new instance of the Repository
 func NewRepository() evt.Repository {
 	return &Repository{
-		make(map[string][]evt.SerializedEvent),
-		make(map[string]evt.SerializedSnapshot),
-		&memFeatures{},
+		events:    make(map[string][]evt.SerializedEvent),
+		snapshots: make(map[string]evt.SerializedSnapshot),
+		heads:     make(map[string]evt.EventSequence),
+		features:  &memFeatures{},
 	}
 }
 
@@ -59,10 +64,12 @@ var (
 // all or nothing (evt.TransactionalRepository).
 func (Repository) AtomicTransactions() {}
 
-// Commit Events to memory. It does not reject reused sequences, but like the durable backends it
-// rejects a commit at or below the entity's snapshot, which compaction may have deleted below.
-// A multi-stream commit validates every stream, snapshot, and read fence before writing
-// anything, so a failure leaves every stream unchanged.
+// Commit Events to memory. Like the durable backends it conditions every written stream on its
+// head (ADR 0007): a stream that starts at sequence 1 must have none, and one that appends must be
+// at head first - 1, so a reused sequence, a skipped sequence, and a commit below a compacted
+// snapshot are all refused. Read fences are one check of the same head. A multi-stream commit
+// validates every stream, snapshot, and read fence before writing anything, so a failure leaves
+// every stream unchanged.
 func (repo Repository) Commit(
 	_ context.Context,
 	result evt.SerializedResult,
@@ -82,40 +89,32 @@ func (repo Repository) Commit(
 	defer repo.features.mu.Unlock()
 
 	// A manifest that declares a feature this writer does not model refuses the commit, as the
-	// durable backends' marker check does. The in-memory double models no extensions.
-	if err := repo.features.validate(); err != nil {
+	// durable backends' marker check does, and so does a store that holds data without declaring
+	// stream-heads. An empty store declares it itself.
+	if err := repo.validateLocked(); err != nil {
 		return err
 	}
 
 	// Fences are refused outright for entity types durably declared with retention, exactly as
-	// the durable backends refuse them: TTL deletes reopen fenced slots without leaving a
-	// successor snapshot, so the two checks cannot protect them.
+	// the durable backends refuse them.
 	if err := evt.CheckFenceRetention(normalized.Fences, repo.features.manifest); err != nil {
 		return err
 	}
 
-	if err := repo.checkFloor(normalized.Events); err != nil {
-		return err
+	// A lost outcome row outranks every other failure but the marker (storage spec, Stream
+	// Heads, Classification): the row is where the answer lives.
+	if outcome := normalized.Outcome; outcome != nil {
+		if _, exists := repo.features.outcomes[outcome.CommandID]; exists {
+			return &evt.OutcomeConflictError{CommandID: outcome.CommandID}
+		}
 	}
 
-	if err := repo.checkContinuation(normalized.Events); err != nil {
+	if err := repo.checkHeads(normalized); err != nil {
 		return err
 	}
 
 	if err := repo.checkSnapshots(normalized.Snapshots); err != nil {
 		return err
-	}
-
-	if err := repo.checkFences(normalized.Fences); err != nil {
-		return err
-	}
-
-	// The outcome row is written once: an existing row means another writer recorded this command
-	// ID first. It is the last check, like the outcome put is the last transaction action.
-	if outcome := normalized.Outcome; outcome != nil {
-		if _, exists := repo.features.outcomes[outcome.CommandID]; exists {
-			return &evt.OutcomeConflictError{CommandID: outcome.CommandID}
-		}
 	}
 
 	for _, event := range normalized.Events {
@@ -127,6 +126,7 @@ func (repo Repository) Commit(
 		}
 
 		repo.events[id] = append(repo.events[id], event)
+		repo.heads[id] = max(repo.heads[id], event.Sequence)
 	}
 
 	for _, snapshot := range normalized.Snapshots {
@@ -186,36 +186,6 @@ func cloneOutcome(outcome evt.Outcome) evt.Outcome {
 	return outcome
 }
 
-// checkContinuation refuses a written stream whose first sequence skips past the stored head. The
-// head is the stream's highest event or, once compaction deleted every covered event, its
-// snapshot's event sequence. Like the durable backends it leaves a first sequence at or below the
-// head to the event-put and floor checks. This is the in-memory form of the continuation check
-// (spec, Writes).
-func (repo Repository) checkContinuation(events []evt.SerializedEvent) error {
-	seen := map[evt.EntityID]bool{}
-
-	for _, event := range events {
-		if seen[event.EntityID] {
-			continue
-		}
-		seen[event.EntityID] = true
-
-		var head evt.EventSequence
-		for _, stored := range repo.events[string(event.EntityID)] {
-			head = max(head, stored.Sequence)
-		}
-		if snapshot, ok := repo.snapshots[string(event.EntityID)]; ok {
-			head = max(head, snapshot.EventSequence)
-		}
-
-		if event.Sequence > head+1 {
-			return &evt.SequenceGapError{EntityID: event.EntityID, After: head, Found: event.Sequence}
-		}
-	}
-
-	return nil
-}
-
 // checkSnapshots rejects a snapshot whose sequence does not follow the stored one, or whose
 // event sequence is not above the events it summarizes.
 func (repo Repository) checkSnapshots(snapshots []evt.SerializedSnapshot) error {
@@ -238,33 +208,172 @@ func (repo Repository) checkSnapshots(snapshots []evt.SerializedSnapshot) error 
 	return nil
 }
 
-// checkFences rejects a fence whose stream has moved past the fenced head: any event above the
-// head, or any snapshot covering it, means another writer advanced the stream. This is the
-// in-memory form of the slot check plus the snapshot companion (ADR 0004, C2).
-func (repo Repository) checkFences(fences []evt.ReadFence) error {
-	for _, fence := range fences {
-		for _, event := range repo.events[string(fence.EntityID)] {
-			if event.Sequence > fence.Head {
-				return policy.FenceConflict(fence)
-			}
+// validateLocked refuses a manifest that declares a feature this build does not model, and a store
+// that holds data without declaring stream-heads (ADR 0007). The in-memory repository models no
+// extensions beyond stream-heads, like the default Go writer. A store that holds no data yet
+// declares stream-heads itself. The caller holds mu.
+func (repo Repository) validateLocked() error {
+	supported := evt.SupportedFeatures(nil).WithStreamHeads()
+
+	if repo.features.manifest != nil {
+		if err := repo.features.manifest.Validate(supported); err != nil {
+			return err
 		}
 
-		if snapshot, ok := repo.snapshots[string(fence.EntityID)]; ok && snapshot.EventSequence > fence.Head {
-			return policy.FenceConflict(fence)
+		if repo.features.manifest.DeclaresStreamHeads() {
+			return nil
 		}
 	}
+
+	if len(repo.events) > 0 || len(repo.snapshots) > 0 {
+		return &evt.StreamHeadsNotMigratedError{}
+	}
+
+	next := evt.FeatureManifest{Features: map[string]evt.FeatureFormat{}}
+	if repo.features.manifest != nil {
+		next = cloneManifest(*repo.features.manifest)
+	}
+
+	if next.Features == nil {
+		next.Features = map[string]evt.FeatureFormat{}
+	}
+
+	next.Features[evt.FeatureStreamHeads] = evt.StreamHeadsFormat
+	next.Version++
+	repo.features.manifest = &next
 
 	return nil
 }
 
-// validate refuses a manifest that declares a feature this build does not model. The in-memory
-// repository models no extensions, like the default Go writer. The caller holds mu.
-func (f *memFeatures) validate() error {
-	if f.manifest == nil {
-		return nil
+// requireStreamHeadsLocked refuses a store that does not declare stream-heads, without declaring
+// it. The caller holds mu.
+func (repo Repository) requireStreamHeadsLocked() error {
+	if repo.features.manifest != nil {
+		if err := repo.features.manifest.Validate(evt.SupportedFeatures(nil).WithStreamHeads()); err != nil {
+			return err
+		}
 	}
 
-	return f.manifest.Validate(nil)
+	return evt.RequireStreamHeads(repo.features.manifest)
+}
+
+// derivedHead is a stream's head as its log derives it: the larger of its highest stored event
+// sequence and its snapshot's event sequence (invariant H4).
+func (repo Repository) derivedHead(id string) evt.EventSequence {
+	var head evt.EventSequence
+	for _, stored := range repo.events[id] {
+		head = max(head, stored.Sequence)
+	}
+
+	if snapshot, ok := repo.snapshots[id]; ok {
+		head = max(head, snapshot.EventSequence)
+	}
+
+	return head
+}
+
+// checkHeads evaluates every head condition of a commit — the head update of each written stream
+// and the head check of each fenced one — and reports the highest-ranked failure: drift, then a
+// gap, then the first conflict (storage spec, Stream Heads, Classification). It is the in-memory
+// form of the head updates and fence checks; the log is read under the manifest lock, so no commit
+// can land between the reads and the probe's verdict is certain.
+func (repo Repository) checkHeads(commit evt.SerializedResult) error {
+	var drift, gap, conflict error
+
+	firsts := map[evt.EntityID]evt.EventSequence{}
+	lasts := map[evt.EntityID]evt.EventSequence{}
+
+	var order []evt.EntityID
+
+	for _, event := range commit.Events {
+		if _, seen := firsts[event.EntityID]; !seen {
+			firsts[event.EntityID] = event.Sequence
+			order = append(order, event.EntityID)
+		}
+
+		lasts[event.EntityID] = event.Sequence
+	}
+
+	for _, id := range order {
+		first, last := firsts[id], lasts[id]
+		stored, present := repo.heads[string(id)]
+
+		if first == 1 && !present || first > 1 && stored == first-1 {
+			// The head condition passes. An event already stored at or above the first sequence
+			// would fail its put: it sits above the head, which is drift.
+			for _, event := range repo.events[string(id)] {
+				if event.Sequence >= first && event.Sequence <= last && drift == nil {
+					drift = repo.drift(id)
+				}
+			}
+
+			continue
+		}
+
+		derived := repo.derivedHead(string(id))
+
+		switch {
+		case stored != derived:
+			if drift == nil {
+				drift = repo.drift(id)
+			}
+
+		case first > 1 && stored < first-1:
+			if gap == nil {
+				gap = &policy.ClassifiedError{
+					Class: policy.ClassTransient,
+					Err:   &evt.SequenceGapError{EntityID: id, After: stored, Found: first},
+				}
+			}
+
+		default:
+			if conflict == nil {
+				conflict = evt.NewConflictError(fmt.Sprintf(
+					"mem: stream %s moved: head %d, commit continues from %d", id, stored, first-1,
+				))
+			}
+		}
+	}
+
+	for _, fence := range commit.Fences {
+		stored, present := repo.heads[string(fence.EntityID)]
+		if stored == fence.Head && (present || fence.Head == 0) {
+			continue
+		}
+
+		if stored != repo.derivedHead(string(fence.EntityID)) {
+			if drift == nil {
+				drift = repo.drift(fence.EntityID)
+			}
+
+			continue
+		}
+
+		if conflict == nil {
+			conflict = policy.FenceConflict(fence)
+		}
+	}
+
+	switch {
+	case drift != nil:
+		return drift
+	case gap != nil:
+		return gap
+	}
+
+	return conflict
+}
+
+// drift builds the typed drift error from the stored and derived heads of a stream.
+func (repo Repository) drift(id evt.EntityID) error {
+	stored, present := repo.heads[string(id)]
+
+	return &evt.StreamHeadDriftError{
+		EntityID:   id,
+		Stored:     stored,
+		HeadAbsent: !present,
+		Derived:    repo.derivedHead(string(id)),
+	}
 }
 
 // Manifest reads the stored feature manifest, or nil when nothing is declared. The returned
@@ -338,21 +447,6 @@ func (repo Repository) CommitStream(
 	}
 
 	return errors
-}
-
-// checkFloor returns an evt.ConflictError when an entity's snapshot covers an event being committed.
-func (repo Repository) checkFloor(events []evt.SerializedEvent) error {
-	for _, event := range events {
-		snapshot, ok := repo.snapshots[string(event.EntityID)]
-		if ok && event.Sequence <= snapshot.EventSequence {
-			return evt.NewConflictError(fmt.Sprintf(
-				"mem: event %d for %s is at or below the snapshot floor %d",
-				event.Sequence, event.EntityID, snapshot.EventSequence,
-			))
-		}
-	}
-
-	return nil
 }
 
 // CommitWithSnapshot commits Events with a Snapshot. It routes through the multi-stream commit
@@ -594,7 +688,7 @@ func (repo Repository) CompactBelow(
 	repo.features.mu.Lock()
 	defer repo.features.mu.Unlock()
 
-	if err := repo.features.validate(); err != nil {
+	if err := repo.requireStreamHeadsLocked(); err != nil {
 		return 0, err
 	}
 

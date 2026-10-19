@@ -17,18 +17,20 @@ use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{
     self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
 };
+use crate::heads::{self, Probe};
 use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::outcome::Outcome;
-use crate::repository::{Commit, Repository, TransactionCommit};
+use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 use crate::wire::postgres::{
     DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, FEATURES_LOCK_EXCLUSIVE,
     FEATURES_LOCK_SHARED, OutcomeRow, SnapshotRow, check_table_names, features_lock_key,
-    features_table, insert_outcome_sql, schema_ddl, select_outcome_sql,
+    features_table, insert_outcome_sql, outcomes_table, schema_ddl, select_outcome_sql,
+    stream_heads_table,
 };
 
 /// A SQL statement that an in-band projector adds to a commit. It runs in the same transaction
-/// as the events, after the event inserts and the floor check and before the snapshot upsert, so a
-/// writer that lost a race fails on the event key before it reaches a view row.
+/// as the events, after the head statements and the event inserts and before the snapshot upsert,
+/// so a writer that lost a race fails on its head before it reaches a view row.
 pub struct PgStatement {
     /// The SQL text, with `$1`-style placeholders.
     pub sql: String,
@@ -199,6 +201,33 @@ impl PostgresRepository {
         &self,
         change: impl Fn(&mut FeatureManifest),
     ) -> Result<(), Error> {
+        self.declare(change, false).await
+    }
+
+    /// Declares `stream-heads: 1` in the feature manifest through the ordinary declaration
+    /// transaction (one version bump), **without** checking that the tables are empty or that
+    /// every stream has a head row.
+    ///
+    /// This is the hook for a migration tool: after it has backfilled and verified a head row
+    /// for every stream, with every writer that predates stream heads stopped, it declares the
+    /// feature with this call. A fresh database needs no call: the first writer declares the
+    /// feature itself after confirming the events and snapshots tables are empty. Declaring on a
+    /// populated database whose streams have no head rows makes every later commit to those
+    /// streams fail with [`Error::StreamHeadDrift`].
+    pub async fn declare_stream_heads(&self) -> Result<(), Error> {
+        self.update_manifest(FeatureManifest::declare_stream_heads)
+            .await
+    }
+
+    /// One declaration transaction. With `only_if_empty`, it is the writer's own declaration of
+    /// `stream-heads` on a fresh database: under the exclusive lock it declares the feature
+    /// unless it is already declared, and refuses with [`Error::StreamHeadsNotMigrated`] when the
+    /// events or snapshots table holds a row.
+    async fn declare(
+        &self,
+        change: impl Fn(&mut FeatureManifest),
+        only_if_empty: bool,
+    ) -> Result<(), Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
         let lock_key = features_lock_key(&self.events_table);
@@ -207,6 +236,31 @@ impl PostgresRepository {
             .map_err(statement_error)?;
 
         let observed = self.read_manifest_in(&tx).await?;
+        if only_if_empty {
+            if let Some(manifest) = &observed {
+                manifest.validate_supported()?;
+                if manifest.declares_stream_heads() {
+                    // Another writer declared it first.
+                    return Ok(());
+                }
+            }
+
+            let populated: bool = tx
+                .query_one(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM {}) OR EXISTS (SELECT 1 FROM {})",
+                        self.events_table, self.snapshots_table
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(Error::backend)?
+                .get(0);
+            if populated {
+                return Err(Error::StreamHeadsNotMigrated);
+            }
+        }
+
         let mut next = observed.clone().unwrap_or_default();
         change(&mut next);
         next.version = observed.as_ref().map_or(1, |manifest| manifest.version + 1);
@@ -270,6 +324,30 @@ impl PostgresRepository {
         Ok(())
     }
 
+    /// Makes sure the database is ready for this writer's first write: the feature manifest
+    /// declares `stream-heads` (ADR 0007). A database whose manifest lacks it is declared by the
+    /// writer itself when the events and snapshots tables are empty, and otherwise refused with
+    /// [`Error::StreamHeadsNotMigrated`]. It runs before the commit transaction, only while the
+    /// handle has not validated a manifest yet: a declaration needs the exclusive lock, which a
+    /// commit holding the shared lock must not wait for. The commit then re-validates inside its
+    /// own transaction.
+    async fn ensure_stream_heads(&self) -> Result<(), Error> {
+        if self.validated_marker().is_some() {
+            return Ok(());
+        }
+
+        let observed = self.read_manifest().await?;
+
+        match features::validate_marker_for_write(observed.as_ref()) {
+            Ok(_) => Ok(()),
+            Err(Error::StreamHeadsNotMigrated) => {
+                self.declare(FeatureManifest::declare_stream_heads, true)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Compares the commit's manifest row against the writer's cached validation, re-validating
     /// when the row changed under it. Runs inside the commit transaction under the shared
     /// advisory lock, so a declaration cannot slip between this check and the `COMMIT`.
@@ -277,7 +355,7 @@ impl PostgresRepository {
         let mut cached = self.validated_marker();
 
         if !features::marker_matches(*cached, observed) {
-            *cached = Some(features::validate_marker(observed)?);
+            *cached = Some(features::validate_marker_for_write(observed)?);
         }
 
         Ok(())
@@ -473,210 +551,170 @@ impl PostgresRepository {
     }
 }
 
-impl PostgresRepository {
-    /// Asserts, under the stream's advisory lock, that a commit whose first sequence is above 1
-    /// continues from the stored head. The head is the larger of the stream's highest event and
-    /// its snapshot's event sequence, because compaction can delete every covered event. A first
-    /// sequence at or below the head is left to the primary key and the floor check, which report
-    /// it as an ordinary conflict.
-    async fn check_continuation(
-        &self,
-        tx: &deadpool_postgres::Transaction<'_>,
-        entity_id: &EntityId,
-        first: EventSequence,
-    ) -> Result<(), Error> {
-        if first <= EventSequence(1) {
-            return Ok(());
-        }
+/// A written stream's head statement and how it fared (ADR 0007).
+struct HeadStatement<'a> {
+    stream: &'a Commit<PgStatement>,
+    first: EventSequence,
+    passed: bool,
+}
 
+impl PostgresRepository {
+    /// The stream-heads table (`{events}__evt_stream_heads`).
+    fn heads_table(&self) -> String {
+        stream_heads_table(&self.events_table)
+    }
+
+    /// Reads a stream's stored head under its advisory lock; absent is 0.
+    async fn stored_head(
+        &self,
+        client: &impl GenericClient,
+        entity_id: &EntityId,
+    ) -> Result<EventSequence, Error> {
+        let sql = format!(
+            "SELECT head FROM {} WHERE entity_id = $1",
+            self.heads_table()
+        );
+        let row = client
+            .query_opt(&sql, &[&entity_id.as_str()])
+            .await
+            .map_err(statement_error)?;
+
+        Ok(EventSequence(row.map_or(0, |row| row.get(0))))
+    }
+
+    /// Derives a stream's head (H4) from the events and snapshots tables: the larger of its
+    /// highest event sequence and its snapshot's event sequence.
+    async fn derived_head(
+        &self,
+        client: &impl GenericClient,
+        entity_id: &EntityId,
+    ) -> Result<EventSequence, Error> {
         let sql = format!(
             "SELECT GREATEST(
                  COALESCE((SELECT MAX(sequence) FROM {} WHERE entity_id = $1), 0),
                  COALESCE((SELECT MAX(event_sequence) FROM {} WHERE entity_id = $1), 0))",
             self.events_table, self.snapshots_table
         );
-        let row = tx
+        let row = client
             .query_one(&sql, &[&entity_id.as_str()])
             .await
             .map_err(statement_error)?;
-        let head: i64 = row.get(0);
 
-        if first.0 > head + 1 {
-            return Err(Error::SequenceGap {
-                entity_id: entity_id.clone(),
-                after: EventSequence(head),
-                found: first,
-            });
-        }
-
-        Ok(())
+        Ok(EventSequence(row.get(0)))
     }
-}
 
-impl Repository for PostgresRepository {
-    type Operation = PgStatement;
+    /// The failure-path probe, run inside the commit transaction under the stream's lock (ADR
+    /// 0007): derive the head `D1`, read the stored head `S`, and compare. `S < D1` is drift,
+    /// `S = D1` is no drift, and `S > D1` derives again: `D2 < S` is drift, otherwise a commit
+    /// landed between the reads, an ordinary conflict. Returns `Ok(Err(drift))` for drift,
+    /// `Ok(Ok(Some(stored)))` when the head matches the log, and `Ok(Ok(None))` for the landed
+    /// commit.
+    async fn probe(
+        &self,
+        client: &impl GenericClient,
+        entity_id: &EntityId,
+    ) -> Result<Result<Option<EventSequence>, Error>, Error> {
+        let derived = self.derived_head(client, entity_id).await?;
+        let stored = self.stored_head(client, entity_id).await?;
 
-    async fn commit(&self, commit: Commit<PgStatement>) -> Result<(), Error> {
-        commit.validate()?;
-        features::check_not_reserved(&commit.entity_id)?;
+        Ok(match Probe::first(stored, derived) {
+            Probe::Settled => Ok(Some(stored)),
+            Probe::Drift => Err(heads::drift(entity_id, stored, derived)),
+            Probe::Ahead => {
+                let rederived = self.derived_head(client, entity_id).await?;
 
-        if commit.events.is_empty() && commit.outcome.is_none() {
-            return Ok(());
-        }
+                match Probe::after_rederive(stored, rederived) {
+                    Probe::Settled => Ok(None),
+                    _ => Err(heads::drift(entity_id, stored, rederived)),
+                }
+            }
+        })
+    }
 
-        let last_sequence = commit.events.last().map(|event| event.sequence);
-        let outcome = commit.stored_outcome();
+    /// Runs one written stream's head statement: a create inserts the row, an append moves it
+    /// from the sequence before the commit's first. It passes when exactly one row is affected.
+    async fn run_head_statement(
+        &self,
+        tx: &deadpool_postgres::Transaction<'_>,
+        stream: &Commit<PgStatement>,
+    ) -> Result<bool, Error> {
+        let (Some(first), Some(last)) = (stream.events.first(), stream.events.last()) else {
+            return Ok(true);
+        };
 
-        // The budget is backend-neutral, so an oversized commit is refused before any write,
-        // identically to the other backends. Each projector statement counts as one action.
-        let mut sizes = commit.sizes(|_| None)?;
-        sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
-        crate::repository::check_budget(sizes)?;
-
-        let rows = commit
-            .events
-            .iter()
-            .map(EventRow::from_event)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
-        // An outcome-only commit writes no stream, so it takes no stream lock.
-        if !commit.events.is_empty() {
-            tx.execute(ENTITY_LOCK, &[&commit.entity_id.as_str()])
-                .await
-                .map_err(statement_error)?;
-        }
-
-        // The feature-marker check is the first action of every v0.9 commit (spec Writes step 1).
-        // The shared advisory lock is held to COMMIT, so a declaration cannot slip between the
-        // version check and the commit.
-        let lock_key = features_lock_key(&self.events_table);
-        tx.execute(FEATURES_LOCK_SHARED, &[&lock_key])
-            .await
-            .map_err(statement_error)?;
-        let manifest = self.read_manifest_in(&tx).await?;
-        self.check_manifest(manifest.as_ref())?;
-
-        // Under the stream's advisory lock the commit must continue exactly from the stored head.
-        if let Some(first) = commit.events.first() {
-            self.check_continuation(&tx, &commit.entity_id, first.sequence)
-                .await?;
-        }
-
-        let insert = format!(
-            "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)",
-            self.events_table
-        );
-
-        for row in &rows {
+        let table = self.heads_table();
+        let affected = if first.sequence <= EventSequence(1) {
+            let sql = format!(
+                "INSERT INTO {table} (entity_id, entity_type, head) VALUES ($1, $2, $3)
+                 ON CONFLICT (entity_id) DO NOTHING"
+            );
             tx.execute(
-                &insert,
+                &sql,
                 &[
-                    &row.entity_id,
-                    &row.sequence,
-                    &row.event_id,
-                    &row.event_type,
-                    &row.version,
-                    &row.entity_type,
-                    &row.payload,
-                    &row.metadata,
+                    &stream.entity_id.as_str(),
+                    &first.entity_type.as_str(),
+                    &last.sequence.0,
                 ],
             )
             .await
-            .map_err(|err| classify(&commit.entity_id, err))?;
-        }
-
-        // Compaction deletes the events a snapshot covers, so the primary key alone would let a
-        // writer that loaded before the snapshot recreate a compacted sequence. Checking after the
-        // inserts is race-free: a concurrent writer can only raise the floor past our first
-        // sequence by inserting that sequence, which our uncommitted insert already holds.
-        let first = rows.first().map_or(0, |row| row.sequence);
-        let floor = format!(
-            "SELECT event_sequence FROM {} WHERE entity_id = $1 AND event_sequence >= $2",
-            self.snapshots_table
-        );
-        if !rows.is_empty()
-            && let Some(row) = tx
-                .query_opt(&floor, &[&commit.entity_id.as_str(), &first])
-                .await
-                .map_err(statement_error)?
-        {
-            return Err(Error::Conflict {
-                entity_id: commit.entity_id,
-                message: format!(
-                    "event sequence {first} is at or below the snapshot floor {}",
-                    row.get::<_, i64>(0)
-                ),
-            });
-        }
-
-        // Projector statements run after the events, so a writer that lost a race fails on the
-        // event key (a conflict) rather than on a view row (a projector error).
-        for statement in &commit.operations {
-            let params: Vec<&(dyn ToSql + Sync)> = statement
-                .params
-                .iter()
-                .map(|param| param.as_ref() as &(dyn ToSql + Sync))
-                .collect();
-            tx.execute(&statement.sql, &params)
-                .await
-                .map_err(projector_error)?;
-        }
-
-        if let (Some(snapshot), Some(last_sequence)) = (commit.snapshot, last_sequence) {
-            self.check_snapshot_predecessor(&tx, &commit.entity_id, snapshot.sequence.0)
-                .await?;
-            let row = SnapshotRow {
-                entity_id: commit.entity_id.to_string(),
-                entity_type: snapshot.entity_type.to_string(),
-                sequence: snapshot.sequence.0,
-                event_sequence: last_sequence.0,
-                payload: snapshot.payload,
-            };
-            self.upsert_snapshot(&tx, &row).await?;
-        }
-
-        // The outcome row is the last write of the transaction.
-        if let Some(outcome) = &outcome {
-            self.insert_outcome(&tx, outcome).await?;
-        }
-
-        tx.commit()
+        } else {
+            let sql = format!("UPDATE {table} SET head = $3 WHERE entity_id = $1 AND head = $2");
+            tx.execute(
+                &sql,
+                &[
+                    &stream.entity_id.as_str(),
+                    &(first.sequence.0 - 1),
+                    &last.sequence.0,
+                ],
+            )
             .await
-            .map_err(|err| commit_error(err, outcome.is_some()))
+        }
+        .map_err(statement_error)?;
+
+        Ok(affected == 1)
     }
 
-    async fn commit_transaction(
+    /// Writes the streams, fences, and outcome of one commit in one transaction, in the pinned
+    /// statement order (spec, "PostgreSQL"):
+    ///
+    /// 1. the per-entity advisory locks, written and fenced streams in ascending entity-ID byte
+    ///    order;
+    /// 2. the feature-marker `SELECT` (the rebuild-lock assertion would follow, C10);
+    /// 3. a probe for an existing outcome row for the command, which is `OutcomeConflict` and
+    ///    outranks every stream failure, as on DynamoDB;
+    /// 4. every head statement and every fence read, each evaluated without stopping at the
+    ///    first failure;
+    /// 5. the ranking of any failures (drift, then gap, then conflicts), by the same probe as
+    ///    DynamoDB;
+    /// 6. the event inserts (an event that already exists after the head statement passed is
+    ///    drift, because the locks make it certain), the projector statements, the snapshot
+    ///    upserts, and the outcome insert.
+    async fn write_commit(
         &self,
-        commit: TransactionCommit<PgStatement>,
+        streams: &[&Commit<PgStatement>],
+        fences: &[ReadFence],
+        operations: &[&PgStatement],
+        outcome: Option<&Outcome>,
+        check_retention: impl FnOnce(Option<&FeatureManifest>) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let mut commit = commit;
-        commit.normalize()?;
+        let written: Vec<&Commit<PgStatement>> = streams
+            .iter()
+            .copied()
+            .filter(|stream| !stream.events.is_empty())
+            .collect();
 
-        if commit.is_empty() {
-            return Ok(());
-        }
-
-        let outcome = commit.stored_outcome();
-
-        // Budget parity: an oversized commit fails identically on every backend, before any write.
-        // Each projector statement counts as one action.
-        let mut sizes = commit.sizes(|_| None)?;
-        sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
-        crate::repository::check_budget(sizes)?;
+        self.ensure_stream_heads().await?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
 
-        // Every touched stream — written and fenced — takes its advisory lock in canonical
-        // (sorted) order, so concurrent multi-stream commits cannot deadlock.
-        let mut ids: Vec<&str> = commit
-            .streams
+        // Every touched stream, written and fenced, takes its advisory lock in canonical
+        // (sorted) order, so concurrent multi-stream commits cannot deadlock. An outcome-only
+        // commit with no fences writes no stream, so it takes no stream lock.
+        let mut ids: Vec<&str> = written
             .iter()
             .map(|stream| stream.entity_id.as_str())
-            .chain(commit.fences.iter().map(|fence| fence.entity_id.as_str()))
+            .chain(fences.iter().map(|fence| fence.entity_id.as_str()))
             .collect();
         ids.sort_unstable();
         ids.dedup();
@@ -699,72 +737,116 @@ impl Repository for PostgresRepository {
         // Fences are refused for entity types durably declared with retention: TTL deletes reopen
         // fenced slots without leaving a successor snapshot. The refusal consults the manifest in
         // this transaction, not this instance's configuration.
-        commit.check_retention(manifest.as_ref(), |_| false)?;
+        check_retention(manifest.as_ref())?;
 
-        // Under the streams' advisory locks every written stream must continue exactly from its
-        // stored head; a gap is refused before anything is inserted.
-        for stream in &commit.streams {
-            if let Some(first) = stream.events.first() {
-                self.check_continuation(&tx, &stream.entity_id, first.sequence)
-                    .await?;
-            }
-        }
-
-        let insert = format!(
-            "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)",
-            self.events_table
-        );
-
-        for stream in &commit.streams {
-            let rows = stream
-                .events
-                .iter()
-                .map(EventRow::from_event)
-                .collect::<Result<Vec<_>, _>>()?;
-
-            for row in &rows {
-                tx.execute(
-                    &insert,
-                    &[
-                        &row.entity_id,
-                        &row.sequence,
-                        &row.event_id,
-                        &row.event_type,
-                        &row.version,
-                        &row.entity_type,
-                        &row.payload,
-                        &row.metadata,
-                    ],
-                )
-                .await
-                .map_err(|err| classify(&stream.entity_id, err))?;
-            }
-
-            // Per-stream floor check, as after the inserts: race-free under the stream's lock.
-            let first = rows.first().map_or(0, |row| row.sequence);
-            let floor = format!(
-                "SELECT event_sequence FROM {} WHERE entity_id = $1 AND event_sequence >= $2",
-                self.snapshots_table
+        // A recorded outcome outranks every stream failure, as the outcome put does on DynamoDB.
+        // The final insert's `23505` still resolves a real race.
+        if let Some(outcome) = outcome {
+            let sql = format!(
+                "SELECT 1 FROM {} WHERE command_id = $1",
+                outcomes_table(&self.events_table)
             );
-            if let Some(row) = tx
-                .query_opt(&floor, &[&stream.entity_id.as_str(), &first])
+            if tx
+                .query_opt(&sql, &[&outcome.command_id.as_str()])
                 .await
                 .map_err(statement_error)?
+                .is_some()
             {
-                return Err(Error::Conflict {
-                    entity_id: stream.entity_id.clone(),
-                    message: format!(
-                        "event sequence {first} is at or below the snapshot floor {}",
-                        row.get::<_, i64>(0)
-                    ),
+                return Err(Error::OutcomeConflict {
+                    command_id: outcome.command_id.clone(),
                 });
             }
         }
 
-        // Projector statements run after the events, so a writer that lost a race fails on the
-        // event key (a conflict) rather than on a view row (a projector error).
-        for statement in &commit.operations {
+        // Every head statement and fence read runs, without stopping at the first failure.
+        let mut statements = Vec::with_capacity(written.len());
+        for stream in &written {
+            statements.push(HeadStatement {
+                stream,
+                first: stream.events[0].sequence,
+                passed: self.run_head_statement(&tx, stream).await?,
+            });
+        }
+
+        let mut failed_fences = Vec::new();
+        for fence in fences {
+            if written
+                .iter()
+                .any(|stream| stream.entity_id == fence.entity_id)
+            {
+                // A written stream's head update supersedes its fence.
+                continue;
+            }
+
+            if self.stored_head(&tx, &fence.entity_id).await? != fence.head {
+                failed_fences.push(fence);
+            }
+        }
+
+        // Rank before reporting: drift, then gap, then conflicts, in transaction order.
+        let mut verdicts = Vec::new();
+        for statement in statements.iter().filter(|statement| !statement.passed) {
+            let entity_id = &statement.stream.entity_id;
+
+            verdicts.push(match self.probe(&tx, entity_id).await? {
+                Err(drift) => drift,
+                Ok(Some(stored)) => heads::gap_or_conflict(entity_id, statement.first, stored),
+                Ok(None) => heads::conflict(entity_id),
+            });
+        }
+        for fence in failed_fences {
+            verdicts.push(match self.probe(&tx, &fence.entity_id).await? {
+                Err(drift) => drift,
+                Ok(_) => heads::fence_conflict(fence),
+            });
+        }
+        if let Some(error) = heads::rank(verdicts) {
+            return Err(error);
+        }
+
+        // The event inserts. A conflicting row after the head statement passed is certain drift:
+        // an event sits above the head, and the locks rule out a racing writer.
+        let insert = format!(
+            "INSERT INTO {} (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)
+             ON CONFLICT (entity_id, sequence) DO NOTHING",
+            self.events_table
+        );
+        for statement in &statements {
+            let stream = statement.stream;
+
+            for event in &stream.events {
+                let row = EventRow::from_event(event)?;
+                let inserted = tx
+                    .execute(
+                        &insert,
+                        &[
+                            &row.entity_id,
+                            &row.sequence,
+                            &row.event_id,
+                            &row.event_type,
+                            &row.version,
+                            &row.entity_type,
+                            &row.payload,
+                            &row.metadata,
+                        ],
+                    )
+                    .await
+                    .map_err(|err| classify(&stream.entity_id, err))?;
+
+                if inserted == 0 {
+                    let derived = self.derived_head(&tx, &stream.entity_id).await?;
+                    // The head the stream had before this commit's head statement.
+                    let stored = EventSequence(statement.first.0 - 1);
+
+                    return Err(heads::drift(&stream.entity_id, stored, derived));
+                }
+            }
+        }
+
+        // Projector statements run after the events, so a writer that lost a race fails on its
+        // head (a conflict) rather than on a view row (a projector error).
+        for statement in operations {
             let params: Vec<&(dyn ToSql + Sync)> = statement
                 .params
                 .iter()
@@ -776,8 +858,10 @@ impl Repository for PostgresRepository {
         }
 
         // Commit snapshots are written in the same transaction as their events, under the same
-        // conditions the DynamoDB snapshot put expresses.
-        for stream in &commit.streams {
+        // conditions the DynamoDB snapshot put expresses. The commit raised the head to the
+        // snapshot's event sequence, so the snapshot is covered (H3).
+        for statement in &statements {
+            let stream = statement.stream;
             if let Some(snapshot) = &stream.snapshot {
                 self.check_snapshot_predecessor(&tx, &stream.entity_id, snapshot.sequence.0)
                     .await?;
@@ -785,7 +869,7 @@ impl Repository for PostgresRepository {
                 let last_sequence = stream
                     .events
                     .last()
-                    .expect("normalized stream has events")
+                    .expect("a written stream has events")
                     .sequence;
                 let row = SnapshotRow {
                     entity_id: stream.entity_id.to_string(),
@@ -798,39 +882,72 @@ impl Repository for PostgresRepository {
             }
         }
 
-        // Fenced read-only streams: assert that no stored event and no snapshot covers past the
-        // fenced head — the SQL form of the slot check plus the snapshot companion (ADR 0004, C2).
-        // The locks above hold the streams steady through the assertions.
-        for fence in &commit.fences {
-            let sql = format!(
-                "SELECT COALESCE((SELECT MAX(sequence) FROM {} WHERE entity_id = $1), 0),
-                        COALESCE((SELECT MAX(event_sequence) FROM {} WHERE entity_id = $1), 0)",
-                self.events_table, self.snapshots_table
-            );
-            let row = tx
-                .query_one(&sql, &[&fence.entity_id.as_str()])
-                .await
-                .map_err(statement_error)?;
-            let event_head: i64 = row.get(0);
-            let snapshot_head: i64 = row.get(1);
-
-            if event_head > fence.head.0 || snapshot_head > fence.head.0 {
-                return Err(Error::FenceConflict {
-                    entity_id: fence.entity_id.clone(),
-                    head: fence.head,
-                    provenance: fence.provenance,
-                });
-            }
-        }
-
-        // The outcome row is the last write of the transaction, after the fence assertions.
-        if let Some(outcome) = &outcome {
+        // The outcome row is the last write of the transaction, after the fence reads.
+        if let Some(outcome) = outcome {
             self.insert_outcome(&tx, outcome).await?;
         }
 
         tx.commit()
             .await
             .map_err(|err| commit_error(err, outcome.is_some()))
+    }
+}
+
+impl Repository for PostgresRepository {
+    type Operation = PgStatement;
+
+    async fn commit(&self, commit: Commit<PgStatement>) -> Result<(), Error> {
+        commit.validate()?;
+        features::check_not_reserved(&commit.entity_id)?;
+
+        if commit.events.is_empty() && commit.outcome.is_none() {
+            return Ok(());
+        }
+
+        let outcome = commit.stored_outcome();
+
+        // The budget is backend-neutral, so an oversized commit is refused before any write,
+        // identically to the other backends. Each projector statement counts as one action.
+        let mut sizes = commit.sizes(|_| None)?;
+        sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
+        crate::repository::check_budget(sizes)?;
+
+        let operations: Vec<&PgStatement> = commit.operations.iter().collect();
+
+        self.write_commit(&[&commit], &[], &operations, outcome.as_ref(), |_| Ok(()))
+            .await
+    }
+
+    async fn commit_transaction(
+        &self,
+        commit: TransactionCommit<PgStatement>,
+    ) -> Result<(), Error> {
+        let mut commit = commit;
+        commit.normalize()?;
+
+        if commit.is_empty() {
+            return Ok(());
+        }
+
+        let outcome = commit.stored_outcome();
+
+        // Budget parity: an oversized commit fails identically on every backend, before any write.
+        // Each projector statement counts as one action.
+        let mut sizes = commit.sizes(|_| None)?;
+        sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
+        crate::repository::check_budget(sizes)?;
+
+        let streams: Vec<&Commit<PgStatement>> = commit.streams.iter().collect();
+        let operations: Vec<&PgStatement> = commit.operations.iter().collect();
+
+        self.write_commit(
+            &streams,
+            &commit.fences,
+            &operations,
+            outcome.as_ref(),
+            |manifest| commit.check_retention(manifest, |_| false),
+        )
+        .await
     }
 
     /// Reads the outcome row. PostgreSQL reads are transactionally consistent, so no flag is
@@ -925,6 +1042,8 @@ impl Repository for PostgresRepository {
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
         features::check_not_reserved(&snapshot.entity_id)?;
 
+        self.ensure_stream_heads().await?;
+
         let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
         tx.execute(ENTITY_LOCK, &[&snapshot.entity_id.as_str()])
@@ -937,6 +1056,18 @@ impl Repository for PostgresRepository {
             .map_err(statement_error)?;
         let manifest = self.read_manifest_in(&tx).await?;
         self.check_manifest(manifest.as_ref())?;
+
+        // H3: the stream's head must cover the snapshot. A snapshot of an empty stream (event
+        // sequence 0) may have no head row at all. The entity lock holds the head steady.
+        let head = self.stored_head(&tx, &snapshot.entity_id).await?;
+        if snapshot.event_sequence > EventSequence::ZERO && head < snapshot.event_sequence {
+            let derived = self
+                .derived_head(&tx, &snapshot.entity_id)
+                .await?
+                .max(snapshot.event_sequence);
+
+            return Err(heads::drift(&snapshot.entity_id, head, derived));
+        }
 
         let written = self
             .upsert_snapshot(&tx, &SnapshotRow::from_snapshot(snapshot))
@@ -964,9 +1095,11 @@ impl Repository for PostgresRepository {
             .await
             .map_err(statement_error)?;
         let manifest = self.read_manifest_in(&tx).await?;
-        if let Some(manifest) = &manifest {
-            manifest.validate_supported()?;
-        }
+        // Compaction is a write path: a database that does not declare `stream-heads` (or
+        // declares a feature this build does not model) is refused before the snapshot is read,
+        // so the refusal wins over `CompactionUncovered`. It never declares the feature itself,
+        // and never touches a head row.
+        features::validate_marker_for_write(manifest.as_ref())?;
 
         let sql = format!(
             "SELECT entity_type, event_sequence FROM {} WHERE entity_id = $1",
@@ -1013,19 +1146,40 @@ impl Repository for PostgresRepository {
         &self,
         entity_type: Option<&EntityType>,
     ) -> Result<BTreeMap<EntityId, EventSequence>, Error> {
+        // Until `stream-heads` is declared, the heads table may be empty on a populated database
+        // (`ensure_schema` creates it empty), and a head-aware process reading it would report
+        // no entities, so an incremental rebuild would skip them all. The aggregate over the
+        // events and snapshots is the answer until then.
+        let declared = self
+            .read_manifest()
+            .await?
+            .is_some_and(|manifest| manifest.declares_stream_heads());
+
         let client = self.pool.get().await.map_err(pool_error)?;
-        let sql = format!(
-            "SELECT entity_id, MAX(head) AS head FROM (
-                 SELECT entity_id, sequence AS head, entity_type FROM {}
-                 UNION ALL
-                 SELECT entity_id, event_sequence AS head, entity_type FROM {}
-             ) sources
-             WHERE ($1::text IS NULL OR entity_type = $1)
-                 AND entity_id NOT LIKE '{}%'
-                 AND entity_id NOT LIKE '{}%'
-             GROUP BY entity_id",
-            self.events_table, self.snapshots_table, SYSTEM_PREFIX, COMMAND_OUTCOME_PREFIX
-        );
+        let sql = if declared {
+            format!(
+                "SELECT entity_id, head FROM {}
+                 WHERE ($1::text IS NULL OR entity_type = $1)
+                     AND entity_id NOT LIKE '{}%'
+                     AND entity_id NOT LIKE '{}%'",
+                self.heads_table(),
+                SYSTEM_PREFIX,
+                COMMAND_OUTCOME_PREFIX
+            )
+        } else {
+            format!(
+                "SELECT entity_id, MAX(head) AS head FROM (
+                     SELECT entity_id, sequence AS head, entity_type FROM {}
+                     UNION ALL
+                     SELECT entity_id, event_sequence AS head, entity_type FROM {}
+                 ) sources
+                 WHERE ($1::text IS NULL OR entity_type = $1)
+                     AND entity_id NOT LIKE '{}%'
+                     AND entity_id NOT LIKE '{}%'
+                 GROUP BY entity_id",
+                self.events_table, self.snapshots_table, SYSTEM_PREFIX, COMMAND_OUTCOME_PREFIX
+            )
+        };
         let filter = entity_type.map(EntityType::as_str);
 
         let rows = client

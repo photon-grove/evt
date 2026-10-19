@@ -101,6 +101,19 @@ func expectManifest(client *dynamo_mock.Client, item map[string]types.AttributeV
 	}), mock.Anything).Return(out, nil).Once()
 }
 
+// expectScan wires the strongly consistent emptiness scan a writer runs before it declares
+// stream-heads on a store with no marker; pks are the partition keys the scan finds.
+func expectScan(client *dynamo_mock.Client, pks ...string) {
+	items := make([]map[string]types.AttributeValue, 0, len(pks))
+	for _, pk := range pks {
+		items = append(items, map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: pk}})
+	}
+
+	client.On("Scan", mock.Anything, mock.MatchedBy(func(in *dynamodb.ScanInput) bool {
+		return aws.ToBool(in.ConsistentRead)
+	}), mock.Anything).Return(&dynamodb.ScanOutput{Items: items}, nil).Once()
+}
+
 func (s *FeatureMarkerSuite) commit(repo *dynamo.Repository, entityID string) error {
 	events := []evt.SerializedEvent{serializedEvent(entityID)}
 
@@ -108,25 +121,46 @@ func (s *FeatureMarkerSuite) commit(repo *dynamo.Repository, entityID string) er
 }
 
 // Test_Commit_IncludesMarkerCheck asserts the per-commit ConditionCheck on SYSTEM#FEATURES is the
-// transaction's first item, and that the validation is cached (no re-read on the next commit).
+// transaction's first item, and that the validation is cached (no re-read on the next commit). A
+// store with no marker and no data is declared by the writer itself.
 func (s *FeatureMarkerSuite) Test_Commit_IncludesMarkerCheck() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
 		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
-	// First commit: no marker row exists; validate against attribute_not_exists(pk).
+	// First commit: no marker row exists and the scan finds only engine rows, so the writer
+	// declares stream-heads (version 1) and validates against that version.
 	expectManifest(client, nil)
+	expectScan(client, "SYSTEM#REBUILD")
+	expectManifest(client, nil)
+	// The declaration is followed by a second look at the store, for a stream without a head item.
+	expectScan(client, "SYSTEM#REBUILD")
+
+	var declared *dynamodb.PutItemInput
+	client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).
+		Return(new(dynamodb.PutItemOutput), nil).
+		Once().
+		Run(func(args mock.Arguments) {
+			var ok bool
+			declared, ok = args.Get(1).(*dynamodb.PutItemInput)
+			require.True(s.T(), ok, "expected PutItem input")
+		})
 
 	var first dynamodb.TransactWriteItemsInput
 	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
+
+	require.Equal(s.T(), "attribute_not_exists(pk)", aws.ToString(declared.ConditionExpression))
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "1"}, declared.Item["version"])
+	require.Equal(s.T(), &types.AttributeValueMemberS{Value: `{"stream-heads":1}`}, declared.Item["features"])
 
 	require.NotEmpty(s.T(), first.TransactItems)
 	check := first.TransactItems[0].ConditionCheck
 	require.NotNil(s.T(), check)
 	require.Equal(s.T(), &types.AttributeValueMemberS{Value: "SYSTEM#FEATURES"}, check.Key["pk"])
 	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "0"}, check.Key["sk"])
-	require.Equal(s.T(), "attribute_not_exists(pk)", aws.ToString(check.ConditionExpression))
+	require.Equal(s.T(), "attribute_not_exists(pk) OR version = :v", aws.ToString(check.ConditionExpression))
+	require.Equal(s.T(), &types.AttributeValueMemberN{Value: "1"}, check.ExpressionAttributeValues[":v"])
 
 	// Second commit: the validation is cached; the same check is included without a re-read.
 	var second dynamodb.TransactWriteItemsInput
@@ -134,8 +168,34 @@ func (s *FeatureMarkerSuite) Test_Commit_IncludesMarkerCheck() {
 	require.NoError(s.T(), s.commit(repo, "acct-2"))
 
 	require.NotNil(s.T(), second.TransactItems[0].ConditionCheck)
-	require.Equal(s.T(), "attribute_not_exists(pk)", aws.ToString(second.TransactItems[0].ConditionCheck.ConditionExpression))
+	require.Equal(s.T(), "attribute_not_exists(pk) OR version = :v", aws.ToString(second.TransactItems[0].ConditionCheck.ConditionExpression))
 	client.AssertExpectations(s.T())
+}
+
+// Test_Commit_RefusesAnUnmigratedStore asserts a store that holds data but does not declare
+// stream-heads is refused before anything is written: its streams have no head items.
+func (s *FeatureMarkerSuite) Test_Commit_RefusesAnUnmigratedStore() {
+	for name, manifest := range map[string]map[string]types.AttributeValue{
+		"no marker row":        nil,
+		"a marker without it":  markerItem(2, "{}", "", ""),
+		"a marker with others": markerItem(3, `{"journal":1}`, `["audit-feed"]`, ""),
+	} {
+		s.Run(name, func() {
+			client := dynamo_mock.NewClient()
+			repo := dynamo.NewRepository(client, "test-events").
+				WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(evt.SupportedFeatures{"journal": 1}))
+
+			expectManifest(client, manifest)
+			expectScan(client, "SYSTEM#REBUILD", "acct-0")
+
+			err := s.commit(repo, "acct-1")
+			require.Error(s.T(), err)
+			require.True(s.T(), evt.IsStreamHeadsNotMigratedErr(err), "expected StreamHeadsNotMigratedError, got %v", err)
+			require.ErrorIs(s.T(), err, evt.ErrStreamHeadsNotMigrated)
+			client.AssertNotCalled(s.T(), "TransactWriteItems", mock.Anything, mock.Anything, mock.Anything)
+			client.AssertNotCalled(s.T(), "PutItem", mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
 }
 
 // Test_Commit_ConditionsOnCachedVersion asserts a commit against an existing marker conditions on
@@ -145,7 +205,7 @@ func (s *FeatureMarkerSuite) Test_Commit_ConditionsOnCachedVersion() {
 	repo := dynamo.NewRepository(client, "test-events").
 		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
-	expectManifest(client, markerItem(3, "{}", "", ""))
+	expectManifest(client, markerItem(3, `{"stream-heads":1}`, "", ""))
 
 	var first dynamodb.TransactWriteItemsInput
 	expectCommit(s.T(), client, &first)
@@ -182,16 +242,16 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_RevalidatesAndRefuses() {
 	repo := dynamo.NewRepository(client, "test-events").
 		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
 
-	// First commit validates an empty table and succeeds.
-	expectManifest(client, nil)
+	// First commit validates a migrated store and succeeds.
+	expectManifest(client, markerItem(1, `{"stream-heads":1}`, "", ""))
 
 	var first dynamodb.TransactWriteItemsInput
 	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
 
-	// A declaration lands between the commits. The next commit's cached "no marker" condition
+	// A declaration lands between the commits. The next commit's cached version condition
 	// fails; the re-validation reads the manifest and refuses the unsupported pair.
-	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
+	expectManifest(client, markerItem(2, `{"journal":1,"stream-heads":1}`, "", ""))
 	expectCommitFailure(client)
 
 	err := s.commit(repo, "acct-2")
@@ -207,14 +267,14 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient
 	repo := dynamo.NewRepository(client, "test-events").
 		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(evt.SupportedFeatures{"journal": 1}))
 
-	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
+	expectManifest(client, markerItem(1, `{"journal":1,"stream-heads":1}`, "", ""))
 
 	var first dynamodb.TransactWriteItemsInput
 	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
 
 	// The manifest bumps to version 2 under the writer; the cached condition fails.
-	expectManifest(client, markerItem(2, `{"journal":1}`, "", ""))
+	expectManifest(client, markerItem(2, `{"journal":1,"stream-heads":1}`, "", ""))
 	expectCommitFailure(client)
 
 	err := s.commit(repo, "acct-2")
@@ -297,7 +357,7 @@ func (s *FeatureMarkerSuite) Test_Declare_SameInstanceRevalidatesUnsupportedFeat
 	marker := dynamo.NewRepository(client, "test-events").FeatureMarker(nil)
 	repo := dynamo.NewRepository(client, "test-events").WithFeatureMarker(marker)
 
-	expectManifest(client, nil)
+	expectManifest(client, markerItem(1, `{"stream-heads":1}`, "", ""))
 	var first dynamodb.TransactWriteItemsInput
 	expectCommit(s.T(), client, &first)
 	require.NoError(s.T(), s.commit(repo, "acct-1"))
@@ -355,7 +415,7 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
 	}}, nil).Once()
 
 	// The durable refusal reads the manifest.
-	expectManifest(client, markerItem(4, "{}", `["session"]`, ""))
+	expectManifest(client, markerItem(4, `{"stream-heads":1}`, `["session"]`, ""))
 
 	deleted, err := repo.CompactBelow(context.Background(), "acct-1", 5)
 	require.Error(s.T(), err)
@@ -364,9 +424,25 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
 	client.AssertNotCalled(s.T(), "TransactWriteItems", mock.Anything, mock.Anything, mock.Anything)
 }
 
-// Test_CompactBelow_ProceedsWithoutMarker asserts compaction proceeds when no manifest declares
-// the entity's type.
-func (s *FeatureMarkerSuite) Test_CompactBelow_ProceedsWithoutMarker() {
+// Test_CompactBelow_RefusesAnUnmigratedStore asserts compaction refuses a store that does not
+// declare stream-heads before it reads or deletes anything.
+func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesAnUnmigratedStore() {
+	client := dynamo_mock.NewClient()
+	repo := dynamo.NewRepository(client, "test-events").
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
+
+	expectManifest(client, nil)
+
+	deleted, err := repo.CompactBelow(context.Background(), "acct-1", 5)
+	require.True(s.T(), evt.IsStreamHeadsNotMigratedErr(err), "expected StreamHeadsNotMigratedError, got %v", err)
+	require.Equal(s.T(), 0, deleted)
+	client.AssertExpectations(s.T())
+	client.AssertNotCalled(s.T(), "TransactWriteItems", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// Test_CompactBelow_ProceedsOnAMigratedStore asserts compaction proceeds when the manifest declares
+// stream-heads and does not declare the entity's type history-dependent.
+func (s *FeatureMarkerSuite) Test_CompactBelow_ProceedsOnAMigratedStore() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").
 		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
@@ -383,7 +459,7 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_ProceedsWithoutMarker() {
 		"payload":    &types.AttributeValueMemberS{Value: "{}"},
 	}}, nil).Once()
 
-	expectManifest(client, nil)
+	expectManifest(client, markerItem(1, `{"stream-heads":1}`, "", ""))
 
 	// Compaction proceeds past the refusal checks; the range query finds the events to delete.
 	client.On("Query", mock.Anything, mock.Anything, mock.Anything).

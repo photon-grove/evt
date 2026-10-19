@@ -48,6 +48,14 @@ fn snapshot(id: &EntityId) -> SerializedSnapshot {
     }
 }
 
+/// A snapshot of an empty stream: it needs no head row (ADR 0007).
+fn empty_snapshot(id: &EntityId) -> SerializedSnapshot {
+    SerializedSnapshot {
+        event_sequence: EventSequence(0),
+        ..snapshot(id)
+    }
+}
+
 async fn seed(repo: &PostgresRepository, id: &EntityId) {
     let event = SerializedEvent {
         id: EventId::for_event(id, EventSequence(1)),
@@ -94,10 +102,34 @@ async fn wait_for(repo: &PostgresRepository, query: &str) {
     .expect("operation reached its database lock wait");
 }
 
+/// A log written before the feature marker (no features relation) holds data without stream heads
+/// (ADR 0007): every write path refuses it as not migrated, without poisoning its transaction
+/// with `undefined_table` (42P01), and reads keep working.
 #[tokio::test]
-async fn legacy_schema_without_features_table_remains_writable() {
-    let (repo, events, _) = repository().await;
+async fn legacy_schema_without_features_table_is_refused_until_migrated() {
+    let (repo, events, snapshots) = repository().await;
+    let id = EntityId::new("legacy-account");
     let client = repo.pool().get().await.unwrap();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {events} (entity_id, sequence, event_id, event_type, version, entity_type, payload)
+                 VALUES ($1, 1, $2, 'account:opened', 1, 'account', ''::bytea)"
+            ),
+            &[&id.as_str(), &"legacy-account:1"],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {snapshots} (entity_id, entity_type, sequence, event_sequence, payload)
+                 VALUES ($1, 'account', 1, 1, '{{}}'::bytea)"
+            ),
+            &[&id.as_str()],
+        )
+        .await
+        .unwrap();
     client
         .batch_execute(&format!("DROP TABLE {}", features_table(&events)))
         .await
@@ -106,11 +138,35 @@ async fn legacy_schema_without_features_table_remains_writable() {
 
     // Both commit and standalone snapshot transactions probe the absent relation while holding
     // the shared feature lock. Neither may poison its transaction with undefined_table (42P01).
-    let id = EntityId::new("legacy-account");
-    seed(&repo, &id).await;
+    let next = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(2)),
+        sequence: EventSequence(2),
+        event_type: EventType::new("account:opened"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: "account".into(),
+        payload: b"{}".to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    assert!(matches!(
+        repo.commit(Commit::new(id.clone(), vec![next])).await,
+        Err(Error::StreamHeadsNotMigrated)
+    ));
+    assert!(matches!(
+        repo.put_snapshot(&snapshot(&id)).await,
+        Err(Error::StreamHeadsNotMigrated)
+    ));
+    assert!(matches!(
+        repo.compact_below(&id, EventSequence(1)).await,
+        Err(Error::StreamHeadsNotMigrated)
+    ));
     assert_eq!(repo.events(&id).await.unwrap().len(), 1);
     assert_eq!(repo.snapshot(&id).await.unwrap(), Some(snapshot(&id)));
-    assert_eq!(repo.compact_below(&id, EventSequence(1)).await.unwrap(), 1);
+    assert_eq!(
+        repo.entity_heads(None).await.unwrap().get(&id),
+        Some(&EventSequence(1)),
+        "without the feature, entity heads aggregate the log"
+    );
 }
 
 #[tokio::test]
@@ -204,7 +260,7 @@ async fn mixed_case_handles_share_feature_locks_and_refuse_after_declaration() {
     declaration
         .execute(
             &format!(
-                "INSERT INTO {} (id, version, features) VALUES (0, 1, '{{\"future\":1}}')",
+                "UPDATE {} SET version = version + 1, features = '{{\"future\":1,\"stream-heads\":1}}' WHERE id = 0",
                 features_table(&events)
             ),
             &[],
@@ -232,7 +288,8 @@ async fn marker_cache_is_invalidated_by_updates_and_log_reconfiguration() {
     let (repo, _, _) = repository().await;
     let id = EntityId::new("account-1");
     repo.update_manifest(|_| {}).await.unwrap();
-    assert!(repo.put_snapshot(&snapshot(&id)).await.unwrap()); // cache version 1
+    // The first write finds a marker without stream-heads on empty tables and declares it.
+    assert!(repo.put_snapshot(&empty_snapshot(&id)).await.unwrap());
     let (other, events, snapshots) = repository().await;
     unsupported(&other).await; // also version 1, but a different log
     let moved = repo.with_tables(&events, &snapshots).unwrap();
@@ -256,7 +313,7 @@ async fn marker_cache_is_invalidated_by_updates_and_log_reconfiguration() {
         Err(Error::UnsupportedFeature { .. })
     ));
     other.update_manifest(|m| m.features.clear()).await.unwrap();
-    assert!(other.put_snapshot(&snapshot(&id)).await.unwrap());
+    assert!(other.put_snapshot(&empty_snapshot(&id)).await.unwrap());
     unsupported(&other).await;
     assert!(matches!(
         other.put_snapshot(&snapshot(&id)).await,

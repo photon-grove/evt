@@ -15,7 +15,6 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/internal/eventjson"
-	"github.com/photon-grove/evt/policy"
 	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
@@ -81,9 +80,9 @@ func validIdentifier(name string) bool {
 // Unquoted identifiers fold to lower case, so names are compared that way.
 func sharedRelationName(eventsTable, snapshotsTable string) string {
 	events, snapshots := strings.ToLower(eventsTable), strings.ToLower(snapshotsTable)
-	relations := make([]string, 0, 13)
+	relations := make([]string, 0, 15)
 	relations = append(relations, events, events+"_pkey", events+"__evt_entity_type_idx", snapshots, snapshots+"_pkey")
-	for _, suffix := range []string{"command_outcomes", "features", "rebuild_lock", "rebuild_generation"} {
+	for _, suffix := range []string{"command_outcomes", "features", "rebuild_lock", "rebuild_generation", "stream_heads"} {
 		name := events + reservedInfix + suffix
 		relations = append(relations, name, name+"_pkey")
 	}
@@ -306,6 +305,12 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
     history_dependent text   NOT NULL DEFAULT '[]',
     retention         text   NOT NULL DEFAULT '[]'
 );
+
+CREATE TABLE IF NOT EXISTS %[1]s__evt_stream_heads (
+    entity_id   text   PRIMARY KEY,
+    entity_type text   NOT NULL,
+    head        bigint NOT NULL CHECK (head >= 1)
+);
 `, repo.eventsTable, repo.snapshotsTable)
 }
 
@@ -349,6 +354,11 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 		return err
 	}
 
+	// A store with no data declares stream-heads itself; one that holds data without it is refused.
+	if err = repo.ensureStreamHeads(ctx); err != nil {
+		return err
+	}
+
 	err = repo.inTx(ctx, func(tx pgx.Tx) error { return repo.commitInTx(ctx, tx, normalized) })
 	if err == nil {
 		return nil
@@ -364,9 +374,11 @@ func (repo *Repository) Commit(ctx context.Context, res evt.SerializedResult) er
 	return err
 }
 
-// commitInTx writes one normalized commit inside an open transaction: the entity locks, the
-// feature-marker check, the continuity, event, floor, snapshot, and fence checks, and last the
-// outcome insert.
+// commitInTx writes one normalized commit inside an open transaction, in the order the storage spec
+// pins (Stream Heads, PostgreSQL): the entity locks, the feature-marker check, a probe for an
+// existing outcome row, every head statement and fence read (evaluated without stopping at the
+// first failure, then ranked), the event inserts, the snapshot upserts, and last the outcome
+// insert.
 func (repo *Repository) commitInTx(ctx context.Context, tx pgx.Tx, normalized evt.SerializedResult) error {
 	// Every touched stream — written and fenced — takes its advisory lock in canonical
 	// (sorted) order, so concurrent multi-stream commits cannot deadlock.
@@ -379,78 +391,32 @@ func (repo *Repository) commitInTx(ctx context.Context, tx pgx.Tx, normalized ev
 		return err
 	}
 
-	// Fences are refused for entity types durably declared with retention: TTL deletes reopen
-	// fenced slots without leaving a successor snapshot. The refusal consults the manifest in
-	// this transaction, not this instance's configuration.
+	// Fences are refused for entity types durably declared with retention. The refusal consults
+	// the manifest in this transaction, not this instance's configuration.
 	if err = evt.CheckFenceRetention(normalized.Fences, manifest); err != nil {
 		return err
 	}
 
-	// Under the streams' advisory locks, every written stream must continue exactly from its
-	// stored head: a gap is refused before anything is inserted.
-	if err = repo.checkContinuations(ctx, tx, normalized.Events); err != nil {
+	// An existing outcome row for the command outranks drift, gap, and conflicts, as the outcome
+	// put does on DynamoDB. The final insert's unique violation still resolves a real race.
+	if err = repo.checkOutcomeAbsent(ctx, tx, normalized.Outcome); err != nil {
+		return err
+	}
+
+	if err = repo.checkHeads(ctx, tx, normalized); err != nil {
 		return err
 	}
 
 	if err = repo.insertEvents(ctx, tx, normalized.Events); err != nil {
-		return err
-	}
-
-	if err = repo.checkFloor(ctx, tx, normalized.Events); err != nil {
-		return err
+		return repo.classifyInsertFailure(ctx, tx, normalized.Events, err)
 	}
 
 	if err = repo.commitSnapshots(ctx, tx, normalized); err != nil {
 		return err
 	}
 
-	if err = repo.checkFences(ctx, tx, normalized.Fences); err != nil {
-		return err
-	}
-
 	// The outcome insert runs last, after the snapshot upserts (storage spec, PostgreSQL).
 	return repo.insertOutcome(ctx, tx, normalized.Outcome)
-}
-
-// checkContinuations asserts, for each written stream whose first sequence is above 1, that the
-// stored head is the sequence just before it. The head is the larger of the stream's highest event
-// and its snapshot's event sequence, because compaction can delete every covered event. The
-// per-entity advisory lock holds the stream steady through the assertion, so no writer can move
-// the head between this check and the insert. A first sequence at or below the head is left to the
-// primary key and the floor check, which report it as an ordinary conflict.
-func (repo *Repository) checkContinuations(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
-	seen := make(map[evt.EntityID]bool)
-
-	for _, event := range events {
-		if seen[event.EntityID] {
-			continue
-		}
-		seen[event.EntityID] = true
-
-		if event.Sequence <= 1 {
-			continue
-		}
-
-		var head int64
-		err := tx.QueryRow(ctx, fmt.Sprintf(
-			`SELECT GREATEST(
-			         COALESCE((SELECT MAX(sequence) FROM %s WHERE entity_id = $1), 0),
-			         COALESCE((SELECT MAX(event_sequence) FROM %s WHERE entity_id = $1), 0))`,
-			repo.eventsTable, repo.snapshotsTable,
-		), string(event.EntityID)).Scan(&head)
-		if err != nil {
-			return fmt.Errorf("postgres: check continuation %s: %w", event.EntityID, err)
-		}
-
-		if int64(event.Sequence) > head+1 {
-			return &policy.ClassifiedError{
-				Class: policy.ClassTransient,
-				Err:   &evt.SequenceGapError{EntityID: event.EntityID, After: evt.EventSequence(head), Found: event.Sequence},
-			}
-		}
-	}
-
-	return nil
 }
 
 // lockTransactionEntities takes the advisory lock for every stream a transactional commit
@@ -504,30 +470,6 @@ func (repo *Repository) commitSnapshots(ctx context.Context, tx pgx.Tx, result e
 
 		if err := repo.upsertSnapshot(ctx, tx, snapshot); err != nil {
 			return err
-		}
-	}
-
-	return nil
-}
-
-// checkFences asserts, for each fenced read-only stream, that no stored event and no snapshot
-// covers past the fenced head — the SQL form of the slot check plus the snapshot companion
-// (ADR 0004, C2). The locks above hold the stream steady through the assertions. A failed
-// assertion is a typed fence conflict carrying the fence's provenance.
-func (repo *Repository) checkFences(ctx context.Context, tx pgx.Tx, fences []evt.ReadFence) error {
-	for _, fence := range fences {
-		var eventHead, snapshotHead int64
-		err := tx.QueryRow(ctx, fmt.Sprintf(
-			`SELECT COALESCE((SELECT MAX(sequence) FROM %s WHERE entity_id = $1), 0),
-			       COALESCE((SELECT MAX(event_sequence) FROM %s WHERE entity_id = $1), 0)`,
-			repo.eventsTable, repo.snapshotsTable,
-		), string(fence.EntityID)).Scan(&eventHead, &snapshotHead)
-		if err != nil {
-			return fmt.Errorf("postgres: check fence %s: %w", fence.EntityID, err)
-		}
-
-		if eventHead > int64(fence.Head) || snapshotHead > int64(fence.Head) {
-			return policy.FenceConflict(fence)
 		}
 	}
 
@@ -693,6 +635,16 @@ func (repo *Repository) GetSnapshot(
 	ctx context.Context,
 	entityID evt.EntityID,
 ) (*evt.SerializedSnapshot, error) {
+	return repo.getSnapshot(ctx, repo.db, entityID)
+}
+
+// getSnapshot reads the entity's durable snapshot through db, so a caller holding a transaction
+// reads inside it.
+func (repo *Repository) getSnapshot(
+	ctx context.Context,
+	db DB,
+	entityID evt.EntityID,
+) (*evt.SerializedSnapshot, error) {
 	query := fmt.Sprintf(
 		`SELECT entity_type, entity_id, sequence, event_sequence, payload FROM %s WHERE entity_id = $1`,
 		repo.snapshotsTable,
@@ -704,7 +656,7 @@ func (repo *Repository) GetSnapshot(
 		eventSequence int64
 	)
 
-	err := repo.db.QueryRow(ctx, query, string(entityID)).Scan(
+	err := db.QueryRow(ctx, query, string(entityID)).Scan(
 		&snapshot.EntityType,
 		&snapshot.EntityID,
 		&sequence,
@@ -778,8 +730,8 @@ func (e *indeterminateCommitError) Error() string { return e.err.Error() }
 func (e *indeterminateCommitError) Unwrap() error { return e.err }
 
 // checkContiguous rejects events whose sequences are not contiguous (each one more than the last)
-// for each entity. The floor check reads the first event and the snapshot records the last, so a
-// commit like [6, 5] after compacting through 5 would recreate sequence 5, and loads reject a
+// for each entity. The head condition reads the first event's sequence and the snapshot records the
+// last, so a commit like [6, 5] after compacting through 5 would recreate sequence 5, and loads reject a
 // stream with a gap such as [1, 3]. Sequences start at 1: DynamoDB keeps the snapshot at sk = 0 and
 // reads events after it.
 func checkContiguous(events []evt.SerializedEvent) error {
@@ -800,49 +752,13 @@ func checkContiguous(events []evt.SerializedEvent) error {
 	return nil
 }
 
-// checkFloor rejects a commit whose first event for an entity is at or below that entity's
-// snapshot event_sequence. Compaction deletes the events a snapshot covers, so the primary key
-// alone would let a writer that loaded before the snapshot recreate a compacted sequence. It runs
-// after the inserts: a concurrent writer can only raise the floor past our first sequence by
-// inserting that sequence, which our uncommitted insert already holds.
-func (repo *Repository) checkFloor(ctx context.Context, tx pgx.Tx, events []evt.SerializedEvent) error {
-	first := make(map[evt.EntityID]evt.EventSequence)
-	for _, event := range events {
-		if current, ok := first[event.EntityID]; !ok || event.Sequence < current {
-			first[event.EntityID] = event.Sequence
-		}
-	}
-
-	query := fmt.Sprintf(
-		`SELECT event_sequence FROM %s WHERE entity_id = $1 AND event_sequence >= $2`,
-		repo.snapshotsTable,
-	)
-
-	for entityID, sequence := range first {
-		var floor int64
-
-		err := tx.QueryRow(ctx, query, string(entityID), int64(sequence)).Scan(&floor)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("postgres: check snapshot floor: %w", err)
-		}
-
-		return transientConflict(fmt.Sprintf(
-			"postgres: event %d for %s is at or below the snapshot floor %d", sequence, entityID, floor,
-		))
-	}
-
-	return nil
-}
-
-// insertEvents inserts a batch of events, translating a unique-constraint violation into an
-// evt.ConflictError so optimistic-concurrency failures are detectable by callers.
+// insertEvents inserts a batch of events. A sequence already stored is a *duplicateEventError;
+// commitInTx classifies it.
 func (repo *Repository) insertEvents(ctx context.Context, db DB, events []evt.SerializedEvent) error {
 	query := fmt.Sprintf(
 		`INSERT INTO %s (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 ON CONFLICT (entity_id, sequence) DO NOTHING`,
 		repo.eventsTable,
 	)
 
@@ -852,7 +768,7 @@ func (repo *Repository) insertEvents(ctx context.Context, db DB, events []evt.Se
 			return fmt.Errorf("postgres: marshal metadata: %w", err)
 		}
 
-		_, err = db.Exec(ctx, query,
+		tag, err := db.Exec(ctx, query,
 			string(event.EntityID),
 			int64(event.Sequence),
 			string(event.ID),
@@ -863,7 +779,14 @@ func (repo *Repository) insertEvents(ctx context.Context, db DB, events []evt.Se
 			metadata,
 		)
 		if err != nil {
-			return classifyWriteError(fmt.Errorf("postgres: insert event %s: %w", event.ID, err))
+			return fmt.Errorf("postgres: insert event %s: %w", event.ID, err)
+		}
+
+		// The head statement of the stream passed, so a row already stored at this sequence sits
+		// above the head. A plain INSERT would abort the transaction; DO NOTHING lets the commit
+		// describe it.
+		if tag.RowsAffected() != 1 {
+			return &duplicateEventError{event: event}
 		}
 	}
 

@@ -33,6 +33,7 @@ mod enumerate;
 mod error;
 mod event;
 mod features;
+mod heads;
 mod ids;
 pub mod json;
 mod mem;
@@ -64,8 +65,8 @@ pub use enumerate::{EventBatch, EventLog, StreamFilter};
 pub use error::{BoxError, Error, ExecuteError, ReplayPhase};
 pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
 pub use features::{
-    COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker, SUPPORTED_FEATURES,
-    SYSTEM_PREFIX, ValidatedMarker,
+    COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker, STREAM_HEADS_FEATURE,
+    STREAM_HEADS_VERSION, SUPPORTED_FEATURES, SYSTEM_PREFIX, ValidatedMarker,
 };
 pub use ids::{
     CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion, PrincipalId,

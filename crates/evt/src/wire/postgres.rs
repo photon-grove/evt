@@ -40,6 +40,12 @@ pub fn features_table(events_table: &str) -> String {
     format!("{events_table}{RESERVED_INFIX}features")
 }
 
+/// The stream-heads table for an events table (`evt_events` yields
+/// `evt_events__evt_stream_heads`): one row per stream with its head (ADR 0007).
+pub fn stream_heads_table(events_table: &str) -> String {
+    format!("{events_table}{RESERVED_INFIX}stream_heads")
+}
+
 /// Returns the idempotent DDL for the event and snapshot tables. It is the same DDL Go's
 /// `postgres.Repository.EnsureSchema` runs, so either implementation can create the schema.
 pub fn schema_ddl(events_table: &str, snapshots_table: &str) -> String {
@@ -98,9 +104,16 @@ CREATE TABLE IF NOT EXISTS {features} (
     history_dependent text   NOT NULL DEFAULT '[]',
     retention         text   NOT NULL DEFAULT '[]'
 );
+
+CREATE TABLE IF NOT EXISTS {stream_heads} (
+    entity_id   text   PRIMARY KEY,
+    entity_type text   NOT NULL,
+    head        bigint NOT NULL CHECK (head >= 1)
+);
 "#,
         outcomes = outcomes_table(events_table),
-        features = features_table(events_table)
+        features = features_table(events_table),
+        stream_heads = stream_heads_table(events_table)
     )
 }
 
@@ -253,7 +266,7 @@ pub fn is_valid_identifier(name: &str, max_len: usize) -> bool {
 
 /// Checks a pair of table names: each must be a valid identifier within its length cap and must
 /// not contain the reserved infix, and no two relations the schema creates (the tables, the
-/// entity-type index, the command-outcomes and feature-marker tables, and each table's `{table}_pkey` index) may share
+/// entity-type index, the command-outcomes, feature-marker, and stream-heads tables, and each table's `{table}_pkey` index) may share
 /// a name. Unquoted identifiers fold to lower case, so names are compared that way.
 /// `CREATE TABLE IF NOT EXISTS` would otherwise skip a table whose name an index already took.
 pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<(), String> {
@@ -276,6 +289,7 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
     let snapshots = snapshots_table.to_ascii_lowercase();
     let features = features_table(&events);
     let outcomes = outcomes_table(&events);
+    let heads = stream_heads_table(&events);
     let relations = [
         events.clone(),
         format!("{events}_pkey"),
@@ -284,6 +298,8 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
         format!("{outcomes}_pkey"),
         features.clone(),
         format!("{features}_pkey"),
+        heads.clone(),
+        format!("{heads}_pkey"),
         snapshots.clone(),
         format!("{snapshots}_pkey"),
     ];

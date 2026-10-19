@@ -49,13 +49,28 @@ func (s *RepositorySuite) expectSnapshot(entityID string, out *dynamodb.GetItemO
 	}), mock.Anything).Return(out, nil)
 }
 
-// expectNoMarker scopes a GetItem expectation to the feature-marker key and returns its absence:
-// a table with no marker row declares nothing.
-func (s *RepositorySuite) expectNoMarker() {
+// expectDeclaredMarker scopes a GetItem expectation to the feature-marker key and returns a marker
+// that declares stream-heads at version 1: the state of every store compaction may touch.
+func (s *RepositorySuite) expectDeclaredMarker() {
 	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
 		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
 		return ok && pk.Value == "SYSTEM#FEATURES"
-	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{Item: declaredMarker()}, nil)
+}
+
+// compactionMarkerCheck is the delete batch's marker check, pinning the declared marker's version.
+func compactionMarkerCheck(table string) types.TransactWriteItem {
+	return types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+		TableName: aws.String(table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "SYSTEM#FEATURES"},
+			"sk": &types.AttributeValueMemberN{Value: "0"},
+		},
+		ConditionExpression: aws.String("version = :observed"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":observed": &types.AttributeValueMemberN{Value: "1"},
+		},
+	}}
 }
 
 func (s *RepositorySuite) Test_CompactBelow_Success() {
@@ -63,7 +78,7 @@ func (s *RepositorySuite) Test_CompactBelow_Success() {
 	const entityID = "acct-1"
 
 	s.expectSnapshot(entityID, snapshotItem(entityID, 5))
-	s.expectNoMarker()
+	s.expectDeclaredMarker()
 
 	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
 		Return(eventKeyPage(entityID, 1, 2, 3, 4, 5), nil)
@@ -71,7 +86,7 @@ func (s *RepositorySuite) Test_CompactBelow_Success() {
 	// Pin marker absence and delete exactly the event keys, never sk=0.
 	s.client.On("TransactWriteItems", mock.Anything, mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
 		require.Len(s.T(), in.TransactItems, 6)
-		require.Equal(s.T(), absentMarkerCheck(s.repo.EventsTable), in.TransactItems[0])
+		require.Equal(s.T(), compactionMarkerCheck(s.repo.EventsTable), in.TransactItems[0])
 		for i, item := range in.TransactItems[1:] {
 			require.NotNil(s.T(), item.Delete)
 			require.Equal(s.T(), s.repo.EventsTable, *item.Delete.TableName)
@@ -107,7 +122,7 @@ func (s *RepositorySuite) Test_CompactBelow_Batches99DeletesPlusMarker() {
 			in, ok := args.Get(1).(*dynamodb.TransactWriteItemsInput)
 			require.True(s.T(), ok)
 			require.LessOrEqual(s.T(), len(in.TransactItems), 100)
-			require.Equal(s.T(), absentMarkerCheck(s.repo.EventsTable), in.TransactItems[0])
+			require.Equal(s.T(), compactionMarkerCheck(s.repo.EventsTable), in.TransactItems[0])
 			batchSizes = append(batchSizes, len(in.TransactItems)-1)
 			for _, item := range in.TransactItems[1:] {
 				require.NotNil(s.T(), item.Delete)
@@ -135,7 +150,7 @@ func (s *RepositorySuite) Test_CompactBelow_RefusesWithoutSnapshot() {
 	ctx := context.Background()
 
 	s.expectSnapshot("acct-nosnap", &dynamodb.GetItemOutput{Item: nil})
-	s.expectNoMarker()
+	s.expectDeclaredMarker()
 
 	deleted, err := s.repo.CompactBelow(ctx, "acct-nosnap", 5)
 	require.ErrorIs(s.T(), err, evt.ErrCompactionUncovered)
@@ -152,7 +167,7 @@ func (s *RepositorySuite) Test_CompactBelow_RefusesWhenUncovered() {
 
 	// Snapshot only covers through event 3, but compaction requested through 5.
 	s.expectSnapshot(entityID, snapshotItem(entityID, 3))
-	s.expectNoMarker()
+	s.expectDeclaredMarker()
 
 	deleted, err := s.repo.CompactBelow(ctx, entityID, 5)
 	require.ErrorIs(s.T(), err, evt.ErrCompactionUncovered)
@@ -176,7 +191,7 @@ func (s *RepositorySuite) Test_CompactBelow_NothingToDelete() {
 	const entityID = "acct-empty"
 
 	s.expectSnapshot(entityID, snapshotItem(entityID, 5))
-	s.expectNoMarker()
+	s.expectDeclaredMarker()
 	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).
 		Return(eventKeyPage(entityID), nil)
 
@@ -197,15 +212,19 @@ func (s *RepositorySuite) Test_CompactBelow_RetriesMarkerChange() {
 		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
 		return ok && pk.Value == entityID
 	}), mock.Anything).Return(snapshotItem(entityID, 2), nil).Once()
-	expectManifest(client, nil)
+	expectManifest(client, declaredMarker())
 	client.On("Query", mock.Anything, mock.Anything, mock.Anything).
 		Return(eventKeyPage(entityID, 1, 2), nil).Once()
 
 	client.On("TransactWriteItems", mock.Anything, mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
-		if len(in.TransactItems) != 3 || aws.ToString(in.TransactItems[0].ConditionCheck.ConditionExpression) != "attribute_not_exists(pk)" {
+		if len(in.TransactItems) != 3 {
 			return false
 		}
-		require.Equal(s.T(), absentMarkerCheck(repo.EventsTable), in.TransactItems[0])
+		observed, isNumber := in.TransactItems[0].ConditionCheck.ExpressionAttributeValues[":observed"].(*types.AttributeValueMemberN)
+		if !isNumber || observed.Value != "1" {
+			return false
+		}
+		require.Equal(s.T(), compactionMarkerCheck(repo.EventsTable), in.TransactItems[0])
 		for i, item := range in.TransactItems[1:] {
 			require.Equal(s.T(), eventKeyPage(entityID, i+1).Items[0], item.Delete.Key)
 		}
@@ -215,7 +234,7 @@ func (s *RepositorySuite) Test_CompactBelow_RetriesMarkerChange() {
 	}).Once()
 	// An unrelated declaration wins the race: pin its new version and retry the whole
 	// unchanged delete batch, counting the events only once.
-	expectManifest(client, markerItem(2, "{}", `["audit-feed"]`, ""))
+	expectManifest(client, markerItem(2, `{"stream-heads":1}`, `["audit-feed"]`, ""))
 	client.On("TransactWriteItems", mock.Anything, mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
 		if len(in.TransactItems) != 3 || aws.ToString(in.TransactItems[0].ConditionCheck.ConditionExpression) != "version = :observed" {
 			return false
@@ -248,7 +267,7 @@ func (s *RepositorySuite) Test_CompactBelow_ReadsStronglyConsistent() {
 		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
 		return ok && consistent(in.ConsistentRead) && pk.Value == entityID
 	}), mock.Anything).Return(snapshotItem(entityID, 2), nil)
-	s.expectNoMarker()
+	s.expectDeclaredMarker()
 	s.client.On("Query", mock.Anything, mock.MatchedBy(func(in *dynamodb.QueryInput) bool {
 		return consistent(in.ConsistentRead)
 	}), mock.Anything).Return(eventKeyPage(entityID, 1, 2), nil)

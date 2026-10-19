@@ -14,6 +14,7 @@ import (
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/internal/streamheads"
 )
 
 // GroupIDExtractor maps a serialized domain event to an SNS FIFO
@@ -177,6 +178,12 @@ func (p *SNSPublisher) Publish(ctx context.Context, records []events.DynamoDBEve
 	}
 
 	for i, record := range records {
+		// Skip rows that are not events: the inline snapshot and the per-stream head item (ADR 0007).
+		if streamheads.IsNonEventRecord(record) {
+			result.SkippedCount++
+			continue
+		}
+
 		// Skip records with empty NewImage
 		if len(record.Change.NewImage) == 0 {
 			logger.Warn("Skipping record with empty NewImage", "index", i)

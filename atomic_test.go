@@ -38,16 +38,25 @@ func TestTransactionItemSizesWithTTL_CountsTheTTLAttributeOnRetainedTypesOnly(t 
 	})
 	require.NoError(t, err)
 
-	// The feature-marker check, then the event puts, the snapshot put, the floor check for the stream
-	// without a snapshot, and the two checks of the fence.
-	require.Len(t, plain, 1+2+1+1+2)
+	// The feature-marker check, then the event puts, the snapshot put, one head update per written
+	// stream, and the one head check of the fence.
+	require.Len(t, plain, 1+2+1+2+1)
 	require.Len(t, retained, len(plain))
 
 	attribute := len("ttl") + len("1800000000")
 	want := append([]int(nil), plain...)
 	want[1] += attribute // a's event put
 	want[3] += attribute // a's snapshot put
-	require.Equal(t, want, retained, "only retained types' event and snapshot items carry a ttl")
+
+	// a's head update also raises the head item's ttl: the longer update expression, the name
+	// placeholder and name, and the :t value.
+	want[4] += len("SET head = :last, #ttl = :t") - len("SET head = :last") +
+		len("#ttl") + len("ttl") + len(":t") + len("1800000000")
+	require.Equal(t, want, retained, "only retained types' items carry a ttl")
+
+	// The head updates (create, so no :prev) and the fence check (one check at head 3).
+	require.Equal(t, 2+2+len("a")+len("-1")+len(":last")+len("1")+len("SET head = :last")+len("attribute_not_exists(head)"), plain[4])
+	require.Equal(t, 2+2+len("c")+len("-1")+len("head = :head")+len(":head")+len("3"), plain[6])
 }
 
 func TestTransactionItemSizes_NilTTLEqualsNoRetention(t *testing.T) {
@@ -99,7 +108,7 @@ func TestPreflightCommit_BudgetsOnlyEmittedActions(t *testing.T) {
 		return out
 	}
 
-	// The feature-marker check, 98 event puts, and the floor check fill the 100 actions exactly.
+	// The feature-marker check, 98 event puts, and the head update fill the 100 actions exactly.
 	fits, err := evt.TransactionItemSizes(evt.SerializedResult{Events: events(98)})
 	require.NoError(t, err)
 	require.Len(t, fits, 100)
@@ -147,7 +156,7 @@ func TestPreflightCommit_CountsProjectorOperations(t *testing.T) {
 		ID: "a:1", Sequence: 1, Type: "t:created", Version: 1, EntityID: "a", EntityType: "t", Payload: []byte(`{}`),
 	}
 
-	// Marker check, one event, and the floor check leave 97 actions for projector operations.
+	// Marker check, one event, and the head update leave 97 actions for projector operations.
 	require.NoError(t, evt.PreflightCommit(evt.SerializedResult{
 		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{opaqueGroup{size: 97}},
 	}))

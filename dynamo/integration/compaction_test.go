@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
-	"github.com/photon-grove/evt/result"
 	"github.com/photon-grove/evt/snapshots"
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
@@ -194,6 +194,16 @@ func (s *DynamoEventsIntegrationSuite) Test_PutSnapshot_MonotonicFloor() {
 	id := evt.EntityID(newID())
 	et := evt.EntityType("test")
 
+	// A snapshot never covers more than the stream's head, so the stream has events first.
+	events := make([]evt.Event, 0, 8)
+	for range 8 {
+		events = append(events, &test.EntityUpdated{ID: id, Value: "v"})
+	}
+
+	serialized, err := evt.SerializeEvents(events, 0, id, evt.NewMetadata(ctx, aws.String(s.awsRegion)))
+	require.NoError(s.T(), err)
+	require.NoError(s.T(), s.repo.Commit(ctx, evt.SerializedResult{Events: serialized}))
+
 	// Establish a snapshot at eventSeq=6.
 	require.NoError(s.T(), s.repo.PutSnapshot(ctx, et, id, []byte(`{"value":"v6"}`), 1, 6))
 
@@ -277,10 +287,10 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_ConcurrentWithAppends()
 	require.Equal(s.T(), "v9", loaded.Value)
 }
 
-// Test_CommitStream_RejectsBatchBelowFloor sends CommitStream a result above the compacted floor
-// followed by one below it. The batch's floor check must use the lower sequence, so the whole batch
-// is rejected and the compacted sequence is not re-created.
-func (s *DynamoEventsIntegrationSuite) Test_CommitStream_RejectsBatchBelowFloor() {
+// Test_Commit_RejectsBelowTheCompactedFloor commits at a compacted sequence and one above the head
+// of a compacted stream. The head item still says 4 after compaction deleted events 1 to 4, so the
+// compacted sequence is a conflict and is not re-created, and the next sequence commits.
+func (s *DynamoEventsIntegrationSuite) Test_Commit_RejectsBelowTheCompactedFloor() {
 	ctx := context.Background()
 
 	id := evt.EntityID(newID())
@@ -296,18 +306,15 @@ func (s *DynamoEventsIntegrationSuite) Test_CommitStream_RejectsBatchBelowFloor(
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 4, deleted)
 
-	serialize := func(from evt.EventSequence) evt.SerializedResult {
-		events, err := evt.SerializeEvents([]evt.Event{&test.EntityUpdated{ID: id, Value: "stale"}}, from, id, metadata)
-		require.NoError(s.T(), err)
+	commit := func(from evt.EventSequence) error {
+		events, serr := evt.SerializeEvents([]evt.Event{&test.EntityUpdated{ID: id, Value: "stale"}}, from, id, metadata)
+		require.NoError(s.T(), serr)
 
-		return evt.SerializedResult{Events: events}
+		return s.repo.Commit(ctx, evt.SerializedResult{Events: events})
 	}
 
-	channel := make(chan result.Result[evt.SerializedResult], 2)
-	channel <- result.Ok(serialize(4)) // sequence 5, above the floor
-	channel <- result.Ok(serialize(2)) // sequence 3, compacted
-	close(channel)
-
-	require.Len(s.T(), s.repo.CommitStream(ctx, channel), 1) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	require.True(s.T(), evt.IsOptimisticConflict(commit(2)), "sequence 3 was compacted and must not be re-created")
 	require.Empty(s.T(), s.sequencesFor(ctx, id))
+	require.NoError(s.T(), commit(4), "sequence 5 continues from the head")
+	require.Equal(s.T(), []evt.EventSequence{5}, s.sequencesFor(ctx, id))
 }

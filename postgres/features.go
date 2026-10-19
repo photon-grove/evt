@@ -39,6 +39,10 @@ type FeatureMarker struct {
 	validated     bool
 	hasMarker     bool  // whether the cached version came from an existing row
 	cachedVersion int64 // the validated version; meaningful only when validated
+
+	// headsReady caches that the store declares stream-heads, so a commit's happy path does not
+	// read the manifest before its transaction. Any declaration invalidates it.
+	headsReady bool
 }
 
 // FeatureMarker constructs a marker using this repository's client and events table.
@@ -52,7 +56,8 @@ func newFeatureMarker(db DB, eventsTable string, supported evt.SupportedFeatures
 	return &FeatureMarker{
 		db:          db,
 		eventsTable: strings.ToLower(eventsTable),
-		supported:   supported,
+		// Every writer of this format models stream-heads, whatever else the caller configured.
+		supported: supported.WithStreamHeads(),
 	}
 }
 
@@ -75,6 +80,34 @@ func (m *FeatureMarker) Declare(
 	ctx context.Context,
 	update func(*evt.FeatureManifest),
 ) (evt.FeatureManifest, error) {
+	return m.declare(ctx, update, nil)
+}
+
+// DeclareStreamHeads declares the stream-heads feature (evt.FeatureStreamHeads at the format this
+// build writes) in the ordinary declaration transaction, without checking that the store holds
+// no data. It is the migration's declaring step (storage spec, Stream Heads, Migration): the
+// caller has backfilled and verified a head row for every stream with every older writer stopped,
+// and declaring is what lets this build's writers start. A writer that finds a fresh store
+// declares the feature itself; it never calls this.
+func (m *FeatureMarker) DeclareStreamHeads(ctx context.Context) (evt.FeatureManifest, error) {
+	return m.Declare(ctx, declareStreamHeads)
+}
+
+func declareStreamHeads(manifest *evt.FeatureManifest) {
+	if manifest.Features == nil {
+		manifest.Features = map[string]evt.FeatureFormat{}
+	}
+
+	manifest.Features[evt.FeatureStreamHeads] = evt.StreamHeadsFormat
+}
+
+// declare is Declare with an optional guard evaluated inside the declaration transaction, under the
+// exclusive lock, before the manifest is written: a non-nil error from guard aborts the declaration.
+func (m *FeatureMarker) declare(
+	ctx context.Context,
+	update func(*evt.FeatureManifest),
+	guard func(context.Context, pgx.Tx, *evt.FeatureManifest) error,
+) (evt.FeatureManifest, error) {
 	tx, err := m.db.Begin(ctx)
 	if err != nil {
 		return evt.FeatureManifest{}, fmt.Errorf("features: begin declaration: %w", err)
@@ -91,6 +124,12 @@ func (m *FeatureMarker) Declare(
 	manifest, err := m.readManifestTx(ctx, tx)
 	if err != nil {
 		return evt.FeatureManifest{}, err
+	}
+
+	if guard != nil {
+		if err = guard(ctx, tx, manifest); err != nil {
+			return evt.FeatureManifest{}, err
+		}
 	}
 
 	current := evt.FeatureManifest{Version: 1, Features: map[string]evt.FeatureFormat{}}
@@ -227,6 +266,31 @@ func (m *FeatureMarker) checkInTx(ctx context.Context, tx pgx.Tx) error {
 // returns the manifest it validated against, so callers can consult durable declarations (the
 // retention set, for instance) that this instance did not configure.
 func (m *FeatureMarker) checkManifestTx(ctx context.Context, tx pgx.Tx) (*evt.FeatureManifest, error) {
+	manifest, err := m.checkManifestCore(ctx, tx)
+	if err != nil {
+		// A manifest that changed under the writer is retried, unless the change left the store
+		// without stream-heads: that is a refusal, not something a retry can fix.
+		if errors.Is(err, evt.ErrFeatureManifestChanged) {
+			if rerr := evt.RequireStreamHeads(manifest); rerr != nil {
+				return nil, rerr
+			}
+		}
+
+		return manifest, err
+	}
+
+	// A store that holds data without declaring stream-heads has streams with no head rows
+	// (ADR 0007): a head-aware writer refuses it. ensureStreamHeads has already declared an empty
+	// store, so only an unmigrated one reaches this refusal.
+	if err = evt.RequireStreamHeads(manifest); err != nil {
+		return nil, err
+	}
+
+	return manifest, nil
+}
+
+// checkManifestCore is the version check of checkManifestTx, before the stream-heads requirement.
+func (m *FeatureMarker) checkManifestCore(ctx context.Context, tx pgx.Tx) (*evt.FeatureManifest, error) {
 	if err := m.lockShared(ctx, tx); err != nil {
 		return nil, err
 	}
@@ -311,6 +375,7 @@ func (m *FeatureMarker) invalidateLocked() {
 	m.validated = false
 	m.hasMarker = false
 	m.cachedVersion = 0
+	m.headsReady = false
 }
 
 // transientFeatureChanged returns the transient error a failed marker check classifies as, so

@@ -2,11 +2,13 @@
 
 ## Status
 
-Proposed (2026-10-18). Design only: no code lands until this ADR is accepted. Tracking: matrix row
-C12 in [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md) and
-[#159](https://github.com/photon-grove/evt/issues/159). The normative draft is the
-[Stream Heads](../spec/storage-format.md#stream-heads-proposed-adr-0007) section of the storage
-spec, which is marked proposed and leaves every existing paragraph untouched.
+Accepted (2026-10-18). Tracking: matrix row C12 in
+[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md) and
+[#159](https://github.com/photon-grove/evt/issues/159). The core commit path is implemented in Go
+and Rust (the first of two changes); the migration tool (`evt-doctor migrate-heads`) and the
+real-DynamoDB billing measurement follow. The normative text is the
+[Stream Heads](../spec/storage-format.md#stream-heads) section of the storage spec, and the
+sections of the spec that describe commits, fences, and failures follow it.
 
 **Decided:** the migration from v0.8 storage is a stop-the-world procedure (stop writers, backfill,
 verify, declare the marker feature, start the new writers). The project is greenfield, so there is
@@ -306,10 +308,12 @@ for the stream (the snapshot and the events after it). On create, the update is
 events keep the commit's own `ttl`; only the head takes the maximum. The condition makes lowering
 impossible: if an unseen writer (an out-of-band snapshot) raised the stored `ttl` above `:t`, the
 update fails as an ordinary conflict and the retry reloads, sees the larger `ttl`, and passes. An
-out-of-band snapshot write uses the same `ttl` condition with `:t` its snapshot's `ttl`; if only
-that `ttl` condition fails (the head is already at or above `:new` and its `ttl` is higher),
-`PutSnapshot` reads the head item once and retries as a `ConditionCheck` on `head >= :new`, which
-needs no refresh.
+out-of-band snapshot write uses the same `ttl` condition with `:t` its snapshot's `ttl`. When it
+fails, `PutSnapshot` reads the head item back: a head at or above `:new` with a `ttl` at least the
+snapshot's needs no refresh and the write is retried as a `ConditionCheck` on `head >= :new`; one
+with a lower or absent `ttl` (the head was behind when the update failed and a concurrent writer
+advanced it with a shorter `ttl`) is retried as the refreshing update, so the snapshot never
+outlives the head item.
 
 A retained stream disappears whole once every one of its items has expired, and its ID is then
 reusable. TTL deletion is lazy and unordered, so a partly deleted stream is possible and transient,

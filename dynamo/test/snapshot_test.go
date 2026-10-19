@@ -97,9 +97,17 @@ func (s *RepositorySuite) Test_PutSnapshot_UsesMonotonicCondition() {
 	ctx := context.Background()
 
 	s.client.On("TransactWriteItems", mock.Anything, mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
-		require.Len(s.T(), in.TransactItems, 2)
-		require.Equal(s.T(), absentMarkerCheck(s.repo.EventsTable), in.TransactItems[0])
-		put := in.TransactItems[1].Put
+		require.Len(s.T(), in.TransactItems, 3)
+		require.Equal(s.T(), markerCheck(s.repo.EventsTable), in.TransactItems[0])
+
+		// The head guard sits between the marker check and the snapshot put (invariant H3).
+		guard := in.TransactItems[1].ConditionCheck
+		require.NotNil(s.T(), guard)
+		require.Equal(s.T(), &types.AttributeValueMemberN{Value: "-1"}, guard.Key["sk"])
+		require.Equal(s.T(), "head >= :new", aws.ToString(guard.ConditionExpression))
+		require.Equal(s.T(), &types.AttributeValueMemberN{Value: "6"}, guard.ExpressionAttributeValues[":new"])
+
+		put := in.TransactItems[2].Put
 		require.NotNil(s.T(), put)
 		require.Equal(s.T(), "attribute_not_exists(eventSeq) OR eventSeq <= :new", aws.ToString(put.ConditionExpression))
 		require.Equal(s.T(), &types.AttributeValueMemberN{Value: "6"}, put.ExpressionAttributeValues[":new"])
@@ -119,6 +127,7 @@ func (s *RepositorySuite) Test_PutSnapshot_NoOpOnRegression() {
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
 		Return((*dynamodb.TransactWriteItemsOutput)(nil), &types.TransactionCanceledException{
 			CancellationReasons: []types.CancellationReason{
+				{Code: aws.String("None")},
 				{Code: aws.String("None")},
 				{Code: aws.String("ConditionalCheckFailed")},
 			},

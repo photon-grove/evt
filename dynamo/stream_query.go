@@ -233,6 +233,8 @@ func (repo *Repository) collectEntityIDs(
 // enumerateEntityIDs paginates a key-only Scan of the event log and invokes visit once per distinct
 // entity ID (partition key). visit returns false to stop enumeration early (e.g. on context
 // cancellation). Snapshot rows share their entity's partition key, so de-duplication folds them in.
+// Head items (sk = -1, ADR 0007) are skipped: an orphan head, a partition with neither events nor a
+// snapshot, would otherwise list a ghost entity ID.
 func (repo *Repository) enumerateEntityIDs(
 	ctx context.Context,
 	entityType evt.EntityType,
@@ -241,7 +243,7 @@ func (repo *Repository) enumerateEntityIDs(
 	input := dynamodb.ScanInput{
 		TableName:            &repo.EventsTable,
 		ConsistentRead:       aws.Bool(repo.consistentRead),
-		ProjectionExpression: aws.String("pk"),
+		ProjectionExpression: aws.String("pk, sk"),
 	}
 
 	if entityType != "" {
@@ -270,6 +272,11 @@ func (repo *Repository) enumerateEntityIDs(
 		for _, item := range page.Items {
 			pkAttr, ok := item["pk"].(*types.AttributeValueMemberS)
 			if !ok {
+				continue
+			}
+
+			if sk, ok := numAttr(item, "sk"); ok && sk < 0 {
+				// A head item says nothing about its entity's existence.
 				continue
 			}
 

@@ -99,10 +99,11 @@ func (repo *Repository) StreamEntityHeads(
 // headSeqFromItem returns the sequence an event-log row contributes to its entity's head. An event
 // row (sk >= 1) contributes its sk; a snapshot row (sk = 0) contributes its recorded eventSeq so a
 // compacted stream still reports the sequence its snapshot covers. It returns false for rows that
-// carry neither (defensive — should not occur in a well-formed log).
+// carry neither (defensive — should not occur in a well-formed log). A head item (sk = -1, ADR 0007)
+// contributes nothing: it is derived from the log, not part of it.
 func headSeqFromItem(item map[string]types.AttributeValue) (evt.EventSequence, bool) {
 	sk, ok := numAttr(item, "sk")
-	if !ok {
+	if !ok || sk < 0 {
 		return 0, false
 	}
 

@@ -170,9 +170,10 @@ pub(crate) enum Retry {
     /// Run the command again after a delay, but return the error when attempts run out: a
     /// transient backend failure or an ambiguous write says nothing about the state going stale.
     Transient,
-    /// Another writer moved state the attempt read or wrote (an event put, a floor or snapshot
-    /// condition, a continuity check, an engine-filled fence). Run the command again after a
-    /// delay, and record a stale-fence rejection when attempts run out.
+    /// Another writer moved state the attempt read or wrote (a head update, an event put, a
+    /// snapshot condition, an engine-filled fence). Run the command again after a delay, and
+    /// record a stale-fence rejection when attempts run out. Stream head drift is not one of
+    /// these: it is `Never` retried and never recorded.
     Conflict,
 }
 
@@ -191,6 +192,10 @@ impl Retry {
                 ..
             } => Self::Conflict,
             Error::Transient(_) | Error::AmbiguousWrite { .. } => Self::Transient,
+            // Stream head drift says the log is damaged, not that a decision went stale: it is
+            // returned at once, never retried and never exhausted into a stale-fence rejection.
+            // A table that is not migrated stays that way until an operator migrates it.
+            Error::StreamHeadDrift { .. } | Error::StreamHeadsNotMigrated => Self::Never,
             _ => Self::Never,
         }
     }
@@ -316,6 +321,29 @@ mod tests {
             Failed::committing(Error::Handler("boom".into())).retry(),
             Retry::Never
         );
+    }
+
+    #[test]
+    fn drift_and_a_table_that_is_not_migrated_are_never_retried() {
+        use crate::Error;
+        use crate::ids::{EntityId, EventSequence};
+
+        let drift = || Error::StreamHeadDrift {
+            entity_id: EntityId::new("e"),
+            stored: Some(EventSequence(2)),
+            derived: EventSequence(3),
+        };
+
+        for failed in [
+            Failed::committing(drift()),
+            Failed::deciding(drift()),
+            Failed::internal(drift()),
+            Failed::committing(Error::StreamHeadsNotMigrated),
+            Failed::deciding(Error::StreamHeadsNotMigrated),
+        ] {
+            assert_eq!(failed.retry(), Retry::Never, "{}", failed.error);
+            assert!(!failed.error.is_retryable() && !failed.error.is_conflict());
+        }
     }
 
     #[test]

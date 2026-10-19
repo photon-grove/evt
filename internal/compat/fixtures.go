@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -53,6 +54,11 @@ type ScenarioExpectation struct {
 	DynamoItems      []map[string]any `json:"dynamoItems"`
 	SNSMessages      []string         `json:"snsMessages"`
 
+	// Head is the stream's head item value (ADR 0007), or null when the stream has no head item.
+	// DynamoDB stores it as the item at sk = -1 (also in DynamoItems); PostgreSQL stores it in the
+	// {events}__evt_stream_heads table.
+	Head *int64 `json:"head"`
+
 	// Siblings records every other stream a scenario touches outside its primary partition
 	// (transactional sibling streams, fenced read-only streams), ordered by suffix. A stream a
 	// scenario fences but never writes is recorded too, as empty.
@@ -89,6 +95,7 @@ type SiblingExpectation struct {
 	Events      []string         `json:"events"`
 	Snapshot    *string          `json:"snapshot"`
 	DynamoItems []map[string]any `json:"dynamoItems"`
+	Head        *int64           `json:"head"`
 }
 
 // ForRun rewrites the expectation's entity IDs from the fixture run to another run.
@@ -304,13 +311,17 @@ func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) 
 	repo := dynamo.NewRepository(fake, fakeTable)
 
 	if scenario.Outcomes {
-		return NewOutcomeRunner(repo, scenario, FixtureRun), fake, repo
+		runner := NewOutcomeRunner(repo, scenario, FixtureRun)
+		runner.BypassHead = DynamoBypassHead(fake, fakeTable)
+
+		return runner, fake, repo
 	}
 
 	return Runner{
 		Store:            snapshots.NewStore(repo, scenario.SnapshotInterval),
 		Repo:             repo,
 		SnapshotInterval: scenario.SnapshotInterval,
+		BypassHead:       DynamoBypassHead(fake, fakeTable),
 	}, fake, repo
 }
 
@@ -473,10 +484,13 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 		expectation.DynamoItems = []map[string]any{}
 		expectation.SNSMessages = []string{}
 
+		expectation.Head = headOf(fake.Items(string(entityID)))
+
 		for _, item := range fake.Items(string(entityID)) {
 			expectation.DynamoItems = append(expectation.DynamoItems, DynamoItemJSON(item))
 
-			if sk, ok := item["sk"].(*types.AttributeValueMemberN); ok && sk.Value == "0" {
+			if sk, ok := item["sk"].(*types.AttributeValueMemberN); ok && (sk.Value == "0" || sk.Value == "-1") {
+				// The snapshot and the head item are not events, and consumers skip them.
 				continue
 			}
 
@@ -504,6 +518,7 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 				return fixtures, fmt.Errorf("%s: %w", scenario.Name, serr)
 			}
 			sibling.DynamoItems = []map[string]any{}
+			sibling.Head = headOf(fake.Items(string(siblingID)))
 			for _, item := range fake.Items(string(siblingID)) {
 				sibling.DynamoItems = append(sibling.DynamoItems, DynamoItemJSON(item))
 			}
@@ -514,6 +529,30 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 	}
 
 	return fixtures, nil
+}
+
+// headOf reads the head item (sk = -1) out of a partition's items, or nil when it has none.
+func headOf(items []map[string]types.AttributeValue) *int64 {
+	for _, item := range items {
+		sk, ok := item["sk"].(*types.AttributeValueMemberN)
+		if !ok || sk.Value != "-1" {
+			continue
+		}
+
+		head, ok := item["head"].(*types.AttributeValueMemberN)
+		if !ok {
+			continue
+		}
+
+		value, err := strconv.ParseInt(head.Value, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		return &value
+	}
+
+	return nil
 }
 
 // observeOutcomes records the outcome row of every command ID a scenario uses, ordered by ID.

@@ -10,9 +10,10 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// Delete removes serialized events from the events table by point-deleting each (pk, sk). It
-// performs NO snapshot-safety checks and can leave a stream unreplayable, so it is intended only
-// for local and staging fixtures (e.g. resetting test data).
+// Delete removes serialized events from the events table by point-deleting each (pk, sk), and the
+// head item of every stream it names (ADR 0007): a stream that keeps its head after its events are
+// gone could not be recreated. It performs NO snapshot-safety checks and can leave a stream
+// unreplayable, so it is intended only for local and staging fixtures (e.g. resetting test data).
 //
 // This method is compiled out of production builds: it is guarded by `//go:build !prod`, so a
 // binary built with `-tags prod` does not contain it and cannot call it. For principled,
@@ -42,7 +43,7 @@ func (repo *Repository) Delete(
 // Generate the TransactWriteItems needed to delete Events from the DynamoDB table
 // WARNING: This should only be used locally and in Staging
 func (repo *Repository) buildEventDeleteTransactions(serializedEvents []evt.SerializedEvent) ([]types.TransactWriteItem, error) {
-	transactions := make([]types.TransactWriteItem, 0, len(serializedEvents))
+	transactions := make([]types.TransactWriteItem, 0, len(serializedEvents)+1)
 
 	for _, event := range serializedEvents {
 		// Include it within a TransactWriteItem statement that ensures the given sequence
@@ -56,6 +57,21 @@ func (repo *Repository) buildEventDeleteTransactions(serializedEvents []evt.Seri
 		}
 
 		transactions = append(transactions, types.TransactWriteItem{Delete: &deleteItem})
+	}
+
+	// Each named stream's head item goes with its events, once, in first-seen order.
+	seen := make(map[evt.EntityID]struct{}, len(serializedEvents))
+
+	for _, event := range serializedEvents {
+		if _, done := seen[event.EntityID]; done {
+			continue
+		}
+
+		seen[event.EntityID] = struct{}{}
+		transactions = append(transactions, types.TransactWriteItem{Delete: &types.Delete{
+			TableName: &repo.EventsTable,
+			Key:       repo.headKey(event.EntityID),
+		}})
 	}
 
 	return transactions, nil

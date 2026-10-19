@@ -32,6 +32,32 @@ func Test_RepositoryConformance(t *testing.T) {
 
 			return err
 		},
+		BypassHead: func(_ context.Context, repo evt.Repository, event evt.SerializedEvent) error {
+			memRepo, ok := repo.(*mem.Repository)
+			if !ok {
+				return fmt.Errorf("unexpected repository type %T", repo)
+			}
+
+			mem.AppendWithoutHead(memRepo, event)
+
+			return nil
+		},
+		Unmigrate: func(ctx context.Context, repo evt.Repository) (func(), error) {
+			memRepo, ok := repo.(*mem.Repository)
+			if !ok {
+				return nil, fmt.Errorf("unexpected repository type %T", repo)
+			}
+
+			_, err := memRepo.Declare(ctx, func(manifest *evt.FeatureManifest) {
+				delete(manifest.Features, evt.FeatureStreamHeads)
+			})
+
+			return func() {
+				_, _ = memRepo.Declare(context.Background(), func(manifest *evt.FeatureManifest) { //nolint:errcheck // the in-memory declaration cannot fail
+					manifest.Features[evt.FeatureStreamHeads] = evt.StreamHeadsFormat
+				})
+			}, err
+		},
 	})
 }
 

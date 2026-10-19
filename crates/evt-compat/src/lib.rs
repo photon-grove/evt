@@ -13,5 +13,6 @@ pub mod scenario;
 
 pub use account::{Account, AccountCommand, AccountEvent};
 pub use scenario::{
-    Expectation, Outcome, OutcomeExpectation, Runner, Scenario, ScenarioFixtures, Scenarios, Step,
+    Expectation, HeadAccess, Outcome, OutcomeExpectation, Runner, Scenario, ScenarioFixtures,
+    Scenarios, Step,
 };

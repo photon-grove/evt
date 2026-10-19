@@ -43,6 +43,10 @@ const (
 	ResultCompacted = "compacted"
 	ResultUncovered = "uncovered"
 
+	// ResultDrift is *evt.StreamHeadDriftError (Error::StreamHeadDrift): a stream's head item
+	// disagrees with its log (ADR 0007).
+	ResultDrift = "drift"
+
 	// Outcome-store results (ADR 0004, C3/C4).
 	ResultReuse     = "reuse"     // IdempotencyKeyReuse
 	ResultIDTooLong = "idTooLong" // CommandIdTooLong, before any write
@@ -105,6 +109,12 @@ type Step struct {
 	// accepted outcome carrying Response.
 	Identity *Identity `json:"identity,omitempty"`
 	Response string    `json:"response,omitempty"`
+
+	// Snapshot and EventSequence drive putSnapshot steps: an out-of-band snapshot write of the
+	// stream named by Suffix (the primary stream when empty), with snapshot sequence
+	// Snapshot.Sequence covering events through EventSequence.
+	Snapshot      *TransactionSnapshot `json:"snapshot,omitempty"`
+	EventSequence *int64               `json:"eventSequence,omitempty"`
 }
 
 // Identity is the command identity of an outcomeOnly step: its type string and payload object.
@@ -226,6 +236,11 @@ type Runner struct {
 	// to the table: a bare "c1" would collide across scenarios and across runs.
 	Run      string
 	Scenario string
+
+	// BypassHead appends an event to the backend's log without maintaining the stream's head item:
+	// the writer a head-aware build must detect. It backs the appendRawBypassingHead step and is
+	// set by the harness for each backend; nil means the backend cannot be bypassed.
+	BypassHead func(ctx context.Context, event evt.SerializedEvent) error
 }
 
 // metadata builds a step's metadata. On an outcomes runner the command ID is scoped to the run and
@@ -287,6 +302,10 @@ func (r Runner) Execute(ctx context.Context, entityID evt.EntityID, step Step) (
 		return r.execute(ctx, entityID, step)
 	case "appendRaw":
 		return r.appendRaw(ctx, entityID, step)
+	case "appendRawBypassingHead":
+		return r.appendRawBypassingHead(ctx, entityID, step)
+	case "putSnapshot":
+		return r.putSnapshot(ctx, entityID, step)
 	case "conflictProbe":
 		return r.conflictProbe(ctx, entityID, step)
 	case "compact":
@@ -352,6 +371,81 @@ func (r Runner) appendRaw(ctx context.Context, entityID evt.EntityID, step Step)
 	}
 
 	return r.commitRaw(ctx, entityID, current+1, *step.Event, step)
+}
+
+// appendRawBypassingHead writes the next event of a stream straight to the backend, as a writer that
+// does not maintain the stream's head item would, leaving the head one behind the log.
+func (r Runner) appendRawBypassingHead(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
+	if step.Event == nil {
+		return Outcome{}, errors.New("appendRawBypassingHead step has no event")
+	}
+
+	if r.BypassHead == nil {
+		return Outcome{}, errors.New("the backend has no way to bypass the head item")
+	}
+
+	entityID = transactionID(entityID, step.Suffix)
+
+	current, err := r.sequence(ctx, entityID)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	sequence := current + 1
+	event := evt.SerializedEvent{
+		ID:         evt.GetEventID(entityID, sequence),
+		Sequence:   sequence,
+		Type:       step.Event.Type,
+		Version:    step.Event.Version,
+		EntityID:   entityID,
+		EntityType: AccountType,
+		Payload:    []byte(step.Event.Payload),
+		Metadata:   StepMetadata(step),
+	}
+
+	if err := r.BypassHead(ctx, event); err != nil {
+		return Outcome{}, err
+	}
+
+	return Outcome{Result: ResultOK, Events: 1}, nil
+}
+
+// snapshotWriter is the out-of-band snapshot write the DynamoDB and PostgreSQL repositories offer.
+type snapshotWriter interface {
+	PutSnapshot(
+		ctx context.Context,
+		entityType evt.EntityType,
+		entityID evt.EntityID,
+		payload []byte,
+		snapshotSequence evt.EventSequence,
+		eventSequence evt.EventSequence,
+	) error
+}
+
+// putSnapshot writes a snapshot outside a commit. A snapshot ahead of the stream's head is
+// refused as drift; a regressing one is a silent no-op.
+func (r Runner) putSnapshot(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
+	if step.Snapshot == nil || step.EventSequence == nil {
+		return Outcome{}, errors.New("putSnapshot step needs a snapshot and an eventSequence")
+	}
+
+	writer, ok := r.Repo.(snapshotWriter)
+	if !ok {
+		return Outcome{}, fmt.Errorf("repository %T cannot write snapshots outside a commit", r.Repo)
+	}
+
+	entityID = transactionID(entityID, step.Suffix)
+
+	err := writer.PutSnapshot(ctx, AccountType, entityID, []byte(step.Snapshot.Payload),
+		evt.EventSequence(step.Snapshot.Sequence), evt.EventSequence(*step.EventSequence))
+	if outcome, handled := classify(err); handled {
+		return outcome, nil
+	}
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	return Outcome{Result: ResultOK}, nil
 }
 
 func (r Runner) conflictProbe(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {
@@ -522,6 +616,8 @@ func classify(err error) (Outcome, bool) {
 
 	var rejected *RejectedError
 	switch {
+	case evt.IsStreamHeadDriftErr(err):
+		return Outcome{Result: ResultDrift}, true
 	case errors.As(err, &rejected):
 		return Outcome{Result: ResultRejected}, true
 	case evt.IsDuplicateCommandErr(err):

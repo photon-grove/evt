@@ -15,9 +15,9 @@
 
 use std::process::ExitCode;
 
-use evt_compat::drivers;
+use evt_compat::drivers::{self, DynamoHeads, PostgresHeads};
 use evt_compat::scenario::{Expectation, WRITER};
-use evt_compat::{Runner, ScenarioFixtures, Scenarios};
+use evt_compat::{HeadAccess, Runner, ScenarioFixtures, Scenarios};
 use futures_core::Stream;
 use photon_evt::dynamodb::DynamoRepository;
 use photon_evt::postgres::PostgresRepository;
@@ -82,7 +82,12 @@ async fn connect(backend: &str) -> Result<Backend, BoxError> {
     }
 }
 
-async fn step<R: Repository>(repository: R, run: &str, index: usize) -> Result<Failures, BoxError> {
+async fn step<R: Repository, H: HeadAccess + Clone + 'static>(
+    repository: R,
+    heads: H,
+    run: &str,
+    index: usize,
+) -> Result<Failures, BoxError> {
     let scenarios = Scenarios::load()?;
     let mut failures = Vec::new();
 
@@ -91,7 +96,8 @@ async fn step<R: Repository>(repository: R, run: &str, index: usize) -> Result<F
             continue;
         };
 
-        let runner = Runner::for_scenario(&repository, scenario, run);
+        let runner =
+            Runner::for_scenario(&repository, scenario, run).with_head_access(heads.clone());
         let outcome = runner.execute(&scenario.entity_id(run), step).await?;
 
         if outcome == step.expect {
@@ -123,11 +129,12 @@ fn check<T: PartialEq + std::fmt::Debug>(
 
 async fn verify_common<R: Repository>(
     repository: &R,
+    heads: impl HeadAccess + 'static,
     expected: &Expectation,
     snapshot_interval: usize,
     failures: &mut Failures,
 ) -> Result<(), BoxError> {
-    let runner = Runner::new(repository, snapshot_interval);
+    let runner = Runner::new(repository, snapshot_interval).with_head_access(heads);
     let observed = runner
         .observe(&expected.name, &EntityId::new(&expected.entity_id))
         .await?;
@@ -163,6 +170,8 @@ async fn verify_common<R: Repository>(
         &observed.sns_messages,
         &expected.sns_messages,
     );
+    // The stream's head: its `sk = -1` item on DynamoDB, its row in the heads table on PostgreSQL.
+    check(failures, name, "head", observed.head, expected.head);
 
     // Every other stream the scenario touches: written siblings and fenced read-only streams.
     let sibling_ids: Vec<EntityId> = expected
@@ -196,6 +205,7 @@ async fn verify_common<R: Repository>(
             &observed.snapshot,
             &wanted.snapshot,
         );
+        check(failures, name, &what("head"), observed.head, wanted.head);
     }
 
     Ok(())
@@ -278,6 +288,7 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
             Backend::Dynamo(repository) => {
                 verify_common(
                     repository,
+                    DynamoHeads::of(repository),
                     &expected,
                     scenario.snapshot_interval,
                     &mut failures,
@@ -337,6 +348,7 @@ async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
             Backend::Postgres(repository) => {
                 verify_common(
                     repository,
+                    PostgresHeads::default_tables(repository.pool().clone()),
                     &expected,
                     scenario.snapshot_interval,
                     &mut failures,
@@ -455,8 +467,16 @@ async fn run(args: Args) -> Result<Failures, BoxError> {
     let backend = connect(&args.backend).await?;
 
     match (args.command.as_str(), backend) {
-        ("step", Backend::Dynamo(repository)) => step(repository, &args.run, args.index).await,
-        ("step", Backend::Postgres(repository)) => step(repository, &args.run, args.index).await,
+        ("step", Backend::Dynamo(repository)) => {
+            let heads = DynamoHeads::of(&repository);
+
+            step(repository, heads, &args.run, args.index).await
+        }
+        ("step", Backend::Postgres(repository)) => {
+            let heads = PostgresHeads::default_tables(repository.pool().clone());
+
+            step(repository, heads, &args.run, args.index).await
+        }
         ("verify", backend) => verify(backend, &args.run).await,
         ("enumerate", Backend::Dynamo(repository)) => enumerate(&repository, &args.run).await,
         ("enumerate", Backend::Postgres(repository)) => enumerate(&repository, &args.run).await,

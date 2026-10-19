@@ -8,35 +8,31 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// checkHistoryDependent validates supported features and refuses compaction for an entity type
-// declared history-dependent in the store's durable feature manifest. The refusal holds in every
-// process that opens the log, whether or not it registered the projector or configured a feature
-// marker. A log with no marker row
-// declares nothing and compaction proceeds as it always has.
-func (repo *Repository) checkHistoryDependent(ctx context.Context, tx pgx.Tx, entityType evt.EntityType) error {
+// checkCompactionManifest validates the store's durable feature manifest under the shared feature
+// lock: the declared features must be supported, and the store must declare stream-heads. A store
+// that has not been migrated is refused (*evt.StreamHeadsNotMigratedError): compaction never touches
+// the head row, but it is a write path of a store whose streams have none yet.
+func (repo *Repository) checkCompactionManifest(ctx context.Context, tx pgx.Tx) (*evt.FeatureManifest, error) {
 	if err := repo.features.lockShared(ctx, tx); err != nil {
-		return err
+		return nil, err
 	}
 
 	manifest, err := repo.features.readManifestTx(ctx, tx)
 	if err != nil {
-		return err
-	}
-	if manifest == nil {
-		return nil
+		return nil, err
 	}
 
-	if err := manifest.Validate(repo.features.supported); err != nil {
-		return err
-	}
-
-	for _, declared := range manifest.HistoryDependent {
-		if declared == entityType {
-			return evt.NewHistoryDependentProjectionError(entityType)
+	if manifest != nil {
+		if err := manifest.Validate(repo.features.supported); err != nil {
+			return nil, err
 		}
 	}
 
-	return nil
+	if err := evt.RequireStreamHeads(manifest); err != nil {
+		return nil, err
+	}
+
+	return manifest, nil
 }
 
 // CompactBelow deletes events for the entity whose sequence is in [1, throughSequence], but only
@@ -62,33 +58,42 @@ func (repo *Repository) CompactBelow(
 		return 0, nil
 	}
 
-	snapshot, err := repo.GetSnapshot(ctx, entityID)
-	if err != nil {
-		return 0, err
-	}
-
-	if snapshot == nil {
-		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
-	}
-
-	if snapshot.EventSequence < throughSequence {
-		return 0, fmt.Errorf(
-			"%w: entity %s snapshot covers through event %d but compaction was requested through %d",
-			evt.ErrCompactionUncovered, entityID, snapshot.EventSequence, throughSequence,
-		)
-	}
-
 	query := fmt.Sprintf(
 		`DELETE FROM %s WHERE entity_id = $1 AND sequence >= 1 AND sequence <= $2`,
 		repo.eventsTable,
 	)
 
 	deleted := 0
-	err = repo.inTx(ctx, func(tx pgx.Tx) error {
+	err := repo.inTx(ctx, func(tx pgx.Tx) error {
 		// Hold the shared feature lock across validation and every delete: a completed
-		// history-dependent declaration must fence any later deletion.
-		if checkErr := repo.checkHistoryDependent(ctx, tx, snapshot.EntityType); checkErr != nil {
-			return checkErr
+		// history-dependent declaration must fence any later deletion. A store that has not been
+		// migrated to stream heads is refused before anything else is read.
+		manifest, err := repo.checkCompactionManifest(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		snapshot, err := repo.getSnapshot(ctx, tx, entityID)
+		if err != nil {
+			return err
+		}
+
+		if snapshot == nil {
+			return fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
+		}
+
+		if snapshot.EventSequence < throughSequence {
+			return fmt.Errorf(
+				"%w: entity %s snapshot covers through event %d but compaction was requested through %d",
+				evt.ErrCompactionUncovered, entityID, snapshot.EventSequence, throughSequence,
+			)
+		}
+
+		// A history-dependent type's rebuild replays the commits compaction would delete.
+		for _, declared := range manifest.HistoryDependent {
+			if declared == snapshot.EntityType {
+				return evt.NewHistoryDependentProjectionError(snapshot.EntityType)
+			}
 		}
 
 		tag, deleteErr := tx.Exec(ctx, query, string(entityID), int64(throughSequence))

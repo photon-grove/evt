@@ -11,8 +11,8 @@ use crate::wire::dynamo as wire;
 
 impl EventLog for DynamoRepository {
     /// Each batch is one Scan page of events, in the table's order and not grouped by entity.
-    /// Pages the filter empties out are skipped, and so are inline snapshots (`sk = 0`) and the
-    /// reserved namespaces. Reads are strongly consistent when the repository is configured for
+    /// Pages the filter empties out are skipped, and so are every row below `sk = 1` (inline
+    /// snapshots at `sk = 0` and stream head items at `sk = -1`) and the reserved namespaces. Reads are strongly consistent when the repository is configured for
     /// it.
     fn stream_all_events(&self, filter: StreamFilter) -> impl Stream<Item = EventBatch> + Send {
         unfold(
@@ -88,9 +88,14 @@ async fn read_page(scan: &mut Scan<'_>) -> Result<Vec<crate::SerializedEvent>, c
     let mut events = Vec::new();
     for item in page.items() {
         let item = from_sdk_item(item);
-        if !wire::is_snapshot_item(&item) {
-            events.push(wire::event_from_item(&item)?);
+        // Only events are decoded: the snapshot (`sk = 0`) and a stream's head item (`sk = -1`,
+        // which an unfiltered scan returns because it has no `entityType`) are not events. A row
+        // with no readable sort key is left to the decoder, which refuses it.
+        if wire::sort_key(&item).is_some_and(|sk| sk < 1) {
+            continue;
         }
+
+        events.push(wire::event_from_item(&item)?);
     }
 
     Ok(events)

@@ -34,11 +34,18 @@ pub const FEATURES_ID: &str = "SYSTEM#FEATURES";
 /// The sort key of the feature-marker row.
 pub const FEATURES_SORT_KEY: i64 = 0;
 
+/// The feature name a table declares once every stream has a head item (ADR 0007, C12).
+pub const STREAM_HEADS_FEATURE: &str = "stream-heads";
+
+/// The stored-format version of [`STREAM_HEADS_FEATURE`] this build reads and writes.
+pub const STREAM_HEADS_VERSION: i64 = 1;
+
 /// The `(name, stored-format version)` pairs this build of the crate models. A writer refuses a
 /// table whose manifest declares anything else. The extensions this spec defines (`journal`,
 /// `journal-compaction`) are Rust-first and land behind feature flags in later releases, so this
-/// build supports none yet.
-pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[];
+/// build models only `stream-heads`, which every writer here also *requires*: see
+/// [`validate_marker_for_write`].
+pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[(STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION)];
 
 /// Reports whether an entity ID falls in a reserved namespace: a case-sensitive byte prefix of
 /// [`SYSTEM_PREFIX`] or [`COMMAND_OUTCOME_PREFIX`].
@@ -126,6 +133,18 @@ impl FeatureManifest {
         self.retention.contains(entity_type.as_str())
     }
 
+    /// Reports whether the manifest declares [`STREAM_HEADS_FEATURE`] at [`STREAM_HEADS_VERSION`].
+    pub fn declares_stream_heads(&self) -> bool {
+        self.features.get(STREAM_HEADS_FEATURE) == Some(&STREAM_HEADS_VERSION)
+    }
+
+    /// Declares [`STREAM_HEADS_FEATURE`] at [`STREAM_HEADS_VERSION`]. The usual way to apply it is
+    /// [`FeatureMarker::declare_stream_heads`], which also bumps the manifest version.
+    pub fn declare_stream_heads(&mut self) {
+        self.features
+            .insert(STREAM_HEADS_FEATURE.to_owned(), STREAM_HEADS_VERSION);
+    }
+
     /// Refuses the manifest when it declares a `(name, formatVersion)` pair this build does not
     /// support.
     pub fn validate_supported(&self) -> Result<(), Error> {
@@ -190,17 +209,28 @@ pub fn marker_matches(validated: CachedMarker, observed: Option<&FeatureManifest
     }
 }
 
-/// Validates a freshly observed manifest for a writer and returns the state to cache. A manifest
-/// declaring an unsupported `(name, formatVersion)` pair refuses the writer.
-pub fn validate_marker(observed: Option<&FeatureManifest>) -> Result<ValidatedMarker, Error> {
-    match observed {
-        None => Ok(ValidatedMarker::Absent),
-        Some(manifest) => {
-            manifest.validate_supported()?;
+/// Validates a freshly observed manifest for a *write path* (a commit, a snapshot write, or
+/// compaction) and returns the state to cache. On top of [`validate_marker`] it requires the table
+/// to declare `stream-heads` at format version 1 (ADR 0007): a missing row or a row without the
+/// feature is [`Error::StreamHeadsNotMigrated`]. A manifest that declares a pair this build does
+/// not support is refused first, with [`Error::UnsupportedFeature`].
+///
+/// A backend that finds the feature missing may declare it itself, but only on a table it has
+/// confirmed holds no data (see [`FeatureMarker::declare_stream_heads`] for the unconditional
+/// declaration a migration performs).
+pub fn validate_marker_for_write(
+    observed: Option<&FeatureManifest>,
+) -> Result<ValidatedMarker, Error> {
+    let Some(manifest) = observed else {
+        return Err(Error::StreamHeadsNotMigrated);
+    };
 
-            Ok(ValidatedMarker::Version(manifest.version))
-        }
+    manifest.validate_supported()?;
+    if !manifest.declares_stream_heads() {
+        return Err(Error::StreamHeadsNotMigrated);
     }
+
+    Ok(ValidatedMarker::Version(manifest.version))
 }
 
 /// A repository that stores the feature-marker row ([`FEATURES_ID`]). Every backend implements it,
@@ -220,6 +250,19 @@ pub trait FeatureMarker: Send + Sync {
         &self,
         change: impl Fn(&mut FeatureManifest) + Send,
     ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Declares `stream-heads: 1` through the ordinary declaration transaction (one version
+    /// bump), **without** checking that the table is empty or that every stream has a head item.
+    ///
+    /// This is the hook for a migration tool (`evt-doctor migrate-heads`): after it has backfilled
+    /// and verified a head item for every stream, with every v0.8 writer stopped, it declares the
+    /// feature with this call. Calling it on a populated table whose streams have no head items
+    /// makes every later commit to those streams fail with [`Error::StreamHeadDrift`]. A fresh
+    /// table needs no call: the first writer declares the feature itself after confirming the
+    /// table is empty.
+    fn declare_stream_heads(&self) -> impl Future<Output = Result<(), Error>> + Send {
+        self.update_manifest(FeatureManifest::declare_stream_heads)
+    }
 }
 
 #[cfg(test)]
@@ -324,9 +367,53 @@ mod tests {
             Err(Error::UnsupportedFeature { feature, version }) if feature == "journal" && version == 1
         ));
 
-        // The declared version matters, not just the name: this build supports nothing, but a
-        // build that models a feature at version 1 still refuses version 2.
+        // The declared version matters, not just the name: this build models stream-heads at
+        // version 1 and refuses version 2.
         assert!(FeatureManifest::default().validate_supported().is_ok());
+
+        let mut future = FeatureManifest::default();
+        future.features.insert(STREAM_HEADS_FEATURE.to_owned(), 2);
+        assert!(matches!(
+            future.validate_supported(),
+            Err(Error::UnsupportedFeature { feature, version: 2 }) if feature == STREAM_HEADS_FEATURE
+        ));
+    }
+
+    #[test]
+    fn writers_require_the_stream_heads_feature() {
+        // No marker row, or a row without the feature: not migrated.
+        assert!(matches!(
+            validate_marker_for_write(None),
+            Err(Error::StreamHeadsNotMigrated)
+        ));
+
+        let mut manifest = FeatureManifest {
+            version: 2,
+            ..FeatureManifest::default()
+        };
+        assert!(matches!(
+            validate_marker_for_write(Some(&manifest)),
+            Err(Error::StreamHeadsNotMigrated)
+        ));
+
+        manifest.declare_stream_heads();
+        assert_eq!(
+            manifest.features_json(),
+            r#"{"stream-heads":1}"#,
+            "the canonical encoding of the declaration"
+        );
+        assert!(matches!(
+            validate_marker_for_write(Some(&manifest)),
+            Ok(ValidatedMarker::Version(2))
+        ));
+
+        // An unsupported pair is refused first, whatever else is missing.
+        let mut unsupported = FeatureManifest::default();
+        unsupported.features.insert("journal".into(), 1);
+        assert!(matches!(
+            validate_marker_for_write(Some(&unsupported)),
+            Err(Error::UnsupportedFeature { .. })
+        ));
     }
 
     #[test]

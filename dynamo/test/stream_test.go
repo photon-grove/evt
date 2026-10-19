@@ -212,7 +212,7 @@ func (s *RepositorySuite) Test_StreamEntitiesByQuery_EnumeratesAndQueries() {
 
 	// Enumeration scan: key-only, with a duplicate pk to exercise de-duplication.
 	s.client.On("Scan", mock.Anything, mock.MatchedBy(func(in *dynamodb.ScanInput) bool {
-		return in.ProjectionExpression != nil && *in.ProjectionExpression == "pk"
+		return in.ProjectionExpression != nil && *in.ProjectionExpression == "pk, sk"
 	}), mock.Anything).Return(&dynamodb.ScanOutput{
 		Items: []map[string]types.AttributeValue{pkItem("a"), pkItem("b"), pkItem("a")},
 	}, nil).Once()
