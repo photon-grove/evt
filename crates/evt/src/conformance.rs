@@ -812,6 +812,7 @@ impl Stream {
             events,
             snapshot,
             operations: Vec::new(),
+            views: Vec::new(),
             outcome: None,
         })
         .await
@@ -1813,6 +1814,7 @@ fn write<Op>(entity: &Stream, sequences: RangeInclusive<i64>) -> Commit<Op> {
         events: entity.events(sequences),
         snapshot: None,
         operations: Vec::new(),
+        views: Vec::new(),
         outcome: None,
     }
 }
@@ -2381,6 +2383,7 @@ async fn reserved_namespaces<R: Repository>(repo: &R) -> CaseResult {
                 events,
                 snapshot: None,
                 operations: Vec::new(),
+                views: Vec::new(),
                 outcome: None,
             })
             .await,
@@ -2587,6 +2590,7 @@ impl<R: Repository> Repository for Interfering<'_, R> {
                     events: competing,
                     snapshot: None,
                     operations: Vec::new(),
+                    views: Vec::new(),
                     outcome: None,
                 })
                 .await?;
@@ -7011,3 +7015,7 @@ async fn rejection_events_caller_fence<R: Repository>(repo: &R) -> CaseResult {
 
     Ok(())
 }
+
+mod views;
+
+pub use views::{CommitViewTarget, commit_view_cases};

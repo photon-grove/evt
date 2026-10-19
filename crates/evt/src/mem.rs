@@ -11,6 +11,9 @@ use crate::features::{self, CachedMarker, FeatureManifest, FeatureMarker, Valida
 use crate::heads::{self, Probe};
 use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::outcome::Outcome;
+use crate::projection::{
+    ProjectedView, ProjectorOperationError, ViewCondition, ViewOperationKind, ViewRow,
+};
 use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 
 /// An in-memory [`Repository`]. Clones share the same storage.
@@ -21,9 +24,17 @@ use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 /// conflict) exactly as on the live backends. A clone is an independent writer over the shared
 /// storage: it keeps its own feature-marker cache, like a second handle on a live backend, so a
 /// declaration one clone writes refuses the other on its next commit.
+///
+/// It always supports commit-wide view operations (v0.9, C7): rows live in a map keyed by
+/// `(pk, sk)` that clones share, read back with [`view`](MemRepository::view) and
+/// [`views`](MemRepository::views). A commit evaluates every operation's condition against the
+/// rows as they were before the commit, applies nothing unless all hold, and reports the first
+/// failed operation as [`Error::ProjectorOperation`].
 #[derive(Debug, Default)]
 pub struct MemRepository {
     streams: Arc<Mutex<BTreeMap<EntityId, Stream>>>,
+    /// The view rows, keyed by `(pk, sk)`. Shared with clones, like the streams.
+    views: Arc<Mutex<BTreeMap<(String, String), ViewRow>>>,
     /// The command-outcome rows, keyed by command ID. Shared with clones, like the streams.
     outcomes: Arc<Mutex<BTreeMap<CommandId, Outcome>>>,
     manifest: Arc<Mutex<Option<FeatureManifest>>>,
@@ -36,6 +47,7 @@ impl Clone for MemRepository {
     fn clone(&self) -> Self {
         Self {
             streams: self.streams.clone(),
+            views: self.views.clone(),
             outcomes: self.outcomes.clone(),
             manifest: self.manifest.clone(),
             validated: Mutex::new(*self.validated()),
@@ -135,6 +147,24 @@ impl MemRepository {
             .filter(|head| *head > EventSequence::ZERO)
     }
 
+    /// The view row at `(pk, sk)`, if a commit-wide view operation wrote one.
+    pub fn view(&self, pk: &str, sk: &str) -> Option<ViewRow> {
+        self.views_lock()
+            .get(&(pk.to_owned(), sk.to_owned()))
+            .cloned()
+    }
+
+    /// Every view row, ordered by `pk` then `sk` (bytewise).
+    pub fn views(&self) -> Vec<ViewRow> {
+        self.views_lock().values().cloned().collect()
+    }
+
+    fn views_lock(&self) -> MutexGuard<'_, BTreeMap<(String, String), ViewRow>> {
+        self.views
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn lock(&self) -> MutexGuard<'_, BTreeMap<EntityId, Stream>> {
         // A panic while holding the lock cannot leave a stream half-written: commits validate
         // before mutating. Recover the data rather than poisoning every later test.
@@ -197,12 +227,13 @@ impl MemRepository {
         Ok(())
     }
 
-    /// Writes the streams, fences, and outcome of one commit atomically. Streams are in
-    /// ascending entity-ID order, as `TransactionCommit::normalize` leaves them.
+    /// Writes the streams, fences, view operations, and outcome of one commit atomically. Streams
+    /// are in ascending entity-ID order, as `TransactionCommit::normalize` leaves them.
     fn write(
         &self,
         streams: &[&Commit<Infallible>],
         fences: &[ReadFence],
+        views: &[ProjectedView],
         outcome: Option<Outcome>,
         check_retention: impl FnOnce(Option<&FeatureManifest>) -> Result<(), Error>,
     ) -> Result<(), Error> {
@@ -297,6 +328,25 @@ impl MemRepository {
             return Err(error);
         }
 
+        // View conditions rank last: a projector failure is reported only when nothing ranked
+        // above it failed. Every condition is evaluated against the rows as they were before the
+        // commit, in order, and the first failure is reported. Nothing is applied unless all hold.
+        let mut rows = self.views_lock();
+        for view in views {
+            let present = rows.contains_key(&(view.op.pk.clone(), view.op.sk.clone()));
+            let held = match view.op.condition {
+                ViewCondition::None => true,
+                ViewCondition::Absent => !present,
+                ViewCondition::Present => present,
+            };
+
+            if !held {
+                return Err(Error::ProjectorOperation(Box::new(
+                    ProjectorOperationError::condition_failed(view),
+                )));
+            }
+        }
+
         for stream in streams.iter().filter(|stream| !stream.events.is_empty()) {
             let last_sequence = stream.events.last().map(|event| event.sequence);
             let held = stored.entry(stream.entity_id.clone()).or_default();
@@ -319,6 +369,19 @@ impl MemRepository {
             }
         }
 
+        for view in views {
+            let key = (view.op.pk.clone(), view.op.sk.clone());
+
+            match view.op.kind {
+                ViewOperationKind::Put => {
+                    rows.insert(key, ViewRow::of(&view.op));
+                }
+                ViewOperationKind::Delete => {
+                    rows.remove(&key);
+                }
+            }
+        }
+
         outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
 
         Ok(())
@@ -336,10 +399,18 @@ impl Repository for MemRepository {
         }
 
         // Budget parity: an oversized commit fails identically on every backend, before any
-        // write.
-        crate::repository::check_budget(commit.sizes(|_| None)?)?;
+        // write. View operations are sized by the shared rule.
+        let mut sizes = commit.sizes(|_| None)?;
+        sizes.extend(commit.view_sizes());
+        crate::repository::check_budget(sizes)?;
 
-        self.write(&[&commit], &[], commit.stored_outcome(), |_| Ok(()))
+        self.write(
+            &[&commit],
+            &[],
+            &commit.views,
+            commit.stored_outcome(),
+            |_| Ok(()),
+        )
     }
 
     async fn commit_transaction(&self, commit: TransactionCommit<Infallible>) -> Result<(), Error> {
@@ -351,13 +422,16 @@ impl Repository for MemRepository {
         }
 
         // Budget parity: an oversized commit fails identically on every backend.
-        crate::repository::check_budget(commit.sizes(|_| None)?)?;
+        let mut sizes = commit.sizes(|_| None)?;
+        sizes.extend(commit.view_sizes());
+        crate::repository::check_budget(sizes)?;
 
         let streams: Vec<&Commit<Infallible>> = commit.streams.iter().collect();
 
         self.write(
             &streams,
             &commit.fences,
+            &commit.views,
             commit.stored_outcome(),
             |manifest| commit.check_retention(manifest, |_| false),
         )
@@ -549,7 +623,9 @@ mod enumerate;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conformance::{Suite, feature_marker_cases, fresh_store_cases, outcome_cases};
+    use crate::conformance::{
+        Suite, commit_view_cases, feature_marker_cases, fresh_store_cases, outcome_cases,
+    };
 
     #[tokio::test]
     async fn conforms() {
@@ -559,6 +635,13 @@ mod tests {
             .with_head_fixtures(repository.clone())
             .run()
             .await;
+    }
+
+    #[tokio::test]
+    async fn conforms_to_commit_wide_views() {
+        let repository = MemRepository::new();
+
+        commit_view_cases(&repository, &repository.clone()).await;
     }
 
     #[tokio::test]
@@ -583,5 +666,291 @@ mod tests {
         // The clone shares the storage but keeps its own marker cache, so the cases see two
         // writers.
         feature_marker_cases(&first, &first.clone()).await;
+    }
+    // ----- commit-wide view rows (v0.9, C7) -----
+
+    use crate::projection::{CommitProjector, CommitView, ViewOperation};
+    use crate::{BoxError, ProjectedView};
+
+    fn event(id: &str, sequence: i64) -> SerializedEvent {
+        SerializedEvent {
+            id: format!("{id}:{sequence}").into(),
+            sequence: EventSequence(sequence),
+            event_type: "account:credited".into(),
+            version: crate::EventVersion(1),
+            entity_id: id.into(),
+            entity_type: "account".into(),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn view(operation: usize, op: ViewOperation) -> ProjectedView {
+        ProjectedView::new("projector", 0, operation, op)
+    }
+
+    #[tokio::test]
+    async fn view_rows_are_shared_with_clones_and_ordered_by_key_bytes() {
+        let repository = MemRepository::new();
+        let clone = repository.clone();
+
+        repository
+            .commit(Commit::new("a", vec![event("a", 1)]).with_views([
+                view(0, ViewOperation::put("b", "2", "id", "type", "{\"n\":2}")),
+                view(1, ViewOperation::put("B", "1", "", "", "{}")),
+                view(2, ViewOperation::put("b", "1", "", "", "{}")),
+            ]))
+            .await
+            .unwrap();
+
+        // Bytewise: "B" (0x42) sorts before "b" (0x62), then by sort key.
+        let keys: Vec<_> = clone
+            .views()
+            .into_iter()
+            .map(|row| (row.pk, row.sk))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("B".into(), "1".into()),
+                ("b".into(), "1".into()),
+                ("b".into(), "2".into())
+            ]
+        );
+
+        let row = clone.view("b", "2").unwrap();
+        assert_eq!(
+            (
+                row.entity_id.as_str(),
+                row.entity_type.as_str(),
+                row.payload.as_slice()
+            ),
+            ("id", "type", br#"{"n":2}"#.as_slice())
+        );
+        assert!(clone.view("b", "3").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_view_condition_applies_nothing_of_the_commit() {
+        let repository = MemRepository::new();
+        repository
+            .commit(
+                Commit::new("a", vec![event("a", 1)])
+                    .with_views([view(0, ViewOperation::put("claims", "ada", "", "", "{}"))]),
+            )
+            .await
+            .unwrap();
+
+        // The first operation would overwrite and the third would write, but the second fails its
+        // condition: no row changes, no event is stored, and the second is the one named.
+        let result = repository
+            .commit_transaction(
+                TransactionCommit::new(vec![Commit::new("b", vec![event("b", 1)])]).with_views([
+                    view(0, ViewOperation::put("claims", "other", "", "", "{}")),
+                    view(
+                        1,
+                        ViewOperation::put("claims", "ada", "", "", "{}").if_absent(),
+                    ),
+                    view(2, ViewOperation::delete("claims", "missing").if_present()),
+                ]),
+            )
+            .await;
+
+        match result {
+            Err(Error::ProjectorOperation(failed)) => {
+                assert_eq!(
+                    (failed.operation, failed.reason.as_str()),
+                    (1, "ConditionalCheckFailed")
+                );
+            }
+            other => panic!("expected a projector operation failure, got {other:?}"),
+        }
+        assert_eq!(repository.views().len(), 1);
+        assert!(repository.events(&"b".into()).await.unwrap().is_empty());
+
+        // Conditions see the rows as they were before the commit: an unconditional put and an
+        // absent put of the same key cannot both be in one commit (the engine refuses it), so a
+        // delete and a put of different keys apply together.
+        repository
+            .commit(Commit::new("b", vec![event("b", 1)]).with_views([
+                view(0, ViewOperation::delete("claims", "ada").if_present()),
+                view(
+                    1,
+                    ViewOperation::put("claims", "grace", "", "", "{}").if_absent(),
+                ),
+            ]))
+            .await
+            .unwrap();
+        let keys: Vec<_> = repository.views().into_iter().map(|row| row.sk).collect();
+        assert_eq!(keys, ["grace"]);
+    }
+
+    #[tokio::test]
+    async fn a_stream_conflict_outranks_a_failed_view_condition_and_applies_nothing() {
+        let repository = MemRepository::new();
+        repository
+            .commit(
+                Commit::new("a", vec![event("a", 1)])
+                    .with_views([view(0, ViewOperation::put("claims", "ada", "", "", "{}"))]),
+            )
+            .await
+            .unwrap();
+
+        let result = repository
+            .commit(Commit::new("a", vec![event("a", 1)]).with_views([
+                view(0, ViewOperation::put("claims", "new", "", "", "{}")),
+                view(
+                    1,
+                    ViewOperation::put("claims", "ada", "", "", "{}").if_absent(),
+                ),
+            ]))
+            .await;
+
+        assert!(
+            matches!(&result, Err(error) if error.is_conflict()),
+            "{result:?}"
+        );
+        assert_eq!(repository.views().len(), 1);
+    }
+
+    struct Directory;
+
+    impl CommitProjector for Directory {
+        fn name(&self) -> &str {
+            "directory"
+        }
+
+        fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+            Ok(commit
+                .streams
+                .iter()
+                .map(|stream| {
+                    ViewOperation::put(
+                        "directory",
+                        stream.entity_id.as_str(),
+                        stream.entity_id.as_str(),
+                        stream.entity_type.as_str(),
+                        stream.state.clone(),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_projector_added_after_an_append_fails_the_commit() {
+        use crate::conformance::{Added, Ledger};
+        use crate::{Error, Metadata, Transaction};
+
+        let repository = MemRepository::new();
+        let mut tx = Transaction::new(&repository);
+        let mut ledger = tx.read::<Ledger>("late").await.unwrap();
+        tx.append(&mut ledger, vec![Added { amount: 1 }.into()])
+            .unwrap();
+
+        let tx = tx.with_commit_projector(std::sync::Arc::new(Directory));
+        let error = tx.commit(&Metadata::default()).await.unwrap_err();
+
+        assert!(matches!(error, Error::InvalidCommit(_)), "{error}");
+        assert!(repository.view("directory", "late").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_store_and_its_transactions_and_clones_share_their_commit_projectors() {
+        use crate::conformance::{Add, Added, Ledger};
+        use crate::{Metadata, Store, Transaction};
+
+        let repository = MemRepository::new();
+        let store = Store::<Ledger, _>::new(repository.clone(), ())
+            .with_snapshot_interval(0)
+            .with_commit_projector(std::sync::Arc::new(Directory));
+
+        // A clone of the store projects like the store.
+        store
+            .clone()
+            .execute("one", Add(1), Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.view("directory", "one").unwrap().payload,
+            br#"{"total":1,"entries":1}"#
+        );
+
+        // The store's transactions inherit the projectors.
+        let mut tx = store.transaction();
+        let mut ledger = tx.read::<Ledger>("two").await.unwrap();
+        tx.append(&mut ledger, vec![Added { amount: 5 }.into()])
+            .unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+        assert_eq!(
+            repository.view("directory", "two").unwrap().payload,
+            br#"{"total":5,"entries":1}"#
+        );
+
+        // A bare transaction takes its projectors from `with_commit_projector`, and a read-only
+        // stream is not in the commit view.
+        let mut tx =
+            Transaction::new(&repository).with_commit_projector(std::sync::Arc::new(Directory));
+        let mut ledger = tx.read::<Ledger>("three").await.unwrap();
+        tx.read::<Ledger>("one").await.unwrap();
+        tx.append(&mut ledger, vec![Added { amount: 7 }.into()])
+            .unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+        assert_eq!(
+            repository.view("directory", "three").unwrap().payload,
+            br#"{"total":7,"entries":1}"#
+        );
+        assert_eq!(
+            repository.view("directory", "one").unwrap().payload,
+            br#"{"total":1,"entries":1}"#,
+            "the fenced stream's row is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_operations_count_in_the_shared_budget() {
+        let repository = MemRepository::new();
+        let views = |count: usize, payload: usize| -> Vec<ProjectedView> {
+            (0..count)
+                .map(|index| {
+                    view(
+                        index,
+                        ViewOperation::put(
+                            "p",
+                            format!("row-{index:03}"),
+                            "",
+                            "",
+                            "x".repeat(payload),
+                        ),
+                    )
+                })
+                .collect()
+        };
+
+        let result = repository
+            .commit(Commit::new("a", vec![event("a", 1)]).with_views(views(98, 0)))
+            .await;
+        assert!(
+            matches!(result, Err(Error::CommitTooLarge { actions: 101, .. })),
+            "{result:?}"
+        );
+
+        let result = repository
+            .commit(Commit::new("a", vec![event("a", 1)]).with_views(views(12, 330_000)))
+            .await;
+        assert!(
+            matches!(result, Err(Error::CommitTooLarge { bytes, .. }) if bytes > 3_800_000),
+            "{result:?}"
+        );
+        assert!(
+            repository.views().is_empty()
+                && repository.events(&"a".into()).await.unwrap().is_empty()
+        );
+
+        repository
+            .commit(Commit::new("a", vec![event("a", 1)]).with_views(views(97, 0)))
+            .await
+            .unwrap();
+        assert_eq!(repository.views().len(), 97);
     }
 }

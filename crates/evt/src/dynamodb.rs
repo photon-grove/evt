@@ -31,6 +31,7 @@ use crate::heads::{self, Probe};
 use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::json;
 use crate::outcome::Outcome;
+use crate::projection::{ProjectedView, ProjectorOperationError, ViewCondition, ViewOperationKind};
 use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 use crate::wire::dynamo::{self as wire, AttributeValue, HeadAction, Item};
 
@@ -132,6 +133,8 @@ impl LoadedTtls {
 pub struct DynamoRepository {
     client: Client,
     table: String,
+    /// The table commit-wide view operations write to, when configured (v0.9, C7).
+    views_table: Option<String>,
     consistent_read: bool,
     scan_page_size: Option<i32>,
     retention: BTreeMap<EntityType, Duration>,
@@ -148,6 +151,7 @@ impl Clone for DynamoRepository {
         Self {
             client: self.client.clone(),
             table: self.table.clone(),
+            views_table: self.views_table.clone(),
             consistent_read: self.consistent_read,
             scan_page_size: self.scan_page_size,
             retention: self.retention.clone(),
@@ -166,6 +170,7 @@ impl DynamoRepository {
         Self {
             client,
             table: table.into(),
+            views_table: None,
             consistent_read: true,
             scan_page_size: None,
             retention: BTreeMap::new(),
@@ -173,6 +178,24 @@ impl DynamoRepository {
             validated_marker: Mutex::new(None),
             loaded_ttls: Mutex::new(LoadedTtls::default()),
         }
+    }
+
+    /// Writes commit-wide view operations (v0.9, C7) to `table`, in the same transaction as the
+    /// events. A put writes an item with `pk`, `sk`, `entityID`, `entityType`, and `payload` (all
+    /// strings, `attribute_not_exists(pk)` when the operation requires the row to be absent); a
+    /// delete removes the `(pk, sk)` key (`attribute_exists(pk)` when it requires the row to be
+    /// present). The table needs a string partition key `pk` and a string sort key `sk`. Without
+    /// one, a commit that carries view operations is refused with [`Error::ViewsNotConfigured`]
+    /// before any write.
+    #[must_use]
+    pub fn with_views_table(mut self, table: impl Into<String>) -> Self {
+        self.views_table = Some(table.into());
+        self
+    }
+
+    /// The views table, when one is configured.
+    pub fn views_table(&self) -> Option<&str> {
+        self.views_table.as_deref()
     }
 
     /// Uses `clock` instead of the system time to compute `ttl` expiries. For tests.
@@ -525,36 +548,105 @@ impl DynamoRepository {
             .build())
     }
 
+    /// The transaction actions of a commit's view operations, in order: a `Put` of the five-attribute
+    /// item, with `attribute_not_exists(pk)` when the operation requires the row to be absent, or a
+    /// `Delete` of the key, with `attribute_exists(pk)` when it requires the row to be present.
+    /// With no views table configured and views present it refuses with
+    /// [`Error::ViewsNotConfigured`], which the write entry points call before anything else.
+    fn view_items(&self, views: &[ProjectedView]) -> Result<Vec<TransactWriteItem>, Error> {
+        if views.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(table) = &self.views_table else {
+            return Err(Error::ViewsNotConfigured {
+                backend: "dynamodb",
+            });
+        };
+
+        views
+            .iter()
+            .map(|view| match view.op.kind {
+                ViewOperationKind::Put => put(
+                    table,
+                    wire::view_operation_item(&view.op)?,
+                    (view.op.condition == ViewCondition::Absent)
+                        .then_some(wire::VIEW_ABSENT_CONDITION),
+                    &[],
+                ),
+                ViewOperationKind::Delete => {
+                    let delete = Delete::builder()
+                        .table_name(table)
+                        .key("pk", s(&view.op.pk))
+                        .key("sk", s(&view.op.sk))
+                        .set_condition_expression(
+                            (view.op.condition == ViewCondition::Present)
+                                .then(|| wire::VIEW_PRESENT_CONDITION.to_owned()),
+                        )
+                        .build()
+                        .map_err(Error::backend)?;
+
+                    Ok(TransactWriteItem::builder().delete(delete).build())
+                }
+            })
+            .collect()
+    }
+
     /// Builds a single-stream commit's transaction items in the pinned order: the feature-marker
-    /// check, the projector operations, then the stream's group (see
+    /// check, the projector operations (the legacy backend operations, then the commit-wide view
+    /// operations in `view_items`), then the stream's group (see
     /// [`stream_group`](Self::stream_group)). An outcome-only commit has no group; the outcome put
     /// is appended by the caller. The layout records each item's index so a failed commit is
     /// classified by the item that failed.
-    fn transaction_items(
+    fn transaction_items_with(
         &self,
         commit: &Commit<TransactWriteItem>,
         validated: ValidatedMarker,
+        view_items: &[TransactWriteItem],
     ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
-        let mut items = Vec::with_capacity(commit.events.len() + commit.operations.len() + 3);
+        let mut items = Vec::with_capacity(
+            commit.events.len() + commit.operations.len() + view_items.len() + 3,
+        );
         let mut layout = TransactionLayout::new(commit.entity_id.clone());
 
         items.push(self.marker_check(validated)?);
-        items.extend(commit.operations.iter().cloned());
-        layout.operations = items.len() - 1;
+        // C10: the rebuild-lock check (`SYSTEM#REBUILD`) goes here, between the marker check and
+        // the projector operations (spec, Writes step 2). It is not emitted yet, so it is not
+        // budgeted; the change that starts emitting it adds it to the budget too.
+        self.push_projector_items(
+            commit.operations.iter().cloned(),
+            &commit.views,
+            view_items,
+            &mut items,
+            &mut layout,
+        );
         self.push_group(commit, &mut items, &mut layout)?;
 
         Ok((items, layout))
     }
 
+    /// [`transaction_items_with`](Self::transaction_items_with), building the view actions itself.
+    #[cfg(test)]
+    fn transaction_items(
+        &self,
+        commit: &Commit<TransactWriteItem>,
+        validated: ValidatedMarker,
+    ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
+        let view_items = self.view_items(&commit.views)?;
+
+        self.transaction_items_with(commit, validated, &view_items)
+    }
+
     /// Builds a multi-stream commit's transaction items in the pinned order: the feature-marker
-    /// check, the projector operations, then per written stream in bytewise stream-ID order its
+    /// check, the projector operations (legacy backend operations, then the commit-wide view
+    /// operations in `view_items`), then per written stream in bytewise stream-ID order its
     /// group (head update, event puts, snapshot put), then per fenced read-only stream its head
     /// check. The layout records each item's index so a failed commit is classified by the item
     /// that failed.
-    fn transaction_stream_items(
+    fn transaction_stream_items_with(
         &self,
         commit: &TransactionCommit<TransactWriteItem>,
         validated: ValidatedMarker,
+        view_items: &[TransactWriteItem],
     ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
         let mut items = Vec::new();
         let mut layout = TransactionLayout::new(commit.streams.first().map_or_else(
@@ -563,8 +655,14 @@ impl DynamoRepository {
         ));
 
         items.push(self.marker_check(validated)?);
-        items.extend(commit.operations.iter().cloned());
-        layout.operations = items.len() - 1;
+        // C10: the rebuild-lock check goes here (see `transaction_items_with`).
+        self.push_projector_items(
+            commit.operations.iter().cloned(),
+            &commit.views,
+            view_items,
+            &mut items,
+            &mut layout,
+        );
 
         for stream in &commit.streams {
             self.push_group(stream, &mut items, &mut layout)?;
@@ -579,6 +677,42 @@ impl DynamoRepository {
         }
 
         Ok((items, layout))
+    }
+
+    /// [`transaction_stream_items_with`](Self::transaction_stream_items_with), building the view
+    /// actions itself.
+    #[cfg(test)]
+    fn transaction_stream_items(
+        &self,
+        commit: &TransactionCommit<TransactWriteItem>,
+        validated: ValidatedMarker,
+    ) -> Result<(Vec<TransactWriteItem>, TransactionLayout), Error> {
+        let view_items = self.view_items(&commit.views)?;
+
+        self.transaction_stream_items_with(commit, validated, &view_items)
+    }
+
+    /// Appends the projector operations after the marker check, in the pinned order: the legacy
+    /// backend operations first, then the commit-wide view operations (declaration, then emission
+    /// order), and records where each sits. Both precede every written stream's group.
+    fn push_projector_items(
+        &self,
+        operations: impl Iterator<Item = TransactWriteItem>,
+        views: &[ProjectedView],
+        view_items: &[TransactWriteItem],
+        items: &mut Vec<TransactWriteItem>,
+        layout: &mut TransactionLayout,
+    ) {
+        items.extend(operations);
+        layout.operations = items.len() - 1;
+
+        layout.views = views
+            .iter()
+            .zip(view_items)
+            .enumerate()
+            .map(|(offset, (view, _))| (items.len() + offset, view.provenance()))
+            .collect();
+        items.extend(view_items.iter().cloned());
     }
 
     /// Builds the command-outcome put: the last action of every commit that records one, written
@@ -1080,12 +1214,36 @@ impl DynamoRepository {
             return error;
         }
 
-        // Only projector conditions failed, which reloading cannot fix.
+        // Rank 6: only projector operations failed, which reloading cannot fix. The first failed
+        // one in transaction order is named. A legacy backend operation precedes every view
+        // operation and maps to the legacy projector error as before; a view operation maps to a
+        // typed error when its cancellation reason is a condition, validation, or item-collection
+        // failure. `TransactionConflict` and throttling on a projector item are not projector
+        // failures: they keep their transient classification below.
         if failed_items(&codes, "ConditionalCheckFailed")
-            .next()
-            .is_some()
+            .any(|index| (1..=layout.operations).contains(&index))
         {
             return Error::Projector(Box::new(err));
+        }
+
+        let failed_view = layout.views.iter().find_map(|(index, view)| {
+            let code = codes.get(*index).copied().flatten()?;
+
+            matches!(
+                code,
+                "ConditionalCheckFailed" | "ValidationError" | "ItemCollectionSizeLimitExceeded"
+            )
+            .then(|| (view, code.to_owned()))
+        });
+        if let Some((view, code)) = failed_view {
+            // A failed condition is the operation's own doing; any other reason keeps the SDK's
+            // error as the backend's cause.
+            let cause: Option<BoxError> = (code != crate::projection::REASON_CONDITION_FAILED)
+                .then(|| Box::new(err) as BoxError);
+
+            return Error::ProjectorOperation(Box::new(ProjectorOperationError::for_view(
+                view, code, cause,
+            )));
         }
 
         // A concurrent transaction is reported on the item it collided with.
@@ -1094,7 +1252,7 @@ impl DynamoRepository {
             .and_then(|index| layout.entity_at(index))
             .unwrap_or_else(|| layout.fallback.clone());
 
-        classify_transaction_error(&entity, layout.operations, carries_outcome, err)
+        classify_transaction_error(&entity, layout.projector_items(), carries_outcome, err)
     }
 
     async fn query_events(
@@ -1318,18 +1476,22 @@ impl Repository for DynamoRepository {
         let outcome = commit.stored_outcome();
         let mut revalidations = 0;
 
+        // Views with nowhere to write them are refused before anything else, so they are never
+        // silently dropped.
+        let view_items = self.view_items(&commit.views)?;
+
         // The shared budget covers every item the transaction carries, with the projector
-        // operations sized exactly from the items this backend will write. It fails with
-        // CommitTooLarge before any write, identically on every backend.
+        // operations and view operations sized exactly from the items this backend will write. It
+        // fails with CommitTooLarge before any write, identically on every backend.
         let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
-        for operation in &commit.operations {
-            sizes.push(sdk_item_size(operation));
-        }
+        sizes.extend(commit.operations.iter().map(sdk_item_size));
+        sizes.extend(view_items.iter().map(sdk_item_size));
         crate::repository::check_budget(sizes)?;
 
         loop {
             let cached = self.ensure_manifest_validated().await?;
-            let (mut items, mut layout) = self.transaction_items(&commit, cached)?;
+            let (mut items, mut layout) =
+                self.transaction_items_with(&commit, cached, &view_items)?;
 
             // The outcome row is the last action. Its index is how a failed condition on it is
             // told apart from a stream's.
@@ -1352,7 +1514,7 @@ impl Repository for DynamoRepository {
                 }
                 Err(err) => {
                     let codes = cancellation_reasons(&err);
-                    if classify_cancellation(layout.operations, &codes)
+                    if classify_cancellation(layout.projector_items(), &codes)
                         == Some(Cancellation::Marker)
                     {
                         // The feature set changed under this writer: re-validate it, then
@@ -1403,6 +1565,17 @@ impl Repository for DynamoRepository {
 
         let outcome = commit.stored_outcome();
 
+        // Views with nowhere to write them are refused before anything else, so they are never
+        // silently dropped.
+        let view_items = self.view_items(&commit.views)?;
+
+        // The shared budget covers every item the transaction carries, projector operations and
+        // view operations included, and fails with CommitTooLarge before any request.
+        let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
+        sizes.extend(commit.operations.iter().map(sdk_item_size));
+        sizes.extend(view_items.iter().map(sdk_item_size));
+        crate::repository::check_budget(sizes)?;
+
         // Fences are refused for entity types this repository was configured to expire: it needs
         // no I/O, so it runs first. The durable manifest's retention set is checked in the loop,
         // and the refusal is the union of the two.
@@ -1424,17 +1597,12 @@ impl Repository for DynamoRepository {
                     .check_retention(manifest.as_ref(), |entity_type| self.retains(entity_type))?;
             }
 
-            let (mut items, mut layout) = self.transaction_stream_items(&commit, cached)?;
+            let (mut items, mut layout) =
+                self.transaction_stream_items_with(&commit, cached, &view_items)?;
             if let Some(outcome) = &outcome {
                 items.push(self.outcome_put(outcome)?);
                 layout.outcome = Some(items.len() - 1);
             }
-
-            let mut sizes = commit.sizes(|entity_type| self.ttl_for(entity_type))?;
-            for operation in &commit.operations {
-                sizes.push(sdk_item_size(operation));
-            }
-            crate::repository::check_budget(sizes)?;
 
             match self
                 .client
@@ -1882,8 +2050,13 @@ enum Probed {
 
 /// Where each kind of item sits in a transaction, for failure classification.
 struct TransactionLayout {
-    /// Number of projector operations, which start at index 1 after the marker check.
+    /// Number of legacy backend projector operations, which start at index 1 after the marker
+    /// check (and the rebuild-lock check, once C10 emits it).
     operations: usize,
+    /// The commit-wide view operations by item index, in transaction order, directly after the
+    /// legacy operations. Each is the view without its row data: provenance, kind, keys, and the
+    /// mapped error, enough to name it in an error.
+    views: Vec<(usize, ProjectedView)>,
     /// Each written stream's group, in transaction order.
     streams: Vec<StreamLayout>,
     /// Fences by their head-check item index, in transaction order.
@@ -1924,11 +2097,18 @@ impl TransactionLayout {
     fn new(fallback: EntityId) -> Self {
         Self {
             operations: 0,
+            views: Vec::new(),
             streams: Vec::new(),
             fences: Vec::new(),
             outcome: None,
             fallback,
         }
+    }
+
+    /// The number of projector items after the marker check: legacy backend operations, then view
+    /// operations.
+    fn projector_items(&self) -> usize {
+        self.operations + self.views.len()
     }
 
     /// The stream or fenced stream whose action sits at `index`, if it is one of theirs.
@@ -2638,10 +2818,19 @@ mod tests {
                 update.expression_attribute_values(),
                 update.expression_attribute_names(),
             )
+        } else if let Some(delete) = action.delete() {
+            assert!(delete.return_values_on_condition_check_failure().is_none());
+            (
+                json!({"operation": "Delete", "tableName": delete.table_name(),
+                "key": from_sdk_item(delete.key())}),
+                delete.condition_expression(),
+                delete.expression_attribute_values(),
+                delete.expression_attribute_names(),
+            )
         } else {
             let check = action
                 .condition_check()
-                .expect("only puts, updates, and checks");
+                .expect("only puts, updates, deletes, and checks");
             assert!(check.return_values_on_condition_check_failure().is_none());
             (
                 json!({"operation": "ConditionCheck", "tableName": check.table_name(),
@@ -2660,7 +2849,6 @@ mod tests {
         if let Some(names) = names {
             value["expressionAttributeNames"] = json!(names);
         }
-        assert!(action.delete().is_none());
 
         value
     }
@@ -2811,57 +2999,79 @@ mod tests {
     }
 
     /// Summarizes a transaction action the way the Go fixtures record it: operation, key, the
-    /// update expression of an `Update`, and the condition with its expression names and values.
+    /// update expression of an `Update`, and the condition with its expression names and values. An
+    /// action on the views table also names it (`"table": "views"`) and records its string sort key
+    /// as `skText`, with `sk` 0.
+    /// The views table the offline fixtures name.
+    const VIEWS_TABLE: &str = "views";
+
     fn action_summary(action: &TransactWriteItem) -> serde_json::Value {
         use serde_json::json;
 
-        let key_number = |item: &HashMap<String, sdk::AttributeValue>| {
-            item["sk"].as_n().unwrap().parse::<i64>().unwrap()
+        let key_of = |_: &str, item: &HashMap<String, sdk::AttributeValue>| {
+            let pk = item["pk"].as_s().unwrap().clone();
+
+            match &item["sk"] {
+                sdk::AttributeValue::N(number) => (pk, number.parse::<i64>().unwrap(), None),
+                sdk::AttributeValue::S(text) => (pk, 0, Some(text.clone())),
+                other => panic!("unexpected sort key {other:?}"),
+            }
         };
 
-        let (operation, key, update, condition, names, values) = if let Some(put) = action.put() {
-            (
-                "Put",
+        let (operation, table, key, update, condition, names, values) =
+            if let Some(put) = action.put() {
                 (
-                    put.item()["pk"].as_s().unwrap().clone(),
-                    key_number(put.item()),
-                ),
-                None,
-                put.condition_expression(),
-                put.expression_attribute_names(),
-                put.expression_attribute_values(),
-            )
-        } else if let Some(update) = action.update() {
-            (
-                "Update",
+                    "Put",
+                    put.table_name(),
+                    key_of(put.table_name(), put.item()),
+                    None,
+                    put.condition_expression(),
+                    put.expression_attribute_names(),
+                    put.expression_attribute_values(),
+                )
+            } else if let Some(update) = action.update() {
                 (
-                    update.key()["pk"].as_s().unwrap().clone(),
-                    key_number(update.key()),
-                ),
-                Some(update.update_expression()),
-                update.condition_expression(),
-                update.expression_attribute_names(),
-                update.expression_attribute_values(),
-            )
-        } else {
-            let check = action
-                .condition_check()
-                .expect("only puts, updates, and checks");
+                    "Update",
+                    update.table_name(),
+                    key_of(update.table_name(), update.key()),
+                    Some(update.update_expression()),
+                    update.condition_expression(),
+                    update.expression_attribute_names(),
+                    update.expression_attribute_values(),
+                )
+            } else if let Some(delete) = action.delete() {
+                (
+                    "Delete",
+                    delete.table_name(),
+                    key_of(delete.table_name(), delete.key()),
+                    None,
+                    delete.condition_expression(),
+                    delete.expression_attribute_names(),
+                    delete.expression_attribute_values(),
+                )
+            } else {
+                let check = action
+                    .condition_check()
+                    .expect("only puts, updates, deletes, and checks");
 
-            (
-                "ConditionCheck",
                 (
-                    check.key()["pk"].as_s().unwrap().clone(),
-                    key_number(check.key()),
-                ),
-                None,
-                Some(check.condition_expression()),
-                check.expression_attribute_names(),
-                check.expression_attribute_values(),
-            )
-        };
+                    "ConditionCheck",
+                    check.table_name(),
+                    key_of(check.table_name(), check.key()),
+                    None,
+                    Some(check.condition_expression()),
+                    check.expression_attribute_names(),
+                    check.expression_attribute_values(),
+                )
+            };
 
         let mut summary = json!({"operation": operation, "pk": key.0, "sk": key.1});
+        if table == VIEWS_TABLE {
+            summary["table"] = json!("views");
+        }
+        if let Some(text) = key.2 {
+            summary["skText"] = json!(text);
+        }
         if let Some(update) = update {
             summary["update"] = json!(update);
         }
@@ -2876,6 +3086,199 @@ mod tests {
         }
 
         summary
+    }
+
+    /// The commit-wide view operations a scenario step names (`projectors`), with `{id}` resolved to
+    /// the scenario's entity ID and keys padded with `x` to `pkPad` and `skPad`.
+    fn step_views(base: &str, step: &serde_json::Value) -> Vec<ProjectedView> {
+        use crate::projection::ViewOperation;
+
+        let scope = |value: &serde_json::Value| value.as_str().unwrap_or("").replace("{id}", base);
+        let pad = |mut text: String, size: u64| {
+            while (text.len() as u64) < size {
+                text.push('x');
+            }
+
+            text
+        };
+
+        let mut views = Vec::new();
+        for (index, projector) in step["projectors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (operation, item) in projector["operations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let pk = pad(scope(&item["pk"]), item["pkPad"].as_u64().unwrap_or(0));
+                let sk = pad(scope(&item["sk"]), item["skPad"].as_u64().unwrap_or(0));
+                let mut op = if item["op"] == "delete" {
+                    ViewOperation::delete(pk, sk)
+                } else {
+                    ViewOperation::put(
+                        pk,
+                        sk,
+                        scope(&item["entityId"]),
+                        scope(&item["entityType"]),
+                        scope(&item["payload"]).into_bytes(),
+                    )
+                };
+                op = match item["condition"].as_str() {
+                    Some("absent") => op.if_absent(),
+                    Some("present") => op.if_present(),
+                    _ => op,
+                };
+
+                views.push(ProjectedView::new(
+                    projector["name"].as_str().unwrap(),
+                    index,
+                    operation,
+                    op,
+                ));
+            }
+        }
+
+        views
+    }
+
+    /// The commit-wide view vectors Go recorded (`commitViews` in `feature-marker.json`): the exact
+    /// actions of a commit that carries view operations, in order, and the budgeted sizes (the
+    /// events, snapshots, head updates, and fences, then each view operation's size in emission
+    /// order). A view put counts its five attributes and a view delete its key and condition, and
+    /// the size is the size of the action built.
+    #[test]
+    fn commit_view_actions_and_sizes_match_the_go_vectors() {
+        use serde_json::Value;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compat/fixtures/feature-marker.json");
+        let fixture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let cases = fixture["commitViews"].as_array().unwrap();
+        assert!(
+            cases.len() >= 2,
+            "the vectors cover multi- and single-stream commits"
+        );
+
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let request = &case["request"];
+            let expected = case["output"].as_array().unwrap();
+            let events_table = request["eventsTable"].as_str().unwrap();
+            let views_table = request["viewsTable"].as_str().unwrap();
+
+            let mut repository = offline_repository().with_views_table(views_table);
+            repository.table = events_table.into();
+
+            // The events are the stream-head vectors' fixed event: the metadata and payload of
+            // the first event put Go recorded.
+            let events_put = |sequence_is_zero: bool| {
+                expected.iter().find(|action| {
+                    action["operation"] == "Put"
+                        && action["tableName"] == events_table
+                        && (action["item"]["sk"]["N"] == "0") == sequence_is_zero
+                })
+            };
+            let sample =
+                &events_put(false).unwrap_or_else(|| panic!("{name}: an event put"))["item"];
+            let text = |key: &str| sample[key]["S"].as_str().unwrap().to_owned();
+            let snapshot_payload = events_put(true)
+                .map(|action| action["item"]["payload"]["S"].as_str().unwrap().to_owned());
+
+            let streams = request["streams"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|stream| {
+                    let id = EntityId::new(stream["entityId"].as_str().unwrap());
+                    let entity_type = stream["entityType"].as_str().unwrap();
+                    let first = stream["first"].as_i64().unwrap();
+                    let events = (first..first + stream["count"].as_i64().unwrap())
+                        .map(|sequence| SerializedEvent {
+                            id: crate::EventId::for_event(&id, EventSequence(sequence)),
+                            sequence: EventSequence(sequence),
+                            event_type: text("type").into(),
+                            version: crate::EventVersion(1),
+                            entity_id: id.clone(),
+                            entity_type: entity_type.into(),
+                            payload: text("payload").into_bytes(),
+                            metadata: serde_json::from_str(&text("metadata")).unwrap(),
+                        })
+                        .collect();
+                    let mut commit = Commit::new(id, events);
+                    if let Some(sequence) = stream["snapshotSequence"].as_i64() {
+                        commit = commit.with_snapshot(crate::NewSnapshot::new(
+                            entity_type,
+                            EventSequence(sequence),
+                            snapshot_payload.clone().unwrap().into_bytes(),
+                        ));
+                    }
+
+                    commit
+                })
+                .collect();
+            let mut commit = TransactionCommit::new(streams);
+            commit.fences = request["fences"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|fence| {
+                    crate::ReadFence::new(
+                        fence["entityId"].as_str().unwrap(),
+                        "account",
+                        EventSequence(fence["head"].as_i64().unwrap()),
+                        crate::FenceProvenance::Engine,
+                    )
+                })
+                .collect();
+            commit.views = step_views("", request);
+            commit.normalize().unwrap();
+
+            let (items, layout) = repository
+                .transaction_stream_items(&commit, ValidatedMarker::Version(1))
+                .unwrap();
+            let actual: Vec<_> = items.iter().map(fixture_action).collect();
+            assert_eq!(serde_json::Value::Array(actual), case["output"], "{name}");
+            assert_eq!(
+                layout.views.len(),
+                commit.views.len(),
+                "{name}: view layout"
+            );
+
+            // The budget: the non-view actions in any order, then the views in emission order,
+            // each the size of the action built.
+            let recorded: Vec<usize> = case["sizes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|size| size.as_u64().unwrap() as usize)
+                .collect();
+            let (rest, view_sizes) = recorded.split_at(recorded.len() - commit.views.len());
+            let mut sizes = commit
+                .sizes(|entity_type| repository.ttl_for(entity_type))
+                .unwrap();
+            let mut rest = rest.to_vec();
+            sizes.sort_unstable();
+            rest.sort_unstable();
+            assert_eq!(sizes, rest, "{name}: budgeted sizes");
+            assert_eq!(
+                commit.view_sizes().collect::<Vec<_>>(),
+                view_sizes,
+                "{name}: view operation sizes"
+            );
+
+            // The analytic size is the size of the action the repository builds.
+            let built = repository.view_items(&commit.views).unwrap();
+            assert_eq!(
+                built.iter().map(sdk_item_size).collect::<Vec<_>>(),
+                view_sizes,
+                "{name}: the built actions"
+            );
+        }
     }
 
     /// The shared scenarios' transaction steps build the same `TransactWriteItems` action order
@@ -2928,10 +3331,18 @@ mod tests {
                 .collect();
 
             let steps = scenario["steps"].as_array().unwrap();
+            // A transaction refused before any write (a key over the limit, a repeated key,
+            // operations with no event) sends no request and records no order.
             let planned: Vec<_> = steps
                 .iter()
                 .enumerate()
                 .filter(|(_, step)| step["op"] == "transaction")
+                .filter(|(_, step)| {
+                    !matches!(
+                        step["expect"]["result"].as_str(),
+                        Some("viewKeyTooLong" | "duplicateViewKey" | "projectorOnly")
+                    )
+                })
                 .collect();
             assert_eq!(
                 planned.len(),
@@ -2986,6 +3397,7 @@ mod tests {
                     })
                     .unwrap_or_default();
                 let mut commit = TransactionCommit::new(streams);
+                commit.views = step_views(&base, step);
                 commit.fences = step["fences"]
                     .as_array()
                     .map(|fences| {
@@ -3011,6 +3423,7 @@ mod tests {
                 // The scenarios start on a fresh table, so the first writer declared
                 // `stream-heads` itself, which created the marker row at version 1.
                 let (items, _) = offline_repository()
+                    .with_views_table(VIEWS_TABLE)
                     .transaction_stream_items(&commit, ValidatedMarker::Version(1))
                     .unwrap();
                 let actual: Vec<_> = items.iter().map(action_summary).collect();
@@ -3845,5 +4258,644 @@ mod tests {
             wire::head_from_item(&head).unwrap(),
             (EventSequence(3), Some(1_100))
         );
+    }
+    // ----- commit-wide view operations (v0.9, C7) -----
+
+    #[derive(Debug)]
+    struct Taken;
+
+    impl std::fmt::Display for Taken {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("name taken")
+        }
+    }
+
+    impl std::error::Error for Taken {}
+
+    fn view(projector: (&str, usize), operation: usize, op: crate::ViewOperation) -> ProjectedView {
+        ProjectedView::new(projector.0, projector.1, operation, op)
+    }
+
+    fn legacy_put(pk: &str) -> TransactWriteItem {
+        put(
+            "legacy",
+            Item::from([
+                ("pk".into(), AttributeValue::S(pk.into())),
+                ("sk".into(), AttributeValue::N("0".into())),
+            ]),
+            None,
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn views_repository() -> DynamoRepository {
+        offline_repository().with_views_table(VIEWS_TABLE)
+    }
+
+    /// The commit the layout and classification tests share: a legacy operation, two projectors'
+    /// view operations (the second projector's second operation maps its failure), and two
+    /// written streams, `a` with a snapshot.
+    fn view_commit() -> TransactionCommit<TransactWriteItem> {
+        use crate::ViewOperation as Op;
+
+        let mut commit = TransactionCommit::new(vec![
+            stream_commit("b", 1..=1),
+            stream_commit("a", 1..=1).with_snapshot(crate::NewSnapshot::new(
+                "account",
+                EventSequence(1),
+                b"{}".to_vec(),
+            )),
+        ])
+        .with_operations([legacy_put("legacy-1")])
+        .with_views([
+            view(("first", 0), 0, Op::put("p", "one", "", "", "{}")),
+            view(("first", 0), 1, Op::delete("p", "two").if_present()),
+            view(
+                ("second", 1),
+                0,
+                Op::put("q", "one", "id", "type", "{}").if_absent(),
+            ),
+            view(
+                ("second", 1),
+                1,
+                Op::put("q", "two", "", "", "{}")
+                    .if_absent()
+                    .on_conflict(Taken),
+            ),
+        ]);
+        commit.normalize().unwrap();
+
+        commit
+    }
+
+    #[test]
+    fn view_actions_follow_the_marker_and_legacy_operations_and_precede_every_stream() {
+        use serde_json::json;
+
+        let repository = views_repository();
+        let commit = view_commit();
+        let (items, layout) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Version(3))
+            .unwrap();
+        let actions: Vec<_> = items.iter().map(action_summary).collect();
+
+        let shape: Vec<_> = actions
+            .iter()
+            .map(|action| {
+                (
+                    action["operation"].as_str().unwrap().to_owned(),
+                    action["pk"].as_str().unwrap().to_owned(),
+                    action["sk"].as_i64().unwrap(),
+                    action["skText"].as_str().map(str::to_owned),
+                    action["condition"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        let owned = |text: &str| Some(text.to_owned());
+        let expected = [
+            (
+                "ConditionCheck",
+                "SYSTEM#FEATURES",
+                0,
+                None,
+                owned("attribute_not_exists(pk) OR version = :v"),
+            ),
+            // The legacy backend operation, then the views in declaration then emission order.
+            ("Put", "legacy-1", 0, None, None),
+            ("Put", "p", 0, owned("one"), None),
+            (
+                "Delete",
+                "p",
+                0,
+                owned("two"),
+                owned("attribute_exists(pk)"),
+            ),
+            (
+                "Put",
+                "q",
+                0,
+                owned("one"),
+                owned("attribute_not_exists(pk)"),
+            ),
+            (
+                "Put",
+                "q",
+                0,
+                owned("two"),
+                owned("attribute_not_exists(pk)"),
+            ),
+            // Then each written stream's group in ascending stream ID bytes: `a` with its snapshot
+            // put last, then `b`.
+            ("Update", "a", -1, None, owned("attribute_not_exists(head)")),
+            ("Put", "a", 1, None, owned("attribute_not_exists(sk)")),
+            ("Put", "a", 0, None, owned("attribute_not_exists(seq)")),
+            ("Update", "b", -1, None, owned("attribute_not_exists(head)")),
+            ("Put", "b", 1, None, owned("attribute_not_exists(sk)")),
+        ]
+        .map(|(operation, pk, sk, sk_text, condition)| {
+            (operation.to_owned(), pk.to_owned(), sk, sk_text, condition)
+        });
+        assert_eq!(shape, expected);
+
+        // Tables: the legacy operation names its own, the views the views table, the rest the log.
+        let tables: Vec<_> = items
+            .iter()
+            .map(|item| {
+                item.put()
+                    .map(|put| put.table_name())
+                    .or_else(|| item.delete().map(|delete| delete.table_name()))
+                    .or_else(|| item.update().map(|update| update.table_name()))
+                    .or_else(|| item.condition_check().map(|check| check.table_name()))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                "events", "legacy", "views", "views", "views", "views", "events", "events",
+                "events", "events", "events"
+            ]
+        );
+
+        // The item shapes: a put writes all five attributes as strings; a delete is a key.
+        let put = items[4].put().unwrap();
+        assert_eq!(
+            json!(from_sdk_item(put.item())),
+            json!({"pk": {"S": "q"}, "sk": {"S": "one"}, "entityID": {"S": "id"},
+                   "entityType": {"S": "type"}, "payload": {"S": "{}"}})
+        );
+        assert_eq!(items[3].delete().unwrap().key().len(), 2);
+
+        // The layout maps each view to its index, with its provenance.
+        assert_eq!(layout.operations, 1);
+        let indexes: Vec<_> = layout
+            .views
+            .iter()
+            .map(|(index, view)| (*index, view.projector.clone(), view.operation))
+            .collect();
+        assert_eq!(
+            indexes,
+            [
+                (2, "first".to_owned(), 0),
+                (3, "first".to_owned(), 1),
+                (4, "second".to_owned(), 0),
+                (5, "second".to_owned(), 1)
+            ]
+        );
+        assert_eq!(layout.projector_items(), 5);
+        assert_eq!(
+            layout.streams[0].head, 6,
+            "the first stream group follows the views"
+        );
+    }
+
+    #[test]
+    fn a_single_stream_commit_places_views_after_the_legacy_operations() {
+        let repository = views_repository();
+        let commit = stream_commit("a", 1..=1)
+            .with_operations([legacy_put("legacy-1")])
+            .with_views([view(
+                ("only", 0),
+                0,
+                crate::ViewOperation::put("p", "s", "", "", "{}"),
+            )]);
+        commit.validate().unwrap();
+
+        let (items, layout) = repository
+            .transaction_items(&commit, ValidatedMarker::Version(1))
+            .unwrap();
+        let actions: Vec<_> = items.iter().map(action_summary).collect();
+
+        let operations: Vec<_> = actions
+            .iter()
+            .map(|action| {
+                (
+                    action["operation"].as_str().unwrap(),
+                    action["pk"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            operations,
+            [
+                ("ConditionCheck", "SYSTEM#FEATURES"),
+                ("Put", "legacy-1"),
+                ("Put", "p"),
+                ("Update", "a"),
+                ("Put", "a")
+            ]
+        );
+        assert_eq!((layout.operations, layout.views.len()), (1, 1));
+    }
+
+    #[test]
+    fn view_operation_sizes_equal_the_size_of_the_action_built() {
+        use crate::ViewOperation as Op;
+
+        let repository = views_repository();
+        let operations = [
+            Op::put("p", "s", "", "", ""),
+            Op::put("pk", "sk", "entity", "type", "{\"a\":\"é\"}").if_absent(),
+            Op::put("é", "ß", "é", "ß", "é").on_conflict(Taken),
+            Op::delete("p", "s"),
+            Op::delete("pk", "sk").if_present(),
+        ];
+        let views: Vec<_> = operations
+            .iter()
+            .enumerate()
+            .map(|(index, op)| view(("p", 0), index, op.clone()))
+            .collect();
+
+        let built = repository.view_items(&views).unwrap();
+
+        for (op, item) in operations.iter().zip(&built) {
+            assert_eq!(
+                sdk_item_size(item),
+                crate::view_operation_size(op),
+                "{op:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn views_without_a_views_table_are_refused_before_any_request() {
+        let repository = offline_repository();
+        let views = || {
+            [view(
+                ("p", 0),
+                0,
+                crate::ViewOperation::put("p", "s", "", "", "{}"),
+            )]
+        };
+
+        let single = stream_commit("a", 1..=1).with_views(views());
+        let multi = TransactionCommit::new(vec![stream_commit("a", 1..=1)]).with_views(views());
+
+        for (entry_point, result) in [
+            ("commit", repository.commit(single).await),
+            (
+                "commit_transaction",
+                repository.commit_transaction(multi).await,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::ViewsNotConfigured {
+                        backend: "dynamodb"
+                    })
+                ),
+                "{entry_point}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn view_operations_are_checked_before_any_request() {
+        use crate::ViewOperation as Op;
+
+        let repository = views_repository();
+        let bad = |op: Op| [view(("p", 0), 0, op)];
+
+        for views in [
+            bad(Op::put("", "s", "", "", "{}")),
+            bad(Op::put("p".repeat(2049), "s", "", "", "{}")),
+            bad(Op::delete("p", "s".repeat(1025))),
+        ] {
+            let single = stream_commit("a", 1..=1).with_views(views.clone());
+            let multi = TransactionCommit::new(vec![stream_commit("a", 1..=1)]).with_views(views);
+
+            let (one, two) = (
+                repository.commit(single).await,
+                repository.commit_transaction(multi).await,
+            );
+            assert!(
+                matches!(
+                    one,
+                    Err(Error::InvalidViewOperation(_) | Error::ViewKeyTooLong { .. })
+                ),
+                "{one:?}"
+            );
+            assert!(
+                matches!(
+                    two,
+                    Err(Error::InvalidViewOperation(_) | Error::ViewKeyTooLong { .. })
+                ),
+                "{two:?}"
+            );
+        }
+    }
+
+    /// Views are budgeted before the first request: the offline client could not have served one.
+    #[tokio::test]
+    async fn view_operations_count_against_the_budget_before_any_request() {
+        use crate::ViewOperation as Op;
+
+        let repository = views_repository();
+        let bulk = |count: usize, payload: usize| -> Vec<ProjectedView> {
+            (0..count)
+                .map(|index| {
+                    view(
+                        ("bulk", 0),
+                        index,
+                        Op::put("p", format!("row-{index:03}"), "", "", "x".repeat(payload)),
+                    )
+                })
+                .collect()
+        };
+        let too_large = |result: Result<(), Error>| match result {
+            Err(Error::CommitTooLarge {
+                actions,
+                bytes,
+                largest_item,
+            }) => (actions, bytes, largest_item),
+            other => panic!("expected CommitTooLarge, got {other:?}"),
+        };
+        let commit = |views| stream_commit("a", 1..=1).with_views(views);
+        let transaction = |views| {
+            TransactionCommit::new(vec![stream_commit("a", 1..=1), stream_commit("b", 1..=1)])
+                .with_views(views)
+        };
+
+        // Marker + head update + one event leave 97 actions for views.
+        assert_eq!(
+            too_large(repository.commit(commit(bulk(98, 0))).await).0,
+            101
+        );
+        assert!(!matches!(
+            repository.commit(commit(bulk(97, 0))).await,
+            Err(Error::CommitTooLarge { .. })
+        ));
+        // Two streams cost two head updates and two events: 95 fit, 96 do not.
+        assert_eq!(
+            too_large(
+                repository
+                    .commit_transaction(transaction(bulk(96, 0)))
+                    .await
+            )
+            .0,
+            101
+        );
+        assert!(!matches!(
+            repository
+                .commit_transaction(transaction(bulk(95, 0)))
+                .await,
+            Err(Error::CommitTooLarge { .. })
+        ));
+
+        // Bytes: twelve 330,000-byte puts are each under 380,000 and together over 3,800,000.
+        let (actions, bytes, largest) =
+            too_large(repository.commit(commit(bulk(12, 330_000))).await);
+        assert!(
+            actions == 15 && bytes > 3_800_000 && largest < 380_000,
+            "{actions} {bytes} {largest}"
+        );
+        let (_, _, largest) = too_large(repository.commit(commit(bulk(1, 400_000))).await);
+        assert!(largest > 380_000);
+        // The same bytes in a delete's condition would be negligible: deletes carry only keys.
+        let deletes: Vec<_> = (0..97)
+            .map(|index| {
+                view(
+                    ("d", 0),
+                    index,
+                    Op::delete("p", format!("{index:03}")).if_present(),
+                )
+            })
+            .collect();
+        assert!(!matches!(
+            repository.commit(commit(deletes)).await,
+            Err(Error::CommitTooLarge { .. })
+        ));
+    }
+
+    // ----- failure classification of projector operations (rank 6) -----
+
+    fn cancelled(codes: &[Option<&str>]) -> SdkError<TransactWriteItemsError, ()> {
+        use aws_sdk_dynamodb::types::CancellationReason;
+        use aws_sdk_dynamodb::types::error::TransactionCanceledException;
+
+        let mut exception = TransactionCanceledException::builder().message("cancelled");
+        for code in codes {
+            exception = exception.cancellation_reasons(
+                CancellationReason::builder()
+                    .set_code(code.map(str::to_owned))
+                    .build(),
+            );
+        }
+
+        SdkError::service_error(
+            TransactWriteItemsError::TransactionCanceledException(exception.build()),
+            (),
+        )
+    }
+
+    /// The reason codes of `view_commit()`'s transaction: `None` everywhere except the given
+    /// `(index, code)` entries. Items: 0 marker, 1 legacy, 2 to 5 views, 6 to 8 stream `a`'s head,
+    /// event, and snapshot, 9 and 10 stream `b`'s head and event.
+    fn reasons(failed: &[(usize, &'static str)]) -> Vec<Option<&'static str>> {
+        let mut codes = vec![Some("None"); 11];
+        for (index, code) in failed {
+            codes[*index] = Some(code);
+        }
+
+        codes
+    }
+
+    async fn classified(failed: &[(usize, &'static str)]) -> Error {
+        let repository = views_repository();
+        let commit = view_commit();
+        let (_, layout) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Version(3))
+            .unwrap();
+        assert_eq!(layout.streams.len(), 2);
+
+        repository
+            .classify_commit_failure(&layout, false, cancelled(&reasons(failed)))
+            .await
+    }
+
+    fn operation_failure(error: Error) -> Box<ProjectorOperationError> {
+        match error {
+            Error::ProjectorOperation(failed) => failed,
+            other => panic!("expected a projector operation failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_failed_view_operation_in_transaction_order_is_named() {
+        // Operation 1 of the second projector (item 5) carries a mapped error.
+        let failed = operation_failure(classified(&[(5, "ConditionalCheckFailed")]).await);
+        assert_eq!(
+            (
+                failed.projector.as_str(),
+                failed.projector_index,
+                failed.operation
+            ),
+            ("second", 1, 1)
+        );
+        assert_eq!(failed.reason, "ConditionalCheckFailed");
+        assert_eq!(failed.pk, "q");
+        assert_eq!(failed.sk, "two");
+        assert_eq!(failed.mapped().unwrap().to_string(), "name taken");
+        assert!(
+            failed.cause().is_none(),
+            "a condition failure has no backend cause"
+        );
+
+        // Several failures: the earliest item wins, whatever its reason.
+        let failed = operation_failure(
+            classified(&[
+                (5, "ConditionalCheckFailed"),
+                (3, "ValidationError"),
+                (4, "ConditionalCheckFailed"),
+            ])
+            .await,
+        );
+        assert_eq!(
+            (failed.projector.as_str(), failed.operation, failed.kind),
+            ("first", 1, crate::ViewOperationKind::Delete)
+        );
+        assert_eq!(failed.reason, "ValidationError");
+        assert!(failed.mapped().is_none());
+        assert!(
+            failed.cause().is_some(),
+            "the SDK error is the cause of a validation failure"
+        );
+
+        let failed = operation_failure(classified(&[(2, "ItemCollectionSizeLimitExceeded")]).await);
+        assert_eq!(failed.reason, "ItemCollectionSizeLimitExceeded");
+
+        for error in [
+            classified(&[(5, "ConditionalCheckFailed")]).await,
+            classified(&[(2, "ValidationError")]).await,
+        ] {
+            assert!(!error.is_retryable() && !error.is_conflict(), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legacy_operation_failure_keeps_its_legacy_error_and_precedes_the_views() {
+        let error =
+            classified(&[(1, "ConditionalCheckFailed"), (2, "ConditionalCheckFailed")]).await;
+
+        assert!(matches!(error, Error::Projector(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_projector_failure_is_never_reported_when_a_higher_ranked_item_failed() {
+        // Stream `a`'s snapshot put (item 8) failing is an ordinary conflict, however many view
+        // operations failed with it.
+        let error = classified(&[
+            (8, "ConditionalCheckFailed"),
+            (2, "ConditionalCheckFailed"),
+            (5, "ConditionalCheckFailed"),
+        ])
+        .await;
+
+        assert!(error.is_conflict(), "{error:?}");
+        assert!(!matches!(error, Error::ProjectorOperation(_)));
+    }
+
+    #[tokio::test]
+    async fn a_transaction_conflict_or_throttling_on_a_view_item_keeps_its_classification() {
+        let error = classified(&[(3, "TransactionConflict")]).await;
+        assert!(error.is_conflict() && error.is_retryable(), "{error:?}");
+
+        let error = classified(&[(3, "ThrottlingError")]).await;
+        assert!(matches!(error, Error::Transient(_)), "{error:?}");
+
+        // A condition failure elsewhere in the same transaction still names that operation.
+        let failed = operation_failure(
+            classified(&[(3, "TransactionConflict"), (4, "ConditionalCheckFailed")]).await,
+        );
+        assert_eq!((failed.projector.as_str(), failed.operation), ("second", 0));
+    }
+
+    #[test]
+    fn the_cancellation_classifier_counts_legacy_and_view_items_as_projector_items() {
+        const CHECK: Option<&str> = Some("ConditionalCheckFailed");
+        const NONE: Option<&str> = Some("None");
+
+        // Marker, one legacy operation, two views: four projector items after the marker would be
+        // indexes 1 to 3; item 4 is the first stream item.
+        let cases = [
+            (
+                vec![NONE, NONE, NONE, CHECK, NONE],
+                Some(Cancellation::ProjectorCondition),
+            ),
+            (
+                vec![NONE, NONE, NONE, NONE, CHECK],
+                Some(Cancellation::StreamCondition),
+            ),
+            (
+                vec![CHECK, NONE, NONE, CHECK, CHECK],
+                Some(Cancellation::Marker),
+            ),
+        ];
+
+        for (codes, want) in cases {
+            assert_eq!(classify_cancellation(3, &codes), want, "{codes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_write_entry_point_refuses_views_with_no_event() {
+        let repository = views_repository();
+        let views = || {
+            [view(
+                ("orphan", 0),
+                0,
+                crate::ViewOperation::put("p", "s", "", "", "{}"),
+            )]
+        };
+        let fence = || {
+            crate::ReadFence::new(
+                "a",
+                "account",
+                EventSequence(0),
+                crate::FenceProvenance::Engine,
+            )
+        };
+
+        let results = [
+            (
+                "commit",
+                repository
+                    .commit(Commit::new("a", Vec::new()).with_views(views()))
+                    .await,
+            ),
+            (
+                "commit_transaction",
+                repository
+                    .commit_transaction(TransactionCommit::new(Vec::new()).with_views(views()))
+                    .await,
+            ),
+            (
+                "commit_transaction with a fence",
+                repository
+                    .commit_transaction(
+                        TransactionCommit::new(Vec::new())
+                            .with_fences([fence()])
+                            .with_views(views()),
+                    )
+                    .await,
+            ),
+            (
+                "an eventless stream's own views",
+                repository
+                    .commit_transaction(TransactionCommit::new(vec![
+                        Commit::new("a", Vec::new()).with_views(views()),
+                    ]))
+                    .await,
+            ),
+        ];
+
+        for (entry_point, result) in results {
+            assert!(
+                matches!(result, Err(Error::ProjectorWithoutEvents { operations: 1 })),
+                "{entry_point}: {result:?}"
+            );
+        }
     }
 }

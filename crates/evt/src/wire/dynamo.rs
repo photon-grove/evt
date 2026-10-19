@@ -116,6 +116,12 @@ pub const PUT_SNAPSHOT_CONDITION: &str = "attribute_not_exists(eventSeq) OR even
 /// yet. The row is written once, in its final state.
 pub const OUTCOME_CONDITION: &str = "attribute_not_exists(pk)";
 
+/// Condition for a commit-wide view put that requires no row at the key (v0.9, C7).
+pub const VIEW_ABSENT_CONDITION: &str = "attribute_not_exists(pk)";
+
+/// Condition for a commit-wide view delete that requires a row at the key (v0.9, C7).
+pub const VIEW_PRESENT_CONDITION: &str = "attribute_exists(pk)";
+
 /// Condition for the feature-marker check every v0.9 commit carries (`:v` is the version the
 /// writer validated). A writer that validated a table with no marker conditions on
 /// `attribute_not_exists(pk)` instead.
@@ -355,6 +361,23 @@ pub fn view_item(
     item.insert("entityID".into(), s(entity_id.as_str()));
     item.insert("entityType".into(), s(entity_type.as_str()));
     item.insert("payload".into(), s(utf8(payload, "view payload")?));
+
+    Ok(item)
+}
+
+/// Encodes the row a commit-wide view put writes (v0.9, C7): all five attributes, whatever the
+/// projector chose for the informational ones. The payload must be valid UTF-8 (the engine checks
+/// it before any write).
+pub fn view_operation_item(operation: &crate::projection::ViewOperation) -> Result<Item, Error> {
+    let mut item = Item::new();
+    item.insert("pk".into(), s(operation.pk.as_str()));
+    item.insert("sk".into(), s(operation.sk.as_str()));
+    item.insert("entityID".into(), s(operation.entity_id.as_str()));
+    item.insert("entityType".into(), s(operation.entity_type.as_str()));
+    item.insert(
+        "payload".into(),
+        s(utf8(&operation.payload, "view payload")?),
+    );
 
     Ok(item)
 }

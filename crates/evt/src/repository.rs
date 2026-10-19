@@ -9,6 +9,7 @@ use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
 use crate::outcome::{Outcome, check_outcome};
+use crate::projection::{ProjectedView, check_views, view_operation_size};
 
 /// A snapshot to write with a commit. Its event sequence is the last event in the commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +54,12 @@ pub struct Commit<Op> {
     /// transaction. DynamoDB puts them before the events. PostgreSQL runs them after the head
     /// statement and the event inserts, so a racing writer fails on its stream's head first.
     pub operations: Vec<Op>,
+    /// Backend-neutral view operations from commit-wide projectors (v0.9, C7), with their
+    /// provenance, written in order in the same transaction after the `operations`. Each
+    /// repository owns the semantics: DynamoDB writes them to its views table, PostgreSQL through
+    /// its view writer, and the in-memory repository to its view rows. A repository with nowhere
+    /// to write them refuses the commit with [`Error::ViewsNotConfigured`].
+    pub views: Vec<ProjectedView>,
     /// The command outcome to record in the same transaction (C3), after every other write. With
     /// no events it is an outcome-only commit: a rejection or an accepted no-op.
     pub outcome: Option<Outcome>,
@@ -66,6 +73,7 @@ impl<Op> Commit<Op> {
             events,
             snapshot: None,
             operations: Vec::new(),
+            views: Vec::new(),
             outcome: None,
         }
     }
@@ -99,10 +107,24 @@ impl<Op> Commit<Op> {
         self
     }
 
+    /// Adds view operations from commit-wide projectors, written in the same transaction after the
+    /// backend operations.
+    #[must_use]
+    pub fn with_views(mut self, views: impl IntoIterator<Item = ProjectedView>) -> Self {
+        self.views.extend(views);
+        self
+    }
+
+    /// The budgeted sizes of the view operations by the backend-neutral rule
+    /// ([`view_operation_size`]), for repositories that size them analytically.
+    pub(crate) fn view_sizes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.views.iter().map(|view| view_operation_size(&view.op))
+    }
+
     /// Exact backend-neutral event/snapshot/action representation, matching Dynamo item sizes,
     /// for the shared commit budget: the feature-marker check, then the written stream's head
     /// update, event puts, and snapshot put (see [`stream_sizes`]), then the outcome put. Backend
-    /// projector operations are opaque here and sized by the backend.
+    /// projector operations and view operations are opaque here and sized by the backend.
     pub(crate) fn sizes(
         &self,
         ttl: impl Fn(&EntityType) -> Option<i64>,
@@ -131,9 +153,10 @@ impl<Op> Commit<Op> {
     /// response and rejection bounds. A rejected outcome may carry events, under the rules of an
     /// accepted commit. A commit with no events and no operations is a valid no-op (or an
     /// outcome-only commit when it carries an outcome), and repositories ignore its snapshot.
-    /// Operations without an event are refused with [`Error::ProjectorWithoutEvents`]: views are
-    /// projections of committed events, so a projector operation with no backing event could never
-    /// be rebuilt by replay (ADR-0012).
+    /// Operations and views without an event are refused with [`Error::ProjectorWithoutEvents`]:
+    /// views are projections of committed events, so a projector operation with no backing event
+    /// could never be rebuilt by replay (ADR-0012). The view operations are then checked with
+    /// [`check_views`].
     pub fn validate(&self) -> Result<(), Error> {
         let invalid = |message: String| Err(Error::InvalidCommit(message));
 
@@ -147,9 +170,9 @@ impl<Op> Commit<Op> {
         }
 
         let Some(first) = self.events.first() else {
-            if !self.operations.is_empty() {
+            if !self.operations.is_empty() || !self.views.is_empty() {
                 return Err(Error::ProjectorWithoutEvents {
-                    operations: self.operations.len(),
+                    operations: self.operations.len() + self.views.len(),
                 });
             }
 
@@ -217,7 +240,7 @@ impl<Op> Commit<Op> {
             ));
         }
 
-        Ok(())
+        check_views(&self.views)
     }
 }
 
@@ -271,6 +294,10 @@ pub struct TransactionCommit<Op> {
     pub fences: Vec<ReadFence>,
     /// Additional transaction operations, after stream-local operations.
     pub operations: Vec<Op>,
+    /// Commit-wide view operations (v0.9, C7), after every backend operation.
+    /// [`normalize`](Self::normalize) moves a stream's own views here, ahead of these, keeping
+    /// declaration and emission order.
+    pub views: Vec<ProjectedView>,
     /// The command outcome to record in the same transaction (C3), after the fence checks. With
     /// no events it is an outcome-only commit: a rejection or an accepted no-op, still fenced.
     pub outcome: Option<Outcome>,
@@ -283,6 +310,7 @@ impl<Op> TransactionCommit<Op> {
             streams,
             fences: Vec::new(),
             operations: Vec::new(),
+            views: Vec::new(),
             outcome: None,
         }
     }
@@ -321,6 +349,19 @@ impl<Op> TransactionCommit<Op> {
     pub fn with_operations(mut self, operations: impl IntoIterator<Item = Op>) -> Self {
         self.operations.extend(operations);
         self
+    }
+
+    /// Adds commit-wide view operations, after the backend operations.
+    #[must_use]
+    pub fn with_views(mut self, views: impl IntoIterator<Item = ProjectedView>) -> Self {
+        self.views.extend(views);
+        self
+    }
+
+    /// The budgeted sizes of the view operations by the backend-neutral rule
+    /// ([`view_operation_size`]), for repositories that size them analytically.
+    pub(crate) fn view_sizes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.views.iter().map(|view| view_operation_size(&view.op))
     }
 
     /// Validates every stream and normalizes the pinned event/fence ordering.
@@ -378,10 +419,11 @@ impl<Op> TransactionCommit<Op> {
         // Views are derived state: projector operations need a backing event in the same
         // commit, or no replay could rebuild what they wrote (ADR-0012).
         let carried = self.operations.len()
+            + self.views.len()
             + self
                 .streams
                 .iter()
-                .map(|stream| stream.operations.len())
+                .map(|stream| stream.operations.len() + stream.views.len())
                 .sum::<usize>();
         if carried > 0 && self.streams.iter().all(|stream| stream.events.is_empty()) {
             return Err(Error::ProjectorWithoutEvents {
@@ -390,13 +432,18 @@ impl<Op> TransactionCommit<Op> {
         }
         // Preserve declaration/emission order before sorting the write set.
         let mut operations = Vec::new();
+        let mut views = Vec::new();
         for stream in &mut self.streams {
             if !stream.events.is_empty() {
                 operations.append(&mut stream.operations);
+                views.append(&mut stream.views);
             }
         }
         operations.append(&mut self.operations);
+        views.append(&mut self.views);
         self.operations = operations;
+        self.views = views;
+        check_views(&self.views)?;
         self.streams.retain(|stream| !stream.events.is_empty());
         self.streams.sort_by(|a, b| {
             a.entity_id
@@ -449,6 +496,7 @@ impl<Op> TransactionCommit<Op> {
         self.streams.is_empty()
             && self.fences.is_empty()
             && self.operations.is_empty()
+            && self.views.is_empty()
             && self.outcome.is_none()
     }
 
@@ -1275,6 +1323,109 @@ mod tests {
                 what: "response",
                 ..
             })
+        ));
+    }
+    fn view(projector: &str, operation: usize, sk: &str) -> ProjectedView {
+        ProjectedView::new(
+            projector,
+            0,
+            operation,
+            crate::ViewOperation::put("p", sk, "", "", "{}"),
+        )
+    }
+
+    #[test]
+    fn normalize_moves_stream_views_to_the_commit_in_stream_order_then_commit_level() {
+        let mut commit = TransactionCommit::<u8>::new(vec![
+            Commit::new("b", vec![event("b", 1)])
+                .with_views([view("one", 0, "b0"), view("one", 1, "b1")]),
+            Commit::new("a", vec![event("a", 1)]).with_views([view("two", 0, "a0")]),
+        ])
+        .with_views([view("three", 0, "c0")]);
+
+        commit.normalize().unwrap();
+
+        // Streams were given as b then a; their views keep that order, ahead of the commit's own.
+        let order: Vec<_> = commit
+            .views
+            .iter()
+            .map(|view| view.op.sk.as_str())
+            .collect();
+        assert_eq!(order, ["b0", "b1", "a0", "c0"]);
+        assert!(commit.streams.iter().all(|stream| stream.views.is_empty()));
+        assert_eq!(
+            commit
+                .streams
+                .iter()
+                .map(|s| s.entity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"],
+            "the streams themselves are sorted by ID bytes"
+        );
+        assert!(!commit.is_empty());
+
+        // Normalizing again changes nothing.
+        commit.normalize().unwrap();
+        assert_eq!(commit.views.len(), 4);
+    }
+
+    #[test]
+    fn views_count_in_the_projector_only_refusal_and_in_emptiness() {
+        let mut commit = TransactionCommit::<u8>::new(Vec::new()).with_views([view("p", 0, "s")]);
+        assert!(!commit.is_empty());
+        assert!(matches!(
+            commit.normalize(),
+            Err(Error::ProjectorWithoutEvents { operations: 1 })
+        ));
+
+        // Legacy operations and views add up.
+        let mut commit = TransactionCommit::<u8>::new(vec![
+            Commit::new("a", Vec::new())
+                .with_operations([1, 2])
+                .with_views([view("p", 0, "s")]),
+        ]);
+        assert!(matches!(
+            commit.normalize(),
+            Err(Error::ProjectorWithoutEvents { operations: 3 })
+        ));
+
+        let single = Commit::<u8>::new("a", Vec::new())
+            .with_operations([1])
+            .with_views([view("p", 0, "s")]);
+        assert!(matches!(
+            single.validate(),
+            Err(Error::ProjectorWithoutEvents { operations: 2 })
+        ));
+    }
+
+    #[test]
+    fn normalize_and_validate_check_the_views() {
+        let repeated = [view("p", 0, "s"), view("q", 0, "s")];
+
+        let mut commit = TransactionCommit::<u8>::new(vec![
+            Commit::new("a", vec![event("a", 1)]).with_views([repeated[0].clone()]),
+            Commit::new("b", vec![event("b", 1)]).with_views([repeated[1].clone()]),
+        ]);
+        assert!(
+            matches!(commit.normalize(), Err(Error::DuplicateViewKey { .. })),
+            "views of different streams are checked together"
+        );
+
+        let single = Commit::<u8>::new("a", vec![event("a", 1)]).with_views(repeated);
+        assert!(matches!(
+            single.validate(),
+            Err(Error::DuplicateViewKey { .. })
+        ));
+
+        let invalid = Commit::<u8>::new("a", vec![event("a", 1)]).with_views([ProjectedView::new(
+            "p",
+            0,
+            0,
+            crate::ViewOperation::put("", "s", "", "", "{}"),
+        )]);
+        assert!(matches!(
+            invalid.validate(),
+            Err(Error::InvalidViewOperation(_))
         ));
     }
 }

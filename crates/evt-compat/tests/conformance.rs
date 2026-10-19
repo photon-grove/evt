@@ -13,18 +13,23 @@ use deadpool_postgres::Pool;
 use evt_compat::drivers::{self, DynamoHeads, PostgresHeads};
 use futures_core::Stream as _;
 use photon_evt::conformance::{
-    Add, HeadFixtures, Ledger, LedgerEvent, Suite, ViewTarget, enumeration_cases,
-    feature_marker_cases, fresh_store_cases, outcome_cases,
+    Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, Suite, ViewTarget, commit_view_cases,
+    enumeration_cases, feature_marker_cases, fresh_store_cases, outcome_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
-use photon_evt::postgres::{PgStatement, PostgresRepository};
+use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
 use photon_evt::wire::dynamo::DEFAULT_VIEW_SORT_KEY;
 use photon_evt::wire::postgres::ENTITY_LOCK;
 use photon_evt::{
-    Aggregate, BoxError, Commit, EntityId, Error, EventId, EventLog, EventSequence, EventType,
-    EventVersion, Metadata, Projector, Repository, RetryPolicy, SerializedEvent,
-    SerializedSnapshot, Store, StreamFilter, json,
+    Aggregate, BoxError, Commit, CommitProjector, CommitView, EntityId, Error, EventId, EventLog,
+    EventSequence, EventType, EventVersion, Metadata, Projector, Repository, RetryPolicy,
+    SerializedEvent, SerializedSnapshot, Store, StreamFilter, ViewCondition, ViewOperation,
+    ViewOperationKind, ViewRow, json,
 };
+
+/// The table the commit-wide view cases write to on PostgreSQL: the application's own schema, which
+/// evt does not define.
+const PG_COMMIT_VIEWS_TABLE: &str = "evt_conformance_commit_views";
 
 /// Reads the single-item views `ViewProjector` writes.
 struct DynamoViews {
@@ -206,6 +211,7 @@ async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
     let second = DynamoRepository::new(repository.client().clone(), repository.table());
     feature_marker_cases(&repository, &second).await;
     outcome_cases(&repository, &second).await;
+    Box::pin(dynamo_commit_wide_views(&repository)).await;
     dynamo_outcome_row_matches_the_wire_format(&repository).await;
     dynamo_outcome_reads_are_consistent_by_default_and_by_force(&repository).await;
     dynamo_marker_row_matches_the_wire_format(&repository).await;
@@ -215,6 +221,197 @@ async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
     dynamo_enumeration(&repository).await;
     Box::pin(dynamo_fresh_and_unmigrated_tables(&repository)).await;
     Box::pin(dynamo_retained_stream_heads(&repository)).await;
+}
+
+/// Reads the rows commit-wide view operations write to a views table.
+struct DynamoViewRows {
+    client: aws_sdk_dynamodb::Client,
+    table: String,
+}
+
+impl DynamoViewRows {
+    async fn item(
+        &self,
+        pk: &str,
+        sk: &str,
+    ) -> Result<Option<std::collections::HashMap<String, AttributeValue>>, BoxError> {
+        Ok(self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .key("pk", AttributeValue::S(pk.into()))
+            .key("sk", AttributeValue::S(sk.into()))
+            .send()
+            .await?
+            .item)
+    }
+}
+
+impl CommitViewTarget<DynamoRepository> for DynamoViewRows {
+    async fn row(&self, pk: &str, sk: &str) -> Result<Option<ViewRow>, BoxError> {
+        let Some(item) = self.item(pk, sk).await? else {
+            return Ok(None);
+        };
+        let text = |name: &str| -> Result<String, BoxError> {
+            Ok(item
+                .get(name)
+                .and_then(|value| value.as_s().ok())
+                .ok_or_else(|| format!("view item has no string {name}"))?
+                .clone())
+        };
+
+        Ok(Some(ViewRow::new(
+            text("pk")?,
+            text("sk")?,
+            text("entityID")?,
+            text("entityType")?,
+            text("payload")?.into_bytes(),
+        )))
+    }
+}
+
+/// A private views table (string `pk` and `sk`, no stream), like the event-log table of the suite.
+async fn create_dynamo_views_table(client: &aws_sdk_dynamodb::Client, name: &str) {
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+
+    let attribute = |name: &str| {
+        AttributeDefinition::builder()
+            .attribute_name(name)
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .unwrap()
+    };
+    let key = |name: &str, key_type| {
+        KeySchemaElement::builder()
+            .attribute_name(name)
+            .key_type(key_type)
+            .build()
+            .unwrap()
+    };
+
+    client
+        .create_table()
+        .table_name(name)
+        .attribute_definitions(attribute("pk"))
+        .attribute_definitions(attribute("sk"))
+        .key_schema(key("pk", KeyType::Hash))
+        .key_schema(key("sk", KeyType::Range))
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .expect("create the views table");
+}
+
+/// Commit-wide view operations (v0.9, C7) against the emulator: the shared cases, a repository
+/// with no views table, and the stored item's shape.
+async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
+    let client = repository.client().clone();
+    let views = format!(
+        "evt-conformance-views-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    create_dynamo_views_table(&client, &views).await;
+
+    let writer = repository.clone().with_views_table(&views);
+    let rows = DynamoViewRows {
+        client: client.clone(),
+        table: views.clone(),
+    };
+    commit_view_cases(&writer, &rows).await;
+
+    // The stored item has exactly the five string attributes, empty informational ones included.
+    let store = Store::<Ledger, _>::new(&writer, ()).with_commit_projector(std::sync::Arc::new(
+        FixedRows::new("shape", |_| {
+            vec![
+                ViewOperation::put("shape", "row", "", "", "{}"),
+                ViewOperation::put("shape", "full", "id", "type", br#"{"a":1}"#.to_vec()),
+            ]
+        }),
+    ));
+    let id = EntityId::new(format!("conf-views-shape-{}", views));
+    store
+        .execute(&id, Add(1), Metadata::new("local"))
+        .await
+        .unwrap();
+    let item = rows.item("shape", "row").await.unwrap().expect("the row");
+    let mut attributes: Vec<_> = item.keys().cloned().collect();
+    attributes.sort();
+    assert_eq!(
+        attributes,
+        ["entityID", "entityType", "payload", "pk", "sk"],
+        "all five attributes are written"
+    );
+    assert!(item.values().all(|value| value.as_s().is_ok()), "{item:?}");
+    let full = rows.item("shape", "full").await.unwrap().expect("the row");
+    assert_eq!(full["entityID"], AttributeValue::S("id".into()));
+    assert_eq!(full["entityType"], AttributeValue::S("type".into()));
+    assert_eq!(full["payload"], AttributeValue::S(r#"{"a":1}"#.into()));
+
+    // Without a views table the commit is refused before any write, never silently dropped.
+    let unconfigured = Store::<Ledger, _>::new(repository, ()).with_commit_projector(
+        std::sync::Arc::new(FixedRows::new("unconfigured", |_| {
+            vec![ViewOperation::put("p", "s", "", "", "{}")]
+        })),
+    );
+    let id = EntityId::new(format!("conf-views-unconfigured-{}", views));
+    let error = unconfigured
+        .execute(&id, Add(1), Metadata::new("local"))
+        .await
+        .expect_err("no views table");
+    assert!(
+        matches!(
+            error.as_store_error(),
+            Some(Error::ViewsNotConfigured {
+                backend: "dynamodb"
+            })
+        ),
+        "{error:?}"
+    );
+    assert!(repository.events(&id).await.unwrap().is_empty());
+
+    client
+        .delete_table()
+        .table_name(&views)
+        .send()
+        .await
+        .expect("delete the views table");
+}
+
+type Rows = Box<dyn Fn(&CommitView) -> Vec<ViewOperation> + Send + Sync>;
+
+/// A commit-wide projector over a closure, for the cases that need one fixed shape.
+struct FixedRows {
+    name: &'static str,
+    rows: Rows,
+}
+
+impl FixedRows {
+    fn new(
+        name: &'static str,
+        rows: impl Fn(&CommitView) -> Vec<ViewOperation> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name,
+            rows: Box::new(rows),
+        }
+    }
+}
+
+impl CommitProjector for FixedRows {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+        Ok((self.rows)(commit))
+    }
 }
 
 /// A new, empty table for a case that needs a store nothing has written to.
@@ -1352,6 +1549,7 @@ async fn postgres_conforms() {
         .unwrap();
     feature_marker_cases(&repository, &second).await;
     outcome_cases(&repository, &second).await;
+    Box::pin(postgres_commit_wide_views(&repository)).await;
     postgres_outcome_row_matches_the_wire_format(&repository, &events).await;
     postgres_features_text_matches_the_manifest(&repository, &events).await;
     postgres_refuses_projector_only_transactions(&repository).await;
@@ -1368,6 +1566,224 @@ async fn postgres_conforms() {
         ))
         .await
         .expect("drop the isolated event log");
+}
+
+/// The view writer for [`PG_COMMIT_VIEWS_TABLE`], with the statement shapes the condition
+/// semantics require: an absent put is a plain `INSERT` (a unique violation is its failed
+/// condition), an unconditional put an upsert, a delete a `DELETE` (zero rows fails `present`).
+fn postgres_view_writer() -> ViewWriter {
+    std::sync::Arc::new(|operation: &ViewOperation| {
+        Ok(match operation.kind {
+            ViewOperationKind::Put => {
+                let conflict = if operation.condition == ViewCondition::Absent {
+                    ""
+                } else {
+                    " ON CONFLICT (pk, sk) DO UPDATE SET entity_id = EXCLUDED.entity_id, \
+                     entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload"
+                };
+
+                PgStatement::new(
+                    format!(
+                        "INSERT INTO {PG_COMMIT_VIEWS_TABLE} (pk, sk, entity_id, entity_type, payload) \
+                         VALUES ($1, $2, $3, $4, $5){conflict}"
+                    ),
+                    vec![
+                        Box::new(operation.pk.clone()),
+                        Box::new(operation.sk.clone()),
+                        Box::new(operation.entity_id.clone()),
+                        Box::new(operation.entity_type.clone()),
+                        Box::new(String::from_utf8_lossy(&operation.payload).into_owned()),
+                    ],
+                )
+            }
+            ViewOperationKind::Delete => PgStatement::new(
+                format!("DELETE FROM {PG_COMMIT_VIEWS_TABLE} WHERE pk = $1 AND sk = $2"),
+                vec![
+                    Box::new(operation.pk.clone()),
+                    Box::new(operation.sk.clone()),
+                ],
+            ),
+        })
+    })
+}
+
+/// Reads the rows [`postgres_view_writer`] wrote.
+struct PostgresViewRows {
+    pool: Pool,
+}
+
+impl CommitViewTarget<PostgresRepository> for PostgresViewRows {
+    async fn row(&self, pk: &str, sk: &str) -> Result<Option<ViewRow>, BoxError> {
+        let row = self
+            .pool
+            .get()
+            .await?
+            .query_opt(
+                &format!(
+                    "SELECT entity_id, entity_type, payload FROM {PG_COMMIT_VIEWS_TABLE} \
+                     WHERE pk = $1 AND sk = $2"
+                ),
+                &[&pk, &sk],
+            )
+            .await?;
+
+        Ok(row.map(|row| {
+            ViewRow::new(
+                pk,
+                sk,
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2).into_bytes(),
+            )
+        }))
+    }
+
+    fn budgets_view_bytes(&self) -> bool {
+        false
+    }
+}
+
+/// Commit-wide view operations (v0.9, C7) against PostgreSQL: the shared cases, the SQLSTATE
+/// reasons of other statement failures, and the refusals that need no writer or a bad one.
+async fn postgres_commit_wide_views(repository: &PostgresRepository) {
+    let pool = repository.pool().clone();
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {PG_COMMIT_VIEWS_TABLE} (
+                 pk text NOT NULL, sk text NOT NULL, entity_id text NOT NULL,
+                 entity_type text NOT NULL, payload text NOT NULL, PRIMARY KEY (pk, sk))"
+        ))
+        .await
+        .expect("create the commit-wide view table");
+
+    let writer = repository.clone().with_view_writer(postgres_view_writer());
+    let rows = PostgresViewRows { pool: pool.clone() };
+    commit_view_cases(&writer, &rows).await;
+
+    let id = |label: &str| {
+        EntityId::new(format!(
+            "conf-views-{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    };
+
+    // Without a writer the commit is refused before any write, never silently dropped.
+    let unconfigured = Store::<Ledger, _>::new(repository, ()).with_commit_projector(
+        std::sync::Arc::new(FixedRows::new("unconfigured", |_| {
+            vec![ViewOperation::put("p", "s", "", "", "{}")]
+        })),
+    );
+    let unwritten = id("unconfigured");
+    let error = unconfigured
+        .execute(&unwritten, Add(1), Metadata::new("local"))
+        .await
+        .expect_err("no view writer");
+    assert!(
+        matches!(
+            error.as_store_error(),
+            Some(Error::ViewsNotConfigured {
+                backend: "postgres"
+            })
+        ),
+        "{error:?}"
+    );
+    assert!(repository.events(&unwritten).await.unwrap().is_empty());
+
+    // A statement the database rejects for another reason is the operation's failure, with the
+    // SQLSTATE as its reason and the database error as its cause. Nothing else of the commit
+    // survives.
+    let failing = repository.clone().with_view_writer(std::sync::Arc::new(
+        |operation: &ViewOperation| {
+            // A NOT NULL violation (23502): the row's entity ID is a null parameter.
+            Ok(PgStatement::new(
+                format!(
+                    "INSERT INTO {PG_COMMIT_VIEWS_TABLE} (pk, sk, entity_id, entity_type, payload) \
+                     VALUES ($1, $2, NULL, '', '')"
+                ),
+                vec![
+                    Box::new(operation.pk.clone()),
+                    Box::new(operation.sk.clone()),
+                ],
+            ))
+        },
+    ));
+    let store = Store::<Ledger, _>::new(&failing, ()).with_commit_projector(std::sync::Arc::new(
+        FixedRows::new("broken", |_| {
+            vec![
+                ViewOperation::put("sqlstate", "first", "", "", "{}"),
+                ViewOperation::put("sqlstate", "second", "", "", "{}"),
+            ]
+        }),
+    ));
+    let broken = id("sqlstate");
+    let error = store
+        .execute(&broken, Add(1), Metadata::new("local"))
+        .await
+        .expect_err("the statement fails");
+    match error.as_store_error() {
+        Some(Error::ProjectorOperation(failed)) => {
+            assert_eq!(
+                (
+                    failed.projector.as_str(),
+                    failed.projector_index,
+                    failed.operation
+                ),
+                ("broken", 0, 0)
+            );
+            assert_eq!(failed.reason, "23502");
+            assert!(failed.mapped().is_none());
+            assert!(failed.cause().is_some(), "the database error is the cause");
+        }
+        other => panic!("want a projector operation failure, got {other:?}"),
+    }
+    assert!(repository.events(&broken).await.unwrap().is_empty());
+
+    // A writer that returns an empty statement, or fails, refuses the commit before any write.
+    for (label, writer) in [
+        (
+            "empty",
+            std::sync::Arc::new(|_: &ViewOperation| Ok(PgStatement::new("  ", Vec::new())))
+                as ViewWriter,
+        ),
+        (
+            "failing-writer",
+            std::sync::Arc::new(|_: &ViewOperation| {
+                Err(Error::InvalidArgument("no such view".into()))
+            }) as ViewWriter,
+        ),
+    ] {
+        let refusing = repository.clone().with_view_writer(writer);
+        let store = Store::<Ledger, _>::new(&refusing, ()).with_commit_projector(
+            std::sync::Arc::new(FixedRows::new("refused", |_| {
+                vec![ViewOperation::put("p", "s", "", "", "{}")]
+            })),
+        );
+        let refused = id(label);
+        let error = store
+            .execute(&refused, Add(1), Metadata::new("local"))
+            .await
+            .expect_err("the writer refuses");
+        assert!(
+            matches!(
+                error.as_store_error(),
+                Some(Error::InvalidViewOperation(_) | Error::InvalidArgument(_))
+            ),
+            "{label}: {error:?}"
+        );
+        assert!(repository.events(&refused).await.unwrap().is_empty());
+    }
+
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!("DROP TABLE {PG_COMMIT_VIEWS_TABLE}"))
+        .await
+        .expect("drop the commit-wide view table");
 }
 
 /// Fresh and unmigrated databases (ADR 0007): the first write to empty tables declares

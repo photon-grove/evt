@@ -203,9 +203,71 @@ pub enum Error {
     #[error("command handler failed: {0}")]
     Handler(#[source] BoxError),
 
-    /// An in-band projector failed. Nothing was committed.
+    /// An in-band projector failed. Nothing was committed. A commit-wide projector's error names
+    /// the projector. A legacy projector operation that the backend rejected also maps here.
     #[error("projector failed: {0}")]
     Projector(#[source] BoxError),
+
+    /// A commit-wide view operation's condition failed, or the backend rejected its statement
+    /// (v0.9, C7). The error names the projector and the operation, and its
+    /// [`source`](std::error::Error::source) is the operation's mapped error when it carried one
+    /// ([`ViewOperation::on_conflict`](crate::ViewOperation::on_conflict)). It is **not** a
+    /// conflict and **not** transient: re-preparing the command cannot fix it, so it is never
+    /// retried and records no outcome. Nothing was written.
+    #[error(transparent)]
+    ProjectorOperation(Box<crate::projection::ProjectorOperationError>),
+
+    /// A view operation cannot be stored the same way on every backend: an empty `pk` or `sk`,
+    /// text that is not valid UTF-8 or contains U+0000, or a condition its kind does not allow.
+    /// Nothing was written.
+    #[error("invalid view operation: {0}")]
+    InvalidViewOperation(String),
+
+    /// A view row's key is over DynamoDB's limit, 2048 UTF-8 bytes for a `pk` and 1024 for an
+    /// `sk`, so it fails identically on every backend. Nothing was written.
+    #[error(
+        "view key too long: projector {projector:?} operation {operation}: {field} is {length} \
+         bytes, the limit is {max}"
+    )]
+    ViewKeyTooLong {
+        /// `pk` or `sk`.
+        field: &'static str,
+        /// The key's length in UTF-8 bytes.
+        length: usize,
+        /// The limit.
+        max: usize,
+        /// The projector that emitted the operation.
+        projector: String,
+        /// The operation's index among that projector's operations.
+        operation: usize,
+    },
+
+    /// Two view operations of one commit target the same `(pk, sk)` row, which DynamoDB would fail
+    /// with an unclassified validation error. Nothing was written.
+    #[error(
+        "duplicate view key {pk:?}/{sk:?}: projector {:?} operation {} repeats projector {:?} \
+         operation {}",
+        .second.0, .second.1, .first.0, .first.1
+    )]
+    DuplicateViewKey {
+        /// The partition key.
+        pk: String,
+        /// The sort key.
+        sk: String,
+        /// The earlier operation: its projector's name and operation index.
+        first: (String, usize),
+        /// The later operation that repeats the key.
+        second: (String, usize),
+    },
+
+    /// A commit carries view operations, but the repository has no place to write them (no views
+    /// table, no view writer). Dropping them would commit the events without the rows meant to be
+    /// atomic with them, so the repository fails closed. Nothing was written.
+    #[error("the {backend} repository has no views table or view writer configured")]
+    ViewsNotConfigured {
+        /// The refusing backend: `dynamodb` or `postgres`.
+        backend: &'static str,
+    },
 
     /// The backend failed in a way that may succeed on retry, and running the operation again is
     /// safe: throttling, a deadlock, a serialization failure, or a timed-out read. A commit is only

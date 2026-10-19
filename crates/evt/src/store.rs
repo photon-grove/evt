@@ -18,6 +18,7 @@ use crate::outcome::{
     CommandIdentity, CommandOutcome, DigestInput, Outcome, OutcomeCommand, OutcomeConfig,
     Rejection, Settled, ToRejection, pre_check, principal, require_command_id, settle,
 };
+use crate::projection::{CommitProjector, CommitStream, CommitView, project_commit};
 use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
 use crate::retry::{Budget, Failed, Retry, RetryPolicy};
 use crate::transaction::{Begin, PendingCommand, Transaction, freeze_command, persist_rejection};
@@ -40,6 +41,7 @@ pub struct Store<A: Aggregate, R: Repository> {
     services: A::Services,
     pub(crate) snapshot_interval: usize,
     pub(crate) projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
+    pub(crate) commit_projectors: Vec<Arc<dyn CommitProjector>>,
     pub(crate) commit_ids: CommitIdGenerator,
     pub(crate) outcomes: Option<OutcomeConfig>,
 }
@@ -56,6 +58,7 @@ where
             services: self.services.clone(),
             snapshot_interval: self.snapshot_interval,
             projectors: self.projectors.clone(),
+            commit_projectors: self.commit_projectors.clone(),
             commit_ids: self.commit_ids.clone(),
             outcomes: self.outcomes.clone(),
         }
@@ -69,6 +72,7 @@ impl<A: Aggregate, R: Repository + fmt::Debug> fmt::Debug for Store<A, R> {
             .field("repository", &self.repository)
             .field("snapshot_interval", &self.snapshot_interval)
             .field("projectors", &self.projectors.len())
+            .field("commit_projectors", &self.commit_projectors.len())
             .finish_non_exhaustive()
     }
 }
@@ -81,6 +85,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             services,
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             projectors: Vec::new(),
+            commit_projectors: Vec::new(),
             commit_ids: commit_id::default_generator(),
             outcomes: None,
         }
@@ -130,6 +135,18 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     #[must_use]
     pub fn with_projector(mut self, projector: impl Projector<A, R::Operation> + 'static) -> Self {
         self.projectors.push(Arc::new(projector));
+        self
+    }
+
+    /// Adds a commit-wide projector (v0.9, C7): a pure function over every event of a commit,
+    /// whose [view operations](crate::ViewOperation) commit atomically with it, on any backend
+    /// configured to write views. Projectors run in the order they are added, each once per
+    /// commit that writes an event, in every path that builds one ([`execute`](Store::execute),
+    /// [`commit`](Store::commit), the outcome paths, and [`Store::transaction`], which inherits
+    /// them). A re-prepared command projects again from scratch. See [`CommitProjector`].
+    #[must_use]
+    pub fn with_commit_projector(mut self, projector: Arc<dyn CommitProjector>) -> Self {
+        self.commit_projectors.push(projector);
         self
     }
 
@@ -320,11 +337,34 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             }
         }
 
+        // The aggregate's JSON after the commit is the snapshot's payload and the state the
+        // commit-wide projectors see, so it is encoded once and only when one of them needs it.
+        let state = (snapshot_due || !self.commit_projectors.is_empty())
+            .then(|| json::to_vec(&loaded.aggregate))
+            .transpose()?;
+
+        let views = if self.commit_projectors.is_empty() {
+            Vec::new()
+        } else {
+            project_commit(
+                &self.commit_projectors,
+                &CommitView::new(
+                    stamped.commit_id.clone(),
+                    vec![CommitStream::new(
+                        loaded.entity_id.clone(),
+                        EntityType::new(A::TYPE),
+                        serialized.clone(),
+                        state.clone().unwrap_or_default(),
+                    )],
+                ),
+            )?
+        };
+
         let snapshot = if snapshot_due {
             Some(NewSnapshot {
                 entity_type: EntityType::new(A::TYPE),
                 sequence: loaded.snapshot_sequence.next(),
-                payload: json::to_vec(&loaded.aggregate)?,
+                payload: state.unwrap_or_default(),
             })
         } else {
             None
@@ -337,6 +377,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             events: serialized.clone(),
             snapshot,
             operations,
+            views,
             outcome: None,
         };
 

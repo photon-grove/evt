@@ -463,6 +463,58 @@ repository.ensure_schema().await?;
 let store = Store::<Account, _>::new(repository, ());
 ```
 
+## Commit-wide projectors
+
+A `CommitProjector` is a pure function over everything one commit wrote, across every stream and
+aggregate type. It returns `ViewOperation`s, puts and deletes of rows at any `pk`/`sk`, optionally
+conditioned (`if_absent` on a put, `if_present` on a delete) and mapped to your own error
+(`on_conflict`). The rows commit in the same transaction as the events, so a read model that spans
+entities is atomic with the commit. Register projectors with `Store::with_commit_projector` (a
+store's transactions inherit them) or `Transaction::with_commit_projector`.
+
+```rust,ignore
+use std::sync::Arc;
+use photon_evt::{BoxError, CommitProjector, CommitView, ViewOperation};
+
+struct Directory;
+
+impl CommitProjector for Directory {
+    fn name(&self) -> &str {
+        "directory"
+    }
+
+    fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                ViewOperation::put(
+                    "directory",
+                    stream.entity_id.as_str(),
+                    stream.entity_id.as_str(),
+                    stream.entity_type.as_str(),
+                    stream.state.clone(), // the aggregate's JSON after the commit
+                )
+            })
+            .collect())
+    }
+}
+
+let repository = DynamoRepository::new(client, "event-log").with_views_table("views");
+let store = Store::<Account, _>::new(repository, ()).with_commit_projector(Arc::new(Directory));
+```
+
+The repository decides where the rows go: `DynamoRepository::with_views_table`, a
+`PostgresRepository::with_view_writer` that turns each operation into a statement for your own
+table, or `MemRepository` (read back with `view` and `views`). A repository with nowhere to write
+them refuses the commit with `Error::ViewsNotConfigured`. A failed condition is
+`Error::ProjectorOperation`, naming the projector and the operation, with your mapped error as its
+`source()`; it is never retried and records no outcome. Keys over 2,048 bytes (`pk`) or 1,024 bytes
+(`sk`), a repeated key, and operations with no event are refused before any write.
+
+A projector must be deterministic: `group_commits` regroups stored events by commit ID so a
+rebuild, or a test, can run it again over each commit and compare.
+
 ## Enumerating the log
 
 `EventLog`, implemented by all three backends, is the Rust counterpart of Go's `StreamAllEvents`

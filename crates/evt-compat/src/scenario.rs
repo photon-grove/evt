@@ -12,12 +12,14 @@ use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Begin, CommandIdentity, CommandOutcome, Commit, DigestInput, EntityId, EntityType, Error,
     EventId, EventSequence, EventType, EventVersion, ExecuteError, FenceProvenance, Metadata,
-    NewSnapshot, OutcomeConfig, ReadFence, Repository, RetryPolicy, SerializedEvent,
-    SerializedSnapshot, Store, TransactionCommit, default_digest, json,
+    NewSnapshot, OutcomeConfig, ProjectedView, ReadFence, Repository, RetryPolicy, SerializedEvent,
+    SerializedSnapshot, Store, TransactionCommit, ViewOperation, ViewRow, default_digest, json,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::account::{Account, AccountCommand, AccountEvent, balance_response};
+use crate::account::{
+    Account, AccountCommand, AccountEvent, LEDGER_PK, LedgerProjector, balance_response,
+};
 
 /// The writer name of this implementation.
 pub const WRITER: &str = "rust";
@@ -69,6 +71,10 @@ pub struct Scenario {
     /// command ID, and execute steps record and replay outcomes.
     #[serde(default)]
     pub outcomes: bool,
+    /// Registers the shared [`LedgerProjector`] (a commit-wide projector) on the scenario's
+    /// stores, so every commit that writes events also writes ledger rows.
+    #[serde(default)]
+    pub projector: bool,
     pub steps: Vec<Step>,
 }
 
@@ -76,6 +82,27 @@ impl Scenario {
     /// The stream ID of this scenario within a run.
     pub fn entity_id(&self, run: &str) -> EntityId {
         EntityId::new(format!("compat-{run}-{}", self.name))
+    }
+
+    /// The view partitions the scenario writes, ascending: those its transaction steps name, and
+    /// the ledger partition when it registers the shared projector. Placeholders resolve against
+    /// the scenario's entity ID. A partition over the key limit is never stored, so it is not one.
+    pub fn view_partitions(&self, entity_id: &EntityId) -> Vec<String> {
+        let mut partitions = std::collections::BTreeSet::new();
+
+        for step in &self.steps {
+            partitions.extend(
+                views_of(entity_id, step)
+                    .into_iter()
+                    .map(|view| view.op.pk)
+                    .filter(|pk| pk.len() <= photon_evt::MAX_VIEW_PK_BYTES),
+            );
+        }
+        if self.projector {
+            partitions.insert(LEDGER_PK.to_owned());
+        }
+
+        partitions.into_iter().collect()
     }
 
     /// Every non-empty stream suffix the scenario writes, fences, appends to, or compacts, in
@@ -159,6 +186,108 @@ pub struct Step {
     /// The event sequence a `putSnapshot` step's snapshot covers. Present even when 0.
     #[serde(default)]
     pub event_sequence: Option<i64>,
+    /// The commit-wide projectors' view operations of a `transaction` step, in declaration order.
+    #[serde(default)]
+    pub projectors: Vec<StepProjector>,
+}
+
+/// One projector of a transaction step: its name and the operations it emits.
+#[derive(Clone, Debug, Deserialize)]
+pub struct StepProjector {
+    pub name: String,
+    #[serde(default)]
+    pub operations: Vec<StepView>,
+}
+
+/// One view operation of a transaction step. The placeholder `{id}` in `pk`, `sk`, `entityId`, and
+/// `payload` is the scenario's entity ID, so rows are scoped to the run. `pkPad` and `skPad`
+/// extend a key with `x` up to that many bytes, so the key-limit cases need not store a 2 KB string.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepView {
+    pub op: String,
+    pub pk: String,
+    pub sk: String,
+    #[serde(default)]
+    pub entity_id: String,
+    #[serde(default)]
+    pub entity_type: String,
+    #[serde(default)]
+    pub payload: String,
+    #[serde(default)]
+    pub condition: String,
+    #[serde(default)]
+    pub pk_pad: usize,
+    #[serde(default)]
+    pub sk_pad: usize,
+    /// Maps the operation's failed condition to an error with this message.
+    #[serde(default)]
+    pub conflict: String,
+}
+
+/// The operation's mapped error: a message, matched across languages by its text.
+#[derive(Debug)]
+struct Mapped(String);
+
+impl std::fmt::Display for Mapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Mapped {}
+
+/// The step's commit-wide view operations, in declaration then emission order.
+pub fn views_of(base: &EntityId, step: &Step) -> Vec<ProjectedView> {
+    let scope = |text: &str| text.replace("{id}", base.as_str());
+    let pad = |mut text: String, size: usize| {
+        if text.len() < size {
+            text.push_str(&"x".repeat(size - text.len()));
+        }
+
+        text
+    };
+
+    let mut views = Vec::new();
+    for (index, projector) in step.projectors.iter().enumerate() {
+        for (operation, item) in projector.operations.iter().enumerate() {
+            let (pk, sk) = (
+                pad(scope(&item.pk), item.pk_pad),
+                pad(scope(&item.sk), item.sk_pad),
+            );
+            let mut op = if item.op == "delete" {
+                ViewOperation::delete(pk, sk)
+            } else {
+                ViewOperation::put(
+                    pk,
+                    sk,
+                    scope(&item.entity_id),
+                    item.entity_type.clone(),
+                    scope(&item.payload).into_bytes(),
+                )
+            };
+
+            op = match item.condition.as_str() {
+                "absent" => op.if_absent(),
+                "present" => op.if_present(),
+                _ => op,
+            };
+            if !item.conflict.is_empty() {
+                op = op.on_conflict(Mapped(item.conflict.clone()));
+            }
+
+            views.push(ProjectedView::new(&projector.name, index, operation, op));
+        }
+    }
+
+    views
+}
+
+/// Reports whether a row of a shared view partition belongs to the run's scenario: its partition
+/// or sort key contains the scenario's entity ID. Rows of other runs and scenarios share the
+/// ledger partition of a live table, so a verifier keeps only its own.
+pub fn owns_view_row(base: &EntityId, pk: &str, sk: &str) -> bool {
+    pk.contains(base.as_str()) || sk.contains(base.as_str())
 }
 
 /// The command identity of an `outcomeOnly` step: its type string and payload object.
@@ -266,6 +395,18 @@ pub struct Outcome {
     /// The outcome was read back from a stored row rather than produced by the step.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replayed: bool,
+    /// The projector and operation index of a failed view operation (`projector`), and the
+    /// message of the operation's mapped error when it carried one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub projector: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub operation: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mapped: String,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 impl Outcome {
@@ -273,6 +414,22 @@ impl Outcome {
         Self {
             result: result.to_owned(),
             ..Self::default()
+        }
+    }
+
+    /// The step outcome of a commit-wide view failure or refusal, if `error` is one.
+    fn of_view_error(error: &Error) -> Option<Self> {
+        match error {
+            Error::ProjectorOperation(failed) => Some(Self {
+                projector: failed.projector.clone(),
+                operation: failed.operation,
+                mapped: failed.mapped().map(ToString::to_string).unwrap_or_default(),
+                ..Self::of("projector")
+            }),
+            Error::ProjectorWithoutEvents { .. } => Some(Self::of("projectorOnly")),
+            Error::ViewKeyTooLong { .. } => Some(Self::of("viewKeyTooLong")),
+            Error::DuplicateViewKey { .. } => Some(Self::of("duplicateViewKey")),
+            _ => None,
         }
     }
 
@@ -348,6 +505,56 @@ pub struct Expectation {
     /// The command-outcome rows an outcomes scenario leaves behind, ordered by command ID.
     #[serde(default, deserialize_with = "null_to_empty")]
     pub outcomes: Vec<OutcomeExpectation>,
+    /// The view rows commit-wide projectors left in the scenario's partitions, ordered by
+    /// partition then sort key bytes.
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub views: Vec<ViewExpectation>,
+}
+
+/// One stored view row, as its DynamoDB item.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewExpectation {
+    pub pk: String,
+    pub sk: String,
+    pub dynamo_item: serde_json::Value,
+}
+
+impl ViewExpectation {
+    /// The expectation for a stored row: its five attributes as DynamoDB strings.
+    pub fn of(row: &ViewRow) -> Self {
+        let text = |value: &str| serde_json::json!({ "S": value });
+
+        Self {
+            pk: row.pk.clone(),
+            sk: row.sk.clone(),
+            dynamo_item: serde_json::json!({
+                "pk": text(&row.pk),
+                "sk": text(&row.sk),
+                "entityID": text(&row.entity_id),
+                "entityType": text(&row.entity_type),
+                "payload": text(&String::from_utf8_lossy(&row.payload)),
+            }),
+        }
+    }
+
+    /// The row a fixture's item describes.
+    pub fn row(&self) -> ViewRow {
+        let text = |name: &str| {
+            self.dynamo_item[name]["S"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        ViewRow::new(
+            text("pk"),
+            text("sk"),
+            text("entityID"),
+            text("entityType"),
+            text("payload").into_bytes(),
+        )
+    }
 }
 
 /// One stored command-outcome row, as its DynamoDB item.
@@ -421,6 +628,9 @@ pub struct Runner<R: Repository> {
     snapshot_interval: usize,
     outcomes: Option<OutcomeRun>,
     heads: Option<Arc<dyn HeadAccess>>,
+    views: Option<Arc<dyn ViewAccess>>,
+    /// The scenario registers the shared [`LedgerProjector`] on every store the runner builds.
+    projector: bool,
 }
 
 /// A boxed future of a head access.
@@ -434,6 +644,24 @@ pub trait HeadAccess: Send + Sync {
 
     /// The stream's stored head, `None` when it has no head item or row.
     fn stored_head<'a>(&'a self, entity_id: &'a EntityId) -> HeadFuture<'a, Option<EventSequence>>;
+}
+
+/// Read access to a backend's commit-wide view rows, for `observe_views`.
+pub trait ViewAccess: Send + Sync {
+    /// Every row in a view partition, in any order.
+    fn rows<'a>(&'a self, pk: &'a str) -> HeadFuture<'a, Vec<ViewRow>>;
+}
+
+impl ViewAccess for photon_evt::MemRepository {
+    fn rows<'a>(&'a self, pk: &'a str) -> HeadFuture<'a, Vec<ViewRow>> {
+        Box::pin(async move {
+            Ok(self
+                .views()
+                .into_iter()
+                .filter(|row| row.pk == pk)
+                .collect())
+        })
+    }
 }
 
 impl HeadAccess for photon_evt::MemRepository {
@@ -455,7 +683,18 @@ impl<R: Repository> Runner<R> {
             snapshot_interval,
             outcomes: None,
             heads: None,
+            views: None,
+            projector: false,
         }
+    }
+
+    /// Gives the runner read access to the backend's commit-wide view rows, which
+    /// [`observe_views`](Runner::observe_views) needs.
+    #[must_use]
+    pub fn with_view_access(mut self, views: impl ViewAccess + 'static) -> Self {
+        self.views = Some(Arc::new(views));
+
+        self
     }
 
     /// Gives the runner raw access to the backend's stream heads, which the
@@ -474,6 +713,13 @@ impl<R: Repository> Runner<R> {
     /// and the scenario, because outcome rows are global to the table.
     pub fn for_scenario(repository: R, scenario: &Scenario, run: &str) -> Self {
         let mut runner = Self::new(repository, scenario.snapshot_interval);
+
+        if scenario.projector {
+            runner.projector = true;
+            runner.store = runner
+                .store
+                .with_commit_projector(Arc::new(LedgerProjector));
+        }
 
         if scenario.outcomes {
             let (from, to) = (format!("compat-{run}-"), format!("compat-{FIXTURE_RUN}-"));
@@ -646,6 +892,7 @@ impl<R: Repository> Runner<R> {
         }
 
         let mut commit = TransactionCommit::new(streams);
+        commit.views = views_of(entity_id, step);
         commit.fences = step
             .fences
             .iter()
@@ -661,8 +908,10 @@ impl<R: Repository> Runner<R> {
             })
             .collect();
 
+        // A commit refused before any write: a key over the limit, a repeated key, operations
+        // with no event.
         if let Err(error) = commit.normalize() {
-            return Err(error.into());
+            return Outcome::of_view_error(&error).ok_or_else(|| error.into());
         }
 
         // Every stream the transaction touches: a failed transaction must leave all of them
@@ -690,6 +939,9 @@ impl<R: Repository> Runner<R> {
                     return Err(StepError::Unexpected(format!(
                         "failed transaction left partial events: {error}"
                     )));
+                }
+                if let Some(outcome) = Outcome::of_view_error(&error) {
+                    return Ok(outcome);
                 }
                 if matches!(error, Error::StreamHeadDrift { .. }) {
                     return Ok(Outcome::of("drift"));
@@ -742,7 +994,7 @@ impl<R: Repository> Runner<R> {
             Err(err) if err.is_duplicate_command() => Ok(Outcome::of("duplicate")),
             Err(err) if err.is_conflict() => Ok(Outcome::of("conflict")),
             Err(ExecuteError::Store(Error::StreamHeadDrift { .. })) => Ok(Outcome::of("drift")),
-            Err(ExecuteError::Store(err)) => Err(err.into()),
+            Err(ExecuteError::Store(err)) => Outcome::of_view_error(&err).ok_or_else(|| err.into()),
             Err(other) => Err(StepError::Unexpected(other.to_string())),
         }
     }
@@ -771,9 +1023,12 @@ impl<R: Repository> Runner<R> {
                     }
                 }
 
-                let store = Store::<Account, _>::new(&fault, ())
+                let mut store = Store::<Account, _>::new(&fault, ())
                     .with_snapshot_interval(self.snapshot_interval)
                     .with_outcomes(outcomes.config.clone());
+                if self.projector {
+                    store = store.with_commit_projector(Arc::new(LedgerProjector));
+                }
 
                 execute_on(&store, entity_id, step, metadata).await?
             }
@@ -967,7 +1222,36 @@ impl<R: Repository> Runner<R> {
             siblings: Vec::new(),
             transactions: Vec::new(),
             outcomes: Vec::new(),
+            views: Vec::new(),
         })
+    }
+
+    /// Reads the view rows of the scenario's partitions that belong to the run (the rows whose
+    /// partition or sort key names the scenario's entity ID), ordered by partition then sort key
+    /// bytes, as the DynamoDB items this implementation encodes for them. A runner without view
+    /// access observes none.
+    pub async fn observe_views(
+        &self,
+        scenario: &Scenario,
+        entity_id: &EntityId,
+    ) -> Result<Vec<ViewExpectation>, Error> {
+        let Some(access) = &self.views else {
+            return Ok(Vec::new());
+        };
+
+        let mut views = Vec::new();
+        for pk in scenario.view_partitions(entity_id) {
+            let mut rows = access.rows(&pk).await?;
+            rows.sort_by(|a, b| a.sk.as_bytes().cmp(b.sk.as_bytes()));
+
+            views.extend(
+                rows.iter()
+                    .filter(|row| owns_view_row(entity_id, &row.pk, &row.sk))
+                    .map(ViewExpectation::of),
+            );
+        }
+
+        Ok(views)
     }
 
     /// Reads the stored events, snapshot, and DynamoDB items of each sibling stream, in the order
@@ -1050,7 +1334,7 @@ fn classify<E>(result: Result<CommandOutcome<E>, Error>) -> Result<Outcome, Step
         Err(Error::DuplicateCommand(_)) => Ok(Outcome::of("duplicate")),
         Err(error) if error.is_conflict() => Ok(Outcome::of("conflict")),
         Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
-        Err(error) => Err(error.into()),
+        Err(error) => Outcome::of_view_error(&error).ok_or_else(|| error.into()),
     }
 }
 

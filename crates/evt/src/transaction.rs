@@ -23,6 +23,7 @@ use crate::outcome::{
     CommandIdentity, CommandOutcome, Outcome, OutcomeConfig, Rejection, Settled, pre_check,
     require_command_id, settle,
 };
+use crate::projection::{CommitProjector, CommitStream, CommitView, project_commit};
 use crate::repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
     snapshot_events_due,
@@ -107,6 +108,10 @@ struct StreamState<Op> {
     /// The projector operations for the stream's cumulative appended events, recomputed on every
     /// append from the final aggregate state, never accumulated across appends.
     operations: Vec<Op>,
+    /// The stream's state after its cumulative appended events: the JSON its snapshot would carry,
+    /// for the commit-wide projectors. Recomputed on every append, and empty when the transaction
+    /// has none.
+    state: Vec<u8>,
 }
 
 /// A stream read into a [`Transaction`]: the loaded aggregate, typed by its own `A`. Pass it to
@@ -179,6 +184,12 @@ pub struct Transaction<'a, R: Repository> {
     snapshot_interval: usize,
     streams: Vec<StreamState<R::Operation>>,
     fences: Vec<ReadFence>,
+    /// The commit-wide projectors, in declaration order. [`Store::transaction`] carries the
+    /// store's.
+    commit_projectors: Vec<Arc<dyn CommitProjector>>,
+    /// Set when a commit projector was added after a stream already had events appended: that
+    /// stream's state after the commit was never captured for it.
+    late_commit_projector: bool,
     /// Set when a step failed after an append changed a handle's aggregate, leaving the handle
     /// ahead of what the transaction staged. Further appends and the commit are refused.
     poisoned: bool,
@@ -205,6 +216,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             self.snapshot_interval,
         );
         transaction.outcomes = self.outcomes.clone();
+        transaction.commit_projectors = self.commit_projectors.clone();
 
         transaction
     }
@@ -245,6 +257,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
             snapshot_interval,
             streams: Vec::new(),
             fences: Vec::new(),
+            commit_projectors: Vec::new(),
+            late_commit_projector: false,
             poisoned: false,
             finished: false,
             outcomes: None,
@@ -341,6 +355,28 @@ impl<'a, R: Repository> Transaction<'a, R> {
         Ok(Begin::Proceed)
     }
 
+    /// Adds a commit-wide projector (v0.9, C7): a pure function over every event of the commit,
+    /// whose [view operations](crate::ViewOperation) commit atomically with it. Projectors run in
+    /// the order they are added, once, when the transaction is prepared for commit, over the final
+    /// state of every written stream, so a projector sees the whole multi-stream commit. They run
+    /// for [`commit`](Transaction::commit), [`commit_with_outcome`](Transaction::commit_with_outcome),
+    /// and [`reject_with_events`](Transaction::reject_with_events); a plain
+    /// [`reject`](Transaction::reject) and a commit that writes no event run none.
+    /// [`Store::transaction`] carries the store's projectors.
+    #[must_use]
+    ///
+    /// Add projectors before the first [`append`](Transaction::append): a stream's state after the
+    /// commit is captured as events are appended, so a projector added later makes the commit fail
+    /// with [`Error::InvalidCommit`] instead of seeing an empty state.
+    pub fn with_commit_projector(mut self, projector: Arc<dyn CommitProjector>) -> Self {
+        if self.streams.iter().any(|stream| !stream.events.is_empty()) {
+            self.late_commit_projector = true;
+        }
+
+        self.commit_projectors.push(projector);
+        self
+    }
+
     /// Sets the number of events between snapshots for streams staged with
     /// [`append`](Transaction::append). 0 disables snapshots.
     #[must_use]
@@ -401,6 +437,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             events: Vec::new(),
             snapshot: None,
             operations: Vec::new(),
+            state: Vec::new(),
         });
 
         Ok(Read {
@@ -536,7 +573,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
         let staged =
             self.stage_derived(read, &serialized, projected, projectors, snapshot_interval);
-        let (operations, snapshot) = match staged {
+        let (operations, snapshot, state) = match staged {
             Ok(derived) => derived,
             Err(error) => {
                 self.poisoned = true;
@@ -557,12 +594,15 @@ impl<'a, R: Repository> Transaction<'a, R> {
         stream.events.extend(serialized);
         stream.snapshot = snapshot;
         stream.operations = operations;
+        stream.state = state;
 
         Ok(())
     }
 
     /// Derives the projector operations (from the stream's cumulative appended events and final
-    /// aggregate state) and the snapshot for the state after the new events.
+    /// aggregate state), the snapshot, and the state JSON the commit-wide projectors see, for the
+    /// state after the new events. The state is encoded once, and only when a snapshot or a
+    /// commit-wide projector needs it.
     #[allow(clippy::type_complexity)]
     fn stage_derived<A: Aggregate>(
         &self,
@@ -571,7 +611,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         projected: Option<Vec<A::Event>>,
         projectors: &[Arc<dyn Projector<A, R::Operation>>],
         snapshot_interval: usize,
-    ) -> Result<(Vec<R::Operation>, Option<NewSnapshot>), Error> {
+    ) -> Result<(Vec<R::Operation>, Option<NewSnapshot>, Vec<u8>), Error> {
         let mut operations = Vec::new();
         if let Some(new_events) = projected {
             let mut cumulative = read.appended.clone();
@@ -587,17 +627,25 @@ impl<'a, R: Repository> Transaction<'a, R> {
         }
 
         let appended = self.streams[read.index].events.len() + serialized.len();
-        let snapshot = if snapshot_events_due(read.base_sequence, appended, snapshot_interval) > 0 {
-            Some(NewSnapshot {
-                entity_type: EntityType::new(A::TYPE),
-                sequence: read.loaded.snapshot_sequence.next(),
-                payload: json::to_vec(&read.loaded.aggregate)?,
-            })
+        let snapshot_due = snapshot_events_due(read.base_sequence, appended, snapshot_interval) > 0;
+        let state = if snapshot_due || !self.commit_projectors.is_empty() {
+            json::to_vec(&read.loaded.aggregate)?
         } else {
-            None
+            Vec::new()
         };
 
-        Ok((operations, snapshot))
+        let snapshot = snapshot_due.then(|| NewSnapshot {
+            entity_type: EntityType::new(A::TYPE),
+            sequence: read.loaded.snapshot_sequence.next(),
+            payload: state.clone(),
+        });
+        let state = if self.commit_projectors.is_empty() {
+            Vec::new()
+        } else {
+            state
+        };
+
+        Ok((operations, snapshot, state))
     }
 
     /// Adds a caller-stamped read fence for a stream the transaction did not read. The fence fails
@@ -867,6 +915,13 @@ impl<'a, R: Repository> Transaction<'a, R> {
             return Err(Error::TransactionPoisoned);
         }
 
+        if self.late_commit_projector {
+            return Err(Error::InvalidCommit(
+                "a commit projector was added after events were appended; add projectors first"
+                    .into(),
+            ));
+        }
+
         let metadata = stamp_commit_id(metadata, &*self.commit_ids);
 
         if let Some(command_id) = &metadata.command_id
@@ -918,6 +973,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
         let mut committed = Vec::new();
         let mut commits = Vec::new();
+        let mut view_streams = Vec::new();
         for stream in written {
             let mut events = stream.events;
             for event in &mut events {
@@ -925,18 +981,37 @@ impl<'a, R: Repository> Transaction<'a, R> {
             }
 
             committed.extend(events.iter().cloned());
+            if !self.commit_projectors.is_empty() {
+                view_streams.push(CommitStream::new(
+                    stream.entity_id.clone(),
+                    stream.entity_type,
+                    events.clone(),
+                    stream.state,
+                ));
+            }
             commits.push(Commit {
                 entity_id: stream.entity_id,
                 events,
                 snapshot: stream.snapshot,
                 operations: Vec::new(),
+                views: Vec::new(),
                 outcome: None,
             });
         }
 
+        // The commit-wide projectors run once, here, over the whole commit: every written stream
+        // in the transaction's byte order, with the final stamped events and the state after them.
+        // Every attempt of fence-aware retry prepares a fresh transaction, so the operations are
+        // derived again each time and nothing from a failed attempt carries over.
+        let views = project_commit(
+            &self.commit_projectors,
+            &CommitView::new(metadata.commit_id.clone(), view_streams),
+        )?;
+
         let mut commit = TransactionCommit::new(commits);
         commit.fences = std::mem::take(&mut self.fences);
         commit.operations = operations;
+        commit.views = views;
 
         Ok((commit, committed))
     }
