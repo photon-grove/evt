@@ -151,7 +151,44 @@ async fn clear_manifest<R: photon_evt::FeatureMarker>(repository: &R) {
 // does not, but the projector-condition case deliberately fails a transaction.
 #[tokio::test]
 async fn dynamo_conforms() {
-    let repository = drivers::dynamo().await;
+    // A private, stream-less table of its own: the emulator copies every table a transaction
+    // touches (and its change-stream history) to be able to roll it back, so a table shared with
+    // other suites, or one with a stream enabled, makes every commit slower than the last and
+    // balloons the emulator's memory. A new table also starts empty, so the writer declares
+    // `stream-heads` itself the way a fresh deployment does.
+    let client = drivers::dynamo_client().await;
+    let table = format!(
+        "evt-conformance-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    create_dynamo_table(&client, &table).await;
+
+    // The whole run is bounded: a case that loops without making progress fails the test rather
+    // than holding the job until its timeout.
+    tokio::time::timeout(
+        Duration::from_secs(CONFORMANCE_BUDGET_SECS),
+        Box::pin(run_dynamo_conformance(client.clone(), &table)),
+    )
+    .await
+    .expect("the DynamoDB conformance run exceeded its time budget");
+
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .expect("delete the conformance table");
+}
+
+/// The longest the DynamoDB conformance run may take (about 25 s on a laptop-class machine).
+const CONFORMANCE_BUDGET_SECS: u64 = 300;
+
+async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
+    let repository = DynamoRepository::new(client, table);
     let views = DynamoViews {
         client: repository.client().clone(),
         table: drivers::views_table(),

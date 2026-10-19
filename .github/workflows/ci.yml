@@ -224,6 +224,7 @@ jobs:
 
       - name: Run integration tests
         if: needs.changes.outputs.go == 'true'
+        timeout-minutes: 8
         env:
           AWS_ENDPOINT_URL: http://localhost:4566
           AWS_REGION: us-west-2
@@ -238,6 +239,7 @@ jobs:
 
       - name: Run Rust and cross-language integration tests
         if: needs.changes.outputs.compat == 'true'
+        timeout-minutes: 12
         env:
           CARGO_INCREMENTAL: 0
           AWS_ENDPOINT_URL: http://localhost:4566

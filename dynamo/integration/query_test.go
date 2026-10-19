@@ -63,6 +63,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_GetSnapshot_NoneExists() {
 
 func (s *DynamoEventsIntegrationSuite) Test_Query_StreamEntities() {
 	ctx := context.Background()
+	s.SetupEntity(evt.EntityID(newID()), 100)
 	metadata := s.getMetadata(ctx)
 
 	// Create two distinct entities

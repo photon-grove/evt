@@ -2,6 +2,8 @@
 //! variables as the Go integration tests.
 
 use crate::scenario::{HeadAccess, HeadFuture};
+use aws_config::retry::RetryConfig;
+use aws_config::timeout::TimeoutConfig;
 use aws_sdk_dynamodb::types::AttributeValue;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use photon_evt::conformance::HeadFixtures;
@@ -9,6 +11,7 @@ use photon_evt::dynamodb::DynamoRepository;
 use photon_evt::postgres::PostgresRepository;
 use photon_evt::wire::postgres::{DEFAULT_EVENTS_TABLE, EventRow, stream_heads_table};
 use photon_evt::{BoxError, EntityId, Error, EventSequence, Repository, SerializedEvent};
+use std::time::Duration;
 
 /// The local event-log table (`EVT_COMPAT_DYNAMO_TABLE`).
 pub fn dynamo_table() -> String {
@@ -20,13 +23,28 @@ pub fn views_table() -> String {
     std::env::var("EVT_COMPAT_VIEWS_TABLE").unwrap_or_else(|_| "evt-local-entity-views".into())
 }
 
+/// The longest one DynamoDB call may take, retries included. The SDK sets no deadline by default,
+/// so an emulator that stops answering would otherwise hold a test (and the CI job) until its
+/// timeout.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A DynamoDB client for `AWS_ENDPOINT_URL` (default `http://localhost:4566`) in `us-west-2`.
+///
+/// Calls are bounded ([`CALL_TIMEOUT`]) and never retried, like the Go integration client: an
+/// emulator error fails the test where it happened instead of being retried into a hang.
 pub async fn dynamo_client() -> aws_sdk_dynamodb::Client {
     let endpoint =
         std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "http://localhost:4566".into());
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new("us-west-2"))
         .endpoint_url(endpoint)
+        .retry_config(RetryConfig::standard().with_max_attempts(1))
+        .timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .operation_timeout(CALL_TIMEOUT)
+                .build(),
+        )
         .load()
         .await;
 

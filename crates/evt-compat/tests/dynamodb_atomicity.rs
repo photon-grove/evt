@@ -224,6 +224,9 @@ impl TransactionGate {
             .config()
             .to_builder()
             .endpoint_url(&self.endpoint)
+            // The proxy closes every connection after one request, so the SDK's first attempt on
+            // a pooled connection can fail; the drivers' client never retries, this one must.
+            .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(3))
             .build();
         DynamoRepository::new(
             aws_sdk_dynamodb::Client::from_conf(config),

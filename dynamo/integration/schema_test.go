@@ -28,7 +28,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Schema_EventItemStructure() {
 
 	// Fetch directly from DynamoDB to verify schema
 	output, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String("evt-local-event-log"),
+		TableName: aws.String(s.repo.EventsTable),
 		Key: map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: string(s.entityID)},
 			"sk": &types.AttributeValueMemberN{Value: "1"}, // Sequence 1
@@ -101,7 +101,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Schema_SnapshotItemStructure() {
 
 	// Fetch inline snapshot from the event-log table at sk=0
 	output, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String("evt-local-event-log"),
+		TableName: aws.String(s.repo.EventsTable),
 		Key: map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: string(s.entityID)},
 			"sk": &types.AttributeValueMemberN{Value: "0"},
