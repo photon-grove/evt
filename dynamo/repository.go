@@ -23,6 +23,7 @@ type Repository struct {
 	now            func() time.Time // clock for TTL expiry; nil means time.Now
 	logger         *slog.Logger
 	features       *FeatureMarker // mandatory feature validation (C9)
+	ttlFloors      *ttlFloors     // largest loaded ttl per stream, for the head item's never-lower ttl
 }
 
 // Retention maps entity types to TTL durations for events and inline snapshots. Other rows have no
@@ -45,7 +46,7 @@ func NewRepository(client Client, eventsTable string) *Repository {
 	})
 
 	return &Repository{EventsTable: eventsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true,
-		features: newFeatureMarker(client, eventsTable, nil)}
+		features: newFeatureMarker(client, eventsTable, nil), ttlFloors: newTTLFloors()}
 }
 
 // WithLogger returns a shallow copy of the repository with the logger updated.

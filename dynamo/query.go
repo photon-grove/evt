@@ -213,6 +213,10 @@ func (repo *Repository) decodeQueryPage(items []map[string]types.AttributeValue)
 			continue
 		}
 
+		// A retained stream's head item carries a ttl at least that of every other item, so the
+		// next commit needs the largest one this reader saw.
+		repo.ttlFloors.observe(event.PK, event.TTL)
+
 		var metadata evt.Metadata
 		if err := eventjson.UnmarshalMetadata([]byte(event.Metadata), &metadata); err != nil {
 			return nil, err

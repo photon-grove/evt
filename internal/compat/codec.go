@@ -239,6 +239,28 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 	return fixtures, nil
 }
 
+// seedHead declares stream-heads on an empty fake table and stores a stream's head item, the state a
+// stream is in after a head-aware writer committed up to head.
+func seedHead(
+	ctx context.Context,
+	fake *FakeDynamo,
+	repo *dynamo.Repository,
+	entityID evt.EntityID,
+	head evt.EventSequence,
+) error {
+	if _, err := repo.FeatureMarker(nil).DeclareStreamHeads(ctx); err != nil {
+		return err
+	}
+
+	_, err := fake.PutItem(ctx, &dynamodb.PutItemInput{Item: map[string]types.AttributeValue{
+		"pk":   &types.AttributeValueMemberS{Value: string(entityID)},
+		"sk":   &types.AttributeValueMemberN{Value: "-1"},
+		"head": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(head), 10)},
+	}})
+
+	return err
+}
+
 func eventVector(ctx context.Context, c namedEvent) (EventVector, error) {
 	serialized, err := eventjson.MarshalEvent(c.event)
 	if err != nil {
@@ -253,14 +275,10 @@ func eventVector(ctx context.Context, c namedEvent) (EventVector, error) {
 	fake := NewFakeDynamo()
 	repo := dynamo.NewRepository(fake, fakeTable)
 
-	// A commit must continue from the stored head, so a vector above sequence 1 is committed onto
-	// a stream whose previous event is already stored.
+	// A commit must continue from the stored head (ADR 0007), so a vector above sequence 1 is
+	// committed onto a stream whose head item already says the previous event is stored.
 	if c.event.Sequence > 1 {
-		_, err = fake.PutItem(ctx, &dynamodb.PutItemInput{Item: map[string]types.AttributeValue{
-			"pk": &types.AttributeValueMemberS{Value: string(c.event.EntityID)},
-			"sk": &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(c.event.Sequence)-1, 10)},
-		}})
-		if err != nil {
+		if err = seedHead(ctx, fake, repo, c.event.EntityID, c.event.Sequence-1); err != nil {
 			return EventVector{}, err
 		}
 	}
@@ -310,17 +328,28 @@ func snapshotVector(ctx context.Context, c namedSnapshot) (SnapshotVector, error
 		return SnapshotVector{}, err
 	}
 
+	// A snapshot never covers more than the stream's head (H3), so the stream's head item is
+	// stored first.
 	fake := NewFakeDynamo()
 	repo := dynamo.NewRepository(fake, fakeTable)
+	if err = seedHead(ctx, fake, repo, c.snapshot.EntityID, c.snapshot.EventSequence); err != nil {
+		return SnapshotVector{}, err
+	}
+
 	err = repo.PutSnapshot(ctx, c.snapshot.EntityType, c.snapshot.EntityID, c.snapshot.Payload,
 		c.snapshot.Sequence, c.snapshot.EventSequence)
 	if err != nil {
 		return SnapshotVector{}, err
 	}
 
-	items := fake.Items(string(c.snapshot.EntityID))
+	var items []map[string]types.AttributeValue
+	for _, item := range fake.Items(string(c.snapshot.EntityID)) {
+		if sk, ok := item["sk"].(*types.AttributeValueMemberN); ok && sk.Value == "0" {
+			items = append(items, item)
+		}
+	}
 	if len(items) != 1 {
-		return SnapshotVector{}, fmt.Errorf("expected one stored item, got %d", len(items))
+		return SnapshotVector{}, fmt.Errorf("expected one stored snapshot item, got %d", len(items))
 	}
 
 	return SnapshotVector{

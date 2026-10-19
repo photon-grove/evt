@@ -31,6 +31,27 @@ WHERE ($1 = '' OR entity_type = $1) AND `+reservedExclusion+`
 GROUP BY entity_id`, repo.eventsTable, repo.snapshotsTable)
 }
 
+// entityHeadsQuery picks the query that serves entity heads. Once the store declares stream-heads
+// the head table is the source: one row per stream, with no aggregate over the events table. Until
+// then it keeps the aggregate over events and snapshots, because EnsureSchema creates the head table
+// empty on a populated database, and a head-aware process reading it before the migration would
+// report no entities and make an incremental rebuild skip all of them.
+func (repo *Repository) entityHeadsQuery(ctx context.Context) (string, error) {
+	manifest, err := repo.features.Manifest(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	if manifest != nil && manifest.DeclaresStreamHeads() {
+		return fmt.Sprintf(
+			`SELECT entity_id, head FROM %s WHERE ($1 = '' OR entity_type = $1) AND `+reservedExclusion,
+			repo.headsTable(),
+		), nil
+	}
+
+	return repo.headsQuery(), nil
+}
+
 // StreamEntityHeads enumerates the distinct entities in the log and returns each entity's current
 // head sequence. It implements evt.EntityHeadStreamer by materializing the streamed visitor into a
 // map.
@@ -60,7 +81,12 @@ func (repo *Repository) StreamEntityHeadsFunc(
 	entityType evt.EntityType,
 	visit func(evt.EntityID, evt.EventSequence) error,
 ) error {
-	rows, err := repo.db.Query(ctx, repo.headsQuery(), string(entityType))
+	query, err := repo.entityHeadsQuery(ctx)
+	if err != nil {
+		return err
+	}
+
+	rows, err := repo.db.Query(ctx, query, string(entityType))
 	if err != nil {
 		return fmt.Errorf("postgres: stream entity heads: %w", err)
 	}

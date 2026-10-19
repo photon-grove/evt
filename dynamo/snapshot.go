@@ -43,7 +43,8 @@ func (repo *Repository) getSnapshot(
 	return snapshot, nil
 }
 
-// PutSnapshot writes a snapshot and the mandatory feature-marker check in one transaction.
+// PutSnapshot writes a snapshot, guarded by the stream's head item and the mandatory
+// feature-marker check, in one transaction (marker check, head item, snapshot put).
 // Snapshots are stored inline in the event-log table at sk=0.
 // This is intended for use by projectors and background processes that need to
 // write snapshots outside of the transactional command handler flow.
@@ -54,6 +55,13 @@ func (repo *Repository) getSnapshot(
 // later load would seed from the older snapshot and query events that compaction has deleted,
 // rebuilding with missing history. A regressing write is treated as a no-op (the existing, newer
 // snapshot already covers it), so background catch-up writers do not see spurious errors.
+//
+// The write also keeps invariant H3 (a snapshot never covers more than the stream's head): the
+// head item must be at least the snapshot's EventSequence, or absent when that is 0. A snapshot
+// ahead of the stream, or on a stream with no head item, would let a writer that loaded earlier
+// append events beneath a snapshot that already covers them, so it is refused with
+// *evt.StreamHeadDriftError instead of being written. For an entity type with retention the same
+// transaction keeps the head item's ttl at least the snapshot's, never lowering it.
 func (repo *Repository) PutSnapshot(
 	ctx context.Context,
 	entityType evt.EntityType,
@@ -70,6 +78,10 @@ func (repo *Repository) PutSnapshot(
 		return err
 	}
 
+	// Mirror the events' retention so a background/catch-up snapshot of a policy'd type expires
+	// with its stream instead of lingering as an orphan sk=0 row; omitempty drops it otherwise.
+	ttl := repo.ttlFor(entityType)
+
 	snapshot := Snapshot{
 		PK:            entityID,
 		SK:            0,
@@ -77,9 +89,7 @@ func (repo *Repository) PutSnapshot(
 		EventSequence: eventSequence,
 		EntityType:    entityType,
 		Payload:       string(payload),
-		// Mirror the events' retention so a background/catch-up snapshot of a policy'd type expires
-		// with its stream instead of lingering as an orphan sk=0 row; omitempty drops it otherwise.
-		TTL: repo.ttlFor(entityType),
+		TTL:           ttl,
 	}
 
 	item, err := repo.marshalMap(snapshot)
@@ -99,29 +109,89 @@ func (repo *Repository) PutSnapshot(
 		},
 	}
 
+	err = repo.putSnapshotGuarded(ctx, entityID, eventSequence, ttl, put, true)
+	if err == nil {
+		repo.ttlFloors.observe(entityID, ttl)
+	}
+
+	return err
+}
+
+// putSnapshotGuarded sends the snapshot transaction: the marker check, the head guard, and the
+// snapshot put. refreshTTL says whether the guard also refreshes a retained head item's ttl; it is
+// false on the single retry that follows a ttl-only guard failure.
+func (repo *Repository) putSnapshotGuarded(
+	ctx context.Context,
+	entityID evt.EntityID,
+	eventSequence evt.EventSequence,
+	ttl int64,
+	put *types.Put,
+	refreshTTL bool,
+) error {
 	check, err := repo.features.checkItem(ctx)
 	if err != nil {
 		return err
 	}
 
-	_, err = repo.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		TransactItems: []types.TransactWriteItem{check, {Put: put}},
-	})
-	if err != nil {
-		if failed, index := HasConditionalCheckFailure(err); failed {
-			if index == 0 {
-				return repo.features.handleCheckFailure(ctx, err)
-			}
-			if index == 1 {
-				// A newer snapshot already covers this regressing maintenance write.
-				return nil
-			}
-		}
+	guard := repo.buildSnapshotGuard(entityID, eventSequence, ttl, refreshTTL)
 
-		return fmt.Errorf("failed to put snapshot: %w", err)
+	_, err = repo.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{check, guard, {Put: put}},
+	})
+	if err == nil {
+		return nil
 	}
 
-	return nil
+	if failed, index := HasConditionalCheckFailure(err); failed {
+		switch index {
+		case 0:
+			return repo.features.handleCheckFailure(ctx, err)
+
+		case 1:
+			return repo.snapshotGuardFailed(ctx, entityID, eventSequence, ttl, put, refreshTTL && guard.Update != nil)
+
+		case 2:
+			// A newer snapshot already covers this regressing maintenance write.
+			return nil
+		}
+	}
+
+	return fmt.Errorf("failed to put snapshot: %w", err)
+}
+
+// snapshotGuardFailed classifies a failed head guard. For a retained stream the refreshing update
+// has two conditions; when only the ttl one failed (the head already covers the snapshot and its
+// stored ttl is higher), the head needs no refresh and the write is retried once as a plain check.
+// Otherwise the snapshot is ahead of the stream, or the stream has no head item: drift.
+func (repo *Repository) snapshotGuardFailed(
+	ctx context.Context,
+	entityID evt.EntityID,
+	eventSequence evt.EventSequence,
+	ttl int64,
+	put *types.Put,
+	refreshed bool,
+) error {
+	head, err := repo.readHeadItem(ctx, entityID)
+	if err != nil {
+		return wrapClassifiedError(err)
+	}
+
+	if refreshed && head.present && head.head >= eventSequence {
+		return repo.putSnapshotGuarded(ctx, entityID, eventSequence, ttl, put, false)
+	}
+
+	derived, err := repo.deriveHead(ctx, entityID)
+	if err != nil {
+		return wrapClassifiedError(err)
+	}
+
+	return &evt.StreamHeadDriftError{
+		EntityID:   entityID,
+		Stored:     head.head,
+		HeadAbsent: !head.present,
+		// The head the log would derive once the snapshot is written.
+		Derived: max(derived, eventSequence),
+	}
 }
 
 // Submit the given QueryInput to retrieve Snapshot records from the DynamoDB table
@@ -143,6 +213,8 @@ func (repo *Repository) querySnapshot(
 	if err != nil {
 		return nil, err
 	}
+
+	repo.ttlFloors.observe(snapshot.PK, snapshot.TTL)
 
 	return &evt.SerializedSnapshot{
 		EntityType:    snapshot.EntityType,

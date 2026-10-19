@@ -17,6 +17,17 @@
       "snapshot": null,
       "dynamoItems": [
         {
+          "head": {
+            "N": "4"
+          },
+          "pk": {
+            "S": "compat-fixture-metadata-extensions"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
           "entityType": {
             "S": "account"
           },
@@ -114,7 +125,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-metadata-extensions:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-metadata-extensions:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:43\",\"causationId\":\"upstream-rust\",\"extensions\":{\"source\":\"api\",\"tenant\":\"example\"},\"commitId\":\"c2\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-metadata-extensions:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-metadata-extensions:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"c3\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-metadata-extensions:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-metadata-extensions:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-metadata-extensions\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:43\",\"causationId\":\"c4\",\"extensions\":{},\"commitId\":\"c4\"}}}"
-      ]
+      ],
+      "head": 4
     },
     {
       "name": "go-writes-rust-reads",
@@ -135,6 +147,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-go-writes-rust-reads\",\"sequence\":3,\"eventSequence\":9,\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTUwMCwiZGVwb3NpdHMiOjQsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIiwidGFncyI6WyJ2aXAiLCJlYXJseS1hZG9wdGVyIl0sImxhYmVscyI6eyJyZWdpb24iOiJlbWVhIiwidGllciI6ImdvbGQifSwibGFzdE1lbW8iOiJDb2ZmZWUgXHUwMDI2IFx1MDAzY2Nha2VcdTAwM2UifQ==\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "9"
+          },
+          "pk": {
+            "S": "compat-fixture-go-writes-rust-reads"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -373,7 +396,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:7\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsicmVnaW9uIjoiZW1lYSIsInRpZXIiOiJnb2xkIn19\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:8\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:8\",\"sequence\":8,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c6\",\"extensions\":{},\"commitId\":\"c6\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-go-writes-rust-reads:9\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-go-writes-rust-reads:9\",\"sequence\":9,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-go-writes-rust-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIn0=\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c7\",\"extensions\":{},\"commitId\":\"c7\"}}}"
-      ]
+      ],
+      "head": 9
     },
     {
       "name": "rust-writes-go-reads",
@@ -394,6 +418,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-rust-writes-go-reads\",\"sequence\":3,\"eventSequence\":9,\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTUwMCwiZGVwb3NpdHMiOjQsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIiwidGFncyI6WyJ2aXAiLCJlYXJseS1hZG9wdGVyIl0sImxhYmVscyI6eyJyZWdpb24iOiJlbWVhIiwidGllciI6ImdvbGQifSwibGFzdE1lbW8iOiJDb2ZmZWUgXHUwMDI2IFx1MDAzY2Nha2VcdTAwM2UifQ==\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "9"
+          },
+          "pk": {
+            "S": "compat-fixture-rust-writes-go-reads"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -632,7 +667,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:7\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsicmVnaW9uIjoiZW1lYSIsInRpZXIiOiJnb2xkIn19\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:8\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:8\",\"sequence\":8,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NjAwfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c6\",\"extensions\":{},\"commitId\":\"c6\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-rust-writes-go-reads:9\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rust-writes-go-reads:9\",\"sequence\":9,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-rust-writes-go-reads\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkFkYSBLaW5nIn0=\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c7\",\"extensions\":{},\"commitId\":\"c7\"}}}"
-      ]
+      ],
+      "head": 9
     },
     {
       "name": "interleaved",
@@ -652,6 +688,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-interleaved\",\"sequence\":4,\"eventSequence\":8,\"payload\":\"eyJvd25lciI6IkdyYWNlIEhvcHBlciIsInN0YXR1cyI6ImNsb3NlZCIsImJhbGFuY2VDZW50cyI6MjAwMCwiZGVwb3NpdHMiOjIsIm9wZW5lZEF0IjoiMjAyNi0wMy0wNFQwNTowNjowN1oiLCJ0YWdzIjpbImNhZsOpIiwibmHDr3ZlIiwi5ryi5a2XIl0sImxhYmVscyI6eyJhIjoiZmlyc3QiLCJiIjoic2Vjb25kIiwibSI6Im1pZGRsZSIsInoiOiJsYXN0In0sImxhc3RNZW1vIjoiUGF5Y2hlY2sg4piVIFx1MjAyOCBcdTIwMjkgXHUwMDNjdGFiXHUwMDNlXHRcdTAwMjYifQ==\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "8"
+          },
+          "pk": {
+            "S": "compat-fixture-interleaved"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -866,7 +913,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:6\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:6\",\"sequence\":6,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiYSI6ImZpcnN0IiwibSI6Im1pZGRsZSIsInoiOiJsYXN0In19\",\"metadata\":{\"commandId\":\"c7\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c7\",\"extensions\":{},\"commitId\":\"c7\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:7\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:7\",\"sequence\":7,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiYiI6InNlY29uZCJ9fQ==\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-rust-manual\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-interleaved:8\",\"detail-type\":\"account:closed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-interleaved:8\",\"sequence\":8,\"type\":\"account:closed\",\"version\":1,\"entityId\":\"compat-fixture-interleaved\",\"entityType\":\"account\",\"payload\":\"eyJyZWFzb24iOiJjdXN0b21lciByZXF1ZXN0In0=\",\"metadata\":{\"commandId\":\"c9\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c9\",\"extensions\":{},\"commitId\":\"c9\"}}}"
-      ]
+      ],
+      "head": 8
     },
     {
       "name": "compaction-handoff",
@@ -879,6 +927,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-compaction-handoff\",\"sequence\":2,\"eventSequence\":6,\"payload\":\"eyJvd25lciI6IkthdGhlcmluZSBKb2huc29uIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTUwLCJkZXBvc2l0cyI6NSwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiIsInRhZ3MiOm51bGwsImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOm51bGx9\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "7"
+          },
+          "pk": {
+            "S": "compat-fixture-compaction-handoff"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -925,7 +984,8 @@
       ],
       "snsMessages": [
         "{\"version\":\"\",\"id\":\"compat-fixture-compaction-handoff:7\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-compaction-handoff:7\",\"sequence\":7,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-compaction-handoff\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTV9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}"
-      ]
+      ],
+      "head": 7
     },
     {
       "name": "upcast-legacy",
@@ -943,6 +1003,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-upcast-legacy\",\"sequence\":2,\"eventSequence\":6,\"payload\":\"eyJvd25lciI6Ik1vZGVybiIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjMwLCJkZXBvc2l0cyI6Miwib3BlbmVkQXQiOiIwMDAxLTAxLTAxVDAwOjAwOjAwWiIsInRhZ3MiOm51bGwsImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOm51bGx9\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "6"
+          },
+          "pk": {
+            "S": "compat-fixture-upcast-legacy"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -1109,7 +1180,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:4\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:4\",\"sequence\":4,\"type\":\"account:renamed\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJuYW1lIjoiTGVnYWN5IEZyb20gR28ifQ==\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c4\",\"extensions\":{},\"commitId\":\"compat-go-c4\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-upcast-legacy:6\",\"detail-type\":\"account:renamed\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-upcast-legacy:6\",\"sequence\":6,\"type\":\"account:renamed\",\"version\":2,\"entityId\":\"compat-fixture-upcast-legacy\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6Ik1vZGVybiJ9\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c6\",\"extensions\":{},\"commitId\":\"c6\"}}}"
-      ]
+      ],
+      "head": 6
     },
     {
       "name": "conflict-probe",
@@ -1125,6 +1197,17 @@
       ],
       "snapshot": null,
       "dynamoItems": [
+        {
+          "head": {
+            "N": "4"
+          },
+          "pk": {
+            "S": "compat-fixture-conflict-probe"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -1223,7 +1306,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-conflict-probe:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-conflict-probe:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NzUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"c2\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-conflict-probe:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-conflict-probe:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-conflict-probe:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-conflict-probe:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-conflict-probe\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"c3\"}}}"
-      ]
+      ],
+      "head": 4
     },
     {
       "name": "dedupe-window",
@@ -1242,6 +1326,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-dedupe-window\",\"sequence\":1,\"eventSequence\":5,\"payload\":\"eyJvd25lciI6IkRvcm90aHkgVmF1Z2hhbiIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjE1MCwiZGVwb3NpdHMiOjIsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJ0YWdzIjpbIngiXSwibGFiZWxzIjp7ImsiOiJ2In0sImxhc3RNZW1vIjpudWxsfQ==\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "7"
+          },
+          "pk": {
+            "S": "compat-fixture-dedupe-window"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -1432,7 +1527,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:5\",\"detail-type\":\"account:labeled\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:5\",\"sequence\":5,\"type\":\"account:labeled\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJsYWJlbHMiOnsiayI6InYifX0=\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:6\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:6\",\"sequence\":6,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"c2\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-dedupe-window:7\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-dedupe-window:7\",\"sequence\":7,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-dedupe-window\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c6\",\"extensions\":{},\"commitId\":\"c6\"}}}"
-      ]
+      ],
+      "head": 7
     },
     {
       "name": "batch-crosses-snapshot",
@@ -1460,6 +1556,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-batch-crosses-snapshot\",\"sequence\":3,\"eventSequence\":16,\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTIwLCJkZXBvc2l0cyI6MTUsIm9wZW5lZEF0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJ0YWdzIjpudWxsLCJsYWJlbHMiOm51bGwsImxhc3RNZW1vIjpudWxsfQ==\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "16"
+          },
+          "pk": {
+            "S": "compat-fixture-batch-crosses-snapshot"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -1866,7 +1973,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:14\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:14\",\"sequence\":14,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTMsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:15\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:15\",\"sequence\":15,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTQsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-batch-crosses-snapshot:16\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-batch-crosses-snapshot:16\",\"sequence\":16,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-batch-crosses-snapshot\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}"
-      ]
+      ],
+      "head": 16
     },
     {
       "name": "snapshots-disabled",
@@ -1884,6 +1992,17 @@
       ],
       "snapshot": null,
       "dynamoItems": [
+        {
+          "head": {
+            "N": "6"
+          },
+          "pk": {
+            "S": "compat-fixture-snapshots-disabled"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -2030,7 +2149,8 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c4\",\"extensions\":{},\"commitId\":\"c4\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:5\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:5\",\"sequence\":5,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjUwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-snapshots-disabled:6\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-snapshots-disabled:6\",\"sequence\":6,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-snapshots-disabled\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm5vLXNuYXBzaG90cyJdfQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c6\",\"extensions\":{},\"commitId\":\"c6\"}}}"
-      ]
+      ],
+      "head": 6
     },
     {
       "name": "multi-stream",
@@ -2047,6 +2167,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-multi-stream\",\"sequence\":1,\"eventSequence\":5,\"payload\":\"eyJvd25lciI6IkdyYWNlIEhvcHBlciIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjMwNTAsImRlcG9zaXRzIjo1LCJvcGVuZWRBdCI6IjIwMjYtMDEtMDJUMDM6MDQ6MDUuMTIzWiIsInRhZ3MiOm51bGwsImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOiJzbmFwc2hvdHRlZCJ9\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "5"
+          },
+          "pk": {
+            "S": "compat-fixture-multi-stream"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -2190,6 +2321,7 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-multi-stream:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-multi-stream:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-multi-stream\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6ODAwLCJtZW1vIjoiYWZ0ZXItZmFpbHVyZSJ9\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"c5\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-multi-stream:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-multi-stream:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-multi-stream\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6OTAwLCJtZW1vIjoic25hcHNob3R0ZWQifQ==\",\"metadata\":{\"commandId\":\"c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c6\",\"extensions\":{},\"commitId\":\"compat-rust-c6\"}}}"
       ],
+      "head": 5,
       "siblings": [
         {
           "entityId": "compat-fixture-multi-stream-ledger",
@@ -2200,6 +2332,17 @@
           ],
           "snapshot": null,
           "dynamoItems": [
+            {
+              "head": {
+                "N": "2"
+              },
+              "pk": {
+                "S": "compat-fixture-multi-stream-ledger"
+              },
+              "sk": {
+                "N": "-1"
+              }
+            },
             {
               "entityType": {
                 "S": "account"
@@ -2246,7 +2389,8 @@
                 "N": "1"
               }
             }
-          ]
+          ],
+          "head": 2
         }
       ],
       "transactions": [
@@ -2257,13 +2401,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-multi-stream",
-              "sk": 1,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "2"
+                },
+                ":prev": {
+                  "N": "1"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2272,13 +2430,14 @@
               "condition": "attribute_not_exists(sk)"
             },
             {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-multi-stream",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+              "operation": "Update",
+              "pk": "compat-fixture-multi-stream-ledger",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "attribute_not_exists(head)",
               "values": {
-                ":first": {
-                  "N": "2"
+                ":last": {
+                  "N": "1"
                 }
               }
             },
@@ -2287,17 +2446,6 @@
               "pk": "compat-fixture-multi-stream-ledger",
               "sk": 1,
               "condition": "attribute_not_exists(sk)"
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-multi-stream-ledger",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-              "values": {
-                ":first": {
-                  "N": "1"
-                }
-              }
             }
           ]
         },
@@ -2308,13 +2456,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-multi-stream",
-              "sk": 2,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "3"
+                },
+                ":prev": {
+                  "N": "2"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2323,38 +2485,25 @@
               "condition": "attribute_not_exists(sk)"
             },
             {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-multi-stream",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+              "operation": "Update",
+              "pk": "compat-fixture-multi-stream-ledger",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
               "values": {
-                ":first": {
-                  "N": "3"
+                ":last": {
+                  "N": "2"
+                },
+                ":prev": {
+                  "N": "1"
                 }
               }
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-multi-stream-ledger",
-              "sk": 1,
-              "condition": "attribute_exists(sk)"
             },
             {
               "operation": "Put",
               "pk": "compat-fixture-multi-stream-ledger",
               "sk": 2,
               "condition": "attribute_not_exists(sk)"
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-multi-stream-ledger",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-              "values": {
-                ":first": {
-                  "N": "2"
-                }
-              }
             }
           ]
         },
@@ -2365,13 +2514,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-multi-stream",
-              "sk": 3,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "4"
+                },
+                ":prev": {
+                  "N": "3"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2380,13 +2543,14 @@
               "condition": "attribute_not_exists(sk)"
             },
             {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-multi-stream",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+              "operation": "Update",
+              "pk": "compat-fixture-multi-stream-ledger",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "attribute_not_exists(head)",
               "values": {
-                ":first": {
-                  "N": "4"
+                ":last": {
+                  "N": "1"
                 }
               }
             },
@@ -2395,17 +2559,6 @@
               "pk": "compat-fixture-multi-stream-ledger",
               "sk": 1,
               "condition": "attribute_not_exists(sk)"
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-multi-stream-ledger",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-              "values": {
-                ":first": {
-                  "N": "1"
-                }
-              }
             }
           ]
         },
@@ -2416,13 +2569,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-multi-stream",
-              "sk": 4,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "5"
+                },
+                ":prev": {
+                  "N": "4"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2454,6 +2621,17 @@
       ],
       "snapshot": null,
       "dynamoItems": [
+        {
+          "head": {
+            "N": "4"
+          },
+          "pk": {
+            "S": "compat-fixture-read-fences"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -2553,13 +2731,15 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-read-fences:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-read-fences:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MjAwfQ==\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"compat-go-c3\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-read-fences:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-read-fences:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-read-fences\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDAwfQ==\",\"metadata\":{\"commandId\":\"c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c5\",\"extensions\":{},\"commitId\":\"compat-go-c5\"}}}"
       ],
+      "head": 4,
       "siblings": [
         {
           "entityId": "compat-fixture-read-fences-absent",
           "sequence": 0,
           "events": [],
           "snapshot": null,
-          "dynamoItems": []
+          "dynamoItems": [],
+          "head": null
         },
         {
           "entityId": "compat-fixture-read-fences-watched",
@@ -2569,6 +2749,17 @@
           ],
           "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-read-fences-watched\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkthdGhlcmluZSBKb2huc29uIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MzAsImRlcG9zaXRzIjoyLCJvcGVuZWRBdCI6IjIwMjYtMDEtMDJUMDM6MDQ6MDUuMTIzWiIsInRhZ3MiOm51bGwsImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOiJhcHBlbmRlZCJ9\"}",
           "dynamoItems": [
+            {
+              "head": {
+                "N": "3"
+              },
+              "pk": {
+                "S": "compat-fixture-read-fences-watched"
+              },
+              "sk": {
+                "N": "-1"
+              }
+            },
             {
               "entityType": {
                 "S": "account"
@@ -2612,7 +2803,8 @@
                 "N": "1"
               }
             }
-          ]
+          ],
+          "head": 3
         }
       ],
       "transactions": [
@@ -2623,13 +2815,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-read-fences",
-              "sk": 1,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "2"
+                },
+                ":prev": {
+                  "N": "1"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2638,13 +2844,14 @@
               "condition": "attribute_not_exists(sk)"
             },
             {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+              "operation": "Update",
+              "pk": "compat-fixture-read-fences-watched",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "attribute_not_exists(head)",
               "values": {
-                ":first": {
-                  "N": "2"
+                ":last": {
+                  "N": "1"
                 }
               }
             },
@@ -2653,17 +2860,6 @@
               "pk": "compat-fixture-read-fences-watched",
               "sk": 1,
               "condition": "attribute_not_exists(sk)"
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences-watched",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-              "values": {
-                ":first": {
-                  "N": "1"
-                }
-              }
             }
           ]
         },
@@ -2674,13 +2870,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-read-fences",
-              "sk": 2,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "3"
+                },
+                ":prev": {
+                  "N": "2"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2690,43 +2900,15 @@
             },
             {
               "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-              "values": {
-                ":first": {
-                  "N": "3"
-                }
-              }
-            },
-            {
-              "operation": "ConditionCheck",
               "pk": "compat-fixture-read-fences-absent",
-              "sk": 1,
-              "condition": "attribute_not_exists(sk)"
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences-absent",
-              "sk": 0,
-              "condition": "attribute_not_exists(sk) OR eventSeq <= :head",
-              "values": {
-                ":head": {
-                  "N": "0"
-                }
-              }
+              "sk": -1,
+              "condition": "attribute_not_exists(head)"
             },
             {
               "operation": "ConditionCheck",
               "pk": "compat-fixture-read-fences-watched",
-              "sk": 2,
-              "condition": "attribute_not_exists(sk)"
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences-watched",
-              "sk": 0,
-              "condition": "attribute_not_exists(sk) OR eventSeq <= :head",
+              "sk": -1,
+              "condition": "head = :head",
               "values": {
                 ":head": {
                   "N": "1"
@@ -2742,13 +2924,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-read-fences",
-              "sk": 3,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "4"
+                },
+                ":prev": {
+                  "N": "3"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2758,31 +2954,9 @@
             },
             {
               "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-              "values": {
-                ":first": {
-                  "N": "4"
-                }
-              }
-            },
-            {
-              "operation": "ConditionCheck",
               "pk": "compat-fixture-read-fences-watched",
-              "sk": 1,
-              "condition": "attribute_not_exists(sk)"
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences-watched",
-              "sk": 0,
-              "condition": "attribute_not_exists(sk) OR eventSeq <= :head",
-              "values": {
-                ":head": {
-                  "N": "0"
-                }
-              }
+              "sk": -1,
+              "condition": "attribute_not_exists(head)"
             }
           ]
         },
@@ -2793,13 +2967,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-read-fences",
-              "sk": 3,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "4"
+                },
+                ":prev": {
+                  "N": "3"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2808,21 +2996,19 @@
               "condition": "attribute_not_exists(sk)"
             },
             {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+              "operation": "Update",
+              "pk": "compat-fixture-read-fences-watched",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
               "values": {
-                ":first": {
-                  "N": "4"
+                ":last": {
+                  "N": "2"
+                },
+                ":prev": {
+                  "N": "1"
                 }
               }
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences-watched",
-              "sk": 1,
-              "condition": "attribute_exists(sk)"
             },
             {
               "operation": "Put",
@@ -2845,13 +3031,27 @@
               "operation": "ConditionCheck",
               "pk": "SYSTEM#FEATURES",
               "sk": 0,
-              "condition": "attribute_not_exists(pk)"
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
             },
             {
-              "operation": "ConditionCheck",
+              "operation": "Update",
               "pk": "compat-fixture-read-fences",
-              "sk": 4,
-              "condition": "attribute_exists(sk)"
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "5"
+                },
+                ":prev": {
+                  "N": "4"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -2861,26 +3061,9 @@
             },
             {
               "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences",
-              "sk": 0,
-              "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-              "values": {
-                ":first": {
-                  "N": "5"
-                }
-              }
-            },
-            {
-              "operation": "ConditionCheck",
               "pk": "compat-fixture-read-fences-watched",
-              "sk": 2,
-              "condition": "attribute_not_exists(sk)"
-            },
-            {
-              "operation": "ConditionCheck",
-              "pk": "compat-fixture-read-fences-watched",
-              "sk": 0,
-              "condition": "attribute_not_exists(sk) OR eventSeq <= :head",
+              "sk": -1,
+              "condition": "head = :head",
               "values": {
                 ":head": {
                   "N": "1"
@@ -2907,6 +3090,17 @@
       ],
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-outcomes-idempotency\",\"sequence\":2,\"eventSequence\":6,\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjkyNSwiZGVwb3NpdHMiOjUsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIiwidGFncyI6bnVsbCwibGFiZWxzIjpudWxsLCJsYXN0TWVtbyI6ImZpcnN0In0=\"}",
       "dynamoItems": [
+        {
+          "head": {
+            "N": "6"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-idempotency"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
         {
           "entityType": {
             "S": "account"
@@ -3074,6 +3268,7 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-idempotency:5\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-idempotency:5\",\"sequence\":5,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user:42\",\"causationId\":\"compat-fixture-outcomes-idempotency-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c4\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-idempotency:6\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-idempotency:6\",\"sequence\":6,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-idempotency\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NzUsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-idempotency-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-idempotency-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-idempotency-c5\"}}}"
       ],
+      "head": 6,
       "transactions": [
         {
           "step": 0,
@@ -3083,24 +3278,30 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "attribute_not_exists(head)",
+                "values": {
+                  ":last": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-idempotency",
                 "sk": 1,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-idempotency",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "1"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -3119,30 +3320,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-idempotency",
-                "sk": 1,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "2"
+                  },
+                  ":prev": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-idempotency",
                 "sk": 2,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-idempotency",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "2"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -3161,13 +3365,27 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-idempotency",
-                "sk": 2,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "4"
+                  },
+                  ":prev": {
+                    "N": "2"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -3204,24 +3422,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-outcomes-idempotency",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "5"
+                  },
+                  ":prev": {
+                    "N": "4"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-idempotency",
                 "sk": 5,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-idempotency",
-                "sk": 0,
-                "condition": "eventSeq = :prev",
-                "values": {
-                  ":prev": {
-                    "N": "4"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -3240,13 +3467,27 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-idempotency",
-                "sk": 5,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "6"
+                  },
+                  ":prev": {
+                    "N": "5"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -3258,11 +3499,8 @@
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-idempotency",
                 "sk": 0,
-                "condition": "seq = :seq AND eventSeq < :first",
+                "condition": "seq = :seq",
                 "values": {
-                  ":first": {
-                    "N": "6"
-                  },
                   ":seq": {
                     "N": "1"
                   }
@@ -3407,6 +3645,17 @@
       "snapshot": null,
       "dynamoItems": [
         {
+          "head": {
+            "N": "3"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-noop"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
           "entityType": {
             "S": "account"
           },
@@ -3481,6 +3730,7 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-noop:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-noop:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-noop\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-noop-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c2\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-noop:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-noop:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-noop\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAsIm1lbW8iOm51bGx9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-noop-c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-noop-c6\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-noop-c6\"}}}"
       ],
+      "head": 3,
       "transactions": [
         {
           "step": 0,
@@ -3490,24 +3740,30 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-outcomes-noop",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "attribute_not_exists(head)",
+                "values": {
+                  ":last": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-noop",
                 "sk": 1,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-noop",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "1"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -3526,30 +3782,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-noop",
-                "sk": 1,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "2"
+                  },
+                  ":prev": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-noop",
                 "sk": 2,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-noop",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "2"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -3568,7 +3827,12 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -3587,7 +3851,12 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -3606,7 +3875,12 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -3625,30 +3899,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-noop",
-                "sk": 2,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "3"
+                  },
+                  ":prev": {
+                    "N": "2"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-noop",
                 "sk": 3,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-noop",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "3"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -3800,6 +4077,17 @@
       "snapshot": null,
       "dynamoItems": [
         {
+          "head": {
+            "N": "3"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
           "entityType": {
             "S": "account"
           },
@@ -3874,6 +4162,7 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NTAwMCwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c3\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection:3\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection:3\",\"sequence\":3,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-c6\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-c6\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-c6\"}}}"
       ],
+      "head": 3,
       "transactions": [
         {
           "step": 0,
@@ -3883,24 +4172,30 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-outcomes-rejection",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "attribute_not_exists(head)",
+                "values": {
+                  ":last": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-rejection",
                 "sk": 1,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-rejection",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "1"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -3919,7 +4214,12 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -3938,30 +4238,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection",
-                "sk": 1,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "2"
+                  },
+                  ":prev": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-rejection",
                 "sk": 2,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-rejection",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "2"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -3980,7 +4283,12 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -3999,7 +4307,12 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -4018,30 +4331,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection",
-                "sk": 2,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "3"
+                  },
+                  ":prev": {
+                    "N": "2"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-rejection",
                 "sk": 3,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-rejection",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "3"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -4207,6 +4523,17 @@
       "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-outcomes-rejection-events\",\"sequence\":1,\"eventSequence\":3,\"payload\":\"eyJvd25lciI6IkFkYSBMb3ZlbGFjZSIsInN0YXR1cyI6Im9wZW4iLCJiYWxhbmNlQ2VudHMiOjEwMCwiZGVwb3NpdHMiOjEsIm9wZW5lZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjNaIiwidGFncyI6WyJvdmVyZHJhZnQtYXR0ZW1wdGVkIl0sImxhYmVscyI6bnVsbCwibGFzdE1lbW8iOm51bGx9\"}",
       "dynamoItems": [
         {
+          "head": {
+            "N": "5"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-rejection-events"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
           "entityType": {
             "S": "account"
           },
@@ -4349,6 +4676,7 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection-events:4\",\"detail-type\":\"account:tagged\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection-events:4\",\"sequence\":4,\"type\":\"account:tagged\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJ0YWdzIjpbIm92ZXJkcmFmdC1hdHRlbXB0ZWQiXX0=\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c4\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c4\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-rejection-events:5\",\"detail-type\":\"account:withdrawn\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-rejection-events:5\",\"sequence\":5,\"type\":\"account:withdrawn\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-rejection-events\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDB9\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-rejection-events-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-rejection-events-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-rejection-events-c5\"}}}"
       ],
+      "head": 5,
       "transactions": [
         {
           "step": 0,
@@ -4358,24 +4686,30 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "attribute_not_exists(head)",
+                "values": {
+                  ":last": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-rejection-events",
                 "sk": 1,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-rejection-events",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "1"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -4394,30 +4728,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection-events",
-                "sk": 1,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "2"
+                  },
+                  ":prev": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-rejection-events",
                 "sk": 2,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-rejection-events",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "2"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -4436,13 +4773,27 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection-events",
-                "sk": 2,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "3"
+                  },
+                  ":prev": {
+                    "N": "2"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -4473,24 +4824,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-outcomes-rejection-events",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "4"
+                  },
+                  ":prev": {
+                    "N": "3"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-rejection-events",
                 "sk": 4,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-rejection-events",
-                "sk": 0,
-                "condition": "eventSeq = :prev",
-                "values": {
-                  ":prev": {
-                    "N": "3"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -4509,30 +4869,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection-events",
-                "sk": 4,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "5"
+                  },
+                  ":prev": {
+                    "N": "4"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-rejection-events",
                 "sk": 5,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-rejection-events",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "5"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -4551,7 +4914,12 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -4722,6 +5090,17 @@
       "snapshot": null,
       "dynamoItems": [
         {
+          "head": {
+            "N": "4"
+          },
+          "pk": {
+            "S": "compat-fixture-outcomes-ambiguous"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
           "entityType": {
             "S": "account"
           },
@@ -4820,6 +5199,7 @@
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-ambiguous:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-ambiguous:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MzAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c3\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c3\"}}}",
         "{\"version\":\"\",\"id\":\"compat-fixture-outcomes-ambiguous:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-outcomes-ambiguous:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-outcomes-ambiguous\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NDAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-outcomes-ambiguous-c5\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-outcomes-ambiguous-c5\",\"extensions\":{},\"commitId\":\"compat-fixture-outcomes-ambiguous-c5\"}}}"
       ],
+      "head": 4,
       "transactions": [
         {
           "step": 0,
@@ -4829,24 +5209,30 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-outcomes-ambiguous",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "attribute_not_exists(head)",
+                "values": {
+                  ":last": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-ambiguous",
                 "sk": 1,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-ambiguous",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "1"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -4865,30 +5251,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-ambiguous",
-                "sk": 1,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "2"
+                  },
+                  ":prev": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-ambiguous",
                 "sk": 2,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-ambiguous",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "2"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -4907,30 +5296,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-ambiguous",
-                "sk": 2,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "3"
+                  },
+                  ":prev": {
+                    "N": "2"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-ambiguous",
                 "sk": 3,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-ambiguous",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "3"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -4949,7 +5341,12 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
                 "operation": "Put",
@@ -4968,30 +5365,33 @@
                 "operation": "ConditionCheck",
                 "pk": "SYSTEM#FEATURES",
                 "sk": 0,
-                "condition": "attribute_not_exists(pk)"
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
               },
               {
-                "operation": "ConditionCheck",
+                "operation": "Update",
                 "pk": "compat-fixture-outcomes-ambiguous",
-                "sk": 3,
-                "condition": "attribute_exists(sk)"
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "4"
+                  },
+                  ":prev": {
+                    "N": "3"
+                  }
+                }
               },
               {
                 "operation": "Put",
                 "pk": "compat-fixture-outcomes-ambiguous",
                 "sk": 4,
                 "condition": "attribute_not_exists(sk)"
-              },
-              {
-                "operation": "ConditionCheck",
-                "pk": "compat-fixture-outcomes-ambiguous",
-                "sk": 0,
-                "condition": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-                "values": {
-                  ":first": {
-                    "N": "4"
-                  }
-                }
               },
               {
                 "operation": "Put",
@@ -5107,6 +5507,587 @@
             },
             "response": {
               "S": "eyJiYWxhbmNlQ2VudHMiOjkwMH0="
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "stream-heads-snapshot-guard",
+      "entityId": "compat-fixture-stream-heads-snapshot-guard",
+      "sequence": 3,
+      "snapshotSequence": 1,
+      "state": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":105,\"deposits\":2,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-stream-heads-snapshot-guard:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-snapshot-guard\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIyMDI2LTAxLTAyVDAzOjA0OjA1LjEyM1oifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}}",
+        "{\"id\":\"compat-fixture-stream-heads-snapshot-guard:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-snapshot-guard\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"c2\"}}",
+        "{\"id\":\"compat-fixture-stream-heads-snapshot-guard:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-snapshot-guard\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"c3\"}}"
+      ],
+      "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-stream-heads-snapshot-guard\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwic3RhdHVzIjoib3BlbiIsImJhbGFuY2VDZW50cyI6MTAwLCJkZXBvc2l0cyI6MSwib3BlbmVkQXQiOiIyMDI2LTAxLTAyVDAzOjA0OjA1LjEyM1oiLCJ0YWdzIjpudWxsLCJsYWJlbHMiOm51bGwsImxhc3RNZW1vIjpudWxsfQ==\"}",
+      "dynamoItems": [
+        {
+          "head": {
+            "N": "3"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-snapshot-guard"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "eventSeq": {
+            "N": "2"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":100,\"deposits\":1,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-snapshot-guard"
+          },
+          "seq": {
+            "N": "1"
+          },
+          "sk": {
+            "N": "0"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Hedy Lamarr\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-snapshot-guard"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-snapshot-guard"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":5,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-snapshot-guard"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-stream-heads-snapshot-guard:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-stream-heads-snapshot-guard:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-snapshot-guard\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIyMDI2LTAxLTAyVDAzOjA0OjA1LjEyM1oifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-stream-heads-snapshot-guard:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-stream-heads-snapshot-guard:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-snapshot-guard\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-stream-heads-snapshot-guard:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-stream-heads-snapshot-guard:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-snapshot-guard\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"c3\"}}}"
+      ],
+      "head": 3,
+      "siblings": [
+        {
+          "entityId": "compat-fixture-stream-heads-snapshot-guard-empty",
+          "sequence": 0,
+          "events": [],
+          "snapshot": "{\"entityType\":\"account\",\"entityID\":\"compat-fixture-stream-heads-snapshot-guard-empty\",\"sequence\":1,\"eventSequence\":0,\"payload\":\"e30=\"}",
+          "dynamoItems": [
+            {
+              "entityType": {
+                "S": "account"
+              },
+              "eventSeq": {
+                "N": "0"
+              },
+              "payload": {
+                "S": "{}"
+              },
+              "pk": {
+                "S": "compat-fixture-stream-heads-snapshot-guard-empty"
+              },
+              "seq": {
+                "N": "1"
+              },
+              "sk": {
+                "N": "0"
+              }
+            }
+          ],
+          "head": null
+        },
+        {
+          "entityId": "compat-fixture-stream-heads-snapshot-guard-ghost",
+          "sequence": 0,
+          "events": [],
+          "snapshot": null,
+          "dynamoItems": [],
+          "head": null
+        }
+      ]
+    },
+    {
+      "name": "stream-heads-drift",
+      "entityId": "compat-fixture-stream-heads-drift",
+      "sequence": 3,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":107,\"deposits\":2,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":\"bypass\"}",
+      "events": [
+        "{\"id\":\"compat-fixture-stream-heads-drift:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-drift\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIyMDI2LTAxLTAyVDAzOjA0OjA1LjEyM1oifQ==\",\"metadata\":{\"commandId\":\"compat-fixture-stream-heads-drift-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-stream-heads-drift-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-stream-heads-drift-c1\"}}",
+        "{\"id\":\"compat-fixture-stream-heads-drift:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-drift\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-stream-heads-drift-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-stream-heads-drift-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-stream-heads-drift-c2\"}}",
+        "{\"id\":\"compat-fixture-stream-heads-drift:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-drift\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NywibWVtbyI6ImJ5cGFzcyJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"bypass\"}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "head": {
+            "N": "2"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-drift"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-stream-heads-drift-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-stream-heads-drift-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-stream-heads-drift-c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Hedy Lamarr\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-drift"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"compat-fixture-stream-heads-drift-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-stream-heads-drift-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-stream-heads-drift-c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-drift"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"bypass\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":7,\"memo\":\"bypass\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-stream-heads-drift"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-stream-heads-drift:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-stream-heads-drift:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-drift\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIyMDI2LTAxLTAyVDAzOjA0OjA1LjEyM1oifQ==\",\"metadata\":{\"commandId\":\"compat-fixture-stream-heads-drift-c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-stream-heads-drift-c1\",\"extensions\":{},\"commitId\":\"compat-fixture-stream-heads-drift-c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-stream-heads-drift:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-stream-heads-drift:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-drift\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"compat-fixture-stream-heads-drift-c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"compat-fixture-stream-heads-drift-c2\",\"extensions\":{},\"commitId\":\"compat-fixture-stream-heads-drift-c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-stream-heads-drift:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-stream-heads-drift:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-stream-heads-drift\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NywibWVtbyI6ImJ5cGFzcyJ9\",\"metadata\":{\"commandId\":null,\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"bypass\"}}}"
+      ],
+      "head": 2,
+      "siblings": [
+        {
+          "entityId": "compat-fixture-stream-heads-drift-ledger",
+          "sequence": 0,
+          "events": [],
+          "snapshot": null,
+          "dynamoItems": [],
+          "head": null
+        }
+      ],
+      "transactions": [
+        {
+          "step": 0,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "attribute_not_exists(head)",
+                "values": {
+                  ":last": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": 1,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-stream-heads-drift-c1",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 1,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "2"
+                  },
+                  ":prev": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": 2,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-stream-heads-drift-c2",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 3,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "4"
+                  },
+                  ":prev": {
+                    "N": "3"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": 4,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-stream-heads-drift-c3",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 4,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "4"
+                  },
+                  ":prev": {
+                    "N": "3"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": 4,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "Put",
+                "pk": "command-outcome#compat-fixture-stream-heads-drift-c3",
+                "sk": 1,
+                "condition": "attribute_not_exists(pk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 7,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "head = :prev",
+                "values": {
+                  ":last": {
+                    "N": "4"
+                  },
+                  ":prev": {
+                    "N": "3"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": 4,
+                "condition": "attribute_not_exists(sk)"
+              }
+            ]
+          ]
+        },
+        {
+          "step": 8,
+          "calls": [
+            [
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#FEATURES",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk) OR version = :v",
+                "values": {
+                  ":v": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Update",
+                "pk": "compat-fixture-stream-heads-drift-ledger",
+                "sk": -1,
+                "update": "SET head = :last",
+                "condition": "attribute_not_exists(head)",
+                "values": {
+                  ":last": {
+                    "N": "1"
+                  }
+                }
+              },
+              {
+                "operation": "Put",
+                "pk": "compat-fixture-stream-heads-drift-ledger",
+                "sk": 1,
+                "condition": "attribute_not_exists(sk)"
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "compat-fixture-stream-heads-drift",
+                "sk": -1,
+                "condition": "head = :head",
+                "values": {
+                  ":head": {
+                    "N": "3"
+                  }
+                }
+              }
+            ]
+          ]
+        }
+      ],
+      "outcomes": [
+        {
+          "commandId": "compat-fixture-stream-heads-drift-c1",
+          "dynamoItem": {
+            "digest": {
+              "S": "544a0da0249b47de2a3880c9679a93ca31375dac1bf4bcf464cb0a5f7cbb8084"
+            },
+            "events": {
+              "S": "[\"compat-fixture-stream-heads-drift:1\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-stream-heads-drift-c1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          }
+        },
+        {
+          "commandId": "compat-fixture-stream-heads-drift-c2",
+          "dynamoItem": {
+            "digest": {
+              "S": "dd286610e5db0420d742f47d6657098f5efa08c3d8da612822706fac2124aa1b"
+            },
+            "events": {
+              "S": "[\"compat-fixture-stream-heads-drift:2\"]"
+            },
+            "pk": {
+              "S": "command-outcome#compat-fixture-stream-heads-drift-c2"
+            },
+            "response": {
+              "S": "eyJiYWxhbmNlQ2VudHMiOjEwMH0="
             },
             "sk": {
               "N": "1"

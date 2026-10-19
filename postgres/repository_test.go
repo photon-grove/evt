@@ -138,10 +138,11 @@ func TestFoldEntityPropagatesApplyError(t *testing.T) {
 func TestSchemaDDLIsIdempotent(t *testing.T) {
 	ddl := NewRepository(nil).schemaDDL()
 
-	require.Equal(t, 4, strings.Count(ddl, "CREATE TABLE IF NOT EXISTS"))
+	require.Equal(t, 5, strings.Count(ddl, "CREATE TABLE IF NOT EXISTS"))
 	require.Contains(t, ddl, "CREATE INDEX IF NOT EXISTS")
 	require.Contains(t, ddl, defaultEventsTable+"__evt_features")
 	require.Contains(t, ddl, defaultEventsTable+"__evt_command_outcomes")
+	require.Contains(t, ddl, defaultEventsTable+"__evt_stream_heads")
 }
 
 func TestNewRepositoryRejectsReservedInfix(t *testing.T) {

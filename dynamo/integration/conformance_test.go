@@ -15,6 +15,7 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/conformance"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/internal/compat"
 	"github.com/stretchr/testify/require"
 )
 
@@ -71,6 +72,20 @@ func Test_RepositoryConformance(t *testing.T) {
 			})
 
 			return err
+		},
+		RefusesCommitStream: true,
+		BypassHead: func(ctx context.Context, _ evt.Repository, event evt.SerializedEvent) error {
+			return compat.DynamoBypassHead(client, "evt-local-event-log")(ctx, event)
+		},
+		Unmigrate: func(ctx context.Context, _ evt.Repository) (func(), error) {
+			_, err := marker.Declare(ctx, func(manifest *evt.FeatureManifest) {
+				delete(manifest.Features, evt.FeatureStreamHeads)
+			})
+
+			return func() {
+				// Declared again, the store is migrated: the cases that follow write to it.
+				_, _ = marker.DeclareStreamHeads(context.Background()) //nolint:errcheck // best-effort restore of the shared test table
+			}, err
 		},
 	})
 }

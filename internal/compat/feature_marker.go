@@ -24,6 +24,7 @@ const FeatureMarkerFixtureFile = "feature-marker.json"
 type FeatureMarkerFixtures struct {
 	Declarations    []FeatureDeclarationVector `json:"declarations"`
 	Commits         []FeatureCommitVector      `json:"commits"`
+	StreamHeads     []StreamHeadVector         `json:"streamHeads"`
 	PostgresSchemas []FeatureSchemaVector      `json:"postgresSchemas"`
 }
 
@@ -73,11 +74,14 @@ type FeatureSQLWrite struct {
 	Args []any  `json:"args"`
 }
 
-// FeatureCommitVector pins the ordered transaction emitted by a repository commit.
+// FeatureCommitVector pins the ordered transaction emitted by a repository commit. For a fresh
+// store (no marker declaration) the writer declares stream-heads itself before its first commit:
+// Declared is the marker item it stored, and the commit's marker check conditions on its version.
 type FeatureCommitVector struct {
-	Name   string             `json:"name"`
-	Input  FeatureCommitInput `json:"input"`
-	Output []FeatureWriteItem `json:"output"`
+	Name     string             `json:"name"`
+	Input    FeatureCommitInput `json:"input"`
+	Declared map[string]any     `json:"declared,omitempty"`
+	Output   []FeatureWriteItem `json:"output"`
 }
 
 // FeatureCommitInput describes a commit; MarkerDeclaration names a declaration above, or
@@ -98,6 +102,7 @@ type FeatureWriteItem struct {
 	TableName                 string            `json:"tableName"`
 	Item                      map[string]any    `json:"item,omitempty"`
 	Key                       map[string]any    `json:"key,omitempty"`
+	UpdateExpression          string            `json:"updateExpression,omitempty"`
 	ConditionExpression       string            `json:"conditionExpression,omitempty"`
 	ExpressionAttributeNames  map[string]string `json:"expressionAttributeNames,omitempty"`
 	ExpressionAttributeValues map[string]any    `json:"expressionAttributeValues,omitempty"`
@@ -119,6 +124,9 @@ func (c *featureCaptureDynamo) TransactWriteItems(ctx context.Context, in *dynam
 		case item.ConditionCheck != nil:
 			p := item.ConditionCheck
 			out = FeatureWriteItem{Operation: "ConditionCheck", TableName: aws.ToString(p.TableName), Key: DynamoItemJSON(p.Key), ConditionExpression: aws.ToString(p.ConditionExpression), ExpressionAttributeNames: p.ExpressionAttributeNames, ExpressionAttributeValues: DynamoItemJSON(p.ExpressionAttributeValues)}
+		case item.Update != nil:
+			p := item.Update
+			out = FeatureWriteItem{Operation: "Update", TableName: aws.ToString(p.TableName), Key: DynamoItemJSON(p.Key), UpdateExpression: aws.ToString(p.UpdateExpression), ConditionExpression: aws.ToString(p.ConditionExpression), ExpressionAttributeNames: p.ExpressionAttributeNames, ExpressionAttributeValues: DynamoItemJSON(p.ExpressionAttributeValues)}
 		default:
 			return nil, fmt.Errorf("feature fixture: unsupported transaction action")
 		}
@@ -238,7 +246,7 @@ func GenerateFeatureMarkerFixtures(ctx context.Context) (FeatureMarkerFixtures, 
 	inputs := []FeatureDeclarationVector{
 		{Name: "empty", Input: FeatureDeclarationInput{Features: map[string]evt.FeatureFormat{}, HistoryDependent: []evt.EntityType{}, Retention: []evt.EntityType{}}},
 		{Name: "sorted-deduplicated", Input: FeatureDeclarationInput{
-			Features:         map[string]evt.FeatureFormat{evt.FeatureJournalCompaction: 2, evt.FeatureJournal: 1},
+			Features:         map[string]evt.FeatureFormat{evt.FeatureJournalCompaction: 2, evt.FeatureJournal: 1, evt.FeatureStreamHeads: 1},
 			HistoryDependent: []evt.EntityType{"order", "account", "order", "account"},
 			Retention:        []evt.EntityType{"session", "account", "session"},
 		}},
@@ -274,6 +282,12 @@ func GenerateFeatureMarkerFixtures(ctx context.Context) (FeatureMarkerFixtures, 
 		}
 		fixtures.Commits = append(fixtures.Commits, vector)
 	}
+
+	streamHeads, err := GenerateStreamHeadVectors(ctx)
+	if err != nil {
+		return fixtures, err
+	}
+	fixtures.StreamHeads = streamHeads
 
 	for _, tables := range [][2]string{{"orders", "orders_entity_type_idx"}, {"evt_events", "evt_snapshots"}} {
 		capture := &featureSchemaCapture{}
@@ -377,8 +391,21 @@ func featureCommitVector(ctx context.Context, name string, declarations []Featur
 	}
 	vector.Output = capture.writes
 
+	// A fresh store has no marker row, so the writer declared stream-heads itself on its first
+	// commit: record the row it stored.
+	if strings.HasPrefix(name, "absent") {
+		items := capture.Items(featureMarkerPK)
+		if len(items) != 1 {
+			return vector, fmt.Errorf("feature fixture: the writer stored %d marker rows, want 1", len(items))
+		}
+		vector.Declared = DynamoItemJSON(items[0])
+	}
+
 	return vector, nil
 }
+
+// featureMarkerPK is the partition of the feature-marker row.
+const featureMarkerPK = "SYSTEM#FEATURES"
 
 var _ dynamo.Client = (*featureCaptureDynamo)(nil)
 var _ pgx.Tx = (*featurePGTx)(nil)

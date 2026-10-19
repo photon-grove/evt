@@ -171,7 +171,7 @@
     },
     {
       "name": "read-fences",
-      "description": "Fences protect read-only streams: an engine fence at the head passes, a stale slot fails, and the compaction ABA (append, snapshot, compact) fails a stale fence through the snapshot companion.",
+      "description": "Fences protect read-only streams: an engine fence at the head passes, a stale head fails, and the compaction ABA (append, snapshot, compact) still fails a stale fence, because the head only increases.",
       "snapshotInterval": 0,
       "steps": [
         { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Katherine Johnson" }, "expect": { "result": "ok", "events": 1 } },
@@ -294,6 +294,39 @@
         { "by": "go", "op": "execute", "commandId": "c4", "injectCommitFault": "applyThenFail", "command": { "type": "withdraw", "amountCents": 100000 }, "expect": { "result": "rejected", "code": "insufficient-funds", "replayed": true } },
         { "by": "rust", "op": "resolveOutcome", "commandId": "c4", "command": { "type": "withdraw", "amountCents": 100000 }, "expect": { "result": "rejected", "code": "insufficient-funds", "replayed": true } },
         { "by": "go", "op": "execute", "commandId": "c5", "injectCommitFault": "applyThenFail", "command": { "type": "deposit", "amountCents": 400 }, "expect": { "result": "ok", "events": 1, "replayed": true } }
+      ]
+    },
+    {
+      "name": "stream-heads-snapshot-guard",
+      "description": "An out-of-band snapshot never covers more than its stream's head: a snapshot ahead of the head, or on a stream with no head item, is refused as drift in either language and writes nothing, so the stream stays writable. A snapshot at or below the head is written, a regressing one is a silent no-op, and a snapshot of an empty stream (event sequence 0) needs no head item.",
+      "snapshotInterval": 0,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Hedy Lamarr", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "putSnapshot", "snapshot": { "sequence": 1, "payload": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":100,\"deposits\":1,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}" }, "eventSequence": 5, "expect": { "result": "drift" } },
+        { "by": "go", "op": "putSnapshot", "snapshot": { "sequence": 1, "payload": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":100,\"deposits\":1,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}" }, "eventSequence": 2, "expect": { "result": "drift" } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "putSnapshot", "snapshot": { "sequence": 1, "payload": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":100,\"deposits\":1,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}" }, "eventSequence": 2, "expect": { "result": "ok" } },
+        { "by": "rust", "op": "putSnapshot", "snapshot": { "sequence": 2, "payload": "{}" }, "eventSequence": 1, "expect": { "result": "ok" } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 5 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "putSnapshot", "suffix": "empty", "snapshot": { "sequence": 1, "payload": "{}" }, "eventSequence": 0, "expect": { "result": "ok" } },
+        { "by": "go", "op": "putSnapshot", "suffix": "ghost", "snapshot": { "sequence": 1, "payload": "{}" }, "eventSequence": 3, "expect": { "result": "drift" } }
+      ]
+    },
+    {
+      "name": "stream-heads-drift",
+      "description": "A writer that appends an event without maintaining the stream's head item leaves the head behind the log (H2 and H4 broken). Every later write to the stream, in either language, fails with StreamHeadDrift: from a command, from a transaction, and from a fence on the stream. Drift is not a conflict, so it is never retried, never exhausted into a stale-fence rejection, and records no outcome, and nothing is written.",
+      "snapshotInterval": 0,
+      "outcomes": true,
+      "steps": [
+        { "by": "go", "op": "execute", "commandId": "c1", "command": { "type": "open", "owner": "Hedy Lamarr", "openedAt": "2026-01-02T03:04:05.123Z" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c2", "command": { "type": "deposit", "amountCents": 100 }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "go", "op": "appendRawBypassingHead", "commitId": "bypass", "event": { "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":7,\"memo\":\"bypass\"}" }, "expect": { "result": "ok", "events": 1 } },
+        { "by": "rust", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 10 }, "expect": { "result": "drift" } },
+        { "by": "go", "op": "execute", "commandId": "c3", "command": { "type": "deposit", "amountCents": 10 }, "expect": { "result": "drift" } },
+        { "by": "go", "op": "resolveOutcome", "commandId": "c3", "command": { "type": "deposit", "amountCents": 10 }, "expect": { "result": "absent" } },
+        { "by": "rust", "op": "resolveOutcome", "commandId": "c3", "command": { "type": "deposit", "amountCents": 10 }, "expect": { "result": "absent" } },
+        { "by": "rust", "op": "transaction", "commandId": "c4", "streams": [{ "suffix": "", "sequence": 4, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":20}" }] }], "expect": { "result": "drift" } },
+        { "by": "go", "op": "transaction", "commandId": "c5", "streams": [{ "suffix": "ledger", "sequence": 1, "events": [{ "type": "account:deposited", "version": 1, "payload": "{\"amountCents\":30}" }] }], "fences": [{ "suffix": "", "head": 3 }], "expect": { "result": "drift" } }
       ]
     }
   ]

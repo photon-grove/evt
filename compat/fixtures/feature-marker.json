@@ -47,7 +47,8 @@
       "input": {
         "features": {
           "journal": 1,
-          "journal-compaction": 2
+          "journal-compaction": 2,
+          "stream-heads": 1
         },
         "historyDependent": [
           "order",
@@ -62,12 +63,12 @@
         ]
       },
       "output": {
-        "featuresJson": "{\"journal\":1,\"journal-compaction\":2}",
+        "featuresJson": "{\"journal\":1,\"journal-compaction\":2,\"stream-heads\":1}",
         "historyDependentJson": "[\"account\",\"order\"]",
         "retentionJson": "[\"account\",\"session\"]",
         "dynamoItem": {
           "features": {
-            "S": "{\"journal\":1,\"journal-compaction\":2}"
+            "S": "{\"journal\":1,\"journal-compaction\":2,\"stream-heads\":1}"
           },
           "historyDependent": {
             "S": "[\"account\",\"order\"]"
@@ -88,7 +89,7 @@
         "postgresRow": {
           "id": 0,
           "version": 2,
-          "features": "{\"journal\":1,\"journal-compaction\":2}",
+          "features": "{\"journal\":1,\"journal-compaction\":2,\"stream-heads\":1}",
           "history_dependent": "[\"account\",\"order\"]",
           "retention": "[\"account\",\"session\"]"
         },
@@ -96,7 +97,7 @@
           "sql": "UPDATE evt_events__evt_features SET version = $1, features = $2, history_dependent = $3, retention = $4\n\t\t\t\t WHERE id = 0 AND version = $5",
           "args": [
             2,
-            "{\"journal\":1,\"journal-compaction\":2}",
+            "{\"journal\":1,\"journal-compaction\":2,\"stream-heads\":1}",
             "[\"account\",\"order\"]",
             "[\"account\",\"session\"]",
             1
@@ -210,6 +211,25 @@
           }
         },
         {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "1"
+            }
+          }
+        },
+        {
           "operation": "Put",
           "tableName": "evt-compat",
           "item": {
@@ -236,24 +256,6 @@
             }
           },
           "conditionExpression": "attribute_not_exists(sk)"
-        },
-        {
-          "operation": "ConditionCheck",
-          "tableName": "evt-compat",
-          "key": {
-            "pk": {
-              "S": "compat-feature-account"
-            },
-            "sk": {
-              "N": "0"
-            }
-          },
-          "conditionExpression": "attribute_not_exists(eventSeq) OR eventSeq < :first",
-          "expressionAttributeValues": {
-            ":first": {
-              "N": "1"
-            }
-          }
         }
       ]
     },
@@ -319,6 +321,25 @@
             },
             "sk": {
               "S": "VIEW"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "1"
             }
           }
         },
@@ -396,6 +417,20 @@
         "viewState": "{\"owner\":\"Ada\",\"status\":\"open\",\"balanceCents\":0,\"deposits\":0,\"openedAt\":\"0001-01-01T00:00:00Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
         "snapshot": null
       },
+      "declared": {
+        "features": {
+          "S": "{\"stream-heads\":1}"
+        },
+        "pk": {
+          "S": "SYSTEM#FEATURES"
+        },
+        "sk": {
+          "N": "0"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
       "output": [
         {
           "operation": "ConditionCheck",
@@ -408,7 +443,12 @@
               "N": "0"
             }
           },
-          "conditionExpression": "attribute_not_exists(pk)"
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
         },
         {
           "operation": "Put",
@@ -428,6 +468,25 @@
             },
             "sk": {
               "S": "VIEW"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "compat-feature-account"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "1"
             }
           }
         },
@@ -458,22 +517,1334 @@
             }
           },
           "conditionExpression": "attribute_not_exists(sk)"
+        }
+      ]
+    }
+  ],
+  "streamHeads": [
+    {
+      "name": "create",
+      "request": {
+        "streams": [
+          {
+            "entityId": "acct-1",
+            "entityType": "account",
+            "first": 1,
+            "count": 1
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        }
+      ],
+      "sizes": [
+        20,
+        291,
+        60
+      ]
+    },
+    {
+      "name": "append",
+      "request": {
+        "seeded": [
+          {
+            "entityId": "acct-1",
+            "head": 7
+          }
+        ],
+        "streams": [
+          {
+            "entityId": "acct-1",
+            "entityType": "account",
+            "first": 8,
+            "count": 2
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "head = :prev",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "9"
+            },
+            ":prev": {
+              "N": "7"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "8"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "9"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        }
+      ],
+      "sizes": [
+        20,
+        291,
+        291,
+        52
+      ]
+    },
+    {
+      "name": "create-with-snapshot",
+      "request": {
+        "streams": [
+          {
+            "entityId": "acct-1",
+            "entityType": "account",
+            "first": 1,
+            "count": 5,
+            "snapshotSequence": 1
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "5"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "2"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "3"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "4"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "5"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "5"
+            },
+            "payload": {
+              "S": "{}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(seq)"
+        }
+      ],
+      "sizes": [
+        20,
+        291,
+        291,
+        291,
+        291,
+        291,
+        50,
+        60
+      ]
+    },
+    {
+      "name": "append-with-later-snapshot",
+      "request": {
+        "seeded": [
+          {
+            "entityId": "acct-1",
+            "head": 5,
+            "snapshotSequence": 1,
+            "snapshotEventSequence": 5
+          }
+        ],
+        "streams": [
+          {
+            "entityId": "acct-1",
+            "entityType": "account",
+            "first": 6,
+            "count": 1,
+            "snapshotSequence": 2
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "head = :prev",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "6"
+            },
+            ":prev": {
+              "N": "5"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "6"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "6"
+            },
+            "payload": {
+              "S": "{}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "seq": {
+              "N": "2"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "seq = :seq",
+          "expressionAttributeValues": {
+            ":seq": {
+              "N": "1"
+            }
+          }
+        }
+      ],
+      "sizes": [
+        20,
+        291,
+        50,
+        52
+      ]
+    },
+    {
+      "name": "streams-and-fences",
+      "request": {
+        "seeded": [
+          {
+            "entityId": "a",
+            "head": 7,
+            "snapshotSequence": 1,
+            "snapshotEventSequence": 6
+          },
+          {
+            "entityId": "m",
+            "head": 3
+          }
+        ],
+        "streams": [
+          {
+            "entityId": "b",
+            "entityType": "account",
+            "first": 1,
+            "count": 1
+          },
+          {
+            "entityId": "a",
+            "entityType": "account",
+            "first": 8,
+            "count": 1,
+            "snapshotSequence": 2
+          }
+        ],
+        "fences": [
+          {
+            "entityId": "z",
+            "head": 0
+          },
+          {
+            "entityId": "m",
+            "head": 3
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "a"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "head = :prev",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "8"
+            },
+            ":prev": {
+              "N": "7"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "a"
+            },
+            "sk": {
+              "N": "8"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "8"
+            },
+            "payload": {
+              "S": "{}"
+            },
+            "pk": {
+              "S": "a"
+            },
+            "seq": {
+              "N": "2"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "seq = :seq",
+          "expressionAttributeValues": {
+            ":seq": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "b"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "b"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
         },
         {
           "operation": "ConditionCheck",
           "tableName": "evt-compat",
           "key": {
             "pk": {
-              "S": "compat-feature-account"
+              "S": "m"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "conditionExpression": "head = :head",
+          "expressionAttributeValues": {
+            ":head": {
+              "N": "3"
+            }
+          }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "z"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(head)"
+        }
+      ],
+      "sizes": [
+        20,
+        286,
+        286,
+        45,
+        47,
+        55,
+        33,
+        25
+      ]
+    },
+    {
+      "name": "retained-create",
+      "request": {
+        "clockUnixNano": 1791763200000000000,
+        "retentionNanos": {
+          "scratch": 86400000000000
+        },
+        "streams": [
+          {
+            "entityId": "session-9",
+            "entityType": "scratch",
+            "first": 1,
+            "count": 3
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
             },
             "sk": {
               "N": "0"
             }
           },
-          "conditionExpression": "attribute_not_exists(eventSeq) OR eventSeq < :first",
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
           "expressionAttributeValues": {
-            ":first": {
+            ":v": {
               "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "session-9"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last, #ttl = :t",
+          "conditionExpression": "attribute_not_exists(head)",
+          "expressionAttributeNames": {
+            "#ttl": "ttl"
+          },
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "3"
+            },
+            ":t": {
+              "N": "1791849600"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "scratch"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "session-9"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "ttl": {
+              "N": "1791849600"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "scratch"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "session-9"
+            },
+            "sk": {
+              "N": "2"
+            },
+            "ttl": {
+              "N": "1791849600"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "scratch"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "session-9"
+            },
+            "sk": {
+              "N": "3"
+            },
+            "ttl": {
+              "N": "1791849600"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        }
+      ],
+      "sizes": [
+        20,
+        307,
+        307,
+        307,
+        93
+      ]
+    },
+    {
+      "name": "retained-append",
+      "request": {
+        "clockUnixNano": 1791763200000000000,
+        "retentionNanos": {
+          "scratch": 86400000000000
+        },
+        "seeded": [
+          {
+            "entityId": "session-9",
+            "head": 3,
+            "ttl": 1791763000
+          }
+        ],
+        "streams": [
+          {
+            "entityId": "session-9",
+            "entityType": "scratch",
+            "first": 4,
+            "count": 1
+          }
+        ]
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "session-9"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET head = :last, #ttl = :t",
+          "conditionExpression": "head = :prev AND (attribute_not_exists(#ttl) OR #ttl <= :t)",
+          "expressionAttributeNames": {
+            "#ttl": "ttl"
+          },
+          "expressionAttributeValues": {
+            ":last": {
+              "N": "4"
+            },
+            ":prev": {
+              "N": "3"
+            },
+            ":t": {
+              "N": "1791849600"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "scratch"
+            },
+            "metadata": {
+              "S": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"compat-head-vector\"}"
+            },
+            "payload": {
+              "S": "{\"amountCents\":1}"
+            },
+            "pk": {
+              "S": "session-9"
+            },
+            "sk": {
+              "N": "4"
+            },
+            "ttl": {
+              "N": "1791849600"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(sk)"
+        }
+      ],
+      "sizes": [
+        20,
+        307,
+        132
+      ]
+    },
+    {
+      "name": "put-snapshot",
+      "request": {
+        "seeded": [
+          {
+            "entityId": "acct-1",
+            "head": 6
+          }
+        ],
+        "putSnapshot": {
+          "entityId": "acct-1",
+          "entityType": "account",
+          "snapshotSequence": 1,
+          "eventSequence": 6
+        }
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "conditionExpression": "head >= :new",
+          "expressionAttributeValues": {
+            ":new": {
+              "N": "6"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "6"
+            },
+            "payload": {
+              "S": "{}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(eventSeq) OR eventSeq <= :new",
+          "expressionAttributeValues": {
+            ":new": {
+              "N": "6"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "put-snapshot-retained",
+      "request": {
+        "clockUnixNano": 1791763200000000000,
+        "retentionNanos": {
+          "scratch": 86400000000000
+        },
+        "seeded": [
+          {
+            "entityId": "session-9",
+            "head": 6,
+            "ttl": 1791763000
+          }
+        ],
+        "putSnapshot": {
+          "entityId": "session-9",
+          "entityType": "scratch",
+          "snapshotSequence": 1,
+          "eventSequence": 6
+        }
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "Update",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "session-9"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "updateExpression": "SET #ttl = :t",
+          "conditionExpression": "head >= :new AND (attribute_not_exists(#ttl) OR #ttl <= :t)",
+          "expressionAttributeNames": {
+            "#ttl": "ttl"
+          },
+          "expressionAttributeValues": {
+            ":new": {
+              "N": "6"
+            },
+            ":t": {
+              "N": "1791849600"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "scratch"
+            },
+            "eventSeq": {
+              "N": "6"
+            },
+            "payload": {
+              "S": "{}"
+            },
+            "pk": {
+              "S": "session-9"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            },
+            "ttl": {
+              "N": "1791849600"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(eventSeq) OR eventSeq <= :new",
+          "expressionAttributeValues": {
+            ":new": {
+              "N": "6"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "put-snapshot-empty-stream",
+      "request": {
+        "putSnapshot": {
+          "entityId": "acct-1",
+          "entityType": "account",
+          "snapshotSequence": 1,
+          "eventSequence": 0
+        }
+      },
+      "output": [
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#FEATURES"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR version = :v",
+          "expressionAttributeValues": {
+            ":v": {
+              "N": "1"
+            }
+          }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(head) OR head >= :new",
+          "expressionAttributeValues": {
+            ":new": {
+              "N": "0"
+            }
+          }
+        },
+        {
+          "operation": "Put",
+          "tableName": "evt-compat",
+          "item": {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "0"
+            },
+            "payload": {
+              "S": "{}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(eventSeq) OR eventSeq <= :new",
+          "expressionAttributeValues": {
+            ":new": {
+              "N": "0"
             }
           }
         }
@@ -484,12 +1855,12 @@
     {
       "eventsTable": "orders",
       "snapshotsTable": "orders_entity_type_idx",
-      "ddl": "\nCREATE TABLE IF NOT EXISTS orders (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS orders__evt_entity_type_idx ON orders (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('orders_entity_type_idx')\n          AND indrelid = 'orders'::regclass\n    ) THEN\n        DROP INDEX orders_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS orders_entity_type_idx (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_command_outcomes (\n    command_id text        PRIMARY KEY,\n    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),\n    digest     text        NOT NULL,\n    response   bytea,\n    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,\n    rejection  jsonb,\n    code       text,\n    created_at timestamptz NOT NULL DEFAULT now(),\n    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)\n           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n"
+      "ddl": "\nCREATE TABLE IF NOT EXISTS orders (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS orders__evt_entity_type_idx ON orders (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('orders_entity_type_idx')\n          AND indrelid = 'orders'::regclass\n    ) THEN\n        DROP INDEX orders_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS orders_entity_type_idx (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_command_outcomes (\n    command_id text        PRIMARY KEY,\n    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),\n    digest     text        NOT NULL,\n    response   bytea,\n    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,\n    rejection  jsonb,\n    code       text,\n    created_at timestamptz NOT NULL DEFAULT now(),\n    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)\n           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_stream_heads (\n    entity_id   text   PRIMARY KEY,\n    entity_type text   NOT NULL,\n    head        bigint NOT NULL CHECK (head >= 1)\n);\n"
     },
     {
       "eventsTable": "evt_events",
       "snapshotsTable": "evt_snapshots",
-      "ddl": "\nCREATE TABLE IF NOT EXISTS evt_events (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS evt_events__evt_entity_type_idx ON evt_events (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('evt_events_entity_type_idx')\n          AND indrelid = 'evt_events'::regclass\n    ) THEN\n        DROP INDEX evt_events_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS evt_snapshots (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_command_outcomes (\n    command_id text        PRIMARY KEY,\n    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),\n    digest     text        NOT NULL,\n    response   bytea,\n    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,\n    rejection  jsonb,\n    code       text,\n    created_at timestamptz NOT NULL DEFAULT now(),\n    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)\n           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n"
+      "ddl": "\nCREATE TABLE IF NOT EXISTS evt_events (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS evt_events__evt_entity_type_idx ON evt_events (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('evt_events_entity_type_idx')\n          AND indrelid = 'evt_events'::regclass\n    ) THEN\n        DROP INDEX evt_events_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS evt_snapshots (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_command_outcomes (\n    command_id text        PRIMARY KEY,\n    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),\n    digest     text        NOT NULL,\n    response   bytea,\n    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,\n    rejection  jsonb,\n    code       text,\n    created_at timestamptz NOT NULL DEFAULT now(),\n    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)\n           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (\n    entity_id   text   PRIMARY KEY,\n    entity_type text   NOT NULL,\n    head        bigint NOT NULL CHECK (head >= 1)\n);\n"
     }
   ]
 }

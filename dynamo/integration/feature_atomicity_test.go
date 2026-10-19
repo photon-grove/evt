@@ -184,9 +184,9 @@ func Test_DefaultAndDeclaringWritersRefuseUnsupported(t *testing.T) {
 		ch := make(chan result.Result[evt.SerializedResult], 1)
 		ch <- result.Ok(res)
 		close(ch)
-		errs := writer.CommitStream(ctx, ch) //nolint:staticcheck // the mandatory marker binds legacy batches too
+		errs := writer.CommitStream(ctx, ch) //nolint:staticcheck // the legacy batch path is refused outright (ADR 0007)
 		require.Len(t, errs, 1)
-		require.True(t, evt.IsUnsupportedFeatureErr(errs[0]))
+		require.ErrorIs(t, errs[0], dynamo.ErrCommitStreamRefused)
 	}
 
 	// Changing only a durable set is still not writer validation.

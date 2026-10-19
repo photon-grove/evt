@@ -274,7 +274,7 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 
 			messages := make([]string, 0, len(items))
 			for _, item := range items {
-				if sk, ok := item["sk"].(*types.AttributeValueMemberN); ok && sk.Value == "0" {
+				if sk, ok := item["sk"].(*types.AttributeValueMemberN); ok && (sk.Value == "0" || sk.Value == "-1") {
 					continue
 				}
 				message, _, err := compat.SNSMessage(ctx, item)
@@ -308,6 +308,12 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 			compare("event rows", rows, wantRows)
 			compare("snapshot row", snapshot, wantSnapshot)
 
+			head, err := postgresHead(ctx, b.postgres, expected.EntityID)
+			if err != nil {
+				return nil, err
+			}
+			compare("head row", head, expected.Head)
+
 			for _, sibling := range expected.Siblings {
 				siblingRows, siblingSnapshot, err := postgresRows(ctx, b.postgres, sibling.EntityID)
 				if err != nil {
@@ -321,6 +327,12 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 
 				compare("sibling "+string(sibling.EntityID)+" event rows", siblingRows, wantSiblingRows)
 				compare("sibling "+string(sibling.EntityID)+" snapshot row", siblingSnapshot, wantSiblingSnapshot)
+
+				siblingHead, err := postgresHead(ctx, b.postgres, sibling.EntityID)
+				if err != nil {
+					return nil, err
+				}
+				compare("sibling "+string(sibling.EntityID)+" head row", siblingHead, sibling.Head)
 			}
 		}
 
@@ -343,11 +355,57 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 
 // newRunner builds the scenario's runner: a store with command outcomes for an outcomes scenario.
 func newRunner(b backend, scenario compat.Scenario, run string) compat.Runner {
+	var runner compat.Runner
+
 	if scenario.Outcomes {
-		return compat.NewOutcomeRunner(b.repo, scenario, run)
+		runner = compat.NewOutcomeRunner(b.repo, scenario, run)
+	} else {
+		runner = compat.Runner{Store: snapshots.NewStore(b.repo, scenario.SnapshotInterval), Repo: b.repo}
 	}
 
-	return compat.Runner{Store: snapshots.NewStore(b.repo, scenario.SnapshotInterval), Repo: b.repo}
+	switch {
+	case b.dynamo != nil:
+		runner.BypassHead = compat.DynamoBypassHead(b.dynamo, b.table)
+	case b.postgres != nil:
+		runner.BypassHead = postgresBypassHead(b.postgres)
+	}
+
+	return runner
+}
+
+// postgresBypassHead inserts an event row directly, leaving the stream's head row untouched.
+func postgresBypassHead(pool *pgxpool.Pool) func(context.Context, evt.SerializedEvent) error {
+	return func(ctx context.Context, event evt.SerializedEvent) error {
+		metadata, err := eventjson.MarshalMetadata(event.Metadata)
+		if err != nil {
+			return err
+		}
+
+		_, err = pool.Exec(ctx, `INSERT INTO evt_events
+			(entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			string(event.EntityID), int64(event.Sequence), string(event.ID), string(event.Type),
+			int64(event.Version), string(event.EntityType), event.Payload, metadata)
+
+		return err
+	}
+}
+
+// postgresHead reads a stream's head row, or nil when it has none.
+func postgresHead(ctx context.Context, pool *pgxpool.Pool, entityID evt.EntityID) (*int64, error) {
+	var head int64
+
+	err := pool.QueryRow(ctx, `SELECT head FROM evt_events__evt_stream_heads WHERE entity_id = $1`,
+		string(entityID)).Scan(&head)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &head, nil
 }
 
 // verifyOutcomes checks the command-outcome rows of an outcomes scenario against the fixtures:

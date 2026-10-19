@@ -1016,7 +1016,7 @@ func testOutcomeBudget(t *testing.T, repo evt.OutcomeRepository) {
 		return serialized
 	}
 
-	// The feature-marker check, 97 event puts, the floor check, and the outcome put are 100 actions.
+	// The feature-marker check, the head update, 97 event puts, and the outcome put are 100 actions.
 	fits := evt.EntityID(ns + "-fits")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(fits, 0, 97), Outcome: outcome("-fits")}))
 
@@ -1036,15 +1036,16 @@ func testOutcomeBudget(t *testing.T, repo evt.OutcomeRepository) {
 	require.NoError(t, err)
 	require.Nil(t, missing)
 
-	// Appending to an existing stream adds a continuation check: 96 events fit with the outcome.
+	// Appending to an existing stream costs the same one head update: 97 events fit with the
+	// outcome, and 98 do not.
 	grows := evt.EntityID(ns + "-grows")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(grows, 0, 1)}))
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(grows, 1, 96), Outcome: outcome("-grows")}))
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(grows, 1, 97), Outcome: outcome("-grows")}))
 
 	growsOver := evt.EntityID(ns + "-grows-over")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(growsOver, 0, 1)}))
 	require.ErrorAs(t,
-		repo.Commit(ctx, evt.SerializedResult{Events: events(growsOver, 1, 97), Outcome: outcome("-grows-over")}),
+		repo.Commit(ctx, evt.SerializedResult{Events: events(growsOver, 1, 98), Outcome: outcome("-grows-over")}),
 		&tooLarge)
 
 	// An outcome-only commit is the marker check plus the outcome put.
@@ -1660,7 +1661,7 @@ func testRejectionWithEventsCommitRules(t *testing.T, repo evt.OutcomeRepository
 	var projectorOnly *evt.ProjectorOnlyCommitError
 	require.ErrorAs(t, err, &projectorOnly)
 
-	// The outcome row counts against the budget: marker, 97 event puts, floor check, and outcome fit;
+	// The outcome row counts against the budget: marker, head update, 97 event puts, and outcome fit;
 	// one more event does not.
 	fits := evt.EntityID(ns + "-fits")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(fits, 0, 97), Outcome: rejected("-fits")}))

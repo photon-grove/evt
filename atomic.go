@@ -11,11 +11,13 @@ import (
 	"time"
 
 	"github.com/photon-grove/evt/internal/jsondefaults"
+	"github.com/photon-grove/evt/internal/streamheads"
 )
 
-// ReadFence pins a read-only stream to a head. The snapshot companion is mandatory even when
-// the reader disables snapshots. CallerStamped records provenance for conflict handling only;
-// it is in-memory commit metadata and is never stored.
+// ReadFence pins a read-only stream to a head: the commit fails when any writer has written the
+// stream since the reader saw it at Head (a head of 0 means the reader saw no events). On DynamoDB
+// the fence is one ConditionCheck on the stream's head item (ADR 0007). CallerStamped records
+// provenance for conflict handling only; it is in-memory commit metadata and is never stored.
 type ReadFence struct {
 	EntityID      EntityID
 	EntityType    EntityType
@@ -420,7 +422,7 @@ func CommitMetadata(metadata Metadata) Metadata {
 }
 
 // TransactionItemSizes supplies the shared, backend-neutral DynamoDB-shaped estimate for a
-// commit's event puts, snapshot puts, floor checks, and fence checks. Backend projector groups
+// commit's event puts, snapshot puts, head updates, and fence checks. Backend projector groups
 // that carry operations must additionally supply their item sizes through
 // SizedTransactionGroup, because an opaque group cannot safely bypass commit preflight.
 // PreflightCommit adds those group sizes, so every backend budgets projector operations alike.
@@ -432,6 +434,12 @@ func TransactionItemSizes(result SerializedResult) ([]int, error) {
 // retained entity types carry, so a backend with retention policies estimates the same bytes its
 // items encode. A ttlFor that returns 0 sizes items as the retention-free TransactionItemSizes
 // does.
+//
+// The estimate follows the commit's actions (storage spec, Stream Heads): the feature-marker
+// check, every event put, every snapshot put, one head update per written stream, one head check
+// per fenced stream, and the outcome put. A written stream pays one action beyond its events
+// whether it creates or appends, and the head update is budgeted by the rule every update
+// follows: its key attributes, expression strings, name placeholders and names, and values.
 func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType) int64) ([]int, error) {
 	ttlSize := func(entityType EntityType) int {
 		if ttlFor == nil {
@@ -451,13 +459,13 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 	// rebuild-lock check (C10) joins this list in the change that starts emitting it.
 	sizes := []int{keySize(SystemNamespacePrefix+"FEATURES", 0)}
 
-	written := map[EntityID]bool{}
-	firstSequence := map[EntityID]EventSequence{}
-	for _, event := range result.Events {
-		if _, seen := firstSequence[event.EntityID]; !seen {
-			firstSequence[event.EntityID] = event.Sequence
-		}
+	type written struct {
+		entityType  EntityType
+		first, last EventSequence
+	}
 
+	streams := map[EntityID]written{}
+	for _, event := range result.Events {
 		metadata := event.Metadata
 		metadata.CausationID, metadata.Extensions = jsondefaults.Metadata(
 			metadata.CommandID, metadata.CausationID, metadata.Extensions,
@@ -470,7 +478,13 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 			len("type")+len(event.Type)+len("version")+len(strconv.Itoa(int(event.Version)))+
 			len("entityType")+len(event.EntityType)+len("payload")+len(event.Payload)+len("metadata")+len(encoded)+
 			ttlSize(event.EntityType))
-		written[event.EntityID] = true
+
+		stream, seen := streams[event.EntityID]
+		if !seen {
+			stream = written{entityType: event.EntityType, first: event.Sequence}
+		}
+		stream.last = event.Sequence
+		streams[event.EntityID] = stream
 	}
 	for _, snapshot := range result.Snapshots {
 		sizes = append(sizes, keySize(snapshot.EntityID, 0)+
@@ -478,33 +492,28 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 			len("eventSeq")+len(strconv.Itoa(int(snapshot.EventSequence)))+
 			len("entityType")+len(snapshot.EntityType)+len("payload")+len(snapshot.Payload)+
 			ttlSize(snapshot.EntityType))
-		delete(written, snapshot.EntityID)
-	}
-	// A written stream whose first sequence is above 1 contributes a continuation check on the
-	// event just before it. It is budgeted for every such stream, also on the rare compacted-head
-	// path that pins the snapshot instead, so CommitTooLarge fires identically everywhere.
-	continued := make([]EntityID, 0, len(firstSequence))
-	for id, first := range firstSequence {
-		if first > 1 {
-			continued = append(continued, id)
-		}
-	}
-	slices.Sort(continued)
-	for _, id := range continued {
-		sizes = append(sizes, keySize(id, firstSequence[id]-1))
 	}
 
-	// A written stream without a snapshot contributes a floor check on its snapshot item.
-	ids := make([]EntityID, 0, len(written))
-	for id := range written {
+	// Every written stream contributes its head update, whether it creates or appends and whether
+	// or not it writes a snapshot. There is no continuation check and no floor check.
+	ids := make([]EntityID, 0, len(streams))
+	for id := range streams {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
 	for _, id := range ids {
-		sizes = append(sizes, keySize(id, 0))
+		stream := streams[id]
+		var ttl int64
+		if ttlFor != nil {
+			ttl = ttlFor(stream.entityType)
+		}
+
+		sizes = append(sizes, streamheads.UpdateSize(string(id), int64(stream.first), int64(stream.last), ttl))
 	}
+
+	// A fenced read-only stream is one check on its head item.
 	for _, fence := range result.Fences {
-		sizes = append(sizes, keySize(fence.EntityID, fence.Head+1), keySize(fence.EntityID, 0))
+		sizes = append(sizes, streamheads.FenceSize(string(fence.EntityID), int64(fence.Head)))
 	}
 
 	// The outcome put is the last action (storage spec, Writes).

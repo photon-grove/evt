@@ -12,12 +12,38 @@ import (
 )
 
 // compactionCheck validates the durable feature manifest strongly and pins that exact marker
-// version (or its absence). Every delete batch carries this check, fencing declarations that
-// complete after validation but before deletion.
+// version. Every delete batch carries this check, fencing declarations that complete after
+// validation but before deletion. A store that does not declare stream-heads is refused with
+// *evt.StreamHeadsNotMigratedError: compaction never touches the head item, but it is a write
+// path of a store whose streams have no head items yet.
 func (repo *Repository) compactionCheck(ctx context.Context, entityType evt.EntityType) (types.TransactWriteItem, error) {
 	manifest, err := repo.features.Manifest(ctx)
 	if err != nil {
 		return types.TransactWriteItem{}, err
+	}
+
+	return repo.compactionCheckFor(manifest, entityType)
+}
+
+// compactionCheckFor is compactionCheck against a manifest the caller just read.
+func (repo *Repository) compactionCheckFor(
+	manifest *evt.FeatureManifest,
+	entityType evt.EntityType,
+) (types.TransactWriteItem, error) {
+	if manifest != nil {
+		if err := manifest.Validate(repo.features.supported); err != nil {
+			return types.TransactWriteItem{}, err
+		}
+	}
+
+	if err := evt.RequireStreamHeads(manifest); err != nil {
+		return types.TransactWriteItem{}, err
+	}
+
+	for _, declared := range manifest.HistoryDependent {
+		if declared == entityType {
+			return types.TransactWriteItem{}, evt.NewHistoryDependentProjectionError(entityType)
+		}
 	}
 
 	check := &types.ConditionCheck{
@@ -26,23 +52,10 @@ func (repo *Repository) compactionCheck(ctx context.Context, entityType evt.Enti
 			"pk": &types.AttributeValueMemberS{Value: featuresPK},
 			"sk": &types.AttributeValueMemberN{Value: "0"},
 		},
-		ConditionExpression: aws.String("attribute_not_exists(pk)"),
-	}
-	if manifest != nil {
-		if err := manifest.Validate(repo.features.supported); err != nil {
-			return types.TransactWriteItem{}, err
-		}
-
-		for _, declared := range manifest.HistoryDependent {
-			if declared == entityType {
-				return types.TransactWriteItem{}, evt.NewHistoryDependentProjectionError(entityType)
-			}
-		}
-
-		check.ConditionExpression = aws.String("version = :observed")
-		check.ExpressionAttributeValues = map[string]types.AttributeValue{
+		ConditionExpression: aws.String("version = :observed"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":observed": &types.AttributeValueMemberN{Value: strconv.FormatInt(manifest.Version, 10)},
-		}
+		},
 	}
 
 	return types.TransactWriteItem{ConditionCheck: check}, nil
@@ -78,6 +91,23 @@ func (repo *Repository) CompactBelow(
 		return 0, nil
 	}
 
+	// A store that has not been migrated to stream heads is refused before anything is read.
+	manifest, err := repo.features.Manifest(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	// An unsupported declared pair is refused first, then a store without stream-heads.
+	if manifest != nil {
+		if err = manifest.Validate(repo.features.supported); err != nil {
+			return 0, err
+		}
+	}
+
+	if err = evt.RequireStreamHeads(manifest); err != nil {
+		return 0, err
+	}
+
 	// Compaction reads strongly regardless of WithConsistentRead: an eventually consistent read
 	// could miss recent events, and compaction would report success while leaving them behind.
 	snapshot, err := repo.getSnapshot(ctx, entityID, true)
@@ -88,7 +118,7 @@ func (repo *Repository) CompactBelow(
 		return 0, fmt.Errorf("%w: entity %s has no durable snapshot", evt.ErrCompactionUncovered, entityID)
 	}
 
-	check, err := repo.compactionCheck(ctx, snapshot.EntityType)
+	check, err := repo.compactionCheckFor(manifest, snapshot.EntityType)
 	if err != nil {
 		return 0, err
 	}

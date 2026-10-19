@@ -138,50 +138,30 @@ func TestCommit_NamesTheStreamWhoseItemFailed(t *testing.T) {
 	require.NotContains(t, err.Error(), "name-e")
 }
 
-func TestCommitStream_FailsClosedOnSnapshotsAndFences(t *testing.T) {
+func TestCommitStream_Refuses(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
 	repo := dynamo.NewRepository(fake, "events")
 
-	event := func(id string) evt.SerializedEvent {
-		return evt.SerializedEvent{
-			ID: evt.GetEventID(evt.EntityID(id), 1), Sequence: 1, Type: "t:created", Version: 1,
-			EntityID: evt.EntityID(id), EntityType: "t", Payload: []byte(`{}`),
-		}
-	}
+	entry := evt.SerializedResult{Events: []evt.SerializedEvent{{
+		ID: evt.GetEventID("batch-plain", 1), Sequence: 1, Type: "t:created", Version: 1,
+		EntityID: "batch-plain", EntityType: "t", Payload: []byte(`{}`),
+	}}}
 
-	entries := []evt.SerializedResult{
-		{
-			Events: []evt.SerializedEvent{event("batch-snapshot")},
-			Snapshots: []evt.SerializedSnapshot{{
-				EntityType: "t", EntityID: "batch-snapshot", Sequence: 1, EventSequence: 1, Payload: []byte(`{}`),
-			}},
-		},
-		{
-			Events: []evt.SerializedEvent{event("batch-fence")},
-			Fences: []evt.ReadFence{{EntityID: "batch-watched", EntityType: "t", Head: 0}},
-		},
-		{Events: []evt.SerializedEvent{event("batch-plain")}},
-	}
-
-	channel := make(chan result.Result[evt.SerializedResult], len(entries))
-	for _, entry := range entries {
-		channel <- result.Ok(entry)
-	}
+	channel := make(chan result.Result[evt.SerializedResult], 2)
+	channel <- result.Ok(entry)
+	channel <- result.Ok(entry)
 	close(channel)
 
 	errs := repo.CommitStream(ctx, channel)
 
-	require.Len(t, errs, 2)
-	var unsupported *evt.UnsupportedBatchEntryError
-	require.ErrorAs(t, errs[0], &unsupported)
-	require.Equal(t, 1, unsupported.Snapshots)
-	require.ErrorAs(t, errs[1], &unsupported)
-	require.Equal(t, 1, unsupported.Fences)
+	require.Len(t, errs, 1, "the whole stream is refused once, and the channel is drained")
+	require.ErrorIs(t, errs[0], dynamo.ErrCommitStreamRefused)
 
-	require.Empty(t, fake.Items("batch-snapshot"), "the refused entries wrote nothing")
-	require.Empty(t, fake.Items("batch-fence"))
-	require.NotEmpty(t, fake.Items("batch-plain"), "an ordinary entry still commits")
+	var refused *dynamo.CommitStreamRefusedError
+	require.ErrorAs(t, errs[0], &refused)
+	require.Empty(t, fake.Transactions(), "the refusal is before any request")
+	require.Empty(t, fake.Items("batch-plain"))
 }
 
 func TestCommit_RefusesFencesForLocallyRetainedTypesWithoutAManifest(t *testing.T) {
@@ -208,55 +188,4 @@ func TestCommit_RefusesFencesForLocallyRetainedTypesWithoutAManifest(t *testing.
 
 	// A type outside the policy is still fenceable.
 	require.NoError(t, repo.Commit(ctx, fenced("plain")))
-}
-
-// A stream pins its head through the item compaction cannot delete: the head event when it lies
-// above the snapshot, the snapshot when it ends exactly at the head.
-func TestCommit_PinsTheStoredHeadThroughTheItemCompactionCannotDelete(t *testing.T) {
-	ctx := context.Background()
-	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
-
-	event := func(id string, sequence evt.EventSequence) evt.SerializedEvent {
-		return evt.SerializedEvent{
-			ID: evt.GetEventID(evt.EntityID(id), sequence), Sequence: sequence, Type: "t:created", Version: 1,
-			EntityID: evt.EntityID(id), EntityType: "t", Payload: []byte(`{}`),
-		}
-	}
-	conditions := func(call int, pk string) []string {
-		var out []string
-		for _, action := range fake.Transactions()[call] {
-			if action.PK == pk {
-				out = append(out, action.Condition)
-			}
-		}
-
-		return out
-	}
-
-	// Events 1 and 2 with no snapshot: appending 3 pins the head event.
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 1), event("pin-a", 2)}}))
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 3)}}))
-	require.Equal(t,
-		[]string{dynamo.ContinuationCondition, "attribute_not_exists(sk)", dynamo.FloorCondition},
-		conditions(len(fake.Transactions())-1, "pin-a"))
-
-	// A snapshot ending at the head (event 3) is the pin, so compaction deleting event 3 cannot
-	// fail the append: no event check, and the pinned floor.
-	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 4)}},
-		"t", "pin-a", []byte(`{}`), 1))
-	compactor, ok := evt.Repository(repo).(evt.Compactor)
-	require.True(t, ok)
-	_, err := compactor.CompactBelow(ctx, "pin-a", 4)
-	require.NoError(t, err)
-
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 5)}}))
-	require.Equal(t,
-		[]string{"attribute_not_exists(sk)", dynamo.PinnedFloorCondition},
-		conditions(len(fake.Transactions())-1, "pin-a"))
-
-	// A snapshot ahead of the writer's head is a conflict, not a gap.
-	err = repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{event("pin-a", 3)}})
-	require.ErrorIs(t, err, dynamo.ErrSnapshotRaceCondition)
-	require.NotErrorIs(t, err, evt.ErrSequenceGap)
 }

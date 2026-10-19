@@ -60,7 +60,8 @@ func newFeatureMarker(client Client, eventsTable string, supported evt.Supported
 	return &FeatureMarker{
 		client:      client,
 		eventsTable: eventsTable,
-		supported:   supported,
+		// Every writer of this format models stream-heads, whatever else the caller configured.
+		supported: supported.WithStreamHeads(),
 	}
 }
 
@@ -148,6 +149,39 @@ func (m *FeatureMarker) Declare(
 	ctx context.Context,
 	update func(*evt.FeatureManifest),
 ) (evt.FeatureManifest, error) {
+	declared, err := m.declare(ctx, update)
+	if err != nil {
+		return evt.FeatureManifest{}, err
+	}
+
+	m.invalidate()
+
+	return declared, nil
+}
+
+// DeclareStreamHeads declares the stream-heads feature (evt.FeatureStreamHeads at the format this
+// build writes) in the ordinary declaration transaction, without checking that the store holds
+// no data. It is the migration's declaring step (storage spec, Stream Heads, Migration): the
+// caller has backfilled and verified a head item for every stream with every older writer
+// stopped, and declaring is what lets this build's writers start. A writer that finds a fresh
+// store declares the feature itself; it never calls this.
+func (m *FeatureMarker) DeclareStreamHeads(ctx context.Context) (evt.FeatureManifest, error) {
+	return m.Declare(ctx, declareStreamHeads)
+}
+
+func declareStreamHeads(manifest *evt.FeatureManifest) {
+	if manifest.Features == nil {
+		manifest.Features = map[string]evt.FeatureFormat{}
+	}
+
+	manifest.Features[evt.FeatureStreamHeads] = evt.StreamHeadsFormat
+}
+
+// declare is Declare without touching the validation cache, for callers that hold the cache lock.
+func (m *FeatureMarker) declare(
+	ctx context.Context,
+	update func(*evt.FeatureManifest),
+) (evt.FeatureManifest, error) {
 	for attempt := 0; ; attempt++ {
 		manifest, err := m.Manifest(ctx)
 		if err != nil {
@@ -188,8 +222,6 @@ func (m *FeatureMarker) Declare(
 
 		_, err = m.client.PutItem(ctx, input)
 		if err == nil {
-			m.invalidate()
-
 			return current, nil
 		}
 
@@ -202,6 +234,38 @@ func (m *FeatureMarker) Declare(
 		return evt.FeatureManifest{}, fmt.Errorf("features: declaring manifest: %w", err)
 	}
 }
+
+// StoreIsEmpty reports whether the table holds no non-reserved item: nothing but engine rows
+// (the feature marker, the rebuild fence, command outcomes). It reads with a strongly consistent
+// Scan until it finds one ordinary item or the table ends, so a populated table stops it on the
+// first page, and an eventually consistent read cannot miss a just-written stream.
+func (m *FeatureMarker) StoreIsEmpty(ctx context.Context) (bool, error) {
+	pages := dynamodb.NewScanPaginator(m.client, &dynamodb.ScanInput{
+		TableName:            &m.eventsTable,
+		ConsistentRead:       aws.Bool(true),
+		ProjectionExpression: aws.String("pk"),
+		Limit:                aws.Int32(scanProbePageSize),
+	})
+
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return false, fmt.Errorf("features: scanning for existing streams: %w", err)
+		}
+
+		for _, item := range page.Items {
+			pk, ok := item["pk"].(*types.AttributeValueMemberS)
+			if !ok || !evt.IsReservedEntityID(evt.EntityID(pk.Value)) {
+				return false, nil
+			}
+		}
+	}
+
+	return true, nil
+}
+
+// scanProbePageSize bounds each page of the emptiness scan: it exists to find one item.
+const scanProbePageSize = 100
 
 // manifestItem builds the full feature-marker item. historyDependent and retention are omitted
 // when their set is empty; the caller has already set the version (1 on create, observed + 1 on
@@ -243,15 +307,24 @@ func (m *FeatureMarker) manifestItem(manifest evt.FeatureManifest) (map[string]t
 // Validate reads the manifest once, refuses an unsupported declared pair, and caches the version
 // this writer validated. Later commits only condition on the cached version; a failed condition
 // invalidates the cache (see invalidate) and the next commit re-validates.
+//
+// A store that does not declare stream-heads is refused with *evt.StreamHeadsNotMigratedError
+// unless it holds no data. Validate only checks: a writer's first commit is what declares the
+// feature on an empty store.
 func (m *FeatureMarker) Validate(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.validateLocked(ctx)
+	return m.validateLocked(ctx, false)
 }
 
-// validateLocked reads and caches validation while mu is held.
-func (m *FeatureMarker) validateLocked(ctx context.Context) error {
+// validateLocked reads and caches validation while mu is held. Besides refusing a declared pair
+// this writer does not model, it requires the stream-heads feature (ADR 0007): a store that does not
+// declare it holds streams with no head items, which a head-aware writer would fail on every
+// stream, so it refuses with *evt.StreamHeadsNotMigratedError. A store that holds no data yet is
+// declared by the writer itself when declare is set (a commit), so a fresh table needs no step;
+// otherwise it passes without being written or cached.
+func (m *FeatureMarker) validateLocked(ctx context.Context, declare bool) error {
 	if m.validated {
 		return nil
 	}
@@ -261,17 +334,37 @@ func (m *FeatureMarker) validateLocked(ctx context.Context) error {
 		return err
 	}
 
-	if manifest == nil {
-		// No marker row: nothing is declared; cache "no marker" and condition on absence.
-		m.validated = true
-		m.hasMarker = false
-		m.cachedVersion = 0
-
-		return nil
+	if manifest != nil {
+		if err := manifest.Validate(m.supported); err != nil {
+			return err
+		}
 	}
 
-	if err := manifest.Validate(m.supported); err != nil {
-		return err
+	if manifest == nil || !manifest.DeclaresStreamHeads() {
+		empty, serr := m.StoreIsEmpty(ctx)
+		if serr != nil {
+			return serr
+		}
+
+		if !empty {
+			return &evt.StreamHeadsNotMigratedError{}
+		}
+
+		if !declare {
+			return nil
+		}
+
+		declared, derr := m.declare(ctx, declareStreamHeads)
+		if derr != nil {
+			return derr
+		}
+
+		// A concurrent declaration may have added a feature this writer does not model.
+		if verr := declared.Validate(m.supported); verr != nil {
+			return verr
+		}
+
+		manifest = &declared
 	}
 
 	m.validated = true
@@ -297,7 +390,7 @@ func (m *FeatureMarker) checkItem(ctx context.Context) (types.TransactWriteItem,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if err := m.validateLocked(ctx); err != nil {
+	if err := m.validateLocked(ctx, true); err != nil {
 		return types.TransactWriteItem{}, err
 	}
 

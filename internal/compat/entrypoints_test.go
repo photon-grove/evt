@@ -60,6 +60,15 @@ func TestEveryWriteEntryPointRefusesProjectorOnlyInput(t *testing.T) {
 			t.Run(backend+"/"+entryPoint, func(t *testing.T) {
 				errs := run(repo)
 
+				// The DynamoDB batch path writes events with no head update, so it is refused outright
+				// (ADR 0007), whatever it is handed.
+				if backend == "dynamo" && entryPoint == "CommitStream" {
+					require.Len(t, errs, 1)
+					require.ErrorIs(t, errs[0], dynamo.ErrCommitStreamRefused)
+
+					return
+				}
+
 				require.Len(t, errs, 1)
 				var refused *evt.ProjectorOnlyCommitError
 				require.ErrorAs(t, errs[0], &refused)

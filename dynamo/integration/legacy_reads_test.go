@@ -25,7 +25,10 @@ func Test_LegacyReservedStreamsRemainReadable(t *testing.T) {
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "account"}},
 	})
 	require.NoError(t, err)
-	require.Len(t, rows.Items, 3)
+
+	// The head item (sk = -1), the snapshot, and two events. Copying the head item into the
+	// reserved partitions too shows it is neither an event nor a snapshot to any read.
+	require.Len(t, rows.Items, 4)
 
 	for _, id := range []evt.EntityID{"SYSTEM#account", "command-outcome#account"} {
 		for _, item := range rows.Items {

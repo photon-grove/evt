@@ -3096,6 +3096,20 @@
         "snapshot": "{\"entityType\":\"scratch\",\"entityID\":\"ttl-retained\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
         "dynamoItems": [
           {
+            "head": {
+              "N": "2"
+            },
+            "pk": {
+              "S": "ttl-retained"
+            },
+            "sk": {
+              "N": "-1"
+            },
+            "ttl": {
+              "N": "1791849601"
+            }
+          },
+          {
             "entityType": {
               "S": "scratch"
             },
@@ -3182,6 +3196,17 @@
         "snapshot": "{\"entityType\":\"disabled\",\"entityID\":\"ttl-zero-retention\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
         "dynamoItems": [
           {
+            "head": {
+              "N": "2"
+            },
+            "pk": {
+              "S": "ttl-zero-retention"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          {
             "entityType": {
               "S": "disabled"
             },
@@ -3258,6 +3283,17 @@
         ],
         "snapshot": "{\"entityType\":\"account\",\"entityID\":\"ttl-no-policy\",\"sequence\":1,\"eventSequence\":2,\"payload\":\"eyJvd25lciI6IkFkYSJ9\"}",
         "dynamoItems": [
+          {
+            "head": {
+              "N": "2"
+            },
+            "pk": {
+              "S": "ttl-no-policy"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
           {
             "entityType": {
               "S": "account"

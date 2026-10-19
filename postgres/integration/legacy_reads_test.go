@@ -25,6 +25,11 @@ func Test_LegacyReservedStreamsRemainReadable(t *testing.T) {
 			require.NoError(t, err)
 		}
 
+		// The head row stays with the stream that was committed; the moved copy has none, as a
+		// legacy stream would not.
+		_, err := pool.Exec(ctx, "DELETE FROM "+table+"__evt_stream_heads WHERE entity_id = 'account'")
+		require.NoError(t, err)
+
 		all, err := repo.GetEvents(ctx, id)
 		require.NoError(t, err)
 		require.Len(t, all, 2)

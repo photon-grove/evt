@@ -67,7 +67,7 @@ func Test_buildEventPutTransactions_StampsTTLForPolicyTypeOnly(t *testing.T) {
 	transactions, _, err := repo.buildEventPutTransactions([]evt.SerializedEvent{
 		{EntityID: "a", EntityType: "transient", Sequence: 1},
 		{EntityID: "b", EntityType: "durable", Sequence: 1},
-	})
+	}, repo.ttlFor)
 	require.NoError(t, err)
 	require.Len(t, transactions, 2)
 
@@ -84,28 +84,25 @@ func Test_buildEventPutTransactions_NoRetentionNeverStampsTTL(t *testing.T) {
 
 	transactions, _, err := repo.buildEventPutTransactions([]evt.SerializedEvent{
 		{EntityID: "a", EntityType: "transient", Sequence: 1},
-	})
+	}, repo.ttlFor)
 	require.NoError(t, err)
 
 	_, present := ttlValue(t, transactions[0])
 	require.False(t, present, "no policy means no ttl on any row")
 }
 
-func Test_buildSnapshotPutTransactions_StampsTTLForPolicyType(t *testing.T) {
+func Test_buildSnapshotPut_StampsTTLForPolicyType(t *testing.T) {
 	fixed := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
 	repo := NewRepository(nil, "events").
 		WithRetention(Retention{"transient": 7 * 24 * time.Hour}).
 		WithClock(func() time.Time { return fixed })
 
-	transactions, err := repo.buildSnapshotPutTransactions(
-		[]evt.SerializedEvent{{EntityID: "a", EntityType: "transient", Sequence: 1}},
-		"transient", "a", []byte(`{}`), 1,
+	snapshot, err := repo.buildSnapshotPut(
+		evt.SerializedSnapshot{EntityType: "transient", EntityID: "a", Sequence: 1, EventSequence: 1, Payload: []byte(`{}`)},
+		repo.ttlFor,
 	)
 	require.NoError(t, err)
-	require.NotEmpty(t, transactions)
 
-	// The snapshot is the last item (sk=0), appended after the event puts.
-	snapshot := transactions[len(transactions)-1]
 	got, present := ttlValue(t, snapshot)
 	require.True(t, present, "snapshot of a policy'd type must carry a ttl")
 	require.Equal(t, fixed.Add(7*24*time.Hour).Unix(), got)
@@ -116,7 +113,7 @@ func Test_PutSnapshot_StampsTTLForPolicyType(t *testing.T) {
 	client := dynamock.NewClient()
 
 	client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.GetItemOutput{}, nil).Once()
+		Return(&dynamodb.GetItemOutput{Item: declaredMarkerItem()}, nil).Once()
 
 	var captured *types.Put
 	client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
@@ -124,9 +121,9 @@ func Test_PutSnapshot_StampsTTLForPolicyType(t *testing.T) {
 		Run(func(args mock.Arguments) {
 			input, ok := args.Get(1).(*dynamodb.TransactWriteItemsInput)
 			require.True(t, ok)
-			require.Len(t, input.TransactItems, 2)
+			require.Len(t, input.TransactItems, 3)
 			require.NotNil(t, input.TransactItems[0].ConditionCheck)
-			captured = input.TransactItems[1].Put
+			captured = input.TransactItems[2].Put
 		})
 
 	repo := NewRepository(client, "events").
@@ -145,7 +142,7 @@ func Test_PutSnapshot_NoTTLForUnpolicedType(t *testing.T) {
 	client := dynamock.NewClient()
 
 	client.On("GetItem", mock.Anything, mock.Anything, mock.Anything).
-		Return(&dynamodb.GetItemOutput{}, nil).Once()
+		Return(&dynamodb.GetItemOutput{Item: declaredMarkerItem()}, nil).Once()
 
 	var captured *types.Put
 	client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
@@ -153,9 +150,9 @@ func Test_PutSnapshot_NoTTLForUnpolicedType(t *testing.T) {
 		Run(func(args mock.Arguments) {
 			input, ok := args.Get(1).(*dynamodb.TransactWriteItemsInput)
 			require.True(t, ok)
-			require.Len(t, input.TransactItems, 2)
+			require.Len(t, input.TransactItems, 3)
 			require.NotNil(t, input.TransactItems[0].ConditionCheck)
-			captured = input.TransactItems[1].Put
+			captured = input.TransactItems[2].Put
 		})
 
 	repo := NewRepository(client, "events").
@@ -166,4 +163,15 @@ func Test_PutSnapshot_NoTTLForUnpolicedType(t *testing.T) {
 
 	_, present := captured.Item["ttl"]
 	require.False(t, present, "un-policed type must not carry a ttl on background snapshot writes")
+}
+
+// declaredMarkerItem is a feature marker that declares stream-heads, the state of every store a
+// head-aware writer can write to.
+func declaredMarkerItem() map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		"pk":       &types.AttributeValueMemberS{Value: "SYSTEM#FEATURES"},
+		"sk":       &types.AttributeValueMemberN{Value: "0"},
+		"version":  &types.AttributeValueMemberN{Value: "1"},
+		"features": &types.AttributeValueMemberS{Value: `{"stream-heads":1}`},
+	}
 }

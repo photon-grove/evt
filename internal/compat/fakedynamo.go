@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/internal/streamheads"
 )
 
 // FakeDynamo is an in-memory DynamoDB table that understands exactly the key conditions and
@@ -34,11 +35,15 @@ type FakeDynamo struct {
 // the sequence so an implementation that reorders actions fails even when the stored state is
 // identical.
 type TransactionAction struct {
-	Operation string         `json:"operation"`
-	PK        string         `json:"pk"`
-	SK        int64          `json:"sk"`
-	Condition string         `json:"condition,omitempty"`
-	Values    map[string]any `json:"values,omitempty"`
+	Operation string `json:"operation"`
+	PK        string `json:"pk"`
+	SK        int64  `json:"sk"`
+
+	// Update is an Update action's update expression (the head update of a written stream).
+	Update    string            `json:"update,omitempty"`
+	Condition string            `json:"condition,omitempty"`
+	Names     map[string]string `json:"names,omitempty"`
+	Values    map[string]any    `json:"values,omitempty"`
 }
 
 var _ dynamo.Client = (*FakeDynamo)(nil)
@@ -120,6 +125,24 @@ func conditionHolds(
 	condition string,
 	values map[string]types.AttributeValue,
 ) (bool, error) {
+	// is reports the stored numeric attribute compared with an expression value; it is false when
+	// the attribute is absent.
+	is := func(name, value string, compare func(have, want int64) bool) (bool, error) {
+		if _, ok := existing[name]; !ok {
+			return false, nil
+		}
+
+		return compareIfExists(existing, name, values, value, compare)
+	}
+
+	equal := func(have, want int64) bool { return have == want }
+	atLeast := func(have, want int64) bool { return have >= want }
+
+	// ttlNotLowered is `attribute_not_exists(#ttl) OR #ttl <= :t`.
+	ttlNotLowered := func() (bool, error) {
+		return compareIfExists(existing, "ttl", values, ":t", func(have, want int64) bool { return have <= want })
+	}
+
 	switch condition {
 	case "":
 		return true, nil
@@ -128,55 +151,53 @@ func conditionHolds(
 		return existing == nil, nil
 
 	case "attribute_not_exists(pk) OR version = :v":
-		return compareIfExists(existing, "version", values, ":v", func(have, want int64) bool { return have == want })
+		return compareIfExists(existing, "version", values, ":v", equal)
 
 	case "version = :observed":
 		if existing == nil {
 			return false, nil
 		}
-		return compareIfExists(existing, "version", values, ":observed", func(have, want int64) bool { return have == want })
+		return compareIfExists(existing, "version", values, ":observed", equal)
 
-	case dynamo.FloorCondition:
-		return compareIfExists(existing, "eventSeq", values, ":first", func(have, first int64) bool { return have < first })
+	case streamheads.CreateCondition:
+		_, exists := existing["head"]
+		return !exists, nil
 
-	case dynamo.ContinuationCondition:
-		return existing != nil, nil
+	case streamheads.AppendCondition:
+		return is("head", ":prev", equal)
 
-	case dynamo.PinnedFloorCondition:
-		if _, exists := existing["eventSeq"]; !exists {
-			return false, nil
-		}
-		return compareIfExists(existing, "eventSeq", values, ":prev", func(have, want int64) bool { return have == want })
-
-	case dynamo.PinnedNextSnapshotCondition:
-		if _, exists := existing["seq"]; !exists {
-			return false, nil
-		}
-		sameSnapshot, err := compareIfExists(existing, "seq", values, ":seq", func(have, want int64) bool { return have == want })
-		if err != nil || !sameSnapshot {
+	case streamheads.RetainedAppendCondition:
+		held, err := is("head", ":prev", equal)
+		if err != nil || !held {
 			return false, err
 		}
-		return compareIfExists(existing, "eventSeq", values, ":prev", func(have, want int64) bool { return have == want })
+		return ttlNotLowered()
+
+	case streamheads.FenceCondition:
+		return is("head", ":head", equal)
+
+	case streamheads.GuardCondition:
+		return is("head", ":new", atLeast)
+
+	case streamheads.GuardEmptyCondition:
+		return compareIfExists(existing, "head", values, ":new", atLeast)
+
+	case streamheads.GuardRetainedCondition:
+		held, err := is("head", ":new", atLeast)
+		if err != nil || !held {
+			return false, err
+		}
+		return ttlNotLowered()
 
 	case dynamo.FirstSnapshotCondition:
 		_, exists := existing["seq"]
 		return !exists, nil
 
 	case dynamo.NextSnapshotCondition:
-		if _, exists := existing["seq"]; !exists {
-			return false, nil
-		}
-		sameSnapshot, err := compareIfExists(existing, "seq", values, ":seq", func(have, want int64) bool { return have == want })
-		if err != nil || !sameSnapshot {
-			return false, err
-		}
-		return compareIfExists(existing, "eventSeq", values, ":first", func(have, first int64) bool { return have < first })
+		return is("seq", ":seq", equal)
 
 	case "attribute_not_exists(eventSeq) OR eventSeq <= :new":
 		return compareIfExists(existing, "eventSeq", values, ":new", func(have, limit int64) bool { return have <= limit })
-
-	case "attribute_not_exists(sk) OR eventSeq <= :head":
-		return compareIfExists(existing, "eventSeq", values, ":head", func(have, head int64) bool { return have <= head })
 	}
 
 	return false, fmt.Errorf("fake dynamo: unsupported condition %q", condition)
@@ -215,19 +236,26 @@ type transactTarget struct {
 	condition string
 	values    map[string]types.AttributeValue
 	delete    bool
+
+	// update, with names and values, is an Update action's expression.
+	update string
+	names  map[string]string
 }
 
 func targetOf(write types.TransactWriteItem) (transactTarget, error) {
 	switch {
 	case write.Put != nil:
 		pk, sk, err := keyOf(write.Put.Item)
-		return transactTarget{pk, sk, write.Put.Item, aws.ToString(write.Put.ConditionExpression), write.Put.ExpressionAttributeValues, false}, err
+		return transactTarget{pk, sk, write.Put.Item, aws.ToString(write.Put.ConditionExpression), write.Put.ExpressionAttributeValues, false, "", nil}, err
 	case write.ConditionCheck != nil:
 		pk, sk, err := keyOf(write.ConditionCheck.Key)
-		return transactTarget{pk, sk, nil, aws.ToString(write.ConditionCheck.ConditionExpression), write.ConditionCheck.ExpressionAttributeValues, false}, err
+		return transactTarget{pk, sk, nil, aws.ToString(write.ConditionCheck.ConditionExpression), write.ConditionCheck.ExpressionAttributeValues, false, "", write.ConditionCheck.ExpressionAttributeNames}, err
 	case write.Delete != nil:
 		pk, sk, err := keyOf(write.Delete.Key)
-		return transactTarget{pk, sk, nil, aws.ToString(write.Delete.ConditionExpression), write.Delete.ExpressionAttributeValues, true}, err
+		return transactTarget{pk, sk, nil, aws.ToString(write.Delete.ConditionExpression), write.Delete.ExpressionAttributeValues, true, "", write.Delete.ExpressionAttributeNames}, err
+	case write.Update != nil:
+		pk, sk, err := keyOf(write.Update.Key)
+		return transactTarget{pk, sk, nil, aws.ToString(write.Update.ConditionExpression), write.Update.ExpressionAttributeValues, false, aws.ToString(write.Update.UpdateExpression), write.Update.ExpressionAttributeNames}, err
 	}
 
 	return transactTarget{}, errors.New("fake dynamo: unsupported transaction action")
@@ -241,9 +269,14 @@ func (t transactTarget) action(write types.TransactWriteItem) TransactionAction 
 		operation = "Put"
 	case write.Delete != nil:
 		operation = "Delete"
+	case write.Update != nil:
+		operation = "Update"
 	}
 
-	action := TransactionAction{Operation: operation, PK: t.pk, SK: t.sk, Condition: t.condition}
+	action := TransactionAction{Operation: operation, PK: t.pk, SK: t.sk, Update: t.update, Condition: t.condition}
+	if len(t.names) > 0 {
+		action.Names = t.names
+	}
 	if len(t.values) > 0 {
 		action.Values = DynamoItemJSON(t.values)
 	}
@@ -303,14 +336,60 @@ func (f *FakeDynamo) TransactWriteItems(
 	}
 
 	for _, target := range targets {
-		if target.put != nil {
+		switch {
+		case target.put != nil:
 			f.putLocked(target.pk, target.sk, target.put)
-		} else if target.delete {
+
+		case target.delete:
 			delete(f.items[target.pk], target.sk)
+
+		case target.update != "":
+			if err := f.updateLocked(target); err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	return &dynamodb.TransactWriteItemsOutput{}, nil
+}
+
+// updateLocked applies an update expression of the form `SET lhs = :value[, lhs = :value]`, the
+// only shape the repository issues, creating the item when it does not exist (as DynamoDB does).
+func (f *FakeDynamo) updateLocked(target transactTarget) error {
+	expression, ok := strings.CutPrefix(target.update, "SET ")
+	if !ok {
+		return fmt.Errorf("fake dynamo: unsupported update expression %q", target.update)
+	}
+
+	item := map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: target.pk},
+		"sk": &types.AttributeValueMemberN{Value: strconv.FormatInt(target.sk, 10)},
+	}
+	for name, value := range f.items[target.pk][target.sk] {
+		item[name] = value
+	}
+
+	for _, assignment := range strings.Split(expression, ", ") {
+		name, placeholder, found := strings.Cut(assignment, " = ")
+		if !found {
+			return fmt.Errorf("fake dynamo: unsupported update expression %q", target.update)
+		}
+
+		if resolved, named := target.names[name]; named {
+			name = resolved
+		}
+
+		value, present := target.values[placeholder]
+		if !present {
+			return fmt.Errorf("fake dynamo: update value %s is missing", placeholder)
+		}
+
+		item[name] = value
+	}
+
+	f.putLocked(target.pk, target.sk, item)
+
+	return nil
 }
 
 func (f *FakeDynamo) putLocked(pk string, sk int64, item map[string]types.AttributeValue) {
@@ -367,7 +446,12 @@ func (f *FakeDynamo) GetItem(
 		return nil, err
 	}
 
-	return &dynamodb.GetItemOutput{Item: f.items[pk][sk]}, nil
+	item := f.items[pk][sk]
+	if item != nil {
+		item = project(item, aws.ToString(params.ProjectionExpression), params.ExpressionAttributeNames)
+	}
+
+	return &dynamodb.GetItemOutput{Item: item}, nil
 }
 
 // Query supports `pk = :pk AND sk > :sk` and `pk = :pk AND sk BETWEEN :lo AND :hi`, with
@@ -424,7 +508,7 @@ func (f *FakeDynamo) Query(
 			continue
 		}
 
-		items = append(items, project(item, aws.ToString(params.ProjectionExpression)))
+		items = append(items, project(item, aws.ToString(params.ProjectionExpression), params.ExpressionAttributeNames))
 		if params.Limit != nil && len(items) == int(*params.Limit) {
 			break
 		}
@@ -433,7 +517,7 @@ func (f *FakeDynamo) Query(
 	return &dynamodb.QueryOutput{Items: items, Count: int32(len(items))}, nil //nolint:gosec // an in-memory fixture partition holds a handful of items
 }
 
-func project(item map[string]types.AttributeValue, projection string) map[string]types.AttributeValue {
+func project(item map[string]types.AttributeValue, projection string, names map[string]string) map[string]types.AttributeValue {
 	if projection == "" {
 		return item
 	}
@@ -441,6 +525,10 @@ func project(item map[string]types.AttributeValue, projection string) map[string
 	out := make(map[string]types.AttributeValue)
 	for _, name := range strings.Split(projection, ",") {
 		name = strings.TrimSpace(name)
+		if resolved, named := names[name]; named {
+			name = resolved
+		}
+
 		if value, ok := item[name]; ok {
 			out[name] = value
 		}
@@ -478,9 +566,36 @@ func (f *FakeDynamo) BatchWriteItem(
 
 var errUnsupported = errors.New("fake dynamo: operation not supported")
 
-// Scan is not supported. The harness never scans.
-func (f *FakeDynamo) Scan(context.Context, *dynamodb.ScanInput, ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
-	return nil, errUnsupported
+// Scan returns every item in one page, projected. The harness scans only to prove a table holds no
+// stream before a writer declares stream-heads on it; filters are not supported.
+func (f *FakeDynamo) Scan(
+	_ context.Context,
+	params *dynamodb.ScanInput,
+	_ ...func(*dynamodb.Options),
+) (*dynamodb.ScanOutput, error) {
+	if params.FilterExpression != nil {
+		return nil, errUnsupported
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	pks := make([]string, 0, len(f.items))
+	for pk := range f.items {
+		pks = append(pks, pk)
+	}
+
+	sort.Strings(pks)
+
+	var items []map[string]types.AttributeValue
+
+	for _, pk := range pks {
+		for _, item := range f.sortedLocked(pk, true) {
+			items = append(items, project(item, aws.ToString(params.ProjectionExpression), params.ExpressionAttributeNames))
+		}
+	}
+
+	return &dynamodb.ScanOutput{Items: items, Count: int32(len(items))}, nil //nolint:gosec // an in-memory fixture table holds a handful of items
 }
 
 // BatchGetItem is not supported.

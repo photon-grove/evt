@@ -37,6 +37,20 @@ func (s *RepositorySuite) Test_Commit_Ok() {
 
 	expected := []types.TransactWriteItem{
 		{
+			Update: &types.Update{
+				TableName: &s.repo.EventsTable,
+				Key: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: "test-id"},
+					"sk": &types.AttributeValueMemberN{Value: "-1"},
+				},
+				UpdateExpression:    aws.String("SET head = :last"),
+				ConditionExpression: aws.String("attribute_not_exists(head)"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":last": &types.AttributeValueMemberN{Value: "1"},
+				},
+			},
+		},
+		{
 			Put: &types.Put{
 				TableName: &s.repo.EventsTable,
 				Item: map[string]types.AttributeValue{
@@ -51,22 +65,9 @@ func (s *RepositorySuite) Test_Commit_Ok() {
 				ConditionExpression: aws.String("attribute_not_exists(sk)"),
 			},
 		},
-		{
-			ConditionCheck: &types.ConditionCheck{
-				TableName: &s.repo.EventsTable,
-				Key: map[string]types.AttributeValue{
-					"pk": &types.AttributeValueMemberS{Value: "test-id"},
-					"sk": &types.AttributeValueMemberN{Value: "0"},
-				},
-				ConditionExpression: aws.String("attribute_not_exists(eventSeq) OR eventSeq < :first"),
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":first": &types.AttributeValueMemberN{Value: "1"},
-				},
-			},
-		},
 	}
 
-	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{absentMarkerCheck(s.repo.EventsTable)}, expected...)}
+	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{markerCheck(s.repo.EventsTable)}, expected...)}
 
 	// Return an empty output object, because the result isn't used
 	output := new(dynamodb.TransactWriteItemsOutput)
@@ -102,13 +103,18 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 
 	expected := []types.TransactWriteItem{
 		{
-			ConditionCheck: &types.ConditionCheck{
+			Update: &types.Update{
 				TableName: &s.repo.EventsTable,
 				Key: map[string]types.AttributeValue{
 					"pk": &types.AttributeValueMemberS{Value: "test-id"},
-					"sk": &types.AttributeValueMemberN{Value: "1"},
+					"sk": &types.AttributeValueMemberN{Value: "-1"},
 				},
-				ConditionExpression: aws.String("attribute_exists(sk)"),
+				UpdateExpression:    aws.String("SET head = :last"),
+				ConditionExpression: aws.String("head = :prev"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":last": &types.AttributeValueMemberN{Value: "2"},
+					":prev": &types.AttributeValueMemberN{Value: "1"},
+				},
 			},
 		},
 		{
@@ -142,23 +148,8 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 		},
 	}
 
-	// The stream has no snapshot, and the commit continues from an existing head event, which the
-	// continuation check pins.
-	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
-		return ok && sk.Value == "0"
-	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
-	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
-		return ok && sk.Value == "1"
-	}), mock.Anything).Return(&dynamodb.GetItemOutput{
-		Item: map[string]types.AttributeValue{
-			"pk": &types.AttributeValueMemberS{Value: "test-id"},
-			"sk": &types.AttributeValueMemberN{Value: "1"},
-		},
-	}, nil)
-
-	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{absentMarkerCheck(s.repo.EventsTable)}, expected...)}
+	// An append needs no read before the commit: the head condition carries continuity.
+	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{markerCheck(s.repo.EventsTable)}, expected...)}
 
 	// Return an empty output object, because the result isn't used
 	output := new(dynamodb.TransactWriteItemsOutput)
@@ -173,7 +164,7 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 	s.client.AssertExpectations(s.T())
 }
 
-// Test that a later snapshot requires the loaded snapshot sequence and the floor
+// Test that a later snapshot requires only the loaded snapshot sequence: the head update owns the floor
 func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
 	ctx := context.Background()
 
@@ -181,22 +172,6 @@ func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
 		EntityType: "test", EntityID: "test-id", Sequence: 7, Type: "test-event", Version: 1,
 		Payload: []byte{}, Metadata: evt.Metadata{Region: "us-east-1"},
 	}}
-
-	// The stream has no snapshot, and the commit continues from an existing head event, which the
-	// continuation check pins.
-	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
-		return ok && sk.Value == "0"
-	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
-	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
-		return ok && sk.Value == "6"
-	}), mock.Anything).Return(&dynamodb.GetItemOutput{
-		Item: map[string]types.AttributeValue{
-			"pk": &types.AttributeValueMemberS{Value: "test-id"},
-			"sk": &types.AttributeValueMemberN{Value: "6"},
-		},
-	}, nil)
 
 	var input *dynamodb.TransactWriteItemsInput
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
@@ -211,182 +186,35 @@ func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
 	require.NoError(s.T(), err)
 
 	put := input.TransactItems[len(input.TransactItems)-1].Put
-	require.Equal(s.T(), "seq = :seq AND eventSeq < :first", aws.ToString(put.ConditionExpression))
+	require.Equal(s.T(), "seq = :seq", aws.ToString(put.ConditionExpression))
 	require.Equal(s.T(), map[string]types.AttributeValue{
-		":seq":   &types.AttributeValueMemberN{Value: "2"},
-		":first": &types.AttributeValueMemberN{Value: "7"},
+		":seq": &types.AttributeValueMemberN{Value: "2"},
 	}, put.ExpressionAttributeValues)
+
+	// The append conditions on the head being the sequence before the commit's first.
+	update := input.TransactItems[1].Update
+	require.Equal(s.T(), "head = :prev", aws.ToString(update.ConditionExpression))
+	require.Equal(s.T(), map[string]types.AttributeValue{
+		":last": &types.AttributeValueMemberN{Value: "7"},
+		":prev": &types.AttributeValueMemberN{Value: "6"},
+	}, update.ExpressionAttributeValues)
 }
 
-// Test CommitStream method with successful stream processing
-func (s *RepositorySuite) Test_CommitStream_Ok() {
+// Test CommitStream refuses: its batches would write events without maintaining head items
+func (s *RepositorySuite) Test_CommitStream_Refuses() {
 	ctx := context.Background()
 
 	resultChannel := make(chan result.Result[evt.SerializedResult], 2)
-
-	serializedEvents1 := []evt.SerializedEvent{{
+	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{{
 		EntityType: "test", EntityID: "entity-1", Sequence: 1, Type: "test-event", Version: 1,
 		Payload: []byte(`{"test": "data1"}`), Metadata: evt.Metadata{Region: "us-east-1"},
-	}}
-	serializedEvents2 := []evt.SerializedEvent{{
-		EntityType: "test", EntityID: "entity-2", Sequence: 1, Type: "test-event", Version: 1,
-		Payload: []byte(`{"test": "data2"}`), Metadata: evt.Metadata{Region: "us-east-1"},
-	}}
-
-	resultChannel <- result.Ok(evt.SerializedResult{Events: serializedEvents1})
-	resultChannel <- result.Ok(evt.SerializedResult{Events: serializedEvents2})
-	close(resultChannel)
-
-	output := new(dynamodb.TransactWriteItemsOutput)
-	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).Return(output, nil).Times(1)
-
-	errors := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	require.Empty(s.T(), errors)
-	s.client.AssertExpectations(s.T())
-}
-
-// Test CommitStream adds one floor check per stream per batch, using the batch's lowest sequence
-// whatever order the results arrive in
-func (s *RepositorySuite) Test_CommitStream_OneFloorCheckPerStream() {
-	ctx := context.Background()
-
-	event := func(id evt.EntityID, sequence evt.EventSequence) evt.SerializedEvent {
-		return evt.SerializedEvent{
-			EntityType: "test", EntityID: id, Sequence: sequence, Type: "test-event", Version: 1,
-			Payload: []byte(`{}`), Metadata: evt.Metadata{Region: "us-east-1"},
-		}
-	}
-
-	resultChannel := make(chan result.Result[evt.SerializedResult], 4)
-	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{event("entity-1", 5)}})
-	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{event("entity-2", 1)}})
-	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{event("entity-1", 4)}})
-	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{event("entity-2", 2)}})
-	close(resultChannel)
-
-	var checks []*types.ConditionCheck
-
-	capture := mock.MatchedBy(func(in *dynamodb.TransactWriteItemsInput) bool {
-		for _, item := range in.TransactItems {
-			if item.ConditionCheck != nil {
-				pk, ok := item.ConditionCheck.Key["pk"].(*types.AttributeValueMemberS)
-				require.True(s.T(), ok)
-				// Floor checks only: the marker and continuation checks carry no :first.
-				if pk.Value != "SYSTEM#FEATURES" && aws.ToString(item.ConditionCheck.ConditionExpression) != dynamo.ContinuationCondition {
-					checks = append(checks, item.ConditionCheck)
-				}
-			}
-		}
-
-		return true
-	})
-
-	// entity-1 has no snapshot and continues from an existing head event (sequence 3); entity-2
-	// starts at 1.
-	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
-		return ok && sk.Value == "0"
-	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil).Once()
-	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
-		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
-		return ok && sk.Value == "3"
-	}), mock.Anything).Return(&dynamodb.GetItemOutput{
-		Item: map[string]types.AttributeValue{
-			"pk": &types.AttributeValueMemberS{Value: "entity-1"},
-			"sk": &types.AttributeValueMemberN{Value: "3"},
-		},
-	}, nil).Once()
-
-	output := new(dynamodb.TransactWriteItemsOutput)
-	s.client.On("TransactWriteItems", mock.Anything, capture, mock.Anything).Return(output, nil).Once()
-
-	require.Empty(s.T(), s.repo.CommitStream(ctx, resultChannel)) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-
-	floors := make(map[string]string)
-	for _, check := range checks {
-		pk, ok := check.Key["pk"].(*types.AttributeValueMemberS)
-		require.True(s.T(), ok)
-
-		first, ok := check.ExpressionAttributeValues[":first"].(*types.AttributeValueMemberN)
-		require.True(s.T(), ok)
-
-		floors[pk.Value] = first.Value
-	}
-
-	require.Len(s.T(), checks, 2)
-	require.Equal(s.T(), map[string]string{"entity-1": "4", "entity-2": "1"}, floors)
-	s.client.AssertExpectations(s.T())
-}
-
-// Test CommitStream with channel containing errors
-func (s *RepositorySuite) Test_CommitStream_WithErrors() {
-	ctx := context.Background()
-
-	resultChannel := make(chan result.Result[evt.SerializedResult], 2)
-
-	serializedEvents := []evt.SerializedEvent{{
-		EntityType: "test", EntityID: "entity-1", Sequence: 1, Type: "test-event", Version: 1,
-		Payload: []byte(`{"test": "data"}`), Metadata: evt.Metadata{Region: "us-east-1"},
-	}}
-
-	resultChannel <- result.Ok(evt.SerializedResult{Events: serializedEvents})
+	}}})
 	resultChannel <- result.Err[evt.SerializedResult](errors.New("processing error"))
 	close(resultChannel)
 
-	output := new(dynamodb.TransactWriteItemsOutput)
-	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).Return(output, nil).Once()
-
-	errors := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	require.Len(s.T(), errors, 1)
-	require.Contains(s.T(), errors[0].Error(), "processing error")
-	s.client.AssertExpectations(s.T())
-}
-
-// Test CommitStream with DynamoDB commit errors
-func (s *RepositorySuite) Test_CommitStream_CommitErrors() {
-	ctx := context.Background()
-
-	resultChannel := make(chan result.Result[evt.SerializedResult], 1)
-
-	serializedEvents := []evt.SerializedEvent{{
-		EntityType: "test", EntityID: "entity-1", Sequence: 1, Type: "test-event", Version: 1,
-		Payload: []byte(`{"test": "data"}`), Metadata: evt.Metadata{Region: "us-east-1"},
-	}}
-
-	resultChannel <- result.Ok(evt.SerializedResult{Events: serializedEvents})
-	close(resultChannel)
-
-	commitError := errors.New("DynamoDB commit failed")
-	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).Return((*dynamodb.TransactWriteItemsOutput)(nil), commitError)
-
-	errors := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	require.Len(s.T(), errors, 1)
-	require.Contains(s.T(), errors[0].Error(), "DynamoDB commit failed")
-	s.client.AssertExpectations(s.T())
-}
-
-// Test CommitStream rejects a single result that exceeds the 100-item transaction limit
-func (s *RepositorySuite) Test_CommitStream_OversizedSingleResult() {
-	ctx := context.Background()
-
-	// Create a result with 101 events — exceeds the 100-item DynamoDB transaction limit
-	var oversizedEvents []evt.SerializedEvent
-	for i := 1; i <= 101; i++ {
-		oversizedEvents = append(oversizedEvents, evt.SerializedEvent{
-			EntityType: "test", EntityID: evt.EntityID(fmt.Sprintf("entity-%d", i)),
-			Sequence: 1, Type: "test-event", Version: 1,
-			Payload: []byte(`{"test": "data"}`), Metadata: evt.Metadata{Region: "us-east-1"},
-		})
-	}
-
-	resultChannel := make(chan result.Result[evt.SerializedResult], 1)
-	resultChannel <- result.Ok(evt.SerializedResult{Events: oversizedEvents})
-	close(resultChannel)
-
-	// No DynamoDB calls should be made — the guard rejects before commit
-	errors := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	require.Len(s.T(), errors, 1)
-	require.Contains(s.T(), errors[0].Error(), "exceeding DynamoDB 100-item transaction limit")
+	errs := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	require.Len(s.T(), errs, 1)
+	require.ErrorIs(s.T(), errs[0], dynamo.ErrCommitStreamRefused)
 	s.client.AssertNotCalled(s.T(), "TransactWriteItems")
 }
 
@@ -473,18 +301,37 @@ func (s *RepositorySuite) Test_Commit_ConditionalCheckFailure() {
 
 	conditionalCheckErr := &types.TransactionCanceledException{
 		CancellationReasons: []types.CancellationReason{
-			{Code: aws.String("None")}, // mandatory marker check
-			{Code: aws.String("ConditionalCheckFailed")},
+			{Code: aws.String("None")},                   // mandatory marker check
+			{Code: aws.String("ConditionalCheckFailed")}, // head update: the stream already exists
+			{Code: aws.String("None")},
 		},
 	}
 
 	s.client.On("TransactWriteItems", mock.Anything, mock.Anything, mock.Anything).
 		Return((*dynamodb.TransactWriteItemsOutput)(nil), conditionalCheckErr)
 
+	// The failure-path probe finds a healthy stream at head 1: a plain conflict.
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		sk, skOK := in.Key["sk"].(*types.AttributeValueMemberN)
+		pk, pkOK := in.Key["pk"].(*types.AttributeValueMemberS)
+		return skOK && pkOK && sk.Value == "0" && pk.Value == "test-id"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil)
+	s.client.On("Query", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.QueryOutput{
+		Items: []map[string]types.AttributeValue{{"sk": &types.AttributeValueMemberN{Value: "1"}}},
+	}, nil)
+	s.client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+		sk, ok := in.Key["sk"].(*types.AttributeValueMemberN)
+		return ok && sk.Value == "-1"
+	}), mock.Anything).Return(&dynamodb.GetItemOutput{Item: map[string]types.AttributeValue{
+		"pk":   &types.AttributeValueMemberS{Value: "test-id"},
+		"sk":   &types.AttributeValueMemberN{Value: "-1"},
+		"head": &types.AttributeValueMemberN{Value: "1"},
+	}}, nil)
+
 	result := evt.SerializedResult{Events: serializedEvents}
 	err := s.repo.Commit(ctx, result)
 
-	require.Error(s.T(), err)
+	require.ErrorIs(s.T(), err, dynamo.ErrSnapshotRaceCondition)
 	s.client.AssertExpectations(s.T())
 }
 

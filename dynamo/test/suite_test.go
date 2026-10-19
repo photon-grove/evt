@@ -25,14 +25,29 @@ func Test_RepositorySuite(t *testing.T) {
 	suite.Run(t, new(RepositorySuite))
 }
 
-func absentMarkerCheck(table string) types.TransactWriteItem {
+// declaredMarker is the feature marker of a store that declares stream-heads, the only state a
+// head-aware writer writes to (ADR 0007).
+func declaredMarker() map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		"pk":       &types.AttributeValueMemberS{Value: "SYSTEM#FEATURES"},
+		"sk":       &types.AttributeValueMemberN{Value: "0"},
+		"version":  &types.AttributeValueMemberN{Value: "1"},
+		"features": &types.AttributeValueMemberS{Value: `{"stream-heads":1}`},
+	}
+}
+
+// markerCheck is the commit's mandatory marker check against the declared marker above.
+func markerCheck(table string) types.TransactWriteItem {
 	return types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
 		TableName: aws.String(table),
 		Key: map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: "SYSTEM#FEATURES"},
 			"sk": &types.AttributeValueMemberN{Value: "0"},
 		},
-		ConditionExpression: aws.String("attribute_not_exists(pk)"),
+		ConditionExpression: aws.String("attribute_not_exists(pk) OR version = :v"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":v": &types.AttributeValueMemberN{Value: "1"},
+		},
 	}}
 }
 
@@ -40,12 +55,12 @@ func absentMarkerCheck(table string) types.TransactWriteItem {
 func (s *RepositorySuite) SetupTest() {
 	s.client = mock.NewClient()
 	s.repo = dynamo.NewRepository(s.client, "test-events")
-	// Ordinary repository tests use a table with no feature declarations. Keep this default
-	// scoped to the marker key so entity reads and the explicit FeatureMarkerSuite stay strict.
+	// Ordinary repository tests use a store that declares stream-heads and nothing else. Keep this
+	// default scoped to the marker key so entity reads and the explicit FeatureMarkerSuite stay strict.
 	s.client.On("GetItem", mocktest.Anything, mocktest.MatchedBy(func(in *dynamodb.GetItemInput) bool {
 		pk, pkOK := in.Key["pk"].(*types.AttributeValueMemberS)
 		sk, skOK := in.Key["sk"].(*types.AttributeValueMemberN)
 		return pkOK && skOK && pk.Value == "SYSTEM#FEATURES" && sk.Value == "0" &&
 			aws.ToString(in.TableName) == "test-events" && aws.ToBool(in.ConsistentRead)
-	}), mocktest.Anything).Return(&dynamodb.GetItemOutput{}, nil).Maybe()
+	}), mocktest.Anything).Return(&dynamodb.GetItemOutput{Item: declaredMarker()}, nil).Maybe()
 }

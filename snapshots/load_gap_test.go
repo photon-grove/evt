@@ -126,7 +126,7 @@ func (r *compactDuringLoad) GetLatestEvents(ctx context.Context, id evt.EntityID
 }
 
 // A load that falls behind a compaction returns the older state, like any read that another writer
-// overtakes. The floor check rejects a commit from it.
+// overtakes. The stream's head condition rejects a commit from it.
 func TestFloorRejectsACommitFromALoadBehindACompaction(t *testing.T) {
 	ctx := context.Background()
 	repo := mem.NewRepository()
