@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
+	"github.com/photon-grove/evt/internal/streamheads"
 	"github.com/photon-grove/evt/stream"
 )
 
@@ -43,9 +44,11 @@ func HandleDynamoDBEvent(
 		BatchItemFailures: []events.DynamoDBBatchItemFailure{},
 	}
 
+	// Only INSERT records of events are published: the head item of a stream (sk = -1, ADR 0007)
+	// is inserted with a stream's first commit, and it is not an event.
 	records := make([]events.DynamoDBEventRecord, 0, len(event.Records))
 	for _, record := range event.Records {
-		if record.EventName == "INSERT" {
+		if record.EventName == "INSERT" && !streamheads.IsNonEventRecord(record) {
 			records = append(records, record)
 		}
 	}

@@ -6,6 +6,8 @@ import (
 	"strconv"
 
 	"github.com/aws/aws-lambda-go/events"
+
+	"github.com/photon-grove/evt/internal/streamheads"
 )
 
 // DynamoDBStreamResponse is the Lambda response for DynamoDB Streams event
@@ -52,7 +54,8 @@ func NewLambdaHandler(runtime *Runtime) func(ctx context.Context, event events.D
 // convertRecord transforms a DynamoDB stream event record into a StreamRecord.
 // Returns false if the record should be skipped (e.g., not an INSERT).
 func convertRecord(r events.DynamoDBEventRecord) (StreamRecord, bool) {
-	if r.EventName != "INSERT" {
+	// A head item (sk = -1, ADR 0007) or a snapshot (sk = 0) is not an event.
+	if r.EventName != "INSERT" || streamheads.IsNonEventRecord(r) {
 		return StreamRecord{}, false
 	}
 

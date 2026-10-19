@@ -146,3 +146,22 @@ func TestHandleDynamoDBEvent_IgnoresNonInsertRecords(t *testing.T) {
 	require.Empty(t, resp.BatchItemFailures)
 	require.Equal(t, 0, pub.calls)
 }
+
+// The first commit of a stream inserts its head item (sk = -1, ADR 0007). It is concurrency
+// metadata, not an event, so the publisher never sees it.
+func TestHandleDynamoDBEvent_IgnoresHeadItems(t *testing.T) {
+	pub := &stubPublisher{result: &stream.PublishResult{}} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+
+	keys := map[string]events.DynamoDBAttributeValue{
+		"pk": events.NewStringAttribute("entity-1"),
+		"sk": events.NewNumberAttribute("-1"),
+	}
+	event := events.DynamoDBEvent{Records: []events.DynamoDBEventRecord{
+		{EventID: "head", EventName: "INSERT", Change: events.DynamoDBStreamRecord{Keys: keys, NewImage: keys}},
+	}}
+
+	resp, err := publishers.HandleDynamoDBEvent(context.Background(), event, pub, &stubBudget{}, nil)
+	require.NoError(t, err)
+	require.Empty(t, resp.BatchItemFailures)
+	require.Equal(t, 0, pub.calls)
+}
