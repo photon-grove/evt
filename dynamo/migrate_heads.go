@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,6 +86,10 @@ type HeadsVerifyReport struct {
 	// item whose ttl is below its stream's.
 	Findings []evt.HeadFinding
 
+	// ReservedStreams are streams (not engine rows) in a reserved namespace. Head-aware code hides
+	// them, so they must be renamed first: Migrate refuses to continue while any exists.
+	ReservedStreams []evt.EntityID
+
 	// Warnings do not fail verification: a head item with a ttl and nothing left to count, which a
 	// retained stream leaves behind until its ttl passes.
 	Warnings []evt.HeadFinding
@@ -130,6 +135,10 @@ type HeadsRepairReport struct {
 
 	// Raced head items changed between the scan and the write and were left for the next run.
 	Raced int
+
+	// Remaining are the findings a verification still reports after a repair in which some write
+	// raced. It is empty when no write raced, and when the re-verification came back clean.
+	Remaining []evt.HeadFinding
 
 	// Left are findings a repair does not touch: a higher head without AllowLower, and a head item
 	// with no derived head to lower to.
@@ -206,12 +215,13 @@ func (m *HeadsMigration) Verify(ctx context.Context) (HeadsVerifyReport, error) 
 }
 
 func (m *HeadsMigration) verify(ctx context.Context) (HeadsVerifyReport, error) {
-	tallies, err := m.scan(ctx)
+	scanned, err := m.scan(ctx)
 	if err != nil {
 		return HeadsVerifyReport{}, err
 	}
 
-	report := HeadsVerifyReport{Streams: len(tallies)}
+	tallies := scanned.tallies
+	report := HeadsVerifyReport{Streams: len(tallies), ReservedStreams: scanned.reserved}
 
 	for _, id := range sortedStreamIDs(tallies) {
 		finding, warning := tallies[id].classify(id)
@@ -270,6 +280,10 @@ func (m *HeadsMigration) Migrate(ctx context.Context, opts HeadsMigrateOptions) 
 			return report, err
 		}
 
+		if len(report.Verify.ReservedStreams) > 0 {
+			return report, reservedStreams(report.Verify.ReservedStreams)
+		}
+
 		if !report.Verify.OK() {
 			return report, notVerified(string(phase), report.Verify)
 		}
@@ -297,11 +311,19 @@ func (m *HeadsMigration) Migrate(ctx context.Context, opts HeadsMigrateOptions) 
 		return report, err
 	}
 
+	if len(report.Verify.ReservedStreams) > 0 {
+		return report, reservedStreams(report.Verify.ReservedStreams)
+	}
+
 	if !report.Verify.OK() {
 		return report, notVerified(string(PhaseVerifyAfterDeclare), report.Verify)
 	}
 
 	return report, nil
+}
+
+func reservedStreams(ids []evt.EntityID) error {
+	return &evt.ReservedStreamsError{IDs: ids[:min(len(ids), 100)], Total: len(ids)}
 }
 
 func (m *HeadsMigration) progress(phase HeadsMigrationPhase) {
@@ -320,11 +342,18 @@ func notVerified(phase string, report HeadsVerifyReport) error {
 // whose items all carry a ttl, the largest of them. It scans the whole table first and writes
 // after, because a partition split by a page boundary is complete only when the scan ends.
 func (m *HeadsMigration) backfill(ctx context.Context, dryRun bool) (HeadsBackfillReport, error) {
-	tallies, err := m.scan(ctx)
+	scanned, err := m.scan(ctx)
 	if err != nil {
 		return HeadsBackfillReport{}, err
 	}
 
+	// A stream in a reserved namespace is invisible to head-aware code and must be renamed, not
+	// left without a head item under a declaration. Nothing has been written yet.
+	if len(scanned.reserved) > 0 {
+		return HeadsBackfillReport{}, reservedStreams(scanned.reserved)
+	}
+
+	tallies := scanned.tallies
 	report := HeadsBackfillReport{DryRun: dryRun, Streams: len(tallies)}
 
 	var writes []headWrite
@@ -376,10 +405,12 @@ func (m *HeadsMigration) Repair(ctx context.Context, opts HeadsRepairOptions) (H
 		return report, err
 	}
 
-	tallies, err := m.scan(ctx)
+	scanned, err := m.scan(ctx)
 	if err != nil {
 		return report, err
 	}
+
+	tallies := scanned.tallies
 
 	var (
 		writes   []headWrite
@@ -411,6 +442,17 @@ func (m *HeadsMigration) Repair(ctx context.Context, opts HeadsRepairOptions) (H
 
 	report.Raced = raced
 	report.Repaired = repaired
+
+	// A write that lost its condition left its stream unrepaired. Look again, so the caller can tell
+	// a stream someone else fixed in the meantime from one that still disagrees with its log.
+	if raced > 0 {
+		verified, verr := m.verify(ctx)
+		if verr != nil {
+			return report, verr
+		}
+
+		report.Remaining = verified.Findings
+	}
 
 	return report, nil
 }
@@ -645,7 +687,21 @@ func (t *streamTally) repairHead(id evt.EntityID) headWrite {
 		ttl = t.wantTTL()
 	}
 
-	return t.headUpdate(id, derived, ttl, removeTTL, "head = :observed", &t.head)
+	write := t.headUpdate(id, derived, ttl, removeTTL, "head = :observed", &t.head)
+
+	// A write that changes the ttl is also conditioned on the ttl it saw. Otherwise a head-aware
+	// writer that refreshed the ttl without moving the head (an out-of-band snapshot write does)
+	// between the scan and this write could have a larger ttl overwritten by a smaller one, which
+	// breaks the never-lower rule.
+	// (Only a head item that has a ttl is ever changed: ttlLow requires one.)
+	if ttl != 0 || removeTTL {
+		condition := *write.input.ConditionExpression + " AND " + streamheads.TTLPlaceholder + " = :observedTtl"
+		write.input.ExpressionAttributeValues[":observedTtl"] = numberValue(t.headTTL)
+		write.input.ConditionExpression = &condition
+		write.input.ExpressionAttributeNames = map[string]string{streamheads.TTLPlaceholder: streamheads.TTLName}
+	}
+
+	return write
 }
 
 // headUpdate builds the UpdateItem of a head item. ttl is set when non-zero and removed when
@@ -689,15 +745,33 @@ func (t *streamTally) headUpdate(
 	}}
 }
 
+// tableScan is what one pass over the table learns: a tally per non-reserved partition, and the
+// streams that sit in a reserved namespace without being engine rows.
+type tableScan struct {
+	tallies  map[evt.EntityID]*streamTally
+	reserved []evt.EntityID
+}
+
 // scan reads the whole table with strongly consistent reads and folds it into one tally per
 // non-reserved partition. Items of a partition may be split across pages (or interleaved with
-// other partitions), so nothing is decided until the scan ends.
-func (m *HeadsMigration) scan(ctx context.Context) (map[evt.EntityID]*streamTally, error) {
+// other partitions), so nothing is decided until the scan ends. Reserved namespaces hold engine
+// rows; a row there that is not one is a pre-v0.9 stream the migration cannot leave behind, so the
+// scan collects those too (the same rule as evt-doctor's reserved-namespace check).
+func (m *HeadsMigration) scan(ctx context.Context) (tableScan, error) {
+	// version, owner, leaseExpiresAt, value, and status are DynamoDB reserved words, and they are the
+	// attributes that tell an engine row from a user stream.
 	input := dynamodb.ScanInput{
-		TableName:                &m.repo.EventsTable,
-		ConsistentRead:           aws.Bool(true),
-		ProjectionExpression:     aws.String("pk, sk, eventSeq, head, #ttl"),
-		ExpressionAttributeNames: map[string]string{streamheads.TTLPlaceholder: streamheads.TTLName},
+		TableName:            &m.repo.EventsTable,
+		ConsistentRead:       aws.Bool(true),
+		ProjectionExpression: aws.String("pk, sk, eventSeq, head, #ttl, #ver, #own, #lease, #val, #status"),
+		ExpressionAttributeNames: map[string]string{
+			streamheads.TTLPlaceholder: streamheads.TTLName,
+			"#ver":                     "version",
+			"#own":                     "owner",
+			"#lease":                   "leaseExpiresAt",
+			"#val":                     "value",
+			"#status":                  "status",
+		},
 	}
 
 	if m.cfg.PageSize > 0 {
@@ -705,18 +779,29 @@ func (m *HeadsMigration) scan(ctx context.Context) (map[evt.EntityID]*streamTall
 	}
 
 	now := m.cfg.Now().Unix()
-	tallies := make(map[evt.EntityID]*streamTally)
+	scanned := tableScan{tallies: make(map[evt.EntityID]*streamTally)}
+	reserved := make(map[evt.EntityID]struct{})
 
 	pages := dynamodb.NewScanPaginator(m.repo.client, &input)
 	for pages.HasMorePages() {
 		page, err := pages.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("dynamo: scanning %s for stream heads: %w", m.repo.EventsTable, err)
+			return tableScan{}, fmt.Errorf("dynamo: scanning %s for stream heads: %w", m.repo.EventsTable, err)
 		}
 
 		for _, item := range page.Items {
 			pk, ok := item["pk"].(*types.AttributeValueMemberS)
-			if !ok || evt.IsReservedEntityID(evt.EntityID(pk.Value)) {
+			if !ok {
+				continue
+			}
+
+			id := evt.EntityID(pk.Value)
+
+			if evt.IsReservedEntityID(id) {
+				if ttl, hasTTL := int64Attr(item, "ttl"); !isEngineRow(id, item) && (!hasTTL || ttl >= now) {
+					reserved[id] = struct{}{}
+				}
+
 				continue
 			}
 
@@ -725,19 +810,49 @@ func (m *HeadsMigration) scan(ctx context.Context) (map[evt.EntityID]*streamTall
 				continue
 			}
 
-			id := evt.EntityID(pk.Value)
-
-			tally := tallies[id]
+			tally := scanned.tallies[id]
 			if tally == nil {
 				tally = &streamTally{}
-				tallies[id] = tally
+				scanned.tallies[id] = tally
 			}
 
 			tally.add(sk, item, now)
 		}
 	}
 
-	return tallies, nil
+	scanned.reserved = make([]evt.EntityID, 0, len(reserved))
+	for id := range reserved {
+		scanned.reserved = append(scanned.reserved, id)
+	}
+
+	slices.Sort(scanned.reserved)
+
+	return scanned, nil
+}
+
+// isEngineRow reports whether a reserved-namespace row was written by the engine: the feature
+// marker, the rebuild lock and generation, and command outcomes have stable shapes a user stream
+// cannot accidentally mimic at the same key.
+func isEngineRow(id evt.EntityID, item map[string]types.AttributeValue) bool {
+	sk, ok := int64Attr(item, "sk")
+	if !ok {
+		return false
+	}
+
+	has := func(name string) bool { _, present := item[name]; return present }
+
+	switch {
+	case string(id) == evt.SystemNamespacePrefix+"FEATURES":
+		return sk == 0 && has("version")
+	case string(id) == evt.SystemNamespacePrefix+"REBUILD":
+		return sk == 0 && has("owner") && has("leaseExpiresAt")
+	case string(id) == evt.SystemNamespacePrefix+"REBUILD#GENERATION":
+		return sk == 0 && has("value")
+	case strings.HasPrefix(string(id), evt.CommandOutcomeNamespacePrefix):
+		return sk == 1 && has("status")
+	}
+
+	return false
 }
 
 func sortedStreamIDs(tallies map[evt.EntityID]*streamTally) []evt.EntityID {

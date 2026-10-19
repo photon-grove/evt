@@ -263,9 +263,22 @@ func reportDynamoMigration(
 			b.Streams, verb, b.Written, b.Present, b.Empty, b.ZeroHead, b.Raced, b.MixedTTL)
 	}
 
-	var unverified *evt.HeadsNotVerifiedError
+	var (
+		unverified *evt.HeadsNotVerifiedError
+		reserved   *evt.ReservedStreamsError
+	)
 
 	switch {
+	case errors.As(err, &reserved):
+		printReservedStreams(stderr, reserved.IDs, reserved.Total, flags.maxFindings)
+
+		if report.Declared {
+			sayln(stderr, "migrate-heads: stream-heads WAS declared before this was found; rename them, then run -verify")
+		} else {
+			sayln(stderr, "migrate-heads: stream-heads was NOT declared. Rename (migrate) these streams, then rerun.")
+		}
+
+		return exitFailed
 	case errors.As(err, &unverified):
 		printFindings(stderr, "migrate-heads: "+unverified.Phase+": streams whose head does not match the log",
 			unverified.Findings, unverified.Total, flags.maxFindings)
@@ -306,15 +319,40 @@ func printDynamoVerify(stdout io.Writer, report dynamo.HeadsVerifyReport, limit 
 
 	printFindings(stdout, "migrate-heads: warnings", report.Warnings, len(report.Warnings), limit)
 
-	if report.OK() {
-		sayln(stdout, "migrate-heads: every stream's head matches its log")
+	status := exitOK
 
-		return exitOK
+	if len(report.ReservedStreams) > 0 {
+		printReservedStreams(stdout, report.ReservedStreams, len(report.ReservedStreams), limit)
+
+		status = exitFailed
 	}
 
-	printFindings(stdout, "migrate-heads: streams whose head does not match the log", report.Findings, len(report.Findings), limit)
+	if !report.OK() {
+		printFindings(stdout, "migrate-heads: streams whose head does not match the log", report.Findings, len(report.Findings), limit)
 
-	return exitFailed
+		return exitFailed
+	}
+
+	if status == exitOK {
+		sayln(stdout, "migrate-heads: every stream's head matches its log")
+	}
+
+	return status
+}
+
+// printReservedStreams lists streams that sit in a reserved namespace, which head-aware code hides.
+func printReservedStreams(w io.Writer, ids []evt.EntityID, total, limit int) {
+	say(w, "migrate-heads: %d stream(s) in reserved namespaces (SYSTEM#, command-outcome#) must be renamed before stream heads:\n", total)
+
+	for i, id := range ids {
+		if i >= limit {
+			say(w, "  ... and %d more\n", total-i)
+
+			break
+		}
+
+		say(w, "  %s\n", id)
+	}
 }
 
 func repairDynamo(
@@ -343,17 +381,28 @@ func repairDynamo(
 		verb = "would repair"
 	}
 
-	say(stdout, "migrate-heads: %s %d stream(s); %d raced and were left\n", verb, len(report.Repaired), report.Raced)
+	say(stdout, "migrate-heads: %s %d stream(s); %d write(s) raced and were left\n", verb, len(report.Repaired), report.Raced)
 	printFindings(stdout, "migrate-heads: "+verb, report.Repaired, len(report.Repaired), flags.maxFindings)
+
+	status := exitOK
 
 	if len(report.Left) > 0 {
 		printFindings(stderr, "migrate-heads: left untouched (use -allow-lower for higher heads; an orphan head item needs a manual look)",
 			report.Left, len(report.Left), flags.maxFindings)
 
-		return exitFailed
+		status = exitFailed
 	}
 
-	return exitOK
+	// A write that raced left its stream as it was. The repair re-verified, so it only fails when a
+	// stream still disagrees with its log: rerun it.
+	if len(report.Remaining) > 0 {
+		printFindings(stderr, "migrate-heads: still wrong after writes raced with another writer; rerun the repair",
+			report.Remaining, len(report.Remaining), flags.maxFindings)
+
+		status = exitFailed
+	}
+
+	return status
 }
 
 func migratePostgres(ctx context.Context, flags *migrateHeadsFlags, stdout, stderr io.Writer) int {
@@ -403,9 +452,17 @@ func migratePostgres(ctx context.Context, flags *migrateHeadsFlags, stdout, stde
 		return verifyPostgres(ctx, repo, flags, stdout, stderr)
 	}
 
-	var unverified *evt.HeadsNotVerifiedError
+	var (
+		unverified *evt.HeadsNotVerifiedError
+		reserved   *evt.ReservedStreamsError
+	)
 
 	switch {
+	case errors.As(err, &reserved):
+		printReservedStreams(stderr, reserved.IDs, reserved.Total, flags.maxFindings)
+		sayln(stderr, "migrate-heads: nothing was changed. Rename (migrate) these streams, then rerun.")
+
+		return exitFailed
 	case errors.As(err, &unverified):
 		printFindings(stderr, "migrate-heads: the transaction was aborted and nothing was changed; streams whose head does not match the log",
 			unverified.Findings, unverified.Total, flags.maxFindings)
@@ -440,16 +497,26 @@ func verifyPostgres(ctx context.Context, repo *postgres.Repository, flags *migra
 
 	say(stdout, "migrate-heads: verified %d stream(s)\n", report.Streams)
 
-	if report.OK() {
-		sayln(stdout, "migrate-heads: every stream's head matches its log")
+	status := exitOK
 
-		return exitOK
+	if len(report.ReservedStreams) > 0 {
+		printReservedStreams(stdout, report.ReservedStreams, len(report.ReservedStreams), flags.maxFindings)
+
+		status = exitFailed
 	}
 
-	printFindings(stdout, "migrate-heads: streams whose head does not match the log",
-		report.Findings, int(report.Total), flags.maxFindings)
+	if !report.OK() {
+		printFindings(stdout, "migrate-heads: streams whose head does not match the log",
+			report.Findings, int(report.Total), flags.maxFindings)
 
-	return exitFailed
+		return exitFailed
+	}
+
+	if status == exitOK {
+		sayln(stdout, "migrate-heads: every stream's head matches its log")
+	}
+
+	return status
 }
 
 func repairPostgres(ctx context.Context, repo *postgres.Repository, flags *migrateHeadsFlags, stdout, stderr io.Writer) int {
@@ -469,11 +536,11 @@ func repairPostgres(ctx context.Context, repo *postgres.Repository, flags *migra
 	}
 
 	if report.DryRun {
-		printFindings(stdout, "migrate-heads: would repair", report.Repaired, len(report.Repaired), flags.maxFindings)
+		printFindings(stdout, "migrate-heads: would repair", report.Repaired, int(report.RepairedTotal), flags.maxFindings)
 
-		if len(report.Left) > 0 {
+		if report.LeftTotal > 0 {
 			printFindings(stderr, "migrate-heads: would leave untouched (use -allow-lower for higher heads; an orphan head row needs a manual look)",
-				report.Left, len(report.Left), flags.maxFindings)
+				report.Left, int(report.LeftTotal), flags.maxFindings)
 
 			return exitFailed
 		}
@@ -484,9 +551,9 @@ func repairPostgres(ctx context.Context, repo *postgres.Repository, flags *migra
 	say(stdout, "migrate-heads: inserted %d, raised %d, lowered %d head row(s)\n",
 		report.Inserted, report.Raised, report.Lowered)
 
-	if len(report.Left) > 0 {
+	if report.LeftTotal > 0 {
 		printFindings(stderr, "migrate-heads: left untouched (use -allow-lower for higher heads; an orphan head row needs a manual look)",
-			report.Left, len(report.Left), flags.maxFindings)
+			report.Left, int(report.LeftTotal), flags.maxFindings)
 
 		return exitFailed
 	}

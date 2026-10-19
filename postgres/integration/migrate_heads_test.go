@@ -82,9 +82,6 @@ func (l migrationLog) seed(ctx context.Context, t *testing.T) map[string]int {
 	// A snapshot of an empty stream: the derived head is 0, and head rows start at 1.
 	l.snapshot(ctx, t, "e-empty-snapshot", 1, 0)
 
-	// A legacy stream in a reserved namespace is not a stream.
-	l.event(ctx, t, "SYSTEM#legacy-stream", 1)
-
 	return map[string]int{"a-events-only": 3, "b-snapshot-only": 5, "c-compacted": 6, "d-snapshot-ahead": 9}
 }
 
@@ -558,4 +555,86 @@ func Test_MigrateStreamHeads_DryRunsTakeNoLock(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, tx.Commit(ctx))
+}
+
+// A pre-v0.9 stream whose ID falls in a reserved namespace is hidden from head-aware code, so the
+// migration refuses to backfill or declare around it until it is renamed, and leaves the database
+// as it found it.
+func Test_MigrateStreamHeads_RefusesAStreamInAReservedNamespace(t *testing.T) {
+	ctx := context.Background()
+	log := newMigrationLog(ctx, t)
+	log.seed(ctx, t)
+
+	log.event(ctx, t, "SYSTEM#account", 1)
+	log.snapshot(ctx, t, "command-outcome#legacy", 1, 3)
+
+	for _, dryRun := range []bool{true, false} {
+		_, err := log.repo.MigrateStreamHeads(ctx, postgres.StreamHeadsMigrateOptions{
+			ConfirmWritersStopped: true, DryRun: dryRun,
+		})
+
+		var reserved *evt.ReservedStreamsError
+		require.ErrorAs(t, err, &reserved)
+		require.Equal(t, []evt.EntityID{"SYSTEM#account", "command-outcome#legacy"}, reserved.IDs)
+	}
+
+	require.Empty(t, log.storedHeads(ctx, t))
+	log.requireDeclared(ctx, t, false)
+
+	verified, err := log.repo.VerifyStreamHeads(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []evt.EntityID{"SYSTEM#account", "command-outcome#legacy"}, verified.ReservedStreams)
+
+	// Renamed (here: removed), the migration goes through.
+	_, err = log.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE entity_id = 'SYSTEM#account'`, log.events))
+	require.NoError(t, err)
+
+	_, err = log.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE entity_id = 'command-outcome#legacy'`, log.snapshots))
+	require.NoError(t, err)
+
+	_, err = log.repo.MigrateStreamHeads(ctx, postgres.StreamHeadsMigrateOptions{ConfirmWritersStopped: true})
+	require.NoError(t, err)
+	log.requireDeclared(ctx, t, true)
+}
+
+// The lists in a report are capped at 1000, the classification is not: a higher or orphaned head
+// sorted past the cap is still counted, and a repair dry run still says it would leave it.
+func Test_MigrateStreamHeads_ClassifiesPastTheReportCap(t *testing.T) {
+	ctx := context.Background()
+	log := newMigrationLog(ctx, t)
+
+	// 1,100 streams with no head row sort before the two that matter.
+	_, err := log.pool.Exec(ctx, fmt.Sprintf(
+		`INSERT INTO %s (entity_id, sequence, event_id, event_type, version, entity_type, payload)
+		 SELECT 'm-' || lpad(i::text, 5, '0'), 1, 'e' || i, 't:event', 1, 'scratch', '{}'
+		 FROM generate_series(1, 1100) AS i`, log.events))
+	require.NoError(t, err)
+
+	log.event(ctx, t, "zz-higher", 1)
+	log.setHead(ctx, t, "zz-higher", 5)
+	log.setHead(ctx, t, "zz-orphan", 2)
+
+	verified, err := log.repo.VerifyStreamHeads(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1102), verified.Total)
+	require.Len(t, verified.Findings, 1000, "the list is capped")
+	require.Equal(t, map[evt.HeadFindingKind]int64{
+		evt.HeadMissing: 1100, evt.HeadHigher: 1, evt.HeadOrphan: 1,
+	}, verified.Counts, "the counts are not")
+
+	dry, err := log.repo.RepairStreamHeads(ctx, postgres.StreamHeadsRepairOptions{DryRun: true})
+	require.NoError(t, err)
+	require.Equal(t, int64(1100), dry.RepairedTotal)
+	require.Equal(t, int64(2), dry.LeftTotal, "the higher and the orphaned head are past the capped list")
+
+	dryLower, err := log.repo.RepairStreamHeads(ctx, postgres.StreamHeadsRepairOptions{DryRun: true, AllowLower: true})
+	require.NoError(t, err)
+	require.Equal(t, int64(1101), dryLower.RepairedTotal)
+	require.Equal(t, int64(1), dryLower.LeftTotal)
+
+	repaired, err := log.repo.RepairStreamHeads(ctx, postgres.StreamHeadsRepairOptions{ConfirmWritersStopped: true})
+	require.NoError(t, err)
+	require.Equal(t, int64(1100), repaired.Inserted)
+	require.Equal(t, int64(2), repaired.LeftTotal)
+	require.Len(t, repaired.Left, 2)
 }

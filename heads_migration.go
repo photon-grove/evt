@@ -128,3 +128,42 @@ var ErrHeadsAlreadyDeclared = errors.New("store already declares stream-heads")
 // deny of the migration procedure is the evidence.
 var ErrWritersNotConfirmed = errors.New(
 	"refusing to write head items without confirmation that every writer is stopped")
+
+// ErrReservedStreams matches a ReservedStreamsError with errors.Is.
+var ErrReservedStreams = errors.New("store holds streams in reserved namespaces")
+
+// ReservedStreamsError reports streams (not engine rows) whose entity IDs fall in a reserved
+// namespace (SYSTEM# or command-outcome#). Entity IDs were never restricted before v0.9, but
+// head-aware code hides reserved partitions from enumeration, heads, and rebuild scans, so such a
+// stream must be renamed (migrated) before the v0.9 features are enabled. The migration refuses to
+// backfill or declare over one instead of silently leaving it without a head item.
+type ReservedStreamsError struct {
+	// IDs are the offending entity IDs, sorted. A report may list only the first of them.
+	IDs []EntityID
+
+	// Total is the number of such streams, which can exceed len(IDs).
+	Total int
+}
+
+// Error returns the error message string.
+func (e *ReservedStreamsError) Error() string {
+	shown := e.IDs
+	suffix := ""
+
+	if len(shown) > 5 {
+		shown = shown[:5]
+		suffix = ", ..."
+	}
+
+	names := make([]string, 0, len(shown))
+	for _, id := range shown {
+		names = append(names, string(id))
+	}
+
+	return fmt.Sprintf(
+		"%d stream(s) are in reserved namespaces and must be renamed before enabling stream heads (%s%s)",
+		e.Total, strings.Join(names, ", "), suffix)
+}
+
+// Is makes errors.Is(err, ErrReservedStreams) match.
+func (e *ReservedStreamsError) Is(target error) bool { return target == ErrReservedStreams }

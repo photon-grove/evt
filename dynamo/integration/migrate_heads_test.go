@@ -184,13 +184,15 @@ func seedV08Store(ctx context.Context, t *testing.T, repo *dynamo.Repository) []
 		}},
 	}
 
-	// Engine and legacy rows in the reserved namespaces are not streams.
+	// Engine rows in the reserved namespaces are not streams.
 	reserved := []map[string]types.AttributeValue{
-		v08Event(t, "SYSTEM#legacy-stream", 1, 0),
-		v08Event(t, "SYSTEM#legacy-stream", 2, 0),
 		{
-			"pk": &types.AttributeValueMemberS{Value: "command-outcome#c1"}, "sk": number(0),
+			"pk": &types.AttributeValueMemberS{Value: "command-outcome#c1"}, "sk": number(1),
 			"status": &types.AttributeValueMemberS{Value: "accepted"},
+		},
+		{
+			"pk": &types.AttributeValueMemberS{Value: "SYSTEM#REBUILD"}, "sk": number(0),
+			"owner": &types.AttributeValueMemberS{Value: "job"}, "leaseExpiresAt": number(migrationNow + 60),
 		},
 	}
 
@@ -238,7 +240,7 @@ func requireHeads(ctx context.Context, t *testing.T, repo *dynamo.Repository, st
 		require.Equal(t, stream.headTTL, int64(ttl), "%s head ttl", stream.id)
 	}
 
-	for _, id := range []string{"SYSTEM#legacy-stream", "command-outcome#c1"} {
+	for _, id := range []string{"SYSTEM#REBUILD", "command-outcome#c1"} {
 		_, _, present := storedHead(ctx, t, repo, id)
 		require.False(t, present, "the reserved namespace %s is skipped", id)
 	}
@@ -730,4 +732,112 @@ func Test_MigrateHeads_AnEmptyTableMigrates(t *testing.T) {
 	require.True(t, report.Declared)
 	require.Equal(t, 0, report.Backfill.Streams)
 	requireDeclared(ctx, t, repo, true)
+}
+
+// A pre-v0.9 stream whose ID falls in a reserved namespace is hidden from head-aware code, so the
+// migration refuses to backfill or declare around it until it is renamed.
+func Test_MigrateHeads_RefusesAStreamInAReservedNamespace(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := newIsolatedEventLog(ctx, t)
+	streams := seedV08Store(ctx, t, repo)
+
+	rawPut(ctx, t, repo, v08Event(t, "SYSTEM#account", 1, 0), v08Event(t, "SYSTEM#account", 2, 0))
+
+	for _, dryRun := range []bool{true, false} {
+		_, err := migrationFor(repo, nil).Migrate(ctx, dynamo.HeadsMigrateOptions{ConfirmWritersStopped: true, DryRun: dryRun})
+
+		var reserved *evt.ReservedStreamsError
+		require.ErrorAs(t, err, &reserved)
+		require.Equal(t, []evt.EntityID{"SYSTEM#account"}, reserved.IDs)
+	}
+
+	for _, stream := range streams {
+		_, _, present := storedHead(ctx, t, repo, stream.id)
+		require.False(t, present, "nothing is written before the refusal: %s", stream.id)
+	}
+
+	requireDeclared(ctx, t, repo, false)
+
+	verified, err := migrationFor(repo, nil).Verify(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []evt.EntityID{"SYSTEM#account"}, verified.ReservedStreams)
+
+	// A stream appearing between the verifications also stops the declaration.
+	_, err = repoClient().DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(repo.EventsTable),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "SYSTEM#account"}, "sk": number(1)},
+	})
+	require.NoError(t, err)
+
+	_, err = repoClient().DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(repo.EventsTable),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "SYSTEM#account"}, "sk": number(2)},
+	})
+	require.NoError(t, err)
+
+	_, err = migrationFor(repo, func(phase dynamo.HeadsMigrationPhase) {
+		if phase == dynamo.PhaseVerifyBeforeDeclare {
+			rawPut(ctx, t, repo, v08Event(t, "SYSTEM#late", 1, 0))
+		}
+	}).Migrate(ctx, dynamo.HeadsMigrateOptions{ConfirmWritersStopped: true})
+	require.ErrorIs(t, err, evt.ErrReservedStreams)
+	requireDeclared(ctx, t, repo, false)
+}
+
+// refreshingClient raises a head item's ttl without moving its head just before the repair's own
+// write to it, as a head-aware writer's out-of-band snapshot write does.
+type refreshingClient struct {
+	dynamo.Client
+	ctx   context.Context
+	table string
+	id    string
+	ttl   int64
+}
+
+func (c *refreshingClient) UpdateItem(
+	ctx context.Context,
+	params *dynamodb.UpdateItemInput,
+	options ...func(*dynamodb.Options),
+) (*dynamodb.UpdateItemOutput, error) {
+	if params.Key["pk"].(*types.AttributeValueMemberS).Value == c.id { //nolint:errcheck // the key is the test's own
+		_, err := c.PutItem(c.ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(c.table),
+			Item: map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: c.id}, "sk": number(-1), "head": number(3), "ttl": number(c.ttl),
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return c.Client.UpdateItem(ctx, params, options...)
+}
+
+// A repair that raises a head ttl never overwrites a larger one a writer set in the meantime.
+func Test_MigrateHeads_RepairNeverLowersAConcurrentlyRefreshedTTL(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := newIsolatedEventLog(ctx, t)
+	seedV08Store(ctx, t, repo)
+
+	_, err := migrationFor(repo, nil).Migrate(ctx, dynamo.HeadsMigrateOptions{ConfirmWritersStopped: true})
+	require.NoError(t, err)
+
+	// f-retained needs a head ttl of now+300; its head item has a smaller one.
+	rawSetHead(ctx, t, repo, "f-retained", 3, migrationNow+10)
+
+	refreshed := int64(migrationNow + 9000)
+	racing := dynamo.NewRepository(&refreshingClient{
+		Client: repoClient(), ctx: ctx, table: repo.EventsTable, id: "f-retained", ttl: refreshed,
+	}, repo.EventsTable).HeadsMigration(dynamo.HeadsMigrationConfig{Concurrency: 1, Now: migrationClock})
+
+	report, err := racing.Repair(ctx, dynamo.HeadsRepairOptions{ConfirmWritersStopped: true})
+	require.NoError(t, err)
+	require.Equal(t, 1, report.Raced, "the repair's write lost its condition on the ttl it had seen")
+	require.Empty(t, report.Remaining, "the larger ttl satisfies the stream, so nothing is left to repair")
+
+	head, ttl, present := storedHead(ctx, t, repo, "f-retained")
+	require.True(t, present)
+	require.Equal(t, 3, head)
+	require.Equal(t, int(refreshed), ttl, "the writer's larger ttl survived the repair")
 }

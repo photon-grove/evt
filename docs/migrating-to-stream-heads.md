@@ -140,6 +140,12 @@ The summary line counts these as "without a ttl because their items mix ttls".
 - a table whose feature marker declares `journal` (or any feature the Go tool does not model; the
   Rust-first extensions keep rows it would misread): `store declares unsupported features`;
 - a run without `-confirm-writers-stopped`;
+- a store holding a **stream in a reserved namespace** (an entity ID starting `SYSTEM#` or
+  `command-outcome#` that is not an engine row; entity IDs were never restricted before v0.9).
+  Head-aware code hides those partitions from enumeration, heads, and rebuild scans, so the stream
+  would be left without a head item under a declaration. Rename (migrate) it first, the same upgrade
+  step the plain `evt-doctor` reserved-namespace check asks for, and rerun. The check runs again
+  before the declaration, and `-verify` and `-dry-run` report it too;
 - a store that already declares `stream-heads`: there is nothing to migrate, so the command verifies the store instead
   and exits with the verification's status (rerunning after an interruption that came after the declaration ends here).
 
@@ -187,12 +193,17 @@ evt-doctor migrate-heads -repair -allow-lower -confirm-writers-stopped -events-t
 ```
 
 `-repair` raises a low head, creates a missing one, and fixes a low `ttl`, each write conditioned on
-the head it observed (`head = :observed`), so a head that changed since the scan is left for the next
-run. `-allow-lower` also writes `SET head = :derived` for a head above the derived value. Lowering
+the head it observed (`head = :observed`), and, when it changes the `ttl`, on the `ttl` it observed
+too, so a head or `ttl` that changed since the scan (a writer refreshed the `ttl` without moving the
+head) is never overwritten. A write that loses its condition is left alone and counted as raced; the
+repair then verifies again and exits 1 if any stream still disagrees with its log, so rerun it. `-allow-lower` also writes `SET head = :derived` for a head above the derived value. Lowering
 breaks the rule that a head never decreases, which is why it needs every writer stopped: an
 in-flight fence reads the head. A plain `-repair` never lowers anything. Both modes take
 `-dry-run`. Repair does not declare the feature; rerun the migration afterwards if the store is not
 declared yet.
+
+On PostgreSQL the lists in a report are capped at 1000 entries, but the counts behind the exit
+status are not: a finding past the cap still fails `-verify` and a repair dry run.
 
 A plain `evt-doctor` run (no subcommand) reports head drift too, once the store declares
 `stream-heads`: a head below, above, or missing, a `ttl` that is too low, and an orphan head item

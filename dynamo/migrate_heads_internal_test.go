@@ -290,7 +290,7 @@ func TestScanAccumulatesAPartitionSplitAcrossPages(t *testing.T) {
 	client := &pagedScan{pageSize: 2, items: []map[string]types.AttributeValue{
 		tallyItem("a", 1, nil), tallyItem("b", 0, map[string]int64{"eventSeq": 7}),
 		tallyItem("a", 2, nil), tallyItem("b", 8, nil),
-		tallyItem("a", 3, nil), tallyItem("SYSTEM#FEATURES", 0, nil),
+		tallyItem("a", 3, nil), tallyItem("SYSTEM#FEATURES", 0, map[string]int64{"version": 1}),
 		tallyItem("b", 9, nil),
 	}}
 
@@ -298,9 +298,12 @@ func TestScanAccumulatesAPartitionSplitAcrossPages(t *testing.T) {
 		PageSize: 2, Now: func() time.Time { return time.Unix(tallyNow, 0) },
 	})
 
-	tallies, err := migration.scan(context.Background())
+	scanned, err := migration.scan(context.Background())
 	require.NoError(t, err)
+
+	tallies := scanned.tallies
 	require.Len(t, tallies, 2, "the reserved partition is skipped")
+	require.Empty(t, scanned.reserved, "the feature marker is an engine row")
 	require.Equal(t, evt.EventSequence(3), tallies["a"].derived())
 	require.Equal(t, evt.EventSequence(9), tallies["b"].derived())
 	require.Equal(t, 3, tallies["a"].live)
@@ -374,12 +377,22 @@ func TestRepairWritesAreConditionedOnTheObservedHead(t *testing.T) {
 	require.Equal(t, "head = :observed", *lower.ConditionExpression)
 	require.Equal(t, map[string]types.AttributeValue{":last": n(2), ":observed": n(1)}, lower.ExpressionAttributeValues)
 
+	// A write that changes the ttl is conditioned on the ttl it saw, so a refresh by a head-aware
+	// writer in between is never overwritten by a smaller value.
+	require.Equal(t, "head = :observed", *byKey["lower"].ConditionExpression)
+
 	slow := byKey["slow"]
 	require.Equal(t, "SET head = :last, #ttl = :t", *slow.UpdateExpression)
-	require.Equal(t, map[string]types.AttributeValue{":last": n(1), ":t": n(7000), ":observed": n(1)}, slow.ExpressionAttributeValues)
+	require.Equal(t, "head = :observed AND #ttl = :observedTtl", *slow.ConditionExpression)
+	require.Equal(t, map[string]types.AttributeValue{
+		":last": n(1), ":t": n(7000), ":observed": n(1), ":observedTtl": n(2000),
+	}, slow.ExpressionAttributeValues)
+	require.Equal(t, map[string]string{"#ttl": "ttl"}, slow.ExpressionAttributeNames)
 
 	immortal := byKey["immortal"]
 	require.Equal(t, "SET head = :last REMOVE #ttl", *immortal.UpdateExpression)
+	require.Equal(t, "head = :observed AND #ttl = :observedTtl", *immortal.ConditionExpression)
+	require.Equal(t, n(2000), immortal.ExpressionAttributeValues[":observedTtl"])
 	require.Equal(t, map[string]string{"#ttl": "ttl"}, immortal.ExpressionAttributeNames)
 
 	client.updates = nil
@@ -482,4 +495,76 @@ func TestEveryReadIsStronglyConsistent(t *testing.T) {
 	require.Error(t, err, "the fake never persists the heads it is asked to write")
 
 	require.Empty(t, client.unreadable)
+}
+
+// A repair write that lost its condition leaves its stream as it was. The repair looks again: a
+// stream someone else fixed meanwhile is not reported, one that still disagrees is.
+func TestARacedRepairReVerifies(t *testing.T) {
+	items := []map[string]types.AttributeValue{
+		tallyItem("fixed-elsewhere", 1, nil), tallyItem("fixed-elsewhere", 2, nil),
+		tallyItem("fixed-elsewhere", -1, map[string]int64{"head": 1}),
+		tallyItem("still-wrong", 1, nil), tallyItem("still-wrong", 2, nil),
+		tallyItem("still-wrong", -1, map[string]int64{"head": 1}),
+	}
+
+	client := &pagedScan{pageSize: 100, items: items}
+	client.updateErr = func(input *dynamodb.UpdateItemInput) error {
+		if input.Key["pk"].(*types.AttributeValueMemberS).Value == "fixed-elsewhere" { //nolint:errcheck // the test controls the key
+			// The other writer raised the head; the next scan sees it.
+			client.items[2] = tallyItem("fixed-elsewhere", -1, map[string]int64{"head": 2})
+		}
+
+		return &types.ConditionalCheckFailedException{}
+	}
+
+	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{Concurrency: 1})
+
+	report, err := migration.Repair(context.Background(), HeadsRepairOptions{ConfirmWritersStopped: true})
+	require.NoError(t, err)
+	require.Equal(t, 2, report.Raced)
+	require.Len(t, report.Remaining, 1)
+	require.Equal(t, evt.EntityID("still-wrong"), report.Remaining[0].EntityID)
+
+	// Without a race there is nothing to look at again.
+	client.updateErr = nil
+
+	report, err = migration.Repair(context.Background(), HeadsRepairOptions{ConfirmWritersStopped: true})
+	require.NoError(t, err)
+	require.Zero(t, report.Raced)
+	require.Empty(t, report.Remaining)
+}
+
+// A stream in a reserved namespace is invisible to head-aware code, so the migration stops before
+// writing anything; engine rows are not streams.
+func TestReservedStreamsStopTheMigrationBeforeAnyWrite(t *testing.T) {
+	client := &pagedScan{pageSize: 100, items: []map[string]types.AttributeValue{
+		tallyItem("a", 1, nil),
+		tallyItem("SYSTEM#FEATURES", 0, map[string]int64{"version": 3}),
+		tallyItem("command-outcome#c1", 1, map[string]int64{"status": 1}),
+		tallyItem("SYSTEM#account", 1, nil),
+		tallyItem("SYSTEM#account", 2, nil),
+		tallyItem("command-outcome#legacy", 1, nil),
+		tallyItem("SYSTEM#expired", 1, map[string]int64{"ttl": 5}),
+	}}
+
+	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{
+		Now: func() time.Time { return time.Unix(tallyNow, 0) },
+	})
+
+	for _, dryRun := range []bool{true, false} {
+		_, err := migration.Migrate(context.Background(), HeadsMigrateOptions{ConfirmWritersStopped: true, DryRun: dryRun})
+
+		var reserved *evt.ReservedStreamsError
+		require.ErrorAs(t, err, &reserved)
+		require.ErrorIs(t, err, evt.ErrReservedStreams)
+		require.Equal(t, []evt.EntityID{"SYSTEM#account", "command-outcome#legacy"}, reserved.IDs)
+		require.Equal(t, 2, reserved.Total)
+	}
+
+	require.Empty(t, client.updates)
+	require.Zero(t, client.puts)
+
+	report, err := migration.Verify(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []evt.EntityID{"SYSTEM#account", "command-outcome#legacy"}, report.ReservedStreams)
 }

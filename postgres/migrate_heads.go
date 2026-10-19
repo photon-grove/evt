@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 
@@ -68,8 +69,14 @@ type StreamHeadsVerifyReport struct {
 	Streams int64
 
 	// Total is the number of failing streams; Findings lists up to the first 1000, by entity ID.
+	// Counts breaks Total down by kind, without the cap.
 	Total    int64
+	Counts   map[evt.HeadFindingKind]int64
 	Findings []evt.HeadFinding
+
+	// ReservedStreams are streams in a reserved namespace (SYSTEM# or command-outcome#). Head-aware
+	// code hides them, so they must be renamed first: the migration refuses while any exists.
+	ReservedStreams []evt.EntityID
 }
 
 // OK reports whether every stream passed.
@@ -85,11 +92,17 @@ type StreamHeadsRepairReport struct {
 	Raised   int64
 	Lowered  int64
 
-	// Repaired lists, in a dry run, the findings the repair would fix. It is empty otherwise.
+	// RepairedTotal and LeftTotal count, without the cap on the lists below, the findings a dry run
+	// would fix, and the findings the repair did not (or, in a dry run, would not) fix.
+	RepairedTotal int64
+	LeftTotal     int64
+
+	// Repaired lists, in a dry run, up to the first 1000 findings the repair would fix. It is empty
+	// otherwise.
 	Repaired []evt.HeadFinding
 
-	// Left are the findings the repair did not fix: a higher head without AllowLower, and a head
-	// row with no events or snapshot to derive from.
+	// Left lists up to the first 1000 findings the repair did not fix: a higher head without
+	// AllowLower, and a head row with no events or snapshot to derive from.
 	Left []evt.HeadFinding
 }
 
@@ -240,7 +253,104 @@ LIMIT %d`, heads, maxReportedHeadFindings))
 		return report, fmt.Errorf("postgres: verifying stream heads: %w", err)
 	}
 
-	return report, nil
+	rows.Close()
+
+	// The list is capped, so the classification totals come from their own aggregate.
+	report.Counts, err = repo.countHeadFindings(ctx, tx, heads)
+	if err != nil {
+		return report, err
+	}
+
+	report.ReservedStreams, err = repo.reservedStreams(ctx, tx)
+
+	return report, err
+}
+
+// countHeadFindings counts the failing streams of each kind, with no cap.
+func (repo *Repository) countHeadFindings(
+	ctx context.Context,
+	tx pgx.Tx,
+	heads string,
+) (map[evt.HeadFindingKind]int64, error) {
+	rows, err := tx.Query(ctx, repo.derivedHeadsCTE()+fmt.Sprintf(`
+SELECT kind, count(*) FROM (
+    SELECT CASE WHEN d.entity_id IS NULL THEN '%s'
+                WHEN h.entity_id IS NULL THEN '%s'
+                WHEN h.head < d.head THEN '%s'
+                ELSE '%s' END AS kind
+    FROM (SELECT * FROM derived WHERE head >= 1) d
+    FULL OUTER JOIN %s h ON h.entity_id = d.entity_id
+    WHERE d.entity_id IS NULL OR h.entity_id IS NULL OR h.head <> d.head
+) kinds GROUP BY kind`, evt.HeadOrphan, evt.HeadMissing, evt.HeadLower, evt.HeadHigher, heads))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: counting stream head findings: %w", err)
+	}
+	defer rows.Close()
+
+	counts := map[evt.HeadFindingKind]int64{}
+
+	for rows.Next() {
+		var (
+			kind  string
+			count int64
+		)
+
+		if err = rows.Scan(&kind, &count); err != nil {
+			return nil, fmt.Errorf("postgres: reading stream head finding counts: %w", err)
+		}
+
+		counts[evt.HeadFindingKind(kind)] = count
+	}
+
+	return counts, rows.Err()
+}
+
+// reservedStreams runs the storage spec's two reserved-namespace queries against the events and
+// snapshots tables (engine rows live in their own relations, so they never appear) and returns the
+// entity IDs they report, sorted. Such a stream is hidden from enumeration, heads, and rebuild scans
+// once the head-aware features are on, so it must be renamed before the migration.
+func (repo *Repository) reservedStreams(ctx context.Context, db DB) ([]evt.EntityID, error) {
+	seen := map[evt.EntityID]struct{}{}
+
+	for _, table := range []string{repo.eventsTable, repo.snapshotsTable} {
+		rows, err := db.Query(ctx, fmt.Sprintf(
+			`SELECT DISTINCT entity_id FROM %s WHERE entity_id LIKE 'SYSTEM#%%' OR entity_id LIKE 'command-outcome#%%'`,
+			table))
+		if err != nil {
+			return nil, fmt.Errorf("postgres: checking %s for reserved-namespace streams: %w", table, err)
+		}
+
+		for rows.Next() {
+			var id evt.EntityID
+			if err = rows.Scan(&id); err != nil {
+				rows.Close()
+
+				return nil, fmt.Errorf("postgres: reading a reserved-namespace stream: %w", err)
+			}
+
+			seen[id] = struct{}{}
+		}
+
+		err = rows.Err()
+		rows.Close()
+
+		if err != nil {
+			return nil, fmt.Errorf("postgres: checking %s for reserved-namespace streams: %w", table, err)
+		}
+	}
+
+	ids := make([]evt.EntityID, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+
+	slices.Sort(ids)
+
+	return ids, nil
+}
+
+func reservedStreamsError(ids []evt.EntityID) error {
+	return &evt.ReservedStreamsError{IDs: ids[:min(len(ids), 100)], Total: len(ids)}
 }
 
 // headFinding classifies one mismatch from the stored head row and the derived head (nil: absent).
@@ -333,6 +443,16 @@ func (repo *Repository) migrateInTx(
 		return err
 	}
 
+	// Checked under the locks, so none appears between this look and the declaration.
+	reserved, err := repo.reservedStreams(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	if len(reserved) > 0 {
+		return reservedStreamsError(reserved)
+	}
+
 	tag, err := tx.Exec(ctx, repo.derivedHeadsCTE()+fmt.Sprintf(`
 INSERT INTO %s (entity_id, entity_type, head)
 SELECT entity_id, entity_type, head FROM derived WHERE head >= 1
@@ -371,6 +491,15 @@ func (repo *Repository) countMigrationInTx(ctx context.Context, tx pgx.Tx, repor
 
 	if manifest != nil && manifest.DeclaresStreamHeads() {
 		return evt.ErrHeadsAlreadyDeclared
+	}
+
+	reserved, err := repo.reservedStreams(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	if len(reserved) > 0 {
+		return reservedStreamsError(reserved)
 	}
 
 	heads, err := repo.headsRelation(ctx, tx)
@@ -446,6 +575,11 @@ func (repo *Repository) RepairStreamHeads(
 	return report, err
 }
 
+// repairs reports whether a repair fixes a finding of the kind.
+func repairs(kind evt.HeadFindingKind, allowLower bool) bool {
+	return kind == evt.HeadMissing || kind == evt.HeadLower || (kind == evt.HeadHigher && allowLower)
+}
+
 // planRepairInTx is the dry run of a repair: it sorts the findings into those a repair would fix
 // and those it would leave, from one read-only snapshot.
 func (repo *Repository) planRepairInTx(
@@ -469,13 +603,19 @@ func (repo *Repository) planRepairInTx(
 	}
 
 	for _, finding := range verified.Findings {
-		fixable := finding.Kind == evt.HeadMissing || finding.Kind == evt.HeadLower ||
-			(finding.Kind == evt.HeadHigher && opts.AllowLower)
-
-		if fixable {
+		if repairs(finding.Kind, opts.AllowLower) {
 			report.Repaired = append(report.Repaired, finding)
 		} else {
 			report.Left = append(report.Left, finding)
+		}
+	}
+
+	// The lists above are capped; the totals are not.
+	for kind, count := range verified.Counts {
+		if repairs(kind, opts.AllowLower) {
+			report.RepairedTotal += count
+		} else {
+			report.LeftTotal += count
 		}
 	}
 
@@ -519,7 +659,7 @@ WHERE h.entity_id = d.entity_id AND d.head >= 1 AND h.head > d.head`, heads))
 	}
 
 	remaining, err := repo.verifyStreamHeads(ctx, tx)
-	report.Left = remaining.Findings
+	report.Left, report.LeftTotal = remaining.Findings, remaining.Total
 
 	return err
 }

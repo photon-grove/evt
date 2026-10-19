@@ -2060,7 +2060,9 @@ release in which old and new writers coexist, and it is one-way. The procedure, 
    `evt-doctor`, every Streams, ESM, or Pipes consumer with the filter), before any head item
    exists. The backfill emits `sk = -1` stream records.
 3. **Backfill.** `evt-doctor migrate-heads` refuses a table whose marker declares `journal` or any
-   feature the tool does not model. It scans the table (an explicit migration scan, projecting `pk`,
+   feature the tool does not model, and a store that holds a stream in a [reserved
+   namespace](#reserved-namespaces) (such a stream must be renamed first; head-aware code hides it, so
+   the tool neither backfills around it nor declares over it, and checks again before declaring). It scans the table (an explicit migration scan, projecting `pk`,
    `sk`, `eventSeq`, `ttl`), accumulating per partition across the whole scan (a partition split by
    a page boundary is finalized when the scan ends). It ignores items whose `ttl` has passed but
    which are not yet deleted, and skips a partition with nothing left. For each remaining partition

@@ -20,6 +20,9 @@ type fakeDynamo struct {
 	scan    string
 	updates int
 	puts    int
+
+	// conflict makes every UpdateItem lose its condition.
+	conflict bool
 }
 
 func (f *fakeDynamo) serve(t *testing.T) *httptest.Server {
@@ -43,6 +46,13 @@ func (f *fakeDynamo) serve(t *testing.T) *httptest.Server {
 			writeDynamoJSON(t, w, http.StatusOK, f.scan)
 		case "UpdateItem":
 			f.updates++
+
+			if f.conflict {
+				writeDynamoJSON(t, w, http.StatusBadRequest,
+					`{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"raced"}`)
+
+				return
+			}
 
 			writeDynamoJSON(t, w, http.StatusOK, `{}`)
 		case "PutItem":
@@ -276,5 +286,39 @@ func TestMigrateHeadsRejectsStrayArguments(t *testing.T) {
 	_, stderr, status := migrateHeads(t, "-endpoint", server.URL, "-verify", "oops")
 	if status != exitUsage || !strings.Contains(stderr, "takes flags only") {
 		t.Fatalf("status=%d stderr=%q", status, stderr)
+	}
+}
+
+// A repair whose writes lost their conditions repaired nothing; it must not report success while
+// the streams still disagree with their logs.
+func TestMigrateHeadsRepairFailsWhenWritesRaceAndDriftRemains(t *testing.T) {
+	lower := `{"Items":[{"pk":{"S":"a"},"sk":{"N":"1"}},{"pk":{"S":"a"},"sk":{"N":"2"}},{"pk":{"S":"a"},"sk":{"N":"-1"},"head":{"N":"1"}}]}`
+
+	fake := &fakeDynamo{scan: lower, conflict: true}
+	server := fake.serve(t)
+
+	stdout, stderr, status := migrateHeads(t, "-endpoint", server.URL, "-region", "us-west-2", "-repair", "-confirm-writers-stopped")
+	if status != exitFailed || !strings.Contains(stdout, "1 write(s) raced") ||
+		!strings.Contains(stderr, "still wrong after writes raced") || !strings.Contains(stderr, "a: head 1 is lower") {
+		t.Fatalf("status=%d stdout=%q stderr=%q", status, stdout, stderr)
+	}
+}
+
+func TestMigrateHeadsRefusesReservedNamespaceStreams(t *testing.T) {
+	scan := `{"Items":[{"pk":{"S":"a"},"sk":{"N":"1"}},{"pk":{"S":"SYSTEM#account"},"sk":{"N":"1"}}]}`
+
+	for _, args := range [][]string{{"-confirm-writers-stopped"}, {"-dry-run"}, {"-verify"}} {
+		fake := &fakeDynamo{scan: scan}
+		server := fake.serve(t)
+
+		stdout, stderr, status := migrateHeads(t, append([]string{"-endpoint", server.URL, "-region", "us-west-2"}, args...)...)
+		if status != exitFailed || !strings.Contains(stdout+stderr, "SYSTEM#account") ||
+			!strings.Contains(stdout+stderr, "must be renamed") {
+			t.Fatalf("%v: status=%d stdout=%q stderr=%q", args, status, stdout, stderr)
+		}
+
+		if fake.updates != 0 || fake.puts != 0 {
+			t.Fatalf("%v: wrote %d updates and %d puts", args, fake.updates, fake.puts)
+		}
 	}
 }
