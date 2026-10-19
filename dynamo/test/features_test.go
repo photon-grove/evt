@@ -133,6 +133,8 @@ func (s *FeatureMarkerSuite) Test_Commit_IncludesMarkerCheck() {
 	expectManifest(client, nil)
 	expectScan(client, "SYSTEM#REBUILD")
 	expectManifest(client, nil)
+	// The declaration is followed by a second look at the store, for a stream without a head item.
+	expectScan(client, "SYSTEM#REBUILD")
 
 	var declared *dynamodb.PutItemInput
 	client.On("PutItem", mock.Anything, mock.Anything, mock.Anything).

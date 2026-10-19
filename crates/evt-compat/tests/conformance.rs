@@ -260,6 +260,121 @@ async fn create_dynamo_table(client: &aws_sdk_dynamodb::Client, name: &str) {
         .expect("create the table");
 }
 
+/// Writes a stream with no head item just before the first `PutItem` a client sends (the marker's
+/// declaration), as a writer that never reads the feature marker committing between the empty-table
+/// check and the declaration.
+#[derive(Debug)]
+struct HeadlessAfterDeclare {
+    fired: AtomicBool,
+    raw: DynamoHeads,
+    event: SerializedEvent,
+}
+
+impl aws_sdk_dynamodb::config::Intercept for HeadlessAfterDeclare {
+    fn name(&self) -> &'static str {
+        "HeadlessAfterDeclare"
+    }
+
+    fn read_before_transmit(
+        &self,
+        context: &aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+        _runtime_components: &aws_sdk_dynamodb::config::RuntimeComponents,
+        _cfg: &mut aws_sdk_dynamodb::config::ConfigBag,
+    ) -> Result<(), BoxError> {
+        let is_put_item = context
+            .request()
+            .headers()
+            .get("x-amz-target")
+            .is_some_and(|target| target.ends_with(".PutItem"));
+
+        if is_put_item && !self.fired.swap(true, Ordering::SeqCst) {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    HeadFixtures::<DynamoRepository>::append_bypassing_head(&self.raw, &self.event),
+                )
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
+/// The empty-table check and the declaration are two steps, and a writer that never reads the
+/// marker can commit a stream between them. The declaration is committed first and the table is
+/// looked at again afterward: a stream with no head item retracts the declaration and the table
+/// is refused, rather than being left declared over a stream the heads cannot guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_retracts_a_declaration_over_a_headless_stream() {
+    let client = drivers::dynamo_client().await;
+    let table = format!(
+        "evt-window-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    create_dynamo_table(&client, &table).await;
+
+    let id = EntityId::new("early-stream");
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: Ledger::TYPE.into(),
+        payload: br#"{"amount":1}"#.to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    let config = client
+        .config()
+        .to_builder()
+        .interceptor(HeadlessAfterDeclare {
+            fired: AtomicBool::new(false),
+            raw: DynamoHeads::new(client.clone(), table.clone()),
+            event,
+        })
+        .build();
+    let writer = DynamoRepository::new(aws_sdk_dynamodb::Client::from_conf(config), &table);
+
+    let late = SerializedEvent {
+        id: EventId::for_event(&EntityId::new("late-stream"), EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: EntityId::new("late-stream"),
+        entity_type: Ledger::TYPE.into(),
+        payload: br#"{"amount":2}"#.to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    let error = writer
+        .commit(Commit::new("late-stream", vec![late]))
+        .await
+        .expect_err("the table held a headless stream");
+    assert!(
+        matches!(error, Error::StreamHeadsNotMigrated),
+        "refused as unmigrated, got {error:?}"
+    );
+
+    let manifest = DynamoRepository::new(client.clone(), &table)
+        .read_manifest()
+        .await
+        .unwrap()
+        .expect("the retraction leaves a manifest");
+    assert!(
+        !manifest.declares_stream_heads(),
+        "the declaration is retracted"
+    );
+
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .unwrap();
+}
+
 /// A clock in the past, so the `ttl`s it stamps have already expired by the time anything reads.
 fn long_ago() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_700_000_000)

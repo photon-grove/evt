@@ -42,6 +42,44 @@ pub const MAX_TRANSACTION_ITEMS: usize = 100;
 /// changing under the writer can exhaust it.
 const MAX_MARKER_REVALIDATIONS: usize = 8;
 
+/// How often an out-of-band snapshot write re-sends its head guard after a concurrent writer moved
+/// the head item under it.
+const MAX_SNAPSHOT_GUARD_RETRIES: usize = 4;
+
+/// What a failed snapshot head guard should do next, given the head item read back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardRetry {
+    /// The head covers the snapshot but carries a lower (or no) `ttl` than the snapshot's: send
+    /// the refreshing guard again.
+    Refresh,
+    /// The head covers the snapshot and its `ttl` is already at least the snapshot's: a plain
+    /// check is enough.
+    Cover,
+    /// The head is absent or behind the snapshot: drift.
+    Drift,
+}
+
+/// Decides the retry after a refreshing guard failed. The guard fails on either of its two
+/// conditions, and a head that was behind when it failed may have been advanced by a concurrent
+/// writer with a shorter `ttl` since, so only the stored `ttl` says whether the refresh is still
+/// needed.
+fn snapshot_guard_retry(
+    stored: Option<(EventSequence, Option<i64>)>,
+    snapshot: EventSequence,
+    ttl: Option<i64>,
+) -> GuardRetry {
+    match stored {
+        Some((head, head_ttl)) if head >= snapshot => {
+            if ttl.is_some_and(|ttl| head_ttl.is_none_or(|head_ttl| head_ttl < ttl)) {
+                GuardRetry::Refresh
+            } else {
+                GuardRetry::Cover
+            }
+        }
+        _ => GuardRetry::Drift,
+    }
+}
+
 /// How many times a manifest declaration retries its conditional write when another declaration
 /// changed the row first.
 const MAX_DECLARATION_RETRIES: usize = 8;
@@ -263,12 +301,84 @@ impl DynamoRepository {
     /// Declares `stream-heads` on a table with no data: a strongly consistent scan must find no
     /// item outside the reserved namespaces, or the table is refused with
     /// [`Error::StreamHeadsNotMigrated`].
+    ///
+    /// The scan and the declaration are two steps, and no transaction can exclude a writer that
+    /// never reads the marker, so the order does the work: the declaration is committed first,
+    /// which makes every marker-reading writer fail its per-commit check or refuse the table from
+    /// then on, and only then is the table looked at once more. A stream such a writer committed
+    /// before the declaration is durable by then, so the second look sees it. A stream with no
+    /// head item means the table was not fresh after all: the declaration is retracted (a new
+    /// manifest version, so every cached validation is dropped) and the table is refused. Streams
+    /// other head-aware writers created in the meantime have a head item and are no reason to
+    /// retract.
     async fn declare_on_empty_table(&self) -> Result<(), Error> {
         if self.holds_stream_data().await? {
             return Err(Error::StreamHeadsNotMigrated);
         }
 
-        self.declare_stream_heads().await
+        self.declare_stream_heads().await?;
+
+        if self.holds_headless_stream().await? {
+            self.update_manifest(|manifest| {
+                manifest
+                    .features
+                    .remove(crate::features::STREAM_HEADS_FEATURE);
+            })
+            .await?;
+
+            return Err(Error::StreamHeadsNotMigrated);
+        }
+
+        Ok(())
+    }
+
+    /// Reports whether any stream in the table has items but no head item. A scan is not atomic
+    /// across items, so a stream that looks headless is confirmed with a strongly consistent read
+    /// of its head item before it counts.
+    async fn holds_headless_stream(&self) -> Result<bool, Error> {
+        let mut streams = std::collections::BTreeSet::new();
+        let mut headed = std::collections::BTreeSet::new();
+        let mut start = None;
+
+        loop {
+            let page = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .consistent_read(true)
+                .projection_expression("pk, sk")
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(sdk_error)?;
+
+            for item in page.items() {
+                let Some(sdk::AttributeValue::S(pk)) = item.get("pk") else {
+                    continue;
+                };
+                if pk.starts_with(SYSTEM_PREFIX) || pk.starts_with(COMMAND_OUTCOME_PREFIX) {
+                    continue;
+                }
+
+                streams.insert(pk.clone());
+                if matches!(item.get("sk"), Some(sdk::AttributeValue::N(sk)) if sk == "-1") {
+                    headed.insert(pk.clone());
+                }
+            }
+
+            match page.last_evaluated_key {
+                Some(key) if !key.is_empty() => start = Some(key),
+                _ => break,
+            }
+        }
+
+        for pk in streams.difference(&headed) {
+            if self.read_head(&EntityId::new(pk.as_str())).await?.is_none() {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Reports whether the table holds any item outside the reserved namespaces, with a strongly
@@ -678,6 +788,15 @@ impl DynamoRepository {
     /// `None` when the stream has no head item. The `ttl` is remembered for the stream's next
     /// head update.
     async fn read_head(&self, entity_id: &EntityId) -> Result<Option<EventSequence>, Error> {
+        Ok(self.read_head_item(entity_id).await?.map(|(head, _)| head))
+    }
+
+    /// The stream's head item read with a strongly consistent `GetItem`: its `head` and its `ttl`
+    /// (`None` for an item with no `ttl`), or `None` when there is no head item.
+    async fn read_head_item(
+        &self,
+        entity_id: &EntityId,
+    ) -> Result<Option<(EventSequence, Option<i64>)>, Error> {
         let output = self
             .client
             .get_item()
@@ -698,9 +817,7 @@ impl DynamoRepository {
             self.note_ttl(entity_id, ttl);
         }
 
-        let (head, _) = wire::head_from_item(&item)?;
-
-        Ok(Some(head))
+        wire::head_from_item(&item).map(Some)
     }
 
     /// Reports whether every item remaining in a stream (its snapshot, and the events from
@@ -831,7 +948,7 @@ impl DynamoRepository {
     fn snapshot_parts(
         &self,
         snapshot: &SerializedSnapshot,
-    ) -> Result<(HeadAction, TransactWriteItem), Error> {
+    ) -> Result<(HeadAction, TransactWriteItem, Option<i64>), Error> {
         let ttl = self.ttl_for(&snapshot.entity_type);
         let item = wire::snapshot_item(snapshot, ttl)?;
         let snapshot_put = put(
@@ -844,6 +961,7 @@ impl DynamoRepository {
         Ok((
             HeadAction::snapshot_guard(&snapshot.entity_id, snapshot.event_sequence, ttl),
             snapshot_put,
+            ttl,
         ))
     }
 
@@ -1496,8 +1614,9 @@ impl Repository for DynamoRepository {
         // H3: the stream's head item must cover the snapshot, and a stream with retention
         // refreshes the head's `ttl` to the snapshot's own in the same transaction, because the
         // snapshot would otherwise outlive the head item.
-        let (mut guard, snapshot_put) = self.snapshot_parts(snapshot)?;
-        let mut refreshed_without_ttl = false;
+        let (refresh_guard, snapshot_put, ttl) = self.snapshot_parts(snapshot)?;
+        let mut guard = refresh_guard.clone();
+        let mut guard_retries = 0;
 
         let mut revalidations = 0;
         loop {
@@ -1531,16 +1650,36 @@ impl Repository for DynamoRepository {
                     // stream has no head item. It ranks above the snapshot's own condition,
                     // which keeps its meaning: a newer snapshot already covers this write.
                     if failed(1) {
-                        // Only the refresh's `ttl` condition failed when the head already covers
-                        // the snapshot: retry once as a plain check, which needs no refresh.
-                        if guard.update_expression.is_some() && !refreshed_without_ttl {
-                            let stored = self.read_head(&snapshot.entity_id).await?;
-                            if stored.is_some_and(|head| head >= snapshot.event_sequence) {
-                                guard = HeadAction::snapshot_cover(
-                                    &snapshot.entity_id,
-                                    snapshot.event_sequence,
-                                );
-                                refreshed_without_ttl = true;
+                        // A refreshing guard has two conditions (the head covers the snapshot,
+                        // and its stored `ttl` is not above the snapshot's) and the read-back
+                        // says which still matters. A stored `ttl` at least the snapshot's needs
+                        // no refresh: retry as a plain check. A lower or missing one means the
+                        // head was behind when the guard failed and a concurrent writer then
+                        // advanced it with a shorter `ttl`: retry the refresh, because a plain
+                        // check would leave the snapshot outliving the head item.
+                        if guard.update_expression.is_some() {
+                            let stored = self.read_head_item(&snapshot.entity_id).await?;
+                            let next = snapshot_guard_retry(stored, snapshot.event_sequence, ttl);
+                            if next != GuardRetry::Drift {
+                                if guard_retries >= MAX_SNAPSHOT_GUARD_RETRIES {
+                                    return Err(Error::Transient(
+                                        format!(
+                                            "the head item of {} kept moving under its snapshot write",
+                                            snapshot.entity_id
+                                        )
+                                        .into(),
+                                    ));
+                                }
+                                guard_retries += 1;
+
+                                guard = if next == GuardRetry::Refresh {
+                                    refresh_guard.clone()
+                                } else {
+                                    HeadAction::snapshot_cover(
+                                        &snapshot.entity_id,
+                                        snapshot.event_sequence,
+                                    )
+                                };
 
                                 continue;
                             }
@@ -2234,6 +2373,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_snapshot_guard_retries_the_refresh_when_the_head_advanced_with_a_shorter_ttl() {
+        let covers = EventSequence(3);
+
+        // The guard failed while the head was behind; a concurrent writer advanced it, keeping
+        // the earlier ttl: the refresh must be sent again.
+        assert_eq!(
+            snapshot_guard_retry(Some((EventSequence(3), Some(100))), covers, Some(200)),
+            GuardRetry::Refresh
+        );
+        assert_eq!(
+            snapshot_guard_retry(Some((EventSequence(9), None)), covers, Some(200)),
+            GuardRetry::Refresh
+        );
+
+        // The stored ttl already covers the snapshot's (or the stream is not retained).
+        assert_eq!(
+            snapshot_guard_retry(Some((EventSequence(3), Some(200))), covers, Some(200)),
+            GuardRetry::Cover
+        );
+        assert_eq!(
+            snapshot_guard_retry(Some((EventSequence(3), Some(300))), covers, Some(200)),
+            GuardRetry::Cover
+        );
+        assert_eq!(
+            snapshot_guard_retry(Some((EventSequence(3), None)), covers, None),
+            GuardRetry::Cover
+        );
+
+        // A head behind the snapshot, or no head, is drift.
+        assert_eq!(
+            snapshot_guard_retry(Some((EventSequence(2), Some(500))), covers, Some(200)),
+            GuardRetry::Drift
+        );
+        assert_eq!(
+            snapshot_guard_retry(None, covers, Some(200)),
+            GuardRetry::Drift
+        );
+    }
+
+    #[test]
     fn classifies_cancellations_by_item() {
         const CHECK: Option<&str> = Some("ConditionalCheckFailed");
         const CONFLICT: Option<&str> = Some("TransactionConflict");
@@ -2538,7 +2717,7 @@ mod tests {
                     event_sequence: EventSequence(write["eventSequence"].as_i64().unwrap()),
                     payload: b"{}".to_vec(),
                 };
-                let (guard, snapshot_put) = repository.snapshot_parts(&snapshot).unwrap();
+                let (guard, snapshot_put, _) = repository.snapshot_parts(&snapshot).unwrap();
                 let items = repository
                     .snapshot_items(ValidatedMarker::Version(1), &guard, &snapshot_put)
                     .unwrap();

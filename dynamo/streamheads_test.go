@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"testing"
@@ -430,6 +431,41 @@ func TestPutSnapshot_RefreshesARetainedHeadTTL(t *testing.T) {
 	require.Equal(t, evt.EventSequence(9), drift.Derived)
 }
 
+// The snapshot's guard can fail because the head is still behind it. If a concurrent writer then
+// advances the head, the read-back finds a head that covers the snapshot, but with a ttl below the
+// snapshot's: the refresh is retried instead of dropped, so the snapshot never outlives the head item.
+func TestPutSnapshot_RetriesTheTTLRefreshWhenTheHeadAdvancesUnderIt(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	now := time.Unix(1_791_763_200, 0)
+	retention := dynamo.Retention{"scratch": time.Hour}
+
+	writer := dynamo.NewRepository(fake, "events").WithRetention(retention).WithClock(func() time.Time { return now })
+	require.NoError(t, writer.Commit(ctx, evt.SerializedResult{Events: headEvents("lagging", 1, 2, "scratch")}))
+
+	// The snapshot covers event 3 and is stamped half an hour later than the stream's items.
+	later := now.Add(30 * time.Minute)
+	client := &interleavingClient{FakeDynamo: fake}
+	snapshotter := dynamo.NewRepository(client, "events").WithRetention(retention).WithClock(func() time.Time { return later })
+
+	// The head (2) is behind the snapshot (3), so the guard fails; a rival then appends event 3,
+	// stamped with the earlier ttl, before the guard's failure is read back.
+	client.onHeadRead = func() {
+		require.NoError(t, writer.Commit(ctx, evt.SerializedResult{Events: headEvents("lagging", 3, 1, "scratch")}))
+	}
+
+	require.NoError(t, snapshotter.PutSnapshot(ctx, "scratch", "lagging", []byte(`{}`), 1, 3))
+
+	head, ttl, present := headOf(fake, "lagging")
+	require.True(t, present)
+	require.Equal(t, 3, head)
+	require.Equal(t, int(later.Add(time.Hour).Unix()), ttl, "the head item must outlive the snapshot it covers")
+
+	snapshot, err := snapshotter.GetSnapshot(ctx, "lagging")
+	require.NoError(t, err)
+	require.Equal(t, evt.EventSequence(3), snapshot.EventSequence)
+}
+
 // A retained stream whose head item expired before its events is a transient conflict, not drift,
 // while every remaining item has expired. A residual that has not expired is drift.
 func TestCommit_ExpiredResidualOfARetainedStreamHeals(t *testing.T) {
@@ -615,6 +651,98 @@ func TestCommit_AFreshStoreDeclaresStreamHeads(t *testing.T) {
 	manifest, err = other.FeatureMarker(nil).Manifest(ctx)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), manifest.Version)
+}
+
+// declaringClient runs a callback right after the feature-marker declaration is written, as a
+// writer that never reads the marker committing in the window around it.
+type declaringClient struct {
+	*compat.FakeDynamo
+
+	afterDeclare func()
+}
+
+func (c *declaringClient) PutItem(
+	ctx context.Context,
+	params *dynamodb.PutItemInput,
+	options ...func(*dynamodb.Options),
+) (*dynamodb.PutItemOutput, error) {
+	out, err := c.FakeDynamo.PutItem(ctx, params, options...)
+	if pk, ok := params.Item["pk"].(*types.AttributeValueMemberS); ok && err == nil &&
+		pk.Value == "SYSTEM#FEATURES" && c.afterDeclare != nil {
+		callback := c.afterDeclare
+		c.afterDeclare = nil
+		callback()
+	}
+
+	return out, err
+}
+
+func putRaw(t *testing.T, fake *compat.FakeDynamo, pk string, sk int, attrs map[string]types.AttributeValue) {
+	t.Helper()
+
+	item := map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: pk},
+		"sk": &types.AttributeValueMemberN{Value: strconv.Itoa(sk)},
+	}
+	maps.Copy(item, attrs)
+
+	_, err := fake.PutItem(context.Background(), &dynamodb.PutItemInput{Item: item})
+	require.NoError(t, err)
+}
+
+// The empty-store check and the declaration are two steps, so a writer that does not read the
+// marker can commit a stream between them. The declaration is committed first and the store is
+// looked at again afterward: that stream has no head item, so the declaration is retracted and
+// the store is refused instead of being left declared over a stream it cannot guard.
+func TestCommit_ARetractedDeclarationWhenAHeadlessStreamAppearsInTheWindow(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	client := &declaringClient{FakeDynamo: fake}
+	repo := dynamo.NewRepository(client, "events")
+
+	client.afterDeclare = func() {
+		putRaw(t, fake, "early", 1, map[string]types.AttributeValue{
+			"entityType": &types.AttributeValueMemberS{Value: "t"},
+			"payload":    &types.AttributeValueMemberS{Value: "{}"},
+		})
+	}
+
+	err := repo.Commit(ctx, evt.SerializedResult{Events: headEvents("late", 1, 1, "t")})
+	require.ErrorIs(t, err, evt.ErrStreamHeadsNotMigrated)
+
+	// Nothing of the refused commit was written, and the store still does not declare the feature.
+	require.Empty(t, fake.Items("late"))
+
+	manifest, err := repo.FeatureMarker(nil).Manifest(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, manifest)
+	require.NotContains(t, manifest.Features, evt.FeatureStreamHeads)
+
+	// It stays refused: the store is populated and undeclared.
+	err = dynamo.NewRepository(fake, "events").Commit(ctx, evt.SerializedResult{Events: headEvents("later", 1, 1, "t")})
+	require.ErrorIs(t, err, evt.ErrStreamHeadsNotMigrated)
+}
+
+// Another head-aware writer's stream, created in the same window, is not a reason to retract.
+func TestCommit_AHeadedStreamInTheWindowKeepsTheDeclaration(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	client := &declaringClient{FakeDynamo: fake}
+	repo := dynamo.NewRepository(client, "events")
+
+	client.afterDeclare = func() {
+		putRaw(t, fake, "peer", -1, map[string]types.AttributeValue{"head": &types.AttributeValueMemberN{Value: "1"}})
+		putRaw(t, fake, "peer", 1, map[string]types.AttributeValue{
+			"entityType": &types.AttributeValueMemberS{Value: "t"},
+			"payload":    &types.AttributeValueMemberS{Value: "{}"},
+		})
+	}
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("late", 1, 1, "t")}))
+
+	manifest, err := repo.FeatureMarker(nil).Manifest(ctx)
+	require.NoError(t, err)
+	require.Contains(t, manifest.Features, evt.FeatureStreamHeads)
 }
 
 // Engine rows alone do not make a store populated: a table holding only command outcomes or a

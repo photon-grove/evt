@@ -354,7 +354,7 @@ func (m *FeatureMarker) validateLocked(ctx context.Context, declare bool) error 
 			return nil
 		}
 
-		declared, derr := m.declare(ctx, declareStreamHeads)
+		declared, derr := m.declareOnEmptyStore(ctx)
 		if derr != nil {
 			return derr
 		}
@@ -372,6 +372,102 @@ func (m *FeatureMarker) validateLocked(ctx context.Context, declare bool) error 
 	m.cachedVersion = manifest.Version
 
 	return nil
+}
+
+// declareOnEmptyStore declares stream-heads on a store that held no data when it was looked at,
+// and closes the window between that look and the declaration.
+//
+// No transaction can exclude a writer that never reads the marker, so the order does the work:
+// the declaration is committed first, which makes every writer that reads the marker fail its
+// per-commit check or refuse the store from then on, and only then is the store looked at once
+// more. A stream a marker-reading writer committed before the declaration is durable by then, so
+// the second look sees it. A stream without a head item means the store was not fresh after all:
+// the declaration is retracted (a new version, so every cached validation is dropped) and the
+// store is refused as unmigrated. Streams other head-aware writers created in the meantime have a
+// head item and are no reason to retract.
+func (m *FeatureMarker) declareOnEmptyStore(ctx context.Context) (evt.FeatureManifest, error) {
+	declared, err := m.declare(ctx, declareStreamHeads)
+	if err != nil {
+		return evt.FeatureManifest{}, err
+	}
+
+	headless, err := m.hasHeadlessStream(ctx)
+	if err != nil {
+		return evt.FeatureManifest{}, err
+	}
+
+	if !headless {
+		return declared, nil
+	}
+
+	if _, err := m.declare(ctx, retractStreamHeads); err != nil {
+		return evt.FeatureManifest{}, err
+	}
+
+	return evt.FeatureManifest{}, &evt.StreamHeadsNotMigratedError{}
+}
+
+func retractStreamHeads(manifest *evt.FeatureManifest) {
+	delete(manifest.Features, evt.FeatureStreamHeads)
+}
+
+// hasHeadlessStream reports whether any stream in the table has items but no head item. A scan
+// is not atomic across items, so a stream that looks headless is confirmed with a strongly
+// consistent read of its head item before it counts.
+func (m *FeatureMarker) hasHeadlessStream(ctx context.Context) (bool, error) {
+	pages := dynamodb.NewScanPaginator(m.client, &dynamodb.ScanInput{
+		TableName:            &m.eventsTable,
+		ConsistentRead:       aws.Bool(true),
+		ProjectionExpression: aws.String("pk, sk"),
+		Limit:                aws.Int32(scanProbePageSize),
+	})
+
+	headed := map[string]bool{}
+	streams := map[string]bool{}
+
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return false, fmt.Errorf("features: scanning for headless streams: %w", err)
+		}
+
+		for _, item := range page.Items {
+			pk, ok := item["pk"].(*types.AttributeValueMemberS)
+			if !ok || evt.IsReservedEntityID(evt.EntityID(pk.Value)) {
+				continue
+			}
+
+			streams[pk.Value] = true
+
+			if sk, isNumber := item["sk"].(*types.AttributeValueMemberN); isNumber && sk.Value == "-1" {
+				headed[pk.Value] = true
+			}
+		}
+	}
+
+	for pk := range streams {
+		if headed[pk] {
+			continue
+		}
+
+		out, err := m.client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:      &m.eventsTable,
+			ConsistentRead: aws.Bool(true),
+			Key: map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: pk},
+				"sk": &types.AttributeValueMemberN{Value: "-1"},
+			},
+		})
+		if err != nil {
+			return false, fmt.Errorf("features: reading the head item of %s: %w", pk, err)
+		}
+
+		if len(out.Item) == 0 {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // invalidate drops the cached validation so the next commit re-reads the manifest.

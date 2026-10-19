@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/policy"
 )
 
 // GetSnapshot gets the latest Snapshot for an Entity instance.
@@ -109,7 +110,7 @@ func (repo *Repository) PutSnapshot(
 		},
 	}
 
-	err = repo.putSnapshotGuarded(ctx, entityID, eventSequence, ttl, put, true)
+	err = repo.putSnapshotGuarded(ctx, entityID, eventSequence, ttl, put, true, 0)
 	if err == nil {
 		repo.ttlFloors.observe(entityID, ttl)
 	}
@@ -119,7 +120,8 @@ func (repo *Repository) PutSnapshot(
 
 // putSnapshotGuarded sends the snapshot transaction: the marker check, the head guard, and the
 // snapshot put. refreshTTL says whether the guard also refreshes a retained head item's ttl; it is
-// false on the single retry that follows a ttl-only guard failure.
+// false only on the retry that follows a guard failure after which the stored head ttl already
+// covers the snapshot's. retries counts the guard failures this call chain has already absorbed.
 func (repo *Repository) putSnapshotGuarded(
 	ctx context.Context,
 	entityID evt.EntityID,
@@ -127,6 +129,7 @@ func (repo *Repository) putSnapshotGuarded(
 	ttl int64,
 	put *types.Put,
 	refreshTTL bool,
+	retries int,
 ) error {
 	check, err := repo.features.checkItem(ctx)
 	if err != nil {
@@ -148,7 +151,7 @@ func (repo *Repository) putSnapshotGuarded(
 			return repo.features.handleCheckFailure(ctx, err)
 
 		case 1:
-			return repo.snapshotGuardFailed(ctx, entityID, eventSequence, ttl, put, refreshTTL && guard.Update != nil)
+			return repo.snapshotGuardFailed(ctx, entityID, eventSequence, ttl, put, refreshTTL && guard.Update != nil, retries)
 
 		case 2:
 			// A newer snapshot already covers this regressing maintenance write.
@@ -159,10 +162,20 @@ func (repo *Repository) putSnapshotGuarded(
 	return fmt.Errorf("failed to put snapshot: %w", err)
 }
 
-// snapshotGuardFailed classifies a failed head guard. For a retained stream the refreshing update
-// has two conditions; when only the ttl one failed (the head already covers the snapshot and its
-// stored ttl is higher), the head needs no refresh and the write is retried once as a plain check.
-// Otherwise the snapshot is ahead of the stream, or the stream has no head item: drift.
+// maxSnapshotGuardRetries bounds how often a snapshot write re-sends its guard after a concurrent
+// writer moved the head item under it.
+const maxSnapshotGuardRetries = 4
+
+// snapshotGuardFailed classifies a failed head guard by reading the head item back.
+//
+// For a retained stream the refreshing update has two conditions (the head covers the snapshot,
+// and its stored ttl is not above the snapshot's), and it can fail on either. The read decides
+// which: when the head covers the snapshot, the stored ttl is what matters. A ttl at least the
+// snapshot's needs no refresh, so the write is retried as a plain check. A lower or missing ttl
+// means the guard failed while the head was still behind and a concurrent writer then advanced it
+// with a shorter ttl: the refresh is retried, because a plain check would leave the snapshot
+// outliving the head item. Otherwise the snapshot is ahead of the stream, or the stream has no
+// head item: drift.
 func (repo *Repository) snapshotGuardFailed(
 	ctx context.Context,
 	entityID evt.EntityID,
@@ -170,6 +183,7 @@ func (repo *Repository) snapshotGuardFailed(
 	ttl int64,
 	put *types.Put,
 	refreshed bool,
+	retries int,
 ) error {
 	head, err := repo.readHeadItem(ctx, entityID)
 	if err != nil {
@@ -177,7 +191,15 @@ func (repo *Repository) snapshotGuardFailed(
 	}
 
 	if refreshed && head.present && head.head >= eventSequence {
-		return repo.putSnapshotGuarded(ctx, entityID, eventSequence, ttl, put, false)
+		if retries >= maxSnapshotGuardRetries {
+			return &policy.ClassifiedError{
+				Class: policy.ClassTransient,
+				Err: fmt.Errorf(
+					"dynamo: the head item of %s kept moving under its snapshot write", entityID),
+			}
+		}
+
+		return repo.putSnapshotGuarded(ctx, entityID, eventSequence, ttl, put, head.ttl < ttl, retries+1)
 	}
 
 	derived, err := repo.deriveHead(ctx, entityID)
