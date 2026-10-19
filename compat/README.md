@@ -74,10 +74,10 @@ changed, and update the spec.
    | `resolveOutcome`| `command`, `commandId`                                           | outcomes scenarios: `absent`, a replayed outcome, or `reuse` |
 
    A `transaction` step may also carry `projectors` (C7): a list of `{name, operations}` whose
-   operations (`op` `put` or `delete`, `pk`, `sk`, `entityId`, `entityType`, `payload`, `condition`
+   operations (`op` `put` or `delete`, `pk`, `sk`, `owner`, `entityType`, `payload`, `condition`
    `absent` or `present`, `conflict` for a mapped error message, and `pkPad`/`skPad` to extend a key
    with `x` to that many bytes) are the commit-wide view operations of the commit, in declaration
-   then emission order. `{id}` in a key, entity ID, or payload is the scenario's entity ID, so rows
+   then emission order. `{id}` in a key, owner, or payload is the scenario's entity ID, so rows
    are scoped to the run. The step's `expect` adds the results `projector` (a failed condition,
    with the `projector` name, the `operation` index, and the `mapped` message), `projectorOnly`,
    `viewKeyTooLong`, and `duplicateViewKey`.

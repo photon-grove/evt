@@ -51,7 +51,7 @@ func (store *Store) projectCommit(
 		return nil, nil
 	}
 
-	if _, ok := store.repo.(evt.ViewWritingRepository); !ok {
+	if !evt.WritesViews(store.repo) {
 		return nil, &evt.ViewsUnsupportedError{Repository: fmt.Sprintf("%T", store.repo)}
 	}
 

@@ -162,12 +162,25 @@ type TransactionalRepository interface {
 // PostgreSQL repositories implement it.
 //
 // Implement it only when Commit honors that contract. A decorator type hides the capability unless
-// it declares it too.
+// it declares it too, and a decorator cannot choose its method set at run time, so WritesViews
+// reports the capability: a decorator returns what the repository it wraps reports (see
+// WritesViews).
 type ViewWritingRepository interface {
 	Repository
 
-	// WritesViews is a marker: implementing it asserts the capability above.
-	WritesViews()
+	// WritesViews reports whether Commit writes commit-wide view operations atomically with the
+	// events. The in-memory, DynamoDB, and PostgreSQL repositories return true; a decorator returns
+	// the wrapped repository's answer.
+	WritesViews() bool
+}
+
+// WritesViews reports whether repo declares and reports the view-writing capability
+// (ViewWritingRepository). A repository that does not implement it, or whose WritesViews returns
+// false, is refused a commit-wide projector.
+func WritesViews(repo Repository) bool {
+	writer, ok := repo.(ViewWritingRepository)
+
+	return ok && writer.WritesViews()
 }
 
 // ViewsUnsupportedError refuses a commit-wide projector over a repository that has not declared

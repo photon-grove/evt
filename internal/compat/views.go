@@ -31,14 +31,15 @@ type StepProjector struct {
 	Operations []StepView `json:"operations"`
 }
 
-// StepView is one view operation of a transaction step. The placeholder {id} in pk, sk, entityId,
-// and payload is the scenario's entity ID, so rows are scoped to the run. PKPad and SKPad extend a
-// key with "x" up to that many bytes, so the key-limit cases need not store a 2 KB string.
+// StepView is one view operation of a transaction step. The placeholder {id} in pk, sk, owner, and
+// payload is the scenario's entity ID, so rows are scoped to the run. PKPad and SKPad extend a key
+// with "x" up to that many bytes, so the key-limit cases need not store a 2 KB string. Every
+// operation names its owner, the stream the row belongs to.
 type StepView struct {
 	Op         string `json:"op"`
 	PK         string `json:"pk"`
 	SK         string `json:"sk"`
-	EntityID   string `json:"entityId,omitempty"`
+	Owner      string `json:"owner"`
 	EntityType string `json:"entityType,omitempty"`
 	Payload    string `json:"payload,omitempty"`
 	Condition  string `json:"condition,omitempty"`
@@ -68,7 +69,7 @@ func viewsOf(base evt.EntityID, step Step) []evt.ProjectedView {
 				Kind:       evt.ViewOperationKind(item.Op),
 				PK:         pad(scope(item.PK), item.PKPad),
 				SK:         pad(scope(item.SK), item.SKPad),
-				EntityID:   evt.EntityID(scope(item.EntityID)),
+				Owner:      evt.EntityID(scope(item.Owner)),
 				EntityType: evt.EntityType(item.EntityType),
 				Payload:    []byte(scope(item.Payload)),
 				Condition:  evt.ViewCondition(item.Condition),
@@ -86,7 +87,8 @@ func viewsOf(base evt.EntityID, step Step) []evt.ProjectedView {
 	return views
 }
 
-// ledgerRow is the payload of a ledger row: the account's state after the commit. Declared in this order, it encodes the same bytes as the Rust struct.
+// ledgerRow is the payload of a ledger row: the account's state after the commit. Declared in this
+// order, it encodes the same bytes as the Rust struct.
 type ledgerRow struct {
 	BalanceCents int64  `json:"balanceCents"`
 	Status       string `json:"status"`
@@ -95,9 +97,9 @@ type ledgerRow struct {
 
 // LedgerProjector is the shared commit-wide projector of the account domain (name "ledger"), a
 // current-state projector. For every stream the commit wrote it puts a ledger row (pk "ledger", sk
-// the stream ID) from the
-// stream's state after the commit, or deletes it when the balance is zero. Every byte is a function
-// of the commit view, so Rust must write the same rows.
+// the stream ID, owned by the stream) from the stream's state after the commit, or deletes it when
+// the balance is zero. Every byte is a function of the commit view, so Rust must write the same
+// rows.
 type LedgerProjector struct{}
 
 // Name implements evt.CommitProjector.
@@ -119,7 +121,7 @@ func (LedgerProjector) ProjectCommit(_ context.Context, commit evt.CommitView) (
 		}
 
 		if state.BalanceCents == 0 {
-			operations = append(operations, evt.DeleteView(LedgerPK, string(stream.EntityID)))
+			operations = append(operations, evt.DeleteView(LedgerPK, string(stream.EntityID), stream.EntityID))
 
 			continue
 		}
@@ -185,18 +187,36 @@ const PostgresViewDDL = `CREATE TABLE IF NOT EXISTS evt_compat_views (
 )`
 
 // PostgresViewWriter writes a view operation to PostgresViewTable, with the statement semantics the
-// repository relies on: a put that requires the row to be absent is a plain INSERT (the unique
-// violation is its failed condition), an unconditional put overwrites, and a delete's affected-row
-// count decides a "present" condition. The Rust driver issues the same statements.
+// repository relies on (postgres.ViewWriter). The table's entity_id column holds the row's owner and
+// every statement enforces it:
+//
+//   - a put that requires the row to be absent is a plain INSERT, and the unique violation is its
+//     failed condition;
+//   - any other put overwrites only the owner's row: the conflict update is guarded by the owner, and
+//     a row of another owner leaves it affecting nothing;
+//   - a delete that requires the row deletes the owner's row, and affecting nothing fails it;
+//   - any other delete deletes the owner's row if there is one, and reports the rows of another owner
+//     it found, which fail it.
+//
+// The Rust driver issues the same statements.
 func PostgresViewWriter(op evt.ViewOperation) (postgres.ViewStatement, error) {
 	if op.Kind == evt.ViewDelete {
+		args := []any{op.PK, op.SK, string(op.Owner)}
+		if op.Condition == evt.ViewPresent {
+			return postgres.ViewStatement{
+				SQL:  "DELETE FROM evt_compat_views WHERE pk = $1 AND sk = $2 AND entity_id = $3",
+				Args: args,
+			}, nil
+		}
+
 		return postgres.ViewStatement{
-			SQL:  "DELETE FROM evt_compat_views WHERE pk = $1 AND sk = $2",
-			Args: []any{op.PK, op.SK},
+			SQL: "WITH gone AS (DELETE FROM evt_compat_views WHERE pk = $1 AND sk = $2 AND entity_id = $3) " +
+				"SELECT 1 FROM evt_compat_views WHERE pk = $1 AND sk = $2 AND entity_id <> $3",
+			Args: args,
 		}, nil
 	}
 
-	args := []any{op.PK, op.SK, string(op.EntityID), string(op.EntityType), string(op.Payload)}
+	args := []any{op.PK, op.SK, string(op.Owner), string(op.EntityType), string(op.Payload)}
 	insert := "INSERT INTO evt_compat_views (pk, sk, entity_id, entity_type, payload) VALUES ($1, $2, $3, $4, $5)"
 
 	if op.Condition == evt.ViewAbsent {
@@ -204,8 +224,8 @@ func PostgresViewWriter(op evt.ViewOperation) (postgres.ViewStatement, error) {
 	}
 
 	return postgres.ViewStatement{
-		SQL: insert + " ON CONFLICT (pk, sk) DO UPDATE SET entity_id = EXCLUDED.entity_id, " +
-			"entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload",
+		SQL: insert + " ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, " +
+			"payload = EXCLUDED.payload WHERE evt_compat_views.entity_id = EXCLUDED.entity_id",
 		Args: args,
 	}, nil
 }

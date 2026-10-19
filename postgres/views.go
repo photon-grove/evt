@@ -31,16 +31,24 @@ type ViewStatement struct {
 // repository executes whatever statement its writer returns, inside the commit's transaction, after
 // the events and before the snapshots.
 //
-// The repository decides whether the operation's condition held from the statement's outcome, so
-// the statement must have these semantics:
+// The writer must store the operation's Owner with the row (the application's own column, the
+// stream's ID) and enforce it, because the owner of a row must never change: the repository cannot
+// see the table, so it decides whether a condition held from the statement's outcome, and the
+// statement must have these semantics:
 //
 //   - a put with evt.ViewAbsent must raise a unique violation of the (pk, sk) key constraint when
 //     the row exists: write a plain INSERT, with no ON CONFLICT clause, and name the constraint in
 //     ViewStatement.KeyConstraint;
-//   - a put without a condition overwrites: an INSERT ... ON CONFLICT DO UPDATE;
-//   - a delete with evt.ViewPresent must delete a row: a DELETE whose affected-row count is zero
-//     fails the condition;
-//   - a delete without a condition succeeds whether or not it deleted a row.
+//   - a put without a condition overwrites the owner's row and refuses another owner's:
+//     INSERT ... ON CONFLICT (pk, sk) DO UPDATE ... WHERE <table>.owner = EXCLUDED.owner. It
+//     affects one row, or none when the row belongs to another owner, which fails the condition;
+//   - a delete with evt.ViewPresent must delete the owner's row: DELETE ... WHERE pk, sk, and
+//     owner. An affected-row count of zero (the row is absent or another owner's) fails the
+//     condition;
+//   - a delete without a condition succeeds whether or not it deleted a row, and refuses another
+//     owner's row. Its statement reports the foreign rows it found instead of the rows it deleted:
+//     WITH gone AS (DELETE ... WHERE pk, sk, and owner) SELECT 1 FROM <table> WHERE pk, sk, and
+//     owner <> $owner. An affected-row count above zero fails the condition.
 //
 // A failed condition is an *evt.ProjectorOperationError with the reason evt.ReasonConditionFailed;
 // any other error the database raises is one too, with its SQLSTATE as the reason.
@@ -118,12 +126,27 @@ func execViews(ctx context.Context, tx pgx.Tx, built []builtView) error {
 			return mapViewError(item.view, item.statement.KeyConstraint, err)
 		}
 
-		if item.view.Op.Kind == evt.ViewDelete && item.view.Op.Condition == evt.ViewPresent && tag.RowsAffected() == 0 {
+		if viewConditionFailed(item.view.Op, tag.RowsAffected()) {
 			return evt.NewProjectorOperationError(item.view, evt.ReasonConditionFailed, nil)
 		}
 	}
 
 	return nil
+}
+
+// viewConditionFailed reads a statement's affected-row count (see ViewWriter): a put without a
+// presence condition, and a delete that requires the row, affect no row when the owner's condition
+// fails; a delete without a condition affects (reports) a row only when another owner's holds the
+// key. A put that requires the row to be absent fails with a unique violation instead.
+func viewConditionFailed(op evt.ViewOperation, affected int64) bool {
+	switch {
+	case op.Kind == evt.ViewPut && op.Condition == evt.ViewAbsent:
+		return false
+	case op.Kind == evt.ViewPut, op.Condition == evt.ViewPresent:
+		return affected == 0
+	default:
+		return affected > 0
+	}
 }
 
 // mapViewError maps an error a view statement raised. A violation of the (pk, sk) key constraint on
@@ -186,12 +209,16 @@ func commitBudget(normalized evt.SerializedResult, views []builtView) error {
 
 // WritesViews declares that Commit writes commit-wide view operations, or refuses them with
 // *evt.ViewsNotConfiguredError when no view writer is configured (evt.ViewWritingRepository).
-func (repo *Repository) WritesViews() {}
+func (repo *Repository) WritesViews() bool { return true }
 
 // DeclareHistoryDependent durably adds the entity types to the feature manifest's historyDependent
 // set, so CompactBelow refuses them in every process (evt.HistoryDeclarer). Types already declared
 // are left alone and nothing is written.
 func (repo *Repository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	manifest, err := repo.features.Manifest(ctx)
 	if err != nil {
 		return err

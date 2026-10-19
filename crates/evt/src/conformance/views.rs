@@ -12,7 +12,7 @@ use crate::error::ExecuteError;
 use crate::json;
 use crate::projection::{
     CommitProjector, CommitView, ProjectedView, ProjectorOperationError, REASON_CONDITION_FAILED,
-    ViewOperation, ViewOperationKind, ViewRow, group_commits,
+    ViewOperation, ViewOperationKind, ViewRow, group_commits, project_commit, replay_views,
 };
 
 /// A backend's commit-wide view storage, for [`commit_view_cases`]: how to read back the row a
@@ -97,7 +97,15 @@ where
         Box::pin(view_rejections(repo, target)).await,
     );
     record(
-        "a projector replayed over regrouped events reproduces the live operations",
+        "a stream never overwrites or deletes a row another stream owns",
+        Box::pin(view_ownership(repo, target)).await,
+    );
+    record(
+        "a projector sees only what its kind declares, and owns only rows of streams it may name",
+        Box::pin(view_visibility(repo, target)).await,
+    );
+    record(
+        "a projector replayed over regrouped events reproduces the live rows",
         Box::pin(view_determinism(repo, target)).await,
     );
     record(
@@ -222,39 +230,57 @@ fn summary(view: &CommitView) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A projector for the row cases: one directory row per written stream, at a partition that names
-/// no entity, plus a summary row for the whole commit.
+/// A current-state projector for the row cases: one directory row per written stream, owned by the
+/// stream, at a partition that names no entity, and a count row per stream. It sees no commit ID
+/// and no events, so none of its rows can depend on them.
 fn directory(ns: &str) -> Arc<Scripted> {
     let ns = ns.to_owned();
 
     Scripted::new("directory", move |view| {
-        let mut operations: Vec<ViewOperation> = view
-            .streams
+        view.streams
             .iter()
-            .map(|stream| {
-                ViewOperation::put(
-                    format!("{ns}-directory"),
-                    stream.entity_id.as_str(),
-                    stream.entity_id.as_str(),
-                    stream.entity_type.as_str(),
-                    stream.state.clone(),
-                )
+            .flat_map(|stream| {
+                [
+                    ViewOperation::put(
+                        format!("{ns}-directory"),
+                        stream.entity_id.as_str(),
+                        stream.entity_id.clone(),
+                        stream.entity_type.as_str(),
+                        stream.state.clone(),
+                    ),
+                    ViewOperation::put(
+                        format!("{ns}-width"),
+                        stream.entity_id.as_str(),
+                        stream.entity_id.clone(),
+                        "",
+                        format!(r#"{{"streams":{}}}"#, view.streams.len()),
+                    ),
+                ]
             })
-            .collect();
-        operations.push(ViewOperation::put(
-            format!("{ns}-summary"),
-            "commit",
-            "",
-            "",
-            summary(view),
-        ));
-
-        operations
+            .collect()
     })
 }
 
-/// The determinism case's projector: like [`directory`], but history-dependent, so it reads the
-/// commit's events and owns each row by its stream.
+/// A history-dependent projector that writes only the per-commit summary row of
+/// [`directory_reading`].
+fn commit_summary(ns: &str) -> Arc<Scripted> {
+    let ns = ns.to_owned();
+
+    Scripted::reading("summary", &[Ledger::TYPE, Claim::TYPE], move |view| {
+        vec![ViewOperation::put(
+            format!("{ns}-summary"),
+            view.commit_id.as_str(),
+            view.streams[0].entity_id.clone(),
+            "",
+            summary(view),
+        )]
+    })
+}
+
+/// A history-dependent projector over the ledger and claim types: like [`directory`], plus one
+/// summary row per commit, keyed by the commit ID (which only a history-dependent projector sees)
+/// and owned by the commit's first stream. Every row has one stable owner, so a replay can apply
+/// the writes to it in its owner's order.
 fn directory_reading(ns: &str) -> Arc<Scripted> {
     let ns = ns.to_owned();
 
@@ -266,17 +292,19 @@ fn directory_reading(ns: &str) -> Arc<Scripted> {
                 ViewOperation::put(
                     format!("{ns}-directory"),
                     stream.entity_id.as_str(),
-                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(),
                     stream.entity_type.as_str(),
                     stream.state.clone(),
                 )
-                .owned_by(stream.entity_id.clone())
             })
             .collect();
-        operations.push(
-            ViewOperation::put(format!("{ns}-summary"), "commit", "", "", summary(view))
-                .owned_by(view.streams[0].entity_id.clone()),
-        );
+        operations.push(ViewOperation::put(
+            format!("{ns}-summary"),
+            view.commit_id.as_str(),
+            view.streams[0].entity_id.clone(),
+            "",
+            summary(view),
+        ));
 
         operations
     })
@@ -360,9 +388,11 @@ where
     let (directory_pk, summary_pk) = (format!("{ns}-directory"), format!("{ns}-summary"));
 
     let projector = directory(&ns);
+    let summaries = commit_summary(&ns);
     let store = Store::<Ledger, _>::new(repo, ())
         .with_snapshot_interval(0)
-        .with_commit_projector(projector.clone());
+        .with_commit_projector(projector.clone())
+        .with_commit_projector(summaries);
 
     // One commit across two aggregate types writes its rows beside both streams' events, at
     // partitions that are not `{entityType}#{entityId}`.
@@ -407,12 +437,28 @@ where
     );
     let commit_id = committed[0].metadata.commit_id.clone();
     ensure!(!commit_id.is_empty(), "the events carry the commit ID");
+    let summary_row = row(target, &summary_pk, &commit_id).await?;
     ensure_eq!(
-        row(target, &summary_pk, "commit")
+        summary_row.map(|row| (
+            row.entity_id,
+            String::from_utf8_lossy(&row.payload).into_owned()
+        )),
+        Some((
+            ledger.to_string(),
+            format!(r#"{{"commitId":"{commit_id}","streams":2}}"#)
+        )),
+        "the summary row, keyed by the final stamped commit ID, saw both streams and is owned by \
+         the first"
+    );
+    ensure_eq!(
+        row(target, &format!("{ns}-width"), claim.as_str())
             .await?
-            .map(|row| String::from_utf8_lossy(&row.payload).into_owned()),
-        Some(format!(r#"{{"commitId":"{commit_id}","streams":2}}"#)),
-        "the commit-wide summary row saw the final stamped commit ID and both streams"
+            .map(|row| (
+                row.entity_id,
+                String::from_utf8_lossy(&row.payload).into_owned()
+            )),
+        Some((claim.to_string(), r#"{"streams":2}"#.to_owned())),
+        "a current-state projector reads every stream's state"
     );
 
     // A later commit overwrites the rows it touches and leaves the others.
@@ -432,12 +478,12 @@ where
         "the claim row is untouched"
     );
 
-    // A later commit deletes a row an earlier one wrote.
+    // A later commit deletes a row its stream's earlier commit wrote.
     let retire = {
-        let (pk, claim) = (directory_pk.clone(), claim.to_string());
+        let (pk, ledger) = (directory_pk.clone(), ledger.clone());
 
         Scripted::new("retire", move |_| {
-            vec![ViewOperation::delete(pk.clone(), claim.clone()).if_present()]
+            vec![ViewOperation::delete(pk.clone(), ledger.to_string(), ledger.clone()).if_present()]
         })
     };
     Store::<Ledger, _>::new(repo, ())
@@ -446,12 +492,12 @@ where
         .execute(&ledger, Add(1), metadata())
         .await?;
     ensure!(
-        row(target, &directory_pk, claim.as_str()).await?.is_none(),
-        "the claim row was deleted"
+        row(target, &directory_pk, ledger.as_str()).await?.is_none(),
+        "the ledger row was deleted by its owner"
     );
     ensure!(
-        row(target, &directory_pk, ledger.as_str()).await?.is_some(),
-        "the ledger row stays"
+        row(target, &directory_pk, claim.as_str()).await?.is_some(),
+        "the claim row stays"
     );
 
     // A single-stream commit through the store's other write path projects too.
@@ -487,10 +533,13 @@ where
         Scripted::new("claims", move |view| {
             view.streams
                 .iter()
-                .filter_map(|stream| serde_json::from_slice::<Claim>(&stream.state).ok())
-                .filter_map(|claim| claim.holder)
-                .map(|holder| {
-                    ViewOperation::put(names.clone(), holder.clone(), "", "", "{}")
+                .filter_map(|stream| {
+                    let claim = serde_json::from_slice::<Claim>(&stream.state).ok()?;
+
+                    Some((stream.entity_id.clone(), claim.holder?))
+                })
+                .map(|(owner, holder)| {
+                    ViewOperation::put(names.clone(), holder.clone(), owner, "", "{}")
                         .if_absent()
                         .on_conflict(NameTaken(holder))
                 })
@@ -501,22 +550,26 @@ where
         let audit = audit.clone();
 
         Scripted::new("audit", move |view| {
-            let holder = view
+            let (owner, holder) = view
                 .streams
                 .iter()
-                .find_map(|stream| serde_json::from_slice::<Claim>(&stream.state).ok()?.holder)
+                .find_map(|stream| {
+                    let claim = serde_json::from_slice::<Claim>(&stream.state).ok()?;
+
+                    Some((stream.entity_id.clone(), claim.holder?))
+                })
                 .unwrap_or_default();
 
             let mut operations = vec![ViewOperation::put(
                 audit.clone(),
                 format!("held-{holder}"),
-                "",
+                owner.clone(),
                 "",
                 "{}",
             )];
             if holder == "grace" {
                 operations.push(
-                    ViewOperation::delete(audit.clone(), "never-written")
+                    ViewOperation::delete(audit.clone(), "never-written", owner)
                         .if_present()
                         .on_conflict(NameTaken("never-written".into())),
                 );
@@ -657,12 +710,12 @@ where
 
 /// An absent put of `pk`/`x` that maps its failure to [`NameTaken`], as the first operation of the
 /// projector `claims`.
-fn claimed(pk: &str) -> ProjectedView {
+fn claimed(pk: &str, owner: &EntityId) -> ProjectedView {
     ProjectedView::new(
         "claims",
         0,
         0,
-        ViewOperation::put(pk, "x", "", "", "{}")
+        ViewOperation::put(pk, "x", owner.clone(), "", "{}")
             .if_absent()
             .on_conflict(NameTaken("x".into())),
     )
@@ -679,14 +732,17 @@ where
     let owner = Stream::new(&ns, "owner", "ledger");
 
     // The owner claims the row; the stream has one event.
-    repo.commit(Commit::new(owner.id.clone(), owner.events(1..=1)).with_views([claimed(&pk)]))
-        .await?;
+    repo.commit(
+        Commit::new(owner.id.clone(), owner.events(1..=1)).with_views([claimed(&pk, &owner.id)]),
+    )
+    .await?;
     stream.commit(repo, stream.events(1..=1), None).await?;
 
     // Alone, the failing claim is the projector's failure.
     let error = error_of(
         repo.commit(
-            Commit::new(stream.id.clone(), stream.events(2..=2)).with_views([claimed(&pk)]),
+            Commit::new(stream.id.clone(), stream.events(2..=2))
+                .with_views([claimed(&pk, &stream.id)]),
         )
         .await,
         "a failing claim alone",
@@ -708,7 +764,8 @@ where
     for (what, events) in [("a stale head", 1..=1), ("a sequence gap", 5..=5)] {
         let error = error_of(
             repo.commit(
-                Commit::new(stream.id.clone(), stream.events(events)).with_views([claimed(&pk)]),
+                Commit::new(stream.id.clone(), stream.events(events))
+                    .with_views([claimed(&pk, &stream.id)]),
             )
             .await,
             what,
@@ -721,7 +778,7 @@ where
     let error = error_of(
         repo.commit_transaction(
             TransactionCommit::new(vec![Commit::new(stream.id.clone(), stream.events(1..=1))])
-                .with_views([claimed(&pk)]),
+                .with_views([claimed(&pk, &stream.id)]),
         )
         .await,
         "a stale head in a transaction",
@@ -744,7 +801,7 @@ where
                     EventSequence(0),
                     FenceProvenance::Engine,
                 )])
-                .with_views([claimed(&pk)]),
+                .with_views([claimed(&pk, &writes.id)]),
         )
         .await,
         "a failed fence",
@@ -768,7 +825,7 @@ where
                     EventSequence(1),
                     FenceProvenance::Engine,
                 )])
-                .with_views([claimed(&pk)]),
+                .with_views([claimed(&pk, &writes.id)]),
         )
         .await,
         "a passing fence",
@@ -793,7 +850,7 @@ where
         let error = error_of(
             repo.commit(
                 Commit::new(stream.id.clone(), stream.events(events))
-                    .with_views([claimed(&pk)])
+                    .with_views([claimed(&pk, &stream.id)])
                     .with_outcome(Outcome::accepted(command.clone(), "digest")),
             )
             .await,
@@ -807,7 +864,7 @@ where
     let error = error_of(
         repo.commit_transaction(
             TransactionCommit::new(vec![Commit::new(stream.id.clone(), stream.events(2..=2))])
-                .with_views([claimed(&pk)])
+                .with_views([claimed(&pk, &stream.id)])
                 .with_outcome(Outcome::accepted(command.clone(), "digest")),
         )
         .await,
@@ -838,7 +895,14 @@ where
     let ns = namespace();
     let pk = format!("{ns}-orphan");
     let stream = Stream::new(&ns, "s", "ledger");
-    let view = || ProjectedView::new("orphan", 0, 0, ViewOperation::put(&pk, "r", "", "", "{}"));
+    let view = || {
+        ProjectedView::new(
+            "orphan",
+            0,
+            0,
+            ViewOperation::put(&pk, "r", "orphan", "", "{}"),
+        )
+    };
     let fence = || {
         ReadFence::new(
             stream.id.clone(),
@@ -931,7 +995,7 @@ where
     let error = error_of(
         attempt(vec![view(
             3,
-            ViewOperation::put(padded(&ns, 2049), "s", "", "", "{}"),
+            ViewOperation::put(padded(&ns, 2049), "s", "o", "", "{}"),
         )])
         .await,
         "a pk of 2049 bytes",
@@ -943,7 +1007,7 @@ where
     let error = error_of(
         attempt(vec![view(
             0,
-            ViewOperation::delete(format!("{ns}-p"), padded("", 1025)),
+            ViewOperation::delete(format!("{ns}-p"), padded("", 1025), "o"),
         )])
         .await,
         "an sk of 1025 bytes",
@@ -965,9 +1029,9 @@ where
     let key = format!("{ns}-dup");
     let error = error_of(
         attempt(vec![
-            view(0, ViewOperation::put(&key, "s", "", "", "{}")),
-            view(1, ViewOperation::put(&key, "t", "", "", "{}")),
-            view(2, ViewOperation::delete(&key, "s")),
+            view(0, ViewOperation::put(&key, "s", "o", "", "{}")),
+            view(1, ViewOperation::put(&key, "t", "o", "", "{}")),
+            view(2, ViewOperation::delete(&key, "s", "o")),
         ])
         .await,
         "a repeated key",
@@ -980,31 +1044,43 @@ where
 
     // Operations that cannot be stored the same way everywhere.
     let invalid = [
-        ("an empty pk", ViewOperation::put("", "s", "", "", "{}")),
-        ("an empty sk", ViewOperation::put(&key, "", "", "", "{}")),
+        ("an empty pk", ViewOperation::put("", "s", "o", "", "{}")),
+        ("an empty sk", ViewOperation::put(&key, "", "o", "", "{}")),
         (
-            "U+0000 in a pk",
-            ViewOperation::put(format!("{key}\0"), "s", "", "", "{}"),
+            "an empty owner",
+            ViewOperation::put(&key, "s", "", "", "{}"),
         ),
         (
-            "U+0000 in an entityID",
+            "an empty owner on a delete",
+            ViewOperation::delete(&key, "s", ""),
+        ),
+        (
+            "U+0000 in a pk",
+            ViewOperation::put(format!("{key}\0"), "s", "o", "", "{}"),
+        ),
+        (
+            "U+0000 in an owner",
             ViewOperation::put(&key, "s", "a\0", "", "{}"),
         ),
         (
+            "U+0000 in the owner of a delete",
+            ViewOperation::delete(&key, "s", "a\0"),
+        ),
+        (
             "U+0000 in a payload",
-            ViewOperation::put(&key, "s", "", "", "{\0}"),
+            ViewOperation::put(&key, "s", "o", "", "{\0}"),
         ),
         (
             "a payload that is not UTF-8",
-            ViewOperation::put(&key, "s", "", "", vec![0xff, 0xfe]),
+            ViewOperation::put(&key, "s", "o", "", vec![0xff, 0xfe]),
         ),
         (
             "a present put",
-            ViewOperation::put(&key, "s", "", "", "{}").if_present(),
+            ViewOperation::put(&key, "s", "o", "", "{}").if_present(),
         ),
         (
             "an absent delete",
-            ViewOperation::delete(&key, "s").if_absent(),
+            ViewOperation::delete(&key, "s", "o").if_absent(),
         ),
     ];
     for (what, op) in invalid {
@@ -1023,7 +1099,15 @@ where
     let long = Scripted::new("long", {
         let ns = ns.clone();
 
-        move |_| vec![ViewOperation::put(padded(&ns, 2049), "s", "", "", "{}")]
+        move |view| {
+            vec![ViewOperation::put(
+                padded(&ns, 2049),
+                "s",
+                view.streams[0].entity_id.clone(),
+                "",
+                "{}",
+            )]
+        }
     });
     let store = Store::<Ledger, _>::new(repo, ())
         .with_snapshot_interval(0)
@@ -1041,7 +1125,7 @@ where
     let (long_pk, long_sk) = (padded(&ns, 2048), padded("", 1024));
     attempt(vec![view(
         0,
-        ViewOperation::put(long_pk.clone(), long_sk.clone(), "", "", "{}"),
+        ViewOperation::put(long_pk.clone(), long_sk.clone(), "o", "", "{}"),
     )])
     .await?;
     ensure!(
@@ -1059,7 +1143,7 @@ fn bulk(pk: &str, count: usize, payload: &str) -> Vec<ProjectedView> {
                 "bulk",
                 0,
                 index,
-                ViewOperation::put(pk, format!("row-{index:03}"), "", "", payload),
+                ViewOperation::put(pk, format!("row-{index:03}"), "bulk-owner", "", payload),
             )
         })
         .collect()
@@ -1244,9 +1328,17 @@ where
                 .map(|ledger| ledger.total)
                 .unwrap_or_default();
 
+            let owner = stream.entity_id.clone();
+
             vec![
-                ViewOperation::put(pk.clone(), format!("total-{total}"), "", "", "{}"),
-                ViewOperation::put(pk.clone(), "latest", "", "", stream.state.clone()),
+                ViewOperation::put(
+                    pk.clone(),
+                    format!("total-{total}"),
+                    owner.clone(),
+                    "",
+                    "{}",
+                ),
+                ViewOperation::put(pk.clone(), "latest", owner, "", stream.state.clone()),
             ]
         })
     };
@@ -1314,7 +1406,7 @@ where
             vec![ViewOperation::put(
                 spk.clone(),
                 format!("total-{total}"),
-                "",
+                view.streams[0].entity_id.clone(),
                 "",
                 "{}",
             )]
@@ -1385,11 +1477,10 @@ where
                     ViewOperation::put(
                         pk.clone(),
                         format!("{}-{}", view.commit_id, stream.entity_id),
-                        "",
+                        stream.entity_id.clone(),
                         "",
                         types.join(","),
                     )
-                    .owned_by(stream.entity_id.clone())
                 })
                 .collect()
         })
@@ -1494,7 +1585,7 @@ fn fold<A: Aggregate>(
     Ok(json::to_vec(&aggregate)?)
 }
 
-async fn view_determinism<R, T>(repo: &R, _target: &T) -> CaseResult
+async fn view_determinism<R, T>(repo: &R, target: &T) -> CaseResult
 where
     R: Repository,
     T: CommitViewTarget<R>,
@@ -1538,8 +1629,8 @@ where
     );
 
     // The replay runs a fresh projector over each regrouped commit, with the state each stream
-    // had after it.
-    let replay = directory_reading(&ns);
+    // had after it, through the engine's own visibility and ownership rules.
+    let replay: Arc<dyn CommitProjector> = directory_reading(&ns);
     for group in &mut groups {
         for stream in &mut group.streams {
             let events: Vec<SerializedEvent> = stored
@@ -1566,13 +1657,26 @@ where
             .ok_or_else(|| Failure(format!("no live commit {}", group.commit_id)))?;
         ensure_eq!(group, view, "the regrouped view is the live view");
 
-        let replayed = replay
-            .project(group)
-            .map_err(|err| Failure(err.to_string()))?;
+        let replayed: Vec<ViewOperation> = project_commit(std::slice::from_ref(&replay), group)?
+            .into_iter()
+            .map(|item| item.op)
+            .collect();
         ensure_eq!(
             &replayed,
             operations,
             "the replayed operations are the live operations"
+        );
+    }
+
+    // The rebuilt rows are the rows the live commits left, field for field.
+    let rebuilt = replay_views(std::slice::from_ref(&replay), &groups)?;
+    ensure_eq!(rebuilt.len(), 5, "two directory rows and three summaries");
+    for want in &rebuilt {
+        let live = row(target, &want.pk, &want.sk).await?;
+        ensure_eq!(
+            live.as_ref(),
+            Some(want),
+            format!("the live row {}/{}", want.pk, want.sk)
         );
     }
 
@@ -1599,11 +1703,10 @@ where
                     ViewOperation::put(
                         pk.clone(),
                         stream.entity_id.as_str(),
-                        "",
+                        stream.entity_id.clone(),
                         "",
                         stream.events.len().to_string(),
                     )
-                    .owned_by(stream.entity_id.clone())
                 })
                 .collect()
         }
@@ -1632,6 +1735,292 @@ where
         "the declaration refuses compaction: {error:?}"
     );
     ensure_eq!(repo.events(&ledger).await?.len(), 2, "nothing was deleted");
+
+    Ok(())
+}
+
+async fn view_ownership<R, T>(repo: &R, target: &T) -> CaseResult
+where
+    R: Repository,
+    T: CommitViewTarget<R>,
+{
+    let ns = namespace();
+    let pk = format!("{ns}-plots");
+    let (a, b, c) = (ledger_id(), ledger_id(), ledger_id());
+
+    // Every projector below writes the one row `plots/plot`, owned by the stream it commits.
+    let plot = |name: &str, kind: ViewOperationKind, present: bool| {
+        let pk = pk.clone();
+
+        Scripted::new(name, move |view| {
+            let stream = &view.streams[0];
+            let op = match kind {
+                ViewOperationKind::Put => ViewOperation::put(
+                    pk.clone(),
+                    "plot",
+                    stream.entity_id.clone(),
+                    "ledger",
+                    stream.state.clone(),
+                ),
+                ViewOperationKind::Delete => {
+                    ViewOperation::delete(pk.clone(), "plot", stream.entity_id.clone())
+                }
+            };
+
+            vec![if present { op.if_present() } else { op }]
+        })
+    };
+    let owner_of = |row: Option<ViewRow>| row.map(|row| (row.entity_id, row.payload));
+    let state = |total: i64| json::to_vec(&Ledger { total, entries: 1 });
+
+    // A owns the row.
+    let putting = plot("put", ViewOperationKind::Put, false);
+    store_of(repo, &putting)
+        .execute(&a, Add(1), metadata())
+        .await?;
+    ensure_eq!(
+        owner_of(row(target, &pk, "plot").await?),
+        Some((a.to_string(), state(1)?)),
+        "the first stream owns the row"
+    );
+
+    // B can neither overwrite it nor delete it as a present row: a typed failure, nothing written.
+    let error = store_failed(
+        store_of(repo, &putting)
+            .execute(&b, Add(2), metadata())
+            .await,
+        "another stream's put",
+    )?;
+    let failed = expect_operation(
+        error,
+        "another stream's put",
+        ("put", 0),
+        0,
+        ViewOperationKind::Put,
+    )?;
+    ensure_eq!(
+        failed.reason.as_str(),
+        REASON_CONDITION_FAILED,
+        "the reason"
+    );
+
+    let present = plot("present", ViewOperationKind::Delete, true);
+    let error = store_failed(
+        store_of(repo, &present)
+            .execute(&b, Add(2), metadata())
+            .await,
+        "another stream's present delete",
+    )?;
+    expect_operation(
+        error,
+        "another stream's present delete",
+        ("present", 0),
+        0,
+        ViewOperationKind::Delete,
+    )?;
+    ensure!(repo.events(&b).await?.is_empty(), "B wrote nothing");
+    ensure_eq!(
+        owner_of(row(target, &pk, "plot").await?),
+        Some((a.to_string(), state(1)?)),
+        "the row is unchanged"
+    );
+
+    // An unconditional delete of another stream's row fails too, though it would succeed on an
+    // absent row.
+    let blind = plot("blind", ViewOperationKind::Delete, false);
+    let error = store_failed(
+        store_of(repo, &blind).execute(&c, Add(3), metadata()).await,
+        "another stream's blind delete",
+    )?;
+    expect_operation(
+        error,
+        "another stream's blind delete",
+        ("blind", 0),
+        0,
+        ViewOperationKind::Delete,
+    )?;
+    ensure!(repo.events(&c).await?.is_empty(), "C wrote nothing");
+    ensure_eq!(
+        owner_of(row(target, &pk, "plot").await?),
+        Some((a.to_string(), state(1)?)),
+        "the row is still A's"
+    );
+
+    // The owner overwrites its own row, and deletes it.
+    store_of(repo, &putting)
+        .execute(&a, Add(2), metadata())
+        .await?;
+    ensure_eq!(
+        owner_of(row(target, &pk, "plot").await?),
+        Some((
+            a.to_string(),
+            json::to_vec(&Ledger {
+                total: 3,
+                entries: 2
+            })?
+        )),
+        "the owner overwrote its row"
+    );
+    store_of(repo, &present)
+        .execute(&a, Add(1), metadata())
+        .await?;
+    ensure!(
+        row(target, &pk, "plot").await?.is_none(),
+        "the owner deleted its row"
+    );
+
+    // Once the row is gone, any stream may write the key.
+    store_of(repo, &putting)
+        .execute(&b, Add(2), metadata())
+        .await?;
+    ensure_eq!(
+        owner_of(row(target, &pk, "plot").await?).map(|(owner, _)| owner),
+        Some(b.to_string()),
+        "an absent row is claimed by whoever writes it"
+    );
+
+    Ok(())
+}
+
+/// A store of ledgers over `repo` with one commit-wide projector.
+fn store_of<'r, R: Repository>(repo: &'r R, projector: &Arc<Scripted>) -> Store<Ledger, &'r R> {
+    Store::new(repo, ())
+        .with_snapshot_interval(0)
+        .with_commit_projector(projector.clone())
+}
+
+async fn view_visibility<R, T>(repo: &R, target: &T) -> CaseResult
+where
+    R: Repository,
+    T: CommitViewTarget<R>,
+{
+    let ns = namespace();
+    let (ledger, claim) = (ledger_id(), claim_id());
+
+    // Two projectors that write nothing and record what they were given.
+    let current = Scripted::new("current", |_| Vec::new());
+    let reading = Scripted::reading("reading", &[Ledger::TYPE], |_| Vec::new());
+    let store = Store::<Ledger, _>::new(repo, ())
+        .with_snapshot_interval(0)
+        .with_commit_projector(current.clone())
+        .with_commit_projector(reading.clone());
+
+    let mut tx = store.transaction();
+    let mut ledger_read = tx.read::<Ledger>(&ledger).await?;
+    let mut claim_read = tx.read::<Claim>(&claim).await?;
+    tx.append(&mut ledger_read, added(5))?;
+    tx.append(
+        &mut claim_read,
+        vec![
+            Taken {
+                holder: "ada".into(),
+            }
+            .into(),
+        ],
+    )?;
+    let committed = tx.commit(&metadata()).await?;
+    let commit_id = committed[0].metadata.commit_id.clone();
+
+    // A current-state projector sees no commit ID and no events, and every stream's state.
+    let seen = current.emitted();
+    let [(view, _)] = &seen[..] else {
+        return Err(Failure(format!("one commit was projected: {seen:?}")));
+    };
+    ensure_eq!(
+        view.commit_id.as_str(),
+        "",
+        "a current-state projector sees no commit ID"
+    );
+    ensure_eq!(view.streams.len(), 2, "it sees both streams");
+    ensure!(
+        view.streams
+            .iter()
+            .all(|stream| stream.events.is_empty() && !stream.state.is_empty()),
+        "no events, every state: {view:?}"
+    );
+
+    // A history-dependent projector sees the commit ID, and events and state only of its types.
+    let seen = reading.emitted();
+    let [(view, _)] = &seen[..] else {
+        return Err(Failure(format!("one commit was projected: {seen:?}")));
+    };
+    ensure_eq!(
+        view.commit_id,
+        commit_id,
+        "a history projector sees the commit ID"
+    );
+    let by_id = |id: &EntityId| view.streams.iter().find(|stream| &stream.entity_id == id);
+    let declared = by_id(&ledger).ok_or_else(|| Failure("the ledger stream".into()))?;
+    ensure!(
+        declared.events.len() == 1 && !declared.state.is_empty(),
+        "a declared type's events and state: {declared:?}"
+    );
+    let undeclared = by_id(&claim).ok_or_else(|| Failure("the claim stream".into()))?;
+    ensure!(
+        undeclared.events.is_empty() && undeclared.state.is_empty(),
+        "an undeclared type's events and state are hidden: {undeclared:?}"
+    );
+
+    // A history projector may not own a row by a stream of a type it did not declare, and no
+    // projector by a stream the commit did not write. Nothing of either commit is written.
+    let pk = format!("{ns}-owned");
+    let claim_owner = {
+        let (pk, claim) = (pk.clone(), claim.clone());
+
+        Scripted::reading("claim-owner", &[Ledger::TYPE], move |_| {
+            vec![ViewOperation::put(
+                pk.clone(),
+                "row",
+                claim.clone(),
+                "",
+                "{}",
+            )]
+        })
+    };
+    let ghost_owner = {
+        let pk = pk.clone();
+
+        Scripted::new("ghost-owner", move |_| {
+            vec![ViewOperation::put(pk.clone(), "row", "ghost", "", "{}")]
+        })
+    };
+    for (what, projector) in [
+        ("an owner of an undeclared type", claim_owner),
+        ("an owner the commit did not write", ghost_owner),
+    ] {
+        let store = Store::<Ledger, _>::new(repo, ())
+            .with_snapshot_interval(0)
+            .with_commit_projector(projector);
+        let (other_ledger, other_claim) = (ledger_id(), claim_id());
+
+        let mut tx = store.transaction();
+        let mut ledger_read = tx.read::<Ledger>(&other_ledger).await?;
+        let mut claim_read = tx.read::<Claim>(&other_claim).await?;
+        tx.append(&mut ledger_read, added(1))?;
+        tx.append(
+            &mut claim_read,
+            vec![
+                Taken {
+                    holder: "grace".into(),
+                }
+                .into(),
+            ],
+        )?;
+        let error = error_of(tx.commit(&metadata()).await, what)?;
+        ensure!(
+            matches!(&error, Error::InvalidViewOperation(message) if message.contains("owner")),
+            "{what}: {error:?}"
+        );
+        ensure!(
+            repo.events(&other_ledger).await?.is_empty()
+                && repo.events(&other_claim).await?.is_empty(),
+            "{what}: nothing was written"
+        );
+    }
+    ensure!(
+        row(target, &pk, "row").await?.is_none(),
+        "no refused row was written"
+    );
 
     Ok(())
 }

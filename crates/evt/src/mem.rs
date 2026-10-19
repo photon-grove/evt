@@ -331,13 +331,16 @@ impl MemRepository {
         // View conditions rank last: a projector failure is reported only when nothing ranked
         // above it failed. Every condition is evaluated against the rows as they were before the
         // commit, in order, and the first failure is reported. Nothing is applied unless all hold.
+        // Every write is conditioned on the row's owner, as on DynamoDB: the stored `entity_id`
+        // is the owner, so an operation by another stream fails whatever its own condition.
         let mut rows = self.views_lock();
         for view in views {
-            let present = rows.contains_key(&(view.op.pk.clone(), view.op.sk.clone()));
+            let stored = rows.get(&(view.op.pk.clone(), view.op.sk.clone()));
+            let owned = stored.is_none_or(|row| row.entity_id == view.op.owner.as_str());
             let held = match view.op.condition {
-                ViewCondition::None => true,
-                ViewCondition::Absent => !present,
-                ViewCondition::Present => present,
+                ViewCondition::None => owned,
+                ViewCondition::Absent => stored.is_none(),
+                ViewCondition::Present => stored.is_some() && owned,
             };
 
             if !held {
@@ -705,8 +708,8 @@ mod tests {
         repository
             .commit(Commit::new("a", vec![event("a", 1)]).with_views([
                 view(0, ViewOperation::put("b", "2", "id", "type", "{\"n\":2}")),
-                view(1, ViewOperation::put("B", "1", "", "", "{}")),
-                view(2, ViewOperation::put("b", "1", "", "", "{}")),
+                view(1, ViewOperation::put("B", "1", "o", "", "{}")),
+                view(2, ViewOperation::put("b", "1", "o", "", "{}")),
             ]))
             .await
             .unwrap();
@@ -744,7 +747,7 @@ mod tests {
         repository
             .commit(
                 Commit::new("a", vec![event("a", 1)])
-                    .with_views([view(0, ViewOperation::put("claims", "ada", "", "", "{}"))]),
+                    .with_views([view(0, ViewOperation::put("claims", "ada", "o", "", "{}"))]),
             )
             .await
             .unwrap();
@@ -754,12 +757,15 @@ mod tests {
         let result = repository
             .commit_transaction(
                 TransactionCommit::new(vec![Commit::new("b", vec![event("b", 1)])]).with_views([
-                    view(0, ViewOperation::put("claims", "other", "", "", "{}")),
+                    view(0, ViewOperation::put("claims", "other", "o", "", "{}")),
                     view(
                         1,
-                        ViewOperation::put("claims", "ada", "", "", "{}").if_absent(),
+                        ViewOperation::put("claims", "ada", "o", "", "{}").if_absent(),
                     ),
-                    view(2, ViewOperation::delete("claims", "missing").if_present()),
+                    view(
+                        2,
+                        ViewOperation::delete("claims", "missing", "o").if_present(),
+                    ),
                 ]),
             )
             .await;
@@ -781,10 +787,10 @@ mod tests {
         // delete and a put of different keys apply together.
         repository
             .commit(Commit::new("b", vec![event("b", 1)]).with_views([
-                view(0, ViewOperation::delete("claims", "ada").if_present()),
+                view(0, ViewOperation::delete("claims", "ada", "o").if_present()),
                 view(
                     1,
-                    ViewOperation::put("claims", "grace", "", "", "{}").if_absent(),
+                    ViewOperation::put("claims", "grace", "o", "", "{}").if_absent(),
                 ),
             ]))
             .await
@@ -799,17 +805,17 @@ mod tests {
         repository
             .commit(
                 Commit::new("a", vec![event("a", 1)])
-                    .with_views([view(0, ViewOperation::put("claims", "ada", "", "", "{}"))]),
+                    .with_views([view(0, ViewOperation::put("claims", "ada", "o", "", "{}"))]),
             )
             .await
             .unwrap();
 
         let result = repository
             .commit(Commit::new("a", vec![event("a", 1)]).with_views([
-                view(0, ViewOperation::put("claims", "new", "", "", "{}")),
+                view(0, ViewOperation::put("claims", "new", "o", "", "{}")),
                 view(
                     1,
-                    ViewOperation::put("claims", "ada", "", "", "{}").if_absent(),
+                    ViewOperation::put("claims", "ada", "o", "", "{}").if_absent(),
                 ),
             ]))
             .await;
@@ -1073,7 +1079,7 @@ mod tests {
                         ViewOperation::put(
                             "p",
                             format!("row-{index:03}"),
-                            "",
+                            "o",
                             "",
                             "x".repeat(payload),
                         ),
@@ -1107,5 +1113,280 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repository.views().len(), 97);
+    }
+    /// A history-dependent projector whose rows depend on the events of the commit: one row per
+    /// stream, owned by it, listing the commit's event types and the state after them; and a
+    /// summary row per commit, keyed by its ID and owned by its first stream.
+    struct Journal;
+
+    impl CommitProjector for Journal {
+        fn name(&self) -> &str {
+            "journal"
+        }
+
+        fn history(&self) -> &[EntityType] {
+            static TYPES: std::sync::OnceLock<Vec<EntityType>> = std::sync::OnceLock::new();
+
+            TYPES.get_or_init(|| vec![EntityType::new("ledger"), EntityType::new("claim")])
+        }
+
+        fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+            let mut operations: Vec<ViewOperation> = commit
+                .streams
+                .iter()
+                .map(|stream| {
+                    let types: Vec<&str> = stream
+                        .events
+                        .iter()
+                        .map(|event| event.event_type.as_str())
+                        .collect();
+
+                    ViewOperation::put(
+                        "journal",
+                        stream.entity_id.as_str(),
+                        stream.entity_id.clone(),
+                        stream.entity_type.as_str(),
+                        format!(
+                            "{} {}",
+                            types.join(","),
+                            String::from_utf8_lossy(&stream.state)
+                        ),
+                    )
+                })
+                .collect();
+            operations.push(ViewOperation::put(
+                "commits",
+                commit.commit_id.as_str(),
+                commit.streams[0].entity_id.clone(),
+                "",
+                format!("{} streams", commit.streams.len()),
+            ));
+
+            Ok(operations)
+        }
+    }
+
+    fn fold<A: crate::Aggregate>(events: &[SerializedEvent], through: EventSequence) -> Vec<u8> {
+        let mut aggregate = A::default();
+        for event in events.iter().filter(|event| event.sequence <= through) {
+            aggregate.apply(
+                <A::Event as crate::DomainEvent>::from_payload(
+                    event.event_type.as_str(),
+                    event.version,
+                    &event.payload,
+                )
+                .unwrap(),
+            );
+        }
+
+        crate::json::to_vec(&aggregate).unwrap()
+    }
+
+    /// The end-to-end contract of a history-dependent projector: the rows the live commits leave
+    /// are exactly the rows a rebuild reproduces from the stored events, the state each stream had
+    /// after each commit, and the commits regrouped by commit ID. Contents are compared, not
+    /// counts.
+    #[tokio::test]
+    async fn a_rebuild_reproduces_the_rows_the_live_commits_left() {
+        use crate::conformance::{Add, Added, Claim, Ledger, Take, Taken};
+        use crate::{Metadata, Store, group_commits, replay_views};
+
+        let repository = MemRepository::new();
+        let projector: std::sync::Arc<dyn CommitProjector> = std::sync::Arc::new(Journal);
+        let store = Store::<Ledger, _>::new(repository.clone(), ())
+            .with_snapshot_interval(2)
+            .with_commit_projector(projector.clone());
+        let claims = Store::<Claim, _>::new(repository.clone(), ())
+            .with_snapshot_interval(2)
+            .with_commit_projector(projector.clone());
+
+        // Single-stream commits, interleaved with a multi-stream one and a snapshot boundary.
+        store
+            .execute("ledger-1", Add(5), Metadata::default())
+            .await
+            .unwrap();
+        claims
+            .execute("claim-1", Take("ada".into()), Metadata::default())
+            .await
+            .unwrap();
+        let mut tx = store.transaction();
+        let mut ledger = tx.read::<Ledger>("ledger-1").await.unwrap();
+        let mut other = tx.read::<Ledger>("ledger-2").await.unwrap();
+        let mut claim = tx.read::<Claim>("claim-2").await.unwrap();
+        tx.append(
+            &mut ledger,
+            vec![Added { amount: 1 }.into(), Added { amount: 2 }.into()],
+        )
+        .unwrap();
+        tx.append(&mut other, vec![Added { amount: 9 }.into()])
+            .unwrap();
+        tx.append(
+            &mut claim,
+            vec![
+                Taken {
+                    holder: "grace".into(),
+                }
+                .into(),
+            ],
+        )
+        .unwrap();
+        tx.commit(&Metadata::default()).await.unwrap();
+        store
+            .execute("ledger-2", Add(1), Metadata::default())
+            .await
+            .unwrap();
+        store
+            .execute("ledger-1", Add(3), Metadata::default())
+            .await
+            .unwrap();
+
+        let live: Vec<(String, String, String, String)> = repository
+            .views()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.pk,
+                    row.sk,
+                    row.entity_id,
+                    String::from_utf8(row.payload).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            live.len(),
+            4 + 5,
+            "four streams' rows and five commits' summaries"
+        );
+
+        let mut stored = Vec::new();
+        for id in ["ledger-1", "ledger-2", "claim-1", "claim-2"] {
+            stored.extend(repository.events(&id.into()).await.unwrap());
+        }
+        let mut commits = group_commits(stored.clone()).unwrap();
+        assert_eq!(commits.len(), 5);
+        for commit in &mut commits {
+            for stream in &mut commit.streams {
+                let events: Vec<SerializedEvent> = stored
+                    .iter()
+                    .filter(|event| event.entity_id == stream.entity_id)
+                    .cloned()
+                    .collect();
+                let through = stream.events.last().unwrap().sequence;
+
+                stream.state = if stream.entity_type.as_str() == "claim" {
+                    fold::<Claim>(&events, through)
+                } else {
+                    fold::<Ledger>(&events, through)
+                };
+            }
+        }
+
+        let rebuilt: Vec<(String, String, String, String)> = replay_views(&[projector], &commits)
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.pk,
+                    row.sk,
+                    row.entity_id,
+                    String::from_utf8(row.payload).unwrap(),
+                )
+            })
+            .collect();
+
+        assert_eq!(rebuilt, live);
+        // The journal row of ledger-1 shows the last commit's event and the final state.
+        assert!(
+            live.iter().any(|row| row.0 == "journal"
+                && row.1 == "ledger-1"
+                && row.3 == r#"ledger:added {"total":11,"entries":4}"#),
+            "{live:?}"
+        );
+    }
+    #[tokio::test]
+    async fn only_a_rows_owner_overwrites_or_deletes_it() {
+        let repository = MemRepository::new();
+        repository
+            .commit(Commit::new("a", vec![event("a", 1)]).with_views([view(
+                0,
+                ViewOperation::put("rows", "r", "a", "t", "{\"v\":1}"),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(repository.view("rows", "r").unwrap().entity_id, "a");
+
+        // Another stream's put, unconditional or not, and its delete, conditional or not, all
+        // fail the condition, and nothing of the failing commit is written.
+        let foreign = [
+            ViewOperation::put("rows", "r", "b", "t", "{\"v\":2}"),
+            ViewOperation::put("rows", "r", "b", "t", "{\"v\":2}").if_absent(),
+            ViewOperation::delete("rows", "r", "b"),
+            ViewOperation::delete("rows", "r", "b").if_present(),
+        ];
+        for op in foreign {
+            let result = repository
+                .commit(Commit::new("b", vec![event("b", 1)]).with_views([view(0, op.clone())]))
+                .await;
+
+            match result {
+                Err(Error::ProjectorOperation(failed)) => {
+                    assert_eq!(failed.reason, "ConditionalCheckFailed", "{op:?}");
+                }
+                other => panic!("{op:?}: expected a failed condition, got {other:?}"),
+            }
+            assert!(repository.events(&"b".into()).await.unwrap().is_empty());
+            let row = repository.view("rows", "r").unwrap();
+            assert_eq!(
+                (row.entity_id.as_str(), row.payload.as_slice()),
+                ("a", b"{\"v\":1}".as_slice())
+            );
+        }
+
+        // The owner overwrites its row, and deletes it.
+        repository
+            .commit(Commit::new("a", vec![event("a", 2)]).with_views([view(
+                0,
+                ViewOperation::put("rows", "r", "a", "t", "{\"v\":3}"),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(repository.view("rows", "r").unwrap().payload, b"{\"v\":3}");
+        repository
+            .commit(Commit::new("a", vec![event("a", 3)]).with_views([view(
+                0,
+                ViewOperation::delete("rows", "r", "a").if_present(),
+            )]))
+            .await
+            .unwrap();
+        assert!(repository.view("rows", "r").is_none());
+
+        // A delete of an absent row succeeds for anyone; a present delete does not.
+        repository
+            .commit(
+                Commit::new("b", vec![event("b", 1)])
+                    .with_views([view(0, ViewOperation::delete("rows", "r", "b"))]),
+            )
+            .await
+            .unwrap();
+        let result = repository
+            .commit(Commit::new("b", vec![event("b", 2)]).with_views([view(
+                0,
+                ViewOperation::delete("rows", "r", "b").if_present(),
+            )]))
+            .await;
+        assert!(
+            matches!(result, Err(Error::ProjectorOperation(_))),
+            "{result:?}"
+        );
+
+        // Once the row is gone any stream may take the key.
+        repository
+            .commit(Commit::new("b", vec![event("b", 2)]).with_views([view(
+                0,
+                ViewOperation::put("rows", "r", "b", "t", "{}").if_absent(),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(repository.view("rows", "r").unwrap().entity_id, "b");
     }
 }

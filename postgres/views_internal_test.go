@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -17,7 +18,7 @@ func projectedView(op evt.ViewOperation) evt.ProjectedView {
 func Test_mapViewError_AUniqueViolationOnAnAbsentPutIsItsFailedCondition(t *testing.T) {
 	taken := errors.New("taken")
 	cause := &pgconn.PgError{Code: "23505", ConstraintName: "views_pkey"}
-	view := projectedView(evt.PutView("pk", "sk", "", "", nil).IfAbsent().OnConflict(taken))
+	view := projectedView(evt.PutView("pk", "sk", "o", "", nil).IfAbsent().OnConflict(taken))
 
 	err := mapViewError(view, "views_pkey", cause)
 
@@ -37,7 +38,7 @@ func Test_mapViewError_AnyOtherDatabaseErrorIsTheStatementsFailureWithItsSQLStat
 
 	// An unconditioned put that hits a constraint is not a failed condition: its mapped error, if
 	// any, does not apply, and the reason is the SQLSTATE.
-	view := projectedView(evt.PutView("pk", "sk", "", "", nil).OnConflict(errors.New("taken")))
+	view := projectedView(evt.PutView("pk", "sk", "o", "", nil).OnConflict(errors.New("taken")))
 
 	var failed *evt.ProjectorOperationError
 
@@ -52,7 +53,7 @@ func Test_mapViewError_AnyOtherDatabaseErrorIsTheStatementsFailureWithItsSQLStat
 }
 
 func Test_mapViewError_ATransactionRollbackOrAConnectionErrorIsNotTheProjectors(t *testing.T) {
-	view := projectedView(evt.PutView("pk", "sk", "", "", nil))
+	view := projectedView(evt.PutView("pk", "sk", "o", "", nil))
 
 	for name, cause := range map[string]error{
 		"serialization failure": &pgconn.PgError{Code: "40001"},
@@ -77,7 +78,7 @@ func Test_viewCommitError_AnIntegrityViolationAtCommitIsTheProjectorsAndNamesNoO
 
 func Test_buildViews_RefusesWithoutAWriterAndWrapsAWriterFailure(t *testing.T) {
 	repo := NewRepository(nil)
-	views := []evt.ProjectedView{projectedView(evt.PutView("pk", "sk", "", "", nil))}
+	views := []evt.ProjectedView{projectedView(evt.PutView("pk", "sk", "o", "", nil))}
 
 	_, err := repo.buildViews(views)
 
@@ -117,7 +118,7 @@ func Test_buildViews_RefusesWithoutAWriterAndWrapsAWriterFailure(t *testing.T) {
 
 func Test_mapViewError_AUniqueViolationOfAnotherConstraintIsNotTheFailedCondition(t *testing.T) {
 	taken := errors.New("taken")
-	view := projectedView(evt.PutView("pk", "sk", "", "", nil).IfAbsent().OnConflict(taken))
+	view := projectedView(evt.PutView("pk", "sk", "o", "", nil).IfAbsent().OnConflict(taken))
 	cause := &pgconn.PgError{Code: "23505", ConstraintName: "views_payload_key"}
 
 	var failed *evt.ProjectorOperationError
@@ -134,7 +135,7 @@ func Test_mapViewError_AUniqueViolationOfAnotherConstraintIsNotTheFailedConditio
 }
 
 func Test_buildViews_AnAbsentPutNeedsTheKeyConstraintNamed(t *testing.T) {
-	views := []evt.ProjectedView{projectedView(evt.PutView("pk", "sk", "", "", nil).IfAbsent())}
+	views := []evt.ProjectedView{projectedView(evt.PutView("pk", "sk", "o", "", nil).IfAbsent())}
 
 	unnamed := NewRepository(nil).WithViewWriter(func(evt.ViewOperation) (ViewStatement, error) {
 		return ViewStatement{SQL: "INSERT INTO v VALUES ($1)"}, nil
@@ -153,6 +154,38 @@ func Test_buildViews_AnAbsentPutNeedsTheKeyConstraintNamed(t *testing.T) {
 	require.NoError(t, err)
 
 	// An unconditioned put needs no constraint: it overwrites.
-	_, err = unnamed.buildViews([]evt.ProjectedView{projectedView(evt.PutView("pk", "sk", "", "", nil))})
+	_, err = unnamed.buildViews([]evt.ProjectedView{projectedView(evt.PutView("pk", "sk", "o", "", nil))})
 	require.NoError(t, err)
+}
+
+func Test_viewConditionFailed_ReadsTheAffectedRowCountPerOperationShape(t *testing.T) {
+	put := evt.PutView("pk", "sk", "o", "", nil)
+	deletion := evt.DeleteView("pk", "sk", "o")
+
+	// An upsert guarded by the owner affects no row when another owner holds the key.
+	require.False(t, viewConditionFailed(put, 1))
+	require.True(t, viewConditionFailed(put, 0))
+
+	// A put that requires the row to be absent fails with a unique violation, never by count.
+	require.False(t, viewConditionFailed(put.IfAbsent(), 0))
+	require.False(t, viewConditionFailed(put.IfAbsent(), 1))
+
+	// A delete that requires the owner's row fails when it deleted none.
+	require.False(t, viewConditionFailed(deletion.IfPresent(), 1))
+	require.True(t, viewConditionFailed(deletion.IfPresent(), 0))
+
+	// A delete without a condition reports the rows of another owner it found, which fail it.
+	require.False(t, viewConditionFailed(deletion, 0))
+	require.True(t, viewConditionFailed(deletion, 1))
+}
+
+func Test_DeclareHistoryDependent_ChecksTheFeatureMarkerBeforeAnyRead(t *testing.T) {
+	repo := NewRepository(nil)
+
+	moved := *repo
+	moved.eventsTable = "other_events"
+
+	var mismatch *evt.FeatureMarkerTableMismatchError
+
+	require.ErrorAs(t, moved.DeclareHistoryDependent(context.Background(), "account"), &mismatch)
 }

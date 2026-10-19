@@ -142,16 +142,31 @@ impl PostgresRepository {
     /// Writes commit-wide view operations (v0.9, C7) with `writer`. Without one, a commit that
     /// carries view operations is refused with [`Error::ViewsNotConfigured`] before any write.
     ///
-    /// The repository decides whether an operation's condition held from its statement's outcome,
-    /// so the writer's statements must have these semantics:
+    /// **The writer must enforce ownership in SQL.** Every operation names an
+    /// [owner](crate::ViewOperation::owner), the stream that owns the row and the value of its
+    /// `entity_id` column; no operation may overwrite or delete a row another stream owns, and the
+    /// engine cannot check that for you. The repository decides whether an operation's condition
+    /// held from its statement's outcome, so the writer's statements must have these semantics:
     ///
     /// - a put with [`ViewCondition::Absent`] must raise a unique violation (`23505`) of the
     ///   `(pk, sk)` key constraint when the row exists: write a plain `INSERT`, with no
     ///   `ON CONFLICT` clause, and name the constraint with [`PgStatement::with_key_constraint`];
-    /// - a put without a condition overwrites: an `INSERT ... ON CONFLICT DO UPDATE`;
-    /// - a delete with [`ViewCondition::Present`] must delete a row: a `DELETE` that affects no
-    ///   row fails the condition;
-    /// - a delete without a condition succeeds whether or not it deleted a row.
+    /// - any other put is an upsert that only the owner may overwrite:
+    ///   `INSERT ... ON CONFLICT (pk, sk) DO UPDATE SET ... WHERE <table>.entity_id =
+    ///   EXCLUDED.entity_id`. A put that affects no row (the row belongs to another stream) fails
+    ///   its condition;
+    /// - a delete with [`ViewCondition::Present`] must delete the owner's row:
+    ///   `DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3`. A delete that affects no row
+    ///   (the row is absent, or another stream's) fails the condition;
+    /// - a delete without a condition succeeds whether or not it deleted a row, and refuses
+    ///   another stream's row. Its statement reports the foreign rows it found instead of the rows
+    ///   it deleted: `WITH gone AS (DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3)
+    ///   SELECT 1 FROM <table> WHERE pk = $1 AND sk = $2 AND entity_id <> $3`. An affected-row
+    ///   count above zero fails the condition. A plain `DELETE` is wrong here: it would silently
+    ///   do nothing to another stream's row, and the engine could not tell.
+    ///
+    /// **A row's owner must never change.** Never delete a row to hand its key to another stream;
+    /// keep the row and rewrite it, as its owner, with a tombstone payload.
     ///
     /// A failed condition is an [`Error::ProjectorOperation`] with the reason
     /// [`REASON_CONDITION_FAILED`]; any other error the database raises from a view statement is
@@ -967,10 +982,7 @@ impl PostgresRepository {
                 .await
                 .map_err(|err| view_error(view, statement.key_constraint.as_deref(), err))?;
 
-            if view.op.kind == ViewOperationKind::Delete
-                && view.op.condition == ViewCondition::Present
-                && affected == 0
-            {
+            if view_condition_failed(&view.op, affected) {
                 return Err(Error::ProjectorOperation(Box::new(
                     ProjectorOperationError::condition_failed(view),
                 )));
@@ -1401,6 +1413,21 @@ fn projector_error(err: tokio_postgres::Error) -> Error {
     }
 }
 
+/// Reads a view statement's affected-row count (see
+/// [`with_view_writer`](PostgresRepository::with_view_writer)): a put without a presence condition
+/// and a delete that requires the row affect no row when the owner's condition fails; a delete
+/// without a condition reports (affects) a row only when another stream's holds the key; a put that
+/// requires the row to be absent fails with a unique violation instead, mapped by [`view_error`].
+fn view_condition_failed(op: &ViewOperation, affected: u64) -> bool {
+    match (op.kind, op.condition) {
+        (ViewOperationKind::Put, ViewCondition::Absent) => false,
+        (ViewOperationKind::Put, _) | (ViewOperationKind::Delete, ViewCondition::Present) => {
+            affected == 0
+        }
+        (ViewOperationKind::Delete, _) => affected > 0,
+    }
+}
+
 /// Pairs each view operation with the statement its writer built.
 fn view_writes<'a>(
     views: &'a [ProjectedView],
@@ -1409,13 +1436,13 @@ fn view_writes<'a>(
     views.iter().zip(statements).collect()
 }
 
-/// Maps an error a view statement raised. A violation of the `(pk, sk)` key constraint on a put that
-/// requires the row to be absent is its failed condition; a unique violation of any other
-/// constraint is an ordinary failure of the statement. Any other error the database raised belongs to the statement, so
-/// it is the operation's failure with the SQLSTATE as its reason, except a transaction rollback
-/// (serialization failure, deadlock), which is not the projector's doing and passes through as
-/// transient like for every other statement of the commit. A lost connection or pool timeout is a
-/// backend failure.
+/// Maps an error a view statement raised. A violation of the `(pk, sk)` key constraint on a put
+/// that requires the row to be absent is its failed condition; a unique violation of any other
+/// constraint is an ordinary failure of the statement. Any other error the database raised belongs
+/// to the statement, so it is the operation's failure with the SQLSTATE as its reason, except a
+/// transaction rollback (serialization failure, deadlock), which is not the projector's doing and
+/// passes through as transient like for every other statement of the commit. A lost connection or
+/// pool timeout is a backend failure.
 fn view_error(
     view: &ProjectedView,
     key_constraint: Option<&str>,
@@ -1574,7 +1601,7 @@ mod tests {
             .map(|index| {
                 view(
                     index,
-                    ViewOperation::put("p", format!("row-{index:03}"), "", "", "{}"),
+                    ViewOperation::put("p", format!("row-{index:03}"), "o", "", "{}"),
                 )
             })
             .collect()
@@ -1714,7 +1741,7 @@ mod tests {
 
         let long = vec![view(
             0,
-            ViewOperation::put("p".repeat(2049), "s", "", "", "{}"),
+            ViewOperation::put("p".repeat(2049), "s", "o", "", "{}"),
         )];
         let result = repository
             .commit(Commit::<PgStatement>::new("a", vec![event("a", 1)]).with_views(long))
@@ -1725,8 +1752,8 @@ mod tests {
         );
 
         let repeated = vec![
-            view(0, ViewOperation::put("p", "s", "", "", "{}")),
-            view(1, ViewOperation::delete("p", "s")),
+            view(0, ViewOperation::put("p", "s", "o", "", "{}")),
+            view(1, ViewOperation::delete("p", "s", "o")),
         ];
         let result = repository
             .commit_transaction(

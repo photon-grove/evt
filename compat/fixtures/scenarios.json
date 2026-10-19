@@ -6331,7 +6331,13 @@
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#audit",
               "sk": 0,
-              "skText": "c2"
+              "skText": "c2",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Update",
@@ -6393,7 +6399,13 @@
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
               "sk": 0,
-              "skText": "account"
+              "skText": "account",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Delete",
@@ -6401,7 +6413,12 @@
               "pk": "compat-fixture-commit-wide-views#directory",
               "sk": 0,
               "skText": "ledger",
-              "condition": "attribute_exists(pk)"
+              "condition": "attribute_exists(pk) AND entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -6474,14 +6491,26 @@
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
               "sk": 0,
-              "skText": "fresh"
+              "skText": "fresh",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Put",
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#claims",
               "sk": 0,
-              "skText": "handle#hedy"
+              "skText": "handle#hedy",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -6533,14 +6562,26 @@
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
               "sk": 0,
-              "skText": "fresh"
+              "skText": "fresh",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Put",
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#claims",
               "sk": 0,
-              "skText": "handle#hedy"
+              "skText": "handle#hedy",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Put",
@@ -6593,7 +6634,12 @@
               "pk": "compat-fixture-commit-wide-views#directory",
               "sk": 0,
               "skText": "ledger",
-              "condition": "attribute_exists(pk)"
+              "condition": "attribute_exists(pk) AND entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Update",
@@ -6637,14 +6683,26 @@
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
               "sk": 0,
-              "skText": "fresh"
+              "skText": "fresh",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Put",
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
               "sk": 0,
-              "skText": "account"
+              "skText": "account",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Delete",
@@ -6652,7 +6710,12 @@
               "pk": "compat-fixture-commit-wide-views#audit",
               "sk": 0,
               "skText": "c2",
-              "condition": "attribute_exists(pk)"
+              "condition": "attribute_exists(pk) AND entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views"
+                }
+              }
             },
             {
               "operation": "Update",
@@ -6673,6 +6736,106 @@
               "operation": "Put",
               "pk": "compat-fixture-commit-wide-views",
               "sk": 4,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 11,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "account",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views-other"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "5"
+                },
+                ":prev": {
+                  "N": "4"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 5,
+              "condition": "attribute_not_exists(sk)"
+            }
+          ]
+        },
+        {
+          "step": 12,
+          "actions": [
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#FEATURES",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk) OR version = :v",
+              "values": {
+                ":v": {
+                  "N": "1"
+                }
+              }
+            },
+            {
+              "operation": "Delete",
+              "table": "views",
+              "pk": "compat-fixture-commit-wide-views#directory",
+              "sk": 0,
+              "skText": "account",
+              "condition": "attribute_not_exists(pk) OR entityID = :owner",
+              "values": {
+                ":owner": {
+                  "S": "compat-fixture-commit-wide-views-other"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": -1,
+              "update": "SET head = :last",
+              "condition": "head = :prev",
+              "values": {
+                ":last": {
+                  "N": "5"
+                },
+                ":prev": {
+                  "N": "4"
+                }
+              }
+            },
+            {
+              "operation": "Put",
+              "pk": "compat-fixture-commit-wide-views",
+              "sk": 5,
               "condition": "attribute_not_exists(sk)"
             }
           ]
@@ -7014,7 +7177,13 @@
                 "table": "views",
                 "pk": "ledger",
                 "sk": 0,
-                "skText": "compat-fixture-commit-wide-projector"
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
               },
               {
                 "operation": "Update",
@@ -7063,7 +7232,13 @@
                 "table": "views",
                 "pk": "ledger",
                 "sk": 0,
-                "skText": "compat-fixture-commit-wide-projector"
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
               },
               {
                 "operation": "Update",
@@ -7115,7 +7290,13 @@
                 "table": "views",
                 "pk": "ledger",
                 "sk": 0,
-                "skText": "compat-fixture-commit-wide-projector"
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
               },
               {
                 "operation": "Update",
@@ -7185,7 +7366,13 @@
                 "table": "views",
                 "pk": "ledger",
                 "sk": 0,
-                "skText": "compat-fixture-commit-wide-projector"
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
               },
               {
                 "operation": "Update",
@@ -7296,7 +7483,13 @@
                 "table": "views",
                 "pk": "ledger",
                 "sk": 0,
-                "skText": "compat-fixture-commit-wide-projector"
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
               },
               {
                 "operation": "Update",
@@ -7348,7 +7541,13 @@
                 "table": "views",
                 "pk": "ledger",
                 "sk": 0,
-                "skText": "compat-fixture-commit-wide-projector"
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
               },
               {
                 "operation": "Update",
@@ -7400,7 +7599,13 @@
                 "table": "views",
                 "pk": "ledger",
                 "sk": 0,
-                "skText": "compat-fixture-commit-wide-projector"
+                "skText": "compat-fixture-commit-wide-projector",
+                "condition": "attribute_not_exists(pk) OR entityID = :owner",
+                "values": {
+                  ":owner": {
+                    "S": "compat-fixture-commit-wide-projector"
+                  }
+                }
               },
               {
                 "operation": "Update",

@@ -9,14 +9,25 @@ import (
 	"github.com/photon-grove/evt"
 )
 
-// The condition expressions of commit-wide view operations (storage spec, Views): a put that must
-// not replace a row, and a delete that must find one.
+// The condition expressions of commit-wide view operations (storage spec, Views). Every view write
+// is conditioned on the row's owner, the stream stored in its entityID attribute and given to the
+// expression as :owner, so a row can never change hands: the write is refused when the row exists
+// and belongs to another stream.
 const (
-	// ViewAbsentCondition is a conditional view put's condition.
+	// ViewAbsentCondition is a view put that must not replace a row. The row is absent, so there is
+	// no owner to check.
 	ViewAbsentCondition = "attribute_not_exists(pk)"
 
-	// ViewPresentCondition is a conditional view delete's condition.
-	ViewPresentCondition = "attribute_exists(pk)"
+	// ViewOwnedCondition is every other view put and every delete without a presence condition:
+	// the row is absent or belongs to the operation's owner.
+	ViewOwnedCondition = "attribute_not_exists(pk) OR entityID = :owner"
+
+	// ViewPresentCondition is a view delete that must find a row: the row exists and belongs to
+	// the operation's owner.
+	ViewPresentCondition = "attribute_exists(pk) AND entityID = :owner"
+
+	// ViewOwnerValue is the expression value naming the operation's owner.
+	ViewOwnerValue = ":owner"
 )
 
 // WithViewsTable returns a shallow copy of the repository that writes commit-wide view operations
@@ -66,26 +77,39 @@ func (repo *Repository) buildViewItem(op evt.ViewOperation) (types.TransactWrite
 				"sk": &types.AttributeValueMemberS{Value: op.SK},
 			},
 		}
+		deletion.ConditionExpression = aws.String(ViewOwnedCondition)
 		if op.Condition == evt.ViewPresent {
 			deletion.ConditionExpression = aws.String(ViewPresentCondition)
 		}
+
+		deletion.ExpressionAttributeValues = ownerValue(op)
 
 		return types.TransactWriteItem{Delete: &deletion}, nil
 	}
 
 	item, err := MarshalViewToItem(repo.encoder, &evt.SerializedView{
-		PK: op.PK, SK: op.SK, EntityID: op.EntityID, EntityType: op.EntityType, Payload: op.Payload,
+		PK: op.PK, SK: op.SK, EntityID: op.Owner, EntityType: op.EntityType, Payload: op.Payload,
 	})
 	if err != nil {
 		return types.TransactWriteItem{}, err
 	}
 
-	put := types.Put{TableName: aws.String(repo.viewsTable), Item: item}
+	put := types.Put{
+		TableName:                 aws.String(repo.viewsTable),
+		Item:                      item,
+		ConditionExpression:       aws.String(ViewOwnedCondition),
+		ExpressionAttributeValues: ownerValue(op),
+	}
 	if op.Condition == evt.ViewAbsent {
 		put.ConditionExpression = aws.String(ViewAbsentCondition)
+		put.ExpressionAttributeValues = nil
 	}
 
 	return types.TransactWriteItem{Put: &put}, nil
+}
+
+func ownerValue(op evt.ViewOperation) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{ViewOwnerValue: &types.AttributeValueMemberS{Value: string(op.Owner)}}
 }
 
 // viewFailure maps a failed view item of a cancelled commit to the typed error naming its projector
@@ -106,12 +130,16 @@ func viewFailure(view evt.ProjectedView, code string, cause error) error {
 
 // WritesViews declares that Commit writes commit-wide view operations, or refuses them with
 // *evt.ViewsNotConfiguredError when no views table is configured (evt.ViewWritingRepository).
-func (repo *Repository) WritesViews() {}
+func (repo *Repository) WritesViews() bool { return true }
 
 // DeclareHistoryDependent durably adds the entity types to the feature manifest's historyDependent
 // set, so CompactBelow refuses them in every process (evt.HistoryDeclarer). Types already declared
 // are left alone and nothing is written.
 func (repo *Repository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
 	manifest, err := repo.features.Manifest(ctx)
 	if err != nil {
 		return err

@@ -83,11 +83,17 @@ pub struct ViewOperation {
     pub pk: String,
     /// The row's sort key, chosen by the projector. Required.
     pub sk: String,
-    /// Informational and always written by a put; readers never interpret it. A row that belongs
-    /// to no single entity repeats the commit's primary stream or any stable label. Empty for a
-    /// delete.
-    pub entity_id: String,
-    /// Informational, like [`entity_id`](ViewOperation::entity_id).
+    /// The stream the row belongs to: required, and stored as the row's `entityID` attribute. It
+    /// must be a stream the commit wrote. Every write to a row is conditioned on its owner: an
+    /// operation by any other stream fails with [`Error::ProjectorOperation`], so a stream never
+    /// takes over, overwrites, or deletes another stream's row.
+    ///
+    /// **A row's owner must never change.** To give a key to another stream, do not delete the row
+    /// and put it again under the new owner: keep the row and rewrite it, as its owner, with a
+    /// tombstone payload. A replay orders the writes to a row by its owner's sequence, the only
+    /// commit order the log keeps, and a row two owners wrote has no such order.
+    pub owner: EntityId,
+    /// Informational and always written by a put; readers never interpret it. Empty for a delete.
     pub entity_type: String,
     /// The view state JSON of a put. It must be valid UTF-8, because DynamoDB stores it as a
     /// string. Empty for a delete.
@@ -97,12 +103,6 @@ pub struct ViewOperation {
     /// The projector's own error for the case where the condition fails. The commit's
     /// [`ProjectorOperationError`] reports it as its [`source`](StdError::source).
     pub conflict: Option<Arc<dyn StdError + Send + Sync + 'static>>,
-    /// The stream the row belongs to. A history-dependent projector (one whose
-    /// [`history`](CommitProjector::history) is not empty) must name one for every operation, and
-    /// it must be a stream the commit wrote: then every write to a row is ordered by that stream's
-    /// own sequence, the only commit order the log keeps, and a replay can apply them in that
-    /// order. A current-state projector needs no owner. In-memory commit data, never stored.
-    pub owner: Option<EntityId>,
 }
 
 impl ViewOperation {
@@ -110,7 +110,7 @@ impl ViewOperation {
     pub fn put(
         pk: impl Into<String>,
         sk: impl Into<String>,
-        entity_id: impl Into<String>,
+        owner: impl Into<EntityId>,
         entity_type: impl Into<String>,
         payload: impl Into<Vec<u8>>,
     ) -> Self {
@@ -118,27 +118,29 @@ impl ViewOperation {
             kind: ViewOperationKind::Put,
             pk: pk.into(),
             sk: sk.into(),
-            entity_id: entity_id.into(),
+            owner: owner.into(),
             entity_type: entity_type.into(),
             payload: payload.into(),
             condition: ViewCondition::None,
             conflict: None,
-            owner: None,
         }
     }
 
-    /// An operation that deletes the row at `pk` and `sk`.
-    pub fn delete(pk: impl Into<String>, sk: impl Into<String>) -> Self {
+    /// An operation that deletes the row at `pk` and `sk`, which only its `owner` may delete.
+    pub fn delete(
+        pk: impl Into<String>,
+        sk: impl Into<String>,
+        owner: impl Into<EntityId>,
+    ) -> Self {
         Self {
             kind: ViewOperationKind::Delete,
             pk: pk.into(),
             sk: sk.into(),
-            entity_id: String::new(),
+            owner: owner.into(),
             entity_type: String::new(),
             payload: Vec::new(),
             condition: ViewCondition::None,
             conflict: None,
-            owner: None,
         }
     }
 
@@ -158,13 +160,6 @@ impl ViewOperation {
         self
     }
 
-    /// Names the stream the row belongs to; see [`owner`](ViewOperation::owner).
-    #[must_use]
-    pub fn owned_by(mut self, owner: impl Into<EntityId>) -> Self {
-        self.owner = Some(owner.into());
-        self
-    }
-
     /// Maps a failed condition to the projector's own error: the commit's
     /// [`ProjectorOperationError`] reports `error` as its [`source`](StdError::source), so the
     /// application matches its own error value.
@@ -180,11 +175,10 @@ impl PartialEq for ViewOperation {
         self.kind == other.kind
             && self.pk == other.pk
             && self.sk == other.sk
-            && self.entity_id == other.entity_id
+            && self.owner == other.owner
             && self.entity_type == other.entity_type
             && self.payload == other.payload
             && self.condition == other.condition
-            && self.owner == other.owner
             && self.conflict.as_ref().map(|error| error.to_string())
                 == other.conflict.as_ref().map(|error| error.to_string())
     }
@@ -192,24 +186,25 @@ impl PartialEq for ViewOperation {
 
 impl Eq for ViewOperation {}
 
-/// The size of a view operation in the commit budget: a put counts its five attributes (name and
-/// value bytes each), and a delete its two key attributes plus the condition expression when it
-/// carries one. It equals the size of the DynamoDB action the repository builds, and the in-memory
-/// repository budgets operations by it.
+/// The size of a view operation in the commit budget. A put counts its five attributes (name and
+/// value bytes each; `entityID` is the owner), whatever its condition. A delete counts its two key
+/// attributes, its condition expression, and the owner value it binds (`:owner`). It equals the
+/// size of the DynamoDB action the repository builds, and the in-memory repository budgets
+/// operations by it.
 pub fn view_operation_size(operation: &ViewOperation) -> usize {
+    use crate::wire::dynamo::{OWNER_PLACEHOLDER, delete_condition};
+
     let keys = "pk".len() + operation.pk.len() + "sk".len() + operation.sk.len();
 
     match operation.kind {
         ViewOperationKind::Delete => {
-            if operation.condition == ViewCondition::Present {
-                keys + crate::wire::dynamo::VIEW_PRESENT_CONDITION.len()
-            } else {
-                keys
-            }
+            keys + delete_condition(operation.condition).len()
+                + OWNER_PLACEHOLDER.len()
+                + operation.owner.as_str().len()
         }
         ViewOperationKind::Put => {
             keys + "entityID".len()
-                + operation.entity_id.len()
+                + operation.owner.as_str().len()
                 + "entityType".len()
                 + operation.entity_type.len()
                 + "payload".len()
@@ -226,7 +221,7 @@ pub struct ViewRow {
     pub pk: String,
     /// The sort key.
     pub sk: String,
-    /// The informational entity ID.
+    /// The row's owner: the stream that wrote it.
     pub entity_id: String,
     /// The informational entity type.
     pub entity_type: String,
@@ -257,7 +252,7 @@ impl ViewRow {
         Self {
             pk: operation.pk.clone(),
             sk: operation.sk.clone(),
-            entity_id: operation.entity_id.clone(),
+            entity_id: operation.owner.to_string(),
             entity_type: operation.entity_type.clone(),
             payload: operation.payload.clone(),
         }
@@ -335,14 +330,28 @@ impl CommitView {
         self.streams.iter().map(|stream| stream.events.len()).sum()
     }
 
-    /// The view a projector is given: the events of the streams whose entity type it names, and
-    /// none of any other stream. A current-state projector names no type, so it reads state only;
-    /// that is what makes a rebuild from state alone reproduce its rows.
+    /// The view a projector is given. A current-state projector (it names no `history`) gets an
+    /// empty commit ID and streams with no events, and the state of every stream: its rows are a
+    /// function of the final states alone, which is what lets a rebuild reproduce them from state.
+    /// A history-dependent projector gets the commit ID and, for the streams whose entity type it
+    /// names, their events and state; for every other stream it gets neither, so its rows cannot
+    /// depend on a stream whose history it did not declare.
     fn visible_to(&self, history: &[EntityType]) -> CommitView {
         let mut view = self.clone();
+
+        if history.is_empty() {
+            view.commit_id = String::new();
+            for stream in &mut view.streams {
+                stream.events = Vec::new();
+            }
+
+            return view;
+        }
+
         for stream in &mut view.streams {
             if !history.contains(&stream.entity_type) {
                 stream.events = Vec::new();
+                stream.state = Vec::new();
             }
         }
 
@@ -360,21 +369,27 @@ impl CommitView {
 /// in the projector's declaration order, each projector's in emission order.
 ///
 /// A projector is one of two kinds, and [`history`](CommitProjector::history) says which. A
-/// current-state projector computes its rows from the state each stream has after the commit; a
-/// rebuild never replays history for it. A history-dependent projector also reads the commit's
-/// events; a rebuild replays every commit for it, so the commits it reads must never be compacted
+/// current-state projector computes its rows from the state each stream has after the commit; it is
+/// given an empty commit ID and no events, and a rebuild never replays history for it. A
+/// history-dependent projector also reads the commit ID and the events of the entity types it
+/// names; a rebuild replays every commit for it, so the commits it reads must never be compacted
 /// away, and its rows must be ordered by something a replay has.
+///
+/// Every operation of every projector names an [owner](ViewOperation::owner): a stream the commit
+/// wrote (and, for a history-dependent projector, one of the types it names). **A row's owner must
+/// never change**: never delete a row to hand its key to another stream; keep the row and rewrite
+/// it with a tombstone payload.
 pub trait CommitProjector: Send + Sync {
     /// Identifies the projector in errors. It should be unique within a store.
     fn name(&self) -> &str;
 
     /// The entity types whose events the projector reads. Empty (the default) for a current-state
-    /// projector, which is then given views whose streams carry no events. A history-dependent
-    /// projector is given the events of the streams of these types only, and no others. The store
-    /// declares these types in the feature manifest's `historyDependent` set before the first
-    /// commit that runs the projector, so `compact_below` refuses them in every process, and each
-    /// of its operations must name the stream that owns its row
-    /// ([`ViewOperation::owned_by`]).
+    /// projector, which is then given views with an empty commit ID and streams that carry no
+    /// events. A history-dependent projector is given the commit ID and the events and state of the
+    /// streams of these types only; every other stream arrives with neither. The store declares
+    /// these types in the feature manifest's `historyDependent` set before the first commit that
+    /// runs the projector, so `compact_below` refuses them in every process, and each of the
+    /// projector's operations must be owned by a stream of one of these types.
     fn history(&self) -> &[EntityType] {
         &[]
     }
@@ -418,8 +433,8 @@ impl ProjectedView {
 }
 
 impl ProjectedView {
-    /// The view without its row data (informational attributes and payload), keeping what
-    /// identifies it in an error: provenance, kind, keys, condition, and mapped error. Repositories
+    /// The view without its row data (entity type and payload), keeping what identifies it in an
+    /// error: provenance, kind, keys, owner, condition, and mapped error. Repositories
     /// keep this beside the built actions, so a failed commit can be mapped without holding a
     /// second copy of large payloads.
     #[cfg_attr(not(feature = "dynamodb"), allow(dead_code))]
@@ -432,12 +447,11 @@ impl ProjectedView {
                 kind: self.op.kind,
                 pk: self.op.pk.clone(),
                 sk: self.op.sk.clone(),
-                entity_id: String::new(),
+                owner: self.op.owner.clone(),
                 entity_type: String::new(),
                 payload: Vec::new(),
                 condition: self.op.condition,
                 conflict: self.op.conflict.clone(),
-                owner: None,
             },
         }
     }
@@ -618,11 +632,15 @@ pub(crate) async fn ready_projectors<R: Repository>(
 }
 
 /// Runs the projectors over a commit view, in declaration order, and returns their operations with
-/// provenance in the order the commit writes them. A view with no events runs no projector. A
-/// current-state projector (empty [`history`](CommitProjector::history)) sees the view without
-/// events; a history-dependent one sees the events of the entity types it names, and each of its
-/// operations must name an owner stream the commit wrote ([`Error::InvalidViewOperation`]
-/// otherwise). A projector's error is an [`Error::Projector`] naming it (an internal failure: nothing is
+/// provenance in the order the commit writes them. A view with no events runs no projector.
+///
+/// What a projector sees depends on its kind (see [`CommitProjector`]): a current-state projector
+/// (empty [`history`](CommitProjector::history)) gets an empty commit ID and no events; a
+/// history-dependent one gets the commit ID and the events and state of the entity types it names,
+/// and nothing of any other stream. Every operation of every projector must then be owned by a
+/// stream the commit wrote (checked against the whole view), and a history-dependent projector's
+/// by a stream of a type it names; otherwise the result is [`Error::InvalidViewOperation`]. A
+/// projector's error is an [`Error::Projector`] naming it (an internal failure: nothing is
 /// written, nothing is retried); the combined operations are then validated with [`check_views`].
 pub fn project_commit(
     projectors: &[Arc<dyn CommitProjector>],
@@ -652,10 +670,7 @@ pub fn project_commit(
                 op,
             };
 
-            if !history.is_empty() {
-                check_owner(&item, view)?;
-            }
-
+            check_owner(&item, view, history)?;
             projected.push(item);
         }
     }
@@ -731,23 +746,29 @@ fn invalid_reason(op: &ViewOperation) -> Option<String> {
     if op.sk.is_empty() {
         return Some("sk is empty".into());
     }
+    if op.owner.is_empty() {
+        return Some("owner is empty".into());
+    }
 
     let text = |name: &'static str, value: &str| {
         value
             .contains('\0')
             .then(|| format!("{name} contains U+0000"))
     };
-    if let Some(reason) = text("pk", &op.pk).or_else(|| text("sk", &op.sk)) {
+    if let Some(reason) = text("pk", &op.pk)
+        .or_else(|| text("sk", &op.sk))
+        .or_else(|| text("owner", op.owner.as_str()))
+    {
         return Some(reason);
     }
 
     if op.kind == ViewOperationKind::Put {
-        return text("entityID", &op.entity_id)
-            .or_else(|| text("entityType", &op.entity_type))
-            .or_else(|| match std::str::from_utf8(&op.payload) {
+        return text("entityType", &op.entity_type).or_else(|| {
+            match std::str::from_utf8(&op.payload) {
                 Err(_) => Some("payload is not valid UTF-8".into()),
                 Ok(payload) => text("payload", payload),
-            });
+            }
+        });
     }
 
     None
@@ -885,19 +906,17 @@ pub fn replay_views(
             let op = item.op;
             let target = (op.pk.clone(), op.sk.clone());
 
-            if let Some(owner) = op.owner {
-                match owners.get(&target) {
-                    Some(first) if *first != owner => {
-                        return Err(Error::SharedViewKey {
-                            pk: target.0,
-                            sk: target.1,
-                            first: first.to_string(),
-                            second: owner.to_string(),
-                        });
-                    }
-                    _ => {
-                        owners.insert(target.clone(), owner);
-                    }
+            match owners.get(&target) {
+                Some(first) if *first != op.owner => {
+                    return Err(Error::SharedViewKey {
+                        pk: target.0,
+                        sk: target.1,
+                        first: first.to_string(),
+                        second: op.owner.to_string(),
+                    });
+                }
+                _ => {
+                    owners.insert(target.clone(), op.owner.clone());
                 }
             }
 
@@ -909,7 +928,13 @@ pub fn replay_views(
                 ViewOperationKind::Put => {
                     rows.insert(
                         key,
-                        ViewRow::new(op.pk, op.sk, op.entity_id, op.entity_type, op.payload),
+                        ViewRow::new(
+                            op.pk,
+                            op.sk,
+                            op.owner.to_string(),
+                            op.entity_type,
+                            op.payload,
+                        ),
                     );
                 }
             }
@@ -919,8 +944,14 @@ pub fn replay_views(
     Ok(rows.into_values().collect())
 }
 
-/// Requires a history-dependent projector's operation to name an owner stream the commit wrote.
-fn check_owner(view: &ProjectedView, commit: &CommitView) -> Result<(), Error> {
+/// Requires an operation to be owned by a stream the commit wrote, and, for a history-dependent
+/// projector, by a stream of a type it names. The owner is looked up in the whole commit view, not
+/// in the view the projector was given.
+fn check_owner(
+    view: &ProjectedView,
+    commit: &CommitView,
+    history: &[EntityType],
+) -> Result<(), Error> {
     let invalid = |reason: String| {
         Err(Error::InvalidViewOperation(format!(
             "projector {:?} (#{}) operation {}: {reason}",
@@ -928,22 +959,26 @@ fn check_owner(view: &ProjectedView, commit: &CommitView) -> Result<(), Error> {
         )))
     };
 
-    match &view.op.owner {
-        None => {
-            invalid("a history-dependent projector's operation must name an owner stream".into())
-        }
-        Some(owner)
-            if !commit
-                .streams
-                .iter()
-                .any(|stream| &stream.entity_id == owner) =>
-        {
-            invalid(format!(
-                "the owner stream {owner:?} was not written by this commit"
-            ))
-        }
-        Some(_) => Ok(()),
+    let owner = &view.op.owner;
+    let Some(stream) = commit
+        .streams
+        .iter()
+        .find(|stream| &stream.entity_id == owner)
+    else {
+        return invalid(format!(
+            "the owner stream {owner:?} was not written by this commit"
+        ));
+    };
+
+    if !history.is_empty() && !history.contains(&stream.entity_type) {
+        return invalid(format!(
+            "the owner stream {owner:?} is of type {:?}, which the projector does not declare in \
+             its history",
+            stream.entity_type.as_str()
+        ));
     }
+
+    Ok(())
 }
 
 /// The view of one commit's events, already in (entity-ID bytes, sequence) order.
@@ -1067,7 +1102,7 @@ mod tests {
         assert_eq!(put.conflict.as_ref().unwrap().to_string(), "name taken");
         assert_eq!(put.payload, b"{}");
 
-        let delete = ViewOperation::delete("p", "s").if_present();
+        let delete = ViewOperation::delete("p", "s", "a").if_present();
         assert_eq!(delete.kind, ViewOperationKind::Delete);
         assert_eq!(delete.condition, ViewCondition::Present);
         assert!(delete.conflict.is_none());
@@ -1086,13 +1121,13 @@ mod tests {
             Arc::new(Fixed {
                 name: "first",
                 operations: vec![
-                    ViewOperation::put("a", "1", "", "", "{}"),
-                    ViewOperation::delete("a", "2"),
+                    ViewOperation::put("a", "1", "a", "", "{}"),
+                    ViewOperation::delete("a", "2", "a"),
                 ],
             }),
             Arc::new(Fixed {
                 name: "second",
-                operations: vec![ViewOperation::put("b", "1", "", "", "{}")],
+                operations: vec![ViewOperation::put("b", "1", "a", "", "{}")],
             }),
         ];
 
@@ -1158,11 +1193,11 @@ mod tests {
         let projectors: Vec<Arc<dyn CommitProjector>> = vec![
             Arc::new(Fixed {
                 name: "one",
-                operations: vec![ViewOperation::put("p", "s", "", "", "{}")],
+                operations: vec![ViewOperation::put("p", "s", "a", "", "{}")],
             }),
             Arc::new(Fixed {
                 name: "two",
-                operations: vec![ViewOperation::delete("p", "s")],
+                operations: vec![ViewOperation::delete("p", "s", "a")],
             }),
         ];
 
@@ -1190,40 +1225,51 @@ mod tests {
             other => panic!("expected an invalid operation, got {other:?}"),
         };
 
-        assert!(invalid(ViewOperation::put("", "s", "", "", "{}")).contains("pk is empty"));
-        assert!(invalid(ViewOperation::put("p", "", "", "", "{}")).contains("sk is empty"));
-        assert!(invalid(ViewOperation::delete("", "s")).contains("pk is empty"));
+        assert!(invalid(ViewOperation::put("", "s", "a", "", "{}")).contains("pk is empty"));
+        assert!(invalid(ViewOperation::put("p", "", "a", "", "{}")).contains("sk is empty"));
+        assert!(invalid(ViewOperation::delete("", "s", "a")).contains("pk is empty"));
         assert!(
-            invalid(ViewOperation::put("a\0b", "s", "", "", "{}")).contains("pk contains U+0000")
+            invalid(ViewOperation::put("a\0b", "s", "a", "", "{}")).contains("pk contains U+0000")
         );
         assert!(
-            invalid(ViewOperation::put("p", "a\0", "", "", "{}")).contains("sk contains U+0000")
+            invalid(ViewOperation::put("p", "a\0", "a", "", "{}")).contains("sk contains U+0000")
         );
-        assert!(invalid(ViewOperation::put("p", "s", "i\0", "", "{}")).contains("entityID"));
-        assert!(invalid(ViewOperation::put("p", "s", "", "t\0", "{}")).contains("entityType"));
-        assert!(invalid(ViewOperation::put("p", "s", "", "", "{\0}")).contains("payload contains"));
+        assert!(invalid(ViewOperation::put("p", "s", "", "", "{}")).contains("owner is empty"));
+        assert!(invalid(ViewOperation::delete("p", "s", "")).contains("owner is empty"));
         assert!(
-            invalid(ViewOperation::put("p", "s", "", "", vec![0xff, 0xfe]))
+            invalid(ViewOperation::put("p", "s", "i\0", "", "{}"))
+                .contains("owner contains U+0000")
+        );
+        assert!(
+            invalid(ViewOperation::delete("p", "s", "i\0")).contains("owner contains U+0000"),
+            "a delete's owner is text-checked too"
+        );
+        assert!(invalid(ViewOperation::put("p", "s", "a", "t\0", "{}")).contains("entityType"));
+        assert!(
+            invalid(ViewOperation::put("p", "s", "a", "", "{\0}")).contains("payload contains")
+        );
+        assert!(
+            invalid(ViewOperation::put("p", "s", "a", "", vec![0xff, 0xfe]))
                 .contains("payload is not valid UTF-8")
         );
         assert!(
-            invalid(ViewOperation::put("p", "s", "", "", "{}").if_present()).contains("present")
+            invalid(ViewOperation::put("p", "s", "a", "", "{}").if_present()).contains("present")
         );
-        assert!(invalid(ViewOperation::delete("p", "s").if_absent()).contains("absent"));
+        assert!(invalid(ViewOperation::delete("p", "s", "a").if_absent()).contains("absent"));
 
         // The message names the projector and the operation.
-        let message = invalid(ViewOperation::put("", "s", "", "", "{}"));
+        let message = invalid(ViewOperation::put("", "s", "a", "", "{}"));
         assert!(
             message.contains("\"p\"") && message.contains("operation 3"),
             "{message}"
         );
 
-        // A delete carries no entity or payload, so only its keys are text-checked.
+        // A delete carries no entity type or payload, so only its keys and owner are checked.
         assert!(
             check_views(&[projected(
                 "p",
                 0,
-                ViewOperation::delete("p", "s").if_present()
+                ViewOperation::delete("p", "s", "a").if_present()
             )])
             .is_ok()
         );
@@ -1243,23 +1289,23 @@ mod tests {
         };
 
         // Exactly at the limits passes.
-        let at_limit = ViewOperation::put("p".repeat(2048), "s".repeat(1024), "", "", "{}");
+        let at_limit = ViewOperation::put("p".repeat(2048), "s".repeat(1024), "a", "", "{}");
         assert!(check_views(&[projected("p", 0, at_limit)]).is_ok());
 
         assert_eq!(
-            key_error(ViewOperation::put("p".repeat(2049), "s", "", "", "{}")),
+            key_error(ViewOperation::put("p".repeat(2049), "s", "a", "", "{}")),
             ("pk", 2049, 2048, "p".to_owned(), 1)
         );
         assert_eq!(
-            key_error(ViewOperation::delete("p", "s".repeat(1025))),
+            key_error(ViewOperation::delete("p", "s".repeat(1025), "a")),
             ("sk", 1025, 1024, "p".to_owned(), 1)
         );
 
         // Bytes, not characters: 1025 two-byte characters are 2050 bytes.
         let wide = "é".repeat(1025);
-        assert_eq!(key_error(ViewOperation::delete(wide, "s")).1, 2050);
+        assert_eq!(key_error(ViewOperation::delete(wide, "s", "a")).1, 2050);
         let fits = "é".repeat(1024);
-        assert!(check_views(&[projected("p", 0, ViewOperation::delete(fits, "s"))]).is_ok());
+        assert!(check_views(&[projected("p", 0, ViewOperation::delete(fits, "s", "a"))]).is_ok());
     }
 
     #[test]
@@ -1270,9 +1316,9 @@ mod tests {
             projected(
                 "p",
                 0,
-                ViewOperation::put("p".repeat(2049), "s", "", "", "{}"),
+                ViewOperation::put("p".repeat(2049), "s", "a", "", "{}"),
             ),
-            projected("p", 1, ViewOperation::put("", "s", "", "", "{}")),
+            projected("p", 1, ViewOperation::put("", "s", "a", "", "{}")),
         ];
         assert!(matches!(
             check_views(&views),
@@ -1281,8 +1327,8 @@ mod tests {
 
         // A duplicate is reported on the second operation, after its own validity checks.
         let views = [
-            projected("p", 0, ViewOperation::put("p", "s", "", "", "{}")),
-            projected("p", 1, ViewOperation::put("p", "s", "", "", "{}")),
+            projected("p", 0, ViewOperation::put("p", "s", "a", "", "{}")),
+            projected("p", 1, ViewOperation::put("p", "s", "a", "", "{}")),
         ];
         match check_views(&views) {
             Err(Error::DuplicateViewKey { first, second, .. }) => {
@@ -1294,32 +1340,38 @@ mod tests {
 
         // Keys that differ in either part are distinct rows.
         let views = [
-            projected("p", 0, ViewOperation::put("p", "s", "", "", "{}")),
-            projected("p", 1, ViewOperation::put("p", "t", "", "", "{}")),
-            projected("p", 2, ViewOperation::put("q", "s", "", "", "{}")),
+            projected("p", 0, ViewOperation::put("p", "s", "a", "", "{}")),
+            projected("p", 1, ViewOperation::put("p", "t", "a", "", "{}")),
+            projected("p", 2, ViewOperation::put("q", "s", "a", "", "{}")),
         ];
         assert!(check_views(&views).is_ok());
     }
 
     #[test]
-    fn view_operation_sizes_count_names_values_and_the_present_condition() {
-        // "pk"+"p"+"sk"+"s"+"entityID"+"id"+"entityType"+"ty"+"payload"+"{}"
+    fn view_operation_sizes_count_names_values_and_the_owner_condition() {
+        // "pk"+"p"+"sk"+"s"+"entityID"+"id"+"entityType"+"ty"+"payload"+"{}". The entityID is the
+        // owner.
         let put = ViewOperation::put("p", "s", "id", "ty", "{}");
         assert_eq!(
             view_operation_size(&put),
             2 + 1 + 2 + 1 + 8 + 2 + 10 + 2 + 7 + 2
         );
-        // An absent condition is not budgeted, like every put's.
+        // A put's condition is not budgeted, like every put's.
         assert_eq!(
             view_operation_size(&put.clone().if_absent()),
             view_operation_size(&put)
         );
 
-        let delete = ViewOperation::delete("p", "s");
-        assert_eq!(view_operation_size(&delete), 2 + 1 + 2 + 1);
+        // A delete counts its key, its condition expression, and the owner value it binds.
+        let delete = ViewOperation::delete("p", "s", "id");
+        let owner_value = ":owner".len() + "id".len();
+        assert_eq!(
+            view_operation_size(&delete),
+            2 + 1 + 2 + 1 + "attribute_not_exists(pk) OR entityID = :owner".len() + owner_value
+        );
         assert_eq!(
             view_operation_size(&delete.if_present()),
-            2 + 1 + 2 + 1 + "attribute_exists(pk)".len()
+            2 + 1 + 2 + 1 + "attribute_exists(pk) AND entityID = :owner".len() + owner_value
         );
     }
 
@@ -1452,72 +1504,115 @@ mod tests {
     }
 
     fn row_for(commit_id: &str, owner: &str) -> ViewOperation {
-        ViewOperation::put("shared", "row", owner, "t", format!("\"{commit_id}\"")).owned_by(owner)
+        ViewOperation::put("shared", "row", owner, "t", format!("\"{commit_id}\""))
     }
 
     #[test]
     fn a_current_state_projector_sees_no_events_and_a_history_one_only_its_types() {
         let mut view = view_of(vec![event("a", 1, "c"), event("b", 1, "c")]);
+        view.streams[0].state = b"{\"a\":1}".to_vec();
+        view.streams[1].state = b"{\"b\":1}".to_vec();
         view.streams[1].entity_type = EntityType::new("other");
 
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        type Seen = (&'static str, String, Vec<(usize, usize)>);
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
         let record = |name: &'static str, history: &'static [&'static str]| {
             let seen = seen.clone();
 
             reading(history, move |commit| {
                 seen.lock().unwrap().push((
                     name,
+                    commit.commit_id.clone(),
                     commit
                         .streams
                         .iter()
-                        .map(|stream| stream.events.len())
-                        .collect::<Vec<_>>(),
+                        .map(|stream| (stream.events.len(), stream.state.len()))
+                        .collect(),
                 ));
 
-                if history.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![ViewOperation::put("pk", "sk", "", "", "{}").owned_by("a")]
-                }
+                Vec::new()
             })
         };
 
         project_commit(&[record("current", &[]), record("reads", &["t"])], &view).unwrap();
 
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen[0], ("current", vec![0, 0]), "state only");
+        assert_eq!(
+            seen[0],
+            ("current", String::new(), vec![(0, 7), (0, 7)]),
+            "no commit ID, no events, every state"
+        );
         assert_eq!(
             seen[1],
-            ("reads", vec![1, 0]),
-            "its type's events, not the other type's"
+            ("reads", "c".to_owned(), vec![(1, 7), (0, 0)]),
+            "the commit ID, its type's events and state, and nothing of the other type"
         );
-        assert_eq!(
-            view.streams[1].events.len(),
-            1,
-            "the caller's view is unchanged"
-        );
+        assert_eq!(view.commit_id, "c", "the caller's view is unchanged");
+        assert_eq!(view.streams[1].events.len(), 1);
+        assert_eq!(view.streams[1].state.len(), 7);
     }
 
     #[test]
-    fn a_history_dependent_operation_names_an_owner_the_commit_wrote() {
-        let view = view_of(vec![event("a", 1, "c")]);
-        let run = |op: ViewOperation| {
-            project_commit(&[reading(&["t"], move |_| vec![op.clone()])], &view)
+    fn every_operation_names_an_owner_the_commit_wrote() {
+        let mut view = view_of(vec![event("a", 1, "c"), event("b", 1, "c")]);
+        view.streams[1].entity_type = EntityType::new("other");
+
+        let run = |history: &[&str], op: ViewOperation| {
+            project_commit(&[reading(history, move |_| vec![op.clone()])], &view)
         };
+        let put = |owner: &str| ViewOperation::put("pk", "sk", owner, "", "{}");
 
-        assert!(run(ViewOperation::put("pk", "sk", "", "", "{}").owned_by("a")).is_ok());
-        assert!(matches!(
-            run(ViewOperation::put("pk", "sk", "", "", "{}")),
-            Err(Error::InvalidViewOperation(_))
-        ));
-        assert!(matches!(
-            run(ViewOperation::put("pk", "sk", "", "", "{}").owned_by("elsewhere")),
-            Err(Error::InvalidViewOperation(_))
-        ));
+        for history in [&[][..], &["t"][..]] {
+            assert!(
+                run(history, put("a")).is_ok(),
+                "{history:?}: a written stream"
+            );
+            assert!(
+                matches!(run(history, put("elsewhere")), Err(Error::InvalidViewOperation(m)) if m.contains("not written")),
+                "{history:?}: a stream the commit did not write"
+            );
+            assert!(
+                matches!(run(history, put("")), Err(Error::InvalidViewOperation(_))),
+                "{history:?}: no owner"
+            );
+            assert!(
+                matches!(
+                    run(history, ViewOperation::delete("pk", "sk", "elsewhere")),
+                    Err(Error::InvalidViewOperation(_))
+                ),
+                "{history:?}: a delete is owned too"
+            );
+        }
 
-        // A current-state projector needs no owner.
-        let state = reading(&[], |_| vec![ViewOperation::put("pk", "sk", "", "", "{}")]);
-        assert!(project_commit(&[state], &view).is_ok());
+        // A current-state projector may own a row by a stream of any type; a history-dependent one
+        // only by a stream of a type it declares. The owner is looked up in the whole commit, so a
+        // stream whose events the projector cannot see is still a stream the commit wrote.
+        assert!(run(&[], put("b")).is_ok());
+        assert!(matches!(
+            run(&["t"], put("b")),
+            Err(Error::InvalidViewOperation(m)) if m.contains("history")
+        ));
+    }
+
+    #[test]
+    fn the_owner_error_names_the_projector_and_the_operation() {
+        let view = view_of(vec![event("a", 1, "c")]);
+        let projector = reading(&[], |_| {
+            vec![
+                ViewOperation::put("pk", "one", "a", "", "{}"),
+                ViewOperation::put("pk", "two", "elsewhere", "", "{}"),
+            ]
+        });
+
+        match project_commit(&[projector], &view) {
+            Err(Error::InvalidViewOperation(message)) => {
+                assert!(
+                    message.contains("\"reading\"") && message.contains("operation 1"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected an invalid operation, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1539,6 +1634,7 @@ mod tests {
             rows[0].payload, b"\"y\"",
             "the later commit of the owner stream wins"
         );
+        assert_eq!(rows[0].entity_id, "z", "the stored entityID is the owner");
     }
 
     #[test]
@@ -1562,15 +1658,34 @@ mod tests {
     }
 
     #[test]
+    fn replay_refuses_a_row_two_streams_write_even_for_a_delete() {
+        let groups = group_commits(vec![event("z", 1, "x"), event("a", 1, "y")]).unwrap();
+        let projector = reading(&[], |commit| {
+            let owner = commit.streams[0].entity_id.as_str();
+
+            if owner == "z" {
+                vec![ViewOperation::put("pk", "sk", owner, "", "{}")]
+            } else {
+                vec![ViewOperation::delete("pk", "sk", owner)]
+            }
+        });
+
+        assert!(matches!(
+            replay_views(&[projector], &groups),
+            Err(Error::SharedViewKey { .. })
+        ));
+    }
+
+    #[test]
     fn replay_applies_deletes_and_sorts_the_rows() {
         let groups = group_commits(vec![event("a", 1, "c1"), event("a", 2, "c2")]).unwrap();
         let projector = reading(&["t"], |commit| {
             if commit.commit_id == "c2" {
-                vec![ViewOperation::delete("pk", "gone").owned_by("a")]
+                vec![ViewOperation::delete("pk", "gone", "a")]
             } else {
                 vec![
-                    ViewOperation::put("pk", "kept", "", "", "{}").owned_by("a"),
-                    ViewOperation::put("pk", "gone", "", "", "{}").owned_by("a"),
+                    ViewOperation::put("pk", "kept", "a", "", "{}"),
+                    ViewOperation::put("pk", "gone", "a", "", "{}"),
                 ]
             }
         });
@@ -1599,7 +1714,7 @@ mod tests {
         let view = projected(
             "claims",
             2,
-            ViewOperation::put("p", "s", "", "", "{}")
+            ViewOperation::put("p", "s", "a", "", "{}")
                 .if_absent()
                 .on_conflict(Taken),
         );
@@ -1621,7 +1736,7 @@ mod tests {
         assert!(wrapped.to_string().contains("claims"), "{wrapped}");
 
         // Without a mapped error the backend's cause stands in; with neither, there is no source.
-        let plain = projected("claims", 0, ViewOperation::delete("p", "s"));
+        let plain = projected("claims", 0, ViewOperation::delete("p", "s", "a"));
         assert!(
             ProjectorOperationError::condition_failed(&plain)
                 .source()
@@ -1637,7 +1752,7 @@ mod tests {
         let mapped = projected(
             "claims",
             0,
-            ViewOperation::put("p", "s", "", "", "{}").on_conflict(Taken),
+            ViewOperation::put("p", "s", "a", "", "{}").on_conflict(Taken),
         );
         let validation = ProjectorOperationError::for_view(&mapped, "ValidationError", None);
         assert!(validation.mapped().is_none() && validation.source().is_none());

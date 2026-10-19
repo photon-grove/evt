@@ -94,15 +94,15 @@ func (f *FakeDynamo) Views(pk string) []map[string]types.AttributeValue {
 	return out
 }
 
-// SeedView stores a views row directly, as a fixture's starting state.
-func (f *FakeDynamo) SeedView(pk, sk string) {
+// SeedView stores a views row owned by owner directly, as a fixture's starting state.
+func (f *FakeDynamo) SeedView(pk, sk, owner string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.putViewLocked(pk, sk, map[string]types.AttributeValue{
 		"pk":         &types.AttributeValueMemberS{Value: pk},
 		"sk":         &types.AttributeValueMemberS{Value: sk},
-		"entityID":   &types.AttributeValueMemberS{Value: ""},
+		"entityID":   &types.AttributeValueMemberS{Value: owner},
 		"entityType": &types.AttributeValueMemberS{Value: ""},
 		"payload":    &types.AttributeValueMemberS{Value: "{}"},
 	})
@@ -182,6 +182,14 @@ func number(values map[string]types.AttributeValue, name string) (int64, error) 
 	return strconv.ParseInt(attr.Value, 10, 64)
 }
 
+// ownedBy reports whether a stored views row's entityID is the expression's :owner.
+func ownedBy(existing, values map[string]types.AttributeValue) bool {
+	have, ok := existing["entityID"].(*types.AttributeValueMemberS)
+	want, wantOK := values[dynamo.ViewOwnerValue].(*types.AttributeValueMemberS)
+
+	return ok && wantOK && have.Value == want.Value
+}
+
 // conditionHolds evaluates the condition expressions the repository uses.
 func conditionHolds(
 	existing map[string]types.AttributeValue,
@@ -213,8 +221,11 @@ func conditionHolds(
 	case "attribute_not_exists(sk)", dynamo.ViewAbsentCondition:
 		return existing == nil, nil
 
+	case dynamo.ViewOwnedCondition:
+		return existing == nil || ownedBy(existing, values), nil
+
 	case dynamo.ViewPresentCondition:
-		return existing != nil, nil
+		return existing != nil && ownedBy(existing, values), nil
 
 	case "attribute_not_exists(pk) OR version = :v":
 		return compareIfExists(existing, "version", values, ":v", equal)

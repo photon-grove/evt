@@ -47,13 +47,17 @@ func (repo Repository) Views() []evt.SerializedView {
 }
 
 // checkViewConditions evaluates each operation's condition, in order, against the rows as they
-// stand before the commit. The first that does not hold is the failure; the caller holds the lock.
+// stand before the commit, as the DynamoDB conditions do: every write is refused when the row
+// exists and belongs to another stream, a put that requires the row to be absent when it exists,
+// and a delete that requires it when none of the owner's does. The first that does not hold is the
+// failure; the caller holds the lock.
 func (repo Repository) checkViewConditions(views []evt.ProjectedView) error {
 	for _, view := range views {
-		_, exists := repo.features.views[viewKey{view.Op.PK, view.Op.SK}]
+		row, exists := repo.features.views[viewKey{view.Op.PK, view.Op.SK}]
+		foreign := exists && row.EntityID != view.Op.Owner
 
 		switch {
-		case view.Op.Condition == evt.ViewAbsent && exists, view.Op.Condition == evt.ViewPresent && !exists:
+		case view.Op.Condition == evt.ViewAbsent && exists, view.Op.Condition == evt.ViewPresent && !exists, foreign:
 			return evt.NewProjectorOperationError(view, evt.ReasonConditionFailed, nil)
 		}
 	}
@@ -81,14 +85,14 @@ func (repo Repository) applyViews(views []evt.ProjectedView) {
 		}
 
 		repo.features.views[key] = evt.SerializedView{
-			PK: view.Op.PK, SK: view.Op.SK, EntityID: view.Op.EntityID, EntityType: view.Op.EntityType,
+			PK: view.Op.PK, SK: view.Op.SK, EntityID: view.Op.Owner, EntityType: view.Op.EntityType,
 			Payload: bytes.Clone(view.Op.Payload),
 		}
 	}
 }
 
 // WritesViews declares that Commit writes commit-wide view operations (evt.ViewWritingRepository).
-func (Repository) WritesViews() {}
+func (Repository) WritesViews() bool { return true }
 
 // DeclareHistoryDependent durably adds the entity types to the manifest's historyDependent set, so
 // CompactBelow refuses them (evt.HistoryDeclarer). Types already declared are left alone.

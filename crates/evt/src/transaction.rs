@@ -366,8 +366,9 @@ impl<'a, R: Repository> Transaction<'a, R> {
     /// whose [view operations](crate::ViewOperation) commit atomically with it. Projectors run in
     /// the order they are added, once, when the transaction is prepared for commit, over the final
     /// state of every written stream, so a projector sees the whole multi-stream commit. They run
-    /// for [`commit`](Transaction::commit), [`commit_with_outcome`](Transaction::commit_with_outcome),
-    /// and [`reject_with_events`](Transaction::reject_with_events); a plain
+    /// for [`commit`](Transaction::commit),
+    /// [`commit_with_outcome`](Transaction::commit_with_outcome), and
+    /// [`reject_with_events`](Transaction::reject_with_events); a plain
     /// [`reject`](Transaction::reject) and a commit that writes no event run none.
     /// [`Store::transaction`] carries the store's projectors.
     #[must_use]

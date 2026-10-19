@@ -32,9 +32,9 @@ func NewFaultRepository(repo evt.Repository) (*FaultRepository, error) {
 	return &FaultRepository{OutcomeRepository: outcomes}, nil
 }
 
-// WritesViews forwards the capability of the wrapped repository (evt.ViewWritingRepository): a
-// decorator hides it unless it declares it too.
-func (f *FaultRepository) WritesViews() {}
+// WritesViews reports the wrapped repository's capability (evt.ViewWritingRepository): a decorator
+// hides it unless it declares it too, and it must not claim one the wrapped repository lacks.
+func (f *FaultRepository) WritesViews() bool { return evt.WritesViews(f.OutcomeRepository) }
 
 // DeclareHistoryDependent forwards to the wrapped repository (evt.HistoryDeclarer), or refuses when
 // it cannot declare.

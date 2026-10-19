@@ -16,17 +16,17 @@ func view(projector string, index, operation int, op evt.ViewOperation) evt.Proj
 }
 
 func put(pk, sk string) evt.ViewOperation {
-	return evt.PutView(pk, sk, "owner", "account", []byte(`{}`))
+	return evt.PutView(pk, sk, "a", "account", []byte(`{}`))
 }
 
 func Test_CheckViews_AcceptsValidOperations(t *testing.T) {
 	require.NoError(t, evt.CheckViews(nil))
 	require.NoError(t, evt.CheckViews([]evt.ProjectedView{
 		view("a", 0, 0, put("pk", "one").IfAbsent()),
-		view("a", 0, 1, evt.DeleteView("pk", "two").IfPresent()),
-		view("b", 1, 0, evt.DeleteView("pk", "three")),
-		view("b", 1, 1, evt.PutView("other", "one", "", "", nil)),
-	}), "entityID, entityType, and the payload may be empty")
+		view("a", 0, 1, evt.DeleteView("pk", "two", "a").IfPresent()),
+		view("b", 1, 0, evt.DeleteView("pk", "three", "a")),
+		view("b", 1, 1, evt.PutView("other", "one", "a", "", nil)),
+	}), "entityType and the payload may be empty")
 }
 
 func Test_CheckViews_KeyLimitsAreInUTF8Bytes(t *testing.T) {
@@ -62,10 +62,13 @@ func Test_CheckViews_RejectsInvalidOperations(t *testing.T) {
 		"NUL in the sk":           put("pk", "s\x00k"),
 		"invalid UTF-8 in the sk": put("pk", "\xff"),
 		"NUL in the payload":      evt.PutView("pk", "sk", "owner", "account", []byte("{\"v\":\"\x00\"}")),
-		"NUL in the entity ID":    evt.PutView("pk", "sk", "own\x00er", "account", nil),
+		"empty owner":             evt.PutView("pk", "sk", "", "account", nil),
+		"NUL in the owner":        evt.PutView("pk", "sk", "own\x00er", "account", nil),
+		"invalid UTF-8 owner":     evt.DeleteView("pk", "sk", "\xff"),
+		"empty owner on a delete": evt.DeleteView("pk", "sk", ""),
 		"NUL in the entity type":  evt.PutView("pk", "sk", "owner", "acc\x00ount", nil),
 		"unknown kind":            {Kind: "upsert", PK: "pk", SK: "sk"},
-		"absent on a delete":      evt.DeleteView("pk", "sk").IfAbsent(),
+		"absent on a delete":      evt.DeleteView("pk", "sk", "a").IfAbsent(),
 		"present on a put":        put("pk", "sk").IfPresent(),
 		"unknown condition":       {Kind: evt.ViewPut, PK: "pk", SK: "sk", Condition: "maybe"},
 	} {
@@ -79,10 +82,11 @@ func Test_CheckViews_RejectsInvalidOperations(t *testing.T) {
 }
 
 func Test_CheckViews_TextRulesApplyToTheFieldsAnOperationWrites(t *testing.T) {
-	// A delete writes only its keys, so the fields it does not write are not held to the text rules.
-	op := evt.DeleteView("pk", "sk")
+	// A delete writes its keys and its owner, so the fields it does not write are not held to the
+	// text rules.
+	op := evt.DeleteView("pk", "sk", "a")
 	op.Payload = []byte("\x00")
-	op.EntityID = "\xff"
+	op.EntityType = "\xff"
 
 	require.NoError(t, evt.CheckViews([]evt.ProjectedView{view("p", 0, 0, op)}))
 }
@@ -116,7 +120,7 @@ func Test_CheckViews_RefusesARepeatedKey(t *testing.T) {
 	err := evt.CheckViews([]evt.ProjectedView{
 		view("first", 0, 0, put("pk", "one")),
 		view("first", 0, 1, put("pk", "two")),
-		view("second", 1, 0, evt.DeleteView("pk", "one")),
+		view("second", 1, 0, evt.DeleteView("pk", "one", "a")),
 	})
 	require.ErrorAs(t, err, &duplicate)
 	require.Equal(t, "pk", duplicate.PK)
@@ -138,9 +142,11 @@ func Test_ViewOperationSize_CountsTheAttributesTheBackendStores(t *testing.T) {
 		evt.ViewOperationSize(op))
 	require.Equal(t, evt.ViewOperationSize(op), evt.ViewOperationSize(op.IfAbsent()), "a put counts its item only")
 
-	deletion := evt.DeleteView("pk", "sk")
-	require.Equal(t, len("pk")+2+len("sk")+2, evt.ViewOperationSize(deletion))
-	require.Equal(t, evt.ViewOperationSize(deletion)+len("attribute_exists(pk)"), evt.ViewOperationSize(deletion.IfPresent()))
+	// A delete counts its two keys, its condition expression, and the :owner value it sends.
+	deletion := evt.DeleteView("pk", "sk", "own")
+	keys := len("pk") + 2 + len("sk") + 2
+	require.Equal(t, keys+len("attribute_not_exists(pk) OR entityID = :owner")+len(":owner")+3, evt.ViewOperationSize(deletion))
+	require.Equal(t, keys+len("attribute_exists(pk) AND entityID = :owner")+len(":owner")+3, evt.ViewOperationSize(deletion.IfPresent()))
 }
 
 func Test_ViewOperation_BuildersDoNotShareState(t *testing.T) {
@@ -257,7 +263,7 @@ func Test_ProjectCommit_TagsOperationsWithTheirProvenanceInDeclarationOrder(t *t
 		return []evt.ViewOperation{put("pk", "a"), put("pk", "b")}
 	}}
 	second := &directory{name: "second", ops: func(evt.CommitView) []evt.ViewOperation {
-		return []evt.ViewOperation{evt.DeleteView("pk", "c")}
+		return []evt.ViewOperation{evt.DeleteView("pk", "c", "a")}
 	}}
 
 	projected, err := evt.ProjectCommit(context.Background(),
@@ -435,62 +441,88 @@ func Test_GroupCommits_RefusesEventsNoOrderFits(t *testing.T) {
 	require.Equal(t, []string{"c1", "c2"}, unordered.Commits)
 }
 
-func Test_ProjectCommit_ACurrentStateProjectorSeesNoEventsAndAHistoryOneOnlyItsTypes(t *testing.T) {
-	commit := evt.NewCommitView([]evt.SerializedEvent{event("a", 1, "c"), event("b", 1, "c")}, nil)
+func Test_ProjectCommit_EachKindSeesOnlyWhatARebuildCanGiveIt(t *testing.T) {
+	commit := evt.NewCommitView([]evt.SerializedEvent{event("a", 1, "c"), event("b", 1, "c")},
+		map[evt.EntityID][]byte{"a": []byte(`{"a":1}`), "b": []byte(`{"b":1}`)})
 	commit.Streams[1].EntityType = "other"
 	commit.Streams[1].Events[0].EntityType = "other"
 
 	current := &directory{name: "current", ops: func(evt.CommitView) []evt.ViewOperation { return nil }}
 	reads := &directory{name: "reads", history: []evt.EntityType{"account"}, ops: func(evt.CommitView) []evt.ViewOperation {
-		return []evt.ViewOperation{put("pk", "a").OwnedBy("a")}
+		return []evt.ViewOperation{put("pk", "a")}
 	}}
 
 	_, err := evt.ProjectCommit(context.Background(), []evt.CommitProjector{current, reads}, commit)
 	require.NoError(t, err)
 
-	for _, stream := range current.seen[0].Streams {
+	seen := current.seen[0]
+	require.Empty(t, seen.CommitID, "a current-state projector is given no commit ID")
+
+	for _, stream := range seen.Streams {
 		require.Empty(t, stream.Events, "a current-state projector reads state only")
+		require.NotNil(t, stream.State, "and gets every stream's state")
 	}
 
-	require.Len(t, reads.seen[0].Streams[0].Events, 1, "the account stream's events are visible")
-	require.Empty(t, reads.seen[0].Streams[1].Events, "an undeclared type's events are not")
-	require.Len(t, commit.Streams[0].Events, 1, "the caller's view is not changed")
+	seen = reads.seen[0]
+	require.Equal(t, "c", seen.CommitID)
+	require.Len(t, seen.Streams[0].Events, 1, "the declared type's events are visible")
+	require.Equal(t, []byte(`{"a":1}`), seen.Streams[0].State, "and its state")
+	require.Empty(t, seen.Streams[1].Events, "an undeclared type's events are not")
+	require.Nil(t, seen.Streams[1].State, "and neither is its state")
+	require.Equal(t, evt.EntityID("b"), seen.Streams[1].EntityID, "the stream is still named")
+
+	require.Equal(t, "c", commit.CommitID, "the caller's view is not changed")
+	require.Len(t, commit.Streams[0].Events, 1)
+	require.NotNil(t, commit.Streams[1].State)
 }
 
-func Test_ProjectCommit_AHistoryDependentOperationNamesAnOwnerTheCommitWrote(t *testing.T) {
-	commit := evt.NewCommitView([]evt.SerializedEvent{event("a", 1, "c")}, nil)
-	project := func(op evt.ViewOperation) error {
+func Test_ProjectCommit_EveryOperationNamesAnOwnerStreamOfADeclaredType(t *testing.T) {
+	commit := evt.NewCommitView([]evt.SerializedEvent{event("a", 1, "c"), event("b", 1, "c")}, nil)
+	commit.Streams[1].EntityType = "other"
+	commit.Streams[1].Events[0].EntityType = "other"
+
+	project := func(history []evt.EntityType, op evt.ViewOperation) error {
 		_, err := evt.ProjectCommit(context.Background(), []evt.CommitProjector{&directory{
-			name: "reads", history: []evt.EntityType{"account"},
+			name: "p", history: history,
 			ops: func(evt.CommitView) []evt.ViewOperation { return []evt.ViewOperation{op} },
 		}}, commit)
 
 		return err
 	}
 
-	require.NoError(t, project(put("pk", "sk").OwnedBy("a")))
+	account := []evt.EntityType{"account"}
 
 	var invalid *evt.InvalidViewOperationError
 
-	require.ErrorAs(t, project(put("pk", "sk")), &invalid, "no owner")
-	require.ErrorAs(t, project(put("pk", "sk").OwnedBy("elsewhere")), &invalid, "an owner the commit did not write")
+	for name, history := range map[string][]evt.EntityType{"current-state": nil, "history-dependent": account} {
+		require.NoError(t, project(history, put("pk", "sk")), name)
+		require.NoError(t, project(history, evt.DeleteView("pk", "sk", "a")), name)
 
-	// A current-state projector needs no owner.
-	_, err := evt.ProjectCommit(context.Background(), []evt.CommitProjector{&directory{
-		name: "state", ops: func(evt.CommitView) []evt.ViewOperation { return []evt.ViewOperation{put("pk", "sk")} },
-	}}, commit)
-	require.NoError(t, err)
+		require.ErrorAs(t, project(history, evt.PutView("pk", "sk", "", "", nil)), &invalid, name+": no owner")
+		require.ErrorAs(t, project(history, evt.DeleteView("pk", "sk", "")), &invalid, name+": no owner on a delete")
+		require.ErrorAs(t, project(history, evt.PutView("pk", "sk", "elsewhere", "", nil)), &invalid,
+			name+": an owner the commit did not write")
+	}
+
+	// A history-dependent projector's owner must be of a type it declares: the row is rebuilt from
+	// the events of those types alone.
+	require.ErrorAs(t, project(account, evt.PutView("pk", "sk", "b", "other", nil)), &invalid, "an undeclared type")
+	require.Contains(t, invalid.Reason, "does not declare")
+	require.NoError(t, project([]evt.EntityType{"account", "other"}, evt.PutView("pk", "sk", "b", "other", nil)))
+
+	// A current-state projector declares nothing, so any stream the commit wrote may own its row.
+	require.NoError(t, project(nil, evt.PutView("pk", "sk", "b", "other", nil)))
 }
 
-// shared writes one row, "shared", for whichever stream a commit wrote, owned by that stream: the
-// projector Codex described, whose final row depends on the order its commits replay in.
+// shared writes one row, "shared", for whichever stream a commit wrote, owned by that stream: a
+// projector whose final row depends on the order its commits replay in.
 func shared(owner func(evt.CommitView) evt.EntityID) *directory {
 	return &directory{
 		name: "shared", history: []evt.EntityType{"account"},
 		ops: func(c evt.CommitView) []evt.ViewOperation {
 			id := owner(c)
 
-			return []evt.ViewOperation{evt.PutView("shared", "row", id, "account", []byte(`"`+c.CommitID+`"`)).OwnedBy(id)}
+			return []evt.ViewOperation{evt.PutView("shared", "row", id, "account", []byte(`"`+c.CommitID+`"`))}
 		},
 	}
 }
@@ -536,10 +568,10 @@ func Test_ReplayViews_AppliesDeletesAndSortsTheRows(t *testing.T) {
 		name: "p", history: []evt.EntityType{"account"},
 		ops: func(c evt.CommitView) []evt.ViewOperation {
 			if c.CommitID == "c2" {
-				return []evt.ViewOperation{evt.DeleteView("pk", "gone").OwnedBy("a")}
+				return []evt.ViewOperation{evt.DeleteView("pk", "gone", "a")}
 			}
 
-			return []evt.ViewOperation{put("pk", "kept").OwnedBy("a"), put("pk", "gone").OwnedBy("a")}
+			return []evt.ViewOperation{put("pk", "kept"), put("pk", "gone")}
 		},
 	}}, groups)
 	require.NoError(t, err)

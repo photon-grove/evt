@@ -116,11 +116,38 @@ pub const PUT_SNAPSHOT_CONDITION: &str = "attribute_not_exists(eventSeq) OR even
 /// yet. The row is written once, in its final state.
 pub const OUTCOME_CONDITION: &str = "attribute_not_exists(pk)";
 
+/// The placeholder of the owner value that every commit-wide view write binds (v0.9, C7), except
+/// a put that requires the row to be absent.
+pub const OWNER_PLACEHOLDER: &str = ":owner";
+
 /// Condition for a commit-wide view put that requires no row at the key (v0.9, C7).
 pub const VIEW_ABSENT_CONDITION: &str = "attribute_not_exists(pk)";
 
-/// Condition for a commit-wide view delete that requires a row at the key (v0.9, C7).
-pub const VIEW_PRESENT_CONDITION: &str = "attribute_exists(pk)";
+/// Condition for any other commit-wide view put: no row at the key, or the owner's own.
+pub const VIEW_PUT_CONDITION: &str = "attribute_not_exists(pk) OR entityID = :owner";
+
+/// Condition for a commit-wide view delete that requires the owner's row at the key.
+pub const VIEW_PRESENT_CONDITION: &str = "attribute_exists(pk) AND entityID = :owner";
+
+/// Condition for any other commit-wide view delete: no row at the key, or the owner's own.
+pub const VIEW_DELETE_CONDITION: &str = "attribute_not_exists(pk) OR entityID = :owner";
+
+/// The condition expression of a view put: it binds [`OWNER_PLACEHOLDER`] unless the put requires
+/// the row to be absent.
+pub fn put_condition(condition: crate::projection::ViewCondition) -> &'static str {
+    match condition {
+        crate::projection::ViewCondition::Absent => VIEW_ABSENT_CONDITION,
+        _ => VIEW_PUT_CONDITION,
+    }
+}
+
+/// The condition expression of a view delete, which always binds [`OWNER_PLACEHOLDER`].
+pub fn delete_condition(condition: crate::projection::ViewCondition) -> &'static str {
+    match condition {
+        crate::projection::ViewCondition::Present => VIEW_PRESENT_CONDITION,
+        _ => VIEW_DELETE_CONDITION,
+    }
+}
 
 /// Condition for the feature-marker check every v0.9 commit carries (`:v` is the version the
 /// writer validated). A writer that validated a table with no marker conditions on
@@ -365,14 +392,13 @@ pub fn view_item(
     Ok(item)
 }
 
-/// Encodes the row a commit-wide view put writes (v0.9, C7): all five attributes, whatever the
-/// projector chose for the informational ones. The payload must be valid UTF-8 (the engine checks
-/// it before any write).
+/// Encodes the row a commit-wide view put writes (v0.9, C7): all five attributes, the owner as
+/// `entityID`. The payload must be valid UTF-8 (the engine checks it before any write).
 pub fn view_operation_item(operation: &crate::projection::ViewOperation) -> Result<Item, Error> {
     let mut item = Item::new();
     item.insert("pk".into(), s(operation.pk.as_str()));
     item.insert("sk".into(), s(operation.sk.as_str()));
-    item.insert("entityID".into(), s(operation.entity_id.as_str()));
+    item.insert("entityID".into(), s(operation.owner.as_str()));
     item.insert("entityType".into(), s(operation.entity_type.as_str()));
     item.insert(
         "payload".into(),

@@ -491,7 +491,7 @@ impl CommitProjector for Directory {
                 ViewOperation::put(
                     "directory",
                     stream.entity_id.as_str(),
-                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(), // the owner: the stream that owns the row
                     stream.entity_type.as_str(),
                     stream.state.clone(), // the aggregate's JSON after the commit
                 )
@@ -512,20 +512,53 @@ them refuses the commit with `Error::ViewsNotConfigured`. A failed condition is
 `source()`; it is never retried and records no outcome. Keys over 2,048 bytes (`pk`) or 1,024 bytes
 (`sk`), a repeated key, and operations with no event are refused before any write.
 
-A projector says which entity types it reads the *events* of with `history()`. The default, none, is a
-current-state projector, given the view without events; one that names types is given those types'
-events, and the store durably adds them to the manifest's `historyDependent` set before its first
-commit (`compact_below` then refuses them), so the repository must implement
-`declare_history_dependent` and `writes_views` (the in-memory, DynamoDB, and PostgreSQL ones do).
-Each operation of a history-dependent projector names the stream that owns its row with
-`owned_by`, which must be a stream the commit wrote: a stream's sequence is the only commit order the
-log keeps, `group_commits` orders commits consistently with it, and `replay_views` refuses a row two
-streams write (`Error::SharedViewKey`). A PostgreSQL view writer names the table's `(pk, sk)` key
-constraint with `PgStatement::with_key_constraint`, so only a violation of that constraint is a
-failed `if_absent` condition.
+### Row owners
 
-A projector must be deterministic: `group_commits` regroups stored events by commit ID so a
-rebuild, or a test, can run it again over each commit and compare.
+Every operation names an **owner**: the stream the row belongs to, which is stored as the row's
+`entityID` attribute. The owner must be a stream the commit wrote. Every write to a row is
+conditioned on its owner, so a stream never overwrites or deletes a row another stream owns: the
+operation fails with `Error::ProjectorOperation` (reason `ConditionalCheckFailed`), and nothing of
+the commit is written. A row that does not exist yet can be written by anyone.
+
+**A row's owner must never change.** Never delete a row to hand its key to another stream: keep the
+row and rewrite it, as its owner, with a tombstone payload. A rebuild orders the writes to a row by
+its owner's sequence, the only commit order the log keeps, and `replay_views` refuses a row that
+two streams write (`Error::SharedViewKey`).
+
+**A PostgreSQL view writer must enforce the owner in SQL**; the engine cannot. The statements it
+returns must have these semantics (see `PostgresRepository::with_view_writer`):
+
+- a put with `if_absent` is a plain `INSERT` (no `ON CONFLICT`), and the statement names the
+  table's `(pk, sk)` key constraint with `PgStatement::with_key_constraint`: only a violation of
+  that constraint is a failed `if_absent` condition;
+- any other put is an upsert that only the owner may overwrite:
+  `INSERT ... ON CONFLICT (pk, sk) DO UPDATE SET ... WHERE <table>.entity_id = EXCLUDED.entity_id`.
+  A put that affects no row (the row is another stream's) fails its condition;
+- a delete with `if_present` removes the owner's row only:
+  `DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3`, and a delete that affects no row fails
+  its condition;
+- a delete without a condition succeeds on an absent row but refuses another stream's row, so its
+  statement reports the foreign rows it found rather than the rows it deleted:
+  `WITH gone AS (DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3) SELECT 1 FROM <table>
+  WHERE pk = $1 AND sk = $2 AND entity_id <> $3`. An affected-row count above zero fails its
+  condition (a plain `DELETE` would silently do nothing to another stream's row).
+
+### Current-state and history-dependent projectors
+
+A projector says which entity types it reads the *events* of with `history()`. The default, none,
+is a **current-state** projector: it is given an empty commit ID and streams without events, and
+the state of every stream, so a rebuild reproduces its rows from the final states alone. One that
+names types is **history-dependent**: it is given the commit ID, and the events and state of the
+streams of those types; every other stream arrives without events and without state. A
+history-dependent projector may only own rows by streams of the types it names. The store durably
+adds those types to the manifest's `historyDependent` set before the projector's first commit
+(`compact_below` then refuses them), so the repository must implement `declare_history_dependent`
+and `writes_views` (the in-memory, DynamoDB, and PostgreSQL ones do). A row keyed by the commit ID
+therefore needs a history-dependent projector.
+
+A projector must be deterministic: `group_commits` regroups stored events by commit ID in an order
+every stream agrees with, so a rebuild, or a test, can run the projector again over each commit
+(`replay_views`) and compare the rows.
 
 ## Enumerating the log
 

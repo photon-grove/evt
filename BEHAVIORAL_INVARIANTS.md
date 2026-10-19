@@ -565,15 +565,24 @@ transaction as the events. The byte-level rules are in the
 **Kinds, history, and ownership**
 
 - `History()` names the entity types whose events the projector reads. None: current-state, given
-  views without events. Otherwise history-dependent: given the events of those types only, and the
+  each stream's state and no events and no commit ID. Otherwise history-dependent: given the commit
+  ID and the events and state of those types only (other streams by ID and type), and the
   store durably adds them to the manifest's `historyDependent` set before the first commit that runs
   it (`CompactBelow` then refuses them in every process). A repository that cannot declare
   (`evt.HistoryDeclarer`) refuses the commit (`HistoryDeclarationUnsupportedError`).
-- Every operation of a history-dependent projector names an owner stream the commit wrote. A
-  stream's sequence is the only commit order the log keeps (commit IDs are not causal), so writes
-  to a row are ordered by its owner's sequence; `GroupCommits` returns an order every stream agrees
-  with, and `ReplayViews` refuses a row two streams write (`SharedViewKeyError`).
-- A repository must declare `evt.ViewWritingRepository` (Rust `Repository::writes_views`) or the
+- Every operation of every projector names an owner stream the commit wrote (of a declared type
+  for a history-dependent projector). The owner is stored as the row's `entityID`, and every write
+  to the row (put or delete) is conditioned on it: DynamoDB
+  `attribute_not_exists(pk) OR entityID = :owner` (`attribute_exists(pk) AND entityID = :owner`
+  for a `present` delete), the in-memory repository the same, a PostgreSQL view writer in SQL. A
+  stream's sequence is the only commit order the log keeps (commit IDs are not causal), so a row's
+  owner must never change: reuse a key with a tombstone put by its owner, never delete-then-put by
+  another stream. `GroupCommits` returns an order every stream agrees with, and `ReplayViews`
+  refuses a row two streams write (`SharedViewKeyError`).
+- Only the in-memory replay of history-dependent projectors exists today; the state entry point and
+  the state-based rebuild of current-state projectors are not implemented.
+- A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` returns true; a
+  decorator returns the wrapped repository's; Rust `Repository::writes_views`) or the
   store refuses a commit-wide projector (`ViewsUnsupportedError`); `CheckProjectorOperationsSupported`
   stays fail-closed for view operations.
 

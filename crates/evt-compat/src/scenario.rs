@@ -199,17 +199,18 @@ pub struct StepProjector {
     pub operations: Vec<StepView>,
 }
 
-/// One view operation of a transaction step. The placeholder `{id}` in `pk`, `sk`, `entityId`, and
-/// `payload` is the scenario's entity ID, so rows are scoped to the run. `pkPad` and `skPad`
-/// extend a key with `x` up to that many bytes, so the key-limit cases need not store a 2 KB string.
+/// One view operation of a transaction step. The placeholder `{id}` in `pk`, `sk`, `owner`, and
+/// `payload` is the scenario's entity ID, so rows are scoped to the run. `owner` is the stream that
+/// owns the row (required on a delete too). `pkPad` and `skPad`
+/// extend a key with `x` up to that many bytes, so the key-limit cases need not store a 2 KB
+/// string.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepView {
     pub op: String,
     pub pk: String,
     pub sk: String,
-    #[serde(default)]
-    pub entity_id: String,
+    pub owner: String,
     #[serde(default)]
     pub entity_type: String,
     #[serde(default)]
@@ -255,13 +256,16 @@ pub fn views_of(base: &EntityId, step: &Step) -> Vec<ProjectedView> {
                 pad(scope(&item.pk), item.pk_pad),
                 pad(scope(&item.sk), item.sk_pad),
             );
+            // The owner is the operation's `owner` (`{id}` resolves to the scenario's stream),
+            // required on a delete as well as a put.
+            let owner = scope(&item.owner);
             let mut op = if item.op == "delete" {
-                ViewOperation::delete(pk, sk)
+                ViewOperation::delete(pk, sk, owner)
             } else {
                 ViewOperation::put(
                     pk,
                     sk,
-                    scope(&item.entity_id),
+                    owner,
                     item.entity_type.clone(),
                     scope(&item.payload).into_bytes(),
                 )

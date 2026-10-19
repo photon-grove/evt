@@ -33,8 +33,9 @@ type CommitViewRequest struct {
 
 	Seeded []SeededStream `json:"seeded,omitempty"`
 
-	// SeededViews are view rows [pk, sk] the store holds, so a "present" delete finds its row.
-	SeededViews [][2]string `json:"seededViews,omitempty"`
+	// SeededViews are view rows [pk, sk, owner] the store holds, so a "present" delete finds its
+	// row.
+	SeededViews [][3]string `json:"seededViews,omitempty"`
 
 	Streams    []HeadStreamRequest `json:"streams"`
 	Fences     []HeadFenceRequest  `json:"fences,omitempty"`
@@ -56,16 +57,16 @@ func commitViewVectors() []CommitViewVector {
 				{EntityID: "a", EntityType: "account", First: 8, Count: 1, SnapshotSequence: 2},
 			},
 			Fences:      []HeadFenceRequest{{EntityID: "z", Head: 0}, {EntityID: "m", Head: 3}},
-			SeededViews: [][2]string{{"handles", "grace"}},
+			SeededViews: [][3]string{{"handles", "grace", "a"}},
 			Projectors: []StepProjector{
 				{Name: "directory", Operations: []StepView{
-					{Op: "put", PK: "directory", SK: "acct#a", EntityID: "a", EntityType: "account", Payload: `{"status":"open"}`},
-					{Op: "put", PK: "handles", SK: "ada", EntityID: "a", EntityType: "account", Payload: `{"owner":"a"}`, Condition: "absent"},
-					{Op: "delete", PK: "handles", SK: "grace", Condition: "present"},
+					{Op: "put", PK: "directory", SK: "acct#a", Owner: "a", EntityType: "account", Payload: `{"status":"open"}`},
+					{Op: "put", PK: "handles", SK: "ada", Owner: "a", EntityType: "account", Payload: `{"owner":"a"}`, Condition: "absent"},
+					{Op: "delete", PK: "handles", SK: "grace", Owner: "a", Condition: "present"},
 				}},
 				{Name: "audit", Operations: []StepView{
-					{Op: "delete", PK: "audit", SK: "pending"},
-					{Op: "put", PK: "audit", SK: "c1", EntityID: "", EntityType: "", Payload: `{"streams":2}`},
+					{Op: "delete", PK: "audit", SK: "pending", Owner: "b"},
+					{Op: "put", PK: "audit", SK: "c1", Owner: "b", EntityType: "", Payload: `{"streams":2}`},
 				}},
 			},
 		}},
@@ -73,7 +74,7 @@ func commitViewVectors() []CommitViewVector {
 			EventsTable: fakeTable, ViewsTable: ViewsTable,
 			Streams: []HeadStreamRequest{{EntityID: "acct-1", EntityType: "account", First: 1, Count: 2}},
 			Projectors: []StepProjector{{Name: "ledger", Operations: []StepView{
-				{Op: "put", PK: "ledger", SK: "acct-1", EntityID: "acct-1", EntityType: "account", Payload: `{"events":2}`},
+				{Op: "put", PK: "ledger", SK: "acct-1", Owner: "acct-1", EntityType: "account", Payload: `{"events":2}`},
 			}}},
 		}},
 	}
@@ -101,7 +102,7 @@ func GenerateCommitViewVectors(ctx context.Context) ([]CommitViewVector, error) 
 		}
 
 		for _, seeded := range vectors[i].Request.SeededViews {
-			capture.SeedView(seeded[0], seeded[1])
+			capture.SeedView(seeded[0], seeded[1], seeded[2])
 		}
 
 		capture.writes = nil

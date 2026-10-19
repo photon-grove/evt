@@ -43,8 +43,8 @@ func TestViewOperationsSitBetweenTheMarkerCheckAndTheWrittenStreams(t *testing.T
 		Events: []evt.SerializedEvent{viewEvent("b", 1), viewEvent("a", 1)},
 		Views: []evt.ProjectedView{
 			projected("directory", 0, 0, evt.PutView("directory", "a", "a", "t", []byte(`{}`))),
-			projected("directory", 0, 1, evt.DeleteView("directory", "old")),
-			projected("audit", 1, 0, evt.PutView("audit", "commit-1", "", "", []byte(`{}`)).IfAbsent()),
+			projected("directory", 0, 1, evt.DeleteView("directory", "old", "o")),
+			projected("audit", 1, 0, evt.PutView("audit", "commit-1", "o", "", []byte(`{}`)).IfAbsent()),
 		},
 	}))
 
@@ -85,7 +85,7 @@ func TestViewOperationsWithoutAViewsTableAreRefusedBeforeAnyRequest(t *testing.T
 
 	err := repo.Commit(context.Background(), evt.SerializedResult{
 		Events: []evt.SerializedEvent{viewEvent("a", 1)},
-		Views:  []evt.ProjectedView{projected("p", 0, 0, evt.PutView("pk", "sk", "", "", nil))},
+		Views:  []evt.ProjectedView{projected("p", 0, 0, evt.PutView("pk", "sk", "o", "", nil))},
 	})
 
 	var refused *evt.ViewsNotConfiguredError
@@ -205,7 +205,7 @@ func TestViewOperationsCountInTheBudget(t *testing.T) {
 	views := func(count int) []evt.ProjectedView {
 		out := make([]evt.ProjectedView, 0, count)
 		for i := range count {
-			out = append(out, projected("bulk", 0, i, evt.PutView("bulk", fmt.Sprintf("row-%03d", i), "", "", nil)))
+			out = append(out, projected("bulk", 0, i, evt.PutView("bulk", fmt.Sprintf("row-%03d", i), "o", "", nil)))
 		}
 
 		return out
@@ -228,7 +228,7 @@ func TestViewOperationsCountInTheBudget(t *testing.T) {
 	// item limit but not the 3,800,000-byte request limit.
 	big := make([]evt.ProjectedView, 0, 11)
 	for i := range 11 {
-		big = append(big, projected("big", 0, i, evt.PutView("big", fmt.Sprintf("part-%02d", i), "", "", bytes.Repeat([]byte("x"), 350_000))))
+		big = append(big, projected("big", 0, i, evt.PutView("big", fmt.Sprintf("part-%02d", i), "o", "", bytes.Repeat([]byte("x"), 350_000))))
 	}
 
 	err = repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{viewEvent("c", 1)}, Views: big})
@@ -242,12 +242,12 @@ func TestViewKeysAreCheckedBeforeAnyRequest(t *testing.T) {
 	long := bytes.Repeat([]byte("p"), evt.MaxViewPKBytes+1)
 
 	for name, views := range map[string][]evt.ProjectedView{
-		"a key over the limit": {projected("p", 0, 0, evt.PutView(string(long), "sk", "", "", nil))},
+		"a key over the limit": {projected("p", 0, 0, evt.PutView(string(long), "sk", "o", "", nil))},
 		"a repeated key": {
-			projected("p", 0, 0, evt.PutView("pk", "sk", "", "", nil)),
-			projected("q", 1, 0, evt.DeleteView("pk", "sk")),
+			projected("p", 0, 0, evt.PutView("pk", "sk", "o", "", nil)),
+			projected("q", 1, 0, evt.DeleteView("pk", "sk", "o")),
 		},
-		"an empty key": {projected("p", 0, 0, evt.PutView("pk", "", "", "", nil))},
+		"an empty key": {projected("p", 0, 0, evt.PutView("pk", "", "o", "", nil))},
 	} {
 		err := repo.Commit(context.Background(), evt.SerializedResult{Events: []evt.SerializedEvent{viewEvent("a", 1)}, Views: views})
 		require.ErrorIs(t, err, evt.ErrInvalidArgument, name)

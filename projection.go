@@ -61,13 +61,31 @@ const (
 	ViewPresent ViewCondition = "present"
 )
 
-// viewPresentConditionSize is the length of the DynamoDB condition expression a ViewPresent delete
-// carries ("attribute_exists(pk)"). A ViewAbsent put's condition is not budgeted: a put counts its
-// item only, like every put the commit carries.
-const viewPresentConditionSize = len("attribute_exists(pk)")
+// The lengths of the DynamoDB condition expressions a view delete carries, and of the name of its
+// expression value; the DynamoDB repository's conditions are these strings. A put counts its item
+// only, like every put the commit carries, so its condition is not budgeted.
+const (
+	// viewUnconditionalDeleteConditionSize is "attribute_not_exists(pk) OR entityID = :owner".
+	viewUnconditionalDeleteConditionSize = len("attribute_not_exists(pk) OR entityID = :owner")
+
+	// viewPresentDeleteConditionSize is "attribute_exists(pk) AND entityID = :owner".
+	viewPresentDeleteConditionSize = len("attribute_exists(pk) AND entityID = :owner")
+
+	// viewOwnerValueNameSize is the length of ":owner".
+	viewOwnerValueNameSize = len(":owner")
+)
 
 // ViewOperation is one backend-neutral view write, evaluated and written by the repository in the
 // commit's transaction. Build one with PutView or DeleteView.
+//
+// Every operation names the stream that owns its row, and the repository stores the owner in the
+// row's entityID attribute and refuses any write by a different owner. **A row's owner must never
+// change.** The log keeps one commit order only, each stream's own sequence, so a replay can order
+// the writes to a row only while they all come from commits that wrote the same stream; a row
+// handed from one stream to another (a delete by the first, then a put by the second) is accepted
+// live and cannot be rebuilt. A key that must be reused by another stream is never deleted: it is
+// overwritten by its owner with a tombstone, or the row is owned by a stream both claimants write
+// (see the commit-wide projector guide).
 type ViewOperation struct {
 	// Kind is ViewPut or ViewDelete.
 	Kind ViewOperationKind `json:"kind"`
@@ -76,10 +94,11 @@ type ViewOperation struct {
 	PK string `json:"pk"`
 	SK string `json:"sk"`
 
-	// EntityID and EntityType are informational and always written by a put; readers never
-	// interpret them. A row that belongs to no single entity repeats the commit's primary stream
-	// or any stable label.
-	EntityID   EntityID   `json:"entityID,omitempty"`
+	// Owner is the stream the row belongs to; required. A projector's operation must name a stream
+	// the commit wrote, and a history-dependent projector one of the entity types it declares.
+	Owner EntityID `json:"owner"`
+
+	// EntityType is informational and always written by a put; readers never interpret it.
 	EntityType EntityType `json:"entityType,omitempty"`
 
 	// Payload is the view state JSON of a put.
@@ -88,27 +107,21 @@ type ViewOperation struct {
 	// Condition is the operation's condition, if any.
 	Condition ViewCondition `json:"condition,omitempty"`
 
-	// Owner is the stream the row belongs to. A history-dependent projector (one whose History
-	// is not empty) must name one for every operation, and it must be a stream the commit wrote:
-	// then every write to a row is ordered by that stream's own sequence, which is the only commit
-	// order the log keeps, and a replay can apply them in that order. A current-state projector
-	// needs no owner. It is in-memory commit data and is never stored.
-	Owner EntityID `json:"-"`
-
 	// Conflict is the projector's own error for the case where Condition fails. The commit's
 	// *ProjectorOperationError wraps it, so errors.Is matches the projector's value. It is
 	// in-memory commit data and is never stored.
 	Conflict error `json:"-"`
 }
 
-// PutView returns an operation that writes a row at pk and sk.
-func PutView(pk, sk string, entityID EntityID, entityType EntityType, payload []byte) ViewOperation {
-	return ViewOperation{Kind: ViewPut, PK: pk, SK: sk, EntityID: entityID, EntityType: entityType, Payload: payload}
+// PutView returns an operation that writes a row at pk and sk on behalf of the owner stream.
+func PutView(pk, sk string, owner EntityID, entityType EntityType, payload []byte) ViewOperation {
+	return ViewOperation{Kind: ViewPut, PK: pk, SK: sk, Owner: owner, EntityType: entityType, Payload: payload}
 }
 
-// DeleteView returns an operation that deletes the row at pk and sk.
-func DeleteView(pk, sk string) ViewOperation {
-	return ViewOperation{Kind: ViewDelete, PK: pk, SK: sk}
+// DeleteView returns an operation that deletes the row at pk and sk on behalf of the owner stream.
+// Deleting a row another stream owns fails the commit; deleting an absent row succeeds.
+func DeleteView(pk, sk string, owner EntityID) ViewOperation {
+	return ViewOperation{Kind: ViewDelete, PK: pk, SK: sk, Owner: owner}
 }
 
 // IfAbsent returns the operation requiring that no row exists at its key. It is valid on a put.
@@ -118,16 +131,10 @@ func (op ViewOperation) IfAbsent() ViewOperation {
 	return op
 }
 
-// IfPresent returns the operation requiring that a row exists at its key. It is valid on a delete.
+// IfPresent returns the operation requiring that a row owned by the operation's owner exists at its
+// key. It is valid on a delete.
 func (op ViewOperation) IfPresent() ViewOperation {
 	op.Condition = ViewPresent
-
-	return op
-}
-
-// OwnedBy returns the operation owned by the given stream; see ViewOperation.Owner.
-func (op ViewOperation) OwnedBy(owner EntityID) ViewOperation {
-	op.Owner = owner
 
 	return op
 }
@@ -141,22 +148,23 @@ func (op ViewOperation) OnConflict(err error) ViewOperation {
 }
 
 // ViewOperationSize is the DynamoDB-encoded size of an operation in the commit budget: a put
-// counts its five attributes, and a delete its two key attributes plus the condition expression
-// when it carries one. The DynamoDB and in-memory repositories budget operations by it, and it
-// equals the size of the item the DynamoDB repository builds.
+// counts its five attributes (the owner is its entityID), and a delete its two key attributes plus
+// its condition expression and the owner expression value. The DynamoDB and in-memory repositories
+// budget operations by it, and it equals the size of the item the DynamoDB repository builds.
 func ViewOperationSize(op ViewOperation) int {
 	keys := len("pk") + len(op.PK) + len("sk") + len(op.SK)
 
 	if op.Kind == ViewDelete {
+		condition := viewUnconditionalDeleteConditionSize
 		if op.Condition == ViewPresent {
-			keys += viewPresentConditionSize
+			condition = viewPresentDeleteConditionSize
 		}
 
-		return keys
+		return keys + condition + viewOwnerValueNameSize + len(op.Owner)
 	}
 
 	return keys +
-		len("entityID") + len(op.EntityID) +
+		len("entityID") + len(op.Owner) +
 		len("entityType") + len(op.EntityType) +
 		len("payload") + len(op.Payload)
 }
@@ -178,10 +186,12 @@ type CommitStream struct {
 // entity-ID bytes, the order of the transaction's groups; events are those of the commit only.
 //
 // It carries no outcome context: a rebuild regroups stored events by commit ID and has no outcome
-// row, so a row that depended on the outcome's status could not be rebuilt.
+// row, so a row that depended on the outcome's status could not be rebuilt. What a projector is
+// given of it depends on its kind (CommitProjector).
 type CommitView struct {
 	// CommitID is the one commit ID every event of the commit carries; empty for a pre-v0.9
-	// event, which replays as a single-event commit.
+	// event, which replays as a single-event commit, and always empty for a current-state
+	// projector.
 	CommitID string
 
 	// Streams are the written streams, ascending by entity ID bytes.
@@ -207,22 +217,26 @@ func (v CommitView) EventCount() int {
 // not be ordered by map iteration. It must not modify the view. The operations it returns are
 // appended to the commit in the projector's declaration order, each projector's in emission order.
 //
-// A projector is one of two kinds, and History says which. A current-state projector computes its
-// rows from the state each stream has after the commit; a rebuild never replays history for it. A
-// history-dependent projector also reads the commit's events; a rebuild replays every commit for it,
-// so the commits it reads must never be compacted away, and its rows must be ordered by something a
-// replay has.
+// A projector is one of two kinds, and History says which, and the view it is given is what a
+// rebuild of that kind can give it again. A current-state projector computes its rows from the
+// state each stream has after the commit, and is given nothing else: no events and no commit ID.
+// A history-dependent projector also reads the commit's events and its commit ID, of the entity
+// types it declares only; a rebuild replays every commit for it, so the commits it reads must never
+// be compacted away, and its rows must be ordered by something a replay has.
+//
+// Every operation of either kind names the stream that owns its row, and a row's owner must never
+// change (see ViewOperation).
 type CommitProjector interface {
 	// Name identifies the projector in errors. It should be unique within a store.
 	Name() string
 
 	// History returns the entity types whose events the projector reads. It returns nil for a
-	// current-state projector, which is then given views whose streams carry no events. A
-	// history-dependent projector is given the events of the streams of these types only, and no
-	// others. The store declares these types in the feature manifest's historyDependent set
-	// before the first commit that runs the projector, so CompactBelow refuses them in every
-	// process, and each of its operations must name the stream that owns its row (see
-	// ViewOperation.Owner).
+	// current-state projector, which is given every stream's state but no events and an empty
+	// commit ID. A history-dependent projector is given the commit ID, and the events and state of
+	// the streams of these types only; other streams carry neither. The store declares these types
+	// in the feature manifest's historyDependent set before the first commit that runs the
+	// projector, so CompactBelow refuses them in every process, and the owner of each of its
+	// operations must be a stream of one of these types.
 	History() []EntityType
 
 	// ProjectCommit returns the commit's view operations.
@@ -496,10 +510,13 @@ func invalidViewReason(op ViewOperation) string {
 		return "sk is empty"
 	}
 
-	fields := []struct{ name, value string }{{"pk", op.PK}, {"sk", op.SK}}
+	if op.Owner == "" {
+		return "owner is empty"
+	}
+
+	fields := []struct{ name, value string }{{"pk", op.PK}, {"sk", op.SK}, {"owner", string(op.Owner)}}
 	if op.Kind == ViewPut {
 		fields = append(fields,
-			struct{ name, value string }{"entityID", string(op.EntityID)},
 			struct{ name, value string }{"entityType", string(op.EntityType)},
 			struct{ name, value string }{"payload", string(op.Payload)},
 		)
@@ -520,11 +537,13 @@ func invalidViewReason(op ViewOperation) string {
 
 // ProjectCommit runs the projectors over a commit view, in declaration order, and returns their
 // operations with provenance in the order the commit writes them. A commit that wrote no event
-// runs no projector. A current-state projector (History is empty) sees the view without events; a
-// history-dependent one sees the events of the entity types it names, and its operations must each
-// name an owner stream the commit wrote (*InvalidViewOperationError otherwise). A projector's
-// error is a *ProjectorError; the combined operations are validated with CheckViews. A nil
-// projector is skipped but keeps its position.
+// runs no projector.
+//
+// Each projector is given the view its kind may see (CommitView.visibleTo). Every operation must
+// name an owner stream the commit wrote, and a history-dependent projector's owner must also be of
+// an entity type it declares in History (*InvalidViewOperationError otherwise). A projector's error
+// is a *ProjectorError; the combined operations are validated with CheckViews. A nil projector is
+// skipped but keeps its position.
 func ProjectCommit(ctx context.Context, projectors []CommitProjector, view CommitView) ([]ProjectedView, error) {
 	if len(projectors) == 0 || view.EventCount() == 0 {
 		return nil, nil
@@ -547,10 +566,8 @@ func ProjectCommit(ctx context.Context, projectors []CommitProjector, view Commi
 		for operation, op := range operations {
 			item := ProjectedView{Projector: projector.Name(), ProjectorIndex: index, Operation: operation, Op: op}
 
-			if len(history) > 0 {
-				if err := checkOwner(item, view); err != nil {
-					return nil, err
-				}
+			if err := checkOwner(item, view, history); err != nil {
+				return nil, err
 			}
 
 			projected = append(projected, item)
@@ -564,15 +581,25 @@ func ProjectCommit(ctx context.Context, projectors []CommitProjector, view Commi
 	return projected, nil
 }
 
-// visibleTo returns the view a projector is given: the events of the streams whose entity type it
-// names, and none of any other stream. A current-state projector names no type, so it reads state
-// only; that is what makes a rebuild from state alone reproduce its rows.
+// visibleTo returns the view a projector is given, which is what a rebuild can give it again.
+//
+// A current-state projector (History is empty) is given the state each stream has after the commit
+// and nothing else: no events and no commit ID, because a rebuild from state alone has neither and
+// a row that depended on them could not be rebuilt.
+//
+// A history-dependent projector is given the commit ID, and the events and state of the streams
+// whose entity type it declares; the other streams appear by ID and type only, so it cannot read
+// what its declaration does not cover (a stream of an undeclared type may have been compacted).
 func (v CommitView) visibleTo(history []EntityType) CommitView {
 	streams := make([]CommitStream, len(v.Streams))
 
 	for i, stream := range v.Streams {
-		if !slices.Contains(history, stream.EntityType) {
+		if len(history) == 0 || !slices.Contains(history, stream.EntityType) {
 			stream.Events = nil
+
+			if len(history) > 0 {
+				stream.State = nil
+			}
 		}
 
 		streams[i] = stream
@@ -580,28 +607,42 @@ func (v CommitView) visibleTo(history []EntityType) CommitView {
 
 	v.Streams = streams
 
+	if len(history) == 0 {
+		v.CommitID = ""
+	}
+
 	return v
 }
 
-// checkOwner requires a history-dependent projector's operation to name an owner stream the commit
-// wrote.
-func checkOwner(view ProjectedView, commit CommitView) error {
+// checkOwner requires an operation to name an owner stream the commit wrote and, for a
+// history-dependent projector, one of an entity type it declares.
+func checkOwner(view ProjectedView, commit CommitView, history []EntityType) error {
 	ref := ProjectorOperationRef{Projector: view.Projector, ProjectorIndex: view.ProjectorIndex, Operation: view.Operation}
 
+	invalid := func(reason string) error {
+		return &InvalidViewOperationError{ProjectorOperationRef: ref, Reason: reason}
+	}
+
 	if view.Op.Owner == "" {
-		return &InvalidViewOperationError{ProjectorOperationRef: ref, Reason: "a history-dependent projector's operation must name an owner stream"}
+		return invalid("every operation must name an owner stream")
 	}
 
 	for _, stream := range commit.Streams {
-		if stream.EntityID == view.Op.Owner {
-			return nil
+		if stream.EntityID != view.Op.Owner {
+			continue
 		}
+
+		if len(history) > 0 && !slices.Contains(history, stream.EntityType) {
+			return invalid(fmt.Sprintf(
+				"the owner stream %q is of entity type %q, which the projector does not declare in History",
+				view.Op.Owner, stream.EntityType,
+			))
+		}
+
+		return nil
 	}
 
-	return &InvalidViewOperationError{
-		ProjectorOperationRef: ref,
-		Reason:                fmt.Sprintf("the owner stream %q was not written by this commit", view.Op.Owner),
-	}
+	return invalid(fmt.Sprintf("the owner stream %q was not written by this commit", view.Op.Owner))
 }
 
 // NewCommitView builds the view of one commit from its events: streams ascending by entity-ID
@@ -821,13 +862,12 @@ func ReplayViews(ctx context.Context, projectors []CommitProjector, commits []Co
 		for _, item := range projected {
 			target := key{item.Op.PK, item.Op.SK}
 
-			if owner := item.Op.Owner; owner != "" {
-				if first, seen := owners[target]; seen && first != owner {
-					return nil, &SharedViewKeyError{PK: target.pk, SK: target.sk, First: first, Second: owner}
-				}
-
-				owners[target] = owner
+			owner := item.Op.Owner
+			if first, seen := owners[target]; seen && first != owner {
+				return nil, &SharedViewKeyError{PK: target.pk, SK: target.sk, First: first, Second: owner}
 			}
+
+			owners[target] = owner
 
 			if item.Op.Kind == ViewDelete {
 				delete(rows, target)
@@ -836,7 +876,7 @@ func ReplayViews(ctx context.Context, projectors []CommitProjector, commits []Co
 			}
 
 			rows[target] = SerializedView{
-				PK: item.Op.PK, SK: item.Op.SK, EntityID: item.Op.EntityID, EntityType: item.Op.EntityType,
+				PK: item.Op.PK, SK: item.Op.SK, EntityID: item.Op.Owner, EntityType: item.Op.EntityType,
 				Payload: slices.Clone(item.Op.Payload),
 			}
 		}

@@ -1872,7 +1872,8 @@
         "seededViews": [
           [
             "handles",
-            "grace"
+            "grace",
+            "a"
           ]
         ],
         "streams": [
@@ -1908,7 +1909,7 @@
                 "op": "put",
                 "pk": "directory",
                 "sk": "acct#a",
-                "entityId": "a",
+                "owner": "a",
                 "entityType": "account",
                 "payload": "{\"status\":\"open\"}"
               },
@@ -1916,7 +1917,7 @@
                 "op": "put",
                 "pk": "handles",
                 "sk": "ada",
-                "entityId": "a",
+                "owner": "a",
                 "entityType": "account",
                 "payload": "{\"owner\":\"a\"}",
                 "condition": "absent"
@@ -1925,6 +1926,7 @@
                 "op": "delete",
                 "pk": "handles",
                 "sk": "grace",
+                "owner": "a",
                 "condition": "present"
               }
             ]
@@ -1935,12 +1937,14 @@
               {
                 "op": "delete",
                 "pk": "audit",
-                "sk": "pending"
+                "sk": "pending",
+                "owner": "b"
               },
               {
                 "op": "put",
                 "pk": "audit",
                 "sk": "c1",
+                "owner": "b",
                 "payload": "{\"streams\":2}"
               }
             ]
@@ -1985,6 +1989,12 @@
             "sk": {
               "S": "acct#a"
             }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR entityID = :owner",
+          "expressionAttributeValues": {
+            ":owner": {
+              "S": "a"
+            }
           }
         },
         {
@@ -2020,7 +2030,12 @@
               "S": "grace"
             }
           },
-          "conditionExpression": "attribute_exists(pk)"
+          "conditionExpression": "attribute_exists(pk) AND entityID = :owner",
+          "expressionAttributeValues": {
+            ":owner": {
+              "S": "a"
+            }
+          }
         },
         {
           "operation": "Delete",
@@ -2032,6 +2047,12 @@
             "sk": {
               "S": "pending"
             }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR entityID = :owner",
+          "expressionAttributeValues": {
+            ":owner": {
+              "S": "b"
+            }
           }
         },
         {
@@ -2039,7 +2060,7 @@
           "tableName": "evt-compat-views",
           "item": {
             "entityID": {
-              "S": ""
+              "S": "b"
             },
             "entityType": {
               "S": ""
@@ -2052,6 +2073,12 @@
             },
             "sk": {
               "S": "c1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR entityID = :owner",
+          "expressionAttributeValues": {
+            ":owner": {
+              "S": "b"
             }
           }
         },
@@ -2225,9 +2252,9 @@
         25,
         69,
         60,
-        36,
-        16,
-        49
+        65,
+        68,
+        50
       ]
     },
     {
@@ -2251,7 +2278,7 @@
                 "op": "put",
                 "pk": "ledger",
                 "sk": "acct-1",
-                "entityId": "acct-1",
+                "owner": "acct-1",
                 "entityType": "account",
                 "payload": "{\"events\":2}"
               }
@@ -2295,6 +2322,12 @@
               "S": "ledger"
             },
             "sk": {
+              "S": "acct-1"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk) OR entityID = :owner",
+          "expressionAttributeValues": {
+            ":owner": {
               "S": "acct-1"
             }
           }

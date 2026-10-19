@@ -338,12 +338,14 @@ async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
     };
     commit_view_cases(&writer, &rows).await;
 
-    // The stored item has exactly the five string attributes, empty informational ones included.
+    // The stored item has exactly the five string attributes, an empty entity type included.
     let store = Store::<Ledger, _>::new(&writer, ()).with_commit_projector(std::sync::Arc::new(
-        FixedRows::new("shape", |_| {
+        FixedRows::new("shape", |commit| {
+            let owner = commit.streams[0].entity_id.clone();
+
             vec![
-                ViewOperation::put("shape", "row", "", "", "{}"),
-                ViewOperation::put("shape", "full", "id", "type", br#"{"a":1}"#.to_vec()),
+                ViewOperation::put("shape", "row", owner.clone(), "", "{}"),
+                ViewOperation::put("shape", "full", owner, "type", br#"{"a":1}"#.to_vec()),
             ]
         }),
     ));
@@ -362,14 +364,20 @@ async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
     );
     assert!(item.values().all(|value| value.as_s().is_ok()), "{item:?}");
     let full = rows.item("shape", "full").await.unwrap().expect("the row");
-    assert_eq!(full["entityID"], AttributeValue::S("id".into()));
+    assert_eq!(full["entityID"], AttributeValue::S(id.to_string()));
     assert_eq!(full["entityType"], AttributeValue::S("type".into()));
     assert_eq!(full["payload"], AttributeValue::S(r#"{"a":1}"#.into()));
 
     // Without a views table the commit is refused before any write, never silently dropped.
     let unconfigured = Store::<Ledger, _>::new(repository, ()).with_commit_projector(
-        std::sync::Arc::new(FixedRows::new("unconfigured", |_| {
-            vec![ViewOperation::put("p", "s", "", "", "{}")]
+        std::sync::Arc::new(FixedRows::new("unconfigured", |commit| {
+            vec![ViewOperation::put(
+                "p",
+                "s",
+                commit.streams[0].entity_id.clone(),
+                "",
+                "{}",
+            )]
         })),
     );
     let id = EntityId::new(format!("conf-views-unconfigured-{}", views));
@@ -1581,17 +1589,21 @@ async fn postgres_conforms() {
 }
 
 /// The view writer for [`PG_COMMIT_VIEWS_TABLE`], with the statement shapes the condition
-/// semantics require: an absent put is a plain `INSERT` (a unique violation is its failed
-/// condition), an unconditional put an upsert, a delete a `DELETE` (zero rows fails `present`).
+/// semantics require and the owner enforced in SQL: an absent put is a plain `INSERT` (a violation
+/// of the key constraint is its failed condition), any other put an upsert that only the row's
+/// owner may overwrite, a delete a `DELETE` of the owner's row (zero rows fails `present`).
 fn postgres_view_writer() -> ViewWriter {
     std::sync::Arc::new(|operation: &ViewOperation| {
         Ok(match operation.kind {
             ViewOperationKind::Put => {
                 let conflict = if operation.condition == ViewCondition::Absent {
-                    ""
+                    String::new()
                 } else {
-                    " ON CONFLICT (pk, sk) DO UPDATE SET entity_id = EXCLUDED.entity_id, \
-                     entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload"
+                    format!(
+                        " ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, \
+                         payload = EXCLUDED.payload \
+                         WHERE {PG_COMMIT_VIEWS_TABLE}.entity_id = EXCLUDED.entity_id"
+                    )
                 };
 
                 PgStatement::new(
@@ -1602,7 +1614,7 @@ fn postgres_view_writer() -> ViewWriter {
                     vec![
                         Box::new(operation.pk.clone()),
                         Box::new(operation.sk.clone()),
-                        Box::new(operation.entity_id.clone()),
+                        Box::new(operation.owner.to_string()),
                         Box::new(operation.entity_type.clone()),
                         Box::new(String::from_utf8_lossy(&operation.payload).into_owned()),
                     ],
@@ -1610,10 +1622,23 @@ fn postgres_view_writer() -> ViewWriter {
                 .with_key_constraint(format!("{PG_COMMIT_VIEWS_TABLE}_pkey"))
             }
             ViewOperationKind::Delete => PgStatement::new(
-                format!("DELETE FROM {PG_COMMIT_VIEWS_TABLE} WHERE pk = $1 AND sk = $2"),
+                if operation.condition == ViewCondition::Present {
+                    format!(
+                        "DELETE FROM {PG_COMMIT_VIEWS_TABLE} WHERE pk = $1 AND sk = $2 \
+                         AND entity_id = $3"
+                    )
+                } else {
+                    format!(
+                        "WITH gone AS (DELETE FROM {PG_COMMIT_VIEWS_TABLE} \
+                         WHERE pk = $1 AND sk = $2 AND entity_id = $3) \
+                         SELECT 1 FROM {PG_COMMIT_VIEWS_TABLE} \
+                         WHERE pk = $1 AND sk = $2 AND entity_id <> $3"
+                    )
+                },
                 vec![
                     Box::new(operation.pk.clone()),
                     Box::new(operation.sk.clone()),
+                    Box::new(operation.owner.to_string()),
                 ],
             ),
         })
@@ -1687,8 +1712,14 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository) {
 
     // Without a writer the commit is refused before any write, never silently dropped.
     let unconfigured = Store::<Ledger, _>::new(repository, ()).with_commit_projector(
-        std::sync::Arc::new(FixedRows::new("unconfigured", |_| {
-            vec![ViewOperation::put("p", "s", "", "", "{}")]
+        std::sync::Arc::new(FixedRows::new("unconfigured", |commit| {
+            vec![ViewOperation::put(
+                "p",
+                "s",
+                commit.streams[0].entity_id.clone(),
+                "",
+                "{}",
+            )]
         })),
     );
     let unwritten = id("unconfigured");
@@ -1726,10 +1757,12 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository) {
         },
     ));
     let store = Store::<Ledger, _>::new(&failing, ()).with_commit_projector(std::sync::Arc::new(
-        FixedRows::new("broken", |_| {
+        FixedRows::new("broken", |commit| {
+            let owner = commit.streams[0].entity_id.clone();
+
             vec![
-                ViewOperation::put("sqlstate", "first", "", "", "{}"),
-                ViewOperation::put("sqlstate", "second", "", "", "{}"),
+                ViewOperation::put("sqlstate", "first", owner.clone(), "", "{}"),
+                ViewOperation::put("sqlstate", "second", owner, "", "{}"),
             ]
         }),
     ));
@@ -1772,8 +1805,14 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository) {
     ] {
         let refusing = repository.clone().with_view_writer(writer);
         let store = Store::<Ledger, _>::new(&refusing, ()).with_commit_projector(
-            std::sync::Arc::new(FixedRows::new("refused", |_| {
-                vec![ViewOperation::put("p", "s", "", "", "{}")]
+            std::sync::Arc::new(FixedRows::new("refused", |commit| {
+                vec![ViewOperation::put(
+                    "p",
+                    "s",
+                    commit.streams[0].entity_id.clone(),
+                    "",
+                    "{}",
+                )]
             })),
         );
         let refused = id(label);
@@ -1822,30 +1861,28 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository) {
             .with_key_constraint(format!("{table}_pkey")))
         },
     ));
-    let claims = |name: &'static str, rows: Vec<ViewOperation>| {
-        let rows = std::sync::Arc::new(rows);
-
+    let claims = |name: &'static str, rows: fn(EntityId) -> Vec<ViewOperation>| {
         Store::<Ledger, _>::new(&constrained, ()).with_commit_projector(std::sync::Arc::new(
-            FixedRows::new(name, move |_| rows.to_vec()),
+            FixedRows::new(name, move |commit| {
+                rows(commit.streams[0].entity_id.clone())
+            }),
         ))
     };
-    claims(
-        "first",
-        vec![ViewOperation::put("pk", "a", "", "", "same").if_absent()],
-    )
+    claims("first", |owner| {
+        vec![ViewOperation::put("pk", "a", owner, "", "same").if_absent()]
+    })
     .execute(&id("unique-first"), Add(1), Metadata::new("local"))
     .await
     .expect("the first row");
 
     let other = id("unique-other");
-    let error = claims(
-        "second",
+    let error = claims("second", |owner| {
         vec![
-            ViewOperation::put("pk", "b", "", "", "same")
+            ViewOperation::put("pk", "b", owner, "", "same")
                 .if_absent()
                 .on_conflict(NameTaken("b".into())),
-        ],
-    )
+        ]
+    })
     .execute(&other, Add(1), Metadata::new("local"))
     .await
     .expect_err("the payload collides");
@@ -1863,14 +1900,13 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository) {
     assert!(repository.events(&other).await.unwrap().is_empty());
 
     let taken = id("unique-key");
-    let error = claims(
-        "third",
+    let error = claims("third", |owner| {
         vec![
-            ViewOperation::put("pk", "a", "", "", "different")
+            ViewOperation::put("pk", "a", owner, "", "different")
                 .if_absent()
                 .on_conflict(NameTaken("a".into())),
-        ],
-    )
+        ]
+    })
     .execute(&taken, Add(1), Metadata::new("local"))
     .await
     .expect_err("the key exists");
@@ -1893,8 +1929,11 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository) {
                 ))
             }));
     let store = Store::<Ledger, _>::new(&unnamed, ()).with_commit_projector(std::sync::Arc::new(
-        FixedRows::new("unnamed", |_| {
-            vec![ViewOperation::put("p", "s", "", "", "{}").if_absent()]
+        FixedRows::new("unnamed", |commit| {
+            vec![
+                ViewOperation::put("p", "s", commit.streams[0].entity_id.clone(), "", "{}")
+                    .if_absent(),
+            ]
         }),
     ));
     let refused = id("unnamed");

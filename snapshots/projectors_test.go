@@ -21,6 +21,7 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/mem"
 	"github.com/photon-grove/evt/snapshots"
+	"github.com/photon-grove/evt/test"
 )
 
 const counterType evt.EntityType = "counter"
@@ -127,7 +128,7 @@ func (s *summary) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt
 	for _, stream := range commit.Streams {
 		events += len(stream.Events)
 		operations = append(operations,
-			evt.PutView("totals", string(stream.EntityID), stream.EntityID, stream.EntityType, stream.State).OwnedBy(stream.EntityID))
+			evt.PutView("totals", string(stream.EntityID), stream.EntityID, stream.EntityType, stream.State))
 	}
 
 	row, err := json.Marshal(map[string]int{"streams": len(commit.Streams), "events": events})
@@ -135,18 +136,49 @@ func (s *summary) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt
 		return nil, err
 	}
 
-	return append(operations, evt.PutView("commits", commit.CommitID, "", "", row).OwnedBy(commit.Streams[0].EntityID)), nil
+	return append(operations, evt.PutView("commits", commit.CommitID, commit.Streams[0].EntityID, "", row)), nil
 }
 
-// auditor is a second projector, to pin declaration order.
+// auditor is a second projector, to pin declaration order. It writes a row per commit, keyed by the
+// commit ID, so it is history-dependent: a current-state projector is given no commit ID.
 type auditor struct{}
 
 func (auditor) Name() string { return "auditor" }
 
-func (auditor) History() []evt.EntityType { return nil }
+func (auditor) History() []evt.EntityType { return []evt.EntityType{counterType} }
 
 func (auditor) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
-	return []evt.ViewOperation{evt.PutView("audit", commit.CommitID, "", "", []byte(`{}`))}, nil
+	return []evt.ViewOperation{evt.PutView("audit", commit.CommitID, commit.Streams[0].EntityID, "", []byte(`{}`))}, nil
+}
+
+// parity is a current-state projector: from the state each written stream has after the commit it
+// puts a "state" row (the state itself) and, while the stream's total is even, deletes its "odd"
+// row (put while it is odd). Both rows belong to the stream. It reads no event and no commit ID.
+type parity struct{}
+
+func (parity) Name() string { return "parity" }
+
+func (parity) History() []evt.EntityType { return nil }
+
+func (parity) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
+	var operations []evt.ViewOperation
+
+	for _, stream := range commit.Streams {
+		var state counter
+		if err := json.Unmarshal(stream.State, &state); err != nil {
+			return nil, err
+		}
+
+		operations = append(operations, evt.PutView("state", string(stream.EntityID), stream.EntityID, stream.EntityType, stream.State))
+
+		if state.Total%2 == 0 {
+			operations = append(operations, evt.DeleteView("odd", string(stream.EntityID), stream.EntityID))
+		} else {
+			operations = append(operations, evt.PutView("odd", string(stream.EntityID), stream.EntityID, stream.EntityType, []byte(`{}`)))
+		}
+	}
+
+	return operations, nil
 }
 
 // recording is an outcome-capable repository that keeps every result handed to Commit, and can run
@@ -162,7 +194,7 @@ type recording struct {
 func (r *recording) AtomicTransactions() {}
 
 // WritesViews and DeclareHistoryDependent forward the capabilities a decorator would otherwise hide.
-func (r *recording) WritesViews() {}
+func (r *recording) WritesViews() bool { return evt.WritesViews(r.OutcomeRepository) }
 
 func (r *recording) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
 	r.declared = append(r.declared, types...)
@@ -475,9 +507,9 @@ func (c claimer) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.
 	}, nil
 }
 
-func TestCommitProjectors_ReplayingTheStoredEventsReproducesTheOperations(t *testing.T) {
+func TestCommitProjectors_ReplayingTheStoredEventsReproducesTheOperationsAndTheRows(t *testing.T) {
 	recorder, repo := newRecording(t)
-	store := snapshots.NewStore(recorder, 3).WithCommitProjectors(&summary{}, auditor{})
+	store := snapshots.NewStore(recorder, 3).WithCommitProjectors(&summary{}, auditor{}, parity{})
 	ctx := context.Background()
 
 	// A history of single-stream and multi-stream commits, across snapshot boundaries.
@@ -511,18 +543,30 @@ func TestCommitProjectors_ReplayingTheStoredEventsReproducesTheOperations(t *tes
 	require.NoError(t, err)
 	require.Len(t, groups, 6)
 
-	replayed := &summary{}
-	projectors := []evt.CommitProjector{replayed, auditor{}}
+	projectors := []evt.CommitProjector{&summary{}, auditor{}, parity{}}
 
 	for _, group := range groups {
 		for i, stream := range group.Streams {
 			group.Streams[i].State = foldState(t, stored, stream.EntityID, stream.Events[len(stream.Events)-1].Sequence)
 		}
 
-		views, err := evt.ProjectCommit(ctx, projectors, group)
-		require.NoError(t, err)
+		views, projectErr := evt.ProjectCommit(ctx, projectors, group)
+		require.NoError(t, projectErr)
 		require.Equal(t, live[group.CommitID], views, "commit %s", group.CommitID)
 	}
+
+	// The rows themselves: a wipe and a replay of every commit rebuilds exactly the rows the live
+	// commits left, deletes included.
+	for i, group := range groups {
+		for j, stream := range group.Streams {
+			groups[i].Streams[j].State = foldState(t, stored, stream.EntityID, stream.Events[len(stream.Events)-1].Sequence)
+		}
+	}
+
+	rebuilt, err := evt.ReplayViews(ctx, projectors, groups)
+	require.NoError(t, err)
+	require.NotEmpty(t, rebuilt)
+	require.Equal(t, repo.Views(), rebuilt, "the rebuilt rows are the live rows, byte for byte")
 }
 
 // foldState rebuilds a stream's state after the given sequence from its stored events.
@@ -608,7 +652,7 @@ func TestCommitProjectors_AHistoryDependentProjectorIsDeclaredDurablyBeforeItsFi
 
 func TestCommitProjectors_ACurrentStateProjectorDeclaresNothingAndSeesNoEvents(t *testing.T) {
 	recorder, repo := newRecording(t)
-	store := snapshots.NewStore(recorder, 1).WithCommitProjectors(auditor{})
+	store := snapshots.NewStore(recorder, 1).WithCommitProjectors(parity{})
 	ctx := context.Background()
 
 	require.NoError(t, store.Execute(ctx, &counter{}, "c-1", &bump{By: 1}, commandID("cmd-1")))
@@ -645,7 +689,7 @@ func TestCommitProjectors_ARepositoryThatDoesNotWriteViewsIsRefusedBeforeAnyWrit
 // viewsOnly writes views but cannot declare history.
 type viewsOnly struct{ bare }
 
-func (viewsOnly) WritesViews() {}
+func (viewsOnly) WritesViews() bool { return true }
 
 func TestCommitProjectors_ARepositoryThatCannotDeclareHistoryRefusesAHistoryDependentProjector(t *testing.T) {
 	inner, _ := newRecording(t)
@@ -696,4 +740,143 @@ func TestCommitProjectors_ACommitThatWritesNoEventNeverEncodesState(t *testing.T
 	events, err := repo.GetEvents(ctx, "c-1")
 	require.NoError(t, err)
 	require.Empty(t, events)
+}
+
+// rowOf writes one fixed row for the first stream a commit wrote.
+type rowOf struct{}
+
+func (rowOf) Name() string { return "row-of" }
+
+func (rowOf) History() []evt.EntityType { return []evt.EntityType{counterType} }
+
+func (rowOf) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
+	first := commit.Streams[0].EntityID
+
+	return []evt.ViewOperation{evt.PutView("shared", "row", first, counterType, []byte(`"`+string(first)+`"`))}, nil
+}
+
+func TestCommitProjectors_AProjectorCannotWriteARowAnotherStreamOwns(t *testing.T) {
+	recorder, repo := newRecording(t)
+	store := snapshots.NewStore(recorder, 0).WithCommitProjectors(rowOf{})
+	ctx := context.Background()
+
+	require.NoError(t, store.Execute(ctx, &counter{}, "a", &bump{By: 1}, commandID("cmd-a")))
+
+	// Another stream writes the same row: the owner never changes, so the commit fails, live, on the
+	// owner condition rather than later at a rebuild.
+	err := store.Execute(ctx, &counter{}, "b", &bump{By: 1}, commandID("cmd-b"))
+	require.ErrorIs(t, err, evt.ErrProjectorOperation)
+
+	var failed *evt.ProjectorOperationError
+
+	require.ErrorAs(t, err, &failed)
+	require.Equal(t, evt.ReasonConditionFailed, failed.Reason)
+
+	events, gerr := repo.GetEvents(ctx, "b")
+	require.NoError(t, gerr)
+	require.Empty(t, events)
+	require.Equal(t, `"a"`, row(t, repo, "shared", "row"))
+
+	// The owner still rewrites its row.
+	require.NoError(t, store.Execute(ctx, &counter{}, "a", &bump{By: 1}, commandID("cmd-a2")))
+}
+
+// handles keeps one row per handle stream ("handle:<name>"): the holder named by the stream's latest
+// claim or release event, with a release written as a tombstone, never a delete. The handle stream
+// owns the row for good, whoever claims the name.
+type handles struct{}
+
+func (handles) Name() string { return "handles" }
+
+func (handles) History() []evt.EntityType { return []evt.EntityType{counterType} }
+
+func (handles) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
+	var operations []evt.ViewOperation
+
+	for _, stream := range commit.Streams {
+		name, ok := strings.CutPrefix(string(stream.EntityID), "handle:")
+		if !ok {
+			continue
+		}
+
+		var note struct {
+			Note string `json:"note"`
+		}
+
+		if err := json.Unmarshal(stream.Events[len(stream.Events)-1].Payload, &note); err != nil {
+			return nil, err
+		}
+
+		holder := ""
+		if claimed, ok := strings.CutPrefix(note.Note, "claim:"); ok {
+			holder = claimed
+		}
+
+		operations = append(operations, evt.PutView("handles", name, stream.EntityID, stream.EntityType,
+			fmt.Appendf(nil, `{"holder":%q}`, holder)))
+	}
+
+	return operations, nil
+}
+
+func TestCommitProjectors_AHandleStreamOwnsItsRowAcrossReleaseAndReclaim(t *testing.T) {
+	recorder, repo := newRecording(t)
+	projectors := []evt.CommitProjector{handles{}}
+	store := snapshots.NewStore(recorder, 0).WithCommitProjectors(projectors...)
+	ctx := context.Background()
+
+	claim := func(command, holder string) {
+		tx := store.Transaction()
+		require.NoError(t, tx.Read(ctx, &counter{}, "handle:ada"))
+		require.NoError(t, tx.Read(ctx, &counter{}, evt.EntityID(holder)))
+		require.NoError(t, tx.Append("handle:ada", &bumped{By: 1, Note: "claim:" + holder}))
+		require.NoError(t, tx.Append(evt.EntityID(holder), &bumped{By: 1, Note: "claimed"}))
+
+		_, err := tx.Commit(ctx, commandID(command))
+		require.NoError(t, err)
+	}
+
+	claim("alice-claims", "alice")
+	require.Equal(t, `{"holder":"alice"}`, row(t, repo, "handles", "ada"))
+
+	require.NoError(t, store.Execute(ctx, &counter{}, "handle:ada", &bump{By: 1, Note: "released"}, commandID("alice-releases")))
+	require.Equal(t, `{"holder":""}`, row(t, repo, "handles", "ada"), "a release is a tombstone put")
+
+	claim("bob-claims", "bob")
+	require.Equal(t, `{"holder":"bob"}`, row(t, repo, "handles", "ada"))
+
+	// A rebuild reproduces it: every write to the row came from commits of the handle stream.
+	var stored []evt.SerializedEvent
+	for _, id := range []evt.EntityID{"handle:ada", "alice", "bob"} {
+		events, err := repo.GetEvents(ctx, id)
+		require.NoError(t, err)
+		stored = append(stored, events...)
+	}
+
+	groups, err := evt.GroupCommits(stored)
+	require.NoError(t, err)
+
+	rebuilt, err := evt.ReplayViews(ctx, projectors, groups)
+	require.NoError(t, err)
+	require.Equal(t, repo.Views(), rebuilt)
+}
+
+func TestCommitProjectors_ADecoratorReportsTheCapabilityOfTheRepositoryItWraps(t *testing.T) {
+	inner, _ := newRecording(t)
+
+	over, err := test.NewFaultRepository(inner)
+	require.NoError(t, err)
+	require.True(t, evt.WritesViews(over))
+
+	// A decorator over a repository that cannot write views must not claim it can.
+	bareOver, err := test.NewFaultRepository(bare{inner})
+	require.NoError(t, err)
+	require.False(t, evt.WritesViews(bareOver))
+
+	store := snapshots.NewStore(bareOver, 0).WithCommitProjectors(parity{})
+
+	var unsupported *evt.ViewsUnsupportedError
+
+	require.ErrorAs(t, store.Execute(context.Background(), &counter{}, "c-1", &bump{By: 1}, commandID("cmd-1")), &unsupported)
+	require.Empty(t, inner.results)
 }

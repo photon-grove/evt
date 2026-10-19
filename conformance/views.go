@@ -40,6 +40,7 @@ func runViewCases(t *testing.T, newRepo func() evt.Repository, opts SuiteOptions
 		{"OverwritesAndDeletes", testViewsOverwriteAndDelete},
 		{"AFailedConditionIsATypedErrorAndWritesNothing", testViewsFailedAbsentCondition},
 		{"AFailedPresentDeleteIsATypedError", testViewsFailedPresentDelete},
+		{"ARowIsOnlyWrittenByItsOwner", testViewsOwnerIsEnforced},
 		{"RefusesProjectorOnlyViews", testViewsProjectorOnly},
 		{"RefusesInvalidViewsBeforeAnyWrite", testViewsRefusedBeforeAnyWrite},
 		{"CountsViewsInTheBudget", testBudget},
@@ -152,8 +153,8 @@ func testViewsOverwriteAndDelete(t *testing.T, repo evt.Repository, read ViewRea
 		Events: serialize(t, id, "test", 1, &test.EntityUpdated{ID: id, Value: "two"}),
 		Views: []evt.ProjectedView{
 			projected("rows", 0, 0, put(pk, "keep", `{"v":2}`)),
-			projected("rows", 0, 1, evt.DeleteView(pk, "drop").IfPresent()),
-			projected("rows", 0, 2, evt.DeleteView(pk, "never-existed")),
+			projected("rows", 0, 1, evt.DeleteView(pk, "drop", "owner").IfPresent()),
+			projected("rows", 0, 2, evt.DeleteView(pk, "never-existed", "owner")),
 		},
 	}))
 
@@ -218,7 +219,7 @@ func testViewsFailedPresentDelete(t *testing.T, repo evt.Repository, read ViewRe
 		Events: serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"}),
 		Views: []evt.ProjectedView{
 			projected("release", 0, 0, put(ns+"#rows", "kept", `{}`)),
-			projected("release", 0, 1, evt.DeleteView(ns+"#rows", "absent").IfPresent()),
+			projected("release", 0, 1, evt.DeleteView(ns+"#rows", "absent", "owner").IfPresent()),
 		},
 	})
 
@@ -232,6 +233,61 @@ func testViewsFailedPresentDelete(t *testing.T, repo evt.Repository, read ViewRe
 
 	requireNoEvents(t, repo, id)
 	requireNoRow(t, read, repo, ns+"#rows", "kept")
+}
+
+// testViewsOwnerIsEnforced covers the rule that a row's owner never changes: a write by any other
+// stream fails its condition, a put or a delete, with or without a presence condition, and writes
+// nothing; the owner itself still overwrites and deletes.
+func testViewsOwnerIsEnforced(t *testing.T, repo evt.Repository, read ViewReader) {
+	t.Helper()
+	ctx := context.Background()
+	ns := newNamespace()
+
+	pk := ns + "#rows"
+	first, second := evt.EntityID(ns+"-first"), evt.EntityID(ns+"-second")
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, first, "test", 0, &test.EntityCreated{ID: first, Value: "one"}),
+		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "row", `{"v":1}`))},
+	}))
+
+	foreign := map[string]evt.ViewOperation{
+		"put":                  evt.PutView(pk, "row", "intruder", "test", []byte(`{"v":2}`)),
+		"delete":               evt.DeleteView(pk, "row", "intruder"),
+		"delete with presence": evt.DeleteView(pk, "row", "intruder").IfPresent(),
+	}
+
+	for name, op := range foreign {
+		err := repo.Commit(ctx, evt.SerializedResult{
+			Events: serialize(t, second, "test", 0, &test.EntityCreated{ID: second, Value: "two"}),
+			Views:  []evt.ProjectedView{projected("rows", 0, 0, op.OnConflict(errClaimTaken))},
+		})
+
+		var failed *evt.ProjectorOperationError
+
+		require.ErrorAs(t, err, &failed, name)
+		require.ErrorIs(t, err, errClaimTaken, name)
+		require.Equal(t, evt.ReasonConditionFailed, failed.Reason, name)
+
+		requireNoEvents(t, repo, second)
+		requireRow(t, read, repo, pk, "row", `{"v":1}`)
+	}
+
+	// The owner overwrites its row and deletes it; the delete of an absent row still succeeds.
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, first, "test", 1, &test.EntityUpdated{ID: first, Value: "two"}),
+		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "row", `{"v":3}`))},
+	}))
+	requireRow(t, read, repo, pk, "row", `{"v":3}`)
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, first, "test", 2, &test.EntityUpdated{ID: first, Value: "three"}),
+		Views: []evt.ProjectedView{
+			projected("rows", 0, 0, evt.DeleteView(pk, "row", "owner").IfPresent()),
+			projected("rows", 0, 1, evt.DeleteView(pk, "gone", "intruder")),
+		},
+	}))
+	requireNoRow(t, read, repo, pk, "row")
 }
 
 func testViewsProjectorOnly(t *testing.T, repo evt.Repository, read ViewReader) {
@@ -308,7 +364,7 @@ func testViewsRefusedBeforeAnyWrite(t *testing.T, repo evt.Repository, read View
 		Events: otherEvents(),
 		Views: []evt.ProjectedView{
 			projected("first", 0, 0, put(ns+"#rows", "twice", `{}`)),
-			projected("second", 1, 0, evt.DeleteView(ns+"#rows", "twice")),
+			projected("second", 1, 0, evt.DeleteView(ns+"#rows", "twice", "owner")),
 		},
 	})
 	require.ErrorAs(t, err, &duplicate)

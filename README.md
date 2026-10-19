@@ -218,12 +218,20 @@ view writer (`WithViewWriter`); the in-memory repository keeps the rows for test
 store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{}) // evt.CommitProjector
 ```
 
-- A projector declares the entity types whose events it reads (`History()`); with none it is
-  current-state and is given no events. The store durably adds declared types to the manifest's
-  `historyDependent` set before the first commit that runs it, so `CompactBelow` refuses them, and
-  each of its operations names the stream that owns its row (`OwnedBy`). A repository must declare
-  `evt.ViewWritingRepository` (and `evt.HistoryDeclarer` for history-dependent projectors) or the
-  commit is refused.
+- A projector declares the entity types whose events it reads (`History()`). With none it is
+  current-state and is given each stream's state, with no events and no commit ID. With types it is
+  history-dependent and is given the commit ID and the events and state of those types only; the
+  store durably adds them to the manifest's `historyDependent` set before the first commit that
+  runs it, so `CompactBelow` refuses them.
+- Every operation names the stream that owns its row (`PutView(pk, sk, owner, ...)`,
+  `DeleteView(pk, sk, owner)`): a stream the commit wrote and, for a history-dependent projector,
+  of a declared type. The repository stores the owner and refuses any write to the row by another
+  stream, so **a row's owner must never change**; to reuse a key, rewrite the row with a tombstone
+  as its owner rather than deleting it. A PostgreSQL view writer must enforce the owner in its SQL
+  ([PostgreSQL](docs/postgres.md#views)).
+- A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` reports the capability,
+  so a decorator reports its wrapped repository's) and `evt.HistoryDeclarer` for history-dependent
+  projectors, or the commit is refused.
 - Operations land after the feature-marker check and before the written streams, in projector
   declaration order then emission order, and count against the shared budget (a single-stream
   commit leaves room for 98 events and view operations together, 97 with a snapshot).

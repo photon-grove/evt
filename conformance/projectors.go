@@ -74,8 +74,8 @@ func (t *tally) DeserializeEvent(serialized evt.SerializedEvent) (evt.Event, err
 	return &event, nil
 }
 
-// rollup is a commit-wide projector: one row per written stream, in a partition that names no
-// entity, from the state after the commit, plus a row for the commit itself.
+// rollup is a current-state commit-wide projector: one row per written stream, in a partition that
+// names no entity, from the state after the commit, each owned by its stream.
 type rollup struct {
 	namespace string
 	calls     int
@@ -96,8 +96,6 @@ func (r *rollup) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.
 		operations = append(operations, evt.PutView(r.namespace+"#totals", string(stream.EntityID), stream.EntityID, stream.EntityType, stream.State))
 	}
 
-	operations = append(operations, evt.PutView(r.namespace+"#commits", commit.CommitID, "", "", fmt.Appendf(nil, `{"streams":%d}`, len(commit.Streams))))
-
 	if r.claim != "" {
 		// The claim is exclusive: a second stream claiming the same name fails the whole commit.
 		operations = append(operations, evt.PutView(r.namespace+"#claims", r.claim, commit.Streams[0].EntityID, tallyType, []byte(`{}`)).
@@ -105,6 +103,23 @@ func (r *rollup) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.
 	}
 
 	return operations, nil
+}
+
+// commitLog is a history-dependent projector: one row per commit, keyed by its commit ID, owned by
+// the commit's first stream.
+type commitLog struct{ namespace string }
+
+func (commitLog) Name() string { return "commit-log" }
+
+func (commitLog) History() []evt.EntityType { return []evt.EntityType{tallyType} }
+
+func (c commitLog) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
+	first := commit.Streams[0]
+
+	return []evt.ViewOperation{
+		evt.PutView(c.namespace+"#commits", commit.CommitID, first.EntityID, first.EntityType,
+			fmt.Appendf(nil, `{"streams":%d}`, len(commit.Streams))),
+	}, nil
 }
 
 func tallyMetadata(id string) evt.Metadata {
@@ -143,7 +158,7 @@ func testProjectorsProjectCommits(t *testing.T, newRepo func() evt.Repository, r
 
 	repo := newRepo()
 	projector := &rollup{namespace: ns}
-	store := snapshots.NewStore(repo, 3).WithCommitProjectors(projector)
+	store := snapshots.NewStore(repo, 3).WithCommitProjectors(projector, commitLog{namespace: ns})
 
 	idA, idB := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-b")
 
@@ -213,7 +228,7 @@ func testProjectorFailureIsTyped(t *testing.T, newRepo func() evt.Repository, re
 
 	require.ErrorAs(t, err, &failed)
 	require.Equal(t, "rollup", failed.Projector)
-	require.Equal(t, 2, failed.Operation, "the claim is the rollup's third operation")
+	require.Equal(t, 1, failed.Operation, "the claim follows the stream's totals row")
 	require.Equal(t, evt.ReasonConditionFailed, failed.Reason)
 
 	requireNoEvents(t, repo, idB)
@@ -236,7 +251,7 @@ func (h *hookRepository) AtomicTransactions() {}
 
 // WritesViews and DeclareHistoryDependent forward what the wrapped repository does, which a
 // decorator would otherwise hide.
-func (h *hookRepository) WritesViews() {}
+func (h *hookRepository) WritesViews() bool { return evt.WritesViews(h.OutcomeRepository) }
 
 func (h *hookRepository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
 	declarer, ok := h.OutcomeRepository.(evt.HistoryDeclarer)
@@ -288,7 +303,7 @@ func testProjectorsRunAgainOnReprepare(t *testing.T, newRepo func() evt.Reposito
 	store := snapshots.NewStore(hooked, 0).
 		WithOutcomes().
 		WithRetry(snapshots.ImmediateRetryPolicy(3)).
-		WithCommitProjectors(projector)
+		WithCommitProjectors(projector, commitLog{namespace: ns})
 
 	_, err = store.ExecuteWithOutcome(ctx, &tally{}, id, &tallyUp{By: 1}, tallyMetadata(ns+"-seed"))
 	require.NoError(t, err)
@@ -333,7 +348,7 @@ func (e eventCounter) ProjectCommit(_ context.Context, commit evt.CommitView) ([
 		operations = append(operations, evt.PutView(
 			e.namespace+"#events", string(stream.EntityID), stream.EntityID, stream.EntityType,
 			fmt.Appendf(nil, `{"events":%d,"last":%d}`, len(stream.Events), stream.Events[len(stream.Events)-1].Sequence),
-		).OwnedBy(stream.EntityID))
+		))
 	}
 
 	return operations, nil

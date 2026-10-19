@@ -42,25 +42,37 @@ func newViewTable(ctx context.Context, t *testing.T, pool *pgxpool.Pool) viewTab
 	return viewTable{pool: pool, name: name}
 }
 
-// writer is the table's postgres.ViewWriter: a plain INSERT for a put that requires the row to be
-// absent (its unique violation is the failed condition), an upsert for any other put, and a DELETE.
+// writer is the table's postgres.ViewWriter, with the ownership semantics it documents: a plain
+// INSERT for a put that requires the row to be absent (its unique violation is the failed
+// condition), an upsert guarded by the owner for any other put, a DELETE of the owner's row, and
+// for a delete without a presence condition a statement that reports the rows of another owner.
 func (v viewTable) writer(op evt.ViewOperation) (postgres.ViewStatement, error) {
 	if op.Kind == evt.ViewDelete {
+		args := []any{op.PK, op.SK, string(op.Owner)}
+		if op.Condition == evt.ViewPresent {
+			return postgres.ViewStatement{
+				SQL:  fmt.Sprintf("DELETE FROM %s WHERE pk = $1 AND sk = $2 AND entity_id = $3", v.name),
+				Args: args,
+			}, nil
+		}
+
 		return postgres.ViewStatement{
-			SQL: fmt.Sprintf("DELETE FROM %s WHERE pk = $1 AND sk = $2", v.name), Args: []any{op.PK, op.SK},
+			SQL: fmt.Sprintf("WITH gone AS (DELETE FROM %[1]s WHERE pk = $1 AND sk = $2 AND entity_id = $3) "+
+				"SELECT 1 FROM %[1]s WHERE pk = $1 AND sk = $2 AND entity_id <> $3", v.name),
+			Args: args,
 		}, nil
 	}
 
 	insert := fmt.Sprintf("INSERT INTO %s (pk, sk, entity_id, entity_type, payload) VALUES ($1, $2, $3, $4, $5)", v.name)
-	args := []any{op.PK, op.SK, string(op.EntityID), string(op.EntityType), string(op.Payload)}
+	args := []any{op.PK, op.SK, string(op.Owner), string(op.EntityType), string(op.Payload)}
 
 	if op.Condition == evt.ViewAbsent {
 		return postgres.ViewStatement{SQL: insert, Args: args, KeyConstraint: v.name + "_pkey"}, nil
 	}
 
 	return postgres.ViewStatement{
-		SQL: insert + " ON CONFLICT (pk, sk) DO UPDATE SET entity_id = EXCLUDED.entity_id, " +
-			"entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload",
+		SQL: insert + fmt.Sprintf(" ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, "+
+			"payload = EXCLUDED.payload WHERE %s.entity_id = EXCLUDED.entity_id", v.name),
 		Args: args,
 	}, nil
 }
@@ -122,8 +134,8 @@ func Test_ViewStatementsRunInTheCommitTransaction(t *testing.T) {
 	err := repo.Commit(ctx, evt.SerializedResult{
 		Events: viewEvents(id),
 		Views: []evt.ProjectedView{
-			{Projector: "good", Op: evt.PutView("pk", "first", "", "", []byte("fine"))},
-			{Projector: "strict", ProjectorIndex: 1, Op: evt.PutView("pk", "second", "", "", []byte("bad"))},
+			{Projector: "good", Op: evt.PutView("pk", "first", "o", "", []byte("fine"))},
+			{Projector: "strict", ProjectorIndex: 1, Op: evt.PutView("pk", "second", "o", "", []byte("bad"))},
 		},
 	})
 
@@ -155,8 +167,8 @@ func Test_AViolationOfADeferredConstraintAtCommitIsTheProjectorsAndNamesNoOperat
 	err := repo.Commit(ctx, evt.SerializedResult{
 		Events: viewEvents(id),
 		Views: []evt.ProjectedView{
-			{Projector: "p", Op: evt.PutView("pk", "a", "", "", []byte("same"))},
-			{Projector: "p", Operation: 1, Op: evt.PutView("pk", "b", "", "", []byte("same"))},
+			{Projector: "p", Op: evt.PutView("pk", "a", "o", "", []byte("same"))},
+			{Projector: "p", Operation: 1, Op: evt.PutView("pk", "b", "o", "", []byte("same"))},
 		},
 	})
 
@@ -180,7 +192,7 @@ func Test_ViewOperationsWithoutAWriterAreRefusedBeforeAnyWrite(t *testing.T) {
 
 	err := repo.Commit(ctx, evt.SerializedResult{
 		Events: viewEvents(id),
-		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "sk", "", "", nil)}},
+		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "sk", "o", "", nil)}},
 	})
 
 	var refused *evt.ViewsNotConfiguredError
@@ -204,7 +216,7 @@ func Test_AViewWriterThatRefusesAnOperationFailsTheWholeCommit(t *testing.T) {
 
 	err := repo.Commit(ctx, evt.SerializedResult{
 		Events: viewEvents(id),
-		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "sk", "", "", nil)}},
+		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "sk", "o", "", nil)}},
 	})
 	require.ErrorIs(t, err, cause)
 
@@ -224,7 +236,7 @@ func Test_AUniqueViolationOfAnotherConstraintIsNotAFailedAbsentCondition(t *test
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 		Events: viewEvents(first),
-		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "a", "", "", []byte("same"))}},
+		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "a", "o", "", []byte("same"))}},
 	}))
 
 	// (pk, sk) is free, but the payload collides with the other row's: a violation of the payload's
@@ -232,7 +244,7 @@ func Test_AUniqueViolationOfAnotherConstraintIsNotAFailedAbsentCondition(t *test
 	taken := errors.New("row taken")
 	err := repo.Commit(ctx, evt.SerializedResult{
 		Events: viewEvents(second),
-		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "b", "", "", []byte("same")).IfAbsent().OnConflict(taken)}},
+		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "b", "o", "", []byte("same")).IfAbsent().OnConflict(taken)}},
 	})
 
 	var failed *evt.ProjectorOperationError
@@ -245,7 +257,7 @@ func Test_AUniqueViolationOfAnotherConstraintIsNotAFailedAbsentCondition(t *test
 	// The same collision on the key itself is the failed condition.
 	err = repo.Commit(ctx, evt.SerializedResult{
 		Events: viewEvents(evt.EntityID(fmt.Sprintf("view-unique-c-%d", suffix))),
-		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "a", "", "", []byte("other")).IfAbsent().OnConflict(taken)}},
+		Views:  []evt.ProjectedView{{Projector: "p", Op: evt.PutView("pk", "a", "o", "", []byte("other")).IfAbsent().OnConflict(taken)}},
 	})
 	require.ErrorAs(t, err, &failed)
 	require.Equal(t, evt.ReasonConditionFailed, failed.Reason)

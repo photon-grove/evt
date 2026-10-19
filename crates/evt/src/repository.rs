@@ -1369,7 +1369,7 @@ mod tests {
             projector,
             0,
             operation,
-            crate::ViewOperation::put("p", sk, "", "", "{}"),
+            crate::ViewOperation::put("p", sk, "o", "", "{}"),
         )
     }
 
@@ -1460,7 +1460,7 @@ mod tests {
             "p",
             0,
             0,
-            crate::ViewOperation::put("", "s", "", "", "{}"),
+            crate::ViewOperation::put("", "s", "o", "", "{}"),
         )]);
         assert!(matches!(
             invalid.validate(),

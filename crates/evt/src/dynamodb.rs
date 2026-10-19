@@ -548,11 +548,14 @@ impl DynamoRepository {
             .build())
     }
 
-    /// The transaction actions of a commit's view operations, in order: a `Put` of the five-attribute
-    /// item, with `attribute_not_exists(pk)` when the operation requires the row to be absent, or a
-    /// `Delete` of the key, with `attribute_exists(pk)` when it requires the row to be present.
-    /// With no views table configured and views present it refuses with
-    /// [`Error::ViewsNotConfigured`], which the write entry points call before anything else.
+    /// The transaction actions of a commit's view operations, in order. Every write is conditioned
+    /// on the row's owner (the operation's owner, bound as `:owner`): a `Put` of the five-attribute
+    /// item whose condition is `attribute_not_exists(pk)` when the row must be absent, else
+    /// `attribute_not_exists(pk) OR entityID = :owner`; a `Delete` of the key whose condition is
+    /// `attribute_exists(pk) AND entityID = :owner` when the row must be present, else
+    /// `attribute_not_exists(pk) OR entityID = :owner`. With no views table configured and views
+    /// present it refuses with [`Error::ViewsNotConfigured`], which the write entry points call
+    /// before anything else.
     fn view_items(&self, views: &[ProjectedView]) -> Result<Vec<TransactWriteItem>, Error> {
         if views.is_empty() {
             return Ok(Vec::new());
@@ -565,27 +568,33 @@ impl DynamoRepository {
 
         views
             .iter()
-            .map(|view| match view.op.kind {
-                ViewOperationKind::Put => put(
-                    table,
-                    wire::view_operation_item(&view.op)?,
-                    (view.op.condition == ViewCondition::Absent)
-                        .then_some(wire::VIEW_ABSENT_CONDITION),
-                    &[],
-                ),
-                ViewOperationKind::Delete => {
-                    let delete = Delete::builder()
-                        .table_name(table)
-                        .key("pk", s(&view.op.pk))
-                        .key("sk", s(&view.op.sk))
-                        .set_condition_expression(
-                            (view.op.condition == ViewCondition::Present)
-                                .then(|| wire::VIEW_PRESENT_CONDITION.to_owned()),
-                        )
-                        .build()
-                        .map_err(Error::backend)?;
+            .map(|view| {
+                let owner = s(view.op.owner.as_str());
 
-                    Ok(TransactWriteItem::builder().delete(delete).build())
+                match view.op.kind {
+                    ViewOperationKind::Put => {
+                        let owned = view.op.condition != ViewCondition::Absent;
+                        let values = [(wire::OWNER_PLACEHOLDER, owner)];
+
+                        put(
+                            table,
+                            wire::view_operation_item(&view.op)?,
+                            Some(wire::put_condition(view.op.condition)),
+                            if owned { &values } else { &[] },
+                        )
+                    }
+                    ViewOperationKind::Delete => {
+                        let delete = Delete::builder()
+                            .table_name(table)
+                            .key("pk", s(&view.op.pk))
+                            .key("sk", s(&view.op.sk))
+                            .condition_expression(wire::delete_condition(view.op.condition))
+                            .expression_attribute_values(wire::OWNER_PLACEHOLDER, owner)
+                            .build()
+                            .map_err(Error::backend)?;
+
+                        Ok(TransactWriteItem::builder().delete(delete).build())
+                    }
                 }
             })
             .collect()
@@ -3096,8 +3105,8 @@ mod tests {
         summary
     }
 
-    /// The commit-wide view operations a scenario step names (`projectors`), with `{id}` resolved to
-    /// the scenario's entity ID and keys padded with `x` to `pkPad` and `skPad`.
+    /// The commit-wide view operations a scenario step names (`projectors`), with `{id}` resolved
+    /// to the scenario's entity ID and keys padded with `x` to `pkPad` and `skPad`.
     fn step_views(base: &str, step: &serde_json::Value) -> Vec<ProjectedView> {
         use crate::projection::ViewOperation;
 
@@ -3126,12 +3135,12 @@ mod tests {
                 let pk = pad(scope(&item["pk"]), item["pkPad"].as_u64().unwrap_or(0));
                 let sk = pad(scope(&item["sk"]), item["skPad"].as_u64().unwrap_or(0));
                 let mut op = if item["op"] == "delete" {
-                    ViewOperation::delete(pk, sk)
+                    ViewOperation::delete(pk, sk, scope(&item["owner"]))
                 } else {
                     ViewOperation::put(
                         pk,
                         sk,
-                        scope(&item["entityId"]),
+                        scope(&item["owner"]),
                         scope(&item["entityType"]),
                         scope(&item["payload"]).into_bytes(),
                     )
@@ -4317,8 +4326,8 @@ mod tests {
         ])
         .with_operations([legacy_put("legacy-1")])
         .with_views([
-            view(("first", 0), 0, Op::put("p", "one", "", "", "{}")),
-            view(("first", 0), 1, Op::delete("p", "two").if_present()),
+            view(("first", 0), 0, Op::put("p", "one", "o", "", "{}")),
+            view(("first", 0), 1, Op::delete("p", "two", "o").if_present()),
             view(
                 ("second", 1),
                 0,
@@ -4327,7 +4336,7 @@ mod tests {
             view(
                 ("second", 1),
                 1,
-                Op::put("q", "two", "", "", "{}")
+                Op::put("q", "two", "o", "", "{}")
                     .if_absent()
                     .on_conflict(Taken),
             ),
@@ -4371,13 +4380,19 @@ mod tests {
             ),
             // The legacy backend operation, then the views in declaration then emission order.
             ("Put", "legacy-1", 0, None, None),
-            ("Put", "p", 0, owned("one"), None),
+            (
+                "Put",
+                "p",
+                0,
+                owned("one"),
+                owned("attribute_not_exists(pk) OR entityID = :owner"),
+            ),
             (
                 "Delete",
                 "p",
                 0,
                 owned("two"),
-                owned("attribute_exists(pk)"),
+                owned("attribute_exists(pk) AND entityID = :owner"),
             ),
             (
                 "Put",
@@ -4435,6 +4450,40 @@ mod tests {
         );
         assert_eq!(items[3].delete().unwrap().key().len(), 2);
 
+        // Every write binds its owner, except a put that requires the row to be absent. The
+        // owner is the stored `entityID`, and the stream the operation is owned by.
+        let owner = |item: &TransactWriteItem| {
+            let values = item
+                .put()
+                .map(|put| put.expression_attribute_values())
+                .or_else(|| {
+                    item.delete()
+                        .map(|delete| delete.expression_attribute_values())
+                })
+                .unwrap();
+
+            values.map(|values| values.keys().cloned().collect::<Vec<_>>())
+        };
+        assert_eq!(
+            owner(&items[2]),
+            Some(vec![":owner".to_owned()]),
+            "an unconditional put"
+        );
+        assert_eq!(
+            owner(&items[3]),
+            Some(vec![":owner".to_owned()]),
+            "a present delete"
+        );
+        assert_eq!(owner(&items[4]), None, "an absent put binds no owner");
+        assert_eq!(
+            items[3]
+                .delete()
+                .unwrap()
+                .expression_attribute_values()
+                .unwrap()[":owner"],
+            s("o")
+        );
+
         // The layout maps each view to its index, with its provenance.
         assert_eq!(layout.operations, 1);
         let indexes: Vec<_> = layout
@@ -4466,7 +4515,7 @@ mod tests {
             .with_views([view(
                 ("only", 0),
                 0,
-                crate::ViewOperation::put("p", "s", "", "", "{}"),
+                crate::ViewOperation::put("p", "s", "o", "", "{}"),
             )]);
         commit.validate().unwrap();
 
@@ -4503,11 +4552,11 @@ mod tests {
 
         let repository = views_repository();
         let operations = [
-            Op::put("p", "s", "", "", ""),
+            Op::put("p", "s", "o", "", ""),
             Op::put("pk", "sk", "entity", "type", "{\"a\":\"é\"}").if_absent(),
             Op::put("é", "ß", "é", "ß", "é").on_conflict(Taken),
-            Op::delete("p", "s"),
-            Op::delete("pk", "sk").if_present(),
+            Op::delete("p", "s", "o"),
+            Op::delete("pk", "sk", "o").if_present(),
         ];
         let views: Vec<_> = operations
             .iter()
@@ -4533,7 +4582,7 @@ mod tests {
             [view(
                 ("p", 0),
                 0,
-                crate::ViewOperation::put("p", "s", "", "", "{}"),
+                crate::ViewOperation::put("p", "s", "o", "", "{}"),
             )]
         };
 
@@ -4567,9 +4616,9 @@ mod tests {
         let bad = |op: Op| [view(("p", 0), 0, op)];
 
         for views in [
-            bad(Op::put("", "s", "", "", "{}")),
-            bad(Op::put("p".repeat(2049), "s", "", "", "{}")),
-            bad(Op::delete("p", "s".repeat(1025))),
+            bad(Op::put("", "s", "o", "", "{}")),
+            bad(Op::put("p".repeat(2049), "s", "o", "", "{}")),
+            bad(Op::delete("p", "s".repeat(1025), "o")),
         ] {
             let single = stream_commit("a", 1..=1).with_views(views.clone());
             let multi = TransactionCommit::new(vec![stream_commit("a", 1..=1)]).with_views(views);
@@ -4607,7 +4656,7 @@ mod tests {
                     view(
                         ("bulk", 0),
                         index,
-                        Op::put("p", format!("row-{index:03}"), "", "", "x".repeat(payload)),
+                        Op::put("p", format!("row-{index:03}"), "o", "", "x".repeat(payload)),
                     )
                 })
                 .collect()
@@ -4667,7 +4716,7 @@ mod tests {
                 view(
                     ("d", 0),
                     index,
-                    Op::delete("p", format!("{index:03}")).if_present(),
+                    Op::delete("p", format!("{index:03}"), "o").if_present(),
                 )
             })
             .collect();
@@ -4854,7 +4903,7 @@ mod tests {
             [view(
                 ("orphan", 0),
                 0,
-                crate::ViewOperation::put("p", "s", "", "", "{}"),
+                crate::ViewOperation::put("p", "s", "o", "", "{}"),
             )]
         };
         let fence = || {

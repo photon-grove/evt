@@ -23,8 +23,8 @@ func Test_buildViewItems_ShapesEveryOperationAsTheSpecPins(t *testing.T) {
 	items, err := repo.buildViewItems([]evt.ProjectedView{
 		projected("p", 0, 0, evt.PutView("pk", "sk", "owner", "account", []byte(`{"v":1}`))),
 		projected("p", 0, 1, evt.PutView("pk", "claim", "owner", "account", []byte(`{}`)).IfAbsent()),
-		projected("p", 0, 2, evt.DeleteView("pk", "gone")),
-		projected("p", 0, 3, evt.DeleteView("pk", "release").IfPresent()),
+		projected("p", 0, 2, evt.DeleteView("pk", "gone", "owner")),
+		projected("p", 0, 3, evt.DeleteView("pk", "release", "owner").IfPresent()),
 	})
 	require.NoError(t, err)
 	require.Len(t, items, 4)
@@ -32,7 +32,9 @@ func Test_buildViewItems_ShapesEveryOperationAsTheSpecPins(t *testing.T) {
 	plain := items[0].Put
 	require.NotNil(t, plain)
 	require.Equal(t, "views", aws.ToString(plain.TableName))
-	require.Nil(t, plain.ConditionExpression, "a put is unconditional unless it carries a condition")
+	require.Equal(t, "attribute_not_exists(pk) OR entityID = :owner", aws.ToString(plain.ConditionExpression),
+		"an unconditional put still refuses a row another stream owns")
+	require.Equal(t, owned("owner"), plain.ExpressionAttributeValues)
 	require.Equal(t, map[string]types.AttributeValue{
 		"pk":         &types.AttributeValueMemberS{Value: "pk"},
 		"sk":         &types.AttributeValueMemberS{Value: "sk"},
@@ -41,7 +43,9 @@ func Test_buildViewItems_ShapesEveryOperationAsTheSpecPins(t *testing.T) {
 		"payload":    &types.AttributeValueMemberS{Value: `{"v":1}`},
 	}, plain.Item, "all five attributes, and never a ttl")
 
-	require.Equal(t, "attribute_not_exists(pk)", aws.ToString(items[1].Put.ConditionExpression))
+	require.Equal(t, "attribute_not_exists(pk)", aws.ToString(items[1].Put.ConditionExpression),
+		"an absent row has no owner to check")
+	require.Nil(t, items[1].Put.ExpressionAttributeValues)
 
 	deletion := items[2].Delete
 	require.NotNil(t, deletion)
@@ -50,27 +54,34 @@ func Test_buildViewItems_ShapesEveryOperationAsTheSpecPins(t *testing.T) {
 		"pk": &types.AttributeValueMemberS{Value: "pk"},
 		"sk": &types.AttributeValueMemberS{Value: "gone"},
 	}, deletion.Key)
-	require.Nil(t, deletion.ConditionExpression)
+	require.Equal(t, "attribute_not_exists(pk) OR entityID = :owner", aws.ToString(deletion.ConditionExpression),
+		"an unconditional delete still refuses a row another stream owns")
+	require.Equal(t, owned("owner"), deletion.ExpressionAttributeValues)
 
-	require.Equal(t, "attribute_exists(pk)", aws.ToString(items[3].Delete.ConditionExpression))
+	require.Equal(t, "attribute_exists(pk) AND entityID = :owner", aws.ToString(items[3].Delete.ConditionExpression))
+	require.Equal(t, owned("owner"), items[3].Delete.ExpressionAttributeValues)
 }
 
-func Test_buildViewItems_AnEmptyEntityIDAndTypeAreStillWritten(t *testing.T) {
+func owned(owner string) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{":owner": &types.AttributeValueMemberS{Value: owner}}
+}
+
+func Test_buildViewItems_AnEmptyEntityTypeIsStillWritten(t *testing.T) {
 	repo := NewRepository(nil, "events").WithViewsTable("views")
 
-	items, err := repo.buildViewItems([]evt.ProjectedView{projected("p", 0, 0, evt.PutView("pk", "sk", "", "", nil))})
+	items, err := repo.buildViewItems([]evt.ProjectedView{projected("p", 0, 0, evt.PutView("pk", "sk", "owner", "", nil))})
 	require.NoError(t, err)
 
 	item := items[0].Put.Item
-	require.Equal(t, &types.AttributeValueMemberS{}, item["entityID"], "entityID and entityType are always written")
-	require.Equal(t, &types.AttributeValueMemberS{}, item["entityType"])
+	require.Equal(t, &types.AttributeValueMemberS{Value: "owner"}, item["entityID"], "the owner is the row's entityID")
+	require.Equal(t, &types.AttributeValueMemberS{}, item["entityType"], "entityType is always written")
 	require.Equal(t, &types.AttributeValueMemberS{}, item["payload"])
 }
 
 func Test_buildViewItems_RefusesOperationsWithoutAViewsTable(t *testing.T) {
 	_, err := NewRepository(nil, "events").buildViewItems([]evt.ProjectedView{
-		projected("p", 0, 0, evt.PutView("pk", "sk", "", "", nil)),
-		projected("p", 0, 1, evt.DeleteView("pk", "other")),
+		projected("p", 0, 0, evt.PutView("pk", "sk", "owner", "", nil)),
+		projected("p", 0, 1, evt.DeleteView("pk", "other", "owner")),
 	})
 
 	var refused *evt.ViewsNotConfiguredError
@@ -90,10 +101,11 @@ func Test_theBudgetedSizeOfAViewOperationIsTheSizeOfItsItem(t *testing.T) {
 	for name, op := range map[string]evt.ViewOperation{
 		"put":                  evt.PutView("pk", "sk", "owner", "account", []byte(`{"balance":10}`)),
 		"conditioned put":      evt.PutView("pk", "sk", "owner", "account", []byte(`{}`)).IfAbsent(),
-		"put without entity":   evt.PutView("pk", "sk", "", "", nil),
+		"put without type":     evt.PutView("pk", "sk", "owner", "", nil),
 		"multi-byte keys":      evt.PutView("p€k", "s€k", "ö", "ü", []byte("€")),
-		"delete":               evt.DeleteView("pk", "sk"),
-		"conditioned delete":   evt.DeleteView("pk", "sk").IfPresent(),
+		"delete":               evt.DeleteView("pk", "sk", "owner"),
+		"conditioned delete":   evt.DeleteView("pk", "sk", "owner").IfPresent(),
+		"multi-byte owner":     evt.DeleteView("pk", "sk", "ö€"),
 		"large payload":        evt.PutView("pk", "sk", "o", "t", []byte(strings.Repeat("x", 10_000))),
 		"conditioned put free": evt.PutView("pk", "sk", "o", "t", []byte(`{}`)).OnConflict(nil),
 	} {
@@ -106,9 +118,9 @@ func Test_theBudgetedSizeOfAViewOperationIsTheSizeOfItsItem(t *testing.T) {
 func Test_classifyCommitFailure_NamesTheProjectorOperationWhoseConditionFailed(t *testing.T) {
 	repo := &Repository{}
 	views := []evt.ProjectedView{
-		projected("profile", 0, 0, evt.PutView("pk", "profile", "", "", nil)),
-		projected("claims", 1, 0, evt.PutView("pk", "note", "", "", nil)),
-		projected("claims", 1, 1, evt.PutView("pk", "ada", "", "", nil).IfAbsent()),
+		projected("profile", 0, 0, evt.PutView("pk", "profile", "o", "", nil)),
+		projected("claims", 1, 0, evt.PutView("pk", "note", "o", "", nil)),
+		projected("claims", 1, 1, evt.PutView("pk", "ada", "o", "", nil).IfAbsent()),
 	}
 	layout := commitLayout{views: views}
 
@@ -147,8 +159,8 @@ func Test_classifyCommitFailure_NamesTheProjectorOperationWhoseConditionFailed(t
 func Test_classifyCommitFailure_ItemLevelReasonsOnAViewAreTheProjectorsAndTransientOnesAreNot(t *testing.T) {
 	repo := &Repository{}
 	layout := commitLayout{views: []evt.ProjectedView{
-		projected("p", 0, 0, evt.PutView("pk", "a", "", "", nil)),
-		projected("p", 0, 1, evt.PutView("pk", "b", "", "", nil)),
+		projected("p", 0, 0, evt.PutView("pk", "a", "o", "", nil)),
+		projected("p", 0, 1, evt.PutView("pk", "b", "o", "", nil)),
 	}}
 
 	cancelled := func(codes ...string) error {
@@ -177,4 +189,27 @@ func Test_classifyCommitFailure_ItemLevelReasonsOnAViewAreTheProjectorsAndTransi
 		require.NotErrorIs(t, err, evt.ErrProjectorOperation, reason)
 		require.True(t, policy.IsTransient(err), reason)
 	}
+}
+
+func Test_aDeleteIsBudgetedByTheConditionAndOwnerValueTheRepositorySends(t *testing.T) {
+	keys := len("pk") + len("sk") + len("p") + len("s")
+
+	unconditional := evt.DeleteView("p", "s", "own")
+	require.Equal(t, keys+len(ViewOwnedCondition)+len(ViewOwnerValue)+len("own"), evt.ViewOperationSize(unconditional))
+
+	present := unconditional.IfPresent()
+	require.Equal(t, keys+len(ViewPresentCondition)+len(ViewOwnerValue)+len("own"), evt.ViewOperationSize(present))
+}
+
+func Test_DeclareHistoryDependent_ChecksTheFeatureMarkerBeforeAnyRead(t *testing.T) {
+	repo := NewRepository(nil, "events").WithViewsTable("views")
+
+	// A repository whose events table no longer matches its marker's is refused before the manifest
+	// is read, like every other write path.
+	moved := *repo
+	moved.EventsTable = "other-events"
+
+	var mismatch *evt.FeatureMarkerTableMismatchError
+
+	require.ErrorAs(t, moved.DeclareHistoryDependent(context.Background(), "account"), &mismatch)
 }

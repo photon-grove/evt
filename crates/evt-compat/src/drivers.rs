@@ -99,17 +99,29 @@ pub const POSTGRES_VIEW_DDL: &str = "CREATE TABLE IF NOT EXISTS evt_compat_views
 )";
 
 /// Writes a view operation to [`POSTGRES_VIEW_TABLE`] with the statement semantics the repository
-/// relies on, and the exact statements of Go's `compat.PostgresViewWriter`: a put that requires the
-/// row to be absent is a plain `INSERT` (the unique violation is its failed condition), an
-/// unconditional put overwrites, and a delete's affected-row count decides a `present` condition.
+/// relies on, enforcing the row's owner (its `entity_id`) in SQL: a put that requires the row to be
+/// absent is a plain `INSERT` (the key-constraint violation is its failed condition), any other put
+/// is an upsert that only the owner may overwrite (it affects no row for another stream's row), a
+/// delete that requires the row removes the owner's row (affecting nothing fails it), and any other
+/// delete removes the owner's row if there is one and reports the rows of another owner it found,
+/// which fail it. The twin of Go's `compat.PostgresViewWriter`.
 pub fn postgres_view_writer() -> ViewWriter {
     std::sync::Arc::new(|operation: &ViewOperation| {
         if operation.kind == ViewOperationKind::Delete {
+            let sql = if operation.condition == ViewCondition::Present {
+                "DELETE FROM evt_compat_views WHERE pk = $1 AND sk = $2 AND entity_id = $3"
+            } else {
+                "WITH gone AS (DELETE FROM evt_compat_views \
+                 WHERE pk = $1 AND sk = $2 AND entity_id = $3) \
+                 SELECT 1 FROM evt_compat_views WHERE pk = $1 AND sk = $2 AND entity_id <> $3"
+            };
+
             return Ok(PgStatement::new(
-                "DELETE FROM evt_compat_views WHERE pk = $1 AND sk = $2",
+                sql,
                 vec![
                     Box::new(operation.pk.clone()),
                     Box::new(operation.sk.clone()),
+                    Box::new(operation.owner.to_string()),
                 ],
             ));
         }
@@ -123,8 +135,8 @@ pub fn postgres_view_writer() -> ViewWriter {
             insert.to_owned()
         } else {
             format!(
-                "{insert} ON CONFLICT (pk, sk) DO UPDATE SET entity_id = EXCLUDED.entity_id, \
-                 entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload"
+                "{insert} ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, \
+                 payload = EXCLUDED.payload WHERE evt_compat_views.entity_id = EXCLUDED.entity_id"
             )
         };
 
@@ -133,7 +145,7 @@ pub fn postgres_view_writer() -> ViewWriter {
             vec![
                 Box::new(operation.pk.clone()),
                 Box::new(operation.sk.clone()),
-                Box::new(operation.entity_id.clone()),
+                Box::new(operation.owner.to_string()),
                 Box::new(operation.entity_type.clone()),
                 Box::new(payload),
             ],
