@@ -1,10 +1,14 @@
 //! Connections to the local DynamoDB emulator and PostgreSQL, configured from the same environment
 //! variables as the Go integration tests.
 
+use crate::scenario::{HeadAccess, HeadFuture};
+use aws_sdk_dynamodb::types::AttributeValue;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use photon_evt::BoxError;
+use photon_evt::conformance::HeadFixtures;
 use photon_evt::dynamodb::DynamoRepository;
 use photon_evt::postgres::PostgresRepository;
+use photon_evt::wire::postgres::{DEFAULT_EVENTS_TABLE, EventRow, stream_heads_table};
+use photon_evt::{BoxError, EntityId, Error, EventSequence, Repository, SerializedEvent};
 
 /// The local event-log table (`EVT_COMPAT_DYNAMO_TABLE`).
 pub fn dynamo_table() -> String {
@@ -61,4 +65,205 @@ pub async fn postgres() -> Result<PostgresRepository, BoxError> {
         .await;
 
     Ok(repository)
+}
+
+/// Raw access to the DynamoDB head items and event items, for the steps and cases that put a
+/// stream in a state no conforming writer can (ADR 0007): an event stored without its head update,
+/// a head item deleted, a stored head read back.
+#[derive(Clone, Debug)]
+pub struct DynamoHeads {
+    client: aws_sdk_dynamodb::Client,
+    table: String,
+}
+
+impl DynamoHeads {
+    /// Raw access to a table through a client.
+    pub fn new(client: aws_sdk_dynamodb::Client, table: impl Into<String>) -> Self {
+        Self {
+            client,
+            table: table.into(),
+        }
+    }
+
+    /// Raw access to a repository's table.
+    pub fn of(repository: &DynamoRepository) -> Self {
+        Self::new(repository.client().clone(), repository.table())
+    }
+}
+
+impl<R: Repository> HeadFixtures<R> for DynamoHeads {
+    /// A `PutItem` of the event item with `attribute_not_exists(sk)`, the item Go's
+    /// `DynamoBypassHead` writes: `pk`, `sk`, `type`, `version`, `entityType`, `payload`, and
+    /// `metadata`.
+    async fn append_bypassing_head(&self, event: &SerializedEvent) -> Result<(), Error> {
+        let item = photon_evt::wire::dynamo::event_item(event, None)?;
+
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(photon_evt::dynamodb::to_sdk_item(&item)))
+            .condition_expression("attribute_not_exists(sk)")
+            .send()
+            .await
+            .map_err(Error::backend)?;
+
+        Ok(())
+    }
+
+    async fn delete_head(&self, entity_id: &EntityId) -> Result<(), Error> {
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(entity_id.to_string()))
+            .key("sk", AttributeValue::N("-1".into()))
+            .send()
+            .await
+            .map_err(Error::backend)?;
+
+        Ok(())
+    }
+
+    async fn stored_head(&self, entity_id: &EntityId) -> Result<Option<EventSequence>, Error> {
+        let output = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .key("pk", AttributeValue::S(entity_id.to_string()))
+            .key("sk", AttributeValue::N("-1".into()))
+            .send()
+            .await
+            .map_err(Error::backend)?;
+
+        output
+            .item
+            .map(|item| {
+                photon_evt::wire::dynamo::head_from_item(&photon_evt::dynamodb::from_sdk_item(
+                    &item,
+                ))
+                .map(|(head, _)| head)
+            })
+            .transpose()
+    }
+}
+
+/// Raw access to the PostgreSQL events and heads tables, for the same purpose as [`DynamoHeads`].
+#[derive(Clone)]
+pub struct PostgresHeads {
+    pool: Pool,
+    events: String,
+}
+
+impl PostgresHeads {
+    /// Raw access to the tables of an event log named by its events table.
+    pub fn new(pool: Pool, events: impl Into<String>) -> Self {
+        Self {
+            pool,
+            events: events.into(),
+        }
+    }
+
+    /// Raw access to the default tables.
+    pub fn default_tables(pool: Pool) -> Self {
+        Self::new(pool, DEFAULT_EVENTS_TABLE)
+    }
+}
+
+impl<R: Repository> HeadFixtures<R> for PostgresHeads {
+    /// A direct `INSERT` of the event row, leaving the heads table untouched.
+    async fn append_bypassing_head(&self, event: &SerializedEvent) -> Result<(), Error> {
+        let row = EventRow::from_event(event)?;
+
+        self.pool
+            .get()
+            .await
+            .map_err(Error::backend)?
+            .execute(
+                &format!(
+                    "INSERT INTO {} \
+                     (entity_id, sequence, event_id, event_type, version, entity_type, payload, metadata) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)",
+                    self.events
+                ),
+                &[
+                    &row.entity_id,
+                    &row.sequence,
+                    &row.event_id,
+                    &row.event_type,
+                    &row.version,
+                    &row.entity_type,
+                    &row.payload,
+                    &row.metadata,
+                ],
+            )
+            .await
+            .map_err(Error::backend)?;
+
+        Ok(())
+    }
+
+    async fn delete_head(&self, entity_id: &EntityId) -> Result<(), Error> {
+        self.pool
+            .get()
+            .await
+            .map_err(Error::backend)?
+            .execute(
+                &format!(
+                    "DELETE FROM {} WHERE entity_id = $1",
+                    stream_heads_table(&self.events)
+                ),
+                &[&entity_id.as_str()],
+            )
+            .await
+            .map_err(Error::backend)?;
+
+        Ok(())
+    }
+
+    async fn stored_head(&self, entity_id: &EntityId) -> Result<Option<EventSequence>, Error> {
+        let row = self
+            .pool
+            .get()
+            .await
+            .map_err(Error::backend)?
+            .query_opt(
+                &format!(
+                    "SELECT head FROM {} WHERE entity_id = $1",
+                    stream_heads_table(&self.events)
+                ),
+                &[&entity_id.as_str()],
+            )
+            .await
+            .map_err(Error::backend)?;
+
+        Ok(row.map(|row| EventSequence(row.get(0))))
+    }
+}
+
+impl HeadAccess for DynamoHeads {
+    fn append_bypassing_head<'a>(&'a self, event: &'a SerializedEvent) -> HeadFuture<'a, ()> {
+        Box::pin(HeadFixtures::<DynamoRepository>::append_bypassing_head(
+            self, event,
+        ))
+    }
+
+    fn stored_head<'a>(&'a self, entity_id: &'a EntityId) -> HeadFuture<'a, Option<EventSequence>> {
+        Box::pin(HeadFixtures::<DynamoRepository>::stored_head(
+            self, entity_id,
+        ))
+    }
+}
+
+impl HeadAccess for PostgresHeads {
+    fn append_bypassing_head<'a>(&'a self, event: &'a SerializedEvent) -> HeadFuture<'a, ()> {
+        Box::pin(HeadFixtures::<PostgresRepository>::append_bypassing_head(
+            self, event,
+        ))
+    }
+
+    fn stored_head<'a>(&'a self, entity_id: &'a EntityId) -> HeadFuture<'a, Option<EventSequence>> {
+        Box::pin(HeadFixtures::<PostgresRepository>::stored_head(
+            self, entity_id,
+        ))
+    }
 }

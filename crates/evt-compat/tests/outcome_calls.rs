@@ -12,6 +12,7 @@ use aws_sdk_dynamodb::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
 };
+use evt_compat::drivers::{DynamoHeads, PostgresHeads};
 use evt_compat::{Runner, ScenarioFixtures, Scenarios};
 use photon_evt::dynamodb::DynamoRepository;
 use serde_json::{Value, json};
@@ -53,7 +54,8 @@ impl Intercept for Recorder {
     }
 }
 
-/// One action in the fixtures' shape: operation, key, condition, and values.
+/// One action in the fixtures' shape: operation, key, update expression, condition, names, and
+/// values.
 fn summarize(action: &Value) -> Value {
     let (operation, body) = action
         .as_object()
@@ -70,8 +72,17 @@ fn summarize(action: &Value) -> Value {
         "pk": key["pk"]["S"],
         "sk": key["sk"]["N"].as_str().unwrap().parse::<i64>().unwrap(),
     });
+    if let Some(update) = body.get("UpdateExpression") {
+        summary["update"] = update.clone();
+    }
     if let Some(condition) = body.get("ConditionExpression") {
         summary["condition"] = condition.clone();
+    }
+    if let Some(names) = body
+        .get("ExpressionAttributeNames")
+        .filter(|names| names.as_object().is_some_and(|names| !names.is_empty()))
+    {
+        summary["names"] = names.clone();
     }
     if let Some(values) = body
         .get("ExpressionAttributeValues")
@@ -150,7 +161,8 @@ async fn outcome_scenarios_send_the_requests_go_recorded() {
         let repository = DynamoRepository::new(client.clone(), &table);
         // Every step runs through the Rust store, whichever language the scenario assigns it to:
         // the requests are the same.
-        let runner = Runner::for_scenario(repository, scenario, &run);
+        let runner = Runner::for_scenario(repository, scenario, &run)
+            .with_head_access(DynamoHeads::new(client.clone(), &table));
         let entity_id = scenario.entity_id(&run);
         let expected = fixtures.for_run(&scenario.name, &run).expect("expectation");
 
@@ -241,7 +253,8 @@ async fn outcome_scenarios_store_the_rows_go_recorded_on_postgres() {
 
     let mut rows = 0;
     for scenario in scenarios.scenarios.iter().filter(|s| s.outcomes) {
-        let runner = Runner::for_scenario(repository.clone(), scenario, &run);
+        let runner = Runner::for_scenario(repository.clone(), scenario, &run)
+            .with_head_access(PostgresHeads::default_tables(repository.pool().clone()));
         let entity_id = scenario.entity_id(&run);
 
         for (index, step) in scenario.steps.iter().enumerate() {

@@ -30,7 +30,21 @@ fn snapshot(id: &str, through: i64) -> SerializedSnapshot {
     }
 }
 
+/// Seeds `count` events through the raw client, as a head-aware writer would have left them: the
+/// events, the stream's head item, and a covering snapshot.
 async fn seed(repository: &DynamoRepository, id: &str, count: i64) {
+    repository
+        .client()
+        .put_item()
+        .table_name(repository.table())
+        .set_item(Some(to_sdk_item(&dynamo::head_item(
+            &EntityId::new(id),
+            EventSequence(count),
+            None,
+        ))))
+        .send()
+        .await
+        .unwrap();
     for sequence in 1..=count {
         let event = SerializedEvent {
             id: format!("{id}:{sequence}").into(),
@@ -276,6 +290,8 @@ async fn maintenance_writes_are_fenced_by_the_durable_manifest() {
         .await
         .unwrap();
     let repository = DynamoRepository::new(client.clone(), &table);
+    // The table is head-aware; its streams are seeded below with their head items.
+    repository.declare_stream_heads().await.unwrap();
 
     seed(&repository, "account-race", 1).await;
     {
@@ -423,7 +439,10 @@ async fn maintenance_writes_are_fenced_by_the_durable_manifest() {
         );
     }
     repository
-        .update_manifest(|manifest| manifest.features.clear())
+        .update_manifest(|manifest| {
+            manifest.features.clear();
+            manifest.declare_stream_heads();
+        })
         .await
         .unwrap();
 
@@ -472,7 +491,10 @@ async fn maintenance_writes_are_fenced_by_the_durable_manifest() {
         );
     }
     repository
-        .update_manifest(|manifest| manifest.features.clear())
+        .update_manifest(|manifest| {
+            manifest.features.clear();
+            manifest.declare_stream_heads();
+        })
         .await
         .unwrap();
 
