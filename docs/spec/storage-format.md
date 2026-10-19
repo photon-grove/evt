@@ -1985,10 +1985,17 @@ Every path that adds, removes, or snapshots events either maintains the head or 
   `sk < 1`; in Go, `stream.DynamoDBHandler` drops such `INSERT` records and `stream.SNSPublisher`
   counts them as skipped, not as malformed events. `KEYS_ONLY` wake-ups fire on every head update unless filtered.
 - `evt-doctor` reports: head below the derived head, head above it, a head item with no events or
-  snapshot, and a stream with events and no head item. `migrate-heads --repair` raises a low head and
+  snapshot, and a stream with events and no head item. A plain `evt-doctor` run reports them once the
+  store declares `stream-heads` and exits 1 on drift; `migrate-heads --verify` is the same check
+  with the migration's refusals. `migrate-heads --repair` raises a low head and
   creates a missing one. A head above the derived value is lowered only by `--repair --allow-lower`,
   which runs with every writer stopped and writes `SET head = :derived` conditioned on
-  `head = :observed`.
+  `head = :observed`. A head item with no event or snapshot left is a warning on DynamoDB when it has a `ttl` (a
+  retained stream's head item outlives the rest until it expires), and a finding when it has none
+  (it never expires, and a create of the stream's ID would fail against it) and on PostgreSQL; a
+  head item over a snapshot of event sequence 0 has no derived head to lower to, so the repair
+  reports it and leaves it. DynamoDB also reports a head item whose `ttl` is below an item of its
+  stream (or that has one while a stream item never expires), and the repair raises or removes it.
 
 ### Required feature
 
@@ -2044,7 +2051,8 @@ release in which old and new writers coexist, and it is one-way. The procedure, 
 
 1. **Stop writers and take a backup.** Stop every v0.8 writer and start no head-aware writer.
    Enforce it: an IAM deny on `PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`, and
-   `TransactWriteItems` for every principal except the migration role (an identity policy on each
+   `TransactWriteItems` (which has no IAM action of its own: its items are authorized by the item-level
+   actions, so deny `ConditionCheckItem` as well) for every principal except the migration role (an identity policy on each
    writer principal, a table resource policy, or a service control policy), held until step 6.
    DynamoDB cannot stop writes by capacity (provisioned mode has a positive minimum, on-demand has
    no writable-capacity setting). Take an on-demand backup or confirm point-in-time recovery.
@@ -2058,7 +2066,10 @@ release in which old and new writers coexist, and it is one-way. The procedure, 
    which are not yet deleted, and skips a partition with nothing left. For each remaining partition
    it computes the derived head and the **maximum `ttl` across the partition**, skips a partition
    whose derived head is 0 (`head ≥ 1`), and writes the head item with `attribute_not_exists(head)`.
-   It is idempotent and resumable, supports `--dry-run`, and never lowers a head.
+   It is idempotent and resumable, supports `--dry-run`, and never lowers a head. A head item whose
+   partition mixes items with and without a `ttl` is written with **no** `ttl`, because a head item
+   that expired before an item that never does would leave that stream without one. Scans are
+   strongly consistent.
 4. **Verify.** `evt-doctor migrate-heads --verify` rescans and requires, for every partition with a
    non-expired item, a head item equal to the derived head (expired-but-undeleted items ignored as
    above), and exits non-zero otherwise.
@@ -2070,6 +2081,10 @@ release in which old and new writers coexist, and it is one-way. The procedure, 
 
 On PostgreSQL steps 3 to 5 are one transaction (see [PostgreSQL](#postgresql-head-table)). Writers are
 stopped before it and started after it.
+
+The operator procedure, with the commands, the verification and repair findings, and the rollback,
+is the [migration runbook](../migrating-to-stream-heads.md). `migrate-heads` is Go only (the Rust
+crate has no doctor); Rust writers run against a migrated store like any head-aware writer.
 
 A v0.8 writer that runs after the declaration leaves the head item stale: head-aware writers then
 fail that stream with `StreamHeadDrift`, and a fence on it can pass although the stream moved. v0.8
@@ -2137,7 +2152,10 @@ stored items gain the head item, and each PostgreSQL stream a heads row recorded
 `internal/compat/fakedynamo.go` (an `Update` action and the new condition strings), the in-memory
 backends, both conformance suites, `BEHAVIORAL_INVARIANTS.md`, `docs/dynamodb.md`, and
 `docs/streams.md`. The migration scenarios (`stream-heads-migration`, `stream-heads-compaction`)
-arrive with the migration tool.
+are not in the shared scenarios yet. The migration is Go only, and a shared fixture table cannot be
+re-declared mid-run, so the Go live suites exercise it on both backends instead (v0.8-layout
+stores, resume, verify, repair, the declare re-verify, and head-aware writers afterwards); the
+cross-language scenarios stay on the [#159](https://github.com/photon-grove/evt/issues/159) fixtures item.
 
 ## PostgreSQL
 
@@ -2524,7 +2542,8 @@ The head item changed the recorded action order of `multi-stream` and `read-fenc
 fixtures regenerate from the Go implementation) and added two scenarios, `stream-heads-snapshot-guard`
 and `stream-heads-drift`. The harness grew the ops they need: `putSnapshot` (an out-of-band snapshot
 write) and `appendRawBypassingHead` (an event appended with no head update). The remaining ADR 0007
-scenarios (`stream-heads-migration`, `stream-heads-compaction`) belong to the migration tool. See
+scenarios (`stream-heads-migration`, `stream-heads-compaction`) are not added yet: the migration
+tool is Go only and covered by the Go live suites. See
 [ADR 0007](../adr/0007-per-stream-head-item.md#migration-and-compatibility).
 
 The v0.9 core reshape (C1–C10) extends `compat/scenarios.json` with the interleaved Go/Rust

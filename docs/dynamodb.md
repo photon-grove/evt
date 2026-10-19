@@ -67,13 +67,15 @@ transactional action is billed as two writes of the checked or written item's si
 1 KB; the head item stays well under 1 KB, so a head update or a fence is the cheapest action a commit
 can send, and it no longer scales with the size of a snapshot. (Whether a `ConditionCheck` bills by
 the size of the item it reads is documented only indirectly, and is still to be measured on real
-DynamoDB: [#159](https://github.com/photon-grove/evt/issues/159).)
+DynamoDB with the `dynamo/awsmeasure` script: [#159](https://github.com/photon-grove/evt/issues/159).)
 
 There are no reads before a commit. A failed commit is told apart by reading the stream on the
 failure path only ([Classification](spec/storage-format.md#failure-classification)). A head item
 that disagrees with its log is `*evt.StreamHeadDriftError`, and a store that holds data without
 declaring the `stream-heads` feature is refused with `*evt.StreamHeadsNotMigratedError` until it is
-migrated; an empty table is declared by its first writer, so a fresh table needs no step.
+migrated; an empty table is declared by its first writer, so a fresh table needs no step. A table
+written by v0.8 is migrated with `evt-doctor migrate-heads` (stop-the-world, one-way): see the
+[migration runbook](migrating-to-stream-heads.md).
 
 The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C2/C3/C10) is:
 

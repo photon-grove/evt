@@ -99,6 +99,11 @@ func writeDynamoJSON(t *testing.T, w http.ResponseWriter, status int, body strin
 	}
 }
 
+const (
+	undeclaredHeads = "head-drift check: stream-heads is not declared; run \"evt-doctor migrate-heads\" to migrate this store\n"
+	declaredMarker  = `{"Item":{"pk":{"S":"SYSTEM#FEATURES"},"sk":{"N":"0"},"version":{"N":"1"},"features":{"S":"{\"stream-heads\":1}"}}}`
+)
+
 func TestDoctorCLI(t *testing.T) {
 	// Force the local SDK configuration regardless of the developer's AWS setup.
 	t.Setenv("AWS_PROFILE", "")
@@ -108,17 +113,38 @@ func TestDoctorCLI(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		scan       string
+		marker     string
+		contains   []string
 		failure    string
 		wantStatus int
 		wantOutput string
 	}{
 		{
 			name: "clean", scan: `{"Items":[{"pk":{"S":"account-1"},"sk":{"N":"1"}}]}`,
-			wantOutput: "events: ACTIVE\nviews: ACTIVE\nreserved-namespace check: no pre-existing streams in reserved namespaces\n",
+			wantOutput: "events: ACTIVE\nviews: ACTIVE\nreserved-namespace check: no pre-existing streams in reserved namespaces\n" + undeclaredHeads,
+		},
+		{
+			name: "declared heads that match", marker: declaredMarker,
+			scan:       `{"Items":[{"pk":{"S":"account-1"},"sk":{"N":"1"},"head":{"N":"1"}},{"pk":{"S":"account-1"},"sk":{"N":"-1"},"head":{"N":"1"}}]}`,
+			wantOutput: "events: ACTIVE\nviews: ACTIVE\nreserved-namespace check: no pre-existing streams in reserved namespaces\nhead-drift check: 1 stream(s), every head matches its log\n",
+		},
+		{
+			name: "declared heads that drifted", marker: declaredMarker, wantStatus: 1,
+			scan: `{"Items":[{"pk":{"S":"account-1"},"sk":{"N":"1"}},{"pk":{"S":"account-1"},"sk":{"N":"2"}},{"pk":{"S":"account-1"},"sk":{"N":"-1"},"head":{"N":"1"}},{"pk":{"S":"account-2"},"sk":{"N":"1"}}]}`,
+			contains: []string{
+				"head-drift check: 2 stream(s), 2 with drift",
+				"account-1: head 1 is lower than the derived head 2",
+				"account-2: missing head item, log derives head 1",
+			},
+		},
+		{
+			name: "a journal store skips the head check", marker: `{"Item":{"pk":{"S":"SYSTEM#FEATURES"},"sk":{"N":"0"},"version":{"N":"1"},"features":{"S":"{\"journal\":1}"}}}`,
+			scan:       `{"Items":[{"pk":{"S":"account-1"},"sk":{"N":"1"}}]}`,
+			wantOutput: "events: ACTIVE\nviews: ACTIVE\nreserved-namespace check: no pre-existing streams in reserved namespaces\nhead-drift check: skipped: store declares unsupported features (journal@1); refusing to write\n",
 		},
 		{
 			name: "migration needed still succeeds", scan: `{"Items":[{"pk":{"S":"SYSTEM#legacy"},"sk":{"N":"1"}}]}`,
-			wantOutput: "events: ACTIVE\nviews: ACTIVE\nreserved-namespace check: 1 stream(s) must be renamed (migrated) before enabling the v0.9 features:\n  SYSTEM#legacy\n",
+			wantOutput: "events: ACTIVE\nviews: ACTIVE\nreserved-namespace check: 1 stream(s) must be renamed (migrated) before enabling the v0.9 features:\n  SYSTEM#legacy\n" + undeclaredHeads,
 		},
 		{
 			name: "scan failure", failure: "Scan", wantStatus: 1,
@@ -127,6 +153,11 @@ func TestDoctorCLI(t *testing.T) {
 		{
 			name: "describe failure", failure: "DescribeTable", wantStatus: 1,
 			wantOutput: "describe events:",
+		},
+		{
+			// A check that could not run must not look like a clean bill of health.
+			name: "marker read failure", scan: `{"Items":[]}`, failure: "GetItem", wantStatus: 1,
+			wantOutput: "head-drift check: could not run:",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -142,6 +173,13 @@ func TestDoctorCLI(t *testing.T) {
 					writeDynamoJSON(t, w, http.StatusOK, `{"Table":{"TableStatus":"ACTIVE"}}`)
 				case "Scan":
 					writeDynamoJSON(t, w, http.StatusOK, tc.scan)
+				case "GetItem":
+					marker := tc.marker
+					if marker == "" {
+						marker = `{}`
+					}
+
+					writeDynamoJSON(t, w, http.StatusOK, marker)
 				default:
 					t.Errorf("unexpected SDK operation %q", op)
 					w.WriteHeader(http.StatusBadRequest)
@@ -153,7 +191,13 @@ func TestDoctorCLI(t *testing.T) {
 			if status != tc.wantStatus {
 				t.Fatalf("status=%d want=%d output=%s", status, tc.wantStatus, out)
 			}
-			if tc.wantStatus == 0 {
+			if len(tc.contains) > 0 {
+				for _, want := range tc.contains {
+					if !strings.Contains(out, want) {
+						t.Fatalf("output is missing %q: %s", want, out)
+					}
+				}
+			} else if tc.wantStatus == 0 {
 				if out != tc.wantOutput {
 					t.Fatalf("output=%q, want %q", out, tc.wantOutput)
 				}

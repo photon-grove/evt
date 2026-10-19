@@ -74,6 +74,12 @@ const DOC_CONFIG: Record<string, DocConfig> = {
     order: 7,
     summary: 'Copy-ready patterns for adopters: rebuilds, dedup, schema evolution, and local testing.',
   },
+  'migrating-to-stream-heads': {
+    group: GUIDES,
+    order: 8,
+    summary:
+      'Runbook for moving a v0.8 store to per-stream head items: stop, back up, backfill, verify, declare.',
+  },
 }
 
 function metaFor(path: string, markdown: string): DocMeta {
