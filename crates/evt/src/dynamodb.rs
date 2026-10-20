@@ -593,6 +593,24 @@ impl DynamoRepository {
 
                 match view.op.kind {
                     ViewOperationKind::Put => {
+                        if let Some(expected) = &view.op.expected_payload {
+                            let expected = String::from_utf8(expected.clone()).map_err(|_| {
+                                Error::InvalidViewOperation(
+                                    "an expected view payload must be UTF-8".into(),
+                                )
+                            })?;
+
+                            return put(
+                                table,
+                                wire::view_operation_item(&view.op)?,
+                                Some(wire::VIEW_EXPECTED_PAYLOAD_CONDITION),
+                                &[
+                                    (wire::OWNER_PLACEHOLDER, owner),
+                                    (wire::EXPECTED_PAYLOAD_PLACEHOLDER, s(&expected)),
+                                ],
+                            );
+                        }
+
                         let owned = view.op.condition != ViewCondition::Absent;
                         let values = [(wire::OWNER_PLACEHOLDER, owner)];
 

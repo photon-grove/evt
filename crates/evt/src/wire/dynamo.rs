@@ -221,6 +221,13 @@ pub const REBUILD_FORCE_RELEASE_UPDATE: &str = "SET #value = #value + :two, forc
 pub const REBUILD_GUARD_CONDITION: &str =
     "#owner = :me AND #generation = :generation AND leaseExpiresAt > :now";
 
+/// The placeholder an expected-payload condition binds.
+pub const EXPECTED_PAYLOAD_PLACEHOLDER: &str = ":expected";
+
+/// The condition of a view put that expects the row's exact payload (the journal's counter): the
+/// row exists, is the owner's, and holds the bytes the writer read.
+pub const VIEW_EXPECTED_PAYLOAD_CONDITION: &str = "entityID = :owner AND payload = :expected";
+
 /// A DynamoDB attribute value. Serializes as DynamoDB JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttributeValue {

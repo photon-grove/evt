@@ -107,6 +107,12 @@ pub struct ViewOperation {
     /// The projector's own error for the case where the condition fails. The commit's
     /// [`ProjectorOperationError`] reports it as its [`source`](StdError::source).
     pub conflict: Option<Arc<dyn StdError + Send + Sync + 'static>>,
+    /// An engine-only condition on a put (the journal's counter, ADR 0005): the row must exist,
+    /// be the owner's, and hold exactly these payload bytes. Projectors cannot set it, and it is
+    /// `None` on every operation they emit. A repository that writes the journal must apply it in
+    /// the commit (DynamoDB: `entityID = :owner AND payload = :expected`); one that cannot refuses
+    /// the operation with [`Error::InvalidViewOperation`].
+    pub expected_payload: Option<Vec<u8>>,
 }
 
 impl ViewOperation {
@@ -127,6 +133,7 @@ impl ViewOperation {
             payload: payload.into(),
             condition: ViewCondition::None,
             conflict: None,
+            expected_payload: None,
         }
     }
 
@@ -145,6 +152,7 @@ impl ViewOperation {
             payload: Vec::new(),
             condition: ViewCondition::None,
             conflict: None,
+            expected_payload: None,
         }
     }
 
@@ -161,6 +169,16 @@ impl ViewOperation {
     #[must_use]
     pub fn if_present(mut self) -> Self {
         self.condition = ViewCondition::Present;
+        self
+    }
+
+    /// Requires the row to exist, be the owner's, and hold exactly `payload`: the engine's
+    /// compare-and-set of a shared row (the journal's counter). Valid only on a put with no other
+    /// condition.
+    #[must_use]
+    #[cfg_attr(not(feature = "journal"), allow(dead_code))]
+    pub(crate) fn if_payload(mut self, payload: Vec<u8>) -> Self {
+        self.expected_payload = Some(payload);
         self
     }
 
@@ -183,6 +201,7 @@ impl PartialEq for ViewOperation {
             && self.entity_type == other.entity_type
             && self.payload == other.payload
             && self.condition == other.condition
+            && self.expected_payload == other.expected_payload
             && self.conflict.as_ref().map(|error| error.to_string())
                 == other.conflict.as_ref().map(|error| error.to_string())
     }
@@ -491,6 +510,7 @@ impl ProjectedView {
                 payload: Vec::new(),
                 condition: self.op.condition,
                 conflict: self.op.conflict.clone(),
+                expected_payload: None,
             },
         }
     }
@@ -777,6 +797,12 @@ fn invalid_reason(op: &ViewOperation) -> Option<String> {
             return Some("a delete cannot carry the \"absent\" condition".into());
         }
         _ => {}
+    }
+
+    if op.expected_payload.is_some()
+        && (op.kind != ViewOperationKind::Put || op.condition != ViewCondition::None)
+    {
+        return Some("an expected payload is valid only on a put with no other condition".into());
     }
 
     if op.pk.is_empty() {
@@ -1265,6 +1291,26 @@ mod tests {
         };
 
         assert!(invalid(ViewOperation::put("", "s", "a", "", "{}")).contains("pk is empty"));
+
+        // The engine's expected-payload condition stands alone, on a put.
+        let expected = |op: ViewOperation| op.if_payload(b"{}".to_vec());
+        assert!(
+            invalid(expected(
+                ViewOperation::put("p", "s", "a", "", "{}").if_absent()
+            ))
+            .contains("expected payload")
+        );
+        assert!(
+            invalid(expected(ViewOperation::delete("p", "s", "a"))).contains("expected payload")
+        );
+        assert!(
+            check_views(&[projected(
+                "p",
+                0,
+                expected(ViewOperation::put("p", "s", "a", "", "{}"))
+            )])
+            .is_ok()
+        );
         assert!(invalid(ViewOperation::put("p", "", "a", "", "{}")).contains("sk is empty"));
         assert!(invalid(ViewOperation::delete("", "s", "a")).contains("pk is empty"));
         assert!(

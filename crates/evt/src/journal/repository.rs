@@ -304,23 +304,28 @@ where
         Ok(plan)
     }
 
-    /// The counter of every scope, in one batch read. With `repair`, a counter behind the scope's
-    /// highest row (a lost or lowered counter) is replaced by that row's position, so the commit
-    /// allocates above the rows that exist and writes the counter back.
-    async fn read_counters(
-        &self,
-        scopes: &[Scope],
-        repair: bool,
-    ) -> Result<BTreeMap<Scope, u64>, Error> {
+    /// The stored counter of every scope (0 for none), in one batch read, and the position each
+    /// scope allocates from. With `repair`, a counter behind the scope's highest row (a lost or
+    /// lowered counter) allocates from that row's position instead, and the commit writes the
+    /// counter back.
+    ///
+    /// The commit's counter put is conditioned on the stored counter it read, so a writer whose
+    /// read went stale fails on the counter even when the rows that would have refused it are
+    /// gone (deleted rows; journal compaction, X2, deletes them by design) instead of
+    /// reallocating a position.
+    async fn read_counters(&self, scopes: &[Scope], repair: bool) -> Result<Counters, Error> {
         let values = self.inner.read_counters(scopes).await?;
-        let mut counters = BTreeMap::new();
+        let mut counters = Counters::default();
 
-        for (scope, mut value) in scopes.iter().zip(values) {
+        for (scope, stored) in scopes.iter().zip(values) {
+            let mut base = stored;
+
             if repair {
-                value = value.max(self.inner.read_last_position(scope).await?);
+                base = base.max(self.inner.read_last_position(scope).await?);
             }
 
-            counters.insert(scope.clone(), value);
+            counters.stored.insert(scope.clone(), stored);
+            counters.base.insert(scope.clone(), base);
         }
 
         Ok(counters)
@@ -333,9 +338,9 @@ where
         &self,
         commit: &mut C,
         plan: &[Vec<Scope>],
-        counters: &BTreeMap<Scope, u64>,
+        counters: &Counters,
     ) -> Result<(), Error> {
-        let allocated = allocate(counters, plan)?;
+        let allocated = allocate(&counters.base, plan)?;
         let projector_index = commit
             .views()
             .iter()
@@ -394,17 +399,29 @@ where
         let rows = views.len();
 
         for (operation, (scope, position)) in (rows..).zip(&allocated.counters) {
+            // A compare-and-set on the counter this attempt read: absent, or exactly its stored
+            // payload. A writer that lost the race fails here even when the rows it allocated
+            // are gone (compacted), and retries like one whose position was taken.
+            let put = ViewOperation::put(
+                scope.counter_pk(),
+                COUNTER_SORT_KEY,
+                COUNTER_OWNER,
+                COUNTER_ENTITY_TYPE,
+                counter_payload(scope, *position),
+            );
+            let put = match counters.stored.get(scope).copied().unwrap_or(0) {
+                0 => put.if_absent(),
+                stored => put.if_payload(counter_payload(scope, stored)),
+            };
+
             views.push(ProjectedView::new(
                 PROJECTOR_NAME,
                 0,
                 operation,
-                ViewOperation::put(
-                    scope.counter_pk(),
-                    COUNTER_SORT_KEY,
-                    COUNTER_OWNER,
-                    COUNTER_ENTITY_TYPE,
-                    counter_payload(scope, *position),
-                ),
+                put.on_conflict(PositionTaken {
+                    scope: scope.as_str().to_owned(),
+                    position: *position,
+                }),
             ));
         }
 
@@ -491,7 +508,7 @@ where
                 // Another writer holds a position this attempt allocated. If the counters have
                 // not moved since they were read, the counter is behind its rows (lost, lowered
                 // by a rebuild, or wiped): the next attempt allocates from the highest row.
-                repair |= self.read_counters(&scopes, false).await? == counters;
+                repair |= self.read_counters(&scopes, false).await?.stored == counters.stored;
 
                 true
             } else if matches!(error, Error::Transient(_)) {
@@ -522,7 +539,16 @@ where
     }
 }
 
-/// Reports whether the error is a journal row that found its position taken.
+/// The counters one attempt read: what each scope's counter row stores (0 for none), which the
+/// commit's counter put is conditioned on, and the position each scope allocates from.
+#[derive(Default)]
+struct Counters {
+    stored: BTreeMap<Scope, u64>,
+    base: BTreeMap<Scope, u64>,
+}
+
+/// Reports whether the error is a journal row that found its position taken, or a counter that
+/// moved since the attempt read it.
 fn taken(error: &Error) -> bool {
     let Error::ProjectorOperation(operation) = error else {
         return false;

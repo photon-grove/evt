@@ -214,6 +214,14 @@ impl PostgresRepository {
         views
             .iter()
             .map(|view| {
+                if view.op.expected_payload.is_some() {
+                    return Err(Error::InvalidViewOperation(format!(
+                        "projector {:?} (#{}) operation {}: PostgreSQL does not apply an expected \
+                         payload",
+                        view.projector, view.projector_index, view.operation
+                    )));
+                }
+
                 let statement = writer(&view.op)?;
                 if statement.sql.trim().is_empty() {
                     return Err(Error::InvalidViewOperation(format!(

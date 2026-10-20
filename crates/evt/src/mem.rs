@@ -423,7 +423,11 @@ fn check_view_conditions(
             ViewCondition::None => owned,
             ViewCondition::Absent => stored.is_none(),
             ViewCondition::Present => stored.is_some() && owned,
-        };
+        } && view
+            .op
+            .expected_payload
+            .as_ref()
+            .is_none_or(|expected| stored.is_some_and(|row| owned && row.payload == *expected));
 
         if !held {
             return Err(Error::ProjectorOperation(Box::new(
