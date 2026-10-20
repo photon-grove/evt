@@ -1,0 +1,386 @@
+{
+  "allocations": [
+    {
+      "allocations": [
+        {
+          "position": "5",
+          "scope": "world:7"
+        }
+      ],
+      "extensionKey": "evt.journal",
+      "extensionValue": "[{\"scope\":\"world:7\",\"position\":5}]",
+      "name": "one scope"
+    },
+    {
+      "allocations": [
+        {
+          "position": "1",
+          "scope": "world:7/place:3"
+        },
+        {
+          "position": "5",
+          "scope": "world:7"
+        }
+      ],
+      "extensionKey": "evt.journal",
+      "extensionValue": "[{\"scope\":\"world:7\",\"position\":5},{\"scope\":\"world:7/place:3\",\"position\":1}]",
+      "name": "two scopes, ascending by scope bytes whatever the order given"
+    },
+    {
+      "allocations": [
+        {
+          "position": "18446744073709551615",
+          "scope": "world:7"
+        }
+      ],
+      "extensionKey": "evt.journal",
+      "extensionValue": "[{\"scope\":\"world:7\",\"position\":18446744073709551615}]",
+      "name": "a position beyond 2^53"
+    }
+  ],
+  "commit": {
+    "counters": [
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "SYSTEM#JOURNAL"
+          },
+          "entityType": {
+            "S": "journal-counter"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7\",\"position\":3}"
+          },
+          "pk": {
+            "S": "journal-counter#world:7"
+          },
+          "sk": {
+            "S": "COUNTER"
+          }
+        },
+        "position": "3",
+        "scope": "world:7"
+      },
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "SYSTEM#JOURNAL"
+          },
+          "entityType": {
+            "S": "journal-counter"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7/place:3\",\"position\":2}"
+          },
+          "pk": {
+            "S": "journal-counter#world:7/place:3"
+          },
+          "sk": {
+            "S": "COUNTER"
+          }
+        },
+        "position": "2",
+        "scope": "world:7/place:3"
+      },
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "SYSTEM#JOURNAL"
+          },
+          "entityType": {
+            "S": "journal-counter"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7/place:4\",\"position\":1}"
+          },
+          "pk": {
+            "S": "journal-counter#world:7/place:4"
+          },
+          "sk": {
+            "S": "COUNTER"
+          }
+        },
+        "position": "1",
+        "scope": "world:7/place:4"
+      }
+    ],
+    "events": [
+      {
+        "entityId": "acct-1",
+        "entityType": "account",
+        "id": "acct-1:1",
+        "metadata": {
+          "address": null,
+          "causationId": "cmd-0001",
+          "commandId": "cmd-0001",
+          "commitId": "01JDXK7Q3W9B5N2M8P4R6TAVHY",
+          "extensions": {
+            "evt.journal": "[{\"scope\":\"world:7\",\"position\":1},{\"scope\":\"world:7/place:3\",\"position\":1}]"
+          },
+          "origin": null,
+          "principalId": null,
+          "region": "us-west-2",
+          "timestamp": "2026-10-12T00:00:00Z",
+          "trace": null
+        },
+        "payload": "eyJjZW50cyI6NTAwfQ==",
+        "sequence": 1,
+        "type": "account:deposited",
+        "version": 1
+      },
+      {
+        "entityId": "acct-1",
+        "entityType": "account",
+        "id": "acct-1:2",
+        "metadata": {
+          "address": null,
+          "causationId": "cmd-0001",
+          "commandId": "cmd-0001",
+          "commitId": "01JDXK7Q3W9B5N2M8P4R6TAVHY",
+          "extensions": {
+            "evt.journal": "[{\"scope\":\"world:7\",\"position\":2},{\"scope\":\"world:7/place:3\",\"position\":2}]"
+          },
+          "origin": null,
+          "principalId": null,
+          "region": "us-west-2",
+          "timestamp": "2026-10-12T00:00:00Z",
+          "trace": null
+        },
+        "payload": "eyJjZW50cyI6MjUwfQ==",
+        "sequence": 2,
+        "type": "account:deposited",
+        "version": 1
+      },
+      {
+        "entityId": "acct-2",
+        "entityType": "account",
+        "id": "acct-2:1",
+        "metadata": {
+          "address": null,
+          "causationId": "cmd-0001",
+          "commandId": "cmd-0001",
+          "commitId": "01JDXK7Q3W9B5N2M8P4R6TAVHY",
+          "extensions": {
+            "evt.journal": "[{\"scope\":\"world:7\",\"position\":3},{\"scope\":\"world:7/place:4\",\"position\":1}]"
+          },
+          "origin": null,
+          "principalId": null,
+          "region": "us-west-2",
+          "timestamp": "2026-10-12T00:00:00Z",
+          "trace": null
+        },
+        "payload": "eyJjZW50cyI6NzV9",
+        "sequence": 1,
+        "type": "account:deposited",
+        "version": 1
+      }
+    ],
+    "measuredRowSize": {
+      "bytes": 523,
+      "event": "acct-1:1",
+      "position": "1",
+      "scope": "world:7"
+    },
+    "note": "acct-1 sequences 1 and 2, then acct-2 sequence 1, each committed once",
+    "rows": [
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "acct-1"
+          },
+          "entityType": {
+            "S": "journal"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7\",\"position\":1,\"event\":{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJjZW50cyI6NTAwfQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"evt.journal\":\"[{\\\"scope\\\":\\\"world:7\\\",\\\"position\\\":1},{\\\"scope\\\":\\\"world:7/place:3\\\",\\\"position\\\":1}]\"},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}}"
+          },
+          "pk": {
+            "S": "journal#world:7"
+          },
+          "sk": {
+            "S": "00000000000000000001"
+          }
+        },
+        "owner": "acct-1",
+        "position": "1",
+        "scope": "world:7",
+        "size": 523
+      },
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "acct-1"
+          },
+          "entityType": {
+            "S": "journal"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7\",\"position\":2,\"event\":{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJjZW50cyI6MjUwfQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"evt.journal\":\"[{\\\"scope\\\":\\\"world:7\\\",\\\"position\\\":2},{\\\"scope\\\":\\\"world:7/place:3\\\",\\\"position\\\":2}]\"},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}}"
+          },
+          "pk": {
+            "S": "journal#world:7"
+          },
+          "sk": {
+            "S": "00000000000000000002"
+          }
+        },
+        "owner": "acct-1",
+        "position": "2",
+        "scope": "world:7",
+        "size": 523
+      },
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "acct-2"
+          },
+          "entityType": {
+            "S": "journal"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7\",\"position\":3,\"event\":{\"id\":\"acct-2:1\",\"sequence\":1,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"eyJjZW50cyI6NzV9\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"evt.journal\":\"[{\\\"scope\\\":\\\"world:7\\\",\\\"position\\\":3},{\\\"scope\\\":\\\"world:7/place:4\\\",\\\"position\\\":1}]\"},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}}"
+          },
+          "pk": {
+            "S": "journal#world:7"
+          },
+          "sk": {
+            "S": "00000000000000000003"
+          }
+        },
+        "owner": "acct-2",
+        "position": "3",
+        "scope": "world:7",
+        "size": 519
+      },
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "acct-1"
+          },
+          "entityType": {
+            "S": "journal"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7/place:3\",\"position\":1,\"event\":{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJjZW50cyI6NTAwfQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"evt.journal\":\"[{\\\"scope\\\":\\\"world:7\\\",\\\"position\\\":1},{\\\"scope\\\":\\\"world:7/place:3\\\",\\\"position\\\":1}]\"},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}}"
+          },
+          "pk": {
+            "S": "journal#world:7/place:3"
+          },
+          "sk": {
+            "S": "00000000000000000001"
+          }
+        },
+        "owner": "acct-1",
+        "position": "1",
+        "scope": "world:7/place:3",
+        "size": 531
+      },
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "acct-1"
+          },
+          "entityType": {
+            "S": "journal"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7/place:3\",\"position\":2,\"event\":{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJjZW50cyI6MjUwfQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"evt.journal\":\"[{\\\"scope\\\":\\\"world:7\\\",\\\"position\\\":2},{\\\"scope\\\":\\\"world:7/place:3\\\",\\\"position\\\":2}]\"},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}}"
+          },
+          "pk": {
+            "S": "journal#world:7/place:3"
+          },
+          "sk": {
+            "S": "00000000000000000002"
+          }
+        },
+        "owner": "acct-1",
+        "position": "2",
+        "scope": "world:7/place:3",
+        "size": 531
+      },
+      {
+        "dynamoItem": {
+          "entityID": {
+            "S": "acct-2"
+          },
+          "entityType": {
+            "S": "journal"
+          },
+          "payload": {
+            "S": "{\"scope\":\"world:7/place:4\",\"position\":1,\"event\":{\"id\":\"acct-2:1\",\"sequence\":1,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-2\",\"entityType\":\"account\",\"payload\":\"eyJjZW50cyI6NzV9\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"evt.journal\":\"[{\\\"scope\\\":\\\"world:7\\\",\\\"position\\\":3},{\\\"scope\\\":\\\"world:7/place:4\\\",\\\"position\\\":1}]\"},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}}"
+          },
+          "pk": {
+            "S": "journal#world:7/place:4"
+          },
+          "sk": {
+            "S": "00000000000000000001"
+          }
+        },
+        "owner": "acct-2",
+        "position": "1",
+        "scope": "world:7/place:4",
+        "size": 527
+      }
+    ]
+  },
+  "keys": [
+    {
+      "counterPk": "journal-counter#world:7",
+      "counterSk": "COUNTER",
+      "position": "5",
+      "rowPk": "journal#world:7",
+      "rowSk": "00000000000000000005",
+      "scope": "world:7"
+    },
+    {
+      "counterPk": "journal-counter#world:7/place:3",
+      "counterSk": "COUNTER",
+      "position": "1",
+      "rowPk": "journal#world:7/place:3",
+      "rowSk": "00000000000000000001",
+      "scope": "world:7/place:3"
+    },
+    {
+      "counterPk": "journal-counter#é𐀀",
+      "counterSk": "COUNTER",
+      "position": "12",
+      "rowPk": "journal#é𐀀",
+      "rowSk": "00000000000000000012",
+      "scope": "é𐀀"
+    },
+    {
+      "counterPk": "journal-counter#world:7",
+      "counterSk": "COUNTER",
+      "position": "18446744073709551615",
+      "rowPk": "journal#world:7",
+      "rowSk": "18446744073709551615",
+      "scope": "world:7"
+    }
+  ],
+  "limits": {
+    "defaultMaxRowBytes": 30000,
+    "maxScopeBytes": 512,
+    "positionWidth": 20
+  },
+  "marker": {
+    "dynamoItem": {
+      "features": {
+        "S": "{\"journal\":1,\"stream-heads\":1}"
+      },
+      "historyDependent": {
+        "S": "[\"account\"]"
+      },
+      "pk": {
+        "S": "SYSTEM#FEATURES"
+      },
+      "sk": {
+        "N": "0"
+      },
+      "version": {
+        "N": "2"
+      }
+    },
+    "features": "{\"journal\":1,\"stream-heads\":1}",
+    "historyDependent": "[\"account\"]"
+  }
+}

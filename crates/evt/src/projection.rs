@@ -24,6 +24,10 @@ use crate::event::SerializedEvent;
 use crate::ids::{EntityId, EntityType, EventSequence};
 use crate::repository::Repository;
 
+/// The event-metadata extension the journal stores its allocations under. Projectors other than the
+/// journal's are never shown it ([`CommitProjector::engine_metadata`]).
+pub(crate) const ENGINE_ALLOCATION_KEY: &str = "evt.journal";
+
 /// The longest view partition key, in UTF-8 bytes (DynamoDB's own limit), so a projector fails
 /// identically on every backend instead of committing on PostgreSQL and failing on DynamoDB.
 pub const MAX_VIEW_PK_BYTES: usize = 2048;
@@ -351,8 +355,20 @@ impl CommitView {
     /// A history-dependent projector gets the commit ID and, for the streams whose entity type it
     /// names, their events and state; for every other stream it gets neither, so its rows cannot
     /// depend on a stream whose history it did not declare.
-    fn visible_to(&self, history: &[EntityType]) -> CommitView {
+    fn visible_to(&self, history: &[EntityType], engine_metadata: bool) -> CommitView {
         let mut view = self.clone();
+
+        // The engine's own metadata (the journal's allocations) is added after the store has run
+        // its projectors, so it exists on a stored event and not on a live one. A projector that
+        // does not ask for it never sees it, which keeps a live commit and a replay of the stored
+        // events in agreement.
+        if !engine_metadata {
+            for stream in &mut view.streams {
+                for event in &mut stream.events {
+                    event.metadata.extensions.remove(ENGINE_ALLOCATION_KEY);
+                }
+            }
+        }
 
         if history.is_empty() {
             view.commit_id = String::new();
@@ -407,6 +423,14 @@ pub trait CommitProjector: Send + Sync {
     /// projector's operations must be owned by a stream of one of these types.
     fn history(&self) -> &[EntityType] {
         &[]
+    }
+
+    /// Whether the projector reads the engine's own metadata extensions on events (the journal's
+    /// `evt.journal` allocation, which the journal adds when it commits). Default `false`: the
+    /// projector is given events without them, live and on replay alike, so its rows are the same
+    /// either way. Only the journal's own projector needs them.
+    fn engine_metadata(&self) -> bool {
+        false
     }
 
     /// Returns the commit's view operations. An error fails the command before any write, as an
@@ -669,7 +693,7 @@ pub fn project_commit(
     for (index, projector) in projectors.iter().enumerate() {
         let history = projector.history();
         let operations = projector
-            .project(&view.visible_to(history))
+            .project(&view.visible_to(history, projector.engine_metadata()))
             .map_err(|source| {
                 Error::Projector(Box::new(CommitProjectorFailed {
                     projector: projector.name().to_owned(),

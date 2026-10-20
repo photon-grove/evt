@@ -39,6 +39,7 @@ tasks:
   integration:
     script: >-
       cargo test -p evt-compat --features drivers --test conformance dynamo &&
+      cargo test -p evt-compat --features drivers --test journal &&
       bash scripts/compat-integration.sh dynamo
     deps:
       - evt:check-integration-readiness

@@ -102,6 +102,13 @@ Rust-first is justified because:
 - **Fixtures gain a second generator.** `internal/compat` (Go) keeps generating core fixtures;
   the Rust side gains a generator for extension fixtures. Both live in `compat/fixtures/` and the
   `compat/README.md` table is updated to say which side writes which file.
+- **The `journal` cargo feature is build-wide.** It makes the build model `journal` at format
+  version 1, so every repository in the build accepts a table that declares it, wrapped in the
+  journal's repository or not; a writer that bypasses the journal leaves rows missing with no gap
+  to show it. The marker refuses builds without the feature, which is the protection the ADR
+  promises against Go and unaware Rust builds; it cannot tell journaling writers from bypassing
+  ones in a build that has the feature. Making acceptance per repository means touching every
+  backend's marker validation, a commit-path change; it is tracked as a follow-up.
 - **Extension tables opt in explicitly.** A table is either journal-enabled (marker row declares
   it, Rust writes, Go refuses) or not (both languages behave as today). There is no partial state
   where a Go writer could half-understand the format.

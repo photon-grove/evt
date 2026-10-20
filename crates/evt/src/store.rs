@@ -531,6 +531,20 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 Err(failed) => failed,
             };
 
+            // A journal row over the cap is a refusal of this command, not a failure of the store:
+            // it is recorded as the command's rejection, so a replay of the command ID gets the
+            // same answer.
+            if let Error::JournalRowTooLarge(row) = &failed.error {
+                return persist_rejection(
+                    &self.repository,
+                    &command_id,
+                    &digest,
+                    config.recovery_wait(),
+                    row.to_rejection(),
+                )
+                .await;
+            }
+
             let kind = failed.retry();
             if kind == Retry::Never {
                 return Err(failed.error);
@@ -794,6 +808,18 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 Ok(outcome) => return Ok(outcome),
                 Err(failed) => failed,
             };
+
+            // See `execute_with_response`: an oversized journal row is the command's rejection.
+            if let Error::JournalRowTooLarge(row) = &failed.error {
+                return persist_rejection(
+                    &self.repository,
+                    pending.command_id(),
+                    pending.digest(),
+                    config.recovery_wait(),
+                    row.to_rejection(),
+                )
+                .await;
+            }
 
             let kind = failed.retry();
             if kind == Retry::Never {

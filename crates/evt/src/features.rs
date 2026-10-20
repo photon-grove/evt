@@ -40,12 +40,33 @@ pub const STREAM_HEADS_FEATURE: &str = "stream-heads";
 /// The stored-format version of [`STREAM_HEADS_FEATURE`] this build reads and writes.
 pub const STREAM_HEADS_VERSION: i64 = 1;
 
+/// The feature name a table declares once a writer journals its events (ADR 0005, X1).
+pub const JOURNAL_FEATURE: &str = "journal";
+
+/// The stored-format version of [`JOURNAL_FEATURE`] this build reads and writes when the `journal`
+/// cargo feature is enabled.
+pub const JOURNAL_VERSION: i64 = 1;
+
 /// The `(name, stored-format version)` pairs this build of the crate models. A writer refuses a
 /// table whose manifest declares anything else. The extensions this spec defines (`journal`,
-/// `journal-compaction`) are Rust-first and land behind feature flags in later releases, so this
-/// build models only `stream-heads`, which every writer here also *requires*: see
-/// [`validate_marker_for_write`].
+/// `journal-compaction`) are Rust-first: this build models `stream-heads`, which every writer here
+/// also *requires* (see [`validate_marker_for_write`]), and, with the `journal` cargo feature,
+/// `journal` at format version 1. A build without the feature refuses a journal table, so a writer
+/// that cannot maintain the journal cannot leave it short.
+#[cfg(not(feature = "journal"))]
 pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[(STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION)];
+
+/// The `(name, stored-format version)` pairs this build of the crate models. A writer refuses a
+/// table whose manifest declares anything else. The extensions this spec defines (`journal`,
+/// `journal-compaction`) are Rust-first: this build models `stream-heads`, which every writer here
+/// also *requires* (see [`validate_marker_for_write`]), and, with the `journal` cargo feature,
+/// `journal` at format version 1. A build without the feature refuses a journal table, so a writer
+/// that cannot maintain the journal cannot leave it short.
+#[cfg(feature = "journal")]
+pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[
+    (JOURNAL_FEATURE, JOURNAL_VERSION),
+    (STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION),
+];
 
 /// Reports whether an entity ID falls in a reserved namespace: a case-sensitive byte prefix of
 /// [`SYSTEM_PREFIX`] or [`COMMAND_OUTCOME_PREFIX`].
@@ -136,6 +157,18 @@ impl FeatureManifest {
     /// Reports whether the manifest declares [`STREAM_HEADS_FEATURE`] at [`STREAM_HEADS_VERSION`].
     pub fn declares_stream_heads(&self) -> bool {
         self.features.get(STREAM_HEADS_FEATURE) == Some(&STREAM_HEADS_VERSION)
+    }
+
+    /// Reports whether the manifest declares [`JOURNAL_FEATURE`] at [`JOURNAL_VERSION`].
+    pub fn declares_journal(&self) -> bool {
+        self.features.get(JOURNAL_FEATURE) == Some(&JOURNAL_VERSION)
+    }
+
+    /// Declares [`JOURNAL_FEATURE`] at [`JOURNAL_VERSION`]. The usual way to apply it is
+    /// [`FeatureMarker::update_manifest`], which also bumps the manifest version.
+    pub fn declare_journal(&mut self) {
+        self.features
+            .insert(JOURNAL_FEATURE.to_owned(), JOURNAL_VERSION);
     }
 
     /// Declares [`STREAM_HEADS_FEATURE`] at [`STREAM_HEADS_VERSION`]. The usual way to apply it is
@@ -390,10 +423,11 @@ mod tests {
     #[test]
     fn refuses_unsupported_declared_features() {
         let mut manifest = FeatureManifest::default();
-        manifest.features.insert("journal".into(), 1);
+        manifest.features.insert("journal-compaction".into(), 1);
         assert!(matches!(
             manifest.validate_supported(),
-            Err(Error::UnsupportedFeature { feature, version }) if feature == "journal" && version == 1
+            Err(Error::UnsupportedFeature { feature, version })
+                if feature == "journal-compaction" && version == 1
         ));
 
         // The declared version matters, not just the name: this build models stream-heads at
@@ -405,6 +439,32 @@ mod tests {
         assert!(matches!(
             future.validate_supported(),
             Err(Error::UnsupportedFeature { feature, version: 2 }) if feature == STREAM_HEADS_FEATURE
+        ));
+    }
+
+    #[test]
+    fn the_journal_is_modeled_only_with_its_cargo_feature() {
+        let mut manifest = FeatureManifest::default();
+        manifest.declare_journal();
+        assert!(manifest.declares_journal());
+        assert_eq!(manifest.features_json(), r#"{"journal":1}"#);
+
+        if cfg!(feature = "journal") {
+            assert!(manifest.validate_supported().is_ok());
+        } else {
+            assert!(matches!(
+                manifest.validate_supported(),
+                Err(Error::UnsupportedFeature { feature, version: 1 }) if feature == "journal"
+            ));
+        }
+
+        // The format version matters: a newer journal is refused by every build.
+        let mut newer = FeatureManifest::default();
+        newer.features.insert(JOURNAL_FEATURE.to_owned(), 2);
+        assert!(!newer.declares_journal());
+        assert!(matches!(
+            newer.validate_supported(),
+            Err(Error::UnsupportedFeature { version: 2, .. })
         ));
     }
 
@@ -438,7 +498,7 @@ mod tests {
 
         // An unsupported pair is refused first, whatever else is missing.
         let mut unsupported = FeatureManifest::default();
-        unsupported.features.insert("journal".into(), 1);
+        unsupported.features.insert("journal-compaction".into(), 1);
         assert!(matches!(
             validate_marker_for_write(Some(&unsupported)),
             Err(Error::UnsupportedFeature { .. })

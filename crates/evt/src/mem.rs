@@ -818,6 +818,8 @@ fn lease_lost(owner: &str) -> Error {
 }
 
 mod enumerate;
+#[cfg(feature = "journal")]
+mod journal;
 mod views;
 
 #[cfg(test)]

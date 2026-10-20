@@ -19,6 +19,11 @@ default = []
 dynamodb = ["dep:aws-sdk-dynamodb"]
 # PostgreSQL event log via tokio-postgres with a deadpool connection pool. Requires Tokio.
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio"]
+# The sync journal (ADR 0005, X1): per-scope ordered delivery rows written in the commit, scope
+# counters, `high_watermark`/`page` reads with gap detection, a row-size guard, and contention
+# retry. Enabling it makes this build model the `journal` feature at format version 1, so its
+# writers may commit to a table that declares it; a build without it refuses such a table.
+journal = []
 # The backend conformance suite (`photon_evt::conformance`), for testing Repository implementations.
 conformance = []
 # Given/when/then test utilities over `MemRepository` (`photon_evt::testing`). The conformance
@@ -42,6 +47,11 @@ tokio.workspace = true
 [[example]]
 name = "banking"
 required-features = ["testing"]
+test = true
+
+[[example]]
+name = "journal"
+required-features = ["journal", "testing"]
 test = true
 
 [package.metadata.docs.rs]

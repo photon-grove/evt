@@ -569,6 +569,110 @@ A projector must be deterministic: `group_commits` regroups stored events by com
 every stream agrees with, so a rebuild, or a test, can run the projector again over each commit
 (`replay_views`) and compare the rows.
 
+## The sync journal
+
+Enable the `journal` feature for per-scope ordered, replayable delivery rows written in the commit
+that wrote the events ([ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md),
+X1; Rust only, Go refuses a table that declares it). A **scope** is a named, independently ordered
+sequence (a world, a place in it). You map each event of the journaled entity types to zero or more
+scopes with a pure function; the event takes the next **position** in each, and a client polls a
+scope with `high_watermark` and `page`. The example below is [`examples/journal.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/journal.rs),
+which `cargo test --all-features` compiles and runs, and a test fails if the two drift apart.
+
+```rust,ignore
+use photon_evt::conformance::{Add, Ledger};
+use photon_evt::journal::{Journal, JournalRepository, Scope};
+use photon_evt::{Error, MemRepository, Metadata, SerializedEvent, Store};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Each event goes to its ledger's scope and to a scope shared by every ledger. The resolver is
+    // a pure function of the stored event; it may return a `Result` and use `?`.
+    let journal = Journal::new(
+        ["ledger"],
+        |event: &SerializedEvent| -> Result<Vec<Scope>, Error> {
+            Ok(vec![
+                Scope::new(format!("ledger:{}", event.entity_id))?,
+                Scope::new("all")?,
+            ])
+        },
+    )?
+    .with_max_row_bytes(30_000)? // the default
+    .with_retry(photon_evt::RetryPolicy::new(5)); // the default
+
+    // Wrap a repository that writes views: in memory here, DynamoDB with a views table in
+    // production.
+    let repository = JournalRepository::new(MemRepository::new(), journal.clone());
+    let store = Store::<Ledger, _>::new(&repository, ());
+
+    store.execute("a", Add(5), Metadata::new("local")).await?;
+    store.execute("b", Add(7), Metadata::new("local")).await?;
+    store.execute("a", Add(1), Metadata::new("local")).await?;
+
+    // A poller keeps the last position it saw per scope.
+    let scope = Scope::new("all")?;
+    let mut after = 0;
+    loop {
+        let page = repository.page(&scope, after, 100).await?;
+        // ... deliver page.rows (each row.event is the stored event) ...
+        after = page.next_after();
+
+        if let Some(gap) = page.gap {
+            // Positions gap.from..=gap.to are missing: retry the page, escalate if it persists.
+            return Err(format!("journal gap {gap:?}").into());
+        }
+        if !page.has_more() {
+            break; // caught up with repository.high_watermark(&scope)
+        }
+    }
+    assert_eq!(after, 3);
+
+    Ok(())
+}
+```
+
+Behind that call, every commit that writes a journaled event reads the scopes' counters, allocates
+positions, stores them in the event's metadata (`evt.journal`), and adds the journal rows and the
+counters to the commit's view operations, so they are atomic with the events. Because the
+allocations are on the events, `journal::replay` and `journal::rebuild` rebuild the rows and counters
+from stored events in any order. The journaled entity types are declared history-dependent in the
+feature marker with the `journal` feature (`journal: 1`), so they are never compacted and builds
+without the feature refuse the table.
+
+- **Row-size guard.** A row over the cap (default 30,000 bytes of stored payload, at most 370,000)
+  fails the commit before any write with `Error::JournalRowTooLarge`; a store with outcomes records
+  that as the command's `journal-row-too-large` rejection. `Journal::pre_check` (or
+  `pre_check_events` for typed events) measures the same rows without a counter, at the widest
+  position. It is exact for the metadata you give it and advisory otherwise (a handler does not see
+  the commit's principal, extensions, or command ID), so pass the commit's metadata or add
+  `with_pre_check_headroom`. Call it in your command handler and turn the error into a recorded
+  rejection with `RowTooLarge::to_rejection`.
+- **Contention.** Writers racing for a scope lose positions to each other. The journal re-reads the
+  counters and allocates again under its `RetryPolicy` (and retries transient failures); when
+  attempts run out on taken positions it returns `Error::Conflict`. A conflict on the stream itself
+  is yours to re-prepare. A hot scope serializes on its counter item. A counter that falls behind its
+  rows (a restore, a rebuild beside writers) is healed from the highest row.
+- **A cursor ahead of the journal.** `page` flags `cursor_ahead` when `after` is above the high
+  watermark (after a restore, say); the page is not caught up, and the consumer should resync.
+- **Every writer of the table must commit through a `JournalRepository`.** The marker stops builds
+  without the feature, not a writer that bypasses the journal, and the `journal` cargo feature is
+  build-wide, so a build that enables it accepts a journal table through every repository,
+  wrapped or not; a bypassing writer's events would be missing from the scopes. Enable the journal
+  before writing the events it covers: earlier events have no row and no gap shows it. A commit's
+  journal rows and counters count toward the commit budget (97 event and projector operations, 96 with a snapshot).
+- **Rebuilds** (`journal::rebuild`, or `rebuild_with_lock`) run under the [rebuild lock](#rebuild-fence)
+  and write the rows and counters through `write_rebuild_views`, fenced on the lease's owner and
+  fencing token. Live commits fail with `Error::RebuildInProgress` while the lock is held, so a
+  rebuild cannot lower a counter under a writer. Readers that can overlap a rebuild use
+  `page_at_epoch` / `high_watermark_at_epoch`: they fail with `RebuildUnavailable` or
+  `RebuildEpochChanged` (both transient) instead of showing half-written rows. Keep the cursor, back
+  off, and read the same page again.
+- **Backends.** DynamoDB and the in-memory repository. The Rust PostgreSQL repository does not write
+  commit-wide views yet.
+
+The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md#journal),
+and `photon_evt::conformance::journal_cases` (features `journal` and `conformance`) checks a backend.
+
 ## Rebuild fence
 
 A projection rebuild wipes and replays derived state, so it must not interleave with live writers
@@ -775,7 +879,7 @@ Rust-first, and Go ports them from the spec and fixtures rather than hand-rollin
 
 ## Minimum Rust version
 
-Rust 1.88 for the core crate and the `postgres` and `conformance` features. CI checks this.
+Rust 1.88 for the core crate and the `postgres`, `conformance`, and `journal` features. CI checks this.
 
 The `dynamodb` feature follows the AWS SDK's minimum Rust version, which rises over time. On Rust
 1.84 and later, Cargo's MSRV-aware resolver (the default for edition 2024, or `resolver = "3"`)

@@ -2606,6 +2606,8 @@ fn from_sdk(value: &sdk::AttributeValue) -> AttributeValue {
 }
 
 mod enumerate;
+#[cfg(feature = "journal")]
+mod journal;
 mod rebuild;
 mod views;
 
