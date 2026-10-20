@@ -43,10 +43,11 @@ func reportReservedStreams(ids []evt.EntityID) {
 // namespaces that are not engine-written rows.
 func reservedStreamIDs(ctx context.Context, client dynamodb.ScanAPIClient, eventsTable string) ([]evt.EntityID, error) {
 	// version, owner, leaseExpiresAt, and value are DynamoDB reserved words, so they are reached
-	// through ExpressionAttributeNames aliases.
+	// through ExpressionAttributeNames aliases. forceReleased marks the lock item a force-release
+	// leaves in place of the lock.
 	input := dynamodb.ScanInput{
 		TableName:            &eventsTable,
-		ProjectionExpression: aws.String("pk, sk, #ver, #own, #lease, #val, #status"),
+		ProjectionExpression: aws.String("pk, sk, #ver, #own, #lease, #val, #status, forceReleased"),
 		ExpressionAttributeNames: map[string]string{
 			"#ver":    "version",
 			"#own":    "owner",
@@ -108,7 +109,8 @@ func isEngineRow(id evt.EntityID, item map[string]types.AttributeValue) bool {
 	case string(id) == evt.SystemNamespacePrefix+"FEATURES":
 		return sk == 0 && hasAttr(item, "version")
 	case string(id) == evt.SystemNamespacePrefix+"REBUILD":
-		return sk == 0 && hasAttr(item, "owner") && hasAttr(item, "leaseExpiresAt")
+		// A held lock, or the item a force-release leaves in its place.
+		return sk == 0 && (hasAttr(item, "owner") && hasAttr(item, "leaseExpiresAt") || hasAttr(item, "forceReleased"))
 	case string(id) == evt.SystemNamespacePrefix+"REBUILD#GENERATION":
 		return sk == 0 && hasAttr(item, "value")
 	case strings.HasPrefix(string(id), evt.CommandOutcomeNamespacePrefix):

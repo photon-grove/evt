@@ -263,6 +263,62 @@ func TestRebuildFence_ReadsAreAlwaysConsistentAndRefuseCorruptItems(t *testing.T
 
 	_, err = newFenceRepo(broken).RebuildFence().State(ctx)
 	require.Error(t, err, "a lock with no lease")
+
+	for name, flag := range map[string]types.AttributeValue{
+		"a force-released lock item flagged false":    &types.AttributeValueMemberBOOL{Value: false},
+		"a force-released lock item with a text flag": &types.AttributeValueMemberS{Value: "true"},
+	} {
+		flagged := compat.NewFakeDynamo()
+		flagged.SeedItem(map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: evt.RebuildLockID}, "sk": &types.AttributeValueMemberN{Value: "0"},
+			"forceReleased": flag,
+		})
+
+		_, err = newFenceRepo(flagged).RebuildFence().State(ctx)
+		require.Error(t, err, name)
+	}
+}
+
+// A force-release leaves a lock item in place of the lock, so the commit's lock check keeps
+// failing at no extra action, while State reports no lock and Begin acquires from it.
+func TestRebuildFence_ForceReleaseKeepsCommitsRefused(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	repo := newFenceRepo(fake)
+	fence := repo.RebuildFence()
+
+	lease, err := fence.Begin(ctx, "job", time.Hour)
+	require.NoError(t, err)
+
+	_, err = fence.ForceRelease(ctx, "job")
+	require.NoError(t, err)
+
+	state, err := fence.State(ctx)
+	require.NoError(t, err)
+	require.Nil(t, state.Lock)
+	require.Equal(t, evt.RebuildGeneration{Value: lease.Generation + 2, ForceReleased: true}, state.Generation)
+
+	items := fake.Items(evt.RebuildLockID)
+	require.Len(t, items, 1, "the force-released lock item stays")
+	require.Equal(t, &types.AttributeValueMemberBOOL{Value: true}, items[0]["forceReleased"])
+	require.NotContains(t, items[0], "owner")
+
+	err = repo.Commit(ctx, evt.SerializedResult{Events: oneEvent(t, "a", 1)})
+	require.ErrorIs(t, err, evt.ErrRebuildInProgress)
+
+	calls := fake.Transactions()
+	refused := calls[len(calls)-1]
+	require.Len(t, refused, 4, "marker check, lock check, head update, event put: no extra action")
+	require.Equal(t, "SYSTEM#REBUILD", refused[1].PK)
+	require.Equal(t, "attribute_not_exists(pk)", refused[1].Condition)
+
+	recovery, err := fence.Begin(ctx, "recovery", time.Hour)
+	require.NoError(t, err)
+
+	_, err = fence.End(ctx, recovery)
+	require.NoError(t, err)
+	require.Empty(t, fake.Items(evt.RebuildLockID))
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: oneEvent(t, "a", 1)}))
 }
 
 // readRecorder records whether each read asked for consistency.

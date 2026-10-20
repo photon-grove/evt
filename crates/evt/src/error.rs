@@ -189,14 +189,17 @@ pub enum Error {
         entity_type: EntityType,
     },
 
-    /// A commit's rebuild-lock check failed (v0.9, C10): a rebuild holds the `SYSTEM#REBUILD` lock,
-    /// including one whose lease expired. Nothing was written.
+    /// A commit's rebuild-lock check failed (v0.9, C10): the rebuild generation is unsettled,
+    /// because a rebuild holds the `SYSTEM#REBUILD` lock (including one whose lease expired) or a
+    /// force-release left the rebuild unfinished. Nothing was written.
     ///
-    /// It is **transient**, never a conflict: the commit can succeed once the lock is released,
-    /// taken over, or force-released. Fence-aware retry runs the command again after a backoff and
-    /// returns this error when the attempts run out; it never becomes a `stale-fence` rejection
-    /// (even when the commit carried caller-stamped fences) and records no outcome. A failed
-    /// feature-marker check outranks it; it outranks every other failure of the commit.
+    /// It is **transient**, never a conflict: the commit can succeed once a rebuild ends and
+    /// settles the generation. A force-release alone does not: it leaves the generation unsettled,
+    /// and commits are refused with this error until a later rebuild ends. Fence-aware retry runs
+    /// the command again after a backoff and returns this error when the attempts run out; it
+    /// never becomes a `stale-fence` rejection (even when the commit carried caller-stamped
+    /// fences) and records no outcome. A failed feature-marker check outranks it; it outranks
+    /// every other failure of the commit.
     #[error("a projection rebuild is in progress")]
     RebuildInProgress,
 

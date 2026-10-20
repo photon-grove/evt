@@ -3385,7 +3385,7 @@ mod tests {
     #[test]
     fn rebuild_fence_requests_match_the_go_vectors() {
         use crate::rebuild::{Plan, RebuildLock};
-        use crate::wire::dynamo::{rebuild_generation_from_item, rebuild_lock_from_item};
+        use crate::wire::dynamo::{rebuild_generation_from_item, rebuild_lock_state_from_item};
         use serde_json::{Value, json};
 
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3423,8 +3423,9 @@ mod tests {
             let generation = item(&vector["before"]["generation"])
                 .map(|item| rebuild_generation_from_item(&item).unwrap())
                 .unwrap_or_default();
-            let lock: Option<RebuildLock> =
-                item(&vector["before"]["lock"]).map(|item| rebuild_lock_from_item(&item).unwrap());
+            // The item a force-release leaves holds no lock.
+            let lock: Option<RebuildLock> = item(&vector["before"]["lock"])
+                .and_then(|item| rebuild_lock_state_from_item(&item).unwrap());
             let state = crate::RebuildState { generation, lock };
             let reads_state = vec![
                 read(wire::rebuild_generation_key()),

@@ -159,12 +159,16 @@ func RunRebuildFenceSuite(t *testing.T, newRepo func() evt.Repository, opts Suit
 func runRebuildFenceCases(t *testing.T, newRepo func() evt.Repository, opts SuiteOptions) {
 	t.Helper()
 
+	t.Run("RebuildSettledStoreAcceptsCommits", func(t *testing.T) { testRebuildSettledStore(t, newRebuildEnv(t, newRepo, opts)) })
 	t.Run("RebuildLifecycle", func(t *testing.T) { testRebuildLifecycle(t, newRebuildEnv(t, newRepo, opts)) })
 	t.Run("RebuildLeaseExpiryAndTakeover", func(t *testing.T) { testRebuildTakeover(t, newRebuildEnv(t, newRepo, opts)) })
 	t.Run("RebuildStaleIncarnation", func(t *testing.T) { testRebuildStaleIncarnation(t, newRebuildEnv(t, newRepo, opts), opts) })
 	t.Run("RebuildForceRelease", func(t *testing.T) { testRebuildForceRelease(t, newRebuildEnv(t, newRepo, opts)) })
 	t.Run("RebuildRejectsBadArguments", func(t *testing.T) { testRebuildArguments(t, newRebuildEnv(t, newRepo, opts)) })
 	t.Run("RebuildRefusesCommits", func(t *testing.T) { testRebuildRefusesCommits(t, newRebuildEnv(t, newRepo, opts), opts) })
+	t.Run("RebuildForceReleasedRefusesCommits", func(t *testing.T) {
+		testRebuildForceReleasedRefusesCommits(t, newRebuildEnv(t, newRepo, opts), opts)
+	})
 	t.Run("RebuildLockCheckPrecedence", func(t *testing.T) { testRebuildPrecedence(t, newRebuildEnv(t, newRepo, opts), opts) })
 	t.Run("RebuildEpochCheck", func(t *testing.T) { testRebuildEpochs(t, newRebuildEnv(t, newRepo, opts)) })
 
@@ -414,10 +418,11 @@ func testRebuildForceRelease(t *testing.T, env *rebuildEnv) {
 
 	state, err := env.fence.State(ctx)
 	require.NoError(t, err)
-	require.False(t, state.InProgress(), "the lock row is gone")
+	require.False(t, state.InProgress(), "no rebuild holds the lock")
 
-	// Commits resume at once, while readers stay fenced: the generation is odd and flagged.
-	require.NoError(t, env.commit("resumed"))
+	// Readers stay fenced and commits stay refused: the generation is odd and flagged, and the
+	// derived state the released rebuild left may be half-written.
+	requireRefused(t, env.commit("force-released"))
 
 	_, err = evt.ObserveRebuildEpoch(ctx, env.fence)
 
@@ -438,10 +443,12 @@ func testRebuildForceRelease(t *testing.T, env *rebuildEnv) {
 	require.True(t, env.generation().ForceReleased)
 	requireRefused(t, env.commit("rebuilding"))
 
-	// Ending it settles the generation and clears the flag, so readers trust derived state again.
+	// Ending it settles the generation and clears the flag, so readers trust derived state again
+	// and commits resume.
 	settled, err := env.fence.End(ctx, env.lease("c"))
 	require.NoError(t, err)
 	require.Equal(t, evt.RebuildGeneration{Value: before.Value + 6}, settled)
+	require.NoError(t, env.commit("force-released"))
 
 	epoch, err := evt.ObserveRebuildEpoch(ctx, env.fence)
 	require.NoError(t, err)
@@ -613,15 +620,135 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 	commitEvents(t, env.repo, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"})
 	require.Len(t, mustEventsOf(t, env.repo, plain), 1)
 
-	// An expired lock still refuses commits, and so does a lock under a new owner after a takeover;
-	// a force-release lets them through.
+	// An expired lock still refuses commits, and so does a force-release of it: only a rebuild
+	// that ends settles the generation.
 	env.begin("short", time.Second)
 	env.clock.Advance(5)
 	requireRefused(t, env.commit("expired-lock"))
 
 	_, err = env.fence.ForceRelease(ctx, env.owner("short"))
 	require.NoError(t, err)
-	require.NoError(t, env.commit("after-force-release"))
+	requireRefused(t, env.commit("after-force-release"))
+}
+
+// A settled generation accepts commits, a store that never ran a rebuild included: the commit's
+// lock check passes against the absent fence rows, and the commit writes neither of them.
+func testRebuildSettledStore(t *testing.T, env *rebuildEnv) {
+	ctx := context.Background()
+
+	before, err := env.fence.State(ctx)
+	require.NoError(t, err)
+	require.True(t, before.Generation.Settled())
+	require.Nil(t, before.Lock)
+
+	require.NoError(t, env.commit("settled"))
+
+	after, err := env.fence.State(ctx)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "a commit never writes the fence")
+}
+
+// A rebuild that fails after its first write leaves derived state half-written. The operator
+// force-releases it, and every commit — a plain one, one with commit-wide views, an outcome-only
+// one — is still refused and writes nothing, so nothing derived from the half-written state (a
+// journal position allocated from a wiped counter, say) can be committed. A rebuild that then
+// runs to its end settles the generation, and the same commits succeed.
+func testRebuildForceReleasedRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions) {
+	ctx := context.Background()
+	pk := env.ns + "#half-built"
+
+	put := func(sk string) evt.ProjectedView {
+		return evt.ProjectedView{Projector: "rebuild", Op: evt.PutView(pk, sk, "owner", "test", []byte(`{}`))}
+	}
+
+	// The rebuild writes its first batch, then fails and never ends.
+	env.begin("failed", time.Hour)
+
+	if opts.SupportsViews {
+		require.NoError(t, env.fence.WriteViews(ctx, env.lease("failed"), []evt.ProjectedView{put("first")}))
+	}
+
+	forced, err := env.fence.ForceRelease(ctx, env.owner("failed"))
+	require.NoError(t, err)
+	require.True(t, forced.ForceReleased)
+	require.False(t, forced.Settled())
+
+	state, err := env.fence.State(ctx)
+	require.NoError(t, err)
+	require.Nil(t, state.Lock, "no rebuild holds the lock")
+
+	// Every commit is refused with the error a held lock gives, and writes nothing.
+	plain := evt.EntityID(env.ns + "-plain")
+	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"}),
+	}))
+	requireNoEvents(t, env.repo, plain)
+
+	viewed := evt.EntityID(env.ns + "-viewed")
+	live := func() evt.SerializedResult {
+		return evt.SerializedResult{
+			Events: serialize(t, viewed, "test", 0, &test.EntityCreated{ID: viewed, Value: "viewed"}),
+			Views:  []evt.ProjectedView{{Projector: "live", Op: evt.PutView(env.ns+"#live", "row", viewed, "test", []byte(`{}`))}},
+		}
+	}
+
+	if opts.SupportsViews {
+		requireRefused(t, env.repo.Commit(ctx, live()))
+		requireNoEvents(t, env.repo, viewed)
+		requireNoRow(t, opts.ReadView, env.repo, env.ns+"#live", "row")
+	}
+
+	outcome := &evt.Outcome{CommandID: evt.CommandID(env.ns + "-only"), Status: evt.OutcomeAccepted, Digest: "digest"}
+
+	if opts.SupportsOutcomes {
+		requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{Outcome: outcome}))
+
+		outcomes, ok := env.repo.(evt.OutcomeRepository)
+		require.True(t, ok)
+
+		stored, gerr := outcomes.GetOutcome(ctx, outcome.CommandID)
+		require.NoError(t, gerr)
+		require.Nil(t, stored, "a refused outcome-only commit records nothing")
+	}
+
+	// The failed worker writes nothing more: its lease is gone.
+	if opts.SupportsViews {
+		err = env.fence.WriteViews(ctx, env.lease("failed"), []evt.ProjectedView{put("second")})
+		require.True(t, evt.IsRebuildLeaseLostErr(err))
+		requireNoRow(t, opts.ReadView, env.repo, pk, "second")
+	}
+
+	// A new rebuild runs to its end: commits stay refused while it runs, and resume once it ends.
+	env.begin("recovery", time.Hour)
+	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
+		Events: serialize(t, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"}),
+	}))
+
+	if opts.SupportsViews {
+		require.NoError(t, env.fence.WriteViews(ctx, env.lease("recovery"), []evt.ProjectedView{put("first"), put("second")}))
+	}
+
+	settled, err := env.fence.End(ctx, env.lease("recovery"))
+	require.NoError(t, err)
+	require.True(t, settled.Settled())
+	require.False(t, settled.ForceReleased)
+
+	commitEvents(t, env.repo, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"})
+	require.Len(t, mustEventsOf(t, env.repo, plain), 1)
+
+	if opts.SupportsViews {
+		require.NoError(t, env.repo.Commit(ctx, live()))
+		require.Len(t, mustEventsOf(t, env.repo, viewed), 1)
+		row, rerr := opts.ReadView(ctx, env.repo, env.ns+"#live", "row")
+		require.NoError(t, rerr)
+		require.NotNil(t, row, "the commit's view row")
+		require.Equal(t, viewed, row.EntityID)
+		requireRow(t, opts.ReadView, env.repo, pk, "second", `{}`)
+	}
+
+	if opts.SupportsOutcomes {
+		require.NoError(t, env.repo.Commit(ctx, evt.SerializedResult{Outcome: outcome}))
+	}
 }
 
 func mustEventsOf(t *testing.T, repo evt.Repository, id evt.EntityID) []evt.SerializedEvent {

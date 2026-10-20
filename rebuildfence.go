@@ -11,8 +11,10 @@ import (
 
 // The rebuild fence (storage spec, Rebuild Fence; ADR-0004 C10) is two engine rows in the
 // reserved SYSTEM# namespace: a lock row naming the rebuild that holds the fence, and a generation
-// counter that is odd while a rebuild is in progress. Every commit asserts the lock row is absent;
-// readers of derived state fence their reads against the generation.
+// counter that is odd while a rebuild is in progress or a force-release left it unsettled. Every
+// commit is refused while the generation is unsettled (on DynamoDB by asserting the lock row is
+// absent, which a force-release keeps in place); readers of derived state fence their reads
+// against the generation.
 const (
 	// RebuildLockID is the partition key of the rebuild-lock row (sort key 0).
 	RebuildLockID = SystemNamespacePrefix + "REBUILD"
@@ -36,8 +38,9 @@ const (
 // while the item does not exist) and whether the last release was a force-release.
 //
 // The value is odd if and only if a rebuild is in progress, with one exception: a force-release
-// deletes the lock but leaves the value odd and sets ForceReleased, which means "derived state
-// untrustworthy", not "rebuild in progress". Readers treat every odd value alike.
+// releases the lock but leaves the value odd and sets ForceReleased, which means "derived state
+// untrustworthy", not "rebuild in progress". Readers and commits treat every odd value alike: a
+// reader gets *RebuildUnavailableError and a commit *RebuildInProgressError until a rebuild ends.
 type RebuildGeneration struct {
 	Value         int64
 	ForceReleased bool
@@ -68,7 +71,8 @@ func (l RebuildLock) Expired(now time.Time) bool {
 type RebuildState struct {
 	Generation RebuildGeneration
 
-	// Lock is the lock row, nil when none exists.
+	// Lock is the lock row, nil when no lock is held (none exists, or only the item a
+	// force-release leaves on DynamoDB).
 	Lock *RebuildLock
 }
 
@@ -120,10 +124,13 @@ type RebuildFence interface {
 	// generation).
 	End(ctx context.Context, lease RebuildLease) (RebuildGeneration, error)
 
-	// ForceRelease is the operator's escape hatch for a lost or wedged worker: it deletes the lock
-	// row of the named owner, so commits resume at once, but leaves the generation odd and sets
-	// the force-release flag, so readers stay fenced until a later rebuild begins and ends. It
-	// fails with *RebuildLeaseLostError when the lock row is gone or names another owner.
+	// ForceRelease is the operator's escape hatch for a lost or wedged worker: it releases the
+	// lock of the named owner, so that worker's lease is lost at once and a new rebuild can begin
+	// without waiting for the lease to lapse, but leaves the generation odd and sets the
+	// force-release flag. The derived state may be half-written (a failed rebuild may already have
+	// wiped rows or journal counters), so readers stay fenced and every commit is still refused
+	// with *RebuildInProgressError until a later rebuild begins and ends. It fails with
+	// *RebuildLeaseLostError when no lock is held or the lock names another owner.
 	ForceRelease(ctx context.Context, owner string) (RebuildGeneration, error)
 
 	// WriteViews writes one batch of view operations (at most MaxRebuildViewBatch) atomically with
@@ -143,9 +150,10 @@ type RebuildFenceProvider interface {
 // ErrRebuildInProgress matches, with errors.Is, a commit refused because a rebuild holds the lock.
 var ErrRebuildInProgress = errors.New("a projection rebuild is in progress")
 
-// RebuildInProgressError is returned when a commit's rebuild-lock check fails: a rebuild holds the
-// lock, including one whose lease expired. It is transient — the commit can succeed once the lock
-// is released, taken over, or force-released — but it is never a conflict: fence-aware retry runs
+// RebuildInProgressError is returned when a commit's rebuild-lock check fails: the generation is
+// unsettled, because a rebuild holds the lock (including one whose lease expired) or a
+// force-release left the rebuild unfinished. It is transient — the commit can succeed once a
+// rebuild ends and settles the generation — but it is never a conflict: fence-aware retry runs
 // the command again after a backoff and returns this error when the attempts run out, never a
 // stale-fence rejection, and it records no outcome. Nothing was written.
 type RebuildInProgressError struct{}

@@ -535,14 +535,24 @@ fenced by the framework, not by app-level flags):
   replays, and completes a release, whose even generation and cleared flag end the fence. The
   operator tradeoff: force-release trades read availability for write availability, because the
   force-released rebuild may have committed only some of its wipe and replay batches and no
-  replacement worker remains to finish them.
+  replacement worker remains to finish them. _Errata (#180):_ force-release no longer resumes
+  commits. A commit can derive durable data from the half-written state — a journaled commit (X1)
+  allocates scope positions from counters the failed rebuild may have cleared and stamps them into
+  immutable event metadata — so every commit stays refused with `RebuildInProgress` until a later
+  rebuild ends. On DynamoDB the force-release replaces the lock row with an item holding only
+  `forceReleased = true` instead of deleting it, so the commit's existing action-2
+  `attribute_not_exists(pk)` check refuses it at no extra action (the budget stays 97/96), and
+  an acquire's lock put accepts that item (`attribute_not_exists(pk) OR forceReleased = :true`).
+  PostgreSQL's commit assertion reads the generation as well. Force-release now trades nothing for
+  write availability: it ends a wedged worker's lease at once so a new rebuild can begin.
 - **Commit-time check**: every commit includes a `ConditionCheck` asserting
   `attribute_not_exists(pk)` on the lock row — a commit is refused whenever any rebuild holds the
   lock, regardless of generation. _Errata (E1.1):_ a commit that races a rebuild fails its check
   with `RebuildInProgress`, a control-row classification like the feature-marker check: it is
   **never** routed through the fence path — it does not produce a stale-fence rejection and is
   **not** retried with a fresh load under C5 — but is retried after the lock is taken over or
-  force-released. The storage spec pins this in "Writes" and "Fence-aware retry".
+  force-released. _Errata (#180):_ retried until a rebuild ends; a force-release alone keeps
+  commits refused. The storage spec pins this in "Writes" and "Fence-aware retry".
 - **Reader epoch check**: the generation increments when a rebuild **acquires** the lock and
   **again when it releases** after replay completes, so the value is odd while a rebuild is in
   progress and even when quiesced. Readers that need consistency read the generation before and

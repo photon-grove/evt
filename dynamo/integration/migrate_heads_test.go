@@ -228,11 +228,20 @@ func seedV08Store(ctx context.Context, t *testing.T, repo *dynamo.Repository) []
 }
 
 // releaseSeededRebuild force-releases the rebuild lock the fixture store carries, as an operator
-// ends a wedged job, so commits can resume.
+// ends a wedged job, then runs a rebuild to its end: a force-release alone leaves the generation
+// unsettled and commits refused, and only a completed rebuild settles it so commits can resume.
 func releaseSeededRebuild(ctx context.Context, t *testing.T, repo *dynamo.Repository) {
 	t.Helper()
 
-	_, err := repo.RebuildFence().ForceRelease(ctx, "job")
+	fence := repo.RebuildFence()
+
+	_, err := fence.ForceRelease(ctx, "job")
+	require.NoError(t, err)
+
+	lease, err := fence.Begin(ctx, "recovery", time.Minute)
+	require.NoError(t, err)
+
+	_, err = fence.End(ctx, lease)
 	require.NoError(t, err)
 }
 
@@ -343,7 +352,8 @@ func Test_MigrateHeads_HeadAwareWritersWorkAfterwards(t *testing.T) {
 	_, err := migrationFor(repo, nil).Migrate(ctx, dynamo.HeadsMigrateOptions{ConfirmWritersStopped: true})
 	require.NoError(t, err)
 
-	// The fixture's rebuild job holds the fence, which refuses every commit: an operator ends it.
+	// The fixture's rebuild job holds the fence, which refuses every commit: an operator ends it
+	// and a rebuild settles the generation.
 	releaseSeededRebuild(ctx, t, repo)
 
 	// A fresh head-aware writer appends to a backfilled stream: the head item continues from the

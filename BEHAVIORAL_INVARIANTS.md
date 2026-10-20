@@ -880,20 +880,30 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 ### Rebuild Fence (ADR-0004 C10)
 
 - The fence is two engine rows in the reserved `SYSTEM#` namespace (storage spec, Rebuild Fence): a
-  lock row (`SYSTEM#REBUILD`: `owner`, `leaseExpiresAt` in whole epoch seconds) and a generation
-  item (`SYSTEM#REBUILD#GENERATION`: `value`, and `forceReleased` after a force-release). On
+  lock row (`SYSTEM#REBUILD`: `owner`, `leaseExpiresAt` in whole epoch seconds; after a
+  force-release, only `forceReleased = true`) and a generation item
+  (`SYSTEM#REBUILD#GENERATION`: `value`, and `forceReleased` after a force-release). On
   PostgreSQL they are `{events}__evt_rebuild_lock` and `{events}__evt_rebuild_generation`. Every
   transition (acquire, takeover, release, force-release) writes both in one transaction, so a crash
   never leaves them disagreeing.
 - **The generation is odd if and only if a rebuild is in progress**, except after a force-release,
-  which deletes the lock but leaves the generation odd and flagged: that value means "derived state
-  untrustworthy", not "rebuild in progress", and readers treat every odd value alike. Acquire adds
+  which releases the lock but leaves the generation odd and flagged: that value means "derived
+  state untrustworthy", not "rebuild in progress", and readers and commits treat every odd value
+  alike. Acquire adds
   one (two from a force-released generation), takeover adds two, release adds one and clears the
   flag, force-release adds two and sets it.
-- **Every commit is refused while any lock row exists**, an expired one included, with
+- **Every commit is refused while the generation is unsettled** — a lock is held, an expired one
+  included, or a force-release left the generation odd and no rebuild has ended since — with
   `*evt.RebuildInProgressError` (`evt.ErrRebuildInProgress`; Rust `Error::RebuildInProgress`): the
   second action of every DynamoDB commit is a `ConditionCheck` of `attribute_not_exists(pk)` on the
-  lock row, and a PostgreSQL commit asserts the row is absent under the shared fence advisory lock.
+  lock row, which a force-release replaces with a `forceReleased` item rather than deleting, and a
+  PostgreSQL commit asserts, under the shared fence advisory lock, that the lock row is absent and
+  the generation even. A force-release therefore never lets commits through: the released rebuild
+  may have cleared derived state a commit reads from (a journaled commit would allocate scope
+  positions from wiped counters into immutable event metadata). A store that never ran a rebuild
+  has neither row and accepts commits. A DynamoDB store force-released by a pre-release v0.9
+  build (which deleted the lock row) has no lock item and is not fenced until a rebuild ends:
+  run one after upgrading (storage spec, Rebuild Fence, "Pre-release stores").
   It is mandatory like the marker check, present in outcome-only commits, in rejections that carry
   events, and in the outcome-only transaction that persists a rejection. Out-of-band snapshot
   writes and compaction carry no lock check. It counts toward the commit budget and its bytes
