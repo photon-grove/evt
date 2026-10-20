@@ -38,6 +38,9 @@ type rebuildEnv struct {
 	repo  evt.Repository
 	fence evt.RebuildFence
 	ns    string
+
+	// leases are the leases the case's workers hold, by name.
+	leases map[string]evt.RebuildLease
 }
 
 func newRebuildEnv(t *testing.T, newRepo func() evt.Repository, opts SuiteOptions) *rebuildEnv {
@@ -51,7 +54,7 @@ func newRebuildEnv(t *testing.T, newRepo func() evt.Repository, opts SuiteOption
 	provider, ok := repo.(evt.RebuildFenceProvider)
 	require.True(t, ok, "%T must implement evt.RebuildFenceProvider", repo)
 
-	env := &rebuildEnv{t: t, clock: clock, repo: repo, fence: provider.RebuildFence(), ns: newNamespace()}
+	env := &rebuildEnv{t: t, clock: clock, repo: repo, fence: provider.RebuildFence(), ns: newNamespace(), leases: map[string]evt.RebuildLease{}}
 
 	// Start from a settled store, whatever an earlier case left, and leave it settled.
 	env.settle()
@@ -77,10 +80,10 @@ func (e *rebuildEnv) settle() {
 	require.NoError(e.t, err)
 
 	if !generation.Settled() {
-		_, err = e.fence.Begin(ctx, e.ns+"-settle", time.Minute)
+		settling, err := e.fence.Begin(ctx, e.ns+"-settle", time.Minute)
 		require.NoError(e.t, err)
 
-		_, err = e.fence.End(ctx, e.ns+"-settle")
+		_, err = e.fence.End(ctx, settling)
 		require.NoError(e.t, err)
 	}
 }
@@ -96,11 +99,23 @@ func (e *rebuildEnv) generation() evt.RebuildGeneration {
 
 func (e *rebuildEnv) owner(name string) string { return e.ns + "-" + name }
 
+// lease is the lease the named worker holds. A worker that never began presents a lease with a
+// generation no lock holds.
+func (e *rebuildEnv) lease(name string) evt.RebuildLease {
+	if lease, ok := e.leases[name]; ok {
+		return lease
+	}
+
+	return evt.RebuildLease{Owner: e.owner(name), Generation: 999_999}
+}
+
 func (e *rebuildEnv) begin(name string, lease time.Duration) evt.RebuildLease {
 	e.t.Helper()
 
 	started, err := e.fence.Begin(context.Background(), e.owner(name), lease)
 	require.NoError(e.t, err)
+
+	e.leases[name] = started
 
 	return started
 }
@@ -146,6 +161,7 @@ func runRebuildFenceCases(t *testing.T, newRepo func() evt.Repository, opts Suit
 
 	t.Run("RebuildLifecycle", func(t *testing.T) { testRebuildLifecycle(t, newRebuildEnv(t, newRepo, opts)) })
 	t.Run("RebuildLeaseExpiryAndTakeover", func(t *testing.T) { testRebuildTakeover(t, newRebuildEnv(t, newRepo, opts)) })
+	t.Run("RebuildStaleIncarnation", func(t *testing.T) { testRebuildStaleIncarnation(t, newRebuildEnv(t, newRepo, opts), opts) })
 	t.Run("RebuildForceRelease", func(t *testing.T) { testRebuildForceRelease(t, newRebuildEnv(t, newRepo, opts)) })
 	t.Run("RebuildRejectsBadArguments", func(t *testing.T) { testRebuildArguments(t, newRebuildEnv(t, newRepo, opts)) })
 	t.Run("RebuildRefusesCommits", func(t *testing.T) { testRebuildRefusesCommits(t, newRebuildEnv(t, newRepo, opts), opts) })
@@ -204,23 +220,26 @@ func testRebuildLifecycle(t *testing.T, env *rebuildEnv) {
 	// Renew extends the lease to the new duration from now, and only for the holder.
 	env.clock.Advance(30)
 
-	expiry, err := env.fence.Renew(ctx, env.owner("a"), 2*time.Minute)
+	renewed, err := env.fence.Renew(ctx, env.lease("a"), 2*time.Minute)
 	require.NoError(t, err)
-	require.Equal(t, env.clock.Now().Unix()+120, expiry.Unix())
+	require.Equal(t, env.clock.Now().Unix()+120, renewed.LeaseExpiresAt.Unix())
+	require.Equal(t, started.Generation, renewed.Generation, "renewing keeps the fencing generation")
+	require.Equal(t, started.Owner, renewed.Owner)
 
 	state, err = env.fence.State(ctx)
 	require.NoError(t, err)
-	require.Equal(t, expiry.Unix(), state.Lock.LeaseExpiresAt.Unix())
+	require.Equal(t, renewed.LeaseExpiresAt.Unix(), state.Lock.LeaseExpiresAt.Unix())
+	require.Equal(t, started.Generation, state.Lock.Generation, "the lock row holds the lease's fencing generation")
 	require.Equal(t, before.Value+1, state.Generation.Value, "renewing does not touch the generation")
 
-	_, err = env.fence.Renew(ctx, env.owner("b"), time.Minute)
+	_, err = env.fence.Renew(ctx, env.lease("b"), time.Minute)
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 
-	_, err = env.fence.End(ctx, env.owner("b"))
+	_, err = env.fence.End(ctx, env.lease("b"))
 	require.True(t, evt.IsRebuildLeaseLostErr(err), "only the holder ends a rebuild")
 
 	// End releases: the generation is even again, the lock is gone, and nothing is flagged.
-	settled, err := env.fence.End(ctx, env.owner("a"))
+	settled, err := env.fence.End(ctx, env.lease("a"))
 	require.NoError(t, err)
 	require.Equal(t, evt.RebuildGeneration{Value: before.Value + 2}, settled)
 	require.Equal(t, settled, env.generation())
@@ -229,17 +248,17 @@ func testRebuildLifecycle(t *testing.T, env *rebuildEnv) {
 	require.NoError(t, err)
 	require.False(t, state.InProgress())
 
-	_, err = env.fence.End(ctx, env.owner("a"))
+	_, err = env.fence.End(ctx, env.lease("a"))
 	require.True(t, evt.IsRebuildLeaseLostErr(err), "a second End finds no lock")
 
-	_, err = env.fence.Renew(ctx, env.owner("a"), time.Minute)
+	_, err = env.fence.Renew(ctx, env.lease("a"), time.Minute)
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 
 	// A new rebuild starts from the settled value, whoever ran the last one.
 	again := env.begin("b", time.Minute)
 	require.Equal(t, before.Value+3, again.Generation)
 
-	_, err = env.fence.End(ctx, env.owner("b"))
+	_, err = env.fence.End(ctx, env.lease("b"))
 	require.NoError(t, err)
 }
 
@@ -270,16 +289,16 @@ func testRebuildTakeover(t *testing.T, env *rebuildEnv) {
 	require.Equal(t, env.owner("b"), state.Lock.Owner)
 
 	// The displaced worker can do nothing: its renew, its release, and its next batch fail.
-	_, err = env.fence.Renew(ctx, env.owner("a"), time.Minute)
+	_, err = env.fence.Renew(ctx, env.lease("a"), time.Minute)
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 
-	_, err = env.fence.End(ctx, env.owner("a"))
+	_, err = env.fence.End(ctx, env.lease("a"))
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 
 	requireRefused(t, env.commit("taken"))
 
 	// The new owner ends the rebuild: odd to even, one step.
-	settled, err := env.fence.End(ctx, env.owner("b"))
+	settled, err := env.fence.End(ctx, env.lease("b"))
 	require.NoError(t, err)
 	require.Equal(t, evt.RebuildGeneration{Value: before.Value + 4}, settled)
 	require.NoError(t, env.commit("after-takeover"))
@@ -288,7 +307,7 @@ func testRebuildTakeover(t *testing.T, env *rebuildEnv) {
 	env.begin("c", 10*time.Second)
 	env.clock.Advance(8)
 
-	_, err = env.fence.Renew(ctx, env.owner("c"), 10*time.Second)
+	_, err = env.fence.Renew(ctx, env.lease("c"), 10*time.Second)
 	require.NoError(t, err)
 
 	env.clock.Advance(8)
@@ -296,7 +315,83 @@ func testRebuildTakeover(t *testing.T, env *rebuildEnv) {
 	_, err = env.fence.Begin(ctx, env.owner("d"), time.Minute)
 	require.True(t, evt.IsRebuildLockHeldErr(err))
 
-	_, err = env.fence.End(ctx, env.owner("c"))
+	_, err = env.fence.End(ctx, env.lease("c"))
+	require.NoError(t, err)
+}
+
+// A lease binds its owner token and its fencing generation. When one worker's lease lapses and a
+// later incarnation of the worker takes over under the same owner token, the first incarnation
+// can neither renew, write, nor end the lease: only the generation tells them apart.
+func testRebuildStaleIncarnation(t *testing.T, env *rebuildEnv, opts SuiteOptions) {
+	ctx := context.Background()
+	pk := env.ns + "#incarnations"
+
+	put := func(sk string) evt.ProjectedView {
+		return evt.ProjectedView{Projector: "rebuild", Op: evt.PutView(pk, sk, "owner", "test", []byte(`{}`))}
+	}
+
+	const token = "worker"
+
+	stale, err := env.fence.Begin(ctx, env.owner(token), 10*time.Second)
+	require.NoError(t, err)
+
+	env.clock.Advance(11)
+
+	fresh, err := env.fence.Begin(ctx, env.owner(token), time.Minute)
+	require.NoError(t, err, "an expired lease is taken over, even by the same owner token")
+	require.Equal(t, stale.Owner, fresh.Owner)
+	require.Equal(t, stale.Generation+2, fresh.Generation)
+
+	before, err := env.fence.State(ctx)
+	require.NoError(t, err)
+	require.Equal(t, fresh.Generation, before.Lock.Generation)
+
+	// The stale incarnation changes nothing.
+	_, err = env.fence.Renew(ctx, stale, time.Hour)
+	require.True(t, evt.IsRebuildLeaseLostErr(err), "renew: %v", err)
+
+	if opts.SupportsViews {
+		err = env.fence.WriteViews(ctx, stale, []evt.ProjectedView{put("stale")})
+		require.True(t, evt.IsRebuildLeaseLostErr(err), "write views: %v", err)
+		requireNoRow(t, opts.ReadView, env.repo, pk, "stale")
+	}
+
+	_, err = env.fence.End(ctx, stale)
+	require.True(t, evt.IsRebuildLeaseLostErr(err), "end: %v", err)
+
+	after, err := env.fence.State(ctx)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "the new holder's lock, expiry, and generation are untouched")
+
+	// The new incarnation can.
+	renewed, err := env.fence.Renew(ctx, fresh, 2*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, env.clock.Now().Unix()+120, renewed.LeaseExpiresAt.Unix())
+
+	if opts.SupportsViews {
+		require.NoError(t, env.fence.WriteViews(ctx, renewed, []evt.ProjectedView{put("fresh")}))
+		requireRow(t, opts.ReadView, env.repo, pk, "fresh", `{}`)
+	}
+
+	settled, err := env.fence.End(ctx, renewed)
+	require.NoError(t, err)
+	require.Equal(t, fresh.Generation+1, settled.Value)
+
+	// A lease does not outlive its rebuild: after End, the same owner token begins again under a
+	// new generation, and both earlier leases are dead.
+	again, err := env.fence.Begin(ctx, env.owner(token), time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, settled.Value+1, again.Generation)
+
+	for name, old := range map[string]evt.RebuildLease{"stale": stale, "ended": fresh} {
+		_, err = env.fence.Renew(ctx, old, time.Hour)
+		require.True(t, evt.IsRebuildLeaseLostErr(err), name)
+
+		_, err = env.fence.End(ctx, old)
+		require.True(t, evt.IsRebuildLeaseLostErr(err), name)
+	}
+
+	_, err = env.fence.End(ctx, again)
 	require.NoError(t, err)
 }
 
@@ -333,7 +428,7 @@ func testRebuildForceRelease(t *testing.T, env *rebuildEnv) {
 	_, err = env.fence.ForceRelease(ctx, env.owner("a"))
 	require.True(t, evt.IsRebuildLeaseLostErr(err), "there is no lock left to release")
 
-	_, err = env.fence.End(ctx, env.owner("a"))
+	_, err = env.fence.End(ctx, env.lease("a"))
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 
 	// A new rebuild acquires from the force-released odd generation, adding two so it stays odd. The
@@ -344,7 +439,7 @@ func testRebuildForceRelease(t *testing.T, env *rebuildEnv) {
 	requireRefused(t, env.commit("rebuilding"))
 
 	// Ending it settles the generation and clears the flag, so readers trust derived state again.
-	settled, err := env.fence.End(ctx, env.owner("c"))
+	settled, err := env.fence.End(ctx, env.lease("c"))
 	require.NoError(t, err)
 	require.Equal(t, evt.RebuildGeneration{Value: before.Value + 6}, settled)
 
@@ -396,12 +491,12 @@ func testRebuildArguments(t *testing.T, env *rebuildEnv) {
 			return err
 		},
 		"renew with a zero lease": func() error {
-			_, err := env.fence.Renew(ctx, env.owner("a"), 0)
+			_, err := env.fence.Renew(ctx, env.lease("a"), 0)
 
 			return err
 		},
 		"end with an empty owner": func() error {
-			_, err := env.fence.End(ctx, "")
+			_, err := env.fence.End(ctx, evt.RebuildLease{Generation: 1})
 
 			return err
 		},
@@ -513,7 +608,7 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 	require.ErrorAs(t, env.repo.Commit(ctx, evt.SerializedResult{Transaction: evt.Transaction{projectorOnlyGroup{}}}), &projectorOnly)
 
 	// The lock is released: commits resume, and the same streams commit as if nothing happened.
-	_, err := env.fence.End(ctx, env.owner("worker"))
+	_, err := env.fence.End(ctx, env.lease("worker"))
 	require.NoError(t, err)
 	commitEvents(t, env.repo, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"})
 	require.Len(t, mustEventsOf(t, env.repo, plain), 1)
@@ -617,7 +712,7 @@ func testRebuildPrecedence(t *testing.T, env *rebuildEnv, opts SuiteOptions) {
 	}
 
 	// Once the lock is gone each commit reports the failure it would have had.
-	_, err := env.fence.End(ctx, env.owner("worker"))
+	_, err := env.fence.End(ctx, env.lease("worker"))
 	require.NoError(t, err)
 
 	err = env.repo.Commit(ctx, evt.SerializedResult{Events: skipped})
@@ -674,13 +769,13 @@ func testRebuildEpochs(t *testing.T, env *rebuildEnv) {
 	require.Zero(t, ran, "a failed observe skips the read")
 
 	// A rebuild that started and finished during the read leaves a settled but changed generation.
-	_, err = env.fence.End(ctx, env.owner("a"))
+	_, err = env.fence.End(ctx, env.lease("a"))
 	require.NoError(t, err)
 
 	err = evt.ReadAtRebuildEpoch(ctx, env.fence, func(context.Context) error {
 		env.begin("b", time.Hour)
 
-		_, endErr := env.fence.End(ctx, env.owner("b"))
+		_, endErr := env.fence.End(ctx, env.lease("b"))
 
 		return endErr
 	})
@@ -706,7 +801,7 @@ func testRebuildEpochs(t *testing.T, env *rebuildEnv) {
 	taken := env.begin("d", time.Hour)
 	require.Equal(t, stalled.Value+2, taken.Generation)
 
-	_, err = env.fence.End(ctx, env.owner("d"))
+	_, err = env.fence.End(ctx, env.lease("d"))
 	require.NoError(t, err)
 }
 
@@ -721,18 +816,18 @@ func testRebuildGuardedViews(t *testing.T, env *rebuildEnv, opts SuiteOptions) {
 	}
 
 	// Without a lock there is nothing to guard the write: it is refused and writes nothing.
-	err := env.fence.WriteViews(ctx, env.owner("a"), []evt.ProjectedView{put("none")})
+	err := env.fence.WriteViews(ctx, env.lease("a"), []evt.ProjectedView{put("none")})
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 	requireNoRow(t, opts.ReadView, env.repo, pk, "none")
 
 	env.begin("a", 10*time.Second)
 
-	require.NoError(t, env.fence.WriteViews(ctx, env.owner("a"), []evt.ProjectedView{put("one"), put("two")}))
+	require.NoError(t, env.fence.WriteViews(ctx, env.lease("a"), []evt.ProjectedView{put("one"), put("two")}))
 	requireRow(t, opts.ReadView, env.repo, pk, "one", `{}`)
 	requireRow(t, opts.ReadView, env.repo, pk, "two", `{}`)
 
 	// Another owner's batch is refused, whole.
-	err = env.fence.WriteViews(ctx, env.owner("b"), []evt.ProjectedView{put("foreign")})
+	err = env.fence.WriteViews(ctx, env.lease("b"), []evt.ProjectedView{put("foreign")})
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 	requireNoRow(t, opts.ReadView, env.repo, pk, "foreign")
 
@@ -744,25 +839,25 @@ func testRebuildGuardedViews(t *testing.T, env *rebuildEnv, opts SuiteOptions) {
 		batch = append(batch, put("bulk-"+string(rune('a'+i/26))+string(rune('a'+i%26))))
 	}
 
-	require.ErrorAs(t, env.fence.WriteViews(ctx, env.owner("a"), batch), &tooLarge)
-	require.NoError(t, env.fence.WriteViews(ctx, env.owner("a"), batch[:evt.MaxRebuildViewBatch]))
-	require.ErrorIs(t, env.fence.WriteViews(ctx, env.owner("a"), nil), evt.ErrInvalidArgument)
+	require.ErrorAs(t, env.fence.WriteViews(ctx, env.lease("a"), batch), &tooLarge)
+	require.NoError(t, env.fence.WriteViews(ctx, env.lease("a"), batch[:evt.MaxRebuildViewBatch]))
+	require.ErrorIs(t, env.fence.WriteViews(ctx, env.lease("a"), nil), evt.ErrInvalidArgument)
 
 	// A lapsed lease is no guard, even before anyone takes over.
 	env.clock.Advance(11)
 
-	err = env.fence.WriteViews(ctx, env.owner("a"), []evt.ProjectedView{put("lapsed")})
+	err = env.fence.WriteViews(ctx, env.lease("a"), []evt.ProjectedView{put("lapsed")})
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 	requireNoRow(t, opts.ReadView, env.repo, pk, "lapsed")
 
 	// The worker that lost its lock to a takeover can write nothing; the new owner can.
 	env.begin("b", time.Hour)
 
-	err = env.fence.WriteViews(ctx, env.owner("a"), []evt.ProjectedView{put("displaced")})
+	err = env.fence.WriteViews(ctx, env.lease("a"), []evt.ProjectedView{put("displaced")})
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
 	requireNoRow(t, opts.ReadView, env.repo, pk, "displaced")
 
-	require.NoError(t, env.fence.WriteViews(ctx, env.owner("b"), []evt.ProjectedView{put("taken-over")}))
+	require.NoError(t, env.fence.WriteViews(ctx, env.lease("b"), []evt.ProjectedView{put("taken-over")}))
 	requireRow(t, opts.ReadView, env.repo, pk, "taken-over", `{}`)
 }
 
@@ -800,7 +895,7 @@ func testRebuildEngineRetry(t *testing.T, env *rebuildEnv) {
 	env.begin("worker", time.Hour)
 	retry.store.WithRetry(waiting(func(n int) {
 		if n == 2 {
-			_, err := env.fence.End(ctx, env.owner("worker"))
+			_, err := env.fence.End(ctx, env.lease("worker"))
 			require.NoError(t, err)
 		}
 	}))
@@ -879,7 +974,7 @@ func testRebuildEngineRetry(t *testing.T, env *rebuildEnv) {
 
 	// Once the rebuild ends the same command IDs run: the stuck deposit commits and the rejection
 	// is recorded.
-	_, err = env.fence.End(ctx, env.owner("stuck"))
+	_, err = env.fence.End(ctx, env.lease("stuck"))
 	require.NoError(t, err)
 
 	retry.store.WithRetry(waiting(func(int) {}))

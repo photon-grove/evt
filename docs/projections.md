@@ -26,7 +26,8 @@ whole run, and every commit is refused with `*evt.RebuildInProgressError` until 
 ```go
 fence := repo.(evt.RebuildFenceProvider).RebuildFence()
 
-if _, err := fence.Begin(ctx, owner, 5*time.Minute); err != nil {
+lease, err := fence.Begin(ctx, owner, 5*time.Minute)
+if err != nil {
     return err // *evt.RebuildLockHeldError: another rebuild holds an unexpired lease
 }
 
@@ -34,7 +35,7 @@ result, err := evt.RebuildProjections(ctx, repo, applyEvent, cfg)
 
 switch {
 case err == nil && len(result.Errors) == 0:
-    _, err = fence.End(ctx, owner) // the generation is even again: readers trust the views
+    _, err = fence.End(ctx, lease) // the generation is even again: readers trust the views
 default:
     // The views may be half-written. Commits may resume, but readers stay fenced until a later
     // rebuild completes.
@@ -42,9 +43,11 @@ default:
 }
 ```
 
-- Renew the lease (`fence.Renew`) while the run goes on, well inside the lease you asked for: a
-  worker that pauses past its lease can be replaced by a takeover. Write view batches through
-  `fence.WriteViews(ctx, owner, batch)` (at most 99 operations) to have each batch conditioned
+- Renew the lease (`lease, err = fence.Renew(ctx, lease, d)`) while the run goes on, well inside the
+  lease you asked for: a worker that pauses past its lease can be replaced by a takeover. The lease
+  (owner and generation) is a fencing token, so the replaced worker cannot renew, write, or end
+  its successor's lease even if both use one owner token. Write view batches through
+  `fence.WriteViews(ctx, lease, batch)` (at most 99 operations) to have each batch conditioned
   transactionally on the lease: a worker that lost the lock gets `*evt.RebuildLeaseLostError` and
   writes nothing. Writes you make through your own `CommitGroup` are not guarded; a crashed worker's
   lock simply blocks commits until it expires and is taken over (`Begin` does that) or an operator

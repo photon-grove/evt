@@ -92,7 +92,7 @@ changed, and update the spec.
    steps: a rebuild lock refuses every other scenario's commits. The interleaved run skips it, and
    `scripts/compat-integration.sh` runs it alone afterwards, one step at a time (`evt-compat steps
    -only NAME`, `step -only NAME`, and `exclusive` in the Go driver; the Rust driver takes the same
-   arguments). `rebuild` owner tokens are scoped to the run and scenario like command IDs, and a
+   arguments). `rebuild` owner tokens are scoped to the run and scenario like command IDs (a step that presents a lease rebuilds it from the store: the lock's fencing generation when it names the scoped owner), and a
    `writeViews` step writes one view row in the partition `rebuild-<entity ID>`. The fixture runs
    advance an injected clock for `wait`; the live runs sleep.
 

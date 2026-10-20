@@ -88,36 +88,44 @@ func (f memFence) Begin(_ context.Context, owner string, lease time.Duration) (e
 	}
 
 	expiry := time.Unix(now.Unix()+seconds, 0)
-	rebuild.lock = &evt.RebuildLock{Owner: owner, LeaseExpiresAt: expiry}
 	rebuild.generation += plan.Increment
+	rebuild.lock = &evt.RebuildLock{Owner: owner, Generation: rebuild.generation, LeaseExpiresAt: expiry}
 
 	return evt.RebuildLease{Owner: owner, Generation: rebuild.generation, LeaseExpiresAt: expiry}, nil
 }
 
+// holds reports whether the lock row is the lease's: the same owner under the same generation. A
+// takeover by the same owner token is a later generation, so the stale incarnation's lease is not
+// the new holder's. The caller holds mu.
+func (r *memRebuild) holds(lease evt.RebuildLease) bool {
+	return r.lock != nil && r.lock.Owner == lease.Owner && r.lock.Generation == lease.Generation
+}
+
 // Renew extends the holder's lease.
-func (f memFence) Renew(_ context.Context, owner string, lease time.Duration) (time.Time, error) {
-	seconds, err := f.validate(owner, lease)
+func (f memFence) Renew(_ context.Context, lease evt.RebuildLease, extend time.Duration) (evt.RebuildLease, error) {
+	seconds, err := f.validate(lease.Owner, extend)
 	if err != nil {
-		return time.Time{}, err
+		return evt.RebuildLease{}, err
 	}
 
 	f.repo.features.mu.Lock()
 	defer f.repo.features.mu.Unlock()
 
 	rebuild := &f.repo.features.rebuild
-	if rebuild.lock == nil || rebuild.lock.Owner != owner {
-		return time.Time{}, &evt.RebuildLeaseLostError{Owner: owner}
+	if !rebuild.holds(lease) {
+		return evt.RebuildLease{}, &evt.RebuildLeaseLostError{Owner: lease.Owner}
 	}
 
 	expiry := time.Unix(f.repo.clock().Unix()+seconds, 0)
 	rebuild.lock.LeaseExpiresAt = expiry
+	lease.LeaseExpiresAt = expiry
 
-	return expiry, nil
+	return lease, nil
 }
 
 // End releases the lock and settles the generation.
-func (f memFence) End(_ context.Context, owner string) (evt.RebuildGeneration, error) {
-	if err := evt.CheckRebuildOwner(owner); err != nil {
+func (f memFence) End(_ context.Context, lease evt.RebuildLease) (evt.RebuildGeneration, error) {
+	if err := evt.CheckRebuildOwner(lease.Owner); err != nil {
 		return evt.RebuildGeneration{}, err
 	}
 
@@ -125,8 +133,8 @@ func (f memFence) End(_ context.Context, owner string) (evt.RebuildGeneration, e
 	defer f.repo.features.mu.Unlock()
 
 	rebuild := &f.repo.features.rebuild
-	if rebuild.lock == nil || rebuild.lock.Owner != owner {
-		return evt.RebuildGeneration{}, &evt.RebuildLeaseLostError{Owner: owner}
+	if !rebuild.holds(lease) {
+		return evt.RebuildGeneration{}, &evt.RebuildLeaseLostError{Owner: lease.Owner}
 	}
 
 	rebuild.lock = nil
@@ -159,8 +167,8 @@ func (f memFence) ForceRelease(_ context.Context, owner string) (evt.RebuildGene
 
 // WriteViews writes one batch of view operations under the lease guard: the owner must still hold
 // an unexpired lease, and the batch is checked and applied in one critical section.
-func (f memFence) WriteViews(_ context.Context, owner string, views []evt.ProjectedView) error {
-	if err := evt.CheckRebuildOwner(owner); err != nil {
+func (f memFence) WriteViews(_ context.Context, lease evt.RebuildLease, views []evt.ProjectedView) error {
+	if err := evt.CheckRebuildOwner(lease.Owner); err != nil {
 		return err
 	}
 
@@ -171,9 +179,9 @@ func (f memFence) WriteViews(_ context.Context, owner string, views []evt.Projec
 	f.repo.features.mu.Lock()
 	defer f.repo.features.mu.Unlock()
 
-	lock := f.repo.features.rebuild.lock
-	if lock == nil || lock.Owner != owner || lock.LeaseExpiresAt.Unix() <= f.repo.clock().Unix() {
-		return &evt.RebuildLeaseLostError{Owner: owner}
+	rebuild := &f.repo.features.rebuild
+	if !rebuild.holds(lease) || rebuild.lock.LeaseExpiresAt.Unix() <= f.repo.clock().Unix() {
+		return &evt.RebuildLeaseLostError{Owner: lease.Owner}
 	}
 
 	if err := f.repo.checkViewConditions(views); err != nil {

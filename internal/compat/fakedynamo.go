@@ -314,19 +314,28 @@ func conditionHolds(
 	case rebuildSeenOddCondition:
 		return is("value", ":seenOdd", equal)
 
-	case "#owner = :owner":
-		return textIs(existing, "owner", values, ":owner"), nil
+	case "#owner = :owner AND #generation = :generation":
+		if !textIs(existing, "owner", values, ":owner") {
+			return false, nil
+		}
+		return is("generation", ":generation", equal)
 
-	case "#owner = :me":
-		return textIs(existing, "owner", values, ":me"), nil
+	case "#owner = :me AND #generation = :generation":
+		if !textIs(existing, "owner", values, ":me") {
+			return false, nil
+		}
+		return is("generation", ":generation", equal)
 
 	case "#owner = :requestedOwner":
 		return textIs(existing, "owner", values, ":requestedOwner"), nil
 
 	case rebuildGuardCondition:
-		// #owner = :me AND leaseExpiresAt > :now
+		// #owner = :me AND #generation = :generation AND leaseExpiresAt > :now
 		if !textIs(existing, "owner", values, ":me") {
 			return false, nil
+		}
+		if held, err := is("generation", ":generation", equal); err != nil || !held {
+			return false, err
 		}
 		return is("leaseExpiresAt", ":now", func(have, now int64) bool { return have > now })
 	}
@@ -340,7 +349,7 @@ const (
 	rebuildAcquireCondition  = "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)"
 	rebuildTakeoverCondition = "leaseExpiresAt < :now AND #owner = :observedOwner"
 	rebuildSeenOddCondition  = "#value = :seenOdd"
-	rebuildGuardCondition    = "#owner = :me AND leaseExpiresAt > :now"
+	rebuildGuardCondition    = "#owner = :me AND #generation = :generation AND leaseExpiresAt > :now"
 )
 
 // textIs reports whether a stored string attribute equals an expression value; it is false when the

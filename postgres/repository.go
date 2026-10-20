@@ -320,6 +320,7 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
 CREATE TABLE IF NOT EXISTS %[1]s__evt_rebuild_lock (
     id               integer PRIMARY KEY,
     owner            text        NOT NULL,
+    generation       bigint      NOT NULL,
     lease_expires_at timestamptz NOT NULL
 );
 

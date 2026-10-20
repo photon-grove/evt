@@ -39,6 +39,10 @@ type RebuildFenceVector struct {
 	// LeaseSeconds is the lease in whole seconds (begin, renew).
 	LeaseSeconds int64 `json:"leaseSeconds,omitempty"`
 
+	// LeaseGeneration is the fencing generation of the lease the call presents (renew, end,
+	// writeViews): the generation Begin returned to the caller.
+	LeaseGeneration int64 `json:"leaseGeneration,omitempty"`
+
 	// Calls are the requests the repository sent, in order.
 	Calls []RebuildFenceCall `json:"calls"`
 
@@ -130,6 +134,7 @@ type rebuildSeed struct {
 	generation *int64
 	forced     bool
 	lockOwner  string
+	lockGen    int64
 	lockExpiry int64
 }
 
@@ -154,6 +159,7 @@ func (seed rebuildSeed) apply(fake *FakeDynamo) {
 			"pk":             &types.AttributeValueMemberS{Value: evt.RebuildLockID},
 			"sk":             &types.AttributeValueMemberN{Value: "0"},
 			"owner":          &types.AttributeValueMemberS{Value: seed.lockOwner},
+			"generation":     &types.AttributeValueMemberN{Value: fmt.Sprint(seed.lockGen)},
 			"leaseExpiresAt": &types.AttributeValueMemberN{Value: fmt.Sprint(seed.lockExpiry)},
 		})
 	}
@@ -184,55 +190,37 @@ func GenerateRebuildFenceVectors(ctx context.Context) ([]RebuildFenceVector, err
 		operation string
 		owner     string
 		lease     int64
+		token     int64
+	}
+
+	held := func(generation int64, owner string, expiry int64) rebuildSeed {
+		return rebuildSeed{generation: int64Ptr(generation), lockOwner: owner, lockGen: generation, lockExpiry: expiry}
 	}
 
 	specs := []spec{
 		{name: "state-empty", operation: "state"},
-		{name: "state-held", seed: rebuildSeed{generation: int64Ptr(5), lockOwner: "job-a", lockExpiry: now + 60}, operation: "state"},
+		{name: "state-held", seed: held(5, "job-a", now+60), operation: "state"},
 		{name: "generation-force-released", seed: rebuildSeed{generation: int64Ptr(7), forced: true}, operation: "generation"},
 		{name: "acquire-first-rebuild", operation: "begin", owner: "job-a", lease: 60},
 		{name: "acquire-from-even", seed: rebuildSeed{generation: int64Ptr(4)}, operation: "begin", owner: "job-a", lease: 90},
 		{name: "acquire-from-force-released", seed: rebuildSeed{generation: int64Ptr(5), forced: true}, operation: "begin", owner: "job-b", lease: 60},
+		{name: "takeover-expired", seed: held(5, "job-a", now-1), operation: "begin", owner: "job-b", lease: 60},
+		{name: "held-is-refused", seed: held(5, "job-a", now), operation: "begin", owner: "job-b", lease: 60},
+		{name: "renew", seed: held(5, "job-a", now+10), operation: "renew", owner: "job-a", lease: 120, token: 5},
+		{name: "renew-lost", seed: held(5, "job-b", now+10), operation: "renew", owner: "job-a", lease: 120, token: 5},
+		{name: "renew-stale-incarnation", seed: held(7, "job-a", now+10), operation: "renew", owner: "job-a", lease: 120, token: 5},
+		{name: "release", seed: held(5, "job-a", now+10), operation: "end", owner: "job-a", token: 5},
 		{
-			name: "takeover-expired", seed: rebuildSeed{generation: int64Ptr(5), lockOwner: "job-a", lockExpiry: now - 1},
-			operation: "begin", owner: "job-b", lease: 60,
+			name:      "release-clears-force-released",
+			seed:      rebuildSeed{generation: int64Ptr(7), forced: true, lockOwner: "job-a", lockGen: 7, lockExpiry: now + 10},
+			operation: "end", owner: "job-a", token: 7,
 		},
-		{
-			name: "held-is-refused", seed: rebuildSeed{generation: int64Ptr(5), lockOwner: "job-a", lockExpiry: now},
-			operation: "begin", owner: "job-b", lease: 60,
-		},
-		{
-			name: "renew", seed: rebuildSeed{generation: int64Ptr(5), lockOwner: "job-a", lockExpiry: now + 10},
-			operation: "renew", owner: "job-a", lease: 120,
-		},
-		{
-			name: "renew-lost", seed: rebuildSeed{generation: int64Ptr(5), lockOwner: "job-b", lockExpiry: now + 10},
-			operation: "renew", owner: "job-a", lease: 120,
-		},
-		{
-			name: "release", seed: rebuildSeed{generation: int64Ptr(5), lockOwner: "job-a", lockExpiry: now + 10},
-			operation: "end", owner: "job-a",
-		},
-		{
-			name: "release-clears-force-released", seed: rebuildSeed{generation: int64Ptr(7), forced: true, lockOwner: "job-a", lockExpiry: now + 10},
-			operation: "end", owner: "job-a",
-		},
-		{
-			name: "release-lost", seed: rebuildSeed{generation: int64Ptr(7), lockOwner: "job-b", lockExpiry: now + 10},
-			operation: "end", owner: "job-a",
-		},
-		{
-			name: "force-release", seed: rebuildSeed{generation: int64Ptr(5), lockOwner: "job-a", lockExpiry: now - 100},
-			operation: "forceRelease", owner: "job-a",
-		},
-		{
-			name: "guarded-views", seed: rebuildSeed{generation: int64Ptr(5), lockOwner: "job-a", lockExpiry: now + 10},
-			operation: "writeViews", owner: "job-a",
-		},
-		{
-			name: "guarded-views-lease-lost", seed: rebuildSeed{generation: int64Ptr(7), lockOwner: "job-b", lockExpiry: now + 10},
-			operation: "writeViews", owner: "job-a",
-		},
+		{name: "release-lost", seed: held(7, "job-b", now+10), operation: "end", owner: "job-a", token: 7},
+		{name: "release-stale-incarnation", seed: held(7, "job-a", now+10), operation: "end", owner: "job-a", token: 5},
+		{name: "force-release", seed: held(5, "job-a", now-100), operation: "forceRelease", owner: "job-a"},
+		{name: "guarded-views", seed: held(5, "job-a", now+10), operation: "writeViews", owner: "job-a", token: 5},
+		{name: "guarded-views-lease-lost", seed: held(7, "job-b", now+10), operation: "writeViews", owner: "job-a", token: 7},
+		{name: "guarded-views-stale-incarnation", seed: held(7, "job-a", now+10), operation: "writeViews", owner: "job-a", token: 5},
 	}
 
 	vectors := make([]RebuildFenceVector, 0, len(specs))
@@ -245,11 +233,12 @@ func GenerateRebuildFenceVectors(ctx context.Context) ([]RebuildFenceVector, err
 
 		vector := RebuildFenceVector{
 			Name: s.name, Before: rebuildFenceState(fake), Operation: s.operation, Owner: s.owner, LeaseSeconds: s.lease,
+			LeaseGeneration: s.token,
 		}
 
 		repo := dynamo.NewRepository(capture, fakeTable).WithViewsTable("views").WithClock(clock)
 
-		result, err := runRebuildFenceOperation(ctx, repo.RebuildFence(), s.operation, s.owner, s.lease)
+		result, err := runRebuildFenceOperation(ctx, repo.RebuildFence(), s.operation, evt.RebuildLease{Owner: s.owner, Generation: s.token}, s.lease)
 		if err != nil {
 			return nil, fmt.Errorf("rebuild fence vector %s: %w", s.name, err)
 		}
@@ -268,9 +257,11 @@ func GenerateRebuildFenceVectors(ctx context.Context) ([]RebuildFenceVector, err
 func runRebuildFenceOperation(
 	ctx context.Context,
 	fence evt.RebuildFence,
-	operation, owner string,
+	operation string,
+	held evt.RebuildLease,
 	leaseSeconds int64,
 ) (RebuildFenceResult, error) {
+	owner := held.Owner
 	var result RebuildFenceResult
 
 	lease := time.Duration(leaseSeconds) * time.Second
@@ -311,16 +302,16 @@ func runRebuildFenceOperation(
 		}
 
 	case "renew":
-		var expiry time.Time
+		var renewed evt.RebuildLease
 
-		if expiry, err = fence.Renew(ctx, owner, lease); err == nil {
-			result.LeaseExpiresAt = int64Ptr(expiry.Unix())
+		if renewed, err = fence.Renew(ctx, held, lease); err == nil {
+			result.LeaseExpiresAt = int64Ptr(renewed.LeaseExpiresAt.Unix())
 		}
 
 	case "end":
 		var generation evt.RebuildGeneration
 
-		if generation, err = fence.End(ctx, owner); err == nil {
+		if generation, err = fence.End(ctx, held); err == nil {
 			setGeneration(generation)
 		}
 
@@ -332,7 +323,7 @@ func runRebuildFenceOperation(
 		}
 
 	case "writeViews":
-		err = fence.WriteViews(ctx, owner, []evt.ProjectedView{
+		err = fence.WriteViews(ctx, held, []evt.ProjectedView{
 			{Projector: "rebuild", Op: evt.PutView("rebuilt", "row-1", "acct-1", "account", []byte(`{"n":1}`))},
 			{Projector: "rebuild", Op: evt.DeleteView("rebuilt", "row-2", "acct-2")},
 		})

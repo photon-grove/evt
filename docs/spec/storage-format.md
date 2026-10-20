@@ -1680,6 +1680,7 @@ items:
 | `pk`             | S    | `SYSTEM#REBUILD`                                    |
 | `sk`             | N    | `0`                                                 |
 | `owner`          | S    | owner token of the current lock holder              |
+| `generation`     | N    | the odd generation the acquire or takeover produced: the lease's fencing token |
 | `leaseExpiresAt` | N    | lease expiry, epoch seconds                         |
 
 | Attribute       | Type | Generation item (`pk = SYSTEM#REBUILD#GENERATION`, `sk = 0`)                  |
@@ -1694,6 +1695,7 @@ items:
   "pk": "SYSTEM#REBUILD",
   "sk": 0,
   "owner": "rebuild-4b1f0a2e",
+  "generation": 5,
   "leaseExpiresAt": 1760000000
 }
 ```
@@ -1707,7 +1709,13 @@ items:
 ```
 
 The lock row above and this generation are one active-rebuild state: the lock exists, so the
-generation is odd.
+generation is odd. The lock row also records the generation its acquire or takeover produced
+(`generation`), the lease's **fencing token**: it is written in the same transaction as the
+generation bump, so while the lock exists it equals the generation item's `value`. A lease is its
+owner token **and** that generation. Owner tokens are caller-chosen, and two incarnations of a
+worker may reuse one: a worker whose lease lapsed and was taken over, even by a later incarnation
+under the same token, still holds the earlier generation, so every lease-guarded write below
+conditions on both and the stale incarnation fails with `RebuildLeaseLost`.
 
 The protocol. Acquire, takeover, release, and force-release are each **one `TransactWriteItems`**
 that writes both items in a single transaction, so a crash can never leave the lock and the
@@ -1765,22 +1773,30 @@ write-condition table in [Writes](#writes).
   epoch sees a new one and re-reads. A takeover racing another takeover fails one of the two
   conditions and retries from a fresh read.
 
-- **Renew**: while it runs, the rebuild renews `leaseExpiresAt` with a conditional update
-  asserting `#owner = :owner`, with `ExpressionAttributeNames` `{"#owner": "owner"}`.
+- **Renew**: while it runs, the rebuild renews `leaseExpiresAt` with one conditional update of the
+  lock item asserting the lease — its owner and its fencing generation:
+
+  ```text
+  UpdateExpression:    SET leaseExpiresAt = :expiry
+  ConditionExpression: #owner = :owner AND #generation = :generation
+  ExpressionAttributeNames: {"#owner": "owner", "#generation": "generation"}
+  ```
 
 - **Release** — one transaction:
 
   ```text
   Delete (SYSTEM#REBUILD, sk = 0)
-         ConditionExpression: #owner = :me
-         ExpressionAttributeNames: {"#owner": "owner"}
+         ConditionExpression: #owner = :me AND #generation = :generation
+         ExpressionAttributeNames: {"#owner": "owner", "#generation": "generation"}
   Update (SYSTEM#REBUILD#GENERATION, sk = 0)
          SET #value = #value + :one REMOVE forceReleased
          ConditionExpression: #value = :seenOdd
          ExpressionAttributeNames: {"#value": "value"}
   ```
 
-  A release restores the quiesced state — generation even — and clears `forceReleased`, so the
+  `:generation` and `:seenOdd` are both the lease's fencing generation, so a release needs no read
+  first: it fails unless the lock row still names the lease's owner under that generation and the
+  generation item still holds it. A release restores the quiesced state — generation even — and clears `forceReleased`, so the
   next acquire sees a plain even value whether or not the rebuild started from a force-released
   generation.
 
@@ -1833,12 +1849,12 @@ write-condition table in [Writes](#writes).
 `ConditionCheck` on the lock row:
 
 ```text
-ConditionExpression: #owner = :me AND leaseExpiresAt > :now
-ExpressionAttributeNames: {"#owner": "owner"}
+ConditionExpression: #owner = :me AND #generation = :generation AND leaseExpiresAt > :now
+ExpressionAttributeNames: {"#owner": "owner", "#generation": "generation"}
 ```
 
-The condition asserts transactionally, with every batch's writes, that the worker still holds an
-unexpired lease. A worker that pauses past its lease and loses the lock to a takeover cannot
+The condition asserts transactionally, with every batch's writes, that the worker still holds its
+lease — its owner and fencing generation — and that it has not expired. A worker that pauses past its lease and loses the lock to a takeover cannot
 resume wiping or replaying views: its next batch fails the check and the worker aborts
 immediately, so the new owner's release is never racing a stale worker's projection writes.
 (Changing the generation protects readers; only this per-batch condition protects the views from
@@ -1847,8 +1863,8 @@ transaction takes the lock row itself with `FOR UPDATE` and asserts ownership an
 the same transaction that carries the view statements —
 
 ```sql
-SELECT owner, lease_expires_at FROM evt_events__evt_rebuild_lock
-WHERE id = 0 FOR UPDATE;  -- must return owner = $1 AND lease_expires_at > $2, else abort
+SELECT owner, generation, EXTRACT(EPOCH FROM lease_expires_at)::bigint FROM evt_events__evt_rebuild_lock
+WHERE id = 0 FOR UPDATE;  -- must return owner = $1 AND generation = $2 AND a lease past $3, else abort
 ```
 
 (`evt_events__evt_rebuild_lock` stands for the configured derived name.) The row lock is held
@@ -1943,23 +1959,19 @@ use. A branch that does not apply binds its value to `-1`, which no generation e
 | force-released odd `v`      | `0`     | `2`          | `-1`          | `v`           | `true`  |
 
 The lock item an acquire or takeover puts is the full item of the example above — `pk`, `sk`,
-`owner`, `leaseExpiresAt` — and the takeover's `:now` and `:observedOwner` are numbers and a
-string as named. A release and a force-release name the owner (`:me`, `:requestedOwner`), and the
-generation update's `:one`, `:two`, and `:seenOdd` are numbers. Renew is one `UpdateItem` (not a
-transaction) on the lock item:
+`owner`, `generation`, `leaseExpiresAt` — where `generation` is the odd generation the transaction
+produces (the observed value plus `:increment`) — and the takeover's `:now` and `:observedOwner`
+are numbers and a string as named. A release names the lease (`:me`, `:generation`), a
+force-release the owner alone (`:requestedOwner`), and the generation update's `:one`, `:two`, and
+`:seenOdd` are numbers. Renew is one `UpdateItem` (not a transaction) on the lock item, as above.
 
-```text
-UpdateExpression:    SET leaseExpiresAt = :expiry
-ConditionExpression: #owner = :owner
-ExpressionAttributeNames: {"#owner": "owner"}
-```
-
-**`Renew`** fails with `RebuildLeaseLost` when the condition fails — the lock row is gone or
-names another owner. It does not require the lease to be unexpired: an owner whose lease lapsed
-but whom no one has taken over may renew it. **`End`** reads the generation, then runs the release
-transaction; a failed condition is `RebuildLeaseLost` as well, because the only operations that
-change the generation of a held lock are a takeover and a force-release, and both replace or
-remove the lock row. `End` returns the settled generation. **`ForceRelease`** names the owner the
+**`Renew`, `End`, and `WriteViews` take the lease `Begin` returned** (owner and generation; in Rust
+the `RebuildLease`), and fail with `RebuildLeaseLost` unless the lock row names that owner under
+that generation. `Renew` returns the lease with its new expiry. It does not require the lease to be
+unexpired: an owner whose lease lapsed but whom no one has taken over may renew it. **`End`** runs
+the release transaction without reading first; a failed condition is `RebuildLeaseLost` as well. A
+takeover — even by the same owner token — and a force-release both change the lock row, so a stale
+lease cannot match it. `End` returns the settled generation. **`ForceRelease`** names the owner the
 operator observed; it fails with `RebuildLeaseLost` when the lock row is gone or names another
 owner (the rebuild it meant to release has already ended or been replaced), and returns the odd,
 flagged generation. It never runs the rebuild's cleanup: its callers accept the tradeoff above.
@@ -1971,7 +1983,7 @@ languages and none is a conflict or a stale-fence rejection.
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `RebuildInProgress` (`Error::RebuildInProgress`)     | A commit's lock check failed. **Transient**: retried with a backoff, returned when attempts run out, never a rejection.            |
 | `RebuildLockHeld` (`Error::RebuildLockHeld`)         | `Begin` found an unexpired lock; names the owner and the expiry. Not retried by the engine.                                        |
-| `RebuildLeaseLost` (`Error::RebuildLeaseLost`)       | `Renew`, `End`, `ForceRelease`, or a guarded write found the lock gone, owned by someone else, or (guarded write) expired.         |
+| `RebuildLeaseLost` (`Error::RebuildLeaseLost`)       | `Renew`, `End`, `ForceRelease`, or a guarded write found the lock gone, owned by someone else, held under another generation (a later incarnation of the same owner token), or (guarded write) expired.         |
 | `RebuildConflict` (`Error::RebuildConflict`)         | `Begin` lost its race eight times. **Transient**.                                                                                  |
 | `RebuildStateInvalid` (`Error::RebuildStateInvalid`) | The two rows disagree in a way this protocol cannot produce.                                                                       |
 | `RebuildUnavailable` (`Error::RebuildUnavailable`)   | A reader found an odd generation: a rebuild is in progress, or a force-release left derived state untrustworthy. **Transient**.    |
@@ -2581,6 +2593,7 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_features (
 CREATE TABLE IF NOT EXISTS evt_events__evt_rebuild_lock (
     id               integer PRIMARY KEY,
     owner            text        NOT NULL,
+    generation       bigint      NOT NULL,
     lease_expires_at timestamptz NOT NULL
 );
 
@@ -2736,7 +2749,8 @@ name.)
   the old epoch re-read; a force-release leaves the generation odd with the flag set, so commits
   resume while readers stay fenced until a later rebuild completes and releases. While it
   replays, the rebuild's view writes are transactions that each take the lock row `FOR UPDATE`
-  and assert `owner = :me AND lease_expires_at > :now` in the same transaction, so a worker that
+  and assert `owner = :me AND generation = :generation AND lease_expires_at > :now` in the same
+  transaction, so a worker that
   lost the lock to a takeover blocks on it, then aborts instead of writing — the transactional
   equivalent of the DynamoDB per-batch `ConditionCheck`
   ([Rebuild Fence](#rebuild-fence)).
@@ -2751,8 +2765,8 @@ name.)
 
   ```sql
   -- acquire (the lock row; a unique violation means a lock row appeared since the read: read again)
-  INSERT INTO evt_events__evt_rebuild_lock (id, owner, lease_expires_at)
-  VALUES (0, $1, to_timestamp($2::bigint::double precision));
+  INSERT INTO evt_events__evt_rebuild_lock (id, owner, generation, lease_expires_at)
+  VALUES (0, $1, $3, to_timestamp($2::bigint::double precision));   -- $3 = the generation after the bump
   -- acquire (the generation; zero rows affected: the state moved, read again)
   INSERT INTO evt_events__evt_rebuild_generation (id, value, force_released)
   VALUES (0, $1, false)
@@ -2762,15 +2776,16 @@ name.)
          AND evt_events__evt_rebuild_generation.force_released);   -- $1 = :increment, $2 = :seenEven, $3 = :seenOdd
   -- takeover
   UPDATE evt_events__evt_rebuild_lock
-  SET owner = $1, lease_expires_at = to_timestamp($2::bigint::double precision)
+  SET owner = $1, generation = $5, lease_expires_at = to_timestamp($2::bigint::double precision)
   WHERE id = 0 AND owner = $3
     AND lease_expires_at < to_timestamp($4::bigint::double precision);
   UPDATE evt_events__evt_rebuild_generation SET value = value + 2 WHERE id = 0 AND value = $1;
   -- renew
   UPDATE evt_events__evt_rebuild_lock
-  SET lease_expires_at = to_timestamp($2::bigint::double precision) WHERE id = 0 AND owner = $1;
-  -- release
-  DELETE FROM evt_events__evt_rebuild_lock WHERE id = 0 AND owner = $1;
+  SET lease_expires_at = to_timestamp($2::bigint::double precision)
+  WHERE id = 0 AND owner = $1 AND generation = $3;
+  -- release (bound to the lease: $2 is its fencing generation; the generation row must still hold it)
+  DELETE FROM evt_events__evt_rebuild_lock WHERE id = 0 AND owner = $1 AND generation = $2;
   UPDATE evt_events__evt_rebuild_generation
   SET value = value + 1, force_released = false WHERE id = 0 AND value = $1;
   -- force-release
@@ -2779,7 +2794,7 @@ name.)
   SET value = value + 2, force_released = true WHERE id = 0 AND value = $1;
   -- reads
   SELECT value, force_released FROM evt_events__evt_rebuild_generation WHERE id = 0;
-  SELECT owner, EXTRACT(EPOCH FROM lease_expires_at)::bigint
+  SELECT owner, generation, EXTRACT(EPOCH FROM lease_expires_at)::bigint
   FROM evt_events__evt_rebuild_lock WHERE id = 0;
   ```
 

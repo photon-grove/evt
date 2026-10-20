@@ -579,7 +579,9 @@ and pins the bytes. What the decision left open:
   records no outcome, so a rejection decided during a rebuild is not recorded either.
 - The lifecycle is `Begin` (acquire, or take over an expired lease), `Renew`, `End`, and the
   operator's `ForceRelease`, plus `WriteViews`, the guarded batch the spec's per-batch condition
-  describes. A lease is whole seconds on the repository's clock.
+  describes. A lease is whole seconds on the repository's clock, and it is the owner token plus the
+  generation `Begin` returned (stored on the lock row), so `Renew`, `End`, and `WriteViews` fence a
+  stale incarnation of a worker that reuses an owner token.
 - A reader fences a decision with the generation alone: observe an even value, read, verify it is
   unchanged. No action rides on the commit for it; the lock check refuses a commit that races a
   rebuild, and a handler that returns the reader's error makes the engine return it and record

@@ -48,10 +48,12 @@ func (g RebuildGeneration) Settled() bool {
 	return g.Value%2 == 0
 }
 
-// RebuildLock is the rebuild-lock row: the owner token of the holder and the second its lease
-// lapses, in whole Unix seconds. The lease has expired when LeaseExpiresAt is before now.
+// RebuildLock is the rebuild-lock row: the owner token of the holder, the generation Begin
+// produced when it took the lock (the fencing token of the lease), and the second the lease lapses,
+// in whole Unix seconds. The lease has expired when LeaseExpiresAt is before now.
 type RebuildLock struct {
 	Owner          string
+	Generation     int64
 	LeaseExpiresAt time.Time
 }
 
@@ -77,7 +79,9 @@ func (s RebuildState) InProgress() bool {
 }
 
 // RebuildLease is what Begin returns: the owner, the odd generation the transaction produced, and
-// the second the lease lapses.
+// the second the lease lapses. The generation is the lease's fencing token: Renew, End, and
+// WriteViews present the whole lease, and a lock held by anyone else, or by the same owner token
+// under a later generation (another incarnation of the worker that took over), is not this lease.
 type RebuildLease struct {
 	Owner          string
 	Generation     int64
@@ -105,14 +109,16 @@ type RebuildFence interface {
 	// be at least one second.
 	Begin(ctx context.Context, owner string, lease time.Duration) (RebuildLease, error)
 
-	// Renew extends the holder's lease to the given duration from now and returns the new expiry.
-	// It fails with *RebuildLeaseLostError when the lock row is gone or names another owner; it
-	// does not require the lease to be unexpired.
-	Renew(ctx context.Context, owner string, lease time.Duration) (time.Time, error)
+	// Renew extends the lease to the given duration from now and returns it with the new expiry. It
+	// fails with *RebuildLeaseLostError unless the lock row still names the lease's owner and
+	// generation (a takeover, even by the same owner token, changes the generation); it does not
+	// require the lease to be unexpired.
+	Renew(ctx context.Context, lease RebuildLease, extend time.Duration) (RebuildLease, error)
 
 	// End releases the lock and restores the settled generation, clearing the force-release flag.
-	// It fails with *RebuildLeaseLostError when the caller no longer holds the lock.
-	End(ctx context.Context, owner string) (RebuildGeneration, error)
+	// It fails with *RebuildLeaseLostError unless the caller still holds the lease (owner and
+	// generation).
+	End(ctx context.Context, lease RebuildLease) (RebuildGeneration, error)
 
 	// ForceRelease is the operator's escape hatch for a lost or wedged worker: it deletes the lock
 	// row of the named owner, so commits resume at once, but leaves the generation odd and sets
@@ -121,9 +127,10 @@ type RebuildFence interface {
 	ForceRelease(ctx context.Context, owner string) (RebuildGeneration, error)
 
 	// WriteViews writes one batch of view operations (at most MaxRebuildViewBatch) atomically with
-	// a guard that the caller still holds an unexpired lease. A failed guard writes nothing and is
-	// *RebuildLeaseLostError: the worker lost its lock and must stop.
-	WriteViews(ctx context.Context, owner string, views []ProjectedView) error
+	// a guard that the caller still holds the lease (owner and generation) and that it has not
+	// expired. A failed guard writes nothing and is *RebuildLeaseLostError: the worker lost its
+	// lock, to a takeover or a force-release, and must stop.
+	WriteViews(ctx context.Context, lease RebuildLease, views []ProjectedView) error
 }
 
 // RebuildFenceProvider is implemented by repositories that keep the rebuild fence: the in-memory,

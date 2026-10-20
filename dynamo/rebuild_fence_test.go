@@ -132,7 +132,7 @@ func TestCommit_RebuildLockFailureRunsNoProbe(t *testing.T) {
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: oneEvent(t, "a", 1)}))
 
-	_, err := repo.RebuildFence().Begin(ctx, "job", time.Minute)
+	lease, err := repo.RebuildFence().Begin(ctx, "job", time.Minute)
 	require.NoError(t, err)
 
 	reads := client.gets.Load() + client.queries.Load()
@@ -144,7 +144,7 @@ func TestCommit_RebuildLockFailureRunsNoProbe(t *testing.T) {
 	require.Equal(t, reads, client.gets.Load()+client.queries.Load(), "no probe reads the stream")
 
 	// With the lock gone the same commit is the conflict it always was.
-	_, err = repo.RebuildFence().End(ctx, "job")
+	_, err = repo.RebuildFence().End(ctx, lease)
 	require.NoError(t, err)
 
 	err = repo.Commit(ctx, evt.SerializedResult{Events: oneEvent(t, "a", 1)})
@@ -292,36 +292,37 @@ func TestRebuildFence_GuardedViewWritesFailInOrder(t *testing.T) {
 	// No views table: refused before any request.
 	bare := dynamo.NewRepository(client, "events").WithClock(func() time.Time { return rebuildNow })
 
-	_, err := bare.RebuildFence().Begin(ctx, "job", time.Minute)
+	lease, err := bare.RebuildFence().Begin(ctx, "job", time.Minute)
 	require.NoError(t, err)
 
 	sent := client.transactions.Load()
 
 	var unconfigured *evt.ViewsNotConfiguredError
-	require.ErrorAs(t, bare.RebuildFence().WriteViews(ctx, "job", []evt.ProjectedView{put("a", "o")}), &unconfigured)
+	require.ErrorAs(t, bare.RebuildFence().WriteViews(ctx, lease, []evt.ProjectedView{put("a", "o")}), &unconfigured)
 	require.Equal(t, sent, client.transactions.Load())
 
 	repo := newFenceRepo(client)
 	fence := repo.RebuildFence()
 
 	// The guard is the last action of the one transaction.
-	require.NoError(t, fence.WriteViews(ctx, "job", []evt.ProjectedView{put("a", "owner-a"), put("b", "owner-a")}))
+	require.NoError(t, fence.WriteViews(ctx, lease, []evt.ProjectedView{put("a", "owner-a"), put("b", "owner-a")}))
 
 	calls := fake.Transactions()
 	last := calls[len(calls)-1]
 	require.Len(t, last, 3)
 	require.Equal(t, compat.TransactionAction{
 		Operation: "ConditionCheck", PK: "SYSTEM#REBUILD", SK: 0,
-		Condition: "#owner = :me AND leaseExpiresAt > :now",
-		Names:     map[string]string{"#owner": "owner"},
+		Condition: "#owner = :me AND #generation = :generation AND leaseExpiresAt > :now",
+		Names:     map[string]string{"#owner": "owner", "#generation": "generation"},
 		Values: map[string]any{
-			":me":  map[string]any{"S": "job"},
-			":now": map[string]any{"N": "1790000000"},
+			":me":         map[string]any{"S": "job"},
+			":generation": map[string]any{"N": "1"},
+			":now":        map[string]any{"N": "1790000000"},
 		},
 	}, last[2])
 
 	// A view whose own condition fails names its projector and operation, and writes nothing.
-	err = fence.WriteViews(ctx, "job", []evt.ProjectedView{
+	err = fence.WriteViews(ctx, lease, []evt.ProjectedView{
 		put("c", "owner-c"),
 		{Projector: "rebuild", Operation: 1, Op: evt.PutView("rebuilt", "a", "owner-z", "t", []byte(`{}`))},
 	})
@@ -336,7 +337,7 @@ func TestRebuildFence_GuardedViewWritesFailInOrder(t *testing.T) {
 	_, err = fence.ForceRelease(ctx, "job")
 	require.NoError(t, err)
 
-	err = fence.WriteViews(ctx, "job", []evt.ProjectedView{
+	err = fence.WriteViews(ctx, lease, []evt.ProjectedView{
 		{Projector: "rebuild", Op: evt.PutView("rebuilt", "a", "owner-z", "t", []byte(`{}`))},
 	})
 	require.True(t, evt.IsRebuildLeaseLostErr(err))
@@ -421,7 +422,8 @@ func TestRebuildFence_BeginReportsAStateNoTransactionProduces(t *testing.T) {
 	fake := compat.NewFakeDynamo()
 	fake.SeedItem(map[string]types.AttributeValue{
 		"pk": &types.AttributeValueMemberS{Value: evt.RebuildLockID}, "sk": &types.AttributeValueMemberN{Value: "0"},
-		"owner": &types.AttributeValueMemberS{Value: "job"}, "leaseExpiresAt": &types.AttributeValueMemberN{Value: "1790003600"},
+		"owner": &types.AttributeValueMemberS{Value: "job"}, "generation": &types.AttributeValueMemberN{Value: "3"},
+		"leaseExpiresAt": &types.AttributeValueMemberN{Value: "1790003600"},
 	})
 
 	client := &countingClient{FakeDynamo: fake}

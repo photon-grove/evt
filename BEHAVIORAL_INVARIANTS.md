@@ -857,11 +857,13 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 - **Lifecycle** (`evt.RebuildFence`, from `evt.RebuildFenceProvider`; Rust `RebuildFence`):
   `Begin` acquires or takes over an expired lease (`*evt.RebuildLockHeldError` while one is held,
   `*evt.RebuildStateInvalidError` for a state the protocol cannot produce), `Renew` extends the
-  holder's lease, `End` releases it, `ForceRelease` is the operator's escape hatch, and `WriteViews`
+  lease, `End` releases it (both, and `WriteViews`, take the whole `evt.RebuildLease`), `ForceRelease` is the operator's escape hatch, and `WriteViews`
   writes one guarded batch of at most 99 view operations whose last action is a lease guard. A
   caller that no longer holds the lock gets `*evt.RebuildLeaseLostError` and must stop; on
   PostgreSQL the guarded transaction holds the lock row `FOR UPDATE`, so a takeover waits for it.
-  Leases are whole seconds on the repository's clock; the generation is always read with a
+  A lease is its owner token **and** the fencing generation `Begin` returned, stored on the lock
+  row: a worker whose lease lapsed cannot renew, write for, or end the lease of a later
+  incarnation that took over under the same owner token. Leases are whole seconds on the repository's clock; the generation is always read with a
   strongly consistent read.
 - **Readers** fence a decision with `evt.ReadAtRebuildEpoch` (or `ObserveRebuildEpoch` and
   `RebuildEpoch.Verify`): an odd generation is `*evt.RebuildUnavailableError` and a changed settled

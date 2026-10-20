@@ -173,15 +173,15 @@ func TestRebuildFence_GuardedBatchWritesAllOrNothing(t *testing.T) {
 	require.True(t, ok)
 	fence := repo.RebuildFence()
 
-	_, err := fence.Begin(ctx, "job", time.Hour)
+	lease, err := fence.Begin(ctx, "job", time.Hour)
 	require.NoError(t, err)
 
 	// Another stream owns the row at ("pk", "taken").
-	require.NoError(t, fence.WriteViews(ctx, "job", []evt.ProjectedView{
+	require.NoError(t, fence.WriteViews(ctx, lease, []evt.ProjectedView{
 		{Projector: "p", Op: evt.PutView("pk", "taken", "stream-a", "t", []byte(`{}`))},
 	}))
 
-	err = fence.WriteViews(ctx, "job", []evt.ProjectedView{
+	err = fence.WriteViews(ctx, lease, []evt.ProjectedView{
 		{Projector: "p", Op: evt.PutView("pk", "fresh", "stream-b", "t", []byte(`{}`))},
 		{Projector: "p", Operation: 1, Op: evt.PutView("pk", "taken", "stream-b", "t", []byte(`{}`))},
 	})

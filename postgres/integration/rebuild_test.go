@@ -186,13 +186,13 @@ func Test_Rebuild_ATakeoverWaitsForAGuardedWriteInFlight(t *testing.T) {
 
 	clock := time.Now()
 	worker := log.WithClock(func() time.Time { return clock })
-	_, err := worker.RebuildFence().Begin(ctx, "old", 10*time.Second)
+	oldLease, err := worker.RebuildFence().Begin(ctx, "old", 10*time.Second)
 	require.NoError(t, err)
 
 	done := make(chan error, 1)
 
 	go func() {
-		done <- worker.RebuildFence().WriteViews(ctx, "old", []evt.ProjectedView{
+		done <- worker.RebuildFence().WriteViews(ctx, oldLease, []evt.ProjectedView{
 			{Projector: "slow", Op: evt.PutView("pk", "sk", "owner", "test", []byte(`{}`))},
 		})
 	}()
@@ -211,7 +211,7 @@ func Test_Rebuild_ATakeoverWaitsForAGuardedWriteInFlight(t *testing.T) {
 	require.NoError(t, <-done, "the old worker's batch had asserted its lease and committed first")
 
 	// Now it has lost the lock: the next batch aborts without writing.
-	err = worker.RebuildFence().WriteViews(ctx, "old", []evt.ProjectedView{
+	err = worker.RebuildFence().WriteViews(ctx, oldLease, []evt.ProjectedView{
 		{Projector: "slow", Op: evt.PutView("pk", "again", "owner", "test", []byte(`{}`))},
 	})
 	require.True(t, evt.IsRebuildLeaseLostErr(err))

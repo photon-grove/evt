@@ -151,17 +151,18 @@ func (f *rebuildFence) generation(ctx context.Context, db queryRower, forUpdate 
 
 // lock reads the lock row, nil when none exists.
 func (f *rebuildFence) lock(ctx context.Context, db queryRower, forUpdate bool) (*evt.RebuildLock, error) {
-	query := fmt.Sprintf(`SELECT owner, %s FROM %s WHERE id = 0`, leaseSeconds, f.repo.rebuildLockTable())
+	query := fmt.Sprintf(`SELECT owner, generation, %s FROM %s WHERE id = 0`, leaseSeconds, f.repo.rebuildLockTable())
 	if forUpdate {
 		query += " FOR UPDATE"
 	}
 
 	var (
-		owner  string
-		expiry int64
+		owner      string
+		generation int64
+		expiry     int64
 	)
 
-	err := db.QueryRow(ctx, query).Scan(&owner, &expiry)
+	err := db.QueryRow(ctx, query).Scan(&owner, &generation, &expiry)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -170,7 +171,7 @@ func (f *rebuildFence) lock(ctx context.Context, db queryRower, forUpdate bool) 
 		return nil, fmt.Errorf("postgres: reading the rebuild lock: %w", err)
 	}
 
-	return &evt.RebuildLock{Owner: owner, LeaseExpiresAt: time.Unix(expiry, 0)}, nil
+	return &evt.RebuildLock{Owner: owner, Generation: generation, LeaseExpiresAt: time.Unix(expiry, 0)}, nil
 }
 
 // Generation reads the generation row. PostgreSQL reads are transactionally consistent, so no
@@ -259,9 +260,9 @@ func (f *rebuildFence) begin(ctx context.Context, tx pgx.Tx, owner string, secon
 	expiry := now.Unix() + seconds
 
 	if plan.Kind == evt.RebuildTakeover {
-		err = f.takeover(ctx, tx, owner, plan, now.Unix(), expiry)
+		err = f.takeover(ctx, tx, owner, plan, generation.Value+plan.Increment, now.Unix(), expiry)
 	} else {
-		err = f.acquire(ctx, tx, owner, plan, expiry)
+		err = f.acquire(ctx, tx, owner, plan, generation.Value+plan.Increment, expiry)
 	}
 
 	if err != nil {
@@ -275,12 +276,18 @@ func (f *rebuildFence) begin(ctx context.Context, tx pgx.Tx, owner string, secon
 	}, nil
 }
 
-func (f *rebuildFence) acquire(ctx context.Context, tx pgx.Tx, owner string, plan evt.RebuildPlan, expiry int64) error {
+func (f *rebuildFence) acquire(
+	ctx context.Context,
+	tx pgx.Tx,
+	owner string,
+	plan evt.RebuildPlan,
+	token, expiry int64,
+) error {
 	insert := fmt.Sprintf(
-		`INSERT INTO %s (id, owner, lease_expires_at) VALUES (0, $1, %s)`,
+		`INSERT INTO %s (id, owner, generation, lease_expires_at) VALUES (0, $1, $3, %s)`,
 		f.repo.rebuildLockTable(), timestampOf(2),
 	)
-	if _, err := tx.Exec(ctx, insert, owner, expiry); err != nil {
+	if _, err := tx.Exec(ctx, insert, owner, expiry, token); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
 			return errRebuildMoved
@@ -314,14 +321,15 @@ func (f *rebuildFence) takeover(
 	tx pgx.Tx,
 	owner string,
 	plan evt.RebuildPlan,
-	now, expiry int64,
+	token, now, expiry int64,
 ) error {
 	update := fmt.Sprintf(
-		`UPDATE %s SET owner = $1, lease_expires_at = %s WHERE id = 0 AND owner = $3 AND lease_expires_at < %s`,
+		`UPDATE %s SET owner = $1, generation = $5, lease_expires_at = %s
+		 WHERE id = 0 AND owner = $3 AND lease_expires_at < %s`,
 		f.repo.rebuildLockTable(), timestampOf(2), timestampOf(4),
 	)
 
-	tag, err := tx.Exec(ctx, update, owner, expiry, plan.ObservedOwner, now)
+	tag, err := tx.Exec(ctx, update, owner, expiry, plan.ObservedOwner, now, token)
 	if err != nil {
 		return fmt.Errorf("postgres: taking over the rebuild lock: %w", err)
 	}
@@ -344,50 +352,54 @@ func (f *rebuildFence) takeover(
 	return nil
 }
 
-// Renew extends the holder's lease with one conditional update.
-func (f *rebuildFence) Renew(ctx context.Context, owner string, lease time.Duration) (time.Time, error) {
-	if err := evt.CheckRebuildOwner(owner); err != nil {
-		return time.Time{}, err
+// Renew extends the lease with one conditional update bound to its owner and fencing generation.
+func (f *rebuildFence) Renew(ctx context.Context, lease evt.RebuildLease, extend time.Duration) (evt.RebuildLease, error) {
+	if err := evt.CheckRebuildOwner(lease.Owner); err != nil {
+		return evt.RebuildLease{}, err
 	}
 
-	seconds, err := evt.RebuildLeaseSeconds(lease)
+	seconds, err := evt.RebuildLeaseSeconds(extend)
 	if err != nil {
-		return time.Time{}, err
+		return evt.RebuildLease{}, err
 	}
 
 	expiry := f.repo.clock().Unix() + seconds
 
 	tag, err := f.repo.db.Exec(ctx,
-		fmt.Sprintf(`UPDATE %s SET lease_expires_at = %s WHERE id = 0 AND owner = $1`,
+		fmt.Sprintf(`UPDATE %s SET lease_expires_at = %s WHERE id = 0 AND owner = $1 AND generation = $3`,
 			f.repo.rebuildLockTable(), timestampOf(2)),
-		owner, expiry,
+		lease.Owner, expiry, lease.Generation,
 	)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("postgres: renewing the rebuild lease: %w", err)
+		return evt.RebuildLease{}, fmt.Errorf("postgres: renewing the rebuild lease: %w", err)
 	}
 
 	if tag.RowsAffected() == 0 {
-		return time.Time{}, &evt.RebuildLeaseLostError{Owner: owner}
+		return evt.RebuildLease{}, &evt.RebuildLeaseLostError{Owner: lease.Owner}
 	}
 
-	return time.Unix(expiry, 0), nil
+	lease.LeaseExpiresAt = time.Unix(expiry, 0)
+
+	return lease, nil
 }
 
-// End releases the lock and settles the generation in one transaction.
-func (f *rebuildFence) End(ctx context.Context, owner string) (evt.RebuildGeneration, error) {
-	return f.release(ctx, owner, 1, false)
+// End releases the lock and settles the generation in one transaction, bound to the lease.
+func (f *rebuildFence) End(ctx context.Context, lease evt.RebuildLease) (evt.RebuildGeneration, error) {
+	return f.release(ctx, lease.Owner, &lease.Generation, 1, false)
 }
 
 // ForceRelease deletes the named owner's lock and leaves the generation odd and flagged.
 func (f *rebuildFence) ForceRelease(ctx context.Context, owner string) (evt.RebuildGeneration, error) {
-	return f.release(ctx, owner, 2, true)
+	return f.release(ctx, owner, nil, 2, true)
 }
 
 // release runs a release's or a force-release's transaction: delete the owner's lock row and bump
-// the generation from the odd value it holds.
+// the generation from the odd value it holds. A release is bound to its lease's fencing generation
+// (token); a force-release names only the owner.
 func (f *rebuildFence) release(
 	ctx context.Context,
 	owner string,
+	token *int64,
 	increment int64,
 	forced bool,
 ) (evt.RebuildGeneration, error) {
@@ -408,12 +420,19 @@ func (f *rebuildFence) release(
 		}
 
 		// A settled generation means no rebuild holds the fence, so the caller cannot be the holder.
-		if generation.Settled() {
+		if generation.Settled() || (token != nil && generation.Value != *token) {
 			return &evt.RebuildLeaseLostError{Owner: owner}
 		}
 
-		tag, err := tx.Exec(ctx,
-			fmt.Sprintf(`DELETE FROM %s WHERE id = 0 AND owner = $1`, f.repo.rebuildLockTable()), owner)
+		deletion := fmt.Sprintf(`DELETE FROM %s WHERE id = 0 AND owner = $1`, f.repo.rebuildLockTable())
+		args := []any{owner}
+
+		if token != nil {
+			deletion += " AND generation = $2"
+			args = append(args, *token)
+		}
+
+		tag, err := tx.Exec(ctx, deletion, args...)
 		if err != nil {
 			return fmt.Errorf("postgres: releasing the rebuild lock: %w", err)
 		}
@@ -453,8 +472,8 @@ func (f *rebuildFence) release(
 // takeover, which must update or delete that row, blocks until the batch commits: the old worker
 // either asserts its lease and commits first, or waits and then fails the assertion against the
 // new owner. A plain predicate read would hold no lock and leave exactly that window.
-func (f *rebuildFence) WriteViews(ctx context.Context, owner string, views []evt.ProjectedView) error {
-	if err := evt.CheckRebuildOwner(owner); err != nil {
+func (f *rebuildFence) WriteViews(ctx context.Context, lease evt.RebuildLease, views []evt.ProjectedView) error {
+	if err := evt.CheckRebuildOwner(lease.Owner); err != nil {
 		return err
 	}
 
@@ -473,8 +492,9 @@ func (f *rebuildFence) WriteViews(ctx context.Context, owner string, views []evt
 			return lerr
 		}
 
-		if lock == nil || lock.Owner != owner || lock.LeaseExpiresAt.Unix() <= f.repo.clock().Unix() {
-			return &evt.RebuildLeaseLostError{Owner: owner}
+		if lock == nil || lock.Owner != lease.Owner || lock.Generation != lease.Generation ||
+			lock.LeaseExpiresAt.Unix() <= f.repo.clock().Unix() {
+			return &evt.RebuildLeaseLostError{Owner: lease.Owner}
 		}
 
 		return execViews(ctx, tx, built)

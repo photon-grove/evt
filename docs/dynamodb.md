@@ -100,7 +100,8 @@ The rebuild-lock check (C10) is a `ConditionCheck` of `attribute_not_exists(pk)`
 `(SYSTEM#REBUILD, sk = 0)`, the second action of every commit: it fails whenever a rebuild holds
 the lock, an expired one included, and is reported as `*evt.RebuildInProgressError` ahead of every
 other failure but the marker check. It is billed as one write unit like the marker check.
-Rebuild workers manage the lock and its generation counter through `Repository.RebuildFence()`
+Every lease-guarded write is conditioned on the lock item's `owner` and `generation` (the fencing token
+`Begin` returned), so `End` sends only its one transaction, with no read first. Rebuild workers manage the lock and its generation counter through `Repository.RebuildFence()`
 ([Rebuild fence](../README.md#rebuild-fence-v09-c10)); the lifecycle's transactions write only the
 two `SYSTEM#REBUILD*` items, and a worker's role needs `dynamodb:PutItem`, `dynamodb:UpdateItem`,
 `dynamodb:DeleteItem` and `dynamodb:ConditionCheckItem` on the table for them, and `GetItem` for

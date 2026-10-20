@@ -268,11 +268,11 @@ fence := repo.(evt.RebuildFenceProvider).RebuildFence()
 
 lease, err := fence.Begin(ctx, "rebuild-2026-10", 5*time.Minute) // acquire, or take over an expired lease
 // ... wipe and replay, renewing the lease while it runs:
-_, err = fence.Renew(ctx, "rebuild-2026-10", 5*time.Minute)
+lease, err = fence.Renew(ctx, lease, 5*time.Minute)
 // ... write view batches under the lease guard (at most 99 operations each):
-err = fence.WriteViews(ctx, "rebuild-2026-10", batch) // *evt.RebuildLeaseLostError: stop, you were replaced
+err = fence.WriteViews(ctx, lease, batch) // *evt.RebuildLeaseLostError: stop, you were replaced
 // ... and release it:
-_, err = fence.End(ctx, "rebuild-2026-10")
+_, err = fence.End(ctx, lease)
 ```
 
 - **Refusal is transient, never a conflict.** A commit that meets the lock is retried with a backoff
@@ -295,8 +295,12 @@ _, err = fence.End(ctx, "rebuild-2026-10")
   the read ran). A command handler that read a derived view returns that error as its own: the
   engine returns it at once and records no outcome, so a decision made on a half-rebuilt view is
   never persisted as an accepted or rejected outcome.
+- A lease is the owner token **and** the generation `Begin` returned, its fencing token: `Renew`,
+  `End`, and `WriteViews` take the whole `evt.RebuildLease`, so a worker whose lease lapsed cannot
+  renew, write for, or end the lease of a later incarnation that took over under the same owner
+  token (`*evt.RebuildLeaseLostError`).
 - Leases are whole seconds on the repository's clock (`WithClock` in tests); the owner token is any
-  string up to 512 bytes. The rows are the reserved `SYSTEM#REBUILD` and `SYSTEM#REBUILD#GENERATION`
+  string up to 512 bytes without U+0000. The rows are the reserved `SYSTEM#REBUILD` and `SYSTEM#REBUILD#GENERATION`
   items on DynamoDB, and the `{events}__evt_rebuild_lock` and `{events}__evt_rebuild_generation`
   tables on PostgreSQL (`EnsureSchema` creates them). See the [storage
   format](docs/spec/storage-format.md#rebuild-fence) for the exact transactions.

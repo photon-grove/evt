@@ -203,11 +203,12 @@ func settle(ctx context.Context, b backend) error {
 		return nil
 	}
 
-	if _, err = fence.Begin(ctx, "compat-settle", time.Minute); err != nil {
+	lease, err := fence.Begin(ctx, "compat-settle", time.Minute)
+	if err != nil {
 		return err
 	}
 
-	_, err = fence.End(ctx, "compat-settle")
+	_, err = fence.End(ctx, lease)
 
 	return err
 }

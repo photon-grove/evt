@@ -37,7 +37,23 @@ func (r Runner) rebuild(ctx context.Context, entityID evt.EntityID, step Step) (
 	}
 
 	owner := r.scopedOwner(entityID, step.Owner)
-	lease := time.Duration(step.LeaseSeconds) * time.Second
+	extend := time.Duration(step.LeaseSeconds) * time.Second
+
+	// Every step is its own process, so a step that presents a lease (renew, end, writeViews)
+	// rebuilds it from the store: the lock's fencing generation when the lock names the owner, and
+	// a generation no lock holds otherwise.
+	held := evt.RebuildLease{Owner: owner}
+
+	if step.Action == "renew" || step.Action == "end" || step.Action == "writeViews" {
+		state, serr := driver.Fence.State(ctx)
+		if serr != nil {
+			return Outcome{}, serr
+		}
+
+		if state.Lock != nil && state.Lock.Owner == owner {
+			held.Generation = state.Lock.Generation
+		}
+	}
 
 	var (
 		result string
@@ -47,11 +63,11 @@ func (r Runner) rebuild(ctx context.Context, entityID evt.EntityID, step Step) (
 
 	switch step.Action {
 	case "begin":
-		_, call = driver.Fence.Begin(ctx, owner, lease)
+		_, call = driver.Fence.Begin(ctx, owner, extend)
 	case "renew":
-		_, call = driver.Fence.Renew(ctx, owner, lease)
+		_, call = driver.Fence.Renew(ctx, held, extend)
 	case "end":
-		_, call = driver.Fence.End(ctx, owner)
+		_, call = driver.Fence.End(ctx, held)
 	case "forceRelease":
 		_, call = driver.Fence.ForceRelease(ctx, owner)
 	case "generation":
@@ -59,7 +75,7 @@ func (r Runner) rebuild(ctx context.Context, entityID evt.EntityID, step Step) (
 	case "wait":
 		call = driver.Wait(ctx, step.Seconds)
 	case "writeViews":
-		call = driver.Fence.WriteViews(ctx, owner, []evt.ProjectedView{{
+		call = driver.Fence.WriteViews(ctx, held, []evt.ProjectedView{{
 			Projector: "rebuild",
 			Op: evt.PutView(RebuildViewPK(entityID), owner, evt.EntityID(owner), RebuildViewType,
 				[]byte(fmt.Sprintf(`{"owner":%q}`, owner))),
