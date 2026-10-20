@@ -192,6 +192,15 @@ impl Retry {
                 ..
             } => Self::Conflict,
             Error::Transient(_) | Error::AmbiguousWrite { .. } => Self::Transient,
+            // A rebuild holds the lock (C10): the store-level control row says nothing about the
+            // decision, so it is never a conflict and never exhausts into a rejection, but the
+            // lock may be released, taken over, or force-released by the next attempt. The
+            // reader errors are only returned by a lost `begin_rebuild` race or a handler's
+            // own epoch check (which is returned at once, as the handler's error).
+            Error::RebuildInProgress
+            | Error::RebuildConflict { .. }
+            | Error::RebuildUnavailable { .. }
+            | Error::RebuildEpochChanged { .. } => Self::Transient,
             // Stream head drift says the log is damaged, not that a decision went stale: it is
             // returned at once, never retried and never exhausted into a stale-fence rejection.
             // A table that is not migrated stays that way until an operator migrates it.
@@ -321,6 +330,32 @@ mod tests {
             Failed::committing(Error::Handler("boom".into())).retry(),
             Retry::Never
         );
+    }
+
+    #[test]
+    fn a_commit_refused_by_a_rebuild_is_retried_but_never_exhausted_into_a_rejection() {
+        use crate::Error;
+
+        let refused = || Error::RebuildInProgress;
+
+        assert_eq!(Failed::committing(refused()).retry(), Retry::Transient);
+        assert_eq!(Failed::deciding(refused()).retry(), Retry::Transient);
+
+        // A handler or prepare step that returns a reader's epoch error is the command's own
+        // failure: returned at once, whatever the variant.
+        for error in [
+            Error::RebuildUnavailable {
+                generation: 3,
+                force_released: false,
+            },
+            Error::RebuildEpochChanged {
+                observed: 2,
+                current: 4,
+            },
+            refused(),
+        ] {
+            assert_eq!(Failed::internal(error).retry(), Retry::Never);
+        }
     }
 
     #[test]

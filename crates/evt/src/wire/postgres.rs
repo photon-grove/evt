@@ -40,6 +40,19 @@ pub fn features_table(events_table: &str) -> String {
     format!("{events_table}{RESERVED_INFIX}features")
 }
 
+/// The rebuild-lock table for an events table (`evt_events` yields
+/// `evt_events__evt_rebuild_lock`): at most one row, `id = 0`, while a rebuild holds the fence
+/// (C10).
+pub fn rebuild_lock_table(events_table: &str) -> String {
+    format!("{events_table}{RESERVED_INFIX}rebuild_lock")
+}
+
+/// The rebuild generation table for an events table (`evt_events` yields
+/// `evt_events__evt_rebuild_generation`): one row, `id = 0`, once the first rebuild begins (C10).
+pub fn rebuild_generation_table(events_table: &str) -> String {
+    format!("{events_table}{RESERVED_INFIX}rebuild_generation")
+}
+
 /// The stream-heads table for an events table (`evt_events` yields
 /// `evt_events__evt_stream_heads`): one row per stream with its head (ADR 0007).
 pub fn stream_heads_table(events_table: &str) -> String {
@@ -105,6 +118,18 @@ CREATE TABLE IF NOT EXISTS {features} (
     retention         text   NOT NULL DEFAULT '[]'
 );
 
+CREATE TABLE IF NOT EXISTS {rebuild_lock} (
+    id               integer PRIMARY KEY,
+    owner            text        NOT NULL,
+    lease_expires_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS {rebuild_generation} (
+    id             integer PRIMARY KEY,
+    value          bigint   NOT NULL,
+    force_released boolean  NOT NULL DEFAULT false
+);
+
 CREATE TABLE IF NOT EXISTS {stream_heads} (
     entity_id   text   PRIMARY KEY,
     entity_type text   NOT NULL,
@@ -113,6 +138,8 @@ CREATE TABLE IF NOT EXISTS {stream_heads} (
 "#,
         outcomes = outcomes_table(events_table),
         features = features_table(events_table),
+        rebuild_lock = rebuild_lock_table(events_table),
+        rebuild_generation = rebuild_generation_table(events_table),
         stream_heads = stream_heads_table(events_table)
     )
 }
@@ -249,6 +276,15 @@ pub fn features_lock_key(events_table: &str) -> String {
     format!("{}:features", events_table.to_ascii_lowercase())
 }
 
+/// The advisory-lock key of an events table's rebuild fence (C10): commits take
+/// [`FEATURES_LOCK_SHARED`]'s statement with it (shared, held to `COMMIT`) before they assert the
+/// lock row is absent, and the lifecycle transactions take [`FEATURES_LOCK_EXCLUSIVE`]'s, so no
+/// acquire or release slips between a commit's assertion and its `COMMIT`. Like the feature key, it
+/// derives from the configured events table name.
+pub fn rebuild_lock_key(events_table: &str) -> String {
+    format!("{}:rebuild", events_table.to_ascii_lowercase())
+}
+
 /// Reports whether a table name is safe to use unquoted: it matches `^[A-Za-z_][A-Za-z0-9_]*$`,
 /// is at most `max_len` bytes, and is not a reserved keyword.
 pub fn is_valid_identifier(name: &str, max_len: usize) -> bool {
@@ -266,9 +302,10 @@ pub fn is_valid_identifier(name: &str, max_len: usize) -> bool {
 
 /// Checks a pair of table names: each must be a valid identifier within its length cap and must
 /// not contain the reserved infix, and no two relations the schema creates (the tables, the
-/// entity-type index, the command-outcomes, feature-marker, and stream-heads tables, and each table's `{table}_pkey` index) may share
-/// a name. Unquoted identifiers fold to lower case, so names are compared that way.
-/// `CREATE TABLE IF NOT EXISTS` would otherwise skip a table whose name an index already took.
+/// entity-type index, the command-outcomes, feature-marker, rebuild-lock, rebuild-generation, and
+/// stream-heads tables, and each table's `{table}_pkey` index) may share a name. Unquoted
+/// identifiers fold to lower case, so names are compared that way. `CREATE TABLE IF NOT EXISTS`
+/// would otherwise skip a table whose name an index already took.
 pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<(), String> {
     for (name, max_len) in [
         (events_table, MAX_EVENTS_TABLE_NAME_LEN),
@@ -290,6 +327,8 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
     let features = features_table(&events);
     let outcomes = outcomes_table(&events);
     let heads = stream_heads_table(&events);
+    let rebuild_lock = rebuild_lock_table(&events);
+    let rebuild_generation = rebuild_generation_table(&events);
     let relations = [
         events.clone(),
         format!("{events}_pkey"),
@@ -298,6 +337,10 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
         format!("{outcomes}_pkey"),
         features.clone(),
         format!("{features}_pkey"),
+        rebuild_lock.clone(),
+        format!("{rebuild_lock}_pkey"),
+        rebuild_generation.clone(),
+        format!("{rebuild_generation}_pkey"),
         heads.clone(),
         format!("{heads}_pkey"),
         snapshots.clone(),
@@ -569,6 +612,37 @@ mod tests {
         // The longest derived name still fits PostgreSQL's identifier limit.
         let events = "e".repeat(MAX_EVENTS_TABLE_NAME_LEN);
         assert!(outcomes_table(&events).len() + "_pkey".len() <= 63);
+    }
+
+    #[test]
+    fn the_rebuild_relations_derive_from_the_events_table_and_fit_the_identifier_limit() {
+        assert_eq!(
+            rebuild_lock_table("evt_events"),
+            "evt_events__evt_rebuild_lock"
+        );
+        assert_eq!(
+            rebuild_generation_table("evt_events"),
+            "evt_events__evt_rebuild_generation"
+        );
+        assert_eq!(rebuild_lock_key("Orders"), "orders:rebuild");
+        assert_eq!(features_lock_key("Orders"), "orders:features");
+
+        // The generation table's primary key is the longest relation the schema derives: 34 + 29
+        // bytes fill PostgreSQL's 63-byte limit exactly.
+        assert_eq!(MAX_EVENTS_TABLE_NAME_LEN, 34);
+        let events = "e".repeat(MAX_EVENTS_TABLE_NAME_LEN);
+        assert_eq!(rebuild_generation_table(&events).len() + "_pkey".len(), 63);
+        assert!(check_table_names(&events, "snapshots").is_ok());
+        assert!(check_table_names(&format!("{events}e"), "snapshots").is_err());
+
+        // Both relations are created by the same idempotent DDL as the rest of the schema.
+        let ddl = schema_ddl("orders", "orders_snapshots");
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS orders__evt_rebuild_lock ("));
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS orders__evt_rebuild_generation ("));
+
+        // A snapshots table named like a derived rebuild relation is refused outright, by the
+        // reserved infix.
+        assert!(check_table_names("orders", "orders__evt_rebuild_lock_pkey").is_err());
     }
 
     #[test]

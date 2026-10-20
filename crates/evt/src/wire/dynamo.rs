@@ -29,6 +29,11 @@
 //! | `head`    | N    | the highest event sequence ever committed to the stream       |
 //! | `ttl`     | N    | optional, epoch seconds; only for entity types with retention |
 //!
+//! The rebuild fence (v0.9, C10) is two engine items in the reserved `SYSTEM#` namespace
+//! ([`rebuild_lock_item`], [`rebuild_generation_item`]): the lock `(SYSTEM#REBUILD, 0)` with
+//! `owner` and `leaseExpiresAt` (epoch seconds), and the generation
+//! `(SYSTEM#REBUILD#GENERATION, 0)` with `value` and an optional `forceReleased` flag.
+//!
 //! Items are modeled with [`AttributeValue`], whose serde encoding is DynamoDB JSON
 //! (`{"S": "..."}`), so they can be compared against fixtures and converted to SDK types.
 
@@ -44,6 +49,9 @@ use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventV
 use crate::json;
 use crate::metadata::Metadata;
 use crate::outcome::{Outcome, OutcomeStatus, Rejection};
+use crate::rebuild::{
+    REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildGeneration, RebuildLock,
+};
 
 /// The sort key of the inline snapshot item.
 pub const SNAPSHOT_SORT_KEY: i64 = 0;
@@ -154,6 +162,57 @@ pub fn delete_condition(condition: crate::projection::ViewCondition) -> &'static
 /// `attribute_not_exists(pk)` instead.
 pub const MARKER_CONDITION: &str = "attribute_not_exists(pk) OR version = :v";
 
+/// Condition for the rebuild-lock check every v0.9 commit carries (C10): no rebuild holds the
+/// lock, an expired one included. It binds no names or values.
+pub const REBUILD_LOCK_CHECK_CONDITION: &str = "attribute_not_exists(pk)";
+
+/// The expression-attribute-name placeholder of the lock row's `owner`, a reserved word.
+pub const REBUILD_OWNER_NAME: &str = "#owner";
+
+/// The expression-attribute-name placeholder of the generation's `value`, a reserved word.
+pub const REBUILD_VALUE_NAME: &str = "#value";
+
+/// The acquire's lock put condition: no lock row exists.
+pub const REBUILD_ACQUIRE_LOCK_CONDITION: &str = "attribute_not_exists(pk)";
+
+/// The acquire's generation update.
+pub const REBUILD_ACQUIRE_UPDATE: &str = "SET #value = if_not_exists(#value, :zero) + :increment";
+
+/// The acquire's generation condition: the settled (or absent) generation the caller observed, or
+/// the force-released odd one. The branch that does not apply binds `-1`.
+pub const REBUILD_ACQUIRE_CONDITION: &str = "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)";
+
+/// The takeover's lock put condition: the observed owner's lease expired.
+pub const REBUILD_TAKEOVER_LOCK_CONDITION: &str =
+    "leaseExpiresAt < :now AND #owner = :observedOwner";
+
+/// The takeover's generation update: odd to odd.
+pub const REBUILD_TAKEOVER_UPDATE: &str = "SET #value = #value + :two";
+
+/// The generation condition of a takeover, a release, and a force-release.
+pub const REBUILD_SEEN_ODD_CONDITION: &str = "#value = :seenOdd";
+
+/// The renew's lock update.
+pub const REBUILD_RENEW_UPDATE: &str = "SET leaseExpiresAt = :expiry";
+
+/// The renew's lock condition.
+pub const REBUILD_RENEW_CONDITION: &str = "#owner = :owner";
+
+/// The release's lock delete condition.
+pub const REBUILD_RELEASE_CONDITION: &str = "#owner = :me";
+
+/// The release's generation update: back to settled, the force-release flag cleared.
+pub const REBUILD_RELEASE_UPDATE: &str = "SET #value = #value + :one REMOVE forceReleased";
+
+/// The force-release's lock delete condition.
+pub const REBUILD_FORCE_RELEASE_CONDITION: &str = "#owner = :requestedOwner";
+
+/// The force-release's generation update: odd to odd, flagged.
+pub const REBUILD_FORCE_RELEASE_UPDATE: &str = "SET #value = #value + :two, forceReleased = :true";
+
+/// The guard of a rebuild view write: the caller still holds an unexpired lease.
+pub const REBUILD_GUARD_CONDITION: &str = "#owner = :me AND leaseExpiresAt > :now";
+
 /// A DynamoDB attribute value. Serializes as DynamoDB JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttributeValue {
@@ -261,6 +320,69 @@ pub fn feature_marker_from_item(item: &Item) -> Result<FeatureManifest, Error> {
         optional_string(item, "historyDependent")?,
         optional_string(item, "retention")?,
     )
+}
+
+/// The key of the rebuild-lock item (`pk = SYSTEM#REBUILD`, `sk = 0`).
+pub fn rebuild_lock_key() -> Item {
+    Item::from([
+        ("pk".into(), s(REBUILD_LOCK_ID)),
+        ("sk".into(), n(REBUILD_SORT_KEY)),
+    ])
+}
+
+/// The key of the rebuild generation item (`pk = SYSTEM#REBUILD#GENERATION`, `sk = 0`).
+pub fn rebuild_generation_key() -> Item {
+    Item::from([
+        ("pk".into(), s(REBUILD_GENERATION_ID)),
+        ("sk".into(), n(REBUILD_SORT_KEY)),
+    ])
+}
+
+/// Encodes the full rebuild-lock item an acquire or a takeover puts: `pk`, `sk`, `owner`, and
+/// `leaseExpiresAt` (whole Unix seconds).
+pub fn rebuild_lock_item(owner: &str, lease_expires_at: i64) -> Item {
+    let mut item = rebuild_lock_key();
+    item.insert("owner".into(), s(owner));
+    item.insert("leaseExpiresAt".into(), n(lease_expires_at));
+
+    item
+}
+
+/// Decodes the rebuild-lock item.
+pub fn rebuild_lock_from_item(item: &Item) -> Result<RebuildLock, Error> {
+    Ok(RebuildLock {
+        owner: required_string(item, "owner")?.to_owned(),
+        lease_expires_at: required_number(item, "leaseExpiresAt")?,
+    })
+}
+
+/// Encodes the rebuild generation item: `forceReleased` is written only when set.
+pub fn rebuild_generation_item(generation: RebuildGeneration) -> Item {
+    let mut item = rebuild_generation_key();
+    item.insert("value".into(), n(generation.value));
+    if generation.force_released {
+        item.insert("forceReleased".into(), AttributeValue::Bool(true));
+    }
+
+    item
+}
+
+/// Decodes the rebuild generation item. `forceReleased` is `false` when absent.
+pub fn rebuild_generation_from_item(item: &Item) -> Result<RebuildGeneration, Error> {
+    let force_released = match item.get("forceReleased") {
+        None => false,
+        Some(AttributeValue::Bool(flag)) => *flag,
+        Some(_) => {
+            return Err(Error::InvalidRecord(
+                "rebuild generation: forceReleased is not a boolean".into(),
+            ));
+        }
+    };
+
+    Ok(RebuildGeneration {
+        value: required_number(item, "value")?,
+        force_released,
+    })
 }
 
 /// The sort key of a command-outcome item.

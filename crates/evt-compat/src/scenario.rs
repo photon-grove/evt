@@ -6,14 +6,17 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use photon_evt::conformance::{FaultInjectingRepository, HeadFixtures};
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Begin, CommandIdentity, CommandOutcome, Commit, DigestInput, EntityId, EntityType, Error,
     EventId, EventSequence, EventType, EventVersion, ExecuteError, FenceProvenance, Metadata,
-    NewSnapshot, OutcomeConfig, ProjectedView, ReadFence, Repository, RetryPolicy, SerializedEvent,
-    SerializedSnapshot, Store, TransactionCommit, ViewOperation, ViewRow, default_digest, json,
+    NewSnapshot, OutcomeConfig, ProjectedView, ReadFence, RebuildFence, RebuildGeneration,
+    Repository, RetryPolicy, SerializedEvent, SerializedSnapshot, Store, TransactionCommit,
+    ViewOperation, ViewRow, default_digest, json, observe_rebuild_epoch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +78,10 @@ pub struct Scenario {
     /// stores, so every commit that writes events also writes ledger rows.
     #[serde(default)]
     pub projector: bool,
+    /// The scenario holds store-wide state across its steps (a rebuild lock refuses every other
+    /// scenario's commits), so the live run executes it alone, after the interleaved scenarios.
+    #[serde(default)]
+    pub exclusive: bool,
     pub steps: Vec<Step>,
 }
 
@@ -100,6 +107,14 @@ impl Scenario {
         }
         if self.projector {
             partitions.insert(LEDGER_PK.to_owned());
+        }
+        // Guarded rebuild writes leave their rows in a partition of their own.
+        if self
+            .steps
+            .iter()
+            .any(|step| step.op == "rebuild" && step.action == "writeViews")
+        {
+            partitions.insert(rebuild_view_pk(entity_id));
         }
 
         partitions.into_iter().collect()
@@ -189,6 +204,19 @@ pub struct Step {
     /// The commit-wide projectors' view operations of a `transaction` step, in declaration order.
     #[serde(default)]
     pub projectors: Vec<StepProjector>,
+    /// The lifecycle action of a `rebuild` step: `begin`, `renew`, `end`, `forceRelease`,
+    /// `generation`, `writeViews`, or `wait`.
+    #[serde(default)]
+    pub action: String,
+    /// The owner token of a `rebuild` step, scoped to the run and scenario before use.
+    #[serde(default)]
+    pub owner: String,
+    /// The lease of a `rebuild` step's `begin` or `renew`.
+    #[serde(default)]
+    pub lease_seconds: u64,
+    /// How long a `rebuild` step's `wait` waits.
+    #[serde(default)]
+    pub seconds: u64,
 }
 
 /// One projector of a transaction step: its name and the operations it emits.
@@ -407,9 +435,26 @@ pub struct Outcome {
     pub operation: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mapped: String,
+    /// A `rebuild` step's generation after the step minus the generation before it.
+    #[serde(default, skip_serializing_if = "is_zero_delta")]
+    pub delta: i64,
+    /// A `rebuild` step's force-release flag after the step.
+    #[serde(
+        default,
+        rename = "forceReleased",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub force_released: bool,
+    /// A `writeViews` step's rows in the scenario's rebuild partition after the step.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rows: usize,
 }
 
 fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_delta(value: &i64) -> bool {
     *value == 0
 }
 
@@ -633,6 +678,7 @@ pub struct Runner<R: Repository> {
     outcomes: Option<OutcomeRun>,
     heads: Option<Arc<dyn HeadAccess>>,
     views: Option<Arc<dyn ViewAccess>>,
+    rebuild: Option<Arc<dyn RebuildAccess>>,
     /// The scenario registers the shared [`LedgerProjector`] on every store the runner builds.
     projector: bool,
 }
@@ -688,8 +734,18 @@ impl<R: Repository> Runner<R> {
             outcomes: None,
             heads: None,
             views: None,
+            rebuild: None,
             projector: false,
         }
+    }
+
+    /// Gives the runner the backend's rebuild fence, which the `rebuild` steps drive (C10). The
+    /// `writeViews` step's `rows` are read through the [view access](Runner::with_view_access).
+    #[must_use]
+    pub fn with_rebuild_access(mut self, rebuild: impl RebuildAccess + 'static) -> Self {
+        self.rebuild = Some(Arc::new(rebuild));
+
+        self
     }
 
     /// Gives the runner read access to the backend's commit-wide view rows, which
@@ -795,6 +851,7 @@ impl<R: Repository> Runner<R> {
             "putSnapshot" => self.put_snapshot(entity_id, step).await,
             "transaction" => self.transaction(entity_id, step).await,
             "outcomeOnly" => self.outcome_only(step).await,
+            "rebuild" => self.rebuild(entity_id, step).await,
             "resolveOutcome" => self.resolve_outcome(entity_id, step).await,
             "compact" => {
                 let id = transaction_id(entity_id, step.suffix.as_deref().unwrap_or(""));
@@ -814,6 +871,82 @@ impl<R: Repository> Runner<R> {
             }
             other => Err(StepError::UnknownOp(other.to_owned())),
         }
+    }
+
+    /// Runs one lifecycle action of the `rebuild` op (C10) and reports what it observed: the
+    /// result, the generation delta across the step (read with the consistent generation read
+    /// before and after), the force-release flag after it, and, for `writeViews`, the rows the
+    /// scenario's rebuild partition holds.
+    async fn rebuild(&self, entity_id: &EntityId, step: &Step) -> Result<Outcome, StepError> {
+        let rebuild = self
+            .rebuild
+            .as_ref()
+            .ok_or(StepError::Missing("a rebuild driver"))?;
+
+        let before = rebuild.generation().await?;
+        let owner = scoped_owner(entity_id, &step.owner);
+        let lease = Duration::from_secs(step.lease_seconds);
+
+        let call = match step.action.as_str() {
+            "begin" => rebuild.begin(&owner, lease).await,
+            "renew" => rebuild.renew(&owner, lease).await,
+            "end" => rebuild.end(&owner).await,
+            "forceRelease" => rebuild.force_release(&owner).await,
+            "generation" => rebuild.observe().await,
+            "wait" => rebuild.wait(step.seconds).await,
+            "writeViews" => {
+                let view = ProjectedView::new(
+                    "rebuild",
+                    0,
+                    0,
+                    ViewOperation::put(
+                        rebuild_view_pk(entity_id),
+                        owner.clone(),
+                        owner.clone(),
+                        REBUILD_VIEW_TYPE,
+                        format!(
+                            r#"{{"owner":{}}}"#,
+                            json::to_string(&owner).map_err(Error::from)?
+                        ),
+                    ),
+                );
+
+                rebuild.write_views(&owner, vec![view]).await
+            }
+            other => {
+                return Err(StepError::Unexpected(format!(
+                    "unknown rebuild action {other:?}"
+                )));
+            }
+        };
+
+        let result = match call {
+            Ok(()) if step.action == "generation" => "settled",
+            Ok(()) => "ok",
+            Err(Error::RebuildLockHeld { .. }) => "held",
+            Err(Error::RebuildLeaseLost { .. }) => "leaseLost",
+            Err(Error::RebuildUnavailable { .. }) => "unavailable",
+            Err(error) => return Err(error.into()),
+        };
+
+        let after = rebuild.generation().await?;
+        let rows = if step.action == "writeViews" {
+            let views = self
+                .views
+                .as_ref()
+                .ok_or(StepError::Missing("view access for the rebuild rows"))?;
+
+            views.rows(&rebuild_view_pk(entity_id)).await?.len()
+        } else {
+            0
+        };
+
+        Ok(Outcome {
+            delta: after.value - before.value,
+            force_released: after.force_released,
+            rows,
+            ..Outcome::of(result)
+        })
     }
 
     /// Writes the stream's next event straight to the backend, as a writer that does not
@@ -950,6 +1083,9 @@ impl<R: Repository> Runner<R> {
                 if matches!(error, Error::StreamHeadDrift { .. }) {
                     return Ok(Outcome::of("drift"));
                 }
+                if matches!(error, Error::RebuildInProgress) {
+                    return Ok(Outcome::of("rebuildInProgress"));
+                }
                 if error.is_conflict() {
                     return Ok(Outcome::of("conflict"));
                 }
@@ -998,6 +1134,9 @@ impl<R: Repository> Runner<R> {
             Err(err) if err.is_duplicate_command() => Ok(Outcome::of("duplicate")),
             Err(err) if err.is_conflict() => Ok(Outcome::of("conflict")),
             Err(ExecuteError::Store(Error::StreamHeadDrift { .. })) => Ok(Outcome::of("drift")),
+            Err(ExecuteError::Store(Error::RebuildInProgress)) => {
+                Ok(Outcome::of("rebuildInProgress"))
+            }
             Err(ExecuteError::Store(err)) => Outcome::of_view_error(&err).ok_or_else(|| err.into()),
             Err(other) => Err(StepError::Unexpected(other.to_string())),
         }
@@ -1154,6 +1293,7 @@ impl<R: Repository> Runner<R> {
             }),
             Err(err) if err.is_conflict() => Ok(Outcome::of("conflict")),
             Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
+            Err(Error::RebuildInProgress) => Ok(Outcome::of("rebuildInProgress")),
             Err(err) => Err(err.into()),
         }
     }
@@ -1306,6 +1446,143 @@ impl<R: Repository> Runner<R> {
     }
 }
 
+/// The view partition a scenario's guarded rebuild writes go to.
+pub fn rebuild_view_pk(base: &EntityId) -> String {
+    format!("rebuild-{base}")
+}
+
+/// The entity type of the view rows a rebuild step writes.
+pub const REBUILD_VIEW_TYPE: &str = "rebuild";
+
+/// The owner token of a `rebuild` step, scoped to the run and the scenario like a command ID: the
+/// lock is global to the table, so a bare token could collide across runs.
+pub fn scoped_owner(base: &EntityId, owner: &str) -> String {
+    format!("{base}-{owner}")
+}
+
+/// A backend's rebuild fence, for the `rebuild` steps, and how a `wait` step waits. Boxed futures
+/// keep it object-safe; [`RebuildDriver`] implements it for any [`RebuildFence`].
+pub trait RebuildAccess: Send + Sync {
+    /// The generation, read consistently.
+    fn generation(&self) -> HeadFuture<'_, RebuildGeneration>;
+
+    /// Begins a rebuild.
+    fn begin<'a>(&'a self, owner: &'a str, lease: Duration) -> HeadFuture<'a, ()>;
+
+    /// Renews a lease.
+    fn renew<'a>(&'a self, owner: &'a str, lease: Duration) -> HeadFuture<'a, ()>;
+
+    /// Ends a rebuild.
+    fn end<'a>(&'a self, owner: &'a str) -> HeadFuture<'a, ()>;
+
+    /// Force-releases a rebuild.
+    fn force_release<'a>(&'a self, owner: &'a str) -> HeadFuture<'a, ()>;
+
+    /// A reader's observe: [`Error::RebuildUnavailable`] for an odd generation.
+    fn observe(&self) -> HeadFuture<'_, ()>;
+
+    /// One guarded batch of view writes.
+    fn write_views<'a>(&'a self, owner: &'a str, views: Vec<ProjectedView>) -> HeadFuture<'a, ()>;
+
+    /// Waits `seconds`: really, on a live backend, or by advancing the injected clock.
+    fn wait(&self, seconds: u64) -> HeadFuture<'_, ()>;
+}
+
+/// A settable clock in whole Unix seconds, for a repository's `with_clock`: a fixture run's `wait`
+/// advances it instead of sleeping.
+#[derive(Clone, Debug)]
+pub struct ManualClock(Arc<AtomicI64>);
+
+impl ManualClock {
+    /// A clock that reads `seconds`.
+    pub fn at(seconds: i64) -> Self {
+        Self(Arc::new(AtomicI64::new(seconds)))
+    }
+
+    /// The clock's current time.
+    pub fn now(&self) -> SystemTime {
+        let seconds = self.0.load(Ordering::SeqCst);
+
+        SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).unwrap_or_default())
+    }
+
+    /// Moves the clock forward.
+    pub fn advance(&self, seconds: u64) {
+        self.0
+            .fetch_add(i64::try_from(seconds).unwrap_or(i64::MAX), Ordering::SeqCst);
+    }
+
+    /// The clock as a function, for `with_clock`.
+    pub fn reader(&self) -> impl Fn() -> SystemTime + Send + Sync + 'static {
+        let clock = self.clone();
+
+        move || clock.now()
+    }
+}
+
+/// [`RebuildAccess`] over a [`RebuildFence`]: a `wait` sleeps (live runs) or advances a
+/// [`ManualClock`] the fence reads (fixture runs).
+pub struct RebuildDriver<F> {
+    fence: F,
+    clock: Option<ManualClock>,
+}
+
+impl<F: RebuildFence> RebuildDriver<F> {
+    /// A driver whose `wait` really sleeps.
+    pub fn sleeping(fence: F) -> Self {
+        Self { fence, clock: None }
+    }
+
+    /// A driver whose `wait` advances `clock`, which `fence` must read.
+    pub fn manual(fence: F, clock: ManualClock) -> Self {
+        Self {
+            fence,
+            clock: Some(clock),
+        }
+    }
+}
+
+impl<F: RebuildFence + 'static> RebuildAccess for RebuildDriver<F> {
+    fn generation(&self) -> HeadFuture<'_, RebuildGeneration> {
+        Box::pin(self.fence.rebuild_generation())
+    }
+
+    fn begin<'a>(&'a self, owner: &'a str, lease: Duration) -> HeadFuture<'a, ()> {
+        Box::pin(async move { self.fence.begin_rebuild(owner, lease).await.map(drop) })
+    }
+
+    fn renew<'a>(&'a self, owner: &'a str, lease: Duration) -> HeadFuture<'a, ()> {
+        Box::pin(async move { self.fence.renew_rebuild(owner, lease).await.map(drop) })
+    }
+
+    fn end<'a>(&'a self, owner: &'a str) -> HeadFuture<'a, ()> {
+        Box::pin(async move { self.fence.end_rebuild(owner).await.map(drop) })
+    }
+
+    fn force_release<'a>(&'a self, owner: &'a str) -> HeadFuture<'a, ()> {
+        Box::pin(async move { self.fence.force_release_rebuild(owner).await.map(drop) })
+    }
+
+    fn observe(&self) -> HeadFuture<'_, ()> {
+        Box::pin(async move { observe_rebuild_epoch(&self.fence).await.map(drop) })
+    }
+
+    fn write_views<'a>(&'a self, owner: &'a str, views: Vec<ProjectedView>) -> HeadFuture<'a, ()> {
+        Box::pin(async move { self.fence.write_rebuild_views(owner, &views).await })
+    }
+
+    fn wait(&self, seconds: u64) -> HeadFuture<'_, ()> {
+        Box::pin(async move {
+            match &self.clock {
+                Some(clock) => clock.advance(seconds),
+                None => tokio::time::sleep(Duration::from_secs(seconds)).await,
+            }
+
+            Ok(())
+        })
+    }
+}
+
 /// The command ID of a step in an outcomes scenario: outcome rows are global to the table, so a
 /// bare `c1` would collide across scenarios and across runs.
 pub fn scoped_command_id(run: &str, scenario: &str, command_id: &str) -> String {
@@ -1338,6 +1615,7 @@ fn classify<E>(result: Result<CommandOutcome<E>, Error>) -> Result<Outcome, Step
         Err(Error::DuplicateCommand(_)) => Ok(Outcome::of("duplicate")),
         Err(error) if error.is_conflict() => Ok(Outcome::of("conflict")),
         Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
+        Err(Error::RebuildInProgress) => Ok(Outcome::of("rebuildInProgress")),
         Err(error) => Outcome::of_view_error(&error).ok_or_else(|| error.into()),
     }
 }

@@ -32,11 +32,20 @@ use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::json;
 use crate::outcome::Outcome;
 use crate::projection::{ProjectedView, ProjectorOperationError, ViewCondition, ViewOperationKind};
+use crate::rebuild::Clock;
 use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 use crate::wire::dynamo::{self as wire, AttributeValue, HeadAction, Item};
 
 /// DynamoDB's limit on actions per transaction.
 pub const MAX_TRANSACTION_ITEMS: usize = 100;
+
+/// The control checks every commit starts with: the feature-marker check (index 0) and the
+/// rebuild-lock check (index 1). The projector operations, the stream groups, the fences, and the
+/// outcome put follow them.
+const CONTROL_ITEMS: usize = 2;
+
+/// The index of the rebuild-lock check in a commit's transaction.
+const REBUILD_LOCK_CHECK_INDEX: usize = 1;
 
 /// How many times a commit re-validates the feature marker when its condition fails before the
 /// commit gives up. Each revalidation re-reads the manifest, so only a table whose manifest keeps
@@ -138,7 +147,8 @@ pub struct DynamoRepository {
     consistent_read: bool,
     scan_page_size: Option<i32>,
     retention: BTreeMap<EntityType, Duration>,
-    clock: fn() -> SystemTime,
+    /// The clock `ttl` expiries and rebuild leases are read from.
+    clock: Clock,
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
     /// its own writer: clones validate independently, like separate processes.
     validated_marker: Mutex<CachedMarker>,
@@ -155,7 +165,7 @@ impl Clone for DynamoRepository {
             consistent_read: self.consistent_read,
             scan_page_size: self.scan_page_size,
             retention: self.retention.clone(),
-            clock: self.clock,
+            clock: self.clock.clone(),
             validated_marker: Mutex::new(*self.validated_marker()),
             // Like a separate process, a clone remembers nothing it did not load itself.
             loaded_ttls: Mutex::new(LoadedTtls::default()),
@@ -174,7 +184,7 @@ impl DynamoRepository {
             consistent_read: true,
             scan_page_size: None,
             retention: BTreeMap::new(),
-            clock: SystemTime::now,
+            clock: Clock::default(),
             validated_marker: Mutex::new(None),
             loaded_ttls: Mutex::new(LoadedTtls::default()),
         }
@@ -198,10 +208,11 @@ impl DynamoRepository {
         self.views_table.as_deref()
     }
 
-    /// Uses `clock` instead of the system time to compute `ttl` expiries. For tests.
+    /// Uses `clock` instead of the system time to compute `ttl` expiries and rebuild leases (see
+    /// [`RebuildFence`](crate::RebuildFence)). For tests.
     #[must_use]
-    pub fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
-        self.clock = clock;
+    pub fn with_clock(mut self, clock: impl Fn() -> SystemTime + Send + Sync + 'static) -> Self {
+        self.clock = Clock::new(clock);
         self
     }
 
@@ -256,7 +267,7 @@ impl DynamoRepository {
     fn ttl_for(&self, entity_type: &EntityType) -> Option<i64> {
         let retention = self.retention.get(entity_type)?;
 
-        wire::expiry((self.clock)(), *retention)
+        wire::expiry(self.clock.now(), *retention)
     }
 
     fn validated_marker(&self) -> MutexGuard<'_, CachedMarker> {
@@ -278,11 +289,7 @@ impl DynamoRepository {
 
     /// The current time in whole Unix seconds, by the repository's clock.
     fn now(&self) -> i64 {
-        (self.clock)()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
-            })
+        self.clock.unix_seconds()
     }
 
     /// Returns the marker version this handle validated, reading and validating the manifest at
@@ -548,6 +555,19 @@ impl DynamoRepository {
             .build())
     }
 
+    /// Builds the rebuild-lock check every commit carries right after the marker check (C10): no
+    /// rebuild holds the lock, an expired one included. It binds no names or values.
+    fn rebuild_lock_check(&self) -> Result<TransactWriteItem, Error> {
+        let check = ConditionCheck::builder()
+            .table_name(&self.table)
+            .set_key(Some(to_sdk_item(&wire::rebuild_lock_key())))
+            .condition_expression(wire::REBUILD_LOCK_CHECK_CONDITION)
+            .build()
+            .map_err(Error::backend)?;
+
+        Ok(TransactWriteItem::builder().condition_check(check).build())
+    }
+
     /// The transaction actions of a commit's view operations, in order. Every write is conditioned
     /// on the row's owner (the operation's owner, bound as `:owner`): a `Put` of the five-attribute
     /// item whose condition is `attribute_not_exists(pk)` when the row must be absent, else
@@ -601,7 +621,7 @@ impl DynamoRepository {
     }
 
     /// Builds a single-stream commit's transaction items in the pinned order: the feature-marker
-    /// check, the projector operations (the legacy backend operations, then the commit-wide view
+    /// check, the rebuild-lock check, the projector operations (the legacy backend operations, then the commit-wide view
     /// operations in `view_items`), then the stream's group (see
     /// [`stream_group`](Self::stream_group)). An outcome-only commit has no group; the outcome put
     /// is appended by the caller. The layout records each item's index so a failed commit is
@@ -618,9 +638,7 @@ impl DynamoRepository {
         let mut layout = TransactionLayout::new(commit.entity_id.clone());
 
         items.push(self.marker_check(validated)?);
-        // C10: the rebuild-lock check (`SYSTEM#REBUILD`) goes here, between the marker check and
-        // the projector operations (spec, Writes step 2). It is not emitted yet, so it is not
-        // budgeted; the change that starts emitting it adds it to the budget too.
+        items.push(self.rebuild_lock_check()?);
         self.push_projector_items(
             commit.operations.iter().cloned(),
             &commit.views,
@@ -646,7 +664,7 @@ impl DynamoRepository {
     }
 
     /// Builds a multi-stream commit's transaction items in the pinned order: the feature-marker
-    /// check, the projector operations (legacy backend operations, then the commit-wide view
+    /// check, the rebuild-lock check, the projector operations (legacy backend operations, then the commit-wide view
     /// operations in `view_items`), then per written stream in bytewise stream-ID order its
     /// group (head update, event puts, snapshot put), then per fenced read-only stream its head
     /// check. The layout records each item's index so a failed commit is classified by the item
@@ -664,7 +682,7 @@ impl DynamoRepository {
         ));
 
         items.push(self.marker_check(validated)?);
-        // C10: the rebuild-lock check goes here (see `transaction_items_with`).
+        items.push(self.rebuild_lock_check()?);
         self.push_projector_items(
             commit.operations.iter().cloned(),
             &commit.views,
@@ -701,7 +719,7 @@ impl DynamoRepository {
         self.transaction_stream_items_with(commit, validated, &view_items)
     }
 
-    /// Appends the projector operations after the marker check, in the pinned order: the legacy
+    /// Appends the projector operations after the control checks, in the pinned order: the legacy
     /// backend operations first, then the commit-wide view operations (declaration, then emission
     /// order), and records where each sits. Both precede every written stream's group.
     fn push_projector_items(
@@ -713,7 +731,7 @@ impl DynamoRepository {
         layout: &mut TransactionLayout,
     ) {
         items.extend(operations);
-        layout.operations = items.len() - 1;
+        layout.operations = items.len() - CONTROL_ITEMS;
 
         layout.views = views
             .iter()
@@ -1177,7 +1195,7 @@ impl DynamoRepository {
         Ok(None)
     }
 
-    /// Maps a cancelled commit (whose marker check and outcome put held) to the error it
+    /// Maps a cancelled commit (whose control checks and outcome put held) to the error it
     /// reports. Every failed stream and fence item is classified before any is reported, and the
     /// ranking is: `StreamHeadDrift`, then `SequenceGap`, then any other conflict (stream items
     /// and fences in transaction order, a fence with its provenance), then projector conditions.
@@ -1230,7 +1248,7 @@ impl DynamoRepository {
         // failure. `TransactionConflict` and throttling on a projector item are not projector
         // failures: they keep their transient classification below.
         if failed_items(&codes, "ConditionalCheckFailed")
-            .any(|index| (1..=layout.operations).contains(&index))
+            .any(|index| (CONTROL_ITEMS..CONTROL_ITEMS + layout.operations).contains(&index))
         {
             return Error::Projector(Box::new(err));
         }
@@ -1545,6 +1563,11 @@ impl Repository for DynamoRepository {
                         continue;
                     }
 
+                    // A rebuild holds the lock: refused whatever else failed, and no probe runs.
+                    if rebuild_lock_failed(&codes) {
+                        return Err(Error::RebuildInProgress);
+                    }
+
                     // A lost outcome put outranks every other failure: the command already ran, and
                     // the writer resolves it through the winner's row. It is never a conflict.
                     if let Some(outcome) = &outcome
@@ -1646,6 +1669,13 @@ impl Repository for DynamoRepository {
                         self.invalidate_manifest();
 
                         continue;
+                    }
+
+                    // A rebuild holds the lock: refused whatever else failed, fences included (a
+                    // caller-stamped fence is never turned into a stale-fence rejection for it),
+                    // and no probe runs.
+                    if rebuild_lock_failed(&codes) {
+                        return Err(Error::RebuildInProgress);
                     }
 
                     // A lost outcome put outranks every other failure, a failed fence included:
@@ -2067,8 +2097,8 @@ enum Probed {
 
 /// Where each kind of item sits in a transaction, for failure classification.
 struct TransactionLayout {
-    /// Number of legacy backend projector operations, which start at index 1 after the marker
-    /// check (and the rebuild-lock check, once C10 emits it).
+    /// Number of legacy backend projector operations, which start at index [`CONTROL_ITEMS`],
+    /// after the feature-marker and rebuild-lock checks.
     operations: usize,
     /// The commit-wide view operations by item index, in transaction order, directly after the
     /// legacy operations. Each is the view without its row data: provenance, kind, keys, and the
@@ -2122,8 +2152,8 @@ impl TransactionLayout {
         }
     }
 
-    /// The number of projector items after the marker check: legacy backend operations, then view
-    /// operations.
+    /// The number of projector items after the control checks: legacy backend operations, then
+    /// view operations.
     fn projector_items(&self) -> usize {
         self.operations + self.views.len()
     }
@@ -2274,6 +2304,8 @@ enum Cancellation {
     /// The feature-marker check failed: the manifest changed under the writer, which re-validates
     /// it and retries the commit (or refuses, if it does not support the declared features).
     Marker,
+    /// The rebuild-lock check failed: a rebuild holds the lock ([`Error::RebuildInProgress`]).
+    RebuildLock,
     /// A stream event or snapshot condition failed: another writer moved the stream.
     StreamCondition,
     /// Only projector conditions failed. Reloading cannot fix it.
@@ -2285,15 +2317,18 @@ enum Cancellation {
 }
 
 /// Classifies cancellation reason codes, which are in transaction order. Item 0 is always the
-/// feature-marker check; the next `operations` are the projector operations, and the rest are the
-/// stream's events and snapshot.
+/// feature-marker check and item 1 the rebuild-lock check; the next `operations` are the projector
+/// operations, and the rest are the stream's events and snapshot.
 fn classify_cancellation(operations: usize, codes: &[Option<&str>]) -> Option<Cancellation> {
     let failed = |code| failed_items(codes, code);
 
     if failed("ConditionalCheckFailed").next() == Some(0) {
         return Some(Cancellation::Marker);
     }
-    if failed("ConditionalCheckFailed").any(|index| index > operations) {
+    if rebuild_lock_failed(codes) {
+        return Some(Cancellation::RebuildLock);
+    }
+    if failed("ConditionalCheckFailed").any(|index| index >= CONTROL_ITEMS + operations) {
         return Some(Cancellation::StreamCondition);
     }
     if failed("ConditionalCheckFailed").next().is_some() {
@@ -2309,6 +2344,11 @@ fn classify_cancellation(operations: usize, codes: &[Option<&str>]) -> Option<Ca
     }
 
     None
+}
+
+/// Reports whether a commit's rebuild-lock check failed its condition: a rebuild holds the lock.
+fn rebuild_lock_failed(codes: &[Option<&str>]) -> bool {
+    codes.get(REBUILD_LOCK_CHECK_INDEX).copied().flatten() == Some("ConditionalCheckFailed")
 }
 
 /// Reports whether the command-outcome put (the action at `outcome_index`) failed its condition.
@@ -2371,6 +2411,8 @@ where
     match classify_cancellation(operations, &codes) {
         // Handled by the commit loop's revalidation before this mapper runs.
         Some(Cancellation::Marker) => Error::backend(err),
+        // Handled by the commit loop before this mapper runs, too.
+        Some(Cancellation::RebuildLock) => Error::RebuildInProgress,
         Some(Cancellation::StreamCondition) => {
             conflict("conditional check failed: the sequence or snapshot changed since it was read")
         }
@@ -2564,6 +2606,7 @@ fn from_sdk(value: &sdk::AttributeValue) -> AttributeValue {
 }
 
 mod enumerate;
+mod rebuild;
 
 #[cfg(test)]
 mod tests {
@@ -2615,28 +2658,41 @@ mod tests {
         const CONFLICT: Option<&str> = Some("TransactionConflict");
         const NONE: Option<&str> = Some("None");
 
-        // Item 0 is the feature-marker check; item 1 is the one projector operation.
+        // Item 0 is the feature-marker check, item 1 the rebuild-lock check, and item 2 the one
+        // projector operation.
         let cases = [
-            (vec![CHECK, NONE], Some(Cancellation::Marker)),
-            (vec![NONE, CHECK], Some(Cancellation::ProjectorCondition)),
-            (vec![NONE, NONE, CHECK], Some(Cancellation::StreamCondition)),
+            (vec![CHECK, NONE, NONE], Some(Cancellation::Marker)),
+            (vec![CHECK, CHECK, NONE], Some(Cancellation::Marker)),
+            (vec![NONE, CHECK, NONE], Some(Cancellation::RebuildLock)),
             (
-                vec![NONE, CHECK, CONFLICT],
+                vec![NONE, CHECK, CHECK, CHECK],
+                Some(Cancellation::RebuildLock),
+            ),
+            (
+                vec![NONE, NONE, CHECK],
                 Some(Cancellation::ProjectorCondition),
             ),
             (
-                vec![NONE, NONE, CONFLICT],
+                vec![NONE, NONE, NONE, CHECK],
+                Some(Cancellation::StreamCondition),
+            ),
+            (
+                vec![NONE, NONE, CHECK, CONFLICT],
+                Some(Cancellation::ProjectorCondition),
+            ),
+            (
+                vec![NONE, NONE, NONE, CONFLICT],
                 Some(Cancellation::TransactionConflict),
             ),
             (
-                vec![CONFLICT, NONE, NONE],
+                vec![CONFLICT, NONE, NONE, NONE],
                 Some(Cancellation::TransactionConflict),
             ),
             (
-                vec![NONE, NONE, Some("ThrottlingError")],
+                vec![NONE, NONE, NONE, Some("ThrottlingError")],
                 Some(Cancellation::Throttled),
             ),
-            (vec![NONE, NONE, Some("ValidationError")], None),
+            (vec![NONE, NONE, NONE, Some("ValidationError")], None),
             (vec![], None),
         ];
 
@@ -3298,6 +3354,132 @@ mod tests {
         }
     }
 
+    /// The rebuild-fence vectors Go recorded (`rebuildFence` in `feature-marker.json`, C10): every
+    /// lifecycle operation's requests, from a given state of the two rows under a fixed clock. The
+    /// reads are the strongly consistent `GetItem`s of the generation (then the lock), and the
+    /// writes are byte for byte the transactions, the renew's `UpdateItem`, and the guarded view
+    /// write this repository builds.
+    #[test]
+    fn rebuild_fence_requests_match_the_go_vectors() {
+        use crate::rebuild::{Plan, RebuildLock};
+        use crate::wire::dynamo::{rebuild_generation_from_item, rebuild_lock_from_item};
+        use serde_json::{Value, json};
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compat/fixtures/feature-marker.json");
+        let fixture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vectors = fixture["rebuildFence"].as_array().unwrap();
+        assert!(vectors.len() >= 16, "every lifecycle operation is pinned");
+
+        let now: i64 = 1_790_000_000;
+        let mut repository = offline_repository().with_views_table("views");
+        repository.table = "evt-compat".into();
+
+        let item = |value: &Value| -> Option<Item> {
+            (!value.is_null()).then(|| serde_json::from_value(value.clone()).unwrap())
+        };
+        let read = |key: Item| {
+            json!({"call": "GetItem", "consistentRead": true, "actions": [{
+                "operation": "Get", "tableName": "evt-compat", "key": key}]})
+        };
+        let transaction = |items: Vec<TransactWriteItem>| {
+            json!({"call": "TransactWriteItems",
+                "actions": items.iter().map(fixture_action).collect::<Vec<_>>()})
+        };
+
+        for vector in vectors {
+            let name = vector["name"].as_str().unwrap();
+            let owner = vector["owner"].as_str().unwrap_or_default();
+            let lease = vector["leaseSeconds"].as_i64().unwrap_or_default();
+            let generation = item(&vector["before"]["generation"])
+                .map(|item| rebuild_generation_from_item(&item).unwrap())
+                .unwrap_or_default();
+            let lock: Option<RebuildLock> =
+                item(&vector["before"]["lock"]).map(|item| rebuild_lock_from_item(&item).unwrap());
+            let state = crate::RebuildState { generation, lock };
+            let reads_state = vec![
+                read(wire::rebuild_generation_key()),
+                read(wire::rebuild_lock_key()),
+            ];
+
+            let calls = match vector["operation"].as_str().unwrap() {
+                "state" => reads_state,
+                "generation" => vec![read(wire::rebuild_generation_key())],
+                "begin" => {
+                    let mut calls = reads_state;
+                    match Plan::decide(&state, now) {
+                        Ok(plan) => calls.push(transaction(
+                            repository
+                                .rebuild_begin_items(&plan, owner, now, now + lease)
+                                .unwrap(),
+                        )),
+                        Err(error) => {
+                            assert!(
+                                matches!(error, Error::RebuildLockHeld { .. }),
+                                "{name}: {error}"
+                            );
+                            assert_eq!(vector["result"]["error"], "lockHeld", "{name}");
+                        }
+                    }
+
+                    calls
+                }
+                "renew" => {
+                    let update = repository.rebuild_renew_update(owner, now + lease).unwrap();
+                    let action =
+                        fixture_action(&TransactWriteItem::builder().update(update).build());
+
+                    vec![json!({"call": "UpdateItem", "actions": [action]})]
+                }
+                operation @ ("end" | "forceRelease") => {
+                    let release = if operation == "end" {
+                        rebuild::Release::End
+                    } else {
+                        rebuild::Release::Force
+                    };
+
+                    vec![
+                        read(wire::rebuild_generation_key()),
+                        transaction(
+                            repository
+                                .rebuild_release_items(release, owner, generation.value)
+                                .unwrap(),
+                        ),
+                    ]
+                }
+                "writeViews" => {
+                    let views = [
+                        ProjectedView::new(
+                            "rebuild",
+                            0,
+                            0,
+                            crate::ViewOperation::put(
+                                "rebuilt",
+                                "row-1",
+                                "acct-1",
+                                "account",
+                                r#"{"n":1}"#,
+                            ),
+                        ),
+                        ProjectedView::new(
+                            "rebuild",
+                            0,
+                            1,
+                            crate::ViewOperation::delete("rebuilt", "row-2", "acct-2"),
+                        ),
+                    ];
+
+                    vec![transaction(
+                        repository.rebuild_view_items(owner, &views, now).unwrap(),
+                    )]
+                }
+                other => panic!("{name}: unknown operation {other}"),
+            };
+
+            assert_eq!(json!(calls), vector["calls"], "{name}");
+        }
+    }
+
     /// The shared scenarios' transaction steps build the same `TransactWriteItems` action order
     /// the Go generator recorded from its repository: a divergence fails here even when both
     /// languages store identical state.
@@ -3769,11 +3951,11 @@ mod tests {
     }
 
     #[test]
-    fn the_outcome_put_is_the_last_action_and_an_outcome_only_commit_is_marker_then_outcome() {
+    fn the_outcome_put_is_the_last_action_and_an_outcome_only_commit_is_controls_then_outcome() {
         let repository = offline_repository();
         let outcome = Outcome::accepted("cmd", "digest");
 
-        // Outcome-only, no fences: the marker check and the outcome put.
+        // Outcome-only, no fences: the marker check, the rebuild-lock check, and the outcome put.
         let mut commit = TransactionCommit::new(Vec::new()).with_outcome(outcome.clone());
         commit.normalize().unwrap();
         let (mut items, mut layout) = repository
@@ -3795,12 +3977,16 @@ mod tests {
                     "condition": "attribute_not_exists(pk)"
                 }),
                 serde_json::json!({
+                    "operation": "ConditionCheck", "pk": "SYSTEM#REBUILD", "sk": 0,
+                    "condition": "attribute_not_exists(pk)"
+                }),
+                serde_json::json!({
                     "operation": "Put", "pk": "command-outcome#cmd", "sk": 1,
                     "condition": "attribute_not_exists(pk)"
                 }),
             ]
         );
-        assert_eq!(layout.outcome, Some(1));
+        assert_eq!(layout.outcome, Some(2));
 
         // With events and a fence, the outcome stays last, after the fence checks.
         let event = SerializedEvent {
@@ -3845,6 +4031,7 @@ mod tests {
             keys,
             vec![
                 ("SYSTEM#FEATURES".to_owned(), 0),
+                ("SYSTEM#REBUILD".to_owned(), 0),
                 ("a".to_owned(), -1),
                 ("a".to_owned(), 1),
                 ("f".to_owned(), -1),
@@ -3924,6 +4111,8 @@ mod tests {
             vec![
                 json!({"operation": "ConditionCheck", "pk": "SYSTEM#FEATURES", "sk": 0,
                     "condition": "attribute_not_exists(pk)"}),
+                json!({"operation": "ConditionCheck", "pk": "SYSTEM#REBUILD", "sk": 0,
+                    "condition": "attribute_not_exists(pk)"}),
                 json!({"operation": "Update", "pk": "a", "sk": -1,
                     "update": "SET head = :last", "condition": "head = :prev",
                     "values": {":last": {"N": "9"}, ":prev": {"N": "7"}}}),
@@ -3940,7 +4129,7 @@ mod tests {
                 json!({"operation": "ConditionCheck", "pk": "z", "sk": -1,
                     "condition": "attribute_not_exists(head)"}),
             ],
-            "marker; per written stream in byte order the head update, event puts, and snapshot \
+            "marker; rebuild lock; per written stream in byte order the head update, event puts, and snapshot \
              put; the fences in byte order; no continuation or floor check, no companion"
         );
 
@@ -3956,8 +4145,8 @@ mod tests {
             ],
             vec![],
         );
-        assert_eq!(first[4]["condition"], "attribute_not_exists(seq)");
-        assert!(first[4].get("values").is_none());
+        assert_eq!(first[5]["condition"], "attribute_not_exists(seq)");
+        assert!(first[5].get("values").is_none());
     }
 
     #[test]
@@ -3976,7 +4165,7 @@ mod tests {
         // A create stamps the commit's own ttl on the head, under `attribute_not_exists(head)`.
         let created = built(&repository, vec![stream_commit("a", 1..=2)], vec![]);
         assert_eq!(
-            created[1],
+            created[2],
             json!({"operation": "Update", "pk": "a", "sk": -1,
                 "update": "SET head = :last, #ttl = :t",
                 "condition": "attribute_not_exists(head)",
@@ -3987,7 +4176,7 @@ mod tests {
         // An append guards the ttl by value.
         let appended = built(&repository, vec![stream_commit("a", 3..=3)], vec![]);
         assert_eq!(
-            appended[1],
+            appended[2],
             json!({"operation": "Update", "pk": "a", "sk": -1,
                 "update": "SET head = :last, #ttl = :t",
                 "condition": "head = :prev AND (attribute_not_exists(#ttl) OR #ttl <= :t)",
@@ -4016,7 +4205,7 @@ mod tests {
         // A smaller remembered ttl never lowers the head below the commit's own.
         repository.note_ttl(&EntityId::new("small"), 10);
         let small = built(&repository, vec![stream_commit("small", 2..=2)], vec![]);
-        assert_eq!(small[1]["values"][":t"], json!({"N": "1100"}));
+        assert_eq!(small[2]["values"][":t"], json!({"N": "1100"}));
 
         // A stream without retention writes neither the name nor `:t`.
         let plain = built(
@@ -4024,7 +4213,7 @@ mod tests {
             vec![stream_commit("p", 2..=2)],
             vec![],
         );
-        assert!(plain[1].get("names").is_none() && plain[1]["values"].get(":t").is_none());
+        assert!(plain[2].get("names").is_none() && plain[2]["values"].get(":t").is_none());
     }
 
     #[test]
@@ -4106,7 +4295,7 @@ mod tests {
     }
 
     /// The ADR's worked examples, counted from the actions this repository really builds: the
-    /// marker check, the groups and fences, and the outcome put.
+    /// two control checks, the groups and fences, and the outcome put.
     #[test]
     fn the_built_actions_match_the_adr_action_counts_and_the_budget() {
         let repository = offline_repository();
@@ -4138,8 +4327,9 @@ mod tests {
                 "the estimator counts the outcome put"
             );
 
-            // The estimator budgets every action by the size of the action it builds.
-            for (item, size) in items.iter().zip(&sizes).skip(1) {
+            // The estimator budgets every action by the size of the action it builds, except the
+            // two control checks, which are budgeted by their keys alone.
+            for (item, size) in items.iter().zip(&sizes).skip(2) {
                 if item.put().is_none() {
                     assert_eq!(sdk_item_size(item), *size, "{item:?}");
                 }
@@ -4148,14 +4338,14 @@ mod tests {
             items.len() + 1
         };
 
-        assert_eq!(count(vec![stream_commit("a", 1..=1)], vec![]), 4, "create");
-        assert_eq!(count(vec![stream_commit("a", 2..=2)], vec![]), 4, "append");
+        assert_eq!(count(vec![stream_commit("a", 1..=1)], vec![]), 5, "create");
+        assert_eq!(count(vec![stream_commit("a", 2..=2)], vec![]), 5, "append");
         assert_eq!(
             count(
                 vec![stream_commit("a", 2..=2).with_snapshot(snapshot(2))],
                 vec![]
             ),
-            5,
+            6,
             "append with a snapshot"
         );
         assert_eq!(
@@ -4163,7 +4353,7 @@ mod tests {
                 vec![stream_commit("a", 1..=5).with_snapshot(snapshot(1))],
                 vec![]
             ),
-            9,
+            10,
             "create five events with a snapshot"
         );
 
@@ -4181,15 +4371,15 @@ mod tests {
                 .map(|(id, head)| (&*Box::leak(id.into_boxed_str()), head))
                 .collect()
         };
-        assert_eq!(count(appends(10), fenced(5)), 27);
-        assert_eq!(count(appends(12), fenced(9)), 35);
-        assert_eq!(count(appends(1), fenced(30)), 34);
+        assert_eq!(count(appends(10), fenced(5)), 28);
+        assert_eq!(count(appends(12), fenced(9)), 36);
+        assert_eq!(count(appends(1), fenced(30)), 35);
     }
 
     #[test]
     fn single_stream_capacity_holds_the_documented_numbers() {
-        // Marker counted, outcome not: create 98, append 98, create with a snapshot 97, append
-        // with a snapshot 97 event and projector operations.
+        // Both control checks counted, outcome not: create 97, append 97, create with a snapshot
+        // 96, append with a snapshot 96 event and projector operations.
         let fits = |first: i64, events: i64, snapshot: bool| {
             let mut commit = stream_commit("a", first..=first + events - 1);
             if snapshot {
@@ -4205,7 +4395,7 @@ mod tests {
         };
 
         for (first, snapshot, capacity) in
-            [(1, false, 98), (2, false, 98), (1, true, 97), (2, true, 97)]
+            [(1, false, 97), (2, false, 97), (1, true, 96), (2, true, 96)]
         {
             assert!(
                 fits(first, capacity, snapshot),
@@ -4241,17 +4431,17 @@ mod tests {
             .transaction_stream_items(&commit, ValidatedMarker::Absent)
             .unwrap();
 
-        // marker, a: head + event + snapshot, b: head + 2 events, fence f
-        assert_eq!(items.len(), 1 + 3 + 3 + 1);
+        // marker, lock, a: head + event + snapshot, b: head + 2 events, fence f
+        assert_eq!(items.len(), 2 + 3 + 3 + 1);
         let [a, b] = &layout.streams[..] else {
             panic!("two written streams")
         };
-        assert_eq!((a.head, a.events.clone(), a.snapshot), (1, 2..3, Some(3)));
-        assert_eq!((b.head, b.events.clone(), b.snapshot), (4, 5..7, None));
+        assert_eq!((a.head, a.events.clone(), a.snapshot), (2, 3..4, Some(4)));
+        assert_eq!((b.head, b.events.clone(), b.snapshot), (5, 6..8, None));
         assert_eq!(a.first, EventSequence(4));
-        assert_eq!(layout.fences[0].0, 7);
+        assert_eq!(layout.fences[0].0, 8);
 
-        for (index, want) in [(1, "a"), (3, "a"), (4, "b"), (6, "b"), (7, "f")] {
+        for (index, want) in [(2, "a"), (4, "a"), (5, "b"), (7, "b"), (8, "f")] {
             assert_eq!(
                 layout.entity_at(index),
                 Some(EntityId::new(want)),
@@ -4263,6 +4453,7 @@ mod tests {
             None,
             "the marker check belongs to no stream"
         );
+        assert_eq!(layout.entity_at(1), None, "nor does the rebuild-lock check");
     }
 
     #[test]
@@ -4378,6 +4569,13 @@ mod tests {
                 None,
                 owned("attribute_not_exists(pk) OR version = :v"),
             ),
+            (
+                "ConditionCheck",
+                "SYSTEM#REBUILD",
+                0,
+                None,
+                owned("attribute_not_exists(pk)"),
+            ),
             // The legacy backend operation, then the views in declaration then emission order.
             ("Put", "legacy-1", 0, None, None),
             (
@@ -4436,19 +4634,19 @@ mod tests {
         assert_eq!(
             tables,
             [
-                "events", "legacy", "views", "views", "views", "views", "events", "events",
-                "events", "events", "events"
+                "events", "events", "legacy", "views", "views", "views", "views", "events",
+                "events", "events", "events", "events"
             ]
         );
 
         // The item shapes: a put writes all five attributes as strings; a delete is a key.
-        let put = items[4].put().unwrap();
+        let put = items[5].put().unwrap();
         assert_eq!(
             json!(from_sdk_item(put.item())),
             json!({"pk": {"S": "q"}, "sk": {"S": "one"}, "entityID": {"S": "id"},
                    "entityType": {"S": "type"}, "payload": {"S": "{}"}})
         );
-        assert_eq!(items[3].delete().unwrap().key().len(), 2);
+        assert_eq!(items[4].delete().unwrap().key().len(), 2);
 
         // Every write binds its owner, except a put that requires the row to be absent. The
         // owner is the stored `entityID`, and the stream the operation is owned by.
@@ -4465,18 +4663,18 @@ mod tests {
             values.map(|values| values.keys().cloned().collect::<Vec<_>>())
         };
         assert_eq!(
-            owner(&items[2]),
+            owner(&items[3]),
             Some(vec![":owner".to_owned()]),
             "an unconditional put"
         );
         assert_eq!(
-            owner(&items[3]),
+            owner(&items[4]),
             Some(vec![":owner".to_owned()]),
             "a present delete"
         );
-        assert_eq!(owner(&items[4]), None, "an absent put binds no owner");
+        assert_eq!(owner(&items[5]), None, "an absent put binds no owner");
         assert_eq!(
-            items[3]
+            items[4]
                 .delete()
                 .unwrap()
                 .expression_attribute_values()
@@ -4494,15 +4692,15 @@ mod tests {
         assert_eq!(
             indexes,
             [
-                (2, "first".to_owned(), 0),
-                (3, "first".to_owned(), 1),
-                (4, "second".to_owned(), 0),
-                (5, "second".to_owned(), 1)
+                (3, "first".to_owned(), 0),
+                (4, "first".to_owned(), 1),
+                (5, "second".to_owned(), 0),
+                (6, "second".to_owned(), 1)
             ]
         );
         assert_eq!(layout.projector_items(), 5);
         assert_eq!(
-            layout.streams[0].head, 6,
+            layout.streams[0].head, 7,
             "the first stream group follows the views"
         );
     }
@@ -4537,6 +4735,7 @@ mod tests {
             operations,
             [
                 ("ConditionCheck", "SYSTEM#FEATURES"),
+                ("ConditionCheck", "SYSTEM#REBUILD"),
                 ("Put", "legacy-1"),
                 ("Put", "p"),
                 ("Update", "a"),
@@ -4675,20 +4874,20 @@ mod tests {
                 .with_views(views)
         };
 
-        // Marker + head update + one event leave 97 actions for views.
+        // The two control checks, the head update, and one event leave 96 actions for views.
         assert_eq!(
-            too_large(repository.commit(commit(bulk(98, 0))).await).0,
+            too_large(repository.commit(commit(bulk(97, 0))).await).0,
             101
         );
         assert!(!matches!(
-            repository.commit(commit(bulk(97, 0))).await,
+            repository.commit(commit(bulk(96, 0))).await,
             Err(Error::CommitTooLarge { .. })
         ));
-        // Two streams cost two head updates and two events: 95 fit, 96 do not.
+        // Two streams cost two head updates and two events: 94 fit, 95 do not.
         assert_eq!(
             too_large(
                 repository
-                    .commit_transaction(transaction(bulk(96, 0)))
+                    .commit_transaction(transaction(bulk(95, 0)))
                     .await
             )
             .0,
@@ -4696,7 +4895,7 @@ mod tests {
         );
         assert!(!matches!(
             repository
-                .commit_transaction(transaction(bulk(95, 0)))
+                .commit_transaction(transaction(bulk(94, 0)))
                 .await,
             Err(Error::CommitTooLarge { .. })
         ));
@@ -4705,13 +4904,13 @@ mod tests {
         let (actions, bytes, largest) =
             too_large(repository.commit(commit(bulk(12, 330_000))).await);
         assert!(
-            actions == 15 && bytes > 3_800_000 && largest < 380_000,
+            actions == 16 && bytes > 3_800_000 && largest < 380_000,
             "{actions} {bytes} {largest}"
         );
         let (_, _, largest) = too_large(repository.commit(commit(bulk(1, 400_000))).await);
         assert!(largest > 380_000);
         // The same bytes in a delete's condition would be negligible: deletes carry only keys.
-        let deletes: Vec<_> = (0..97)
+        let deletes: Vec<_> = (0..96)
             .map(|index| {
                 view(
                     ("d", 0),
@@ -4748,10 +4947,10 @@ mod tests {
     }
 
     /// The reason codes of `view_commit()`'s transaction: `None` everywhere except the given
-    /// `(index, code)` entries. Items: 0 marker, 1 legacy, 2 to 5 views, 6 to 8 stream `a`'s head,
-    /// event, and snapshot, 9 and 10 stream `b`'s head and event.
+    /// `(index, code)` entries. Items: 0 marker, 1 rebuild lock, 2 legacy, 3 to 6 views, 7 to 9
+    /// stream `a`'s head, event, and snapshot, 10 and 11 stream `b`'s head and event.
     fn reasons(failed: &[(usize, &'static str)]) -> Vec<Option<&'static str>> {
-        let mut codes = vec![Some("None"); 11];
+        let mut codes = vec![Some("None"); 12];
         for (index, code) in failed {
             codes[*index] = Some(code);
         }
@@ -4781,8 +4980,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_failed_view_operation_in_transaction_order_is_named() {
-        // Operation 1 of the second projector (item 5) carries a mapped error.
-        let failed = operation_failure(classified(&[(5, "ConditionalCheckFailed")]).await);
+        // Operation 1 of the second projector (item 6) carries a mapped error.
+        let failed = operation_failure(classified(&[(6, "ConditionalCheckFailed")]).await);
         assert_eq!(
             (
                 failed.projector.as_str(),
@@ -4803,9 +5002,9 @@ mod tests {
         // Several failures: the earliest item wins, whatever its reason.
         let failed = operation_failure(
             classified(&[
+                (6, "ConditionalCheckFailed"),
+                (4, "ValidationError"),
                 (5, "ConditionalCheckFailed"),
-                (3, "ValidationError"),
-                (4, "ConditionalCheckFailed"),
             ])
             .await,
         );
@@ -4820,12 +5019,12 @@ mod tests {
             "the SDK error is the cause of a validation failure"
         );
 
-        let failed = operation_failure(classified(&[(2, "ItemCollectionSizeLimitExceeded")]).await);
+        let failed = operation_failure(classified(&[(3, "ItemCollectionSizeLimitExceeded")]).await);
         assert_eq!(failed.reason, "ItemCollectionSizeLimitExceeded");
 
         for error in [
-            classified(&[(5, "ConditionalCheckFailed")]).await,
-            classified(&[(2, "ValidationError")]).await,
+            classified(&[(6, "ConditionalCheckFailed")]).await,
+            classified(&[(3, "ValidationError")]).await,
         ] {
             assert!(!error.is_retryable() && !error.is_conflict(), "{error:?}");
         }
@@ -4834,19 +5033,19 @@ mod tests {
     #[tokio::test]
     async fn a_legacy_operation_failure_keeps_its_legacy_error_and_precedes_the_views() {
         let error =
-            classified(&[(1, "ConditionalCheckFailed"), (2, "ConditionalCheckFailed")]).await;
+            classified(&[(2, "ConditionalCheckFailed"), (3, "ConditionalCheckFailed")]).await;
 
         assert!(matches!(error, Error::Projector(_)), "{error:?}");
     }
 
     #[tokio::test]
     async fn a_projector_failure_is_never_reported_when_a_higher_ranked_item_failed() {
-        // Stream `a`'s snapshot put (item 8) failing is an ordinary conflict, however many view
+        // Stream `a`'s snapshot put (item 9) failing is an ordinary conflict, however many view
         // operations failed with it.
         let error = classified(&[
-            (8, "ConditionalCheckFailed"),
-            (2, "ConditionalCheckFailed"),
-            (5, "ConditionalCheckFailed"),
+            (9, "ConditionalCheckFailed"),
+            (3, "ConditionalCheckFailed"),
+            (6, "ConditionalCheckFailed"),
         ])
         .await;
 
@@ -4856,15 +5055,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_transaction_conflict_or_throttling_on_a_view_item_keeps_its_classification() {
-        let error = classified(&[(3, "TransactionConflict")]).await;
+        let error = classified(&[(4, "TransactionConflict")]).await;
         assert!(error.is_conflict() && error.is_retryable(), "{error:?}");
 
-        let error = classified(&[(3, "ThrottlingError")]).await;
+        let error = classified(&[(4, "ThrottlingError")]).await;
         assert!(matches!(error, Error::Transient(_)), "{error:?}");
 
         // A condition failure elsewhere in the same transaction still names that operation.
         let failed = operation_failure(
-            classified(&[(3, "TransactionConflict"), (4, "ConditionalCheckFailed")]).await,
+            classified(&[(4, "TransactionConflict"), (5, "ConditionalCheckFailed")]).await,
         );
         assert_eq!((failed.projector.as_str(), failed.operation), ("second", 0));
     }
@@ -4874,20 +5073,24 @@ mod tests {
         const CHECK: Option<&str> = Some("ConditionalCheckFailed");
         const NONE: Option<&str> = Some("None");
 
-        // Marker, one legacy operation, two views: four projector items after the marker would be
-        // indexes 1 to 3; item 4 is the first stream item.
+        // Marker, rebuild lock, one legacy operation, two views: the three projector items after
+        // the control checks are indexes 2 to 4; item 5 is the first stream item.
         let cases = [
             (
-                vec![NONE, NONE, NONE, CHECK, NONE],
+                vec![NONE, NONE, NONE, NONE, CHECK, NONE],
                 Some(Cancellation::ProjectorCondition),
             ),
             (
-                vec![NONE, NONE, NONE, NONE, CHECK],
+                vec![NONE, NONE, NONE, NONE, NONE, CHECK],
                 Some(Cancellation::StreamCondition),
             ),
             (
-                vec![CHECK, NONE, NONE, CHECK, CHECK],
+                vec![CHECK, NONE, NONE, NONE, CHECK, CHECK],
                 Some(Cancellation::Marker),
+            ),
+            (
+                vec![NONE, CHECK, NONE, NONE, CHECK, CHECK],
+                Some(Cancellation::RebuildLock),
             ),
         ];
 
