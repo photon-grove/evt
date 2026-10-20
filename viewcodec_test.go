@@ -166,6 +166,8 @@ func TestGetJSONViewPointerConstructorPreservesInjectedFields(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("expected decoded pointer value")
+
+		return
 	}
 	if got.ID != "1" {
 		t.Fatalf("expected ID 1, got %q", got.ID)
@@ -233,6 +235,8 @@ func TestPutJSONViewCopiesMetadataAndWritesPayload(t *testing.T) {
 	}
 	if stored == nil {
 		t.Fatal("expected stored view")
+
+		return
 	}
 	if stored.PK != template.PK {
 		t.Fatalf("expected PK %q, got %q", template.PK, stored.PK)
