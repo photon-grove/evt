@@ -59,6 +59,20 @@ lockstep with the Go types that read and write it:
   `*evt.OutcomeConflictError`, which the store resolves by reading the row. Its name derives from the
   events table through the reserved `__evt_` infix. Use `Store.WithOutcomes` to record outcomes.
 
+- `evt_events__evt_rebuild_lock` and `evt_events__evt_rebuild_generation` — the rebuild fence (v0.9,
+  C10), one row each at `id = 0`: the lock names the `owner` and the `lease_expires_at` of the
+  rebuild that holds it, and the generation counts `value`, odd while a rebuild is in progress,
+  with a `force_released` flag. Every commit takes the shared advisory lock
+  `pg_advisory_xact_lock_shared(1702261761, hashtext('evt_events:rebuild'))` and asserts the lock
+  row is absent, an expired row included, failing with `*evt.RebuildInProgressError`; the lifecycle
+  (`Repository.RebuildFence()`: `Begin`, `Renew`, `End`, `ForceRelease`, `WriteViews`) takes the same
+  advisory lock exclusively for its short transactions, so no acquire or release can slip between a
+  commit's assertion and its `COMMIT`. A guarded view write selects the lock row `FOR UPDATE`
+  and asserts the owner and an unexpired lease in the transaction that carries the view statements,
+  so a takeover waits for it and a worker that lost the lock aborts without writing. A database
+  created before the fence has neither table: commits pass until `EnsureSchema` creates them. See
+  [Rebuild fence](../README.md#rebuild-fence-v09-c10).
+
 Every `SerializedResult` is committed inside a single SQL transaction, so events
 and their snapshot are never observable apart.
 
