@@ -19,6 +19,9 @@
 //! - Read and write view rows outside the commit path with [`ViewRepository`]
 //!   ([`MemRepository`], [`dynamodb::DynamoViewRepository`]), and layer typed JSON values on it with
 //!   [`ViewCodec`].
+//! - Deliver events in per-scope order with the sync journal ([`journal`], feature `journal`):
+//!   scope allocations in event metadata, counters and rows written in the commit, and
+//!   `high_watermark` / `page` reads that detect gaps.
 //! - Bound log growth with [`Repository::compact_below`], which only deletes events a durable
 //!   snapshot covers.
 //!
@@ -38,6 +41,9 @@ mod event;
 mod features;
 mod heads;
 mod ids;
+#[cfg(feature = "journal")]
+#[cfg_attr(docsrs, doc(cfg(feature = "journal")))]
+pub mod journal;
 pub mod json;
 mod mem;
 mod metadata;
@@ -68,11 +74,12 @@ pub mod postgres;
 pub use aggregate::{Aggregate, Projector};
 pub use commit_id::CommitIdGenerator;
 pub use enumerate::{EventBatch, EventLog, StreamFilter};
-pub use error::{BoxError, Error, ExecuteError, ReplayPhase};
+pub use error::{BoxError, Error, ExecuteError, ReplayPhase, RowTooLarge};
 pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
 pub use features::{
-    COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker, STREAM_HEADS_FEATURE,
-    STREAM_HEADS_VERSION, SUPPORTED_FEATURES, SYSTEM_PREFIX, ValidatedMarker,
+    COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker, JOURNAL_FEATURE,
+    JOURNAL_VERSION, STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION, SUPPORTED_FEATURES, SYSTEM_PREFIX,
+    ValidatedMarker,
 };
 pub use ids::{
     CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion, PrincipalId,

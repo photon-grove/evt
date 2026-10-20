@@ -3207,7 +3207,7 @@ where
 
     other
         .update_manifest(|manifest| {
-            manifest.features.insert("journal".to_owned(), 1);
+            manifest.features.insert("journal-compaction".to_owned(), 1);
         })
         .await?;
     let manifest = other
@@ -3215,7 +3215,7 @@ where
         .await?
         .ok_or(Failure("no manifest".into()))?;
     ensure_eq!(
-        manifest.features.get("journal"),
+        manifest.features.get("journal-compaction"),
         Some(&1),
         "the declaration"
     );
@@ -3224,15 +3224,15 @@ where
     // cached validation predates the declaration. Maintenance snapshots obey the same refusal.
     let before_snapshot = repo.snapshot(&stream.id).await?;
     for writer in [other, repo] {
-        let unsupported = |err: &Error| matches!(err, Error::UnsupportedFeature { feature, version: 1 } if feature == "journal");
+        let unsupported = |err: &Error| matches!(err, Error::UnsupportedFeature { feature, version: 1 } if feature == "journal-compaction");
         expect_err(
             stream.commit(writer, stream.events(6..=6), None).await,
-            "committing to a table that declares journal",
+            "committing to a table that declares an unsupported extension",
             unsupported,
         )?;
         expect_err(
             writer.put_snapshot(&stream.snapshot(2, 5, "{}")).await,
-            "writing a snapshot to a table that declares journal",
+            "writing a snapshot to a table that declares an unsupported extension",
             unsupported,
         )?;
     }
@@ -3286,7 +3286,7 @@ where
     // Removing the feature revalidates the writer, which then commits again.
     other
         .update_manifest(|manifest| {
-            manifest.features.remove("journal");
+            manifest.features.remove("journal-compaction");
             manifest.retention.remove(&retained);
         })
         .await?;
@@ -7052,8 +7052,13 @@ async fn rejection_events_caller_fence<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+#[cfg(feature = "journal")]
+mod journal;
 mod view_repository;
 mod views;
 
+#[cfg(feature = "journal")]
+#[cfg_attr(docsrs, doc(cfg(feature = "journal")))]
+pub use journal::journal_cases;
 pub use view_repository::{committed_view_cases, view_repository_cases};
 pub use views::{CommitViewTarget, commit_view_cases};

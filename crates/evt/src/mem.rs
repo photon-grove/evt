@@ -630,6 +630,8 @@ impl FeatureMarker for MemRepository {
 }
 
 mod enumerate;
+#[cfg(feature = "journal")]
+mod journal;
 mod views;
 
 #[cfg(test)]

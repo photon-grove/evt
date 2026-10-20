@@ -2564,6 +2564,8 @@ fn from_sdk(value: &sdk::AttributeValue) -> AttributeValue {
 }
 
 mod enumerate;
+#[cfg(feature = "journal")]
+mod journal;
 mod views;
 
 pub use views::DynamoViewRepository;

@@ -14,7 +14,7 @@ drivers = ["photon-evt/dynamodb", "photon-evt/postgres", "photon-evt/conformance
 
 [dependencies]
 # The conformance feature provides the fault-injecting repository the outcomes scenarios use.
-photon-evt = { workspace = true, features = ["conformance"] }
+photon-evt = { workspace = true, features = ["conformance", "journal"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -40,4 +40,9 @@ required-features = ["drivers"]
 # The view repository's DynamoDB requests and retries against a canned local HTTP server.
 [[test]]
 name = "view_requests"
+required-features = ["drivers"]
+
+# The sync journal (X1) against the local DynamoDB emulator.
+[[test]]
+name = "journal"
 required-features = ["drivers"]

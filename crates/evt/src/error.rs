@@ -318,6 +318,18 @@ pub enum Error {
         backend: &'static str,
     },
 
+    /// A journal row would exceed the configured row-size cap (ADR 0005, X1). Returned before any
+    /// write, by the journal's pre-check and again by the commit-time guard; nothing was written.
+    /// The application turns it into its own rejection with [`RowTooLarge::to_rejection`].
+    #[error(transparent)]
+    JournalRowTooLarge(#[from] RowTooLarge),
+
+    /// A journal configuration, scope, or stored allocation is invalid (ADR 0005, X1): an empty or
+    /// oversized scope, a malformed or inconsistent allocation in event metadata, or a position
+    /// claimed twice. Nothing was written.
+    #[error("invalid journal: {0}")]
+    InvalidJournal(String),
+
     /// The backend failed in a way that may succeed on retry, and running the operation again is
     /// safe: throttling, a deadlock, a serialization failure, or a timed-out read. A commit is only
     /// transient when the backend rejected it. A commit whose outcome is unknown, such as one that
@@ -485,6 +497,57 @@ impl Error {
         )
     }
 }
+
+/// A journal row over the configured size cap: which row, how large, and the cap. The journal's
+/// pre-check and its commit-time guard both raise it ([`Error::JournalRowTooLarge`]) before any
+/// write.
+///
+/// The size is the byte length of the row's stored payload, the widest row of the commit being
+/// the one reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RowTooLarge {
+    /// The scope whose row is too large.
+    pub scope: String,
+    /// The position the row was (or would be) allocated. For a pre-check, which allocates
+    /// nothing, the widest position the format allows ([`u64::MAX`]).
+    pub position: u64,
+    /// The event the row carries.
+    pub event_id: String,
+    /// The row's size in bytes.
+    pub size: usize,
+    /// The configured cap in bytes.
+    pub limit: usize,
+}
+
+impl RowTooLarge {
+    /// The domain rejection an application records for the refused command: code
+    /// `journal-row-too-large`, with the scope, event, size, and cap in the details. A pre-check
+    /// raised in a command handler can map to it from the handler's
+    /// [`ToRejection`](crate::ToRejection), so the outcome records why the command was refused.
+    pub fn to_rejection(&self) -> crate::outcome::Rejection {
+        crate::outcome::Rejection::new("journal-row-too-large", self.to_string()).with_details(
+            serde_json::json!({
+                "scope": self.scope,
+                "eventId": self.event_id,
+                "size": self.size,
+                "limit": self.limit,
+            }),
+        )
+    }
+}
+
+impl fmt::Display for RowTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the journal row for event {} in scope {:?} is {} bytes, over the {} byte cap",
+            self.event_id, self.scope, self.size, self.limit
+        )
+    }
+}
+
+impl std::error::Error for RowTooLarge {}
 
 /// The replay phase that failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
