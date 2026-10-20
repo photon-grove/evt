@@ -377,7 +377,7 @@ error before any write and is never split.
 - The response (raw bytes, stored as padded base64) and the encoded rejection are each at most
   65,536 bytes (`OutcomeTooLarge`, before any write); an empty response is stored as no response
 - The outcome item counts in the commit budget (one action and its encoded size); an outcome-only
-  commit is the feature-marker check plus the outcome put
+  commit is the feature-marker check, the rebuild-lock check, and the outcome put
 - Stores without outcomes keep today's behavior, and `CommitStream` / bare `Store.Commit` refuse
   to carry or skip an outcome
 
@@ -399,7 +399,7 @@ error before any write and is never split.
 - A command that produces zero events is an accepted outcome with no events (still storing any
   response), not an error; if it carries projector operations (the deprecated
   `CommandResult.Transaction`) it is refused with `ProjectorOnlyCommitError` and nothing is
-  written. Outcome-only commits carry the feature-marker check and, for a
+  written. Outcome-only commits carry the feature-marker and rebuild-lock checks and, for a
   multi-stream transaction, the fence checks of its reads; the single-aggregate shortcut has no
   fences to check
 - A rejection may carry domain events that commit atomically with it. Go marks the handler or
@@ -592,8 +592,8 @@ transaction as the events. The byte-level rules are in the
   of an absent row succeeds unless it is `IfPresent`. `OnConflict(err)` names the error for a failed
   condition and is never stored. View items never carry `ttl`.
 - Order: projector declaration order, each projector's operations in emission order, after the
-  operations of any transaction group, after the marker check, before the written streams. On
-  PostgreSQL the statements run after the events and before the snapshot upserts.
+  operations of any transaction group, after the marker and rebuild-lock checks, before the written
+  streams. On PostgreSQL the statements run after the events and before the snapshot upserts.
 - Before any write, on every backend: `InvalidViewOperation` (empty `pk` or `sk`, text that is not
   UTF-8 or contains U+0000, an unknown kind, a condition the kind does not allow), then
   `ViewKeyTooLong` (`pk` over 2,048 or `sk` over 1,024 UTF-8 bytes), then `DuplicateViewKey` (a
@@ -614,7 +614,8 @@ transaction as the events. The byte-level rules are in the
   `ItemCollectionSizeLimitExceeded` on a view item map the same way; `TransactionConflict` and
   throttling keep their transient classification.
 - It is not an optimistic conflict and not transient: it is returned at once, never re-prepared,
-  and records no outcome. It ranks last: the marker check, the outcome put, `StreamHeadDrift`, a
+  and records no outcome. It ranks last: the marker check, the rebuild-lock check, the outcome put,
+  `StreamHeadDrift`, a
   gap, and any conflict on a written stream or a fence are reported first, so it surfaces only when
   nothing above it failed. The first failed operation in transaction order is the one named.
 - Nothing from the commit is written: not its events, not its other rows.
@@ -657,8 +658,10 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   (so they are never compacted); a commit that cannot be built declares nothing, and one refused
   for an unmigrated table retracts the `journal` declaration. A build without the cargo feature
   refuses the table; a build with it, wrapped or not, accepts it.
-- **Rebuilds need quiesced writers.** `rebuild` rewrites rows and counters unconditionally.
-  Enable the journal before writing the events it covers: earlier events have no row and no gap.
+- **Rebuilds run under the rebuild lock.** `rebuild` writes rows and counters unconditionally
+  through the lease-guarded `write_rebuild_views` (owner and fencing token, at most 99 operations a
+  batch); live commits fail with `RebuildInProgress` while the lock is held, and consumers read with
+  `page_at_epoch` / `high_watermark_at_epoch`. A failed rebuild keeps the lock. Enable the journal before writing the events it covers: earlier events have no row and no gap.
 - **Every writer of a journal table must commit through the journal.** The marker cannot tell
   a bypassing writer from a journaling one; its events would be missing from the scopes.
 
@@ -866,6 +869,51 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   uses transactional batches of at most 99 deletes plus a check on the observed marker version
   (or absence). A changed marker is re-read and re-validated before retrying a delete batch.
   A completed history-dependent declaration therefore fences in-flight compaction.
+
+### Rebuild Fence (ADR-0004 C10)
+
+- The fence is two engine rows in the reserved `SYSTEM#` namespace (storage spec, Rebuild Fence): a
+  lock row (`SYSTEM#REBUILD`: `owner`, `leaseExpiresAt` in whole epoch seconds) and a generation
+  item (`SYSTEM#REBUILD#GENERATION`: `value`, and `forceReleased` after a force-release). On
+  PostgreSQL they are `{events}__evt_rebuild_lock` and `{events}__evt_rebuild_generation`. Every
+  transition (acquire, takeover, release, force-release) writes both in one transaction, so a crash
+  never leaves them disagreeing.
+- **The generation is odd if and only if a rebuild is in progress**, except after a force-release,
+  which deletes the lock but leaves the generation odd and flagged: that value means "derived state
+  untrustworthy", not "rebuild in progress", and readers treat every odd value alike. Acquire adds
+  one (two from a force-released generation), takeover adds two, release adds one and clears the
+  flag, force-release adds two and sets it.
+- **Every commit is refused while any lock row exists**, an expired one included, with
+  `*evt.RebuildInProgressError` (`evt.ErrRebuildInProgress`; Rust `Error::RebuildInProgress`): the
+  second action of every DynamoDB commit is a `ConditionCheck` of `attribute_not_exists(pk)` on the
+  lock row, and a PostgreSQL commit asserts the row is absent under the shared fence advisory lock.
+  It is mandatory like the marker check, present in outcome-only commits, in rejections that carry
+  events, and in the outcome-only transaction that persists a rejection. Out-of-band snapshot
+  writes and compaction carry no lock check. It counts toward the commit budget and its bytes
+  (a single-stream commit leaves room for 97 events and projector operations, 96 with a snapshot).
+- **Classification.** The marker check outranks the lock check, which outranks the outcome put,
+  drift, a gap, and every other conflict; no failure-path probe runs for it. A refusal that needs
+  only the manifest (a fence on a retained type) or no store read (projector-only, over budget,
+  reserved ID, invalid commit) is made first and keeps its own error during a rebuild. The
+  refusal is **transient**: fence-aware retry runs the command again after the backoff and
+  returns the error when the attempts run out. It is never a conflict, never a `stale-fence`
+  rejection (even beside a caller-stamped fence), and records no outcome, so a rejection decided
+  during a rebuild is not recorded and the same command ID runs again once the rebuild ends.
+- **Lifecycle** (`evt.RebuildFence`, from `evt.RebuildFenceProvider`; Rust `RebuildFence`):
+  `Begin` acquires or takes over an expired lease (`*evt.RebuildLockHeldError` while one is held,
+  `*evt.RebuildStateInvalidError` for a state the protocol cannot produce), `Renew` extends the
+  lease, `End` releases it (both, and `WriteViews`, take the whole `evt.RebuildLease`), `ForceRelease` is the operator's escape hatch, and `WriteViews`
+  writes one guarded batch of at most 99 view operations whose last action is a lease guard. A
+  caller that no longer holds the lock gets `*evt.RebuildLeaseLostError` and must stop; on
+  PostgreSQL the guarded transaction holds the lock row `FOR UPDATE`, so a takeover waits for it.
+  A lease is its owner token **and** the fencing generation `Begin` returned, stored on the lock
+  row: a worker whose lease lapsed cannot renew, write for, or end the lease of a later
+  incarnation that took over under the same owner token. Leases are whole seconds on the repository's clock; the generation is always read with a
+  strongly consistent read.
+- **Readers** fence a decision with `evt.ReadAtRebuildEpoch` (or `ObserveRebuildEpoch` and
+  `RebuildEpoch.Verify`): an odd generation is `*evt.RebuildUnavailableError` and a changed settled
+  one is `*evt.RebuildEpochChangedError`, both transient. A handler that returns one makes the
+  engine return it at once and record no outcome.
 
 ### GetSnapshot
 

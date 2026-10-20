@@ -3,6 +3,8 @@ package policy
 
 import (
 	stderrors "errors"
+
+	"github.com/photon-grove/evt"
 )
 
 // Class identifies whether an error should be retried.
@@ -35,6 +37,13 @@ func Classify(err error) Class {
 	var classified *ClassifiedError
 	if stderrors.As(err, &classified) {
 		return classified.Class
+	}
+
+	// The rebuild fence's refusals (ADR 0004, C10) are retried later, whoever returns them: a
+	// commit refused by the lock check, a lost Begin race, and a reader's unavailable or changed
+	// epoch.
+	if evt.IsRebuildTransient(err) {
+		return ClassTransient
 	}
 
 	return ClassUnknown

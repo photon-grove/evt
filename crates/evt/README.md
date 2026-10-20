@@ -46,10 +46,17 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
   commits once: all streams land or none does. Reads that were not written are fenced at the head
   they saw, and every event of the commit carries one `commitId` (the command ID when present,
   else a generated ULID). The shared 100-item / 3.8 MB / 380 KB budget fails an oversized commit
-  with `CommitTooLarge` before any write, identically across backends and languages.
+  with `CommitTooLarge` before any write, identically across backends and languages. Every commit
+  carries two control checks (the feature marker and the rebuild lock), so a single-stream commit
+  holds at most 97 events or projector operations, 96 with a snapshot, and one fewer with an
+  outcome.
 - `Store::with_outcomes` records every command as a durable outcome in the same transaction as
   its events, so a retried command returns the stored answer instead of running twice
   ([command outcomes](#command-outcomes)).
+- **Rebuild fence (C10).** `RebuildFence` (every backend) holds a durable `SYSTEM#REBUILD` lock
+  while a projection rebuild runs: every commit is refused with the transient
+  `Error::RebuildInProgress`, readers of derived state check a `RebuildEpoch`, and the worker's
+  view writes are guarded by its lease ([Rebuild fence](#rebuild-fence)).
 
 ## Example
 
@@ -450,8 +457,10 @@ The table needs a string partition key `pk` and a number sort key `sk`, the same
 Enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
 `ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`. Engine relations use the
 reserved `__evt_` infix; schema setup migrates the old `{events}_entity_type_idx` index to
-`{events}__evt_entity_type_idx`. Configured unquoted names are lowercase-canonicalized, with a
-34-byte events-table limit and a 58-byte snapshots-table limit. Both names must avoid `__evt_`
+`{events}__evt_entity_type_idx`, and it creates the rebuild fence's `{events}__evt_rebuild_lock`
+and `{events}__evt_rebuild_generation` (a schema created before them treats a commit's lock check
+as passing until `ensure_schema` runs again). Configured unquoted names are lowercase-canonicalized,
+with a 34-byte events-table limit and a 58-byte snapshots-table limit. Both names must avoid `__evt_`
 and any collision among the tables and derived relations.
 
 ```rust,ignore
@@ -631,14 +640,56 @@ without the feature refuse the table.
   build-wide, so a build that enables it accepts a journal table through every repository,
   wrapped or not; a bypassing writer's events would be missing from the scopes. Enable the journal
   before writing the events it covers: earlier events have no row and no gap shows it. A commit's
-  journal rows and counters count toward the 100-action transaction budget.
-- **Rebuilds** (`journal::rebuild`) rewrite rows and counters unconditionally and take a
-  `WritersQuiesced` acknowledgement: do not run one beside live writers.
+  journal rows and counters count toward the commit budget (97 event and projector operations, 96 with a snapshot).
+- **Rebuilds** (`journal::rebuild`, or `rebuild_with_lock`) run under the [rebuild lock](#rebuild-fence)
+  and write the rows and counters through `write_rebuild_views`, fenced on the lease's owner and
+  fencing token. Live commits fail with `Error::RebuildInProgress` while the lock is held, so a
+  rebuild cannot lower a counter under a writer. Readers that can overlap a rebuild use
+  `page_at_epoch` / `high_watermark_at_epoch`: they fail with `RebuildUnavailable` or
+  `RebuildEpochChanged` (both transient) instead of showing half-written rows. Keep the cursor, back
+  off, and read the same page again.
 - **Backends.** DynamoDB and the in-memory repository. The Rust PostgreSQL repository does not write
   commit-wide views yet.
 
 The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md#journal),
 and `photon_evt::conformance::journal_cases` (features `journal` and `conformance`) checks a backend.
+
+## Rebuild fence
+
+A projection rebuild wipes and replays derived state, so it must not interleave with live writers
+or be read half-done. `RebuildFence` (the in-memory, DynamoDB, and PostgreSQL repositories) keeps
+a lock row and a generation counter, the same rows in both languages:
+
+```rust,ignore
+use std::time::Duration;
+
+use photon_evt::{Error, RebuildFence, read_at_rebuild_epoch};
+
+// The worker: take the lock (or an expired lease), write views in guarded batches, release.
+let lease = repository.begin_rebuild("rebuild-7", Duration::from_secs(300)).await?;
+repository.write_rebuild_views(&lease, &batch).await?; // at most 99 operations
+let lease = repository.renew_rebuild(&lease, Duration::from_secs(300)).await?;
+repository.end_rebuild(&lease).await?;
+
+// A reader of derived state: observe the generation, read, verify.
+let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().await }).await?;
+```
+
+- While the lock exists, an expired one included, every commit fails with
+  `Error::RebuildInProgress`, which is transient: fence-aware retry runs the command again after a
+  backoff and returns the error when attempts run out. It is never a conflict, never a
+  `stale-fence` rejection, and records no outcome.
+- `begin_rebuild` takes over a lease that expired (the generation grows by two) and refuses one
+  that is held with `Error::RebuildLockHeld`. The `RebuildLease` it returns carries a fencing
+  token, the odd generation it produced, which the lock row stores: `renew_rebuild`,
+  `end_rebuild`, and `write_rebuild_views` take the lease and act only while the lock names both
+  its owner and its token. A worker that lost its lock, including a stale incarnation that reuses
+  its owner token after a takeover, gets `Error::RebuildLeaseLost` and writes nothing.
+- `force_release_rebuild` is the operator's escape hatch: commits resume at once, while readers stay
+  fenced (`Error::RebuildUnavailable`) until a later rebuild begins and ends.
+- A command handler that reads a view under the epoch check returns `RebuildUnavailable` or
+  `RebuildEpochChanged` as its own error: the engine returns it at once and records nothing.
+- Leases are whole seconds read from the repository's clock; `with_clock` injects one in tests.
 
 ## Enumerating the log
 
@@ -775,6 +826,8 @@ backends:
 ```rust,ignore
 photon_evt::conformance::Suite::new(&my_repository).run().await;
 photon_evt::conformance::outcome_cases(&my_repository, &second_handle).await;
+// For a backend that implements `RebuildFence` (and reads `clock` for its leases):
+photon_evt::conformance::RebuildSuite::new(&my_repository, &clock).run().await;
 // For a backend that implements `EventLog`:
 photon_evt::conformance::enumeration_cases(&my_repository).await;
 ```

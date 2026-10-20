@@ -236,10 +236,10 @@ entry points compiling. Go adds `Store.ExecuteWithOutcome` (returning `*CommandO
 `Store.BeginCommand` then `Transaction.Complete`/`Reject`. Rust adds
 `Store::execute_with_outcome`/`execute_with_response` and `Transaction::begin_command`
 → `commit_with_outcome`/`reject`, returning `CommandOutcome<E>` rather than a bare enum. An
-outcome-only commit (a persisted rejection that carries no events, or an accepted no-op) is the feature-marker check plus,
+outcome-only commit (a persisted rejection that carries no events, or an accepted no-op) is the feature-marker and rebuild-lock checks plus,
 for a transaction, the fence checks of its reads, then the outcome put; the stale-fence
 rejection omits the failed fences. A failed outcome put outranks every other failed item except the
-feature-marker check. Ambiguous-write recovery polls the row for a bounded window and treats a
+feature-marker and rebuild-lock checks. Ambiguous-write recovery polls the row for a bounded window and treats a
 row still absent at the end as a retryable ambiguous write rather than proof that the commit did
 not apply ("absent → safe to retry" above is superseded: a transaction can land after any single
 read). See the storage spec's Command Outcomes section.
@@ -566,6 +566,26 @@ fenced by the framework, not by app-level flags):
 
 The rows live in the reserved `SYSTEM#` namespace (C8), skipped by enumeration and heads. On
 PostgreSQL the same rows are table rows checked in the commit transaction.
+
+**Implementation (E2.7/E3.7).** The decision above is implemented in both languages on every
+backend; the storage spec's [Rebuild Fence](../spec/storage-format.md#rebuild-fence) is normative
+and pins the bytes. What the decision left open:
+
+- The commit-time check sits at action 2 of every commit, after the marker check, and costs one
+  action: a single-stream commit holds 97 events and projector operations (96 with a snapshot).
+  The marker check outranks it, it outranks everything else, and it runs no failure-path probe.
+  It is **transient**: fence-aware retry runs the command again after a backoff and returns
+  `RebuildInProgress` when the attempts run out; it never becomes a `stale-fence` rejection and
+  records no outcome, so a rejection decided during a rebuild is not recorded either.
+- The lifecycle is `Begin` (acquire, or take over an expired lease), `Renew`, `End`, and the
+  operator's `ForceRelease`, plus `WriteViews`, the guarded batch the spec's per-batch condition
+  describes. A lease is whole seconds on the repository's clock, and it is the owner token plus the
+  generation `Begin` returned (stored on the lock row), so `Renew`, `End`, and `WriteViews` fence a
+  stale incarnation of a worker that reuses an owner token.
+- A reader fences a decision with the generation alone: observe an even value, read, verify it is
+  unchanged. No action rides on the commit for it; the lock check refuses a commit that races a
+  rebuild, and a handler that returns the reader's error makes the engine return it and record
+  nothing.
 
 ### C11 — Conformance and compat for the new core
 

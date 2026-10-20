@@ -75,8 +75,11 @@ mod tests;
 
 pub use config::{DEFAULT_MAX_ROW_BYTES, DEFAULT_RETRY, Journal, MAX_ROW_BYTES, ScopeResolver};
 pub use projector::{JournalProjector, PROJECTOR_NAME, PositionTaken};
-pub use read::{Gap, JournalPage, JournalStore, MAX_PAGE_ROWS, high_watermark, page};
-pub use replay::{JournalState, WritersQuiesced, rebuild, replay};
+pub use read::{
+    Gap, JournalPage, JournalStore, MAX_PAGE_ROWS, high_watermark, high_watermark_at_epoch, page,
+    page_at_epoch,
+};
+pub use replay::{JournalState, REBUILD_OWNER, rebuild, rebuild_with_lock, replay};
 pub use repository::JournalRepository;
 pub use row::{
     JournalRow, counter_payload, counter_view, encode_row, read_counter, row_size, row_view,

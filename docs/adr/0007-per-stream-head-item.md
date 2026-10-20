@@ -31,7 +31,7 @@ Every commit is one DynamoDB `TransactWriteItems`, capped at 100 actions and 4 M
 | floor check on the snapshot item `(pk, 0)`            | written stream with no snapshot  | Compaction deleted keys that `attribute_not_exists(sk)` relies on. |
 | slot check on `(pk, head + 1)`                        | read-only fenced stream          | No writer appended past the head the reader saw.                   |
 | snapshot companion on `(pk, 0)`                       | read-only fenced stream          | Closes the append, snapshot, compact ABA that empties the slot.    |
-| feature-marker check, outcome put, rebuild-lock check | commit (the last once C10 lands) | Control rows.                                                      |
+| feature-marker check, outcome put, rebuild-lock check | commit                           | Control rows.                                                      |
 
 So a written stream costs `events + 2` when it appends (continuation plus floor or snapshot put) and
 `events + 1` when it creates, and a fenced stream costs 2. Projector operations count against the
@@ -39,8 +39,8 @@ same 100.
 
 A command that consumes ten ingredient items (ten single-event appends) and reads five reference
 streams, with an outcome, sends 42 actions before projector operations: `1 + 10 × 3 + 5 × 2 + 1`.
-A command that writes a dozen streams and reads nine lands at 56, or 57 once C10 emits the
-rebuild-lock check, which leaves 43 actions for projector operations. The read-fence pair is the
+A command that writes a dozen streams and reads nine lands at 56, or 57 with the
+rebuild-lock check (C10, emitted since), which leaves 43 actions for projector operations. The read-fence pair is the
 largest avoidable cost, and the continuation and floor checks are the next.
 
 Two further costs are invisible in the action count:
@@ -155,7 +155,7 @@ old per written stream = c + e + 1            continuation (when appending) + ev
 new per written stream =     1 + e + σ        head update + events + snapshot put (when written)
 old per fenced stream  = 2                    slot + companion
 new per fenced stream  = 1                    head check
-fixed                  = marker 1 + outcome 1 (when enabled) + rebuild lock 1 (once C10 emits it) + projector ops
+fixed                  = marker 1 + outcome 1 (when enabled) + rebuild lock 1 (C10) + projector ops
 ```
 
 | Commit                                              | Old | New | Change |
@@ -168,13 +168,15 @@ fixed                  = marker 1 + outcome 1 (when enabled) + rebuild lock 1 (o
 | 12 single-event appends + 9 fenced reads            | 56  | 35  | −21    |
 | 1 single-event append + 30 fenced reads             | 65  | 34  | −31    |
 
-Every row includes the marker and the outcome put. Add one to both columns once C10 emits the
-rebuild-lock check: the dozen-and-nine command becomes 57 against 36, which leaves 64 actions for
+Every row includes the marker and the outcome put. C10 added the rebuild-lock check, so add one to
+both columns: the dozen-and-nine command becomes 57 against 36, which leaves 64 actions for
 projector operations instead of 43. Max fenced streams beside one single-event append, marker and
 outcome counted: 47 old, 96 new.
 
-Single-stream capacity for event and projector operations (marker counted, outcome not, as in the
-spec today): create 98 → 98, append 97 → 98, create-with-snapshot 98 → 97, append-with-snapshot 97 → 97.
+Single-stream capacity for event and projector operations (marker counted, outcome not, before the
+rebuild-lock check): create 98 → 98, append 97 → 98, create-with-snapshot 98 → 97,
+append-with-snapshot 97 → 97. With the rebuild-lock check every number is one lower: 97 → 97,
+96 → 97, 97 → 96, 96 → 96.
 The one regression is a commit that **creates** a stream and writes its first snapshot in the same
 commit (a first commit of `interval` or more events): the old layout let the snapshot put replace the
 floor check, and now it sits beside the head update.
@@ -552,7 +554,7 @@ would save the extra action on creates with a snapshot and every snapshot commit
 of the exact-interval and atomicity guarantees. Orthogonal; not pursued here.
 
 **(g) Merge the marker check and the rebuild-lock check into one control row.** Saves one action per
-commit once C10 lands. It couples two protocols (one already implemented), and it makes the
+commit since C10 landed. It couples two protocols (one already implemented), and it makes the
 cancellation reason ambiguous between "revalidate" and "`RebuildInProgress`" without returned values.
 Worth a follow-up; out of scope.
 

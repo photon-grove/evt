@@ -24,6 +24,8 @@
 //!   `high_watermark` / `page` reads that detect gaps.
 //! - Bound log growth with [`Repository::compact_below`], which only deletes events a durable
 //!   snapshot covers.
+//! - Fence projection rebuilds durably with [`RebuildFence`]: while a rebuild holds the lock every
+//!   commit is refused with [`Error::RebuildInProgress`], and readers check a [`RebuildEpoch`].
 //!
 //! The storage contract is documented in the
 //! [storage format spec](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md).
@@ -50,6 +52,7 @@ mod metadata;
 mod numbers;
 mod outcome;
 mod projection;
+mod rebuild;
 mod repository;
 mod retry;
 mod sha256;
@@ -98,6 +101,12 @@ pub use projection::{
     ProjectorOperationError, REASON_CONDITION_FAILED, ViewCondition, ViewOperation,
     ViewOperationKind, ViewRow, check_views, group_commits, project_commit, replay_views,
     view_operation_size,
+};
+pub use rebuild::{
+    MAX_REBUILD_BEGIN_ATTEMPTS, MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH,
+    REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildEpoch, RebuildFence,
+    RebuildGeneration, RebuildLease, RebuildLock, RebuildState, observe_rebuild_epoch,
+    read_at_rebuild_epoch, verify_rebuild_epoch,
 };
 pub use repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,

@@ -122,16 +122,16 @@ impl<Op> Commit<Op> {
     }
 
     /// Exact backend-neutral event/snapshot/action representation, matching Dynamo item sizes,
-    /// for the shared commit budget: the feature-marker check, then the written stream's head
-    /// update, event puts, and snapshot put (see [`stream_sizes`]), then the outcome put. Backend
-    /// projector operations and view operations are opaque here and sized by the backend.
+    /// for the shared commit budget: the feature-marker and rebuild-lock checks, then the written
+    /// stream's head update, event puts, and snapshot put (see [`stream_sizes`]), then the outcome
+    /// put. Backend projector operations and view operations are opaque here and sized by the
+    /// backend.
     pub(crate) fn sizes(
         &self,
         ttl: impl Fn(&EntityType) -> Option<i64>,
     ) -> Result<Vec<usize>, Error> {
-        // Only actions a commit actually emits are budgeted: the feature-marker check today. The
-        // rebuild-lock check (C10) joins this list in the change that starts emitting it.
-        let mut sizes = vec![marker_check_size()];
+        // The two control checks every commit emits, each sized by its two key attributes.
+        let mut sizes = control_check_sizes();
         stream_sizes(self, &ttl, &mut sizes)?;
         // The outcome row comes last, and an outcome-only commit carries nothing else.
         if let Some(outcome) = self.stored_outcome() {
@@ -507,6 +507,7 @@ impl<Op> TransactionCommit<Op> {
     ///       + fenced read-only streams × 1
     ///       + 1 outcome put, when the commit records one
     ///       + 1 feature-marker check
+    ///       + 1 rebuild-lock check
     ///       + projector operations (sized by the backend)
     /// ```
     pub(crate) fn sizes(
@@ -515,9 +516,8 @@ impl<Op> TransactionCommit<Op> {
     ) -> Result<Vec<usize>, Error> {
         use crate::wire::dynamo::{self as wire, HeadAction};
 
-        // Only actions a commit actually emits are budgeted: the feature-marker check today. The
-        // rebuild-lock check (C10) joins this list in the change that starts emitting it.
-        let mut sizes = vec![marker_check_size()];
+        // The two control checks every commit emits, each sized by its two key attributes.
+        let mut sizes = control_check_sizes();
         for stream in &self.streams {
             stream_sizes(stream, &ttl, &mut sizes)?;
         }
@@ -531,6 +531,12 @@ impl<Op> TransactionCommit<Op> {
 
         Ok(sizes)
     }
+}
+
+/// The budgeted sizes of the two control checks every commit carries, in transaction order: the
+/// feature-marker check and the rebuild-lock check (C10), each sized by its key.
+fn control_check_sizes() -> Vec<usize> {
+    vec![marker_check_size(), crate::rebuild::lock_check_size()]
 }
 
 /// The feature-marker check's budgeted size: its key.
@@ -659,7 +665,12 @@ pub(crate) fn item_size(item: &crate::wire::dynamo::Item) -> usize {
 ///   entity-addressed write path (commit, `put_snapshot`, `compact_below`) with
 ///   [`Error::ReservedEntityId`], before any request, and skip those partitions in `entity_heads`
 ///   (v0.9, C8). Explicit event and snapshot reads by ID retain legacy reserved-prefix streams
-///   so migration tooling can read them.
+///   so migration tooling can read them;
+/// - refuse every commit (outcome-only and rejection commits included) with
+///   [`Error::RebuildInProgress`] while a rebuild holds the fence's lock row, an expired one
+///   included, ranked below the feature-marker check and above every other failure; the lock
+///   rows are in the reserved namespace, and snapshot writes and compaction do not check them
+///   (v0.9, C10, see [`RebuildFence`](crate::RebuildFence)).
 pub trait Repository: Send + Sync {
     /// Backend-specific operations that in-band projectors can add to a commit. Backends without
     /// projector support use [`std::convert::Infallible`].
@@ -1027,39 +1038,40 @@ mod tests {
 
     #[test]
     fn the_budget_counts_only_emitted_actions() {
-        // marker check + head update + events: 98 events fill the 100 actions exactly, whether the
-        // commit creates the stream or appends to it. There is no continuation or floor check.
-        let fits = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect());
+        // marker check + rebuild-lock check + head update + events: 97 events fill the 100
+        // actions exactly, whether the commit creates the stream or appends to it. There is no
+        // continuation or floor check.
+        let fits = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect());
         assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
         check_budget(fits.sizes(|_| None).unwrap()).unwrap();
 
-        let over = Commit::<u8>::new("a", (1..=99).map(|n| event("a", n)).collect());
+        let over = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect());
         assert!(matches!(
             check_budget(over.sizes(|_| None).unwrap()),
             Err(Error::CommitTooLarge { actions: 101, .. })
         ));
 
-        // A snapshot put is one more action beside the head update, so 97 events fill the
+        // A snapshot put is one more action beside the head update, so 96 events fill the
         // budget with a snapshot, for a transaction over one stream as for a single commit.
-        let snapshotted = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
+        let snapshotted = Commit::<u8>::new("a", (1..=96).map(|n| event("a", n)).collect())
             .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
         assert_eq!(snapshotted.sizes(|_| None).unwrap().len(), 100);
         let transaction = TransactionCommit::new(vec![snapshotted]);
         assert_eq!(transaction.sizes(|_| None).unwrap().len(), 100);
 
-        let over = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect())
+        let over = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
             .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
         assert_eq!(over.sizes(|_| None).unwrap().len(), 101);
     }
 
     #[test]
     fn appending_to_an_existing_stream_budgets_no_continuation_check() {
-        // An append costs the same as a create: marker + head update + 98 events fill 100.
-        let fits = Commit::<u8>::new("a", (2..=99).map(|n| event("a", n)).collect());
+        // An append costs the same as a create: marker + lock + head update + 97 events fill 100.
+        let fits = Commit::<u8>::new("a", (2..=98).map(|n| event("a", n)).collect());
         assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
         check_budget(fits.sizes(|_| None).unwrap()).unwrap();
 
-        let over = Commit::<u8>::new("a", (2..=100).map(|n| event("a", n)).collect());
+        let over = Commit::<u8>::new("a", (2..=99).map(|n| event("a", n)).collect());
         assert!(matches!(
             check_budget(over.sizes(|_| None).unwrap()),
             Err(Error::CommitTooLarge { actions: 101, .. })
@@ -1071,12 +1083,13 @@ mod tests {
             Commit::<u8>::new("a", (2..=3).map(|n| event("a", n)).collect()),
             Commit::<u8>::new("b", vec![event("b", 1)]),
         ]);
-        // marker + a: head + 2 events, b: head + 1 event
-        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 1 + 3 + 2);
+        // marker + lock + a: head + 2 events, b: head + 1 event
+        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 2 + 3 + 2);
     }
 
-    /// The ADR's worked examples ("Action counts"), each with the marker check and the outcome
-    /// put, as the shared estimator counts them.
+    /// The ADR's worked examples ("Action counts"), each with the two control checks (the
+    /// feature-marker check and the rebuild-lock check) and the outcome put, as the shared
+    /// estimator counts them.
     #[test]
     fn the_adr_action_counts_hold() {
         let append = |id: &str| Commit::<u8>::new(id, vec![event(id, 2)]);
@@ -1093,27 +1106,27 @@ mod tests {
 
         // create one stream, one event, no snapshot
         let created = Commit::<u8>::new("a", vec![event("a", 1)]).with_outcome(outcome("c"));
-        assert_eq!(created.sizes(|_| None).unwrap().len(), 4);
+        assert_eq!(created.sizes(|_| None).unwrap().len(), 5);
         assert_eq!(
             counted(vec![Commit::new("a", vec![event("a", 1)])], vec![]),
-            4
+            5
         );
 
         // append one event, no snapshot
         let appended = append("a").with_outcome(outcome("c"));
-        assert_eq!(appended.sizes(|_| None).unwrap().len(), 4);
-        assert_eq!(counted(vec![append("a")], vec![]), 4);
+        assert_eq!(appended.sizes(|_| None).unwrap().len(), 5);
+        assert_eq!(counted(vec![append("a")], vec![]), 5);
 
         // append one event that writes a snapshot
         assert_eq!(
             counted(vec![append("a").with_snapshot(snapshot())], vec![]),
-            5
+            6
         );
 
         // create with five events and a snapshot
         let five = Commit::<u8>::new("a", (1..=5).map(|n| event("a", n)).collect())
             .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
-        assert_eq!(counted(vec![five], vec![]), 9);
+        assert_eq!(counted(vec![five], vec![]), 10);
 
         // ten single-event appends and five fenced reads
         let appends = |count: usize| {
@@ -1126,9 +1139,9 @@ mod tests {
                 .map(|n| fence(&format!("r{n:02}")))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(counted(appends(10), fences(5)), 27);
-        assert_eq!(counted(appends(12), fences(9)), 35);
-        assert_eq!(counted(appends(1), fences(30)), 34);
+        assert_eq!(counted(appends(10), fences(5)), 28);
+        assert_eq!(counted(appends(12), fences(9)), 36);
+        assert_eq!(counted(appends(1), fences(30)), 35);
     }
 
     #[test]
@@ -1165,26 +1178,27 @@ mod tests {
 
     #[test]
     fn the_outcome_item_counts_against_the_commit_budget() {
-        // marker + head update + 97 events + outcome = 100 actions; 98 events are one too many.
-        let fits = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
+        // marker + lock + head update + 96 events + outcome = 100 actions; 97 events are one too
+        // many.
+        let fits = Commit::<u8>::new("a", (1..=96).map(|n| event("a", n)).collect())
             .with_outcome(outcome("c"));
         assert_eq!(fits.sizes(|_| None).unwrap().len(), 100);
         check_budget(fits.sizes(|_| None).unwrap()).unwrap();
 
-        let over = Commit::<u8>::new("a", (1..=98).map(|n| event("a", n)).collect())
+        let over = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
             .with_outcome(outcome("c"));
         assert!(matches!(
             check_budget(over.sizes(|_| None).unwrap()),
             Err(Error::CommitTooLarge { actions: 101, .. })
         ));
 
-        // Appending costs the same: there is no continuation check. 97 events fit, 98 do not.
+        // Appending costs the same: there is no continuation check. 96 events fit, 97 do not.
         let appends = |last| {
             Commit::<u8>::new("a", (2..=last).map(|n| event("a", n)).collect())
                 .with_outcome(outcome("c"))
         };
-        assert_eq!(appends(98).sizes(|_| None).unwrap().len(), 100);
-        assert_eq!(appends(99).sizes(|_| None).unwrap().len(), 101);
+        assert_eq!(appends(97).sizes(|_| None).unwrap().len(), 100);
+        assert_eq!(appends(98).sizes(|_| None).unwrap().len(), 101);
 
         // The same arithmetic for a transaction.
         let transaction = |last| {
@@ -1194,19 +1208,23 @@ mod tests {
             )])
             .with_outcome(outcome("c"))
         };
-        assert_eq!(transaction(97).sizes(|_| None).unwrap().len(), 100);
-        assert_eq!(transaction(98).sizes(|_| None).unwrap().len(), 101);
+        assert_eq!(transaction(96).sizes(|_| None).unwrap().len(), 100);
+        assert_eq!(transaction(97).sizes(|_| None).unwrap().len(), 101);
     }
 
     #[test]
-    fn an_outcome_only_commit_budgets_the_marker_check_and_the_outcome() {
+    fn an_outcome_only_commit_budgets_the_control_checks_and_the_outcome() {
         let single = Commit::<u8>::new("a", Vec::new()).with_outcome(outcome("c"));
-        assert_eq!(single.sizes(|_| None).unwrap().len(), 2, "no head update");
+        let sizes = single.sizes(|_| None).unwrap();
+        assert_eq!(sizes.len(), 3, "no head update");
+        // Each control check is sized by its key: pk + SYSTEM#FEATURES + sk + 0, and
+        // pk + SYSTEM#REBUILD + sk + 0.
+        assert_eq!(sizes[..2], [2 + 15 + 2 + 1, 2 + 14 + 2 + 1]);
 
         let transaction = TransactionCommit::<u8>::new(Vec::new()).with_outcome(outcome("c"));
-        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 2);
+        assert_eq!(transaction.sizes(|_| None).unwrap().len(), 3);
 
-        // A fence is one check, budgeted between the marker and the outcome.
+        // A fence is one check, budgeted between the control checks and the outcome.
         let mut fenced = TransactionCommit::<u8>::new(Vec::new()).with_outcome(outcome("c"));
         fenced.fences = vec![ReadFence::new(
             "f",
@@ -1214,7 +1232,7 @@ mod tests {
             EventSequence(1),
             FenceProvenance::Engine,
         )];
-        assert_eq!(fenced.sizes(|_| None).unwrap().len(), 3);
+        assert_eq!(fenced.sizes(|_| None).unwrap().len(), 4);
 
         // Without an outcome it is still a no-op.
         assert!(TransactionCommit::<u8>::new(Vec::new()).is_empty());
@@ -1278,7 +1296,7 @@ mod tests {
         // The estimator uses the commit's own ttl for `:t` and `:prev` only above sequence 1.
         let commit = Commit::<u8>::new("acct", vec![event("acct", 8), event("acct", 9)]);
         let sizes = commit.sizes(|_| Some(1_760_086_400)).unwrap();
-        assert_eq!(sizes[1], retained.size());
+        assert_eq!(sizes[2], retained.size());
     }
 
     #[test]

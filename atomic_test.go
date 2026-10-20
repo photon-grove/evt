@@ -38,25 +38,29 @@ func TestTransactionItemSizesWithTTL_CountsTheTTLAttributeOnRetainedTypesOnly(t 
 	})
 	require.NoError(t, err)
 
-	// The feature-marker check, then the event puts, the snapshot put, one head update per written
-	// stream, and the one head check of the fence.
-	require.Len(t, plain, 1+2+1+2+1)
+	// The feature-marker check and the rebuild-lock check, then the event puts, the snapshot put,
+	// one head update per written stream, and the one head check of the fence.
+	require.Len(t, plain, 2+2+1+2+1)
 	require.Len(t, retained, len(plain))
 
 	attribute := len("ttl") + len("1800000000")
 	want := append([]int(nil), plain...)
-	want[1] += attribute // a's event put
-	want[3] += attribute // a's snapshot put
+	want[2] += attribute // a's event put
+	want[4] += attribute // a's snapshot put
 
 	// a's head update also raises the head item's ttl: the longer update expression, the name
 	// placeholder and name, and the :t value.
-	want[4] += len("SET head = :last, #ttl = :t") - len("SET head = :last") +
+	want[5] += len("SET head = :last, #ttl = :t") - len("SET head = :last") +
 		len("#ttl") + len("ttl") + len(":t") + len("1800000000")
 	require.Equal(t, want, retained, "only retained types' items carry a ttl")
 
 	// The head updates (create, so no :prev) and the fence check (one check at head 3).
-	require.Equal(t, 2+2+len("a")+len("-1")+len(":last")+len("1")+len("SET head = :last")+len("attribute_not_exists(head)"), plain[4])
-	require.Equal(t, 2+2+len("c")+len("-1")+len("head = :head")+len(":head")+len("3"), plain[6])
+	require.Equal(t, 2+2+len("a")+len("-1")+len(":last")+len("1")+len("SET head = :last")+len("attribute_not_exists(head)"), plain[5])
+	require.Equal(t, 2+2+len("c")+len("-1")+len("head = :head")+len(":head")+len("3"), plain[7])
+
+	// The two control checks are sized by their two key attributes.
+	require.Equal(t, len("pk")+len("sk")+len("SYSTEM#FEATURES")+1, plain[0])
+	require.Equal(t, len("pk")+len("sk")+len("SYSTEM#REBUILD")+1, plain[1])
 }
 
 func TestTransactionItemSizes_NilTTLEqualsNoRetention(t *testing.T) {
@@ -108,14 +112,15 @@ func TestPreflightCommit_BudgetsOnlyEmittedActions(t *testing.T) {
 		return out
 	}
 
-	// The feature-marker check, 98 event puts, and the head update fill the 100 actions exactly.
-	fits, err := evt.TransactionItemSizes(evt.SerializedResult{Events: events(98)})
+	// The feature-marker check, the rebuild-lock check, 97 event puts, and the head update fill the
+	// 100 actions exactly.
+	fits, err := evt.TransactionItemSizes(evt.SerializedResult{Events: events(97)})
 	require.NoError(t, err)
 	require.Len(t, fits, 100)
-	require.NoError(t, evt.PreflightCommit(evt.SerializedResult{Events: events(98)}))
+	require.NoError(t, evt.PreflightCommit(evt.SerializedResult{Events: events(97)}))
 
 	var tooLarge *evt.CommitTooLargeError
-	require.ErrorAs(t, evt.PreflightCommit(evt.SerializedResult{Events: events(99)}), &tooLarge)
+	require.ErrorAs(t, evt.PreflightCommit(evt.SerializedResult{Events: events(98)}), &tooLarge)
 	require.Equal(t, 101, tooLarge.Items)
 }
 
@@ -156,14 +161,15 @@ func TestPreflightCommit_CountsProjectorOperations(t *testing.T) {
 		ID: "a:1", Sequence: 1, Type: "t:created", Version: 1, EntityID: "a", EntityType: "t", Payload: []byte(`{}`),
 	}
 
-	// Marker check, one event, and the head update leave 97 actions for projector operations.
+	// The two control checks, one event, and the head update leave 96 actions for projector
+	// operations.
 	require.NoError(t, evt.PreflightCommit(evt.SerializedResult{
-		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{opaqueGroup{size: 97}},
+		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{opaqueGroup{size: 96}},
 	}))
 
 	var tooLarge *evt.CommitTooLargeError
 	require.ErrorAs(t, evt.PreflightCommit(evt.SerializedResult{
-		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{opaqueGroup{size: 98}},
+		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{opaqueGroup{size: 97}},
 	}), &tooLarge)
 	require.Equal(t, 101, tooLarge.Items)
 

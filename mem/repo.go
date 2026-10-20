@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/policy"
@@ -27,6 +28,9 @@ type Repository struct {
 	// features holds the durable feature manifest. Shared through a pointer, like the maps
 	// above, so copies of the handle (and clones of it) see one manifest.
 	features *memFeatures
+
+	// now is the clock the rebuild fence reads for lease expiry; nil means time.Now.
+	now func() time.Time
 }
 
 // memFeatures is the in-memory form of the feature-marker row: the manifest plus the lock that
@@ -42,6 +46,11 @@ type memFeatures struct {
 	// views holds the rows commit-wide view operations write (ADR 0004, C7), keyed by pk and sk.
 	// They share the lock with the events, so a commit's rows appear in the same critical section.
 	views map[viewKey]evt.SerializedView
+
+	// rebuild holds the rebuild fence (ADR 0004, C10): the lock row and the generation item. It
+	// shares the lock with the events, so a commit's lock check and its writes are one critical
+	// section.
+	rebuild memRebuild
 }
 
 // NewRepository creates a new instance of the Repository
@@ -62,6 +71,7 @@ var (
 
 	_ evt.TransactionalRepository = (*Repository)(nil)
 	_ evt.OutcomeRepository       = (*Repository)(nil)
+	_ evt.RebuildFenceProvider    = (*Repository)(nil)
 )
 
 // AtomicTransactions declares that Commit writes every stream, snapshot, and fence of a result
@@ -99,13 +109,17 @@ func (repo Repository) Commit(
 		return err
 	}
 
-	// The rebuild-lock check (C10) joins the checks here, right after the marker validation, once
-	// the rebuild fence lands; until then none is made.
-
 	// Fences are refused outright for entity types durably declared with retention, exactly as
-	// the durable backends refuse them.
+	// the durable backends refuse them. Like every refusal that needs only the manifest, it
+	// precedes the rebuild-lock check.
 	if err := evt.CheckFenceRetention(normalized.Fences, repo.features.manifest); err != nil {
 		return err
+	}
+
+	// The rebuild-lock check (C10): any lock row, including one whose lease expired, refuses the
+	// commit, ahead of the outcome row and every stream check (storage spec, Writes).
+	if repo.features.rebuild.lock != nil {
+		return &evt.RebuildInProgressError{}
 	}
 
 	// A lost outcome row outranks every other failure but the marker (storage spec, Stream

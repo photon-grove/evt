@@ -367,6 +367,44 @@
         {"by": "rust", "op": "execute", "commandId": "c8", "command": {"type": "withdraw", "amountCents": 160}, "expect": {"result": "ok", "events": 1}},
         {"by": "go", "op": "execute", "commandId": "c9", "command": {"type": "deposit", "amountCents": 5}, "expect": {"result": "ok", "events": 1}}
       ]
+    },
+    {
+      "name": "rebuild-fence",
+      "exclusive": true,
+      "description": "The durable rebuild fence (C10). While one language holds SYSTEM#REBUILD the other's commit fails with RebuildInProgress and writes nothing, its Begin is RebuildLockHeld, and its reader epoch check sees an odd generation. End settles the generation (even) and commits resume. A takeover of an expired lease bumps the generation by two and leaves it odd, and the displaced worker's renew and guarded view write are RebuildLeaseLost and write no row. A force-release deletes the lock but leaves the generation odd and flagged: commits resume while readers stay fenced, until a later Begin and End settle it and clear the flag.",
+      "snapshotInterval": 0,
+      "steps": [
+        {"by": "go", "op": "execute", "commandId": "c1", "command": {"type": "open", "owner": "Hedy Lamarr", "openedAt": "2026-01-02T03:04:05.123Z"}, "expect": {"result": "ok", "events": 1}},
+        {"by": "go", "op": "rebuild", "action": "begin", "owner": "w1", "leaseSeconds": 600, "expect": {"result": "ok", "delta": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c2", "command": {"type": "deposit", "amountCents": 100}, "expect": {"result": "rebuildInProgress"}},
+        {"by": "rust", "op": "rebuild", "action": "begin", "owner": "w2", "leaseSeconds": 600, "expect": {"result": "held", "delta": 0}},
+        {"by": "rust", "op": "rebuild", "action": "generation", "expect": {"result": "unavailable", "delta": 0}},
+        {"by": "go", "op": "rebuild", "action": "writeViews", "owner": "w1", "expect": {"result": "ok", "delta": 0, "rows": 1}},
+        {"by": "rust", "op": "rebuild", "action": "writeViews", "owner": "w2", "expect": {"result": "leaseLost", "delta": 0, "rows": 1}},
+        {"by": "go", "op": "rebuild", "action": "renew", "owner": "w1", "leaseSeconds": 600, "expect": {"result": "ok", "delta": 0}},
+        {"by": "go", "op": "rebuild", "action": "end", "owner": "w1", "expect": {"result": "ok", "delta": 1}},
+        {"by": "rust", "op": "rebuild", "action": "generation", "expect": {"result": "settled", "delta": 0}},
+        {"by": "rust", "op": "execute", "commandId": "c2", "command": {"type": "deposit", "amountCents": 100}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "rebuild", "action": "begin", "owner": "w3", "leaseSeconds": 1, "expect": {"result": "ok", "delta": 1}},
+        {"by": "go", "op": "rebuild", "action": "wait", "seconds": 3, "expect": {"result": "ok", "delta": 0}},
+        {"by": "go", "op": "rebuild", "action": "begin", "owner": "w4", "leaseSeconds": 600, "expect": {"result": "ok", "delta": 2}},
+        {"by": "rust", "op": "rebuild", "action": "writeViews", "owner": "w3", "expect": {"result": "leaseLost", "delta": 0, "rows": 1}},
+        {"by": "rust", "op": "rebuild", "action": "renew", "owner": "w3", "leaseSeconds": 600, "expect": {"result": "leaseLost", "delta": 0}},
+        {"by": "rust", "op": "rebuild", "action": "generation", "expect": {"result": "unavailable", "delta": 0}},
+        {"by": "rust", "op": "rebuild", "action": "end", "owner": "w3", "expect": {"result": "leaseLost", "delta": 0}},
+        {"by": "go", "op": "rebuild", "action": "writeViews", "owner": "w4", "expect": {"result": "ok", "delta": 0, "rows": 2}},
+        {"by": "go", "op": "rebuild", "action": "end", "owner": "w4", "expect": {"result": "ok", "delta": 1}},
+        {"by": "go", "op": "rebuild", "action": "begin", "owner": "w5", "leaseSeconds": 600, "expect": {"result": "ok", "delta": 1}},
+        {"by": "rust", "op": "rebuild", "action": "forceRelease", "owner": "w5", "expect": {"result": "ok", "delta": 2, "forceReleased": true}},
+        {"by": "go", "op": "execute", "commandId": "c3", "command": {"type": "deposit", "amountCents": 5}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "rebuild", "action": "generation", "expect": {"result": "unavailable", "delta": 0, "forceReleased": true}},
+        {"by": "rust", "op": "rebuild", "action": "forceRelease", "owner": "w5", "expect": {"result": "leaseLost", "delta": 0, "forceReleased": true}},
+        {"by": "rust", "op": "rebuild", "action": "begin", "owner": "w6", "leaseSeconds": 600, "expect": {"result": "ok", "delta": 2, "forceReleased": true}},
+        {"by": "go", "op": "execute", "commandId": "c4", "command": {"type": "deposit", "amountCents": 7}, "expect": {"result": "rebuildInProgress"}},
+        {"by": "go", "op": "rebuild", "action": "end", "owner": "w6", "expect": {"result": "ok", "delta": 1, "forceReleased": false}},
+        {"by": "go", "op": "rebuild", "action": "generation", "expect": {"result": "settled", "delta": 0}},
+        {"by": "rust", "op": "execute", "commandId": "c4", "command": {"type": "deposit", "amountCents": 7}, "expect": {"result": "ok", "events": 1}}
+      ]
     }
   ]
 }

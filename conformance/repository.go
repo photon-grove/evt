@@ -84,6 +84,12 @@ type SuiteOptions struct {
 	// StreamHeadsNotMigrated case.
 	Unmigrate func(ctx context.Context, repo evt.Repository) (restore func(), err error)
 
+	// WithRebuildClock returns a handle over the same store as repo whose rebuild fence reads the
+	// given clock for lease expiry (ADR 0004, C10). It is mandatory for a backend that sets
+	// SupportsTransactions: every such backend keeps the rebuild fence, and the lease cases drive its
+	// clock instead of sleeping.
+	WithRebuildClock func(repo evt.Repository, now func() time.Time) evt.Repository
+
 	// RefusesCommitStream indicates the deprecated batch path is refused outright because it
 	// writes events without maintaining head items (the DynamoDB backend).
 	RefusesCommitStream bool
@@ -212,6 +218,8 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		})
 
 		runStreamHeadCases(t, newRepo, opts)
+
+		runRebuildFenceCases(t, newRepo, opts)
 	}
 
 	if opts.EnforcesOptimisticConcurrency && opts.SupportsSnapshots {
@@ -919,17 +927,18 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 	ctx := context.Background()
 	ns := newNamespace()
 
-	// The feature-marker check, the head update, and 98 event puts are exactly 100 actions, so a
-	// 98-event commit fits on every backend. Only emitted actions count against the budget.
+	// The feature-marker check, the rebuild-lock check, the head update, and 97 event puts are
+	// exactly 100 actions, so a 97-event commit fits on every backend. Every emitted action counts
+	// against the budget.
 	idFits := evt.EntityID(ns + "-fits")
-	fitting := make([]evt.Event, 0, 98)
-	for i := range 98 {
+	fitting := make([]evt.Event, 0, 97)
+	for i := range 97 {
 		fitting = append(fitting, &test.EntityUpdated{ID: idFits, Value: fmt.Sprintf("value-%d", i)})
 	}
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idFits, "test", 0, fitting...)}))
 
 	// Appending to an existing stream costs the same single head update as creating it, so the
-	// marker check, the head update, and 98 event puts fill the 100 actions: 98 fit, 99 do not.
+	// two control checks, the head update, and 97 event puts fill the 100 actions: 97 fit, 98 do not.
 	idGrows := evt.EntityID(ns + "-grows")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 		Events: serialize(t, idGrows, "test", 0, &test.EntityCreated{ID: idGrows, Value: "first"}),
@@ -944,15 +953,15 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 		return out
 	}
 
-	tooMany := repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(99)...)})
+	tooMany := repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(98)...)})
 	var tooLargeAppend *evt.CommitTooLargeError
 	require.ErrorAs(t, tooMany, &tooLargeAppend)
 	require.Equal(t, 101, tooLargeAppend.Items)
 
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(98)...)}))
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idGrows, "test", 1, growing(97)...)}))
 
 	idA := evt.EntityID(ns + "-a")
-	// 101 event puts plus the marker check and the head update exceed the 100-item budget.
+	// 101 event puts plus the two control checks and the head update exceed the 100-item budget.
 	events := make([]evt.Event, 0, 101)
 	for i := range 101 {
 		events = append(events, &test.EntityUpdated{ID: idA, Value: fmt.Sprintf("value-%d", i)})
@@ -1101,18 +1110,18 @@ func testProjectorBudget(t *testing.T, repo evt.Repository, group func(int) evt.
 	ctx := context.Background()
 	ns := newNamespace()
 
-	// The feature-marker check, one event put, and the head update leave 97 actions for
-	// projector operations: 97 fit exactly and 98 do not.
+	// The two control checks, one event put, and the head update leave 96 actions for
+	// projector operations: 96 fit exactly and 97 do not.
 	idFits, idOver := evt.EntityID(ns+"-fits"), evt.EntityID(ns+"-over")
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 		Events:      serialize(t, idFits, "test", 0, &test.EntityCreated{ID: idFits, Value: "fits"}),
-		Transaction: evt.Transaction{group(97)},
+		Transaction: evt.Transaction{group(96)},
 	}))
 
 	err := repo.Commit(ctx, evt.SerializedResult{
 		Events:      serialize(t, idOver, "test", 0, &test.EntityCreated{ID: idOver, Value: "over"}),
-		Transaction: evt.Transaction{group(98)},
+		Transaction: evt.Transaction{group(97)},
 	})
 	var tooLarge *evt.CommitTooLargeError
 	require.ErrorAs(t, err, &tooLarge)

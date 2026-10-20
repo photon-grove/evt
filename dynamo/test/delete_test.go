@@ -51,7 +51,7 @@ func (s *RepositorySuite) Test_Delete_Success() {
 		},
 	}
 
-	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{markerCheck(s.repo.EventsTable)}, expected...)}
+	input := dynamodb.TransactWriteItemsInput{TransactItems: append(controlChecks(s.repo.EventsTable), expected...)}
 
 	output := new(dynamodb.TransactWriteItemsOutput)
 	s.client.On("TransactWriteItems", mock.Anything, &input, mock.Anything).Return(output, nil)

@@ -763,12 +763,13 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
     /// Records the command as a rejected outcome (C4) without writing events: the domain refused
     /// it. Staged appends are discarded ([`reject_with_events`](Transaction::reject_with_events)
-    /// commits them). The commit is an outcome-only transaction: the
-    /// feature-marker check, then the fence check of every stream the transaction read (at the
-    /// head it saw) and every caller-stamped fence, then the rejected outcome row. A rejection
-    /// decided from stale input is therefore not persisted: an engine-filled fence conflict is
-    /// a retryable error, and a failed caller-stamped fence persists a `stale-fence` rejection
-    /// instead, as in [`commit_with_outcome`](Transaction::commit_with_outcome).
+    /// commits them). The commit is an outcome-only transaction: the feature-marker and
+    /// rebuild-lock checks, then the fence check of every stream the transaction read (at the head
+    /// it saw) and every caller-stamped fence, then the rejected outcome row. A rejection decided
+    /// from stale input is therefore not persisted: an engine-filled fence conflict is a retryable
+    /// error, and a failed caller-stamped fence persists a `stale-fence` rejection instead, as in
+    /// [`commit_with_outcome`](Transaction::commit_with_outcome). During a rebuild it is refused
+    /// with [`Error::RebuildInProgress`], whatever its fences.
     ///
     /// The rejection's encoded form is at most 65536 bytes ([`Error::OutcomeTooLarge`], before
     /// any write). A retried command replays the stored rejection verbatim.

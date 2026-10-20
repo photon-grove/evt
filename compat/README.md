@@ -7,11 +7,11 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 
 | Path                      | Written by   | Contents                                                                                                                                                                                              |
 | ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes the C6 `metadata-extensions` handoff; remaining v0.9 scenarios (C1–C10) for E2.8/E3.8 are listed in the [storage format](../docs/spec/storage-format.md#compat-scenarios-to-add). |
+| `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes the C6 `metadata-extensions` handoff; remaining v0.9 scenarios for E2.8/E3.8 are listed in the [storage format](../docs/spec/storage-format.md#compat-scenarios-to-add). Includes the C10 `rebuild-fence` scenario, which is `exclusive`. |
 | `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
 | `fixtures/views.json`     | Go generator | P1/P2/P10 view repository vectors: the items `PutView` writes (default `VIEW` sort key, `ttl`), delete and get keys, items read back (lenient decoding), the `Query` requests of the paged lists, pagination cursors (encode and decode), and the payload bytes of the typed `viewstore.Codec`. |
 | `fixtures/outcomes.json`  | Go generator | C3/C4 identity-digest vectors (canonical bytes and SHA-256, keyed by `targets`, including a rename whose write set comes from state), the encodings of outcome rows (DynamoDB item, budgeted item size, PostgreSQL row, rejection and event-ID JSON, including both stale-fence rejections and a rejection that lists the events it committed), the canonical text of rejection-detail numbers, and the C5 retry-policy defaults both languages assert. |
-| `fixtures/feature-marker.json` | Go generator | C9 canonical manifest JSON, complete DynamoDB marker items, PostgreSQL declaration rows, ordered commit requests, stream-head requests, the C7 `commitViews` requests (the exact actions, tables, conditions, and values of a commit with commit-wide view operations, and their budget sizes), and schema-upgrade DDL. |
+| `fixtures/feature-marker.json` | Go generator | C9 canonical manifest JSON, complete DynamoDB marker items, PostgreSQL declaration rows, ordered commit requests, stream-head requests, the C7 `commitViews` requests (the exact actions, tables, conditions, and values of a commit with commit-wide view operations, and their budget sizes), the C10 `rebuildFence` vectors (every request the DynamoDB rebuild lifecycle sends, seeded from a stored fence state under a fixed clock: the consistent reads, the acquire, takeover, release, and force-release transactions, the lease renewal, and a guarded view write, with the items the table holds before and after), and schema-upgrade DDL. |
 | `fixtures/journal.json`   | Rust generator | X1 journal vectors (ADR 0005, Rust-first): the row and counter keys, the `evt.journal` allocation encoding, the stored events, journal rows, and counters of a real journaled commit, the widest-row measure, and the marker row that declares the journal. Regenerate with `EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test journal_fixtures`; a Go port must reproduce them byte for byte. |
 | `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items (including the stream head item at `sk = -1`), the stream's `head` (the PostgreSQL heads row), SNS messages, sequences, and loaded state; the view rows commit-wide projectors left in the scenario's partitions (`views`); and the `TransactWriteItems` action order of each transaction step, where an action on the views table carries `table: "views"` and its string sort key in `skText`. |
 
@@ -28,8 +28,8 @@ Both sides implement the same account domain: `internal/compat/account.go` and
 | `scripts/compat-integration.sh postgres` | The same against local PostgreSQL.                                                                             |
 
 The marker vectors include duplicate-input set canonicalization, the complete transaction order
-(marker check, projector operations, then per written stream its head update, event puts, and snapshot
-put), the marker row a writer stores when it declares `stream-heads` on a fresh table, and, under
+(marker check, rebuild-lock check, projector operations, then per written stream its head update,
+event puts, and snapshot put), the marker row a writer stores when it declares `stream-heads` on a fresh table, and, under
 `streamHeads`, the exact actions, expressions, name placeholders, and values of every head request
 shape (create, append, later snapshot, fences, retained streams, and the out-of-band snapshot guard)
 with the commit budget's item sizes. Rust consumes these
@@ -74,6 +74,7 @@ changed, and update the spec.
    | `conflictProbe` | `sequence`                                                       | `conflict`, or `ok` when the sequence is free                |
    | `outcomeOnly`   | `identity` (`type`, `payload` object), `response`, `commandId`   | outcomes scenarios: an accepted outcome with no events       |
    | `resolveOutcome`| `command`, `commandId`                                           | outcomes scenarios: `absent`, a replayed outcome, or `reuse` |
+   | `rebuild`       | `action` (`begin`, `renew`, `end`, `forceRelease`, `generation`, `writeViews`, `wait`), `owner`, `leaseSeconds`, `seconds` | `ok`, `held`, `leaseLost`, `settled`, or `unavailable`, with `delta` (the generation after the step minus before), `forceReleased`, and (`writeViews`) `rows`; an `execute` or `transaction` step during a rebuild expects `rebuildInProgress` |
 
    A `transaction` step may also carry `projectors` (C7): a list of `{name, operations}` whose
    operations (`op` `put` or `delete`, `pk`, `sk`, `owner`, `entityType`, `payload`, `condition`
@@ -87,6 +88,14 @@ changed, and update the spec.
    A scenario with `"projector": true` registers the shared ledger projector (`ledger`, in both
    account domains) on its stores, so every commit that writes events puts or deletes the
    stream's row at `pk = "ledger"`, `sk` = the stream ID.
+
+   A scenario with `"exclusive": true` (C10's `rebuild-fence`) holds store-wide state across its
+   steps: a rebuild lock refuses every other scenario's commits. The interleaved run skips it, and
+   `scripts/compat-integration.sh` runs it alone afterwards, one step at a time (`evt-compat steps
+   -only NAME`, `step -only NAME`, and `exclusive` in the Go driver; the Rust driver takes the same
+   arguments). `rebuild` owner tokens are scoped to the run and scenario like command IDs (a step that presents a lease rebuilds it from the store: the lock's fencing generation when it names the scoped owner), and a
+   `writeViews` step writes one view row in the partition `rebuild-<entity ID>`. The fixture runs
+   advance an injected clock for `wait`; the live runs sleep.
 
    A scenario with `"outcomes": true` runs on stores with command outcomes enabled (C3/C4): every
    step needs a `commandId`, and `execute` steps record and replay outcomes. Outcomes steps

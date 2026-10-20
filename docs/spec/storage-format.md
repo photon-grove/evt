@@ -218,11 +218,8 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
 
 1. The feature-marker check (`SYSTEM#FEATURES`), present in every v0.9 commit
    ([Feature Marker](#feature-marker)).
-2. The rebuild-lock check (`SYSTEM#REBUILD`), when the store carries one
-   ([Rebuild Fence](#rebuild-fence)). The position is pinned, but an implementation that does not
-   yet implement the rebuild fence (C10) emits no action here, every later action moves up by
-   one, and the commit budget below does not count it. The budget counts exactly the actions
-   emitted.
+2. The rebuild-lock check (`SYSTEM#REBUILD`), present in every v0.9 commit
+   ([Rebuild Fence](#rebuild-fence)).
 3. Projector operations, in projector declaration order; within one projector, in emission order
    ([Views](#views)). In Go, the operations of the deprecated handler-attached and per-entity
    transaction groups (K7) come first, then those of the commit-wide projectors. A commit that
@@ -247,37 +244,35 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
 6. The outcome row put, when the store records command outcomes
    ([Command Outcomes](#command-outcomes)).
 
-Steps 5 and 6 apply only when the corresponding capability is enabled for the store. The
-feature-marker check (step 1) is not optional: every commit in a v0.9 store carries it, and a
-store that never declares features still validates the marker against `attribute_not_exists(pk)`.
-The rebuild-lock check (step 2) is part of the target layout once C10 lands. The order is pinned so
-fixtures byte-match across implementations: the shared compatibility scenarios record the action
+Step 6 applies only when command outcomes are enabled for the store. The feature-marker check
+(step 1) and the rebuild-lock check (step 2) are not optional: every commit in a v0.9 store
+carries both, in this order, and a store that never declares features or runs a rebuild still
+validates the marker against `attribute_not_exists(pk)` and the lock row against
+`attribute_not_exists(pk)`. The order is pinned so fixtures byte-match across implementations: the shared compatibility scenarios record the action
 order of every multi-stream and fenced transaction, and both languages assert it
 ([Compat Scenarios to Add](#compat-scenarios-to-add)).
 
 For example, a commit that appends to streams `b` and `a` (declared in that order, `a` carrying
-a snapshot) and fences the read-only streams `z` and `m` sends, with no outcome and no rebuild
-check:
+a snapshot) and fences the read-only streams `z` and `m` sends, with no outcome:
 
 ```text
 1. ConditionCheck (SYSTEM#FEATURES, sk = 0)
-2. Update         (a, sk = -1)    a's head: head = n - 1 -> last        (a's first sequence n > 1)
-3. Put            (a, sk = n)     event puts for a, ascending sequence
-4. Put            (a, sk = 0)     a's snapshot put (sequence chain only)
-5. Update         (b, sk = -1)    b's head: create, attribute_not_exists(head)
-6. Put            (b, sk = 1)     event puts for b
-7. ConditionCheck (m, sk = -1)    m's fence: head = :head
-8. ConditionCheck (z, sk = -1)    z's fence: head = :head
+2. ConditionCheck (SYSTEM#REBUILD, sk = 0)   attribute_not_exists(pk)
+3. Update         (a, sk = -1)    a's head: head = n - 1 -> last        (a's first sequence n > 1)
+4. Put            (a, sk = n)     event puts for a, ascending sequence
+5. Put            (a, sk = 0)     a's snapshot put (sequence chain only)
+6. Update         (b, sk = -1)    b's head: create, attribute_not_exists(head)
+7. Put            (b, sk = 1)     event puts for b
+8. ConditionCheck (m, sk = -1)    m's fence: head = :head
+9. ConditionCheck (z, sk = -1)    z's fence: head = :head
 ```
 
-**Capacity.** Every v0.9 commit carries the feature-marker check, and every written stream carries
-one head update, whether it creates or appends. A single-stream commit therefore holds at most
-**98** event/projector operations when it writes no snapshot, creating or appending, and **97**
-when it also writes its snapshot. The budget counts only the actions a commit actually emits. The
-rebuild-lock check (C10) is not emitted yet, so it is not budgeted; the change that starts emitting
-it adds it to the budget, and the two numbers then drop to 97 and 96. A commit that creates a
-stream and writes its first snapshot in the same commit costs one action more than it did before
-head items, because the snapshot put used to replace the floor check.
+**Capacity.** Every v0.9 commit carries the feature-marker check and the rebuild-lock check, and
+every written stream carries one head update, whether it creates or appends. A single-stream commit
+therefore holds at most **97** event/projector operations when it writes no snapshot, creating or
+appending, and **96** when it also writes its snapshot. The budget counts exactly the actions a
+commit emits. A commit that creates a stream and writes its first snapshot in the same commit costs one action
+more than it did before head items, because the snapshot put used to replace the floor check.
 
 **Multi-stream commits (v0.9, C1).** A commit may append to any number of streams. Each written
 stream keeps its event-put protection (`attribute_not_exists(sk)` on every event put), is protected
@@ -292,7 +287,7 @@ items = Σ over written streams (events_s + 1 + [snapshot put in this commit])
       + fenced read-only streams × 1             head check
       + 1                                        outcome put, when outcomes are enabled
       + 1                                        feature-marker check, always in v0.9 stores
-      + 1                                        rebuild-lock check, once C10 emits it (not yet)
+      + 1                                        rebuild-lock check, always in v0.9 stores
       + projector puts and deletes
 ```
 
@@ -312,7 +307,8 @@ items' sizes. The preflight compares the estimates against 95% of the backend li
 **3,800,000 bytes** in aggregate and **380,000 bytes** for any single item, a 5% safety margin
 for key-encoding and rounding differences. It covers every item the transaction carries: the
 event puts, the snapshot items, the head updates, the projector operations, the fence checks, the
-outcome row, and the control checks the commit emits (the feature-marker check today). A head
+outcome row, and the control checks the commit emits (the feature-marker check and the
+rebuild-lock check, each sized by its two key attributes). A head
 update or fence check counts by the rule below for updates and checks: its key attributes plus
 its expression strings, name placeholders and names, and attribute values (the number of a value
 counts as its decimal text). A head update's `:t` is estimated with the commit's own `ttl`. A
@@ -384,7 +380,7 @@ assertion.
 
 A failed outcome put is **not** one of these conflicts. It means another writer already recorded
 an outcome for this command ID, and re-preparing the command as a conflict can never resolve it.
-It **outranks every other failed item** except the feature-marker check: when the same
+It **outranks every other failed item** except the feature-marker and rebuild-lock checks: when the same
 cancellation also reports a failed head update, event put, or fence, the commit is classified as an
 outcome conflict (`OutcomeConflict`), because the row is where the answer lives. PostgreSQL
 reports the same classification for a unique violation (`23505`) on the outcomes table:
@@ -549,7 +545,7 @@ put**), or give the key to a stream every claimant writes. Deleting a row is for
 end of life: a later put by the same owner is fine, by another is the handoff this rule forbids.
 
 A projector's operations are appended to the commit in projector **declaration order**, each
-projector's in its **emission order**, after the marker check and before the written streams
+projector's in its **emission order**, after the marker check and the rebuild-lock check and before the written streams
 ([Writes](#writes)). Operations are backend-neutral; each is a put or a delete of one row at the
 `pk`/`sk` the projector chooses, including partitions that do not name an entity, which is what
 makes cross-entity read models atomic with the commit:
@@ -630,8 +626,8 @@ never retried, and records no outcome (internal failures write none). The reason
 | In-memory  | `ConditionalCheckFailed`.                                                                                |
 
 Where several items of a cancelled DynamoDB transaction failed, the failure classification ranks
-them ([Failure classification](#failure-classification)): the marker check, the outcome put,
-`StreamHeadDrift`, a gap, any conflict on a written stream or a fence, and only then projector
+them ([Failure classification](#failure-classification)): the marker check, the rebuild-lock
+check, the outcome put, `StreamHeadDrift`, a gap, any conflict on a written stream or a fence, and only then projector
 operations — a projector condition is reported only when nothing ranked above it failed, and the
 first failed projector operation in transaction order is the one named. PostgreSQL runs its
 projector statements after the head statements and the event inserts
@@ -1067,12 +1063,12 @@ is finished.
 
 **Outcome-only commits and their checks.** An accepted no-op, a persisted rejection that carries
 no events, and an outcome-only command write no event, snapshot, or head update. Their transaction is the
-feature-marker check, then — for a multi-stream transaction — the fence checks for the streams it
+feature-marker check, the rebuild-lock check, then — for a multi-stream transaction — the fence checks for the streams it
 read (engine-filled and caller-stamped, in the pinned order), then the outcome put, so a
 rejection or a no-op is recorded only if the state it was decided on still holds: a moved
 engine-filled fence is an ordinary retryable conflict and records nothing. The
 single-aggregate shortcut reads one stream without a fence (it never fenced a read), so its
-outcome-only commit is the marker check and the outcome put. The one exception is the
+outcome-only commit is the marker check, the rebuild-lock check, and the outcome put. The one exception is the
 stale-fence rejection ([Fence-Aware Retry](#fence-aware-retry)), which omits the failed fences.
 
 ### Ambiguous-write recovery
@@ -1238,7 +1234,8 @@ read (a stream it did not read cannot be appended to). A rejection with no event
 rejection, and the plain forms (`Reject`, `Decision::reject`) keep discarding staged events.
 
 **Commit.** The events and the rejected outcome row are one atomic commit, with the transaction
-shape of an accepted commit ([Writes](#writes)): the feature-marker check, projector operations,
+shape of an accepted commit ([Writes](#writes)): the feature-marker check, the rebuild-lock check,
+projector operations,
 the written streams (head updates, event puts, snapshot puts), the fence checks of
 the streams the command read but did not write, and the outcome put last. Every rule of an accepted
 commit applies unchanged:
@@ -1342,9 +1339,13 @@ the error — and only then by fence provenance:
   rejection. Re-preparing cannot repair it, and a recorded rejection for it would be false.
 - Control-row failures — the feature-marker and rebuild-lock checks — are classified separately
   ([Writes](#writes)) and never reach this rule, and a lost outcome put is resolved through the
-  outcome row, never by re-preparing ([Command Outcomes](#command-outcomes)). Every other error
-  (an invalid argument, a handler's own error, `IdempotencyKeyReuse`, a corrupt row) is returned
-  at once.
+  outcome row, never by re-preparing ([Command Outcomes](#command-outcomes)). A marker failure
+  re-validates and runs again. A rebuild-lock failure (`RebuildInProgress`) is **transient**: the
+  command runs again after the backoff, because the lock may be taken over, force-released, or
+  released in the meantime, and when the attempts run out the error is returned as it is — it
+  never exhausts into a `stale-fence` rejection and records no outcome, so the same command ID
+  can run again once the rebuild is over. Every other error (an invalid argument, a handler's own
+  error, `IdempotencyKeyReuse`, a corrupt row) is returned at once.
 
 ### Re-preparing
 
@@ -1688,6 +1689,7 @@ items:
 | `pk`             | S    | `SYSTEM#REBUILD`                                    |
 | `sk`             | N    | `0`                                                 |
 | `owner`          | S    | owner token of the current lock holder              |
+| `generation`     | N    | the odd generation the acquire or takeover produced: the lease's fencing token |
 | `leaseExpiresAt` | N    | lease expiry, epoch seconds                         |
 
 | Attribute       | Type | Generation item (`pk = SYSTEM#REBUILD#GENERATION`, `sk = 0`)                  |
@@ -1702,6 +1704,7 @@ items:
   "pk": "SYSTEM#REBUILD",
   "sk": 0,
   "owner": "rebuild-4b1f0a2e",
+  "generation": 5,
   "leaseExpiresAt": 1760000000
 }
 ```
@@ -1715,7 +1718,13 @@ items:
 ```
 
 The lock row above and this generation are one active-rebuild state: the lock exists, so the
-generation is odd.
+generation is odd. The lock row also records the generation its acquire or takeover produced
+(`generation`), the lease's **fencing token**: it is written in the same transaction as the
+generation bump, so while the lock exists it equals the generation item's `value`. A lease is its
+owner token **and** that generation. Owner tokens are caller-chosen, and two incarnations of a
+worker may reuse one: a worker whose lease lapsed and was taken over, even by a later incarnation
+under the same token, still holds the earlier generation, so every lease-guarded write below
+conditions on both and the stale incarnation fails with `RebuildLeaseLost`.
 
 The protocol. Acquire, takeover, release, and force-release are each **one `TransactWriteItems`**
 that writes both items in a single transaction, so a crash can never leave the lock and the
@@ -1773,22 +1782,30 @@ write-condition table in [Writes](#writes).
   epoch sees a new one and re-reads. A takeover racing another takeover fails one of the two
   conditions and retries from a fresh read.
 
-- **Renew**: while it runs, the rebuild renews `leaseExpiresAt` with a conditional update
-  asserting `#owner = :owner`, with `ExpressionAttributeNames` `{"#owner": "owner"}`.
+- **Renew**: while it runs, the rebuild renews `leaseExpiresAt` with one conditional update of the
+  lock item asserting the lease — its owner and its fencing generation:
+
+  ```text
+  UpdateExpression:    SET leaseExpiresAt = :expiry
+  ConditionExpression: #owner = :owner AND #generation = :generation
+  ExpressionAttributeNames: {"#owner": "owner", "#generation": "generation"}
+  ```
 
 - **Release** — one transaction:
 
   ```text
   Delete (SYSTEM#REBUILD, sk = 0)
-         ConditionExpression: #owner = :me
-         ExpressionAttributeNames: {"#owner": "owner"}
+         ConditionExpression: #owner = :me AND #generation = :generation
+         ExpressionAttributeNames: {"#owner": "owner", "#generation": "generation"}
   Update (SYSTEM#REBUILD#GENERATION, sk = 0)
          SET #value = #value + :one REMOVE forceReleased
          ConditionExpression: #value = :seenOdd
          ExpressionAttributeNames: {"#value": "value"}
   ```
 
-  A release restores the quiesced state — generation even — and clears `forceReleased`, so the
+  `:generation` and `:seenOdd` are both the lease's fencing generation, so a release needs no read
+  first: it fails unless the lock row still names the lease's owner under that generation and the
+  generation item still holds it. A release restores the quiesced state — generation even — and clears `forceReleased`, so the
   next acquire sees a plain even value whether or not the rebuild started from a force-released
   generation.
 
@@ -1822,19 +1839,31 @@ write-condition table in [Writes](#writes).
   deliberate: commits stay safe while any lock row exists, at the cost of waiting out a crashed
   rebuild. A commit that races a rebuild fails its check with `RebuildInProgress`
   ([Writes](#writes)), retryable after the lock is taken over or force-released — never as a
-  fence conflict.
+  fence conflict. The check sits at position 2 of every commit, after the feature-marker check
+  and before every other action, in the commit that writes events, in a commit that writes only
+  an outcome row, and in the [outcome-only transaction](#the-outcome-only-transaction) that
+  persists a rejection; an out-of-band snapshot write, compaction, and a rebuild's own lifecycle
+  and view writes carry no such check. It is a `ConditionCheck` that carries no expression
+  attribute names or values, sized in the commit budget by its two key attributes like the
+  marker check, and it is the second-ranked failure of a commit ([Failure
+  classification](#failure-classification)): a failed marker check outranks it, and it outranks
+  the outcome put, drift, a gap, and every other conflict, so a commit that raced a rebuild
+  reports `RebuildInProgress` whatever else its cancellation reasons say, and no
+  [failure-path probe](#failure-classification) runs for it. A commit that is refused before it
+  reaches the store — a projector-only commit, an invalid commit, a reserved entity ID, a commit
+  over its budget — keeps those errors during a rebuild, because they need no read of the lock.
 
 **Rebuild view writes (v0.9, C10).** While it replays, the rebuild worker writes its view rows in
 `TransactWriteItems` batches of at most 99 view operations — the 100th item of every batch is a
 `ConditionCheck` on the lock row:
 
 ```text
-ConditionExpression: #owner = :me AND leaseExpiresAt > :now
-ExpressionAttributeNames: {"#owner": "owner"}
+ConditionExpression: #owner = :me AND #generation = :generation AND leaseExpiresAt > :now
+ExpressionAttributeNames: {"#owner": "owner", "#generation": "generation"}
 ```
 
-The condition asserts transactionally, with every batch's writes, that the worker still holds an
-unexpired lease. A worker that pauses past its lease and loses the lock to a takeover cannot
+The condition asserts transactionally, with every batch's writes, that the worker still holds its
+lease — its owner and fencing generation — and that it has not expired. A worker that pauses past its lease and loses the lock to a takeover cannot
 resume wiping or replaying views: its next batch fails the check and the worker aborts
 immediately, so the new owner's release is never racing a stale worker's projection writes.
 (Changing the generation protects readers; only this per-batch condition protects the views from
@@ -1843,8 +1872,8 @@ transaction takes the lock row itself with `FOR UPDATE` and asserts ownership an
 the same transaction that carries the view statements —
 
 ```sql
-SELECT owner, lease_expires_at FROM evt_events__evt_rebuild_lock
-WHERE id = 0 FOR UPDATE;  -- must return owner = $1 AND lease_expires_at > $2, else abort
+SELECT owner, generation, EXTRACT(EPOCH FROM lease_expires_at)::bigint FROM evt_events__evt_rebuild_lock
+WHERE id = 0 FOR UPDATE;  -- must return owner = $1 AND generation = $2 AND a lease past $3, else abort
 ```
 
 (`evt_events__evt_rebuild_lock` stands for the configured derived name.) The row lock is held
@@ -1869,6 +1898,152 @@ completes and releases (even). On DynamoDB both generation reads set
 consistent reads can return the same stale even value while a rebuild holds the lock, and the
 reader would accept state produced mid-rebuild. PostgreSQL's reads are transactionally consistent,
 so the rule needs no flag there.
+
+### Rebuild lifecycle API
+
+Every backend (in-memory, DynamoDB, PostgreSQL) in both languages exposes the same operations over
+the two rows (v0.9, C10). The names below are Go's, with Rust's in parentheses; the semantics, the
+errors, and the stored bytes are shared.
+
+| Operation                                            | Effect                                                                                         |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `State` (`rebuild_state`)                            | Reads the generation, then the lock row, each with a consistent read.                          |
+| `Generation` (`rebuild_generation`)                  | Reads the generation item alone with a consistent read — the reader primitive.                 |
+| `Begin` (`begin_rebuild`)                            | Acquires the lock from a quiesced or force-released state, or takes over an expired lease.     |
+| `Renew` (`renew_rebuild`)                            | Extends the holder's lease and returns the new expiry.                                         |
+| `End` (`end_rebuild`)                                | Releases the lock and restores the quiesced (even) generation.                                 |
+| `ForceRelease` (`force_release_rebuild`)             | The operator's release of a named owner's lock, leaving the generation odd.                    |
+| `WriteViews` (`write_rebuild_views`)                 | One guarded batch of view writes ([Rebuild view writes](#rebuild-view-writes)).                |
+
+**Values.** A *generation* is its `value` (an absent item reads as `0`) and its `forceReleased`
+flag (`false` when absent). It is *settled* when `value` is even and *unsettled* when odd. A *lock*
+is its `owner` and `leaseExpiresAt`; a *state* is a generation and an optional lock. A rebuild is
+*in progress* when the lock row exists. `State` reads the generation first and the lock second;
+the two reads are not one snapshot, so a caller that must decide on the generation uses
+`Generation`, and one that must decide on the lock row uses the conditional writes below, which
+assert both items in one transaction.
+
+**Owners and leases.** An owner token is a caller-chosen, non-empty string of at most 512 UTF-8
+bytes without U+0000. A lease is a duration of at least one second; it is rounded up to whole seconds, and a
+lease below one second, an empty or oversized owner, and a non-UTF-8 owner or one containing U+0000 are refused with the
+language's invalid-argument error before any request. Every operation reads the repository's clock
+once, in whole Unix seconds, as `:now`; a lease taken at `:now` expires at `:now + :lease`, and the
+lease has *expired* when `leaseExpiresAt < :now` — a lease is still held at the second it expires.
+The clock is the writer's own, so clock skew between a rebuild worker and a taker-over shortens or
+lengthens a lease by the skew. Choose leases far longer than the skew. Both languages let a test
+inject the clock (Go `WithClock`, Rust's repository clock).
+
+**`Begin`.** It reads the state, then decides:
+
+| Observed state                                          | Action                                                       |
+| ------------------------------------------------------- | ------------------------------------------------------------ |
+| no lock row, generation even or absent                  | acquire, `:increment` 1                                      |
+| no lock row, generation odd with `forceReleased`        | acquire from the force-released state, `:increment` 2        |
+| lock row, `leaseExpiresAt < :now`                       | take over, observing the row's `owner` and the odd generation |
+| lock row, `leaseExpiresAt ≥ :now`                       | refuse with `RebuildLockHeld` (owner and expiry), no write   |
+| no lock row, generation odd without `forceReleased`; or lock row with an even generation | refuse with `RebuildStateInvalid`, no write |
+
+The two inconsistent states cannot arise from this protocol, because every transition writes both
+items in one transaction; they are reported rather than repaired. On DynamoDB `Begin` reads the
+two items one after the other, so a transition that lands between the reads can show such a pair
+(a lock row beside the generation from before it): `Begin` reads again, and only a pair that
+survives all the reads is reported, as `RebuildStateInvalid`. The acquire and the takeover are
+the transactions above. If their conditions fail, another operation raced the read: `Begin` reads
+the state again and decides again, at most eight times in all, and then fails with the transient
+`RebuildConflict`. On success it returns a *lease*: the owner, the generation the transaction
+produced (odd), and the new `leaseExpiresAt`. Every commit's lock check reads the lock item, so on DynamoDB it is a hot item: under heavy write
+traffic a lifecycle transaction can lose several races in a row and `Begin` return the transient
+`RebuildConflict`; the caller retries it. A takeover bumps the generation by two and an
+acquire from a quiesced state by one, so a reader pinned to any earlier epoch sees a changed
+generation either way.
+
+**Request shapes.** The acquire's generation condition is the union written above, with all five
+values always bound, because DynamoDB rejects a request that binds a value its expressions do not
+use. A branch that does not apply binds its value to `-1`, which no generation equals:
+
+| Acquire from                | `:zero` | `:increment` | `:seenEven`   | `:seenOdd`    | `:true` |
+| --------------------------- | ------- | ------------ | ------------- | ------------- | ------- |
+| absent generation           | `0`     | `1`          | `0`           | `-1`          | `true`  |
+| even generation `v`         | `0`     | `1`          | `v`           | `-1`          | `true`  |
+| force-released odd `v`      | `0`     | `2`          | `-1`          | `v`           | `true`  |
+
+The lock item an acquire or takeover puts is the full item of the example above — `pk`, `sk`,
+`owner`, `generation`, `leaseExpiresAt` — where `generation` is the odd generation the transaction
+produces (the observed value plus `:increment`) — and the takeover's `:now` and `:observedOwner`
+are numbers and a string as named. A release names the lease (`:me`, `:generation`), a
+force-release the owner alone (`:requestedOwner`), and the generation update's `:one`, `:two`, and
+`:seenOdd` are numbers. Renew is one `UpdateItem` (not a transaction) on the lock item, as above.
+
+**`Renew`, `End`, and `WriteViews` take the lease `Begin` returned** (owner and generation; in Rust
+the `RebuildLease`), and fail with `RebuildLeaseLost` unless the lock row names that owner under
+that generation. `Renew` returns the lease with its new expiry. It does not require the lease to be
+unexpired: an owner whose lease lapsed but whom no one has taken over may renew it. **`End`** runs
+the release transaction without reading first; a failed condition is `RebuildLeaseLost` as well. A
+takeover — even by the same owner token — and a force-release both change the lock row, so a stale
+lease cannot match it. `End` returns the settled generation. **`ForceRelease`** names the owner the
+operator observed; it fails with `RebuildLeaseLost` when the lock row is gone or names another
+owner (the rebuild it meant to release has already ended or been replaced), and returns the odd,
+flagged generation. It never runs the rebuild's cleanup: its callers accept the tradeoff above.
+
+**Errors.** The names are Go's, with Rust's variant in parentheses. All are typed in both
+languages and none is a conflict or a stale-fence rejection.
+
+| Error                                                | When                                                                                                                              |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `RebuildInProgress` (`Error::RebuildInProgress`)     | A commit's lock check failed. **Transient**: retried with a backoff, returned when attempts run out, never a rejection.            |
+| `RebuildLockHeld` (`Error::RebuildLockHeld`)         | `Begin` found an unexpired lock; names the owner and the expiry. Not retried by the engine.                                        |
+| `RebuildLeaseLost` (`Error::RebuildLeaseLost`)       | `Renew`, `End`, `ForceRelease`, or a guarded write found the lock gone, owned by someone else, held under another generation (a later incarnation of the same owner token), or (guarded write) expired.         |
+| `RebuildConflict` (`Error::RebuildConflict`)         | `Begin` lost its race eight times. **Transient**.                                                                                  |
+| `RebuildStateInvalid` (`Error::RebuildStateInvalid`) | The two rows disagree in a way this protocol cannot produce.                                                                       |
+| `RebuildUnavailable` (`Error::RebuildUnavailable`)   | A reader found an odd generation: a rebuild is in progress, or a force-release left derived state untrustworthy. **Transient**.    |
+| `RebuildEpochChanged` (`Error::RebuildEpochChanged`) | A reader's generation changed between its before and after reads. **Transient**.                                                   |
+
+### Rebuild view writes
+
+A rebuild worker writes its view rows through `WriteViews`, one batch per call. On DynamoDB a
+batch is one `TransactWriteItems` of at most **99** view operations — the same items a commit's
+projector operations produce — followed by the guard as the 100th action:
+
+```text
+ConditionCheck (SYSTEM#REBUILD, sk = 0)
+    ConditionExpression: #owner = :me AND leaseExpiresAt > :now
+    ExpressionAttributeNames: {"#owner": "owner"}
+```
+
+A batch of more than 99 operations fails with `CommitTooLarge` before any write, and an empty
+batch is refused as an invalid argument. A failed guard writes nothing and is `RebuildLeaseLost`:
+the worker lost its lock to a takeover or a force-release, or let the lease lapse, and must stop. On
+PostgreSQL the write is one transaction that selects the lock row `FOR UPDATE`, asserts the owner
+and an unexpired lease, then runs the view statements the repository's view writer produces
+([PostgreSQL](#postgresql)). A repository with no view writer refuses the batch with
+`ViewsNotConfigured`.
+
+### Rebuild epochs
+
+A reader that needs derived state to be consistent fences its read against the generation. The
+protocol is the reader epoch check above, in three shapes every backend and both languages share:
+
+- **Observe.** Read the generation. An odd one fails with `RebuildUnavailable`, naming the
+  generation and whether it is flagged `forceReleased`; an even one is an *epoch*, the value the
+  read is made under.
+- **Verify.** Read the generation again. An odd one fails with `RebuildUnavailable` and a settled
+  one that differs from the epoch fails with `RebuildEpochChanged`, naming both values. A settled
+  generation equal to the epoch means no rebuild started, finished, or was taken over while the
+  read ran.
+- **Fenced read.** Observe, run the read, verify; the read's result counts only when verify
+  passes. A failed observe skips the read.
+
+Both failures are transient: the caller waits and reads again, once a rebuild has ended. A command
+handler that read a view makes its decision *under* an epoch, and returns the error from observe
+or verify as the handler's own error — the engine returns it at once, records no outcome, and the
+same command ID runs again later. That is what keeps a decision made on a half-rebuilt view from
+being recorded as a rejection or an acceptance: a rebuild that begins after the verify is stopped
+at the commit by the lock check (`RebuildInProgress`, transient), and one that began before it
+fails the observe or the verify. No further action rides on the commit — the epoch check is the
+reader's, and the commit's only rebuild action is the lock check. A reader that wants the
+rebuild-in-progress state alone, rather than an epoch, reads `State`: a lock row means a rebuild
+holds the fence now, and an odd generation with no lock row and `forceReleased` means the fence
+ended in a force-release.
 
 ## Stream Heads
 
@@ -1977,7 +2152,8 @@ The head condition subsumes the continuation and floor checks of earlier drafts:
   load is current never conflicts with a compaction.
 
 The worked example in [Writes](#writes) (appends to streams `b` and `a`, `a` carrying a snapshot,
-fencing read-only `z` and `m`) sends eight actions. The old layout sent ten.
+fencing read-only `z` and `m`) sends nine actions with the rebuild-lock check. The old layout sent
+eleven.
 
 ### Head checks
 
@@ -1999,14 +2175,14 @@ items = Σ over written streams (events_s + 1 + [snapshot put in this commit])
       + fenced read-only streams × 1              head check
       + 1                                         outcome put, when outcomes are enabled
       + 1                                         feature-marker check, always
-      + 1                                         rebuild-lock check, once C10 emits it
+      + 1                                         rebuild-lock check, always
       + projector puts and deletes
 ```
 
 A commit that writes no snapshot for a stream pays one action beyond its events for that stream
 whether it creates or appends. A single-stream commit holds
-at most **98** event and projector operations when it writes no snapshot, and **97** when it writes
-one (marker counted, rebuild lock not yet; subtract one from each once C10 emits it). Creating a
+at most **97** event and projector operations when it writes no snapshot, and **96** when it writes
+one (marker and rebuild lock both counted). Creating a
 stream with a snapshot in the same commit is the one case that costs more than before (the snapshot
 put used to replace the floor check). `CommitTooLarge` fires on the new count, before any write, on
 every backend. The head update counts toward the byte budget by the rule used for any update: its
@@ -2448,10 +2624,11 @@ holds. For every commit that writes at least one event of a journaled entity typ
    projectors: the journal rows in event then scope order, then one counter put per touched scope,
    ascending by scope.
 
-Each row and each counter is one action of the 100-action budget ([Writes](#writes)): a
-single-stream commit with `e` journaled events, each in `s` scopes, spends `e × s + (distinct scopes)`
-actions beyond the events, head update, and marker check. A commit over the budget fails with
-`CommitTooLarge` before any write, like any other.
+Each row and each counter is one projector operation of the commit's action budget
+([Writes](#writes)). A single-stream commit holds at most **97** event and projector operations
+(**96** when it writes a snapshot), so with `e` journaled events, each in `s` scopes, the events,
+the `e × s` rows, and one counter per distinct scope must fit: `e + e × s + (distinct scopes) ≤ 97`.
+A commit over the budget fails with `CommitTooLarge` before any write, like any other.
 
 **Contention.** If another commit took a position first, the row put fails its `absent` condition,
 which the repository reports as a projector-operation failure that carries the journal's own
@@ -2539,12 +2716,25 @@ is consistent with the row above: a journal table is already head-aware (the jou
 Every row and counter is derived from stored events: for each event, one row per allocation in its
 metadata, and each scope's counter is the highest position any event holds. The derivation needs no
 order and no commit grouping, so a rebuild reads the events of the journaled types in any order
-(an enumeration or a scan), writes the rows and counters unconditionally with the view
-repository's batch writer, and is idempotent. It does not delete: wipe the journal partitions first
-to rebuild from scratch. It rewrites counters unconditionally, so it must not run beside writers (the
-API takes a `WritersQuiesced` acknowledgement, the place the rebuild fence, C10, will hold them off).
-Two events holding one position of a scope never come from this journal and fail the rebuild
-(`InvalidJournal`). The engine's regroup-and-replay of the projector
+(an enumeration or a scan), and is idempotent. It runs **under the rebuild lock** ([Rebuild
+Fence](#rebuild-fence)): the worker takes a lease (`begin_rebuild`), writes the rows and the counters
+as view puts with no `absent` condition through the guarded writer (`write_rebuild_views`, batches of
+at most 99 operations, each asserting the lease's owner and fencing token), and releases the lease
+(`end_rebuild`), which settles the generation. While the lock is held every live commit, journaled
+or not, fails with `RebuildInProgress`, so the unconditional rewrite of counters cannot lower a
+counter under a live writer, and a worker that lost its lock writes nothing (`RebuildLeaseLost`).
+A rebuild that fails keeps the lock (its rows may be half-written) until the lease lapses and a
+retry takes it over, or an operator force-releases it. It does not delete: wipe the journal
+partitions first to rebuild from scratch. Two events holding one position of a scope never come from
+this journal and fail the rebuild (`InvalidJournal`).
+
+**Consumers.** A page or watermark read while a rebuild rewrites rows would show missing rows or a
+counter that is behind. A consumer of a table whose journal can be rebuilt reads under the reader
+epoch check ([Rebuild epochs](#rebuild-epochs)): `page_at_epoch` and `high_watermark_at_epoch` observe the
+generation, read, and verify it again, and fail with `RebuildUnavailable` (a rebuild holds the lock,
+or a force-release left derived state untrustworthy) or `RebuildEpochChanged` (one started or
+finished during the read). Both are transient: keep the cursor, back off, and read the same page
+again. The engine's regroup-and-replay of the projector
 (`GroupCommits` → `ReplayViews`) reproduces the rows (not the counters) from the same events.
 
 ### Backends
@@ -2635,6 +2825,7 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_features (
 CREATE TABLE IF NOT EXISTS evt_events__evt_rebuild_lock (
     id               integer PRIMARY KEY,
     owner            text        NOT NULL,
+    generation       bigint      NOT NULL,
     lease_expires_at timestamptz NOT NULL
 );
 
@@ -2759,7 +2950,8 @@ name.)
 - **Rebuild fence** (v0.9, C10): the durable `{events}__evt_rebuild_lock` **row** is what fences
   commits, exactly as the DynamoDB item does. After taking the shared advisory lock, every commit
   asserts the row is absent, in the same order as the DynamoDB transaction (the feature-marker
-  `SELECT` first, then this assertion):
+  `SELECT` first, then the refusals that need only the manifest — a fence on a retained type —
+  then this assertion; DynamoDB makes those refusals before it sends the transaction):
 
   ```sql
   SELECT 1 FROM evt_events__evt_rebuild_lock WHERE id = 0;  -- any row present, including an expired one, is a conflict
@@ -2768,8 +2960,8 @@ name.)
   A commit that finds a row fails its check with `RebuildInProgress` ([Writes](#writes)),
   retryable after the lock is taken over or force-released: a crashed rebuild keeps blocking
   commits, same as DynamoDB. The shared lock
-  (`pg_advisory_xact_lock_shared(1702261761, hashtext('{events}:rebuild'))`, taken at commit
-  start) makes the assertion safe without serializing commits against each other: acquire,
+  (`pg_advisory_xact_lock_shared(1702261761, hashtext('{events}:rebuild'))`, taken after the
+  entity locks, the marker check, and the refusals that need only the manifest, held to `COMMIT`) makes the assertion safe without serializing commits against each other: acquire,
   takeover, and release take the exclusive lock
   (`pg_advisory_xact_lock(1702261761, hashtext('{events}:rebuild'))`) for their short
   transactions only, so no acquire or release can slip between a commit's assertion and its
@@ -2789,10 +2981,60 @@ name.)
   the old epoch re-read; a force-release leaves the generation odd with the flag set, so commits
   resume while readers stay fenced until a later rebuild completes and releases. While it
   replays, the rebuild's view writes are transactions that each take the lock row `FOR UPDATE`
-  and assert `owner = :me AND lease_expires_at > :now` in the same transaction, so a worker that
+  and assert `owner = :me AND generation = :generation AND lease_expires_at > :now` in the same
+  transaction, so a worker that
   lost the lock to a takeover blocks on it, then aborts instead of writing — the transactional
   equivalent of the DynamoDB per-batch `ConditionCheck`
   ([Rebuild Fence](#rebuild-fence)).
+
+  The lifecycle operations ([Rebuild lifecycle API](#rebuild-lifecycle-api)) run in one
+  transaction each, under the exclusive advisory lock, and read the state inside it, so a
+  conditional statement that matches no row means a writer outside the protocol moved the rows: the
+  attempt rolls back and `Begin` decides again, at most eight times, then fails with the transient
+  `RebuildConflict` (release and force-release report `RebuildLeaseLost`). Leases are stored as
+  `timestamptz` and compared as whole epoch seconds — the same seconds the DynamoDB item stores —
+  by converting both sides in SQL:
+
+  ```sql
+  -- acquire (the lock row; a unique violation means a lock row appeared since the read: read again)
+  INSERT INTO evt_events__evt_rebuild_lock (id, owner, generation, lease_expires_at)
+  VALUES (0, $1, $3, to_timestamp($2::bigint::double precision));   -- $3 = the generation after the bump
+  -- acquire (the generation; zero rows affected: the state moved, read again)
+  INSERT INTO evt_events__evt_rebuild_generation (id, value, force_released)
+  VALUES (0, $1, false)
+  ON CONFLICT (id) DO UPDATE SET value = evt_events__evt_rebuild_generation.value + $1
+  WHERE evt_events__evt_rebuild_generation.value = $2
+     OR (evt_events__evt_rebuild_generation.value = $3
+         AND evt_events__evt_rebuild_generation.force_released);   -- $1 = :increment, $2 = :seenEven, $3 = :seenOdd
+  -- takeover
+  UPDATE evt_events__evt_rebuild_lock
+  SET owner = $1, generation = $5, lease_expires_at = to_timestamp($2::bigint::double precision)
+  WHERE id = 0 AND owner = $3
+    AND lease_expires_at < to_timestamp($4::bigint::double precision);
+  UPDATE evt_events__evt_rebuild_generation SET value = value + 2 WHERE id = 0 AND value = $1;
+  -- renew
+  UPDATE evt_events__evt_rebuild_lock
+  SET lease_expires_at = to_timestamp($2::bigint::double precision)
+  WHERE id = 0 AND owner = $1 AND generation = $3;
+  -- release (bound to the lease: $2 is its fencing generation; the generation row must still hold it)
+  DELETE FROM evt_events__evt_rebuild_lock WHERE id = 0 AND owner = $1 AND generation = $2;
+  UPDATE evt_events__evt_rebuild_generation
+  SET value = value + 1, force_released = false WHERE id = 0 AND value = $1;
+  -- force-release
+  DELETE FROM evt_events__evt_rebuild_lock WHERE id = 0 AND owner = $1;
+  UPDATE evt_events__evt_rebuild_generation
+  SET value = value + 2, force_released = true WHERE id = 0 AND value = $1;
+  -- reads
+  SELECT value, force_released FROM evt_events__evt_rebuild_generation WHERE id = 0;
+  SELECT owner, generation, EXTRACT(EPOCH FROM lease_expires_at)::bigint
+  FROM evt_events__evt_rebuild_lock WHERE id = 0;
+  ```
+
+  The acquire's `:seenEven`/`:seenOdd` take the same values as the table above (`-1` for the
+  branch that does not apply). A generation row exists once the first rebuild begins. A store
+  whose schema predates the rebuild fence has neither relation: a commit's assertion treats the
+  missing lock relation as no lock (nobody can have taken it), and the lifecycle operations fail
+  until `EnsureSchema` has created them.
 
 - **Feature marker**: declarations take
   `pg_advisory_xact_lock(1702261761, hashtext('{events}:features'))` — exclusive — around the
@@ -3010,14 +3252,30 @@ unchanged. The harness grew the ops and fields the outcomes scenarios need (`res
 outcome-only commit, and `injectCommitFault`, which makes a commit apply — or drop — while the
 caller observes an indeterminate error, so `outcomes-ambiguous` exercises the real ambiguous path
 rather than only the re-read branches); the C7 scenarios add `projectors` on transaction steps and
-a shared commit-wide projector on the account domain; the remaining scenarios need more
-(`declareFeature`, `acquireRebuildLock`, `releaseRebuildLock`, `forceReleaseRebuildLock`, `readLatest`,
-`rebuildViews`, a multi-stream execute). [`compat/README.md`](../../compat/README.md) holds the op
+a shared commit-wide projector on the account domain; `rebuild-fence` is implemented with C10 and
+adds the `rebuild` op below; the remaining scenarios need more (`declareFeature`, `readLatest`,
+a multi-stream execute). [`compat/README.md`](../../compat/README.md) holds the op
 table. The harness scopes command IDs to the run and scenario, because outcome rows are global to
 the table, and uses a digest that replaces the run name in the target stream IDs, so a command
 digests the same in every run and the committed digests hold against live backends.
 `compat/fixtures/outcomes.json` pins the digest vectors (canonical bytes and digest) and the
 encodings of the outcome rows (DynamoDB item, its budgeted size, PostgreSQL row).
+
+**The `rebuild` op (C10).** A `rebuild` step names an `action` and an `owner`, and runs the
+lifecycle call on the step's writer. The harness scopes an owner token to the run and scenario
+(`compat-<run>-<scenario>-<owner>`), like a command ID, and the table's lock and generation are
+global to the table, so a step asserts the generation as a **delta** against the generation it
+read at the start of the step, never an absolute value. Actions: `begin` (with `leaseSeconds`),
+`renew` (with `leaseSeconds`), `end`, `forceRelease` (the owner it releases), `generation` (a
+reader's observe), `writeViews` (one guarded batch writing one view row scoped to the run, with
+`owner`), and `wait` (with `seconds`: the live runs sleep, and the fixture runs advance the
+injected clock). The expectation's `result` is `ok`, `held` (`RebuildLockHeld`), `leaseLost`
+(`RebuildLeaseLost`), `settled` or `unavailable` (the reader's observe), and an `execute` or
+`transaction` step during a rebuild expects `rebuildInProgress`. `delta` is the generation after
+the step minus the generation before it, and `forceReleased` the flag after it. A scenario holds the
+lock across its steps, which would refuse every other scenario's commits, so it is marked
+`exclusive` (the interleaved run skips it and the live script runs it alone afterwards) and ends
+with the table settled.
 
 | Scenario               | Covers | What it pins                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ---------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -3038,7 +3296,7 @@ encodings of the outcome rows (DynamoDB item, its budgeted size, PostgreSQL row)
 | `feature-marker`       | C9     | A declaration bumps `version`; the other language's cached version fails its condition and revalidates; a bump of a feature's format version fails the older writer the same way; a writer that does not support a declared `(name, formatVersion)` pair refuses to commit; adding or removing an entity type from `historyDependent` or `retention` bumps `version` the same way, and the refusals those sets drive hold across independently configured instances.                                                                                                                                                                                                                           |
 | `stream-heads-snapshot-guard` | C12 | An out-of-band snapshot never covers more than its stream's head: a snapshot ahead of the head, or on a stream with no head item, is refused as `StreamHeadDrift` in either language and writes nothing, so the stream stays writable; a snapshot at or below the head is written, a regressing one is a silent no-op, and a snapshot of an empty stream (event sequence 0) needs no head item. |
 | `stream-heads-drift`   | C12    | An event appended with no head update (`appendRawBypassingHead`) leaves the head behind the log: every later write to the stream, in either language, fails with `StreamHeadDrift` — from a command, from a transaction, and from a fence on the stream. Drift is never retried, never exhausted into a `stale-fence` rejection, records no outcome, and writes nothing. |
-| `rebuild-fence`        | C10    | While one language holds `SYSTEM#REBUILD`, the other's commit conflicts; release (and force-release) bumps the generation; takeover of an expired lease bumps it by two while it stays odd; the reader epoch check sees odd/changed generations; a replay batch or transaction whose lock-row condition fails aborts the worker without writing — on PostgreSQL the write transaction holds the lock row `FOR UPDATE`, so a takeover blocks until it commits. Force-release deletes the lock but leaves the generation odd and sets `forceReleased`: commits resume while readers stay fenced until a later rebuild completes and releases (even, flag cleared).                               |
+| `rebuild-fence`        | C10    | While one language holds `SYSTEM#REBUILD`, the other's commit fails with `RebuildInProgress` and writes nothing, and the other's `Begin` is `RebuildLockHeld`; `End` bumps the generation by one to the settled value and commits resume; a takeover of an expired lease bumps it by two while it stays odd, and the displaced worker's guarded view write is `RebuildLeaseLost` and writes no row; the reader epoch check sees odd and changed generations in the other language; a force-release deletes the lock and leaves the generation odd with `forceReleased` set, so commits resume while readers stay fenced, until a later `Begin` (bumping by two) and `End` (bumping by one) settle it and clear the flag. The fixtures pin the exact requests of every lifecycle transaction and the lock-check action in every commit's action order. |
 | `reserved-namespaces`  | C8     | A commit whose entity ID begins with `SYSTEM#` or `command-outcome#` is refused before any write, and so is an out-of-band `PutSnapshot` with a reserved ID; enumeration and heads skip the engine rows the other language wrote.                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 ## Changing the Format

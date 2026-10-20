@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -320,17 +321,30 @@ func SNSMessage(ctx context.Context, item map[string]types.AttributeValue) (stri
 // scenario with outcomes gets a store that records command outcomes.
 func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) {
 	fake := NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, fakeTable).WithViewsTable(ViewsTable)
+
+	// Rebuild leases expire against a manual clock that the rebuild op's wait advances.
+	now := RebuildFenceNow
+	repo := dynamo.NewRepository(fake, fakeTable).WithViewsTable(ViewsTable).
+		WithClock(func() time.Time { return time.Unix(now, 0) })
+
+	var runner Runner
 
 	if scenario.Outcomes {
-		runner := NewOutcomeRunner(repo, scenario, FixtureRun)
-		runner.BypassHead = DynamoBypassHead(fake, fakeTable)
-
-		return runner, fake, repo
+		runner = NewOutcomeRunner(repo, scenario, FixtureRun)
+	} else {
+		runner = NewRunner(repo, scenario)
 	}
 
-	runner := NewRunner(repo, scenario)
 	runner.BypassHead = DynamoBypassHead(fake, fakeTable)
+	runner.Rebuild = &RebuildDriver{
+		Fence: repo.RebuildFence(),
+		Wait: func(_ context.Context, seconds int64) error {
+			now += seconds
+
+			return nil
+		},
+		Rows: func(_ context.Context, pk string) (int, error) { return len(fake.Views(pk)), nil },
+	}
 
 	return runner, fake, repo
 }
@@ -576,6 +590,13 @@ func (s Scenario) ViewPartitions(base evt.EntityID) []string {
 
 	if s.Projector {
 		seen[LedgerPK] = true
+	}
+
+	// Guarded rebuild writes leave their rows in a partition of their own.
+	for _, step := range s.Steps {
+		if step.Op == "rebuild" && step.Action == "writeViews" {
+			seen[RebuildViewPK(base)] = true
+		}
 	}
 
 	partitions := make([]string, 0, len(seen))

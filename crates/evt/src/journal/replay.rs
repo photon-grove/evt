@@ -6,13 +6,15 @@
 //! and counters come out.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use super::projector::PROJECTOR_NAME;
 use super::row::{counter_view, row_view};
 use super::scope::{Scope, allocations};
 use crate::error::Error;
 use crate::event::SerializedEvent;
-use crate::projection::ViewRow;
-use crate::views::ViewRepository;
+use crate::projection::{ProjectedView, ViewOperation, ViewRow};
+use crate::rebuild::{MAX_REBUILD_VIEW_BATCH, RebuildFence, RebuildLease};
 
 /// The journal rows and counters a set of stored events imply.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -80,35 +82,64 @@ pub fn replay<'a>(
     Ok(state)
 }
 
-/// Acknowledges that no writer commits to the journal while a [`rebuild`] runs.
+/// The owner token [`rebuild_with_lock`] takes the rebuild lock under.
+pub const REBUILD_OWNER: &str = "journal-rebuild";
+
+/// Rebuilds the journal under a rebuild lease (C10): derives the state from `events` and writes
+/// every row and counter through [`RebuildFence::write_rebuild_views`], in batches of at most
+/// [`MAX_REBUILD_VIEW_BATCH`] operations.
 ///
-/// A rebuild rewrites rows and counters unconditionally, so a writer committing beside it can have
-/// its counter lowered (the next writer repairs a counter that is behind its rows, but a lowered
-/// counter is not a state to run live). The rebuild fence (C10) is the durable way to hold writers
-/// off; until it is wired in, the caller promises, and this token is where the lock will go.
-#[derive(Clone, Copy, Debug)]
-pub struct WritersQuiesced(());
-
-impl WritersQuiesced {
-    /// The caller guarantees no `JournalRepository` commits to this table until the rebuild ends.
-    pub fn acknowledge() -> Self {
-        Self(())
-    }
-}
-
-/// Rebuilds the journal into a view table: derives the state from `events` and writes every row
-/// and counter, unconditionally, with [`ViewRepository::put_views`] (the rebuild path; the commit
-/// path's `absent` condition is not wanted here, since a rebuild rewrites rows that exist). It is
-/// idempotent. It does not delete rows: wipe the journal's partitions first when rebuilding from
-/// scratch. Writers must be held off ([`WritersQuiesced`]). Returns the state it wrote.
-pub async fn rebuild<'a, V: ViewRepository>(
-    views: &V,
+/// `lease` is the one [`begin_rebuild`](RebuildFence::begin_rebuild) returned; the caller renews and
+/// ends it. While it is held every live commit to the table fails with
+/// [`Error::RebuildInProgress`], so the unconditional rewrite of rows and counters cannot race a
+/// writer (a lowered counter under a live writer is exactly what the lock prevents), and every
+/// batch asserts the lease is still the lock's, owner and fencing token, so a worker that lost its
+/// lock writes nothing. Readers of derived state use the epoch check
+/// ([`page_at_epoch`](super::page_at_epoch)).
+///
+/// Rows are rewritten as they were: owned by the event's stream, counters by the engine, with no
+/// `absent` condition. It is idempotent, and it does not delete: a scope's rows that no event holds
+/// stay, which cannot happen to a journal written through commits. Returns the state it wrote.
+pub async fn rebuild<'a, F: RebuildFence>(
+    fence: &F,
     events: impl IntoIterator<Item = &'a SerializedEvent>,
-    _quiesced: WritersQuiesced,
+    lease: &RebuildLease,
 ) -> Result<JournalState, Error> {
     let state = replay(events)?;
 
-    views.put_views(&state.views()).await?;
+    let mut operations = Vec::with_capacity(state.rows.len() + state.counters.len());
+    for row in state.views() {
+        operations.push(ProjectedView::new(
+            PROJECTOR_NAME,
+            0,
+            operations.len(),
+            ViewOperation::put(row.pk, row.sk, row.entity_id, row.entity_type, row.payload),
+        ));
+    }
+
+    for batch in operations.chunks(MAX_REBUILD_VIEW_BATCH) {
+        fence.write_rebuild_views(lease, batch).await?;
+    }
+
+    Ok(state)
+}
+
+/// [`rebuild`] holding the lock for its whole run: takes it as [`REBUILD_OWNER`] for `lease`
+/// ([`begin_rebuild`](RebuildFence::begin_rebuild)), rebuilds, and releases it, which settles the
+/// generation for readers. A lock another rebuild holds is [`Error::RebuildLockHeld`].
+///
+/// If the rebuild fails the lock is **kept**: the derived rows may be half-written, so commits stay
+/// refused and readers stay fenced until the lease lapses and a retry takes it over, or an operator
+/// force-releases it. The lease is not renewed; use [`rebuild`] and
+/// [`renew_rebuild`](RebuildFence::renew_rebuild) for a long run.
+pub async fn rebuild_with_lock<'a, F: RebuildFence>(
+    fence: &F,
+    events: impl IntoIterator<Item = &'a SerializedEvent>,
+    lease: Duration,
+) -> Result<JournalState, Error> {
+    let held = fence.begin_rebuild(REBUILD_OWNER, lease).await?;
+    let state = rebuild(fence, events, &held).await?;
+    fence.end_rebuild(&held).await?;
 
     Ok(state)
 }

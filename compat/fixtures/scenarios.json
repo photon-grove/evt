@@ -2409,6 +2409,12 @@
               }
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
               "operation": "Update",
               "pk": "compat-fixture-multi-stream",
               "sk": -1,
@@ -2462,6 +2468,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Update",
@@ -2522,6 +2534,12 @@
               }
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
               "operation": "Update",
               "pk": "compat-fixture-multi-stream",
               "sk": -1,
@@ -2575,6 +2593,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Update",
@@ -2823,6 +2847,12 @@
               }
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
               "operation": "Update",
               "pk": "compat-fixture-read-fences",
               "sk": -1,
@@ -2876,6 +2906,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Update",
@@ -2932,6 +2968,12 @@
               }
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
               "operation": "Update",
               "pk": "compat-fixture-read-fences",
               "sk": -1,
@@ -2973,6 +3015,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Update",
@@ -3037,6 +3085,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Update",
@@ -3286,6 +3340,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-idempotency",
                 "sk": -1,
@@ -3326,6 +3386,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -3371,6 +3437,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -3430,6 +3502,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-idempotency",
                 "sk": -1,
@@ -3473,6 +3551,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -3748,6 +3832,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-noop",
                 "sk": -1,
@@ -3788,6 +3878,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -3835,6 +3931,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "pk": "command-outcome#compat-fixture-outcomes-noop-c3",
                 "sk": 1,
@@ -3857,6 +3959,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Put",
@@ -3883,6 +3991,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "pk": "command-outcome#compat-fixture-outcomes-noop-c5",
                 "sk": 1,
@@ -3905,6 +4019,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -4180,6 +4300,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection",
                 "sk": -1,
@@ -4222,6 +4348,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "pk": "command-outcome#compat-fixture-outcomes-rejection-c2",
                 "sk": 1,
@@ -4244,6 +4376,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -4291,6 +4429,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "pk": "command-outcome#compat-fixture-outcomes-rejection-c4",
                 "sk": 1,
@@ -4315,6 +4459,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "pk": "command-outcome#compat-fixture-outcomes-rejection-c5",
                 "sk": 1,
@@ -4337,6 +4487,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -4694,6 +4850,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection-events",
                 "sk": -1,
@@ -4734,6 +4896,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -4779,6 +4947,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -4832,6 +5006,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection-events",
                 "sk": -1,
@@ -4877,6 +5057,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-rejection-events",
                 "sk": -1,
@@ -4920,6 +5106,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Put",
@@ -5217,6 +5409,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-ambiguous",
                 "sk": -1,
@@ -5257,6 +5455,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -5304,6 +5508,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-outcomes-ambiguous",
                 "sk": -1,
@@ -5349,6 +5559,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "pk": "command-outcome#compat-fixture-outcomes-ambiguous-c4",
                 "sk": 1,
@@ -5371,6 +5587,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -5805,6 +6027,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-stream-heads-drift",
                 "sk": -1,
@@ -5845,6 +6073,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -5892,6 +6126,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-stream-heads-drift",
                 "sk": -1,
@@ -5935,6 +6175,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -5982,6 +6228,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Update",
                 "pk": "compat-fixture-stream-heads-drift",
                 "sk": -1,
@@ -6019,6 +6271,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Update",
@@ -6311,6 +6569,12 @@
               }
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
               "operation": "Put",
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
@@ -6393,6 +6657,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Put",
@@ -6487,6 +6757,12 @@
               }
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
               "operation": "Put",
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
@@ -6556,6 +6832,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Put",
@@ -6629,6 +6911,12 @@
               }
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
               "operation": "Delete",
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
@@ -6677,6 +6965,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Delete",
@@ -6755,6 +7049,12 @@
               }
             },
             {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
+            },
+            {
               "operation": "Put",
               "table": "views",
               "pk": "compat-fixture-commit-wide-views#directory",
@@ -6803,6 +7103,12 @@
                   "N": "1"
                 }
               }
+            },
+            {
+              "operation": "ConditionCheck",
+              "pk": "SYSTEM#REBUILD",
+              "sk": 0,
+              "condition": "attribute_not_exists(pk)"
             },
             {
               "operation": "Delete",
@@ -7173,6 +7479,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Delete",
                 "table": "views",
                 "pk": "ledger",
@@ -7226,6 +7538,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Put",
@@ -7284,6 +7602,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Put",
@@ -7362,6 +7686,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "table": "views",
                 "pk": "ledger",
@@ -7431,6 +7761,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "pk": "command-outcome#compat-fixture-commit-wide-projector-c5",
                 "sk": 1,
@@ -7455,6 +7791,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Put",
                 "pk": "command-outcome#compat-fixture-commit-wide-projector-c6",
                 "sk": 1,
@@ -7477,6 +7819,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Put",
@@ -7537,6 +7885,12 @@
                 }
               },
               {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
+              },
+              {
                 "operation": "Delete",
                 "table": "views",
                 "pk": "ledger",
@@ -7593,6 +7947,12 @@
                     "N": "1"
                   }
                 }
+              },
+              {
+                "operation": "ConditionCheck",
+                "pk": "SYSTEM#REBUILD",
+                "sk": 0,
+                "condition": "attribute_not_exists(pk)"
               },
               {
                 "operation": "Put",
@@ -7868,6 +8228,176 @@
             },
             "sk": {
               "S": "compat-fixture-commit-wide-projector"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "rebuild-fence",
+      "entityId": "compat-fixture-rebuild-fence",
+      "sequence": 4,
+      "snapshotSequence": 0,
+      "state": "{\"owner\":\"Hedy Lamarr\",\"status\":\"open\",\"balanceCents\":112,\"deposits\":3,\"openedAt\":\"2026-01-02T03:04:05.123Z\",\"tags\":null,\"labels\":null,\"lastMemo\":null}",
+      "events": [
+        "{\"id\":\"compat-fixture-rebuild-fence:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-rebuild-fence\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIyMDI2LTAxLTAyVDAzOjA0OjA1LjEyM1oifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}}",
+        "{\"id\":\"compat-fixture-rebuild-fence:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rebuild-fence\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"c2\"}}",
+        "{\"id\":\"compat-fixture-rebuild-fence:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rebuild-fence\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"c3\"}}",
+        "{\"id\":\"compat-fixture-rebuild-fence:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rebuild-fence\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NywibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c4\",\"extensions\":{},\"commitId\":\"c4\"}}"
+      ],
+      "snapshot": null,
+      "dynamoItems": [
+        {
+          "head": {
+            "N": "4"
+          },
+          "pk": {
+            "S": "compat-fixture-rebuild-fence"
+          },
+          "sk": {
+            "N": "-1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}"
+          },
+          "payload": {
+            "S": "{\"owner\":\"Hedy Lamarr\",\"openedAt\":\"2026-01-02T03:04:05.123Z\"}"
+          },
+          "pk": {
+            "S": "compat-fixture-rebuild-fence"
+          },
+          "sk": {
+            "N": "1"
+          },
+          "type": {
+            "S": "account:opened"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"c2\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":100,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-rebuild-fence"
+          },
+          "sk": {
+            "N": "2"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"c3\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":5,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-rebuild-fence"
+          },
+          "sk": {
+            "N": "3"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "entityType": {
+            "S": "account"
+          },
+          "metadata": {
+            "S": "{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c4\",\"extensions\":{},\"commitId\":\"c4\"}"
+          },
+          "payload": {
+            "S": "{\"amountCents\":7,\"memo\":null}"
+          },
+          "pk": {
+            "S": "compat-fixture-rebuild-fence"
+          },
+          "sk": {
+            "N": "4"
+          },
+          "type": {
+            "S": "account:deposited"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "snsMessages": [
+        "{\"version\":\"\",\"id\":\"compat-fixture-rebuild-fence:1\",\"detail-type\":\"account:opened\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rebuild-fence:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"compat-fixture-rebuild-fence\",\"entityType\":\"account\",\"payload\":\"eyJvd25lciI6IkhlZHkgTGFtYXJyIiwib3BlbmVkQXQiOiIyMDI2LTAxLTAyVDAzOjA0OjA1LjEyM1oifQ==\",\"metadata\":{\"commandId\":\"c1\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c1\",\"extensions\":{},\"commitId\":\"c1\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rebuild-fence:2\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rebuild-fence:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rebuild-fence\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MTAwLCJtZW1vIjpudWxsfQ==\",\"metadata\":{\"commandId\":\"c2\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c2\",\"extensions\":{},\"commitId\":\"c2\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rebuild-fence:3\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rebuild-fence:3\",\"sequence\":3,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rebuild-fence\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NSwibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c3\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"go\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c3\",\"extensions\":{},\"commitId\":\"c3\"}}}",
+        "{\"version\":\"\",\"id\":\"compat-fixture-rebuild-fence:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"compat-fixture-rebuild-fence:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"compat-fixture-rebuild-fence\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6NywibWVtbyI6bnVsbH0=\",\"metadata\":{\"commandId\":\"c4\",\"trace\":null,\"origin\":{\"source\":\"evt-compat\",\"endpoint\":\"rust\"},\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"c4\",\"extensions\":{},\"commitId\":\"c4\"}}}"
+      ],
+      "head": 4,
+      "views": [
+        {
+          "pk": "rebuild-compat-fixture-rebuild-fence",
+          "sk": "compat-fixture-rebuild-fence-w1",
+          "dynamoItem": {
+            "entityID": {
+              "S": "compat-fixture-rebuild-fence-w1"
+            },
+            "entityType": {
+              "S": "rebuild"
+            },
+            "payload": {
+              "S": "{\"owner\":\"compat-fixture-rebuild-fence-w1\"}"
+            },
+            "pk": {
+              "S": "rebuild-compat-fixture-rebuild-fence"
+            },
+            "sk": {
+              "S": "compat-fixture-rebuild-fence-w1"
+            }
+          }
+        },
+        {
+          "pk": "rebuild-compat-fixture-rebuild-fence",
+          "sk": "compat-fixture-rebuild-fence-w4",
+          "dynamoItem": {
+            "entityID": {
+              "S": "compat-fixture-rebuild-fence-w4"
+            },
+            "entityType": {
+              "S": "rebuild"
+            },
+            "payload": {
+              "S": "{\"owner\":\"compat-fixture-rebuild-fence-w4\"}"
+            },
+            "pk": {
+              "S": "rebuild-compat-fixture-rebuild-fence"
+            },
+            "sk": {
+              "S": "compat-fixture-rebuild-fence-w4"
             }
           }
         }

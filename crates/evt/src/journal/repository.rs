@@ -612,3 +612,55 @@ impl<R: EventLog> EventLog for JournalRepository<R> {
         self.inner.stream_all_events(filter)
     }
 }
+
+impl<R: crate::rebuild::RebuildFence> crate::rebuild::RebuildFence for JournalRepository<R> {
+    fn rebuild_generation(
+        &self,
+    ) -> impl Future<Output = Result<crate::rebuild::RebuildGeneration, Error>> + Send {
+        self.inner.rebuild_generation()
+    }
+
+    fn rebuild_state(
+        &self,
+    ) -> impl Future<Output = Result<crate::rebuild::RebuildState, Error>> + Send {
+        self.inner.rebuild_state()
+    }
+
+    fn begin_rebuild(
+        &self,
+        owner: &str,
+        lease: Duration,
+    ) -> impl Future<Output = Result<crate::rebuild::RebuildLease, Error>> + Send {
+        self.inner.begin_rebuild(owner, lease)
+    }
+
+    fn renew_rebuild(
+        &self,
+        lease: &crate::rebuild::RebuildLease,
+        extend: Duration,
+    ) -> impl Future<Output = Result<crate::rebuild::RebuildLease, Error>> + Send {
+        self.inner.renew_rebuild(lease, extend)
+    }
+
+    fn end_rebuild(
+        &self,
+        lease: &crate::rebuild::RebuildLease,
+    ) -> impl Future<Output = Result<crate::rebuild::RebuildGeneration, Error>> + Send {
+        self.inner.end_rebuild(lease)
+    }
+
+    fn force_release_rebuild(
+        &self,
+        owner: &str,
+    ) -> impl Future<Output = Result<crate::rebuild::RebuildGeneration, Error>> + Send {
+        self.inner.force_release_rebuild(owner)
+    }
+
+    fn write_rebuild_views(
+        &self,
+        lease: &crate::rebuild::RebuildLease,
+        views: &[ProjectedView],
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        self.inner.write_rebuild_views(lease, views)
+    }
+}

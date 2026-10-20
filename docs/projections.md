@@ -16,6 +16,63 @@ groups. In dry-run mode, `evt` reports the work without writing rows.
 The rebuild contract deliberately makes writes explicit through `CommitGroup` so
 adopters can choose the safest commit strategy for their storage backend.
 
+## Fencing a rebuild
+
+A rebuild rewrites view rows while live commits keep writing theirs, so the two can interleave
+unsafely: a live commit can put a row the rebuild's wipe then deletes, or recreate one the replay
+has not reached. The framework fences rebuilds durably (v0.9, C10): take the rebuild lock for the
+whole run, and every commit is refused with `*evt.RebuildInProgressError` until it is released.
+
+```go
+fence := repo.(evt.RebuildFenceProvider).RebuildFence()
+
+lease, err := fence.Begin(ctx, owner, 5*time.Minute)
+if err != nil {
+    return err // *evt.RebuildLockHeldError: another rebuild holds an unexpired lease
+}
+
+result, err := evt.RebuildProjections(ctx, repo, applyEvent, cfg)
+
+switch {
+case err == nil && len(result.Errors) == 0:
+    _, err = fence.End(ctx, lease) // the generation is even again: readers trust the views
+default:
+    // The views may be half-written. Commits may resume, but readers stay fenced until a later
+    // rebuild completes.
+    _, _ = fence.ForceRelease(ctx, owner) //nolint:errcheck // best effort; the lease also expires
+}
+```
+
+- Renew the lease (`lease, err = fence.Renew(ctx, lease, d)`) while the run goes on, well inside the
+  lease you asked for: a worker that pauses past its lease can be replaced by a takeover. The lease
+  (owner and generation) is a fencing token, so the replaced worker cannot renew, write, or end
+  its successor's lease even if both use one owner token. Write view batches through
+  `fence.WriteViews(ctx, lease, batch)` (at most 99 operations) to have each batch conditioned
+  transactionally on the lease: a worker that lost the lock gets `*evt.RebuildLeaseLostError` and
+  writes nothing. Writes you make through your own `CommitGroup` are not guarded; a crashed worker's
+  lock simply blocks commits until it expires and is taken over (`Begin` does that) or an operator
+  force-releases it.
+- Refused commits are transient: fence-aware retry waits and tries again, then returns the error,
+  and records no outcome, so the same command ID runs once the rebuild is over.
+- **Readers fence a decision against the generation.** A command that decides on a derived view
+  reads under an epoch, so a decision made on a half-rebuilt view fails instead of being recorded:
+
+```go
+err := evt.ReadAtRebuildEpoch(ctx, fence, func(ctx context.Context) error {
+    row, err = views.Get(ctx, key) // the derived-view read
+    return err
+})
+// *evt.RebuildUnavailableError: a rebuild is running (or a force-release left the views untrustworthy)
+// *evt.RebuildEpochChangedError: a rebuild began and ended while the read ran; read again
+```
+
+  Return either error from the handler: the engine returns it at once and records no outcome, and
+  both are transient (`policy.IsTransient`), so retry the command later. A rebuild that begins
+  after the read is stopped by the commit's lock check instead.
+
+See the [storage format](spec/storage-format.md#rebuild-fence) for the rows, the transactions, and
+the PostgreSQL equivalent.
+
 ## Commit-wide projectors
 
 An `EventProjector` sees one entity at a time. A **commit-wide projector** (v0.9, C7) is a pure
@@ -111,7 +168,7 @@ every delete as a claim, whether or not it removes a row.
 written. A put overwrites unless it is `IfAbsent`; a delete of a missing row succeeds unless it is
 `IfPresent`. `OnConflict(err)` names the error to return when the condition fails. Projectors are
 appended in the order `WithCommitProjectors` was called, each one's operations in emission order,
-after the marker check and before the written streams ([layout](spec/storage-format.md#writes)).
+after the marker and rebuild-lock checks and before the written streams ([layout](spec/storage-format.md#writes)).
 Before any write, on every backend, the engine refuses an operation with an empty or non-UTF-8 key,
 a `pk` over 2,048 or an `sk` over 1,024 UTF-8 bytes (`*evt.ViewKeyTooLongError`), and two
 operations on the same row (`*evt.DuplicateViewKeyError`). Operations count against the

@@ -4,8 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Journal, JournalRepository, Scope, WritersQuiesced, allocations, high_watermark, page, rebuild,
-    replay,
+    Journal, JournalRepository, Scope, allocations, high_watermark, page, rebuild_with_lock, replay,
 };
 use crate::conformance::{Add, Claim, Ledger, journal_cases};
 use crate::{
@@ -191,7 +190,7 @@ async fn rebuilding_into_wiped_rows_restores_them_exactly() {
     }
     assert!(memory.views().is_empty());
 
-    rebuild(&memory, &events, WritersQuiesced::acknowledge())
+    rebuild_with_lock(&memory, &events, std::time::Duration::from_secs(60))
         .await
         .unwrap();
 

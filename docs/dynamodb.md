@@ -49,9 +49,10 @@ starts at 1), so no sequence is ever skipped and a commit that starts at or belo
 `eventSequence` is rejected, which keeps a writer that loaded before a compaction from recreating the
 deleted events ([Continuity](spec/storage-format.md#continuity)). Compaction never moves the head,
 so a writer whose load is current never conflicts with it. Every v0.9 commit also carries a
-feature-marker check. Of the 100 transaction items, a single-stream commit reserves two (head
-update + marker), leaving **98 event/projector operations** whether it creates its stream or appends
-to it, and **97** when it also writes a snapshot (the snapshot put sits beside the head update).
+feature-marker check and a rebuild-lock check. Of the 100 transaction items, a single-stream commit
+reserves three (head update + marker + rebuild lock), leaving **97 event/projector operations**
+whether it creates its stream or appends to it, and **96** when it also writes a snapshot (the
+snapshot put sits beside the head update).
 These actions are billed as writes. The commit budget counts only the actions a commit actually
 emits.
 
@@ -84,19 +85,33 @@ items = Σ(events per written stream + 1 head update + 1 snapshot put if the com
       + 1 × read-only fenced streams (one head check each)
       + outcome put (when the store records command outcomes)
       + feature-marker check
-      + rebuild-lock check (once C10 emits it)
+      + rebuild-lock check
       + projector operations
 ```
 
 With command outcomes enabled (C3), the outcome row is the last action of every commit and counts
-as one more item, so a single-stream commit leaves **97** event/projector operations, creating or
-appending (96 when it also writes a snapshot). The outcome is a `Put` on
+as one more item, so a single-stream commit leaves **96** event/projector operations, creating or
+appending (95 when it also writes a snapshot). The outcome is a `Put` on
 `(command-outcome#<id>, sk = 1)` conditioned on `attribute_not_exists(pk)`; it is read back with a
 strongly consistent `GetItem`, whatever the repository's read-consistency setting. An outcome-only
-commit (an accepted no-op or a persisted rejection) is the feature-marker check plus that put.
+commit (an accepted no-op or a persisted rejection) is the two control checks plus that put.
 
-The rebuild-lock check (C10) is **not implemented yet** and is not budgeted; when C10 starts
-emitting it, the two capacities above drop by one, to **97** and **96**.
+The rebuild-lock check (C10) is a `ConditionCheck` of `attribute_not_exists(pk)` on
+`(SYSTEM#REBUILD, sk = 0)`, the second action of every commit: it fails whenever a rebuild holds
+the lock, an expired one included, and is reported as `*evt.RebuildInProgressError` ahead of every
+other failure but the marker check. It is billed as one write unit like the marker check.
+Every lease-guarded write is conditioned on the lock item's `owner` and `generation` (the fencing token
+`Begin` returned), so `End` sends only its one transaction, with no read first. Rebuild workers manage the lock and its generation counter through `Repository.RebuildFence()`
+([Rebuild fence](../README.md#rebuild-fence-v09-c10)); the lifecycle's transactions write only the
+two `SYSTEM#REBUILD*` items, and a worker's role needs `dynamodb:PutItem`, `dynamodb:UpdateItem`,
+`dynamodb:DeleteItem` and `dynamodb:ConditionCheckItem` on the table for them, and `GetItem` for
+the consistent reads of the generation.
+
+Every commit checks the lock item, so it is a hot item under heavy write traffic: a lifecycle
+transaction that writes it can lose a race against the commits' checks (or another `Begin`), and
+`Begin` retries from a fresh read up to eight times before returning the transient
+`*evt.RebuildConflictError`. Retry it; the commits that meet the lock are refused meanwhile, which
+is the point of the fence.
 
 The `sk = 0` snapshot row records the entity's serialized state plus the
 `eventSequence` it covers, and snapshot writes are monotonic: a write that would move
@@ -189,8 +204,8 @@ Read models live in their own table, separate from the log:
 
 Commit-wide projectors write to this table too: configure the repository with
 `dynamo.NewRepository(client, events).WithViewsTable("views")` and every view operation of a commit
-becomes one `Put` or `Delete` in the commit's transaction, after the feature-marker check and
-before the written streams. A put carries all five attributes (`pk`, `sk`, `entityID`, `entityType`,
+becomes one `Put` or `Delete` in the commit's transaction, after the feature-marker and rebuild-lock
+checks and before the written streams. A put carries all five attributes (`pk`, `sk`, `entityID`, `entityType`,
 `payload`) and never a `ttl`; an `IfAbsent` put is conditioned on `attribute_not_exists(pk)` and an
 `IfPresent` delete on `attribute_exists(pk)`. A failed condition is a
 `*evt.ProjectorOperationError`. See [commit-wide projectors](projections.md#commit-wide-projectors).

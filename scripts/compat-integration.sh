@@ -24,6 +24,22 @@ for ((index = 0; index < steps; index++)); do
   "$rust_driver" step --backend "$backend" --run "$run" --index "$index"
 done
 
+# An exclusive scenario holds store-wide state across its steps (a rebuild lock refuses every other
+# scenario's commits), so it runs alone, after the interleaved scenarios, one step at a time.
+# A failed exclusive step must not leave its rebuild lock behind for the next run: settle the fence.
+trap '"$go_driver" settle -backend "$backend" || true' ERR
+exclusive_scenarios="$("$go_driver" exclusive)"
+while IFS= read -r scenario; do
+  [ -n "$scenario" ] || continue
+  exclusive_steps="$("$go_driver" steps -only "$scenario")"
+  echo "run ${run}: ${exclusive_steps} exclusive steps of ${scenario} against ${backend}"
+  for ((index = 0; index < exclusive_steps; index++)); do
+    "$go_driver" step -backend "$backend" -run "$run" -index "$index" -only "$scenario"
+    "$rust_driver" step --backend "$backend" --run "$run" --index "$index" --only "$scenario"
+  done
+done <<<"$exclusive_scenarios"
+trap - ERR
+
 "$go_driver" verify -backend "$backend" -run "$run"
 "$rust_driver" verify --backend "$backend" --run "$run"
 

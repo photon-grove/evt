@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::row::JournalRow;
 use super::scope::Scope;
 use crate::error::Error;
+use crate::rebuild::{RebuildFence, read_at_rebuild_epoch};
 
 /// The most rows [`page`] returns at once.
 pub const MAX_PAGE_ROWS: usize = 1000;
@@ -176,6 +177,31 @@ pub async fn page<S: JournalStore>(
     let found = store.read_rows(scope, after, limit).await?;
 
     Ok(assemble(scope, after, limit, high_watermark, found))
+}
+
+/// [`high_watermark`] under the rebuild epoch check (C10): fails with
+/// [`Error::RebuildUnavailable`] while a rebuild holds the fence (or after a force-release) and with
+/// [`Error::RebuildEpochChanged`] if one started, finished, or was taken over during the read.
+/// Both are transient: read again once the rebuild is over.
+pub async fn high_watermark_at_epoch<S: JournalStore + RebuildFence>(
+    store: &S,
+    scope: &Scope,
+) -> Result<u64, Error> {
+    read_at_rebuild_epoch(store, |_| high_watermark(store, scope)).await
+}
+
+/// [`page`] under the rebuild epoch check (C10), as [`high_watermark_at_epoch`]. The recommended
+/// consumer read for a table whose journal can be rebuilt: a page read while a rebuild rewrites
+/// rows and counters would show rows that are missing or counters that are behind, and the epoch
+/// check turns that into a retryable error instead of a gap to interpret. On a failure, keep the
+/// cursor and retry the same page after a backoff.
+pub async fn page_at_epoch<S: JournalStore + RebuildFence>(
+    store: &S,
+    scope: &Scope,
+    after: u64,
+    limit: usize,
+) -> Result<JournalPage, Error> {
+    read_at_rebuild_epoch(store, |_| page(store, scope, after, limit)).await
 }
 
 /// Builds a page from the rows a read returned: contiguous prefix, first gap, watermark.

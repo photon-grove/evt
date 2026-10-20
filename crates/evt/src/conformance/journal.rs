@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::*;
 use crate::features::{JOURNAL_FEATURE, JOURNAL_VERSION};
 use crate::journal::{
-    ALLOCATION_KEY, Gap, Journal, JournalRepository, JournalStore, Scope, WritersQuiesced,
-    allocations, counter_view, encode_allocations, rebuild, replay, row_size, row_sk,
+    ALLOCATION_KEY, Gap, Journal, JournalRepository, JournalStore, Scope, allocations,
+    counter_view, encode_allocations, rebuild_with_lock, replay, row_size, row_sk,
 };
 use crate::projection::{ViewRow, group_commits, replay_views};
+use crate::rebuild::RebuildFence;
 use crate::repository::TransactionCommit;
 use crate::views::ViewRepository;
 
@@ -25,7 +26,7 @@ use crate::views::ViewRepository;
 /// feature manifest and leave them there, so run them on a table you can reset.
 pub async fn journal_cases<R, V>(repo: &R, views: &V)
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -88,6 +89,10 @@ where
         Box::pin(declares_feature_and_history(repo)).await,
     );
     record(
+        "a rebuild under the lock refuses live commits and reproduces the live journal",
+        Box::pin(rebuild_under_the_lock(repo, views)).await,
+    );
+    record(
         "replaying stored events in any order reproduces the live rows and counters",
         Box::pin(replay_reproduces_the_journal(repo, views)).await,
     );
@@ -100,6 +105,9 @@ where
         );
     }
 }
+
+/// The lease the cases rebuild under.
+const LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The scope of a name in a namespace.
 fn scope(ns: &str, name: &str) -> Scope {
@@ -996,7 +1004,7 @@ where
 
 async fn pages_and_gaps<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -1046,12 +1054,7 @@ where
     ensure_eq!(tail.gap, Some(Gap { from: 5, to: 5 }), "the tail gap");
 
     // A rebuild from the stored events repairs both.
-    rebuild(
-        views,
-        &repo.events(&a.id).await?,
-        WritersQuiesced::acknowledge(),
-    )
-    .await?;
+    rebuild_with_lock(repo, &repo.events(&a.id).await?, LEASE).await?;
     let repaired = journaled.page(&world, 0, 10).await?;
     ensure_eq!(positions(&repaired), vec![1, 2, 3, 4, 5], "repaired rows");
     ensure!(repaired.is_caught_up(), "repaired: {repaired:?}");
@@ -1139,7 +1142,7 @@ where
 
 async fn replay_reproduces_the_journal<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -1232,7 +1235,7 @@ where
         journaled.page(&world, 0, 10).await?.rows.is_empty(),
         "the scope was wiped"
     );
-    rebuild(views, &events, WritersQuiesced::acknowledge()).await?;
+    rebuild_with_lock(repo, &events, LEASE).await?;
     ensure_eq!(
         views.list_views_by_pk(&world.row_pk()).await?,
         live_rows,
@@ -1243,6 +1246,102 @@ where
         9,
         "the rebuilt counter"
     );
+
+    Ok(())
+}
+
+async fn rebuild_under_the_lock<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let (a, b) = (
+        Stream::new(&ns, "a", "ledger"),
+        Stream::new(&ns, "b", "ledger"),
+    );
+    let world = scope(&ns, "world");
+
+    a.commit(&journaled, a.events(1..=3), None).await?;
+    b.commit(&journaled, b.events(1..=2), None).await?;
+
+    let live_rows = views.list_views_by_pk(&world.row_pk()).await?;
+    let live_counters: Vec<u64> = {
+        let mut counters = Vec::new();
+        for name in ["world", "place-a", "place-b"] {
+            counters.push(journaled.high_watermark(&scope(&ns, name)).await?);
+        }
+
+        counters
+    };
+    let mut events = repo.events(&a.id).await?;
+    events.extend(repo.events(&b.id).await?);
+
+    // Wipe the derived state, as a rebuild starts from lost rows, then rebuild under the lock.
+    for row in &live_rows {
+        views.delete_view(&row.pk, &row.sk).await?;
+    }
+    views.delete_view(&world.counter_pk(), "COUNTER").await?;
+
+    let lease = repo.begin_rebuild(&format!("{ns}-journal"), LEASE).await?;
+
+    // A live journal commit is refused while the lock is held, and writes nothing.
+    expect_err(
+        b.commit(&journaled, b.events(3..=3), None).await,
+        "a live journal commit during a rebuild",
+        |err| matches!(err, Error::RebuildInProgress),
+    )?;
+    ensure_eq!(
+        repo.events(&b.id).await?.len(),
+        2,
+        "the refused commit wrote no event"
+    );
+
+    // Readers are fenced for the duration, and the epoch-checked reads say so.
+    expect_err(
+        crate::journal::page_at_epoch(repo, &world, 0, 10).await,
+        "an epoch-checked page during a rebuild",
+        |err| matches!(err, Error::RebuildUnavailable { .. }),
+    )?;
+
+    crate::journal::rebuild(repo, &events, &lease).await?;
+    repo.end_rebuild(&lease).await?;
+
+    ensure_eq!(
+        views.list_views_by_pk(&world.row_pk()).await?,
+        live_rows,
+        "the rebuilt rows are the live rows"
+    );
+    let mut rebuilt = Vec::new();
+    for name in ["world", "place-a", "place-b"] {
+        rebuilt.push(journaled.high_watermark(&scope(&ns, name)).await?);
+    }
+    ensure_eq!(
+        rebuilt,
+        live_counters,
+        "the rebuilt counters are the live counters"
+    );
+
+    // The lock is gone: live commits resume at the next position, and the epoch-checked page works.
+    b.commit(&journaled, b.events(3..=3), None).await?;
+    let page = crate::journal::page_at_epoch(repo, &world, 0, 10).await?;
+    ensure_eq!(
+        page.rows.len(),
+        6,
+        "the live commit continued the rebuilt scope"
+    );
+    ensure!(page.is_caught_up(), "{page:?}");
+
+    // A lease that was lost writes nothing: the rebuild fences on owner and fencing token.
+    let stale = repo.begin_rebuild(&format!("{ns}-journal"), LEASE).await?;
+    repo.end_rebuild(&stale).await?;
+    expect_err(
+        crate::journal::rebuild(repo, &events, &stale).await,
+        "a rebuild on a released lease",
+        |err| matches!(err, Error::RebuildLeaseLost { .. }),
+    )?;
 
     Ok(())
 }

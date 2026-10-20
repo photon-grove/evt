@@ -402,19 +402,19 @@ func testViewsBudget(t *testing.T, repo evt.Repository, read ViewReader, bytes b
 		return out
 	}
 
-	// The feature-marker check, one event put, and the stream's head update leave 97 actions for
-	// view operations: 97 fit exactly and 98 do not, on every backend.
+	// The two control checks, one event put, and the stream's head update leave 96 actions for
+	// view operations: 96 fit exactly and 97 do not, on every backend.
 	fits, over := evt.EntityID(ns+"-fits"), evt.EntityID(ns+"-over")
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 		Events: serialize(t, fits, "test", 0, &test.EntityCreated{ID: fits, Value: "fits"}),
-		Views:  views(97),
+		Views:  views(96),
 	}))
-	requireRow(t, read, repo, ns+"#bulk", "row-096", `{}`)
+	requireRow(t, read, repo, ns+"#bulk", "row-095", `{}`)
 
 	err := repo.Commit(ctx, evt.SerializedResult{
 		Events: serialize(t, over, "test", 0, &test.EntityCreated{ID: over, Value: "over"}),
-		Views:  views(98),
+		Views:  views(97),
 	})
 
 	var tooLarge *evt.CommitTooLargeError
