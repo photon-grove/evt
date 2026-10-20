@@ -279,15 +279,17 @@ _, err = fence.End(ctx, lease)
   by fence-aware retry and returned as `*evt.RebuildInProgressError` when the attempts run out; it
   is never exhausted into a `stale-fence` rejection, records no outcome (a rejection decided
   during a rebuild is not recorded either), and the same command ID runs again once the rebuild
-  ends. `policy.Classify` reports it transient. An expired lock still blocks commits until it is
-  taken over or force-released: waiting out a crashed rebuild is the price of never writing beside
-  one.
+  ends. `policy.Classify` reports it transient. An expired lock still blocks commits until a
+  rebuild that takes it over ends: waiting out a crashed rebuild is the price of never writing
+  beside one.
 - **Generation.** The fence keeps a counter that is odd while a rebuild is in progress and even when
   it is quiesced. `Begin` takes it up by one (two for a takeover or after a force-release) and `End`
   by one more. `ForceRelease(ctx, owner)` is the operator's escape hatch for a wedged worker: it
-  deletes the lock so commits resume at once, but leaves the generation odd and flagged, so readers
-  stay fenced until a later rebuild begins and ends — the force-released rebuild may have written
-  only some of its batches.
+  ends the worker's lease at once, so a new rebuild can begin without waiting for it to lapse, but
+  leaves the generation odd and flagged, so readers stay fenced **and commits stay refused** until
+  a later rebuild begins and ends — the force-released rebuild may have written only some of its
+  batches, and a commit (a journaled one above all) could build on that half-written state. To
+  resume writes, run the rebuild again to its end.
 - **Readers fence a decision against the generation.** `evt.ReadAtRebuildEpoch(ctx, fence, read)`
   (or `ObserveRebuildEpoch` and `epoch.Verify`) reads the generation before and after the read and
   fails with `*evt.RebuildUnavailableError` (odd: a rebuild is running, or a force-release left

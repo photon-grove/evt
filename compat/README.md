@@ -74,7 +74,7 @@ changed, and update the spec.
    | `conflictProbe` | `sequence`                                                       | `conflict`, or `ok` when the sequence is free                |
    | `outcomeOnly`   | `identity` (`type`, `payload` object), `response`, `commandId`   | outcomes scenarios: an accepted outcome with no events       |
    | `resolveOutcome`| `command`, `commandId`                                           | outcomes scenarios: `absent`, a replayed outcome, or `reuse` |
-   | `rebuild`       | `action` (`begin`, `renew`, `end`, `forceRelease`, `generation`, `writeViews`, `wait`), `owner`, `leaseSeconds`, `seconds` | `ok`, `held`, `leaseLost`, `settled`, or `unavailable`, with `delta` (the generation after the step minus before), `forceReleased`, and (`writeViews`) `rows`; an `execute` or `transaction` step during a rebuild expects `rebuildInProgress` |
+   | `rebuild`       | `action` (`begin`, `renew`, `end`, `forceRelease`, `generation`, `writeViews`, `wait`), `owner`, `leaseSeconds`, `seconds` | `ok`, `held`, `leaseLost`, `settled`, or `unavailable`, with `delta` (the generation after the step minus before), `forceReleased`, and (`writeViews`) `rows`; an `execute` or `transaction` step while the generation is unsettled (a rebuild holds the lock, or a force-release left it odd) expects `rebuildInProgress` |
 
    A `transaction` step may also carry `projectors` (C7): a list of `{name, operations}` whose
    operations (`op` `put` or `delete`, `pk`, `sk`, `owner`, `entityType`, `payload`, `condition`
