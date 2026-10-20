@@ -27,6 +27,14 @@ type PagedResult struct {
 }
 
 // ViewRepository is a lightweight repository interface for reading/writing entity views.
+//
+// Consistency: a read by key (GetView) and a partition listing (ListViewsByPK, ListViewsByPKPaged,
+// and ViewStreamer.ListViewsByPKEach) should see every row a commit wrote once the commit has
+// returned, so a request handler can commit and then read its own write. The DynamoDB repository
+// reads its base table strongly consistently for these (dynamo.ViewRepository.WithConsistentRead
+// trades that for half the read cost on listings). An entity-type listing may lag behind a
+// commit: DynamoDB serves it from a global secondary index, which can only be read eventually
+// consistently.
 type ViewRepository interface {
 	// GetView retrieves a view by partition key (pk). Returns nil if not found.
 	GetView(ctx context.Context, pk string) (*SerializedView, error)
@@ -34,7 +42,8 @@ type ViewRepository interface {
 	// PutView writes or replaces the given view.
 	PutView(ctx context.Context, view *SerializedView) error
 
-	// ListViewsByEntityType returns serialized views for the provided entity type.
+	// ListViewsByEntityType returns serialized views for the provided entity type. It may be
+	// eventually consistent (see the interface comment).
 	//
 	// This buffers the entire result set in memory. For large entity types prefer
 	// ListViewsByEntityTypePaged (caller-driven paging), or the bounded-memory streaming iterators

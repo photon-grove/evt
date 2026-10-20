@@ -470,9 +470,13 @@ key `entityType` (no range key).
   requests, retrying `UnprocessedItems` (three attempts in all). A repeated `(pk, sk)` in one batch keeps its last row in Rust (Go leaves DynamoDB to refuse the request). An empty `sk` is stored as `VIEW`.
 - A single-item read is a strongly consistent `GetItem` at `(pk, sk = VIEW)`; a batch read is a
   strongly consistent `BatchGetItem` chunked to 100 keys.
-- A list is a `Query` (`pk = :pk` on the table, `entityType = :entityType` on the index), not
-  strongly consistent. A bounded page sets `Limit`; with no limit the page is DynamoDB's response
-  cap.
+- A list is a `Query` (`pk = :pk` on the table, `entityType = :entityType` on the index). A
+  partition list on the table is strongly consistent (`ConsistentRead: true`), so a page read after
+  a commit returns sees that commit's rows; Go's `ViewRepository.WithConsistentRead(false)` and
+  Rust's `DynamoViewRepository::with_consistent_read(false)` send `ConsistentRead: false` instead.
+  An entity-type list on the index sends no `ConsistentRead` (a global secondary index is only
+  eventually consistent). A bounded page sets `Limit`; with no limit the page is DynamoDB's
+  response cap.
 - A **pagination cursor** is the `LastEvaluatedKey`'s string attributes (`pk`, `sk`, and for the
   index `entityType`) as a JSON object, keys sorted and escaped like every other Go JSON, in
   padded base64url. Go and Rust cursors are interchangeable. An empty cursor is the first page.

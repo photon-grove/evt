@@ -786,6 +786,13 @@ loop {
 A cursor is Go's: base64url JSON of the last key, so it moves between a Go and a Rust process. A
 page can come back empty with a cursor on DynamoDB; keep going until the cursor is `None`.
 
+Point reads and partition listings see every commit that has returned, so a handler can commit and
+read its own write. `DynamoViewRepository` gets that with strongly consistent reads of the base
+table, at twice the read capacity of an eventual read; `with_consistent_read(false)` opts the
+partition listings out when a stale page is acceptable. Entity-type listings read the
+`entityType-index` global secondary index, which DynamoDB only reads eventually consistently, so
+they can briefly miss a row a commit just wrote.
+
 `ViewCodec<T, R>` (Go's `viewstore.Codec`, `viewstore.Single`, and the `GetJSONView` family) binds a
 repository, an entity type and a serde type. It writes `T` as the payload with `json::to_vec`, so
 the bytes are Go's `json.Marshal` of the same shape, and reads it back; `with_decoder` stands in

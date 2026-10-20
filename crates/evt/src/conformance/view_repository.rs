@@ -73,17 +73,42 @@ pub async fn view_repository_cases<V: ViewRepository>(repo: &V) {
 
 /// Runs the cases that tie the commit path to the view repository: a row a commit wrote through
 /// `writer` is read, listed and by entity type through `reader`, at the same table and
-/// attributes, owner included. `reader` must read the table `writer` writes view operations to.
+/// attributes, owner included; and a partition page read straight after each commit (put,
+/// overwrite, delete) reflects it, the read-your-writes a request handler relies on. `reader`
+/// must read the table `writer` writes view operations to.
+///
+/// A local emulator is always consistent, so on DynamoDB the read-your-writes case passes even
+/// without `ConsistentRead`; the request itself is pinned by a unit test on the sent request.
 pub async fn committed_view_cases<R, V>(writer: &R, reader: &V)
 where
     R: Repository,
     V: ViewRepository,
 {
-    let result = Box::pin(committed_rows(writer, reader)).await;
+    let mut failures = Vec::new();
 
-    match result {
-        Ok(()) => println!("ok   rows written by a commit are read by the view repository"),
-        Err(Failure(message)) => panic!("committed view row case failed: {message}"),
+    let mut record = |name: &str, result: CaseResult| match result {
+        Ok(()) => println!("ok   {name}"),
+        Err(Failure(message)) => {
+            println!("FAIL {name}");
+            failures.push(format!("{name}: {message}"));
+        }
+    };
+
+    record(
+        "rows written by a commit are read by the view repository",
+        Box::pin(committed_rows(writer, reader)).await,
+    );
+    record(
+        "a partition page read straight after a commit reflects it",
+        Box::pin(committed_page_read_your_writes(writer, reader)).await,
+    );
+
+    if !failures.is_empty() {
+        panic!(
+            "{} committed view case(s) failed:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
     }
 }
 
@@ -585,6 +610,71 @@ async fn committed_rows<R: Repository, V: ViewRepository>(writer: &R, reader: &V
         reader.get_view_at(&pk, "one").await?,
         None,
         "the committed delete"
+    );
+
+    Ok(())
+}
+
+async fn committed_page_read_your_writes<R: Repository, V: ViewRepository>(
+    writer: &R,
+    reader: &V,
+) -> CaseResult {
+    let ns = namespace();
+    let stream = Stream::new(&ns, "owner", "owner");
+    let (pk, entity_type) = (format!("{ns}-ryw"), format!("{ns}-kind"));
+
+    let put = |payload: &str| {
+        ProjectedView::new(
+            "p",
+            0,
+            0,
+            ViewOperation::put(
+                pk.as_str(),
+                "row",
+                stream.id.clone(),
+                entity_type.as_str(),
+                payload,
+            ),
+        )
+    };
+    let payloads = |page: ViewPage| {
+        page.views
+            .into_iter()
+            .map(|row| String::from_utf8_lossy(&row.payload).into_owned())
+            .collect::<Vec<_>>()
+    };
+
+    writer
+        .commit(write(&stream, 1..=1).with_views([put(r#"{"v":1}"#)]))
+        .await?;
+    ensure_eq!(
+        payloads(reader.list_views_by_pk_paged(&pk, Some(10), None).await?),
+        vec![r#"{"v":1}"#.to_owned()],
+        "the page after the put"
+    );
+
+    writer
+        .commit(write(&stream, 2..=2).with_views([put(r#"{"v":2}"#)]))
+        .await?;
+    ensure_eq!(
+        payloads(reader.list_views_by_pk_paged(&pk, Some(10), None).await?),
+        vec![r#"{"v":2}"#.to_owned()],
+        "the page after the overwrite"
+    );
+
+    let delete = ProjectedView::new(
+        "p",
+        0,
+        0,
+        ViewOperation::delete(pk.as_str(), "row", stream.id.clone()),
+    );
+    writer
+        .commit(write(&stream, 3..=3).with_views([delete]))
+        .await?;
+    ensure_eq!(
+        payloads(reader.list_views_by_pk_paged(&pk, Some(10), None).await?),
+        Vec::<String>::new(),
+        "the page after the delete"
     );
 
     Ok(())

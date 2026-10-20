@@ -129,6 +129,9 @@ type ViewQueryVector struct {
 	RequestLimit  *int32         `json:"requestLimit"`
 	StartKey      map[string]any `json:"startKey"`
 	ConsistentSet bool           `json:"consistentSet"`
+	// ConsistentRead is the request's ConsistentRead: true for a partition query of the base
+	// table, unset (false) for the entity-type index, which cannot be read consistently.
+	ConsistentRead bool `json:"consistentRead"`
 }
 
 // ViewCursorVector is a LastEvaluatedKey and its cursor.
@@ -457,7 +460,7 @@ func fillViewQueries(ctx context.Context, fixtures *ViewRepoFixtures) error {
 			Name: c.name, Kind: c.kind, Key: c.key, Limit: c.limit, Cursor: c.cursor,
 			Index: aws.ToString(request.IndexName), KeyCondition: aws.ToString(request.KeyConditionExpression),
 			Values: values, RequestLimit: request.Limit, StartKey: startKey,
-			ConsistentSet: request.ConsistentRead != nil,
+			ConsistentSet: request.ConsistentRead != nil, ConsistentRead: aws.ToBool(request.ConsistentRead),
 		})
 	}
 

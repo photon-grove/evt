@@ -633,6 +633,15 @@ pub struct ViewQuery {
     pub start_key: Option<Item>,
 }
 
+impl ViewQuery {
+    /// Whether the query reads the base table rather than an index. Only a base-table query can
+    /// be strongly consistent: DynamoDB refuses `ConsistentRead` on a global secondary index, so
+    /// an index query sends none.
+    pub fn reads_base_table(&self) -> bool {
+        self.index.is_none()
+    }
+}
+
 /// The query listing the rows of one partition, optionally bounded and continued from a cursor.
 /// A `limit` of `None` or `Some(0)` (or above `i32::MAX`) leaves the page to DynamoDB's size cap.
 pub fn view_query_by_pk(

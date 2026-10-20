@@ -470,7 +470,8 @@
       },
       "requestLimit": null,
       "startKey": null,
-      "consistentSet": false
+      "consistentSet": true,
+      "consistentRead": true
     },
     {
       "name": "pk-limit",
@@ -487,7 +488,8 @@
       },
       "requestLimit": 2,
       "startKey": null,
-      "consistentSet": false
+      "consistentSet": true,
+      "consistentRead": true
     },
     {
       "name": "pk-negative-limit",
@@ -504,7 +506,8 @@
       },
       "requestLimit": null,
       "startKey": null,
-      "consistentSet": false
+      "consistentSet": true,
+      "consistentRead": true
     },
     {
       "name": "entity-type-limit",
@@ -521,7 +524,8 @@
       },
       "requestLimit": 25,
       "startKey": null,
-      "consistentSet": false
+      "consistentSet": false,
+      "consistentRead": false
     },
     {
       "name": "entity-type-unbounded",
@@ -538,7 +542,8 @@
       },
       "requestLimit": null,
       "startKey": null,
-      "consistentSet": false
+      "consistentSet": false,
+      "consistentRead": false
     },
     {
       "name": "pk-cursor",
@@ -562,7 +567,8 @@
           "S": "t2"
         }
       },
-      "consistentSet": false
+      "consistentSet": true,
+      "consistentRead": true
     }
   ],
   "cursors": [

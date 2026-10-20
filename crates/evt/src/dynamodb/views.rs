@@ -27,22 +27,42 @@ const MAX_BATCH_ATTEMPTS: u32 = 3;
 /// [`DynamoRepository::with_views_table`](super::DynamoRepository::with_views_table)). An item
 /// holds `pk`, `sk`, `entityID` (the owner), `entityType`, `payload`, and an optional `ttl`.
 ///
-/// Point reads are strongly consistent; lists are eventually consistent, as they are in Go. Writes
-/// go through `BatchWriteItem` like Go's, so a write is not conditional and not part of any
+/// Reads of the base table are strongly consistent, as in Go: point reads always, and partition
+/// listings ([`list_views_by_pk_paged`](ViewRepository::list_views_by_pk_paged) and
+/// [`list_views_by_pk`](ViewRepository::list_views_by_pk)) unless
+/// [`with_consistent_read(false)`](Self::with_consistent_read) opts them out. A row a commit just
+/// wrote is therefore seen by the next read of its key or partition. A strongly consistent read
+/// costs twice the read capacity of an eventually consistent one. Entity-type listings read the
+/// `entityType-index` global secondary index, which DynamoDB can only read eventually
+/// consistently, so they can lag behind a commit.
+///
+/// Writes go through `BatchWriteItem` like Go's, so a write is not conditional and not part of any
 /// commit. Clones share the client.
 #[derive(Clone, Debug)]
 pub struct DynamoViewRepository {
     client: Client,
     table: String,
+    /// Whether partition listings read strongly consistently (default `true`).
+    consistent_read: bool,
 }
 
 impl DynamoViewRepository {
-    /// A view repository over `table`.
+    /// A view repository over `table`, with strongly consistent partition listings.
     pub fn new(client: Client, table: impl Into<String>) -> Self {
         Self {
             client,
             table: table.into(),
+            consistent_read: true,
         }
+    }
+
+    /// Reads partition listings eventually consistently, at half the read capacity, when `false`
+    /// (Go `WithConsistentRead`); a listing may then miss a row a commit just wrote. Point reads
+    /// stay strongly consistent and entity-type listings stay eventually consistent either way.
+    #[must_use]
+    pub fn with_consistent_read(mut self, consistent: bool) -> Self {
+        self.consistent_read = consistent;
+        self
     }
 
     /// The DynamoDB client.
@@ -163,7 +183,10 @@ impl DynamoViewRepository {
     }
 
     async fn query_page(&self, query: ViewQuery) -> Result<ViewPage, Error> {
+        // Only a base-table query can be consistent; an index query sends no `ConsistentRead`.
+        let consistent = query.reads_base_table().then_some(self.consistent_read);
         let output = apply(self.client.query().table_name(&self.table), query)
+            .set_consistent_read(consistent)
             .send()
             .await
             .map_err(sdk_error)?;
@@ -329,6 +352,8 @@ impl ViewRepository for DynamoViewRepository {
 impl DynamoRepository {
     /// A [`ViewRepository`] over the views table [`with_views_table`](Self::with_views_table)
     /// configured, the table the commit path writes view operations to, with the same client.
+    /// Its reads follow [`DynamoViewRepository::new`] (strongly consistent partition listings),
+    /// whatever this repository's [`with_consistent_read`](Self::with_consistent_read).
     /// Refused with [`Error::ViewsNotConfigured`] when there is none.
     pub fn view_repository(&self) -> Result<DynamoViewRepository, Error> {
         let table = self.views_table.clone().ok_or(Error::ViewsNotConfigured {
