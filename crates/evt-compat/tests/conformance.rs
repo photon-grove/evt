@@ -14,10 +14,10 @@ use evt_compat::drivers::{self, DynamoHeads, PostgresHeads};
 use futures_core::Stream as _;
 use photon_evt::conformance::{
     Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, RebuildSuite, Suite, TestClock,
-    ViewTarget, commit_view_cases, enumeration_cases, feature_marker_cases, fresh_store_cases,
-    outcome_cases,
+    ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, feature_marker_cases,
+    fresh_store_cases, outcome_cases, view_repository_cases,
 };
-use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
+use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
 use photon_evt::wire::dynamo::DEFAULT_VIEW_SORT_KEY;
 use photon_evt::wire::postgres::ENTITY_LOCK;
@@ -25,7 +25,7 @@ use photon_evt::{
     Aggregate, BoxError, Commit, CommitProjector, CommitView, EntityId, Error, EventId, EventLog,
     EventSequence, EventType, EventVersion, Metadata, Projector, REASON_CONDITION_FAILED,
     Repository, RetryPolicy, SerializedEvent, SerializedSnapshot, Store, StreamFilter,
-    ViewCondition, ViewOperation, ViewOperationKind, ViewRow, json,
+    ViewCondition, ViewOperation, ViewOperationKind, ViewRepository, ViewRow, json,
 };
 
 /// A projector's own error for a claim that is already taken.
@@ -225,6 +225,7 @@ async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
     feature_marker_cases(&repository, &second).await;
     outcome_cases(&repository, &second).await;
     Box::pin(dynamo_commit_wide_views(&repository)).await;
+    Box::pin(dynamo_view_repository(&repository)).await;
     dynamo_outcome_row_matches_the_wire_format(&repository).await;
     dynamo_outcome_reads_are_consistent_by_default_and_by_force(&repository).await;
     dynamo_marker_row_matches_the_wire_format(&repository).await;
@@ -287,8 +288,19 @@ impl CommitViewTarget<DynamoRepository> for DynamoViewRows {
 
 /// A private views table (string `pk` and `sk`, no stream), like the event-log table of the suite.
 async fn create_dynamo_views_table(client: &aws_sdk_dynamodb::Client, name: &str) {
+    create_dynamo_views_table_with(client, name, false).await;
+}
+
+/// A private views table, with the `entityType-index` index the view repository lists by when
+/// `indexed` (the table `infra/local` creates has it).
+async fn create_dynamo_views_table_with(
+    client: &aws_sdk_dynamodb::Client,
+    name: &str,
+    indexed: bool,
+) {
     use aws_sdk_dynamodb::types::{
-        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+        AttributeDefinition, BillingMode, GlobalSecondaryIndex, KeySchemaElement, KeyType,
+        Projection, ProjectionType, ScalarAttributeType,
     };
 
     let attribute = |name: &str| {
@@ -306,17 +318,103 @@ async fn create_dynamo_views_table(client: &aws_sdk_dynamodb::Client, name: &str
             .unwrap()
     };
 
-    client
+    let mut request = client
         .create_table()
         .table_name(name)
         .attribute_definitions(attribute("pk"))
         .attribute_definitions(attribute("sk"))
         .key_schema(key("pk", KeyType::Hash))
         .key_schema(key("sk", KeyType::Range))
-        .billing_mode(BillingMode::PayPerRequest)
+        .billing_mode(BillingMode::PayPerRequest);
+
+    if indexed {
+        request = request
+            .attribute_definitions(attribute("entityType"))
+            .global_secondary_indexes(
+                GlobalSecondaryIndex::builder()
+                    .index_name("entityType-index")
+                    .key_schema(key("entityType", KeyType::Hash))
+                    .projection(
+                        Projection::builder()
+                            .projection_type(ProjectionType::All)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            );
+    }
+
+    request.send().await.expect("create the views table");
+}
+
+/// The view repository (P1, P10) against the emulator: the shared cases over a private table with
+/// the entity-type index, the rows a commit wrote through the same table, and the stored items.
+async fn dynamo_view_repository(repository: &DynamoRepository) {
+    let client = repository.client().clone();
+    let table = format!(
+        "evt-conformance-view-repo-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    create_dynamo_views_table_with(&client, &table, true).await;
+
+    let views = DynamoViewRepository::new(client.clone(), &table);
+    view_repository_cases(&views).await;
+
+    // The commit path writes to the table the view repository reads.
+    let writer = repository.clone().with_views_table(&table);
+    committed_view_cases(&writer, &writer.view_repository().unwrap()).await;
+
+    // Without a views table there is nothing to read.
+    assert!(matches!(
+        repository.view_repository(),
+        Err(Error::ViewsNotConfigured {
+            backend: "dynamodb"
+        })
+    ));
+
+    // The stored item is the five string attributes, and a `ttl` number only when set.
+    let pk = format!("shape-{table}");
+    let stored = |ttl: i64| ViewRow::new(&pk, "", "owner", "shape", "{}").with_ttl(ttl);
+    for ttl in [0, 4_102_444_800] {
+        views.put_view(&stored(ttl)).await.unwrap();
+        let item = client
+            .get_item()
+            .table_name(&table)
+            .consistent_read(true)
+            .key("pk", AttributeValue::S(pk.clone()))
+            .key("sk", AttributeValue::S("VIEW".into()))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap();
+
+        let mut names: Vec<_> = item.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            if ttl == 0 {
+                vec!["entityID", "entityType", "payload", "pk", "sk"]
+            } else {
+                vec!["entityID", "entityType", "payload", "pk", "sk", "ttl"]
+            }
+        );
+        assert_eq!(item["entityID"], AttributeValue::S("owner".into()));
+        if ttl != 0 {
+            assert_eq!(item["ttl"], AttributeValue::N(ttl.to_string()));
+        }
+    }
+
+    client
+        .delete_table()
+        .table_name(&table)
         .send()
         .await
-        .expect("create the views table");
+        .expect("delete the view repository table");
 }
 
 /// Commit-wide view operations (v0.9, C7) against the emulator: the shared cases, a repository

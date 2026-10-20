@@ -156,6 +156,11 @@ and a rebuild — which has no order between the two streams — could not tell 
 owner and rewrite the row as a tombstone, or make the key belong to a stream every claimant writes,
 as the handle stream above does. Do not rely on commit IDs for ordering; they are not causal.
 
+Even a delete that finds nothing counts as a claim on the key. A delete by owner A of a row that is
+not there, followed by a put by owner B, is accepted live (the row is absent, so the owner
+condition holds) but refused on replay, because the replay sees two owners touch one row. Treat
+every delete as a claim, whether or not it removes a row.
+
 **What it returns.** Puts and deletes of rows at any `pk`/`sk`, in the order they should be
 written. A put overwrites unless it is `IfAbsent`; a delete of a missing row succeeds unless it is
 `IfPresent`. `OnConflict(err)` names the error to return when the condition fails. Projectors are

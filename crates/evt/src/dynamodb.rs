@@ -2607,6 +2607,9 @@ fn from_sdk(value: &sdk::AttributeValue) -> AttributeValue {
 
 mod enumerate;
 mod rebuild;
+mod views;
+
+pub use views::DynamoViewRepository;
 
 #[cfg(test)]
 mod tests {

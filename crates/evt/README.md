@@ -645,6 +645,63 @@ let mut accounts = std::pin::pin!(repository.stream_entities::<Account>(StreamFi
   the stream continues. Entities fold from events only, as in Go, so a compacted stream reports
   `SequenceGap`: load it with `Store::load` instead.
 
+## Reading and writing views
+
+`ViewRepository` is the Rust counterpart of Go's `evt.ViewRepository`: it reads and writes the rows
+of the views table outside the commit path, with the same five attributes commit-wide view
+operations write (the owner stream is the row's `entityID`) plus an optional `ttl`. `MemRepository`
+implements it over the rows commits write, and `DynamoViewRepository` (feature `dynamodb`) over
+the views table, which needs a string `pk` and `sk` and the `entityType-index` index on
+`entityType`. `DynamoRepository::view_repository` builds one for the table
+`with_views_table` configured.
+
+```rust,ignore
+use photon_evt::{ViewRepository, ViewRow};
+
+let views = repository.view_repository()?; // or DynamoViewRepository::new(client, "views")
+
+// Writes take no owner check: use them for rows no commit-wide projector owns, and for rebuilds.
+views.put_view(&ViewRow::new("USER#1#teams", "t1", "user-1", "team", r#"{"name":"core"}"#)).await?;
+views.put_views(&rows).await?; // DynamoDB: BatchWriteItem in chunks of 25 (Go's PutViews)
+
+let one = views.get_view("account#acct-1").await?; // the row at sk "VIEW"
+let at = views.get_view_at("USER#1#teams", "t1").await?;
+let found = views.batch_get_views(&["account#a", "account#b"]).await?; // BatchGetItem
+
+// Lists: by partition (ascending by sk bytes) or by entity type (the index, unordered).
+let mut cursor = None;
+loop {
+    let page = views.list_views_by_pk_paged("USER#1#teams", Some(50), cursor.as_deref()).await?;
+    // ... page.views ...
+    match page.next_cursor { Some(next) => cursor = Some(next), None => break }
+}
+```
+
+A cursor is Go's: base64url JSON of the last key, so it moves between a Go and a Rust process. A
+page can come back empty with a cursor on DynamoDB; keep going until the cursor is `None`.
+
+`ViewCodec<T, R>` (Go's `viewstore.Codec`, `viewstore.Single`, and the `GetJSONView` family) binds a
+repository, an entity type and a serde type. It writes `T` as the payload with `json::to_vec`, so
+the bytes are Go's `json.Marshal` of the same shape, and reads it back; `with_decoder` stands in
+for Go's factory when a value needs constructor-injected dependencies.
+
+```rust,ignore
+use photon_evt::ViewCodec;
+
+let profiles = ViewCodec::<Profile, _>::new(&views, "profile");
+
+profiles.put_at("profile#ada", "ada", &profile).await?;
+let ada: Option<Profile> = profiles.get("profile#ada").await?;
+
+// Lists skip a payload that does not decode and report it; the _strict forms fail instead.
+let all = profiles.list_all(|row, err| eprintln!("skipped {}/{}: {err}", row.pk, row.sk)).await?;
+```
+
+Where Go's decoder differs from serde's, serde wins: a JSON `null` does not decode into a struct
+and field names match exactly, so mark fields `#[serde(default)]` that older or Go-written rows may
+omit. Views are projections: replaying the events must be able to rebuild every row, so keep the
+mutable state behind these writes in events.
+
 ## Testing your domain
 
 The `testing` feature adds `photon_evt::testing`: given/when/then tests over `MemRepository`, the

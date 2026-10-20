@@ -213,7 +213,9 @@ pub fn view_operation_size(operation: &ViewOperation) -> usize {
     }
 }
 
-/// A view row as the in-memory repository stores it: the five attributes of a views-table item.
+/// A view row as a views-table item holds it: the five attributes of a commit-wide view row, plus
+/// the optional `ttl` the [`ViewRepository`](crate::ViewRepository) can write (Go's
+/// `evt.SerializedView`). Commit-wide view operations never carry a `ttl`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ViewRow {
@@ -227,6 +229,10 @@ pub struct ViewRow {
     pub entity_type: String,
     /// The view state JSON.
     pub payload: Vec<u8>,
+    /// The expiry in epoch seconds, or `0` for none. Only
+    /// [`ViewRepository::put_view`](crate::ViewRepository::put_view) writes one; DynamoDB deletes
+    /// the item some time after it passes, so a read can still return an expired row.
+    pub ttl: i64,
 }
 
 impl ViewRow {
@@ -244,7 +250,15 @@ impl ViewRow {
             entity_id: entity_id.into(),
             entity_type: entity_type.into(),
             payload: payload.into(),
+            ttl: 0,
         }
+    }
+
+    /// The row with an expiry in epoch seconds (`0` for none).
+    #[must_use]
+    pub fn with_ttl(mut self, ttl: i64) -> Self {
+        self.ttl = ttl;
+        self
     }
 
     /// The row a put operation writes.
@@ -255,6 +269,7 @@ impl ViewRow {
             entity_id: operation.owner.to_string(),
             entity_type: operation.entity_type.clone(),
             payload: operation.payload.clone(),
+            ttl: 0,
         }
     }
 }

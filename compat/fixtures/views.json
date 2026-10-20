@@ -1,0 +1,870 @@
+{
+  "limits": {
+    "write": 25,
+    "get": 100
+  },
+  "puts": [
+    {
+      "name": "full",
+      "row": {
+        "pk": "account#acct-1",
+        "sk": "VIEW",
+        "entityId": "acct-1",
+        "entityType": "account",
+        "payload": "{\"status\":\"open\"}",
+        "ttl": 1791849601
+      },
+      "dynamoItem": {
+        "entityID": {
+          "S": "acct-1"
+        },
+        "entityType": {
+          "S": "account"
+        },
+        "payload": {
+          "S": "{\"status\":\"open\"}"
+        },
+        "pk": {
+          "S": "account#acct-1"
+        },
+        "sk": {
+          "S": "VIEW"
+        },
+        "ttl": {
+          "N": "1791849601"
+        }
+      }
+    },
+    {
+      "name": "no-ttl",
+      "row": {
+        "pk": "handles",
+        "sk": "ada",
+        "entityId": "acct-1",
+        "entityType": "account",
+        "payload": "{\"owner\":\"acct-1\"}",
+        "ttl": 0
+      },
+      "dynamoItem": {
+        "entityID": {
+          "S": "acct-1"
+        },
+        "entityType": {
+          "S": "account"
+        },
+        "payload": {
+          "S": "{\"owner\":\"acct-1\"}"
+        },
+        "pk": {
+          "S": "handles"
+        },
+        "sk": {
+          "S": "ada"
+        }
+      }
+    },
+    {
+      "name": "empty-sk-defaults",
+      "row": {
+        "pk": "account#acct-2",
+        "sk": "",
+        "entityId": "acct-2",
+        "entityType": "account",
+        "payload": "{}",
+        "ttl": 5
+      },
+      "dynamoItem": {
+        "entityID": {
+          "S": "acct-2"
+        },
+        "entityType": {
+          "S": "account"
+        },
+        "payload": {
+          "S": "{}"
+        },
+        "pk": {
+          "S": "account#acct-2"
+        },
+        "sk": {
+          "S": "VIEW"
+        },
+        "ttl": {
+          "N": "5"
+        }
+      }
+    },
+    {
+      "name": "negative-ttl",
+      "row": {
+        "pk": "x",
+        "sk": "y",
+        "entityId": "e",
+        "entityType": "t",
+        "payload": "{}",
+        "ttl": -5
+      },
+      "dynamoItem": {
+        "entityID": {
+          "S": "e"
+        },
+        "entityType": {
+          "S": "t"
+        },
+        "payload": {
+          "S": "{}"
+        },
+        "pk": {
+          "S": "x"
+        },
+        "sk": {
+          "S": "y"
+        },
+        "ttl": {
+          "N": "-5"
+        }
+      }
+    },
+    {
+      "name": "escaped",
+      "row": {
+        "pk": "team#é<&>",
+        "sk": "k\u2028",
+        "entityId": "e<&>",
+        "entityType": "t",
+        "payload": "{\"note\":\"<&> \\u2028 é\"}",
+        "ttl": 0
+      },
+      "dynamoItem": {
+        "entityID": {
+          "S": "e<&>"
+        },
+        "entityType": {
+          "S": "t"
+        },
+        "payload": {
+          "S": "{\"note\":\"<&> \\u2028 é\"}"
+        },
+        "pk": {
+          "S": "team#é<&>"
+        },
+        "sk": {
+          "S": "k\u2028"
+        }
+      }
+    },
+    {
+      "name": "empty-strings",
+      "row": {
+        "pk": "p",
+        "sk": "s",
+        "entityId": "",
+        "entityType": "",
+        "payload": "",
+        "ttl": 0
+      },
+      "dynamoItem": {
+        "entityID": {
+          "S": ""
+        },
+        "entityType": {
+          "S": ""
+        },
+        "payload": {
+          "S": ""
+        },
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        }
+      }
+    }
+  ],
+  "deletes": [
+    {
+      "name": "explicit",
+      "pk": "handles",
+      "sk": "ada",
+      "key": {
+        "pk": {
+          "S": "handles"
+        },
+        "sk": {
+          "S": "ada"
+        }
+      }
+    },
+    {
+      "name": "empty-sk-defaults",
+      "pk": "account#acct-1",
+      "sk": "",
+      "key": {
+        "pk": {
+          "S": "account#acct-1"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      }
+    }
+  ],
+  "gets": [
+    {
+      "name": "account#acct-1",
+      "pk": "account#acct-1",
+      "key": {
+        "pk": {
+          "S": "account#acct-1"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      },
+      "consistentRead": true
+    },
+    {
+      "name": "team#é<&>",
+      "pk": "team#é<&>",
+      "key": {
+        "pk": {
+          "S": "team#é<&>"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      },
+      "consistentRead": true
+    }
+  ],
+  "decodes": [
+    {
+      "name": "full",
+      "dynamoItem": {
+        "entityID": {
+          "S": "acct-1"
+        },
+        "entityType": {
+          "S": "account"
+        },
+        "payload": {
+          "S": "{\"a\":1}"
+        },
+        "pk": {
+          "S": "account#acct-1"
+        },
+        "sk": {
+          "S": "VIEW"
+        },
+        "ttl": {
+          "N": "1791849601"
+        }
+      },
+      "row": {
+        "pk": "account#acct-1",
+        "sk": "VIEW",
+        "entityId": "acct-1",
+        "entityType": "account",
+        "payload": "{\"a\":1}",
+        "ttl": 1791849601
+      },
+      "error": false
+    },
+    {
+      "name": "no-ttl",
+      "dynamoItem": {
+        "entityID": {
+          "S": "e"
+        },
+        "entityType": {
+          "S": "t"
+        },
+        "payload": {
+          "S": "{}"
+        },
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        }
+      },
+      "row": {
+        "pk": "p",
+        "sk": "s",
+        "entityId": "e",
+        "entityType": "t",
+        "payload": "{}",
+        "ttl": 0
+      },
+      "error": false
+    },
+    {
+      "name": "missing-attributes",
+      "dynamoItem": {
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        }
+      },
+      "row": {
+        "pk": "p",
+        "sk": "s",
+        "entityId": "",
+        "entityType": "",
+        "payload": "",
+        "ttl": 0
+      },
+      "error": false
+    },
+    {
+      "name": "extra-attributes",
+      "dynamoItem": {
+        "other": {
+          "S": "ignored"
+        },
+        "payload": {
+          "S": "x"
+        },
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        }
+      },
+      "row": {
+        "pk": "p",
+        "sk": "s",
+        "entityId": "",
+        "entityType": "",
+        "payload": "x",
+        "ttl": 0
+      },
+      "error": false
+    },
+    {
+      "name": "negative-ttl",
+      "dynamoItem": {
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        },
+        "ttl": {
+          "N": "-5"
+        }
+      },
+      "row": {
+        "pk": "p",
+        "sk": "s",
+        "entityId": "",
+        "entityType": "",
+        "payload": "",
+        "ttl": -5
+      },
+      "error": false
+    },
+    {
+      "name": "ttl-wrong-type",
+      "dynamoItem": {
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        },
+        "ttl": {
+          "S": "soon"
+        }
+      },
+      "row": null,
+      "error": true
+    },
+    {
+      "name": "payload-wrong-type",
+      "dynamoItem": {
+        "payload": {
+          "N": "1"
+        },
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        }
+      },
+      "row": {
+        "pk": "p",
+        "sk": "s",
+        "entityId": "",
+        "entityType": "",
+        "payload": "1",
+        "ttl": 0
+      },
+      "error": false
+    },
+    {
+      "name": "null-attributes",
+      "dynamoItem": {
+        "entityType": {
+          "NULL": true
+        },
+        "payload": {
+          "NULL": true
+        },
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        },
+        "ttl": {
+          "NULL": true
+        }
+      },
+      "row": {
+        "pk": "p",
+        "sk": "s",
+        "entityId": "",
+        "entityType": "",
+        "payload": "",
+        "ttl": 0
+      },
+      "error": false
+    },
+    {
+      "name": "ttl-fraction",
+      "dynamoItem": {
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        },
+        "ttl": {
+          "N": "1.5"
+        }
+      },
+      "row": null,
+      "error": true
+    }
+  ],
+  "queries": [
+    {
+      "name": "pk-unbounded",
+      "kind": "pk",
+      "key": "USER#1#teams",
+      "limit": 0,
+      "cursor": "",
+      "index": "",
+      "keyCondition": "pk = :pk",
+      "values": {
+        ":pk": {
+          "S": "USER#1#teams"
+        }
+      },
+      "requestLimit": null,
+      "startKey": null,
+      "consistentSet": false
+    },
+    {
+      "name": "pk-limit",
+      "kind": "pk",
+      "key": "USER#1#teams",
+      "limit": 2,
+      "cursor": "",
+      "index": "",
+      "keyCondition": "pk = :pk",
+      "values": {
+        ":pk": {
+          "S": "USER#1#teams"
+        }
+      },
+      "requestLimit": 2,
+      "startKey": null,
+      "consistentSet": false
+    },
+    {
+      "name": "pk-negative-limit",
+      "kind": "pk",
+      "key": "USER#1#teams",
+      "limit": -3,
+      "cursor": "",
+      "index": "",
+      "keyCondition": "pk = :pk",
+      "values": {
+        ":pk": {
+          "S": "USER#1#teams"
+        }
+      },
+      "requestLimit": null,
+      "startKey": null,
+      "consistentSet": false
+    },
+    {
+      "name": "entity-type-limit",
+      "kind": "entityType",
+      "key": "account",
+      "limit": 25,
+      "cursor": "",
+      "index": "entityType-index",
+      "keyCondition": "entityType = :entityType",
+      "values": {
+        ":entityType": {
+          "S": "account"
+        }
+      },
+      "requestLimit": 25,
+      "startKey": null,
+      "consistentSet": false
+    },
+    {
+      "name": "entity-type-unbounded",
+      "kind": "entityType",
+      "key": "account",
+      "limit": 0,
+      "cursor": "",
+      "index": "entityType-index",
+      "keyCondition": "entityType = :entityType",
+      "values": {
+        ":entityType": {
+          "S": "account"
+        }
+      },
+      "requestLimit": null,
+      "startKey": null,
+      "consistentSet": false
+    },
+    {
+      "name": "pk-cursor",
+      "kind": "pk",
+      "key": "USER#1#teams",
+      "limit": 2,
+      "cursor": "eyJwayI6IlVTRVIjMSN0ZWFtcyIsInNrIjoidDIifQ==",
+      "index": "",
+      "keyCondition": "pk = :pk",
+      "values": {
+        ":pk": {
+          "S": "USER#1#teams"
+        }
+      },
+      "requestLimit": 2,
+      "startKey": {
+        "pk": {
+          "S": "USER#1#teams"
+        },
+        "sk": {
+          "S": "t2"
+        }
+      },
+      "consistentSet": false
+    }
+  ],
+  "cursors": [
+    {
+      "name": "table-key",
+      "lastEvaluatedKey": {
+        "pk": {
+          "S": "USER#1#teams"
+        },
+        "sk": {
+          "S": "t2"
+        }
+      },
+      "cursor": "eyJwayI6IlVTRVIjMSN0ZWFtcyIsInNrIjoidDIifQ=="
+    },
+    {
+      "name": "index-key",
+      "lastEvaluatedKey": {
+        "entityType": {
+          "S": "account"
+        },
+        "pk": {
+          "S": "account#acct-1"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      },
+      "cursor": "eyJlbnRpdHlUeXBlIjoiYWNjb3VudCIsInBrIjoiYWNjb3VudCNhY2N0LTEiLCJzayI6IlZJRVcifQ=="
+    },
+    {
+      "name": "escaped",
+      "lastEvaluatedKey": {
+        "entityType": {
+          "S": "t"
+        },
+        "pk": {
+          "S": "team#é<&>"
+        },
+        "sk": {
+          "S": "k\u2028"
+        }
+      },
+      "cursor": "eyJlbnRpdHlUeXBlIjoidCIsInBrIjoidGVhbSPDqVx1MDAzY1x1MDAyNlx1MDAzZSIsInNrIjoia1x1MjAyOCJ9"
+    },
+    {
+      "name": "non-string-dropped",
+      "lastEvaluatedKey": {
+        "n": {
+          "N": "1"
+        },
+        "pk": {
+          "S": "p"
+        },
+        "sk": {
+          "S": "s"
+        }
+      },
+      "cursor": "eyJwayI6InAiLCJzayI6InMifQ=="
+    },
+    {
+      "name": "padding-and-url-alphabet",
+      "lastEvaluatedKey": {
+        "pk": {
+          "S": "???>>>"
+        },
+        "sk": {
+          "S": "~~~"
+        }
+      },
+      "cursor": "eyJwayI6Ij8_P1x1MDAzZVx1MDAzZVx1MDAzZSIsInNrIjoifn5-In0="
+    }
+  ],
+  "startKeys": [
+    {
+      "name": "table-key",
+      "cursor": "eyJwayI6IlVTRVIjMSN0ZWFtcyIsInNrIjoidDIifQ==",
+      "startKey": {
+        "pk": {
+          "S": "USER#1#teams"
+        },
+        "sk": {
+          "S": "t2"
+        }
+      },
+      "error": false
+    },
+    {
+      "name": "index-key",
+      "cursor": "eyJlbnRpdHlUeXBlIjoiYWNjb3VudCIsInBrIjoiYWNjb3VudCNhY2N0LTEiLCJzayI6IlZJRVcifQ==",
+      "startKey": {
+        "entityType": {
+          "S": "account"
+        },
+        "pk": {
+          "S": "account#acct-1"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      },
+      "error": false
+    },
+    {
+      "name": "escaped",
+      "cursor": "eyJlbnRpdHlUeXBlIjoidCIsInBrIjoidGVhbSPDqVx1MDAzY1x1MDAyNlx1MDAzZSIsInNrIjoia1x1MjAyOCJ9",
+      "startKey": {
+        "entityType": {
+          "S": "t"
+        },
+        "pk": {
+          "S": "team#é<&>"
+        },
+        "sk": {
+          "S": "k\u2028"
+        }
+      },
+      "error": false
+    },
+    {
+      "name": "not-base64",
+      "cursor": "not base64!",
+      "startKey": null,
+      "error": true
+    },
+    {
+      "name": "not-json",
+      "cursor": "bm90IGpzb24=",
+      "startKey": null,
+      "error": true
+    },
+    {
+      "name": "not-strings",
+      "cursor": "eyJwayI6MX0=",
+      "startKey": null,
+      "error": true
+    },
+    {
+      "name": "unpadded",
+      "cursor": "eyJwayI6InAiLCJzayI6InMifQ",
+      "startKey": null,
+      "error": true
+    }
+  ],
+  "codec": [
+    {
+      "name": "full",
+      "pk": "profile#ada",
+      "sk": "VIEW",
+      "entityId": "ada",
+      "value": "{\"name\":\"Ada \\u003c\\u0026\\u003e \\u2028\",\"note\":\"line\\nbreak \\\"quoted\\\" \\\\ é 😀\",\"bio\":\"likes \\u003cb\\u003ebold\\u003c/b\\u003e \\u0026 more\",\"tags\":[\"b\",\"a\"],\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"},\"count\":-9007199254740993,\"big\":18446744073709551615}",
+      "dynamoItem": {
+        "entityID": {
+          "S": "ada"
+        },
+        "entityType": {
+          "S": "profile"
+        },
+        "payload": {
+          "S": "{\"name\":\"Ada \\u003c\\u0026\\u003e \\u2028\",\"note\":\"line\\nbreak \\\"quoted\\\" \\\\ é 😀\",\"bio\":\"likes \\u003cb\\u003ebold\\u003c/b\\u003e \\u0026 more\",\"tags\":[\"b\",\"a\"],\"labels\":{\"region\":\"emea\",\"tier\":\"gold\"},\"count\":-9007199254740993,\"big\":18446744073709551615}"
+        },
+        "pk": {
+          "S": "profile#ada"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      }
+    },
+    {
+      "name": "zero",
+      "pk": "profile#zero",
+      "sk": "",
+      "entityId": "zero",
+      "value": "{\"name\":\"\",\"note\":\"\",\"bio\":null,\"tags\":null,\"labels\":null,\"count\":0,\"big\":0}",
+      "dynamoItem": {
+        "entityID": {
+          "S": "zero"
+        },
+        "entityType": {
+          "S": "profile"
+        },
+        "payload": {
+          "S": "{\"name\":\"\",\"note\":\"\",\"bio\":null,\"tags\":null,\"labels\":null,\"count\":0,\"big\":0}"
+        },
+        "pk": {
+          "S": "profile#zero"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      }
+    },
+    {
+      "name": "empty-collections",
+      "pk": "profile#empty",
+      "sk": "VIEW",
+      "entityId": "",
+      "value": "{\"name\":\"\",\"note\":\"\",\"bio\":null,\"tags\":[],\"labels\":{},\"count\":0,\"big\":0}",
+      "dynamoItem": {
+        "entityID": {
+          "S": ""
+        },
+        "entityType": {
+          "S": "profile"
+        },
+        "payload": {
+          "S": "{\"name\":\"\",\"note\":\"\",\"bio\":null,\"tags\":[],\"labels\":{},\"count\":0,\"big\":0}"
+        },
+        "pk": {
+          "S": "profile#empty"
+        },
+        "sk": {
+          "S": "VIEW"
+        }
+      }
+    }
+  ],
+  "codecDecode": [
+    {
+      "name": "full",
+      "payload": "{\"name\":\"Ada\",\"note\":\"n\",\"bio\":\"b\",\"tags\":[\"x\"],\"labels\":{\"k\":\"v\"},\"count\":3,\"big\":7}",
+      "valid": true,
+      "canonical": "{\"name\":\"Ada\",\"note\":\"n\",\"bio\":\"b\",\"tags\":[\"x\"],\"labels\":{\"k\":\"v\"},\"count\":3,\"big\":7}"
+    },
+    {
+      "name": "unknown-field-ignored",
+      "payload": "{\"name\":\"Ada\",\"extra\":{\"nested\":[1,2]}}",
+      "valid": true,
+      "canonical": "{\"name\":\"Ada\",\"note\":\"\",\"bio\":null,\"tags\":null,\"labels\":null,\"count\":0,\"big\":0}"
+    },
+    {
+      "name": "empty-object",
+      "payload": "{}",
+      "valid": true,
+      "canonical": "{\"name\":\"\",\"note\":\"\",\"bio\":null,\"tags\":null,\"labels\":null,\"count\":0,\"big\":0}"
+    },
+    {
+      "name": "nulls",
+      "payload": "{\"name\":\"x\",\"bio\":null,\"tags\":null,\"labels\":null}",
+      "valid": true,
+      "canonical": "{\"name\":\"x\",\"note\":\"\",\"bio\":null,\"tags\":null,\"labels\":null,\"count\":0,\"big\":0}"
+    },
+    {
+      "name": "escaped",
+      "payload": "{\"name\":\"\\u003c\\u0026\\u003e \\u2028 \\ud83d\\ude00\"}",
+      "valid": true,
+      "canonical": "{\"name\":\"\\u003c\\u0026\\u003e \\u2028 😀\",\"note\":\"\",\"bio\":null,\"tags\":null,\"labels\":null,\"count\":0,\"big\":0}"
+    },
+    {
+      "name": "truncated",
+      "payload": "{\"name\":",
+      "valid": false,
+      "canonical": ""
+    },
+    {
+      "name": "empty-payload",
+      "payload": "",
+      "valid": false,
+      "canonical": ""
+    },
+    {
+      "name": "not-json",
+      "payload": "plain text",
+      "valid": false,
+      "canonical": ""
+    },
+    {
+      "name": "array",
+      "payload": "[1,2]",
+      "valid": false,
+      "canonical": ""
+    },
+    {
+      "name": "wrong-type",
+      "payload": "{\"name\":5}",
+      "valid": false,
+      "canonical": ""
+    },
+    {
+      "name": "count-fraction",
+      "payload": "{\"count\":1.5}",
+      "valid": false,
+      "canonical": ""
+    },
+    {
+      "name": "count-overflow",
+      "payload": "{\"count\":9223372036854775808}",
+      "valid": false,
+      "canonical": ""
+    },
+    {
+      "name": "negative-big",
+      "payload": "{\"big\":-1}",
+      "valid": false,
+      "canonical": ""
+    },
+    {
+      "name": "trailing-garbage",
+      "payload": "{} x",
+      "valid": false,
+      "canonical": ""
+    }
+  ]
+}

@@ -739,8 +739,11 @@ fn namespace() -> String {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
 
+    // Zero-padded, so namespaces made in one nanosecond sort in the order they were made: cases
+    // that expect a stream order (the first of two streams by ID bytes) must not flip when the
+    // counter passes 9.
     format!(
-        "conf-{nanos}-{}",
+        "conf-{nanos}-{:06}",
         COUNTER.fetch_add(1, Ordering::Relaxed) + 1
     )
 }
@@ -7052,7 +7055,9 @@ async fn rejection_events_caller_fence<R: Repository>(repo: &R) -> CaseResult {
 }
 
 mod rebuild;
+mod view_repository;
 mod views;
 
 pub use rebuild::{NoViewRows, RebuildSuite, TestClock};
+pub use view_repository::{committed_view_cases, view_repository_cases};
 pub use views::{CommitViewTarget, commit_view_cases};

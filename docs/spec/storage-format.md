@@ -202,7 +202,8 @@ or a snapshot ([Stream Heads](#stream-heads)).
 
 `ttl` is written only for entity types with a positive retention, on event items and on the
 snapshot item alike. Its value is the commit time plus the retention, in whole Unix seconds,
-rounded down after adding. View items never carry it. An event item with missing or empty
+rounded down after adding. Commit-wide view items never carry it (the view repository can
+write one, see [Views](#views)). An event item with missing or empty
 `metadata` is invalid. Readers ignore other attributes.
 
 ### Writes
@@ -453,6 +454,29 @@ one item per entity to a separate views table, in the same transaction as the ev
 | `entityType` | S    | entity type               |
 | `payload`    | S    | aggregate state JSON      |
 
+**View repository.** The views table is also read and written outside the commit path by Go's
+`dynamo.ViewRepository` and Rust's `DynamoViewRepository` (`photon_evt::ViewRepository`), over the
+same five attributes, with one more: `ttl` (N, epoch seconds), written only when it is not zero.
+The table has string `pk` and `sk` keys and a global secondary index `entityType-index` with hash
+key `entityType` (no range key).
+
+- A write is a `BatchWriteItem` put or delete with no condition (no owner check), chunked to 25
+  requests, retrying `UnprocessedItems` (three attempts in all). A repeated `(pk, sk)` in one batch keeps its last row in Rust (Go leaves DynamoDB to refuse the request). An empty `sk` is stored as `VIEW`.
+- A single-item read is a strongly consistent `GetItem` at `(pk, sk = VIEW)`; a batch read is a
+  strongly consistent `BatchGetItem` chunked to 100 keys.
+- A list is a `Query` (`pk = :pk` on the table, `entityType = :entityType` on the index), not
+  strongly consistent. A bounded page sets `Limit`; with no limit the page is DynamoDB's response
+  cap.
+- A **pagination cursor** is the `LastEvaluatedKey`'s string attributes (`pk`, `sk`, and for the
+  index `entityType`) as a JSON object, keys sorted and escaped like every other Go JSON, in
+  padded base64url. Go and Rust cursors are interchangeable. An empty cursor is the first page.
+- A reader treats an absent string attribute as empty, an absent `ttl` as zero, and a number in a
+  string attribute as its text; a `ttl` that is not an integer is a corrupt row.
+
+`compat/fixtures/views.json` pins the items, request keys and expressions, cursors, and the
+payload bytes of the typed codec (`viewstore.Codec` in Go, `ViewCodec` in Rust: the payload is the
+`json.Marshal` of the value).
+
 **Commit-wide projectors (v0.9, C7).** A commit-wide projector is a pure function over the whole
 commit: the engine calls it once for every commit that writes at least one event, after every
 stream of the commit is staged and its snapshot decided, so a fence-aware retry derives its
@@ -531,7 +555,7 @@ row unless it carries the `absent` condition, and a delete of an absent row succ
 carries the `present` condition. In either case, a row that exists and belongs to another owner
 fails the operation. The **mapped error** is the projector's own error value for the case where the
 operation's condition fails (a claim that is already taken, say); it is in-memory commit data and
-is never stored. View items never carry `ttl`.
+is never stored. Commit-wide view items never carry `ttl`.
 
 Stored as a DynamoDB item (the views table is the one the repository is configured with), a put
 is a transaction `Put` of the item. Its condition is `attribute_not_exists(pk)` for `absent`, and
@@ -2938,6 +2962,15 @@ These differences are deliberate and covered by tests. Keep them documented here
   operation, and the reasons, are the same.
 - **PostgreSQL metadata.** Stored as `jsonb`, so its bytes differ from the encoded JSON. Compare it
   as JSON.
+- **View repository (P1, P2, P10).** PostgreSQL has no view repository in either language: evt
+  defines no view schema there, and the application's view writer is its only access (above). Go's
+  streaming iterators (`ViewStreamer`) are not ported; Rust pages with a cursor. Rust refuses a
+  cursor with no `pk` and `sk` string, or one that belongs to another partition or entity type,
+  with `Error::InvalidArgument`, where Go forwards it to DynamoDB; the in-memory repository
+  returns a cursor only when a row follows the page (DynamoDB returns one for every full bounded
+  page). A Rust typed view decodes with serde, so a JSON `null` does not decode into a struct (Go
+  leaves it zero) and field names match exactly (Go matches case-insensitively); use
+  `#[serde(default)]`.
 
 ## Compat Scenarios to Add
 

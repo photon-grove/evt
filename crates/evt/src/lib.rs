@@ -16,6 +16,9 @@
 //!   idempotent retries, persisted domain [`Rejection`]s, and accepted no-ops.
 //! - Walk the whole log lazily with [`EventLog`]: [`stream_all_events`](EventLog::stream_all_events)
 //!   and [`stream_entities`](EventLog::stream_entities) return [`futures_core::Stream`]s.
+//! - Read and write view rows outside the commit path with [`ViewRepository`]
+//!   ([`MemRepository`], [`dynamodb::DynamoViewRepository`]), and layer typed JSON values on it with
+//!   [`ViewCodec`].
 //! - Bound log growth with [`Repository::compact_below`], which only deletes events a durable
 //!   snapshot covers.
 //! - Fence projection rebuilds durably with [`RebuildFence`]: while a rebuild holds the lock every
@@ -53,6 +56,8 @@ mod store;
 pub mod testing;
 mod transaction;
 mod upcast;
+mod viewcodec;
+mod views;
 pub mod wire;
 
 #[cfg(feature = "dynamodb")]
@@ -106,6 +111,8 @@ pub use store::{
 };
 pub use transaction::{Begin, Read, Transaction};
 pub use upcast::{JsonUpcaster, Upcaster};
+pub use viewcodec::{SingleView, ViewCodec, ViewCodecError, ViewDecodeError, decode_json_view};
+pub use views::{DEFAULT_VIEW_SK, ViewPage, ViewRepository};
 
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
