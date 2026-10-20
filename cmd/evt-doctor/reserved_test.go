@@ -46,6 +46,7 @@ func TestReservedStreamIDsPagination(t *testing.T) {
 			reservedItem("command-outcome#legacy", "0"),
 			reservedItem("SYSTEM#FEATURES", "0", "version"),
 			reservedItem("SYSTEM#REBUILD", "0", "owner", "leaseExpiresAt"),
+			reservedItem("SYSTEM#REBUILD", "0", "forceReleased"),
 			reservedItem("SYSTEM#REBUILD#GENERATION", "0", "value"),
 			reservedItem("command-outcome#engine", "1", "status"),
 			{"pk": &types.AttributeValueMemberN{Value: "1"}},
@@ -108,6 +109,7 @@ func TestReservedStreamIDsEngineCollisions(t *testing.T) {
 	}{
 		{"SYSTEM#FEATURES", "0", []string{"version"}},
 		{"SYSTEM#REBUILD", "0", []string{"owner", "leaseExpiresAt"}},
+		{"SYSTEM#REBUILD", "0", []string{"forceReleased"}},
 		{"SYSTEM#REBUILD#GENERATION", "0", []string{"value"}},
 		{"command-outcome#command", "1", []string{"status"}},
 	}

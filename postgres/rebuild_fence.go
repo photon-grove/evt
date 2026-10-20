@@ -66,9 +66,11 @@ func rebuildInProgress() error {
 }
 
 // assertNoRebuildLock is the commit-time rebuild-lock check (C10): after taking the shared
-// advisory lock it asserts that the lock row is absent, an expired row included. A store whose
-// schema predates the fence has no lock relation, and nobody can have taken the lock: the
-// assertion passes, and the probe is not repeated once the relation has been seen.
+// advisory lock it asserts that the generation is settled — no lock row exists, an expired row
+// included, and the generation is even, so a force-release no rebuild has finished since refuses
+// the commit too. A store whose schema predates the fence has no lock relation, and nobody can
+// have taken the lock: the assertion passes, and the probe is not repeated once the relation has
+// been seen.
 func (repo *Repository) assertNoRebuildLock(ctx context.Context, tx pgx.Tx) error {
 	query := fmt.Sprintf("SELECT pg_advisory_xact_lock_shared(%d, hashtext($1))", engineRowLockClass)
 	if _, err := tx.Exec(ctx, query, repo.rebuildAdvisoryKey()); err != nil {
@@ -88,10 +90,13 @@ func (repo *Repository) assertNoRebuildLock(ctx context.Context, tx pgx.Tx) erro
 		repo.rebuildReady.Store(true)
 	}
 
+	// The schema DDL creates the generation relation with the lock relation, so seeing one is
+	// seeing both.
 	var held bool
-	if err := tx.QueryRow(ctx,
-		fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %s WHERE id = 0)`, repo.rebuildLockTable()),
-	).Scan(&held); err != nil {
+	if err := tx.QueryRow(ctx, fmt.Sprintf(
+		`SELECT EXISTS (SELECT 1 FROM %s WHERE id = 0) OR EXISTS (SELECT 1 FROM %s WHERE id = 0 AND value %% 2 <> 0)`,
+		repo.rebuildLockTable(), repo.rebuildGenerationTable(),
+	)).Scan(&held); err != nil {
 		return fmt.Errorf("postgres: reading the rebuild lock: %w", err)
 	}
 
@@ -388,7 +393,8 @@ func (f *rebuildFence) End(ctx context.Context, lease evt.RebuildLease) (evt.Reb
 	return f.release(ctx, lease.Owner, &lease.Generation, 1, false)
 }
 
-// ForceRelease deletes the named owner's lock and leaves the generation odd and flagged.
+// ForceRelease deletes the named owner's lock and leaves the generation odd and flagged, so
+// commits stay refused (the commit assertion reads the generation too) until a rebuild ends.
 func (f *rebuildFence) ForceRelease(ctx context.Context, owner string) (evt.RebuildGeneration, error) {
 	return f.release(ctx, owner, nil, 2, true)
 }

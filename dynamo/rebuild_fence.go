@@ -30,6 +30,7 @@ const (
 	rebuildOwnerAlias     = "#owner"
 	rebuildValueAlias     = "#value"
 	rebuildNoLockHeld     = "attribute_not_exists(pk)"
+	rebuildAcquireLock    = "attribute_not_exists(pk) OR forceReleased = :true"
 	rebuildAcquireUpdate  = "SET #value = if_not_exists(#value, :zero) + :increment"
 	rebuildAcquireCond    = "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)"
 	rebuildTakeoverCond   = "leaseExpiresAt < :now AND #owner = :observedOwner"
@@ -78,8 +79,9 @@ func rebuildValueNames() map[string]string {
 }
 
 // rebuildLockCheck is the commit-time rebuild-lock check, the second action of every commit
-// (storage spec, Writes): a ConditionCheck that fails whenever a lock row exists, an expired one
-// included. It carries no expression names or values.
+// (storage spec, Writes): a ConditionCheck that fails whenever a lock item exists — a held lock,
+// an expired one included, or the force-released item a force-release leaves in its place — that
+// is, whenever the generation is unsettled. It carries no expression names or values.
 func (repo *Repository) rebuildLockCheck() types.TransactWriteItem {
 	return types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
 		TableName:           &repo.EventsTable,
@@ -155,8 +157,19 @@ func generationFromItem(item map[string]types.AttributeValue) (evt.RebuildGenera
 	return evt.RebuildGeneration{Value: value, ForceReleased: forced}, nil
 }
 
+// lockFromItem decodes the lock item. No item and the force-released item (no owner, flagged
+// forceReleased) are both no lock.
 func lockFromItem(item map[string]types.AttributeValue) (*evt.RebuildLock, error) {
 	if len(item) == 0 {
+		return nil, nil
+	}
+
+	if attr, present := item[rebuildForcedAttr]; present {
+		flag, isBool := attr.(*types.AttributeValueMemberBOOL)
+		if !isBool || !flag.Value {
+			return nil, errors.New("rebuild fence: the lock item's forceReleased is not true")
+		}
+
 		return nil, nil
 	}
 
@@ -196,6 +209,19 @@ func (f *rebuildFence) State(ctx context.Context) (evt.RebuildState, error) {
 	}
 
 	return evt.RebuildState{Generation: generation, Lock: lock}, nil
+}
+
+// forceReleasedLockItem is the lock item a force-release leaves in place of the lock: no owner and
+// no lease, so no lease-bound condition holds on it, but present, so every commit's lock check
+// keeps failing until a rebuild acquires from it and ends.
+func forceReleasedLockItem() map[string]types.AttributeValue {
+	key := rebuildLockKey()
+
+	return map[string]types.AttributeValue{
+		"pk":              key["pk"],
+		"sk":              key["sk"],
+		rebuildForcedAttr: &types.AttributeValueMemberBOOL{Value: true},
+	}
 }
 
 // lockItem is the full lock item an acquire or a takeover puts.
@@ -316,11 +342,16 @@ func (f *rebuildFence) beginItems(
 		}
 	}
 
+	// The lock put replaces the item a force-release left; it never matches a held lock, which
+	// carries no forceReleased attribute.
 	return []types.TransactWriteItem{
 		{Put: &types.Put{
 			TableName:           &f.repo.EventsTable,
 			Item:                lockItem(owner, generation, expiry),
-			ConditionExpression: aws.String(rebuildNoLockHeld),
+			ConditionExpression: aws.String(rebuildAcquireLock),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":true": &types.AttributeValueMemberBOOL{Value: true},
+			},
 		}},
 		{Update: &types.Update{
 			TableName:                &f.repo.EventsTable,
@@ -403,7 +434,8 @@ func (f *rebuildFence) End(ctx context.Context, lease evt.RebuildLease) (evt.Reb
 	return evt.RebuildGeneration{Value: lease.Generation + 1}, nil
 }
 
-// ForceRelease deletes the named owner's lock and leaves the generation odd and flagged.
+// ForceRelease replaces the named owner's lock with the force-released item and leaves the
+// generation odd and flagged: the lease is lost, and commits stay refused until a rebuild ends.
 func (f *rebuildFence) ForceRelease(ctx context.Context, owner string) (evt.RebuildGeneration, error) {
 	if err := evt.CheckRebuildOwner(owner); err != nil {
 		return evt.RebuildGeneration{}, err
@@ -439,8 +471,9 @@ func (f *rebuildFence) heldGeneration(ctx context.Context, owner string) (evt.Re
 	return generation, nil
 }
 
-// release runs a release's or a force-release's transaction: delete the owner's lock row and bump
-// the generation from the odd value observed.
+// release runs a release's or a force-release's transaction: delete the owner's lock row (a
+// release) or replace it with the force-released item (a force-release), and bump the generation
+// from the odd value observed.
 func (f *rebuildFence) release(
 	ctx context.Context,
 	owner, lockCondition string,
@@ -464,15 +497,27 @@ func (f *rebuildFence) release(
 		values[":true"] = &types.AttributeValueMemberBOOL{Value: true}
 	}
 
+	lock := types.TransactWriteItem{Delete: &types.Delete{
+		TableName:                 &f.repo.EventsTable,
+		Key:                       rebuildLockKey(),
+		ConditionExpression:       aws.String(lockCondition),
+		ExpressionAttributeNames:  lockNames,
+		ExpressionAttributeValues: lockValues,
+	}}
+
+	if forced {
+		lock = types.TransactWriteItem{Put: &types.Put{
+			TableName:                 &f.repo.EventsTable,
+			Item:                      forceReleasedLockItem(),
+			ConditionExpression:       aws.String(lockCondition),
+			ExpressionAttributeNames:  lockNames,
+			ExpressionAttributeValues: lockValues,
+		}}
+	}
+
 	_, err := f.repo.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: []types.TransactWriteItem{
-			{Delete: &types.Delete{
-				TableName:                 &f.repo.EventsTable,
-				Key:                       rebuildLockKey(),
-				ConditionExpression:       aws.String(lockCondition),
-				ExpressionAttributeNames:  lockNames,
-				ExpressionAttributeValues: lockValues,
-			}},
+			lock,
 			{Update: &types.Update{
 				TableName:                 &f.repo.EventsTable,
 				Key:                       rebuildGenerationKey(),

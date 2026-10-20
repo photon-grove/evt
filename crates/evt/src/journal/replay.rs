@@ -133,8 +133,11 @@ pub async fn rebuild<'a, F: RebuildFence>(
 /// generation for readers. A lock another rebuild holds is [`Error::RebuildLockHeld`].
 ///
 /// If the rebuild fails the lock is **kept**: the derived rows may be half-written, so commits stay
-/// refused and readers stay fenced until the lease lapses and a retry takes it over, or an operator
-/// force-releases it. The lease is not renewed; use [`rebuild`] and
+/// refused and readers stay fenced until the lease lapses and a retry takes it over. An operator
+/// may force-release it instead, but that does not let commits through: the generation stays
+/// unsettled, and every commit (a journaled one would allocate positions from counters the failed
+/// rebuild may have cleared) is refused with [`Error::RebuildInProgress`] until a later rebuild,
+/// this function run again, ends. The lease is not renewed; use [`rebuild`] and
 /// [`renew_rebuild`](RebuildFence::renew_rebuild) for a long run.
 pub async fn rebuild_with_lock<'a, F: RebuildFence>(
     fence: &F,

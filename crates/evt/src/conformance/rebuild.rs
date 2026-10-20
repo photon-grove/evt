@@ -163,6 +163,10 @@ where
         }
 
         case!(
+            "a settled store accepts commits and they never write the fence",
+            settled_store(&env)
+        );
+        case!(
             "begin, renew, and end move the lock and the generation",
             lifecycle(&env)
         );
@@ -171,7 +175,7 @@ where
             takeover(&env)
         );
         case!(
-            "a force-release unblocks commits and leaves readers fenced",
+            "a force-release ends the lease but leaves commits refused and readers fenced",
             force_release(&env)
         );
         case!(
@@ -185,6 +189,10 @@ where
         case!(
             "every commit is refused while a rebuild holds the lock",
             refuses_commits(&env)
+        );
+        case!(
+            "a failed, force-released rebuild refuses commits until a rebuild ends",
+            force_released_refuses_commits(&env, self.views.as_ref())
         );
         case!(
             "the lock check outranks every failure but the marker",
@@ -559,11 +567,12 @@ async fn force_release<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseRe
     ensure_eq!(env.generation().await?, forced, "the stored generation");
     ensure!(
         !repo.rebuild_state().await?.in_progress(),
-        "the lock row is gone"
+        "no rebuild holds the lock"
     );
 
-    // Commits resume at once, while readers stay fenced.
-    env.commit("resumed").await?;
+    // Readers stay fenced and commits stay refused: the derived state the released rebuild left
+    // may be half-written.
+    refused(env.commit("force-released").await, "a commit after it")?;
     expect_err(
         observe_rebuild_epoch(repo).await,
         "a reader after a force-release",
@@ -610,6 +619,7 @@ async fn force_release<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseRe
         before.value + 6,
         "readers trust derived state again"
     );
+    env.commit("force-released").await?;
 
     // A later rebuild can be force-released again.
     env.begin("d", 3600).await?;
@@ -933,12 +943,176 @@ async fn refuses_commits<R: Repository + RebuildFence>(env: &Env<'_, R>) -> Case
     plain.commit(repo, plain.events(1..=1), None).await?;
     ensure_eq!(repo.events(&plain.id).await?.len(), 1, "the plain stream");
 
-    // An expired lock still refuses commits; a force-release lets them through.
+    // An expired lock still refuses commits, and so does a force-release of it: only a rebuild
+    // that ends settles the generation.
     env.begin("short", 1).await?;
     env.clock.advance(5);
     refused(env.commit("expired-lock").await, "an expired lock")?;
     repo.force_release_rebuild(&env.owner("short")).await?;
-    env.commit("after-force-release").await?;
+    refused(
+        env.commit("after-force-release").await,
+        "a commit after the force-release",
+    )?;
+
+    Ok(())
+}
+
+/// A settled generation accepts commits, a store that never ran a rebuild included: the commit's
+/// lock check passes against the absent fence rows, and the commit writes neither of them.
+async fn settled_store<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult {
+    let before = env.repo.rebuild_state().await?;
+    ensure!(before.generation.is_settled(), "{before:?}");
+    ensure!(before.lock.is_none(), "{before:?}");
+
+    env.commit("settled").await?;
+    ensure_eq!(
+        env.repo.rebuild_state().await?,
+        before,
+        "a commit never writes the fence"
+    );
+
+    Ok(())
+}
+
+/// A rebuild that fails after its first write leaves derived state half-written. The operator
+/// force-releases it, and every commit — a plain one, one with commit-wide views, an outcome-only
+/// one — is still refused and writes nothing, so nothing derived from the half-written state (a
+/// journal position allocated from a wiped counter, say) can be committed. A rebuild that then
+/// runs to its end settles the generation, and the same commits succeed.
+async fn force_released_refuses_commits<R, T>(env: &Env<'_, R>, views: Option<&T>) -> CaseResult
+where
+    R: Repository + RebuildFence,
+    T: CommitViewTarget<R>,
+{
+    let repo = env.repo;
+    let pk = format!("{}#half-built", env.ns);
+    let put = |sk: &str| {
+        ProjectedView::new(
+            "rebuild",
+            0,
+            0,
+            ViewOperation::put(pk.clone(), sk, "owner", "test", "{}"),
+        )
+    };
+    let row = |pk: String, sk: &'static str| async move {
+        match views {
+            Some(views) => views
+                .row(&pk, sk)
+                .await
+                .map_err(|err| Failure(err.to_string())),
+            None => Ok(None),
+        }
+    };
+
+    // The rebuild writes its first batch, then fails and never ends.
+    env.begin("failed", 3600).await?;
+    if views.is_some() {
+        repo.write_rebuild_views(&env.lease("failed"), &[put("first")])
+            .await?;
+    }
+
+    let forced = repo.force_release_rebuild(&env.owner("failed")).await?;
+    ensure!(
+        forced.force_released && !forced.is_settled(),
+        "odd and flagged: {forced:?}"
+    );
+    ensure!(
+        repo.rebuild_state().await?.lock.is_none(),
+        "no rebuild holds the lock"
+    );
+
+    // Every commit is refused with the error a held lock gives, and writes nothing.
+    let plain = Stream::new(&env.ns, "released-plain", "ledger");
+    refused(
+        plain.commit(repo, plain.events(1..=1), None).await,
+        "a plain commit",
+    )?;
+
+    let viewed = Stream::new(&env.ns, "released-viewed", "ledger");
+    let live_pk = format!("{}#released-live", env.ns);
+    let live = || {
+        TransactionCommit::new(vec![write(&viewed, 1..=1)]).with_views([ProjectedView::new(
+            "live",
+            0,
+            0,
+            ViewOperation::put(live_pk.clone(), "row", viewed.id.as_str(), "ledger", "{}"),
+        )])
+    };
+    if views.is_some() {
+        refused(repo.commit_transaction(live()).await, "a commit with views")?;
+        ensure!(
+            row(live_pk.clone(), "row").await?.is_none(),
+            "the refused commit wrote no view row"
+        );
+    }
+
+    let only = CommandId::new(format!("{}-released-only", env.ns));
+    let outcome_only = || {
+        TransactionCommit::new(Vec::new()).with_outcome(Outcome::accepted(only.clone(), "digest"))
+    };
+    refused(
+        repo.commit_transaction(outcome_only()).await,
+        "an outcome-only commit",
+    )?;
+    ensure!(
+        repo.outcome(&only).await?.is_none(),
+        "a refused outcome-only commit records nothing"
+    );
+    for id in [&plain.id, &viewed.id] {
+        ensure!(
+            repo.events(id).await?.is_empty(),
+            "a refused commit wrote nothing to {id}"
+        );
+    }
+
+    // The failed worker writes nothing more: its lease is gone.
+    if views.is_some() {
+        lease_lost(
+            repo.write_rebuild_views(&env.lease("failed"), &[put("second")])
+                .await,
+            "the failed worker's next batch",
+        )?;
+        ensure!(
+            row(pk.clone(), "second").await?.is_none(),
+            "the lost lease wrote nothing"
+        );
+    }
+
+    // A new rebuild runs to its end: commits stay refused while it runs, and resume once it ends.
+    env.begin("recovery", 3600).await?;
+    refused(
+        plain.commit(repo, plain.events(1..=1), None).await,
+        "a commit during the recovery",
+    )?;
+    if views.is_some() {
+        repo.write_rebuild_views(&env.lease("recovery"), &[put("first"), put("second")])
+            .await?;
+    }
+    let settled = env.end("recovery").await?;
+    ensure!(
+        settled.is_settled() && !settled.force_released,
+        "settled: {settled:?}"
+    );
+
+    plain.commit(repo, plain.events(1..=1), None).await?;
+    ensure_eq!(repo.events(&plain.id).await?.len(), 1, "the plain stream");
+    if views.is_some() {
+        repo.commit_transaction(live()).await?;
+        ensure_eq!(repo.events(&viewed.id).await?.len(), 1, "the viewed stream");
+        ensure!(
+            row(live_pk.clone(), "row").await?.is_some(),
+            "the commit's view row"
+        );
+        ensure!(
+            row(pk.clone(), "second").await?.is_some(),
+            "the recovery's view row"
+        );
+    }
+    repo.commit_transaction(outcome_only()).await?;
+    ensure!(
+        repo.outcome(&only).await?.is_some(),
+        "the outcome is recorded once the rebuild ends"
+    );
 
     Ok(())
 }

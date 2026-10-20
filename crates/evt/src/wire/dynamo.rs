@@ -32,7 +32,8 @@
 //! The rebuild fence (v0.9, C10) is two engine items in the reserved `SYSTEM#` namespace
 //! ([`rebuild_lock_item`], [`rebuild_generation_item`]): the lock `(SYSTEM#REBUILD, 0)` with
 //! `owner`, `generation` (the fencing token: the odd generation its acquire or takeover produced),
-//! and `leaseExpiresAt` (epoch seconds), and the generation
+//! and `leaseExpiresAt` (epoch seconds) — or, after a force-release, only `forceReleased = true`
+//! ([`rebuild_force_released_item`]) — and the generation
 //! `(SYSTEM#REBUILD#GENERATION, 0)` with `value` and an optional `forceReleased` flag.
 //!
 //! Items are modeled with [`AttributeValue`], whose serde encoding is DynamoDB JSON
@@ -53,6 +54,7 @@ use crate::outcome::{Outcome, OutcomeStatus, Rejection};
 use crate::projection::ViewRow;
 use crate::rebuild::{
     REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildGeneration, RebuildLock,
+    RebuildState,
 };
 
 /// The sort key of the inline snapshot item.
@@ -164,8 +166,9 @@ pub fn delete_condition(condition: crate::projection::ViewCondition) -> &'static
 /// `attribute_not_exists(pk)` instead.
 pub const MARKER_CONDITION: &str = "attribute_not_exists(pk) OR version = :v";
 
-/// Condition for the rebuild-lock check every v0.9 commit carries (C10): no rebuild holds the
-/// lock, an expired one included. It binds no names or values.
+/// Condition for the rebuild-lock check every v0.9 commit carries (C10): no lock item exists, so
+/// the generation is settled — no rebuild holds the lock (an expired one included), and no
+/// force-release left its item in place. It binds no names or values.
 pub const REBUILD_LOCK_CHECK_CONDITION: &str = "attribute_not_exists(pk)";
 
 /// The expression-attribute-name placeholder of the lock row's `owner`, a reserved word.
@@ -178,8 +181,10 @@ pub const REBUILD_VALUE_NAME: &str = "#value";
 /// the lease that holds the lock.
 pub const REBUILD_GENERATION_NAME: &str = "#generation";
 
-/// The acquire's lock put condition: no lock row exists.
-pub const REBUILD_ACQUIRE_LOCK_CONDITION: &str = "attribute_not_exists(pk)";
+/// The acquire's lock put condition: no lock item exists, or only the one a force-release left
+/// (`:true` binds `true`). A held lock never carries `forceReleased`.
+pub const REBUILD_ACQUIRE_LOCK_CONDITION: &str =
+    "attribute_not_exists(pk) OR forceReleased = :true";
 
 /// The acquire's generation update.
 pub const REBUILD_ACQUIRE_UPDATE: &str = "SET #value = if_not_exists(#value, :zero) + :increment";
@@ -210,7 +215,7 @@ pub const REBUILD_RELEASE_CONDITION: &str = "#owner = :me AND #generation = :gen
 /// The release's generation update: back to settled, the force-release flag cleared.
 pub const REBUILD_RELEASE_UPDATE: &str = "SET #value = #value + :one REMOVE forceReleased";
 
-/// The force-release's lock delete condition.
+/// The force-release's lock put condition: the named owner holds the lock it replaces.
 pub const REBUILD_FORCE_RELEASE_CONDITION: &str = "#owner = :requestedOwner";
 
 /// The force-release's generation update: odd to odd, flagged.
@@ -357,13 +362,54 @@ pub fn rebuild_lock_item(lock: &RebuildLock) -> Item {
     item
 }
 
-/// Decodes the rebuild-lock item.
+/// Encodes the lock item a force-release puts in place of the lock: `pk`, `sk`, and
+/// `forceReleased = true`, with no owner or lease, so no lease-bound condition holds on it. While
+/// it exists every commit's lock check fails; an acquire replaces it.
+pub fn rebuild_force_released_item() -> Item {
+    let mut item = rebuild_lock_key();
+    item.insert("forceReleased".into(), AttributeValue::Bool(true));
+
+    item
+}
+
+/// Decodes a rebuild-lock item that holds a lock. The item a force-release leaves holds none and is
+/// [`Error::InvalidRecord`] here; [`rebuild_lock_state_from_item`] decodes either.
 pub fn rebuild_lock_from_item(item: &Item) -> Result<RebuildLock, Error> {
-    Ok(RebuildLock {
+    rebuild_lock_state_from_item(item)?.ok_or_else(|| {
+        Error::InvalidRecord("rebuild lock: the item a force-release leaves holds no lock".into())
+    })
+}
+
+/// Decodes the rebuild-lock item, whatever it holds: `None` for the item a force-release leaves,
+/// which holds no lock.
+pub fn rebuild_lock_state_from_item(item: &Item) -> Result<Option<RebuildLock>, Error> {
+    match item.get("forceReleased") {
+        None => {}
+        Some(AttributeValue::Bool(true)) => return Ok(None),
+        Some(_) => {
+            return Err(Error::InvalidRecord(
+                "rebuild lock: forceReleased is not true".into(),
+            ));
+        }
+    }
+
+    Ok(Some(RebuildLock {
         owner: required_string(item, "owner")?.to_owned(),
         generation: required_number(item, "generation")?,
         lease_expires_at: required_number(item, "leaseExpiresAt")?,
-    })
+    }))
+}
+
+/// The lock item a fence state stores: the lock, the item a force-release leaves while the
+/// generation it left is unsettled, or none.
+pub fn rebuild_lock_item_of(state: &RebuildState) -> Option<Item> {
+    match &state.lock {
+        Some(lock) => Some(rebuild_lock_item(lock)),
+        None if state.generation.force_released && !state.generation.is_settled() => {
+            Some(rebuild_force_released_item())
+        }
+        None => None,
+    }
 }
 
 /// Encodes the rebuild generation item: `forceReleased` is written only when set.
@@ -1209,5 +1255,55 @@ mod tests {
 
         assert_eq!(feature_marker_from_item(&item).unwrap(), manifest);
         assert!(feature_marker_from_item(&Item::new()).is_err());
+    }
+
+    /// The item a force-release leaves decodes as no lock, is what a force-released state
+    /// encodes, and a flag that is not `true` is a corrupt item.
+    #[test]
+    fn the_force_released_lock_item_holds_no_lock() {
+        let released = rebuild_force_released_item();
+        assert_eq!(rebuild_lock_state_from_item(&released).unwrap(), None);
+        assert!(matches!(
+            rebuild_lock_from_item(&released),
+            Err(Error::InvalidRecord(_))
+        ));
+        assert_eq!(
+            rebuild_lock_item_of(&RebuildState {
+                generation: RebuildGeneration {
+                    value: 7,
+                    force_released: true,
+                },
+                lock: None,
+            }),
+            Some(released)
+        );
+        assert_eq!(
+            rebuild_lock_item_of(&RebuildState::default()),
+            None,
+            "a fresh store has no lock item"
+        );
+
+        for flag in [AttributeValue::Bool(false), s("true")] {
+            let mut item = rebuild_lock_key();
+            item.insert("forceReleased".into(), flag);
+            assert!(matches!(
+                rebuild_lock_state_from_item(&item),
+                Err(Error::InvalidRecord(_))
+            ));
+        }
+
+        let lock = RebuildLock {
+            owner: "job".into(),
+            generation: 5,
+            lease_expires_at: 60,
+        };
+        assert_eq!(
+            rebuild_lock_state_from_item(&rebuild_lock_item(&lock)).unwrap(),
+            Some(lock.clone())
+        );
+        assert_eq!(
+            rebuild_lock_from_item(&rebuild_lock_item(&lock)).unwrap(),
+            lock
+        );
     }
 }

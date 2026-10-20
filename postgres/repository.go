@@ -434,8 +434,9 @@ func (repo *Repository) commitInTx(
 		return err
 	}
 
-	// The rebuild-lock assertion (C10): any lock row, an expired one included, refuses the commit,
-	// right after the marker check and before anything is written.
+	// The rebuild-lock assertion (C10): an unsettled generation — any lock row, an expired one
+	// included, or a force-release no rebuild has finished since — refuses the commit, right after
+	// the marker check and before anything is written.
 	if err = repo.assertNoRebuildLock(ctx, tx); err != nil {
 		return err
 	}

@@ -37,8 +37,8 @@ switch {
 case err == nil && len(result.Errors) == 0:
     _, err = fence.End(ctx, lease) // the generation is even again: readers trust the views
 default:
-    // The views may be half-written. Commits may resume, but readers stay fenced until a later
-    // rebuild completes.
+    // The views may be half-written. Releasing the lock lets the next run begin without waiting
+    // for the lease, but readers stay fenced and commits stay refused until a rebuild completes.
     _, _ = fence.ForceRelease(ctx, owner) //nolint:errcheck // best effort; the lease also expires
 }
 ```
@@ -50,8 +50,9 @@ default:
   `fence.WriteViews(ctx, lease, batch)` (at most 99 operations) to have each batch conditioned
   transactionally on the lease: a worker that lost the lock gets `*evt.RebuildLeaseLostError` and
   writes nothing. Writes you make through your own `CommitGroup` are not guarded; a crashed worker's
-  lock simply blocks commits until it expires and is taken over (`Begin` does that) or an operator
-  force-releases it.
+  lock simply blocks commits until it expires and a rebuild that takes it over (`Begin` does that)
+  ends. A force-release does not unblock commits: it leaves the generation unsettled, and every
+  commit is refused with `*evt.RebuildInProgressError` until a later rebuild runs to its end.
 - Refused commits are transient: fence-aware retry waits and tries again, then returns the error,
   and records no outcome, so the same command ID runs once the rebuild is over.
 - **Readers fence a decision against the generation.** A command that decides on a derived view

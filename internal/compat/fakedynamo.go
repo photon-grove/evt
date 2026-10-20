@@ -303,6 +303,10 @@ func conditionHolds(
 		}
 		return flagIs(existing, "forceReleased", values, ":true"), nil
 
+	case rebuildAcquireLockCondition:
+		// attribute_not_exists(pk) OR forceReleased = :true
+		return existing == nil || flagIs(existing, "forceReleased", values, ":true"), nil
+
 	case rebuildTakeoverCondition:
 		// leaseExpiresAt < :now AND #owner = :observedOwner
 		expired, err := is("leaseExpiresAt", ":now", func(have, now int64) bool { return have < now })
@@ -346,10 +350,11 @@ func conditionHolds(
 // The rebuild fence's condition expressions (storage spec, Rebuild Fence), spelled exactly as the
 // DynamoDB repository sends them.
 const (
-	rebuildAcquireCondition  = "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)"
-	rebuildTakeoverCondition = "leaseExpiresAt < :now AND #owner = :observedOwner"
-	rebuildSeenOddCondition  = "#value = :seenOdd"
-	rebuildGuardCondition    = "#owner = :me AND #generation = :generation AND leaseExpiresAt > :now"
+	rebuildAcquireCondition     = "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)"
+	rebuildAcquireLockCondition = "attribute_not_exists(pk) OR forceReleased = :true"
+	rebuildTakeoverCondition    = "leaseExpiresAt < :now AND #owner = :observedOwner"
+	rebuildSeenOddCondition     = "#value = :seenOdd"
+	rebuildGuardCondition       = "#owner = :me AND #generation = :generation AND leaseExpiresAt > :now"
 )
 
 // textIs reports whether a stored string attribute equals an expression value; it is false when the

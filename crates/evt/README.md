@@ -704,8 +704,12 @@ let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().awai
   `end_rebuild`, and `write_rebuild_views` take the lease and act only while the lock names both
   its owner and its token. A worker that lost its lock, including a stale incarnation that reuses
   its owner token after a takeover, gets `Error::RebuildLeaseLost` and writes nothing.
-- `force_release_rebuild` is the operator's escape hatch: commits resume at once, while readers stay
-  fenced (`Error::RebuildUnavailable`) until a later rebuild begins and ends.
+- `force_release_rebuild` is the operator's escape hatch for a wedged worker: it ends the lease at
+  once, so a new rebuild can begin, but leaves the generation unsettled, so readers stay fenced
+  (`Error::RebuildUnavailable`) and every commit is still refused (`Error::RebuildInProgress`) until
+  a later rebuild begins and ends. A failed rebuild may have cleared journal counters, and a
+  journaled commit would otherwise allocate positions from them. To resume writes, run the rebuild
+  again to its end (for the journal, `rebuild_with_lock`).
 - A command handler that reads a view under the epoch check returns `RebuildUnavailable` or
   `RebuildEpochChanged` as its own error: the engine returns it at once and records nothing.
 - Leases are whole seconds read from the repository's clock; `with_clock` injects one in tests.
