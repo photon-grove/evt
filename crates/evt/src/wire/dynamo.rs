@@ -372,8 +372,17 @@ pub fn rebuild_force_released_item() -> Item {
     item
 }
 
-/// Decodes the rebuild-lock item: `None` for the item a force-release leaves, which holds no lock.
-pub fn rebuild_lock_from_item(item: &Item) -> Result<Option<RebuildLock>, Error> {
+/// Decodes a rebuild-lock item that holds a lock. The item a force-release leaves holds none and is
+/// [`Error::InvalidRecord`] here; [`rebuild_lock_state_from_item`] decodes either.
+pub fn rebuild_lock_from_item(item: &Item) -> Result<RebuildLock, Error> {
+    rebuild_lock_state_from_item(item)?.ok_or_else(|| {
+        Error::InvalidRecord("rebuild lock: the item a force-release leaves holds no lock".into())
+    })
+}
+
+/// Decodes the rebuild-lock item, whatever it holds: `None` for the item a force-release leaves,
+/// which holds no lock.
+pub fn rebuild_lock_state_from_item(item: &Item) -> Result<Option<RebuildLock>, Error> {
     match item.get("forceReleased") {
         None => {}
         Some(AttributeValue::Bool(true)) => return Ok(None),
@@ -1253,7 +1262,11 @@ mod tests {
     #[test]
     fn the_force_released_lock_item_holds_no_lock() {
         let released = rebuild_force_released_item();
-        assert_eq!(rebuild_lock_from_item(&released).unwrap(), None);
+        assert_eq!(rebuild_lock_state_from_item(&released).unwrap(), None);
+        assert!(matches!(
+            rebuild_lock_from_item(&released),
+            Err(Error::InvalidRecord(_))
+        ));
         assert_eq!(
             rebuild_lock_item_of(&RebuildState {
                 generation: RebuildGeneration {
@@ -1274,7 +1287,7 @@ mod tests {
             let mut item = rebuild_lock_key();
             item.insert("forceReleased".into(), flag);
             assert!(matches!(
-                rebuild_lock_from_item(&item),
+                rebuild_lock_state_from_item(&item),
                 Err(Error::InvalidRecord(_))
             ));
         }
@@ -1285,8 +1298,12 @@ mod tests {
             lease_expires_at: 60,
         };
         assert_eq!(
+            rebuild_lock_state_from_item(&rebuild_lock_item(&lock)).unwrap(),
+            Some(lock.clone())
+        );
+        assert_eq!(
             rebuild_lock_from_item(&rebuild_lock_item(&lock)).unwrap(),
-            Some(lock)
+            lock
         );
     }
 }

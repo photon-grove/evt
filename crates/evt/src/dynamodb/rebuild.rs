@@ -312,7 +312,7 @@ impl RebuildFence for DynamoRepository {
         let lock = self
             .rebuild_item(wire::rebuild_lock_key())
             .await?
-            .map(|item| wire::rebuild_lock_from_item(&item))
+            .map(|item| wire::rebuild_lock_state_from_item(&item))
             .transpose()?
             .flatten();
 

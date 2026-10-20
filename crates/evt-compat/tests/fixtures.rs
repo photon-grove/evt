@@ -1028,7 +1028,7 @@ async fn rebuild_fence_vectors_match_go() {
                 .map(|item| dynamo::rebuild_generation_from_item(&item).unwrap())
                 .unwrap_or_default(),
             lock: item(&vector["before"]["lock"])
-                .and_then(|item| dynamo::rebuild_lock_from_item(&item).unwrap()),
+                .and_then(|item| dynamo::rebuild_lock_state_from_item(&item).unwrap()),
         };
         assert_eq!(
             items(&before),
