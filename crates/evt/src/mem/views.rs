@@ -1,5 +1,6 @@
 //! [`ViewRepository`] for the in-memory repository, over the same rows commit-wide view operations
-//! write ([`MemRepository::view`](super::MemRepository::view)).
+//! write ([`MemRepository::view`](super::MemRepository::view)). Every read, the entity-type
+//! listing included, sees every commit that has returned: the rows live behind one lock.
 
 use std::ops::Bound;
 

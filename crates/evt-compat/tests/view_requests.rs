@@ -141,7 +141,7 @@ async fn a_delete_sends_the_view_key_for_an_empty_sort_key() {
 }
 
 #[tokio::test]
-async fn queries_set_the_expressions_the_limit_and_no_consistent_read() {
+async fn queries_set_the_expressions_the_limit_and_consistency() {
     let reply = json!({
         "Items": [item("p", "a")],
         "LastEvaluatedKey": {"pk": {"S": "p"}, "sk": {"S": "a"}},
@@ -170,13 +170,55 @@ async fn queries_set_the_expressions_the_limit_and_no_consistent_read() {
     let first = &requests[0].1;
     assert_eq!(first["KeyConditionExpression"], "pk = :pk");
     assert_eq!(first["Limit"], 1);
-    assert!(first.get("ConsistentRead").is_none());
+    // A partition page reads the base table strongly, so it sees a commit that just returned.
+    assert_eq!(first["ConsistentRead"], true);
     assert!(first.get("IndexName").is_none());
 
     let second = &requests[1].1;
     assert_eq!(second["IndexName"], "entityType-index");
     assert_eq!(second["KeyConditionExpression"], "entityType = :entityType");
     assert!(second.get("Limit").is_none());
+    // DynamoDB refuses ConsistentRead on a global secondary index.
+    assert!(second.get("ConsistentRead").is_none());
+}
+
+#[tokio::test]
+async fn every_partition_page_is_consistent_and_an_opt_out_reads_eventually() {
+    let reply = json!({
+        "Items": [item("p", "a")],
+        "LastEvaluatedKey": {"pk": {"S": "p"}, "sk": {"S": "a"}},
+    });
+    let server = canned(vec![
+        reply,
+        json!({"Items": [item("p", "b")]}),
+        json!({"Items": []}),
+        json!({}),
+    ])
+    .await;
+
+    // The buffered listing pages through list_views_by_pk_paged; every page is consistent.
+    let rows = server.repository.list_views_by_pk("p").await.unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let eventual = server.repository.clone().with_consistent_read(false);
+    eventual
+        .list_views_by_pk_paged("p", None, None)
+        .await
+        .unwrap();
+    // Point reads stay strong whatever the setting.
+    eventual.get_view("p").await.unwrap();
+
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 4);
+    for (target, body) in &requests[..2] {
+        assert_eq!(target, "dynamodb_20120810.query");
+        assert_eq!(body["ConsistentRead"], true);
+    }
+    assert_eq!(requests[1].1["ExclusiveStartKey"]["sk"], json!({"S": "a"}));
+    assert_eq!(requests[2].0, "dynamodb_20120810.query");
+    assert_eq!(requests[2].1["ConsistentRead"], false);
+    assert_eq!(requests[3].0, "dynamodb_20120810.getitem");
+    assert_eq!(requests[3].1["ConsistentRead"], true);
 }
 
 #[tokio::test]

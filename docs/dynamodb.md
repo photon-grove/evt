@@ -216,6 +216,18 @@ share one codec — `viewstore.New[T]` for arbitrary pk/sk, or `viewstore.NewSin
 for the common "one row per entity" pattern. See
 [Projections and rebuilds](projections.md).
 
+**Read consistency.** `dynamo.ViewRepository` reads the base table strongly consistently:
+`GetView` and `BatchGetViews` always, and the partition listings (`ListViewsByPK`,
+`ListViewsByPKPaged`, `ListViewsByPKEach`) by default. A handler that commits and then reads the
+rows its commit wrote, to return them or to validate the next step, sees them. A strongly
+consistent read costs twice the read capacity of an eventually consistent one (one read unit per
+4 KB instead of per 8 KB); a listing that can tolerate a stale page can opt out with
+`WithConsistentRead(false)` on the `*dynamo.ViewRepository` (`NewViewRepository` returns the
+interface, so type-assert it). Point reads stay strong either way. The entity-type listings read
+the `entityType-index` global secondary index, which DynamoDB can only read eventually
+consistently, so a row a commit just wrote can be missing from them for a moment. Rust's
+`DynamoViewRepository` behaves the same (`with_consistent_read`).
+
 ## Entity-heads table
 
 *Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K4):* the heads

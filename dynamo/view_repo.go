@@ -16,12 +16,20 @@ import (
 )
 
 // ViewRepository provides Dynamo-backed views.
+//
+// Reads of the base table are strongly consistent by default: GetView, BatchGetViews and
+// BatchGetViewsAtSK always, and the partition listings (ListViewsByPK, ListViewsByPKPaged,
+// ListViewsByPKEach) unless WithConsistentRead(false) opts them out. A row a commit just wrote is
+// therefore seen by the next read of its key or partition. The entity-type listings read the
+// entityType-index global secondary index, which DynamoDB can only read eventually consistently,
+// so they can lag behind a commit.
 type ViewRepository struct {
 	ViewsTable string
 
-	client  Client
-	encoder *attributevalue.Encoder
-	decoder *attributevalue.Decoder
+	client         Client
+	encoder        *attributevalue.Encoder
+	decoder        *attributevalue.Decoder
+	consistentRead bool // partition listings; default true
 }
 
 const entityTypeIndexName = "entityType-index"
@@ -49,7 +57,23 @@ func NewViewRepository(client Client, viewsTable string) evt.ViewRepository {
 	decoder := attributevalue.NewDecoder(func(opts *attributevalue.DecoderOptions) {
 		opts.TagKey = tagKey
 	})
-	return &ViewRepository{ViewsTable: viewsTable, client: client, encoder: encoder, decoder: decoder}
+	return &ViewRepository{
+		ViewsTable: viewsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true,
+	}
+}
+
+// WithConsistentRead returns a shallow copy of the repository with the consistent-read setting of
+// its partition listings (ListViewsByPK, ListViewsByPKPaged, ListViewsByPKEach) updated. They are
+// strongly consistent by default; false reads them eventually consistently, at half the read
+// capacity, and a listing may then miss a row a commit just wrote. Point reads stay strongly
+// consistent and entity-type listings stay eventually consistent either way. NewViewRepository
+// returns an evt.ViewRepository, so type-assert it to *ViewRepository to call this. The original
+// repository is not modified.
+func (repo *ViewRepository) WithConsistentRead(consistent bool) *ViewRepository {
+	r := *repo
+	r.consistentRead = consistent
+
+	return &r
 }
 
 // View is the Dynamo serialization for a materialized view.
@@ -335,7 +359,8 @@ func (repo *ViewRepository) ListViewsByEntityType(ctx context.Context, entityTyp
 }
 
 // ListViewsByEntityTypeEach streams views for the provided entity type via the entityType GSI,
-// invoking fn per view without buffering the whole result set.
+// invoking fn per view without buffering the whole result set. A GSI read is eventually
+// consistent, so a row a commit just wrote may be missing.
 func (repo *ViewRepository) ListViewsByEntityTypeEach(ctx context.Context, entityType evt.EntityType, fn func(*evt.SerializedView) error) error {
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
@@ -349,7 +374,8 @@ func (repo *ViewRepository) ListViewsByEntityTypeEach(ctx context.Context, entit
 	return repo.eachViewPage(ctx, &input, fn)
 }
 
-// ListViewsByEntityTypePaged queries by entity type with cursor-based pagination.
+// ListViewsByEntityTypePaged queries by entity type with cursor-based pagination. It reads the
+// entityType GSI, so it is eventually consistent.
 func (repo *ViewRepository) ListViewsByEntityTypePaged(ctx context.Context, entityType evt.EntityType, limit int, cursor string) (*evt.PagedResult, error) {
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
@@ -438,7 +464,7 @@ func decodeCursor(cursor string) (map[string]types.AttributeValue, error) {
 // Used for composite key tables where pk identifies a collection (e.g., USER#<id>#teams).
 //
 // It buffers the full result set; for partition keys with many rows use ListViewsByPKPaged or
-// ListViewsByPKEach instead.
+// ListViewsByPKEach instead. It is strongly consistent unless WithConsistentRead(false).
 func (repo *ViewRepository) ListViewsByPK(ctx context.Context, pk string) ([]*evt.SerializedView, error) {
 	views := make([]*evt.SerializedView, 0)
 
@@ -454,10 +480,11 @@ func (repo *ViewRepository) ListViewsByPK(ctx context.Context, pk string) ([]*ev
 }
 
 // ListViewsByPKEach streams views for the given partition key, invoking fn per view without
-// buffering the whole result set.
+// buffering the whole result set. Every page is strongly consistent unless WithConsistentRead(false).
 func (repo *ViewRepository) ListViewsByPKEach(ctx context.Context, pk string, fn func(*evt.SerializedView) error) error {
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
+		ConsistentRead:         aws.Bool(repo.consistentRead),
 		KeyConditionExpression: aws.String("pk = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":pk": &types.AttributeValueMemberS{Value: pk},
@@ -500,10 +527,13 @@ func (repo *ViewRepository) eachViewPage(ctx context.Context, input *dynamodb.Qu
 	return nil
 }
 
-// ListViewsByPKPaged queries one partition key with a bounded result page.
+// ListViewsByPKPaged queries one partition key with a bounded result page. The query is strongly
+// consistent unless WithConsistentRead(false), so a page read straight after a commit sees the rows
+// it wrote.
 func (repo *ViewRepository) ListViewsByPKPaged(ctx context.Context, pk string, limit int, cursor string) (*evt.PagedResult, error) {
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
+		ConsistentRead:         aws.Bool(repo.consistentRead),
 		KeyConditionExpression: aws.String("pk = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":pk": &types.AttributeValueMemberS{Value: pk},

@@ -369,3 +369,82 @@ func Test_ViewRepository_ListViewsByPKEach_Streams(t *testing.T) {
 	require.Equal(t, []string{"a", "b"}, seen)
 	client.AssertExpectations(t)
 }
+
+// Test_ViewRepository_ReadConsistency pins the ConsistentRead each read sends: partition listings
+// read the base table strongly by default (read-your-writes after a commit), the entity-type
+// listings read the GSI, which DynamoDB refuses to read consistently, and WithConsistentRead(false)
+// opts the partition listings out without touching point reads.
+func Test_ViewRepository_ReadConsistency(t *testing.T) {
+	ctx := context.Background()
+	empty := &dynamodb.QueryOutput{}
+
+	record := func(client *dynamomock.Client) *[]*dynamodb.QueryInput {
+		var inputs []*dynamodb.QueryInput
+		client.On("Query", mock.Anything, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				// A request of another type is not recorded, so the length checks below catch it.
+				if input, ok := args.Get(1).(*dynamodb.QueryInput); ok {
+					inputs = append(inputs, input)
+				}
+			}).
+			Return(empty, nil)
+
+		return &inputs
+	}
+
+	noop := func(*evt.SerializedView) error { return nil }
+
+	t.Run("strong by default for partitions, unset for the index", func(t *testing.T) {
+		client := dynamomock.NewClient()
+		inputs := record(client)
+		repo := dynamo.NewViewRepository(client, "views")
+		streamer, ok := repo.(evt.ViewStreamer)
+		require.True(t, ok)
+
+		_, err := repo.ListViewsByPKPaged(ctx, "pk1", 2, "")
+		require.NoError(t, err)
+		_, err = repo.ListViewsByPK(ctx, "pk1")
+		require.NoError(t, err)
+		require.NoError(t, streamer.ListViewsByPKEach(ctx, "pk1", noop))
+		_, err = repo.ListViewsByEntityTypePaged(ctx, "t1", 2, "")
+		require.NoError(t, err)
+		require.NoError(t, streamer.ListViewsByEntityTypeEach(ctx, "t1", noop))
+
+		require.Len(t, *inputs, 5)
+		for _, input := range (*inputs)[:3] {
+			require.Nil(t, input.IndexName)
+			require.Equal(t, aws.Bool(true), input.ConsistentRead)
+		}
+		for _, input := range (*inputs)[3:] {
+			require.Equal(t, "entityType-index", aws.ToString(input.IndexName))
+			require.Nil(t, input.ConsistentRead)
+		}
+	})
+
+	t.Run("WithConsistentRead(false) opts the partition listings out", func(t *testing.T) {
+		client := dynamomock.NewClient()
+		inputs := record(client)
+		base, ok := dynamo.NewViewRepository(client, "views").(*dynamo.ViewRepository)
+		require.True(t, ok)
+		eventual := base.WithConsistentRead(false)
+
+		_, err := eventual.ListViewsByPKPaged(ctx, "pk1", 0, "")
+		require.NoError(t, err)
+		require.NoError(t, eventual.ListViewsByPKEach(ctx, "pk1", noop))
+		_, err = base.ListViewsByPKPaged(ctx, "pk1", 0, "")
+		require.NoError(t, err)
+
+		require.Len(t, *inputs, 3)
+		require.Equal(t, aws.Bool(false), (*inputs)[0].ConsistentRead)
+		require.Equal(t, aws.Bool(false), (*inputs)[1].ConsistentRead)
+		require.Equal(t, aws.Bool(true), (*inputs)[2].ConsistentRead, "the original is unchanged")
+
+		client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
+			return aws.ToBool(in.ConsistentRead)
+		}), mock.Anything).Return(&dynamodb.GetItemOutput{}, nil).Once()
+
+		_, err = eventual.GetView(ctx, "pk1")
+		require.NoError(t, err)
+		client.AssertExpectations(t)
+	})
+}
