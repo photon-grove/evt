@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -111,8 +113,14 @@ type Repository struct {
 	db             DB
 	eventsTable    string
 	snapshotsTable string
-	features       *FeatureMarker // mandatory feature validation (C9)
-	viewWriter     ViewWriter     // writes commit-wide view operations (C7); nil refuses them
+	features       *FeatureMarker   // mandatory feature validation (C9)
+	viewWriter     ViewWriter       // writes commit-wide view operations (C7); nil refuses them
+	now            func() time.Time // clock for rebuild lease expiry; nil means time.Now
+
+	// rebuildReady records that the rebuild fence's relations exist, so a commit's lock assertion
+	// probes the catalog only until the first time it finds them. Shared by copies of the
+	// repository, like the database handle it describes.
+	rebuildReady *atomic.Bool
 }
 
 // Compile-time checks that the Repository satisfies the core contract and every optional capability
@@ -121,6 +129,7 @@ var (
 	_ evt.Repository              = (*Repository)(nil)
 	_ evt.TransactionalRepository = (*Repository)(nil)
 	_ evt.OutcomeRepository       = (*Repository)(nil)
+	_ evt.RebuildFenceProvider    = (*Repository)(nil)
 	_ evt.Compactor               = (*Repository)(nil)
 	_ evt.SnapshotStreamer        = (*Repository)(nil)
 	_ evt.EntityHeadStreamer      = (*Repository)(nil)
@@ -192,6 +201,7 @@ func NewRepository(db DB, opts ...Option) *Repository {
 		db:             db,
 		eventsTable:    defaultEventsTable,
 		snapshotsTable: defaultSnapshotsTable,
+		rebuildReady:   new(atomic.Bool),
 	}
 
 	for _, opt := range opts {
@@ -307,6 +317,18 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
     retention         text   NOT NULL DEFAULT '[]'
 );
 
+CREATE TABLE IF NOT EXISTS %[1]s__evt_rebuild_lock (
+    id               integer PRIMARY KEY,
+    owner            text        NOT NULL,
+    lease_expires_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS %[1]s__evt_rebuild_generation (
+    id             integer PRIMARY KEY,
+    value          bigint   NOT NULL,
+    force_released boolean  NOT NULL DEFAULT false
+);
+
 CREATE TABLE IF NOT EXISTS %[1]s__evt_stream_heads (
     entity_id   text   PRIMARY KEY,
     entity_type text   NOT NULL,
@@ -404,12 +426,16 @@ func (repo *Repository) commitInTx(
 		return err
 	}
 
-	// The rebuild-lock assertion (C10) joins the transaction here, right after the marker check
-	// and before anything is written, once the rebuild fence lands; until then none is emitted.
-
 	// Fences are refused for entity types durably declared with retention. The refusal consults
-	// the manifest in this transaction, not this instance's configuration.
+	// the manifest in this transaction, not this instance's configuration, and needs no read of
+	// the lock, so it precedes the rebuild-lock assertion as it does on DynamoDB.
 	if err = evt.CheckFenceRetention(normalized.Fences, manifest); err != nil {
+		return err
+	}
+
+	// The rebuild-lock assertion (C10): any lock row, an expired one included, refuses the commit,
+	// right after the marker check and before anything is written.
+	if err = repo.assertNoRebuildLock(ctx, tx); err != nil {
 		return err
 	}
 

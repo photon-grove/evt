@@ -1,13 +1,18 @@
 // Command evt-compat is the Go driver for the cross-language integration run
 // (scripts/compat-integration.sh).
 //
-//	evt-compat steps
-//	evt-compat step   -backend dynamo|postgres -run RUN -index N
+//	evt-compat steps [-only SCENARIO]
+//	evt-compat exclusive
+//	evt-compat settle -backend dynamo|postgres
+//	evt-compat step   -backend dynamo|postgres -run RUN -index N [-only SCENARIO]
 //	evt-compat verify -backend dynamo|postgres -run RUN
 //	evt-compat enumerate -backend dynamo|postgres -run RUN
 //
 // step executes step N of every scenario whose writer is "go", against streams the Rust driver
-// also writes to. verify checks every stream against the golden fixtures: the raw stored items or
+// also writes to. A scenario marked exclusive holds store-wide state across steps (a rebuild lock
+// refuses every other scenario's commits), so the interleaved run skips it: it runs alone, one step
+// at a time, with -only. steps prints how many steps the interleaved run has, or how many the named
+// scenario has, and exclusive lists the exclusive scenarios. verify checks every stream against the golden fixtures: the raw stored items or
 // rows, the events and snapshot read through the repository, and the loaded state. enumerate prints
 // the run's events as StreamAllEvents yields them (unfiltered and filtered by entity type), one
 // sorted line each, for the integration script to compare with the Rust driver's output.
@@ -24,6 +29,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -58,19 +64,45 @@ func main() {
 	backendName := flags.String("backend", "", "dynamo or postgres")
 	run := flags.String("run", "", "run identifier")
 	index := flags.Int("index", 0, "step index")
+	only := flags.String("only", "", "run only this (exclusive) scenario")
 	check(flags.Parse(os.Args[2:]))
 
 	ctx := context.Background()
 
-	if command == "steps" {
+	if command == "settle" {
+		b, err := connect(ctx, *backendName)
+		check(err)
+		check(settle(ctx, b))
+
+		return
+	}
+
+	switch command {
+	case "steps":
 		scenarios, err := compat.LoadScenarios()
 		check(err)
 
 		maxSteps := 0
 		for _, scenario := range scenarios.Scenarios {
+			if (*only == "") == scenario.Exclusive || (*only != "" && scenario.Name != *only) {
+				continue
+			}
+
 			maxSteps = max(maxSteps, len(scenario.Steps))
 		}
 		fmt.Println(maxSteps)
+
+		return
+
+	case "exclusive":
+		scenarios, err := compat.LoadScenarios()
+		check(err)
+
+		for _, scenario := range scenarios.Scenarios {
+			if scenario.Exclusive {
+				fmt.Println(scenario.Name)
+			}
+		}
 
 		return
 	}
@@ -86,7 +118,7 @@ func main() {
 
 	switch command {
 	case "step":
-		failures, err = step(ctx, b, *run, *index)
+		failures, err = step(ctx, b, *run, *index, *only)
 	case "verify":
 		failures, err = verify(ctx, b, *run)
 	case "enumerate":
@@ -141,6 +173,45 @@ func enumerate(ctx context.Context, b backend, run string) error {
 	return nil
 }
 
+// settle ends a rebuild a failed exclusive step left behind, so a later run starts from a settled
+// fence: it force-releases a lock held by a compat owner, then runs and ends one rebuild if the
+// generation is still odd (a force-release leaves it odd). Locks of other owners are left alone.
+func settle(ctx context.Context, b backend) error {
+	provider, ok := b.repo.(evt.RebuildFenceProvider)
+	if !ok {
+		return nil
+	}
+
+	fence := provider.RebuildFence()
+
+	state, err := fence.State(ctx)
+	if err != nil {
+		return err
+	}
+
+	if state.Lock != nil {
+		if !strings.HasPrefix(state.Lock.Owner, "compat-") {
+			return fmt.Errorf("the rebuild lock is held by %q, which is not a compat owner", state.Lock.Owner)
+		}
+
+		if _, err = fence.ForceRelease(ctx, state.Lock.Owner); err != nil {
+			return err
+		}
+	}
+
+	if state.Generation.Settled() && state.Lock == nil {
+		return nil
+	}
+
+	if _, err = fence.Begin(ctx, "compat-settle", time.Minute); err != nil {
+		return err
+	}
+
+	_, err = fence.End(ctx, "compat-settle")
+
+	return err
+}
+
 func connect(ctx context.Context, name string) (backend, error) {
 	switch name {
 	case "dynamo":
@@ -187,7 +258,7 @@ func connect(ctx context.Context, name string) (backend, error) {
 	return backend{}, fmt.Errorf("unknown backend %q", name)
 }
 
-func step(ctx context.Context, b backend, run string, index int) ([]string, error) {
+func step(ctx context.Context, b backend, run string, index int, only string) ([]string, error) {
 	scenarios, err := compat.LoadScenarios()
 	if err != nil {
 		return nil, err
@@ -196,6 +267,11 @@ func step(ctx context.Context, b backend, run string, index int) ([]string, erro
 	var failures []string
 
 	for _, scenario := range scenarios.Scenarios {
+		// The interleaved run skips exclusive scenarios; a run with -only executes that one alone.
+		if scenario.Exclusive != (only != "") || (only != "" && scenario.Name != only) {
+			continue
+		}
+
 		if index >= len(scenario.Steps) || scenario.Steps[index].By != compat.WriterGo {
 			continue
 		}
@@ -386,7 +462,43 @@ func newRunner(b backend, scenario compat.Scenario, run string) compat.Runner {
 		runner.BypassHead = postgresBypassHead(b.postgres)
 	}
 
+	runner.Rebuild = b.rebuildDriver()
+
 	return runner
+}
+
+// rebuildDriver backs the rebuild op against the live backend: the repository's fence, a wait that
+// really sleeps, and a count of the compat view rows of a partition.
+func (b backend) rebuildDriver() *compat.RebuildDriver {
+	provider, ok := b.repo.(evt.RebuildFenceProvider)
+	if !ok {
+		return nil
+	}
+
+	return &compat.RebuildDriver{
+		Fence: provider.RebuildFence(),
+		Wait: func(ctx context.Context, seconds int64) error {
+			select {
+			case <-time.After(time.Duration(seconds) * time.Second):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+		Rows: func(ctx context.Context, pk string) (int, error) {
+			if b.postgres != nil {
+				var rows int
+
+				err := b.postgres.QueryRow(ctx, `SELECT count(*) FROM `+compat.PostgresViewTable+` WHERE pk = $1`, pk).Scan(&rows)
+
+				return rows, err
+			}
+
+			items, err := partitionItemsIn(ctx, b, b.viewsTable, pk)
+
+			return len(items), err
+		},
+	}
 }
 
 // postgresBypassHead inserts an event row directly, leaving the stream's head row untouched.

@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/conformance"
@@ -46,6 +47,9 @@ func Test_RepositoryConformance(t *testing.T) {
 			})
 
 			return err
+		},
+		WithRebuildClock: func(repo evt.Repository, now func() time.Time) evt.Repository {
+			return repo.(*postgres.Repository).WithClock(now) //nolint:errcheck,forcetypeassert // newRepo returns a *postgres.Repository
 		},
 		BypassHead: func(ctx context.Context, _ evt.Repository, event evt.SerializedEvent) error {
 			metadata, err := eventjson.MarshalMetadata(event.Metadata)

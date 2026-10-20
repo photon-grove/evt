@@ -374,14 +374,14 @@ func Test_ProjectorOperationCount_CountsViewsAndTheCommitIsRefusedWithoutEvents(
 func Test_PreflightCommit_BudgetsViewOperations(t *testing.T) {
 	result := evt.SerializedResult{Events: []evt.SerializedEvent{event("a", 1, "c")}}
 
-	// The marker check, the event put, and the head update leave 97 of the 100 actions.
-	for i := range 97 {
+	// The two control checks, the event put, and the head update leave 96 of the 100 actions.
+	for i := range 96 {
 		result.Views = append(result.Views, view("p", 0, i, put("pk", string(rune('A'+i/26))+string(rune('a'+i%26)))))
 	}
 
 	require.NoError(t, evt.PreflightCommit(result))
 
-	result.Views = append(result.Views, view("p", 0, 97, put("pk", "last")))
+	result.Views = append(result.Views, view("p", 0, 96, put("pk", "last")))
 
 	var tooLarge *evt.CommitTooLargeError
 

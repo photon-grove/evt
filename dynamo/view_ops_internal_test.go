@@ -133,9 +133,9 @@ func Test_classifyCommitFailure_NamesTheProjectorOperationWhoseConditionFailed(t
 		return &types.TransactionCanceledException{CancellationReasons: reasons}
 	}
 
-	// Index 0 is the marker check; the views occupy indexes 1 to 3.
+	// Indexes 0 and 1 are the marker and rebuild-lock checks; the views occupy indexes 2 to 4.
 	err := repo.classifyCommitFailure(context.Background(), nil, nil, layout,
-		cancelled("None", "None", "None", "ConditionalCheckFailed"))
+		cancelled("None", "None", "None", "None", "ConditionalCheckFailed"))
 
 	var failed *evt.ProjectorOperationError
 
@@ -150,7 +150,7 @@ func Test_classifyCommitFailure_NamesTheProjectorOperationWhoseConditionFailed(t
 
 	// Where several fail, the first in transaction order is the one named.
 	err = repo.classifyCommitFailure(context.Background(), nil, nil, layout,
-		cancelled("None", "None", "ConditionalCheckFailed", "ConditionalCheckFailed"))
+		cancelled("None", "None", "None", "ConditionalCheckFailed", "ConditionalCheckFailed"))
 	require.ErrorAs(t, err, &failed)
 	require.Equal(t, 0, failed.Operation)
 	require.Equal(t, "claims", failed.Projector)
@@ -175,7 +175,7 @@ func Test_classifyCommitFailure_ItemLevelReasonsOnAViewAreTheProjectorsAndTransi
 	var failed *evt.ProjectorOperationError
 
 	for _, reason := range []string{"ValidationError", "ItemCollectionSizeLimitExceeded"} {
-		err := repo.classifyCommitFailure(context.Background(), nil, nil, layout, cancelled("None", "None", reason))
+		err := repo.classifyCommitFailure(context.Background(), nil, nil, layout, cancelled("None", "None", "None", reason))
 		require.ErrorAs(t, err, &failed, reason)
 		require.Equal(t, 1, failed.Operation, reason)
 		require.Equal(t, reason, failed.Reason, reason)
@@ -185,7 +185,7 @@ func Test_classifyCommitFailure_ItemLevelReasonsOnAViewAreTheProjectorsAndTransi
 
 	// A concurrent transaction or throttling on a view item keeps its transient classification.
 	for _, reason := range []string{"TransactionConflict", "ThrottlingError"} {
-		err := repo.classifyCommitFailure(context.Background(), nil, nil, layout, cancelled("None", "None", reason))
+		err := repo.classifyCommitFailure(context.Background(), nil, nil, layout, cancelled("None", "None", "None", reason))
 		require.NotErrorIs(t, err, evt.ErrProjectorOperation, reason)
 		require.True(t, policy.IsTransient(err), reason)
 	}

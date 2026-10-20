@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/conformance"
@@ -45,6 +46,14 @@ func Test_RepositoryConformance(t *testing.T) {
 			})
 
 			return err
+		},
+		WithRebuildClock: func(repo evt.Repository, now func() time.Time) evt.Repository {
+			memRepo, ok := repo.(*mem.Repository)
+			if !ok {
+				panic(fmt.Sprintf("unexpected repository type %T", repo))
+			}
+
+			return memRepo.WithClock(now)
 		},
 		BypassHead: func(_ context.Context, repo evt.Repository, event evt.SerializedEvent) error {
 			memRepo, ok := repo.(*mem.Repository)

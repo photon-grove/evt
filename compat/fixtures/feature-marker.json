@@ -190,6 +190,19 @@
           }
         },
         {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
+        },
+        {
           "operation": "Put",
           "tableName": "views",
           "item": {
@@ -302,6 +315,19 @@
               "N": "2"
             }
           }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
         },
         {
           "operation": "Put",
@@ -451,6 +477,19 @@
           }
         },
         {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
+        },
+        {
           "operation": "Put",
           "tableName": "views",
           "item": {
@@ -554,6 +593,19 @@
           }
         },
         {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
+        },
+        {
           "operation": "Update",
           "tableName": "evt-compat",
           "key": {
@@ -603,6 +655,7 @@
       ],
       "sizes": [
         20,
+        19,
         291,
         60
       ]
@@ -643,6 +696,19 @@
               "N": "1"
             }
           }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
         },
         {
           "operation": "Update",
@@ -725,6 +791,7 @@
       ],
       "sizes": [
         20,
+        19,
         291,
         291,
         52
@@ -761,6 +828,19 @@
               "N": "1"
             }
           }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
         },
         {
           "operation": "Update",
@@ -949,6 +1029,7 @@
       ],
       "sizes": [
         20,
+        19,
         291,
         291,
         291,
@@ -997,6 +1078,19 @@
               "N": "1"
             }
           }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
         },
         {
           "operation": "Update",
@@ -1081,6 +1175,7 @@
       ],
       "sizes": [
         20,
+        19,
         291,
         50,
         52
@@ -1145,6 +1240,19 @@
               "N": "1"
             }
           }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
         },
         {
           "operation": "Update",
@@ -1307,6 +1415,7 @@
       ],
       "sizes": [
         20,
+        19,
         286,
         286,
         45,
@@ -1350,6 +1459,19 @@
               "N": "1"
             }
           }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
         },
         {
           "operation": "Update",
@@ -1472,6 +1594,7 @@
       ],
       "sizes": [
         20,
+        19,
         307,
         307,
         307,
@@ -1519,6 +1642,19 @@
               "N": "1"
             }
           }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
         },
         {
           "operation": "Update",
@@ -1582,6 +1718,7 @@
       ],
       "sizes": [
         20,
+        19,
         307,
         132
       ]
@@ -1971,6 +2108,19 @@
           }
         },
         {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
+        },
+        {
           "operation": "Put",
           "tableName": "evt-compat-views",
           "item": {
@@ -2243,6 +2393,7 @@
       ],
       "sizes": [
         20,
+        19,
         286,
         286,
         45,
@@ -2304,6 +2455,19 @@
               "N": "1"
             }
           }
+        },
+        {
+          "operation": "ConditionCheck",
+          "tableName": "evt-compat",
+          "key": {
+            "pk": {
+              "S": "SYSTEM#REBUILD"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "conditionExpression": "attribute_not_exists(pk)"
         },
         {
           "operation": "Put",
@@ -2410,6 +2574,7 @@
       ],
       "sizes": [
         20,
+        19,
         291,
         291,
         60,
@@ -2417,16 +2582,1901 @@
       ]
     }
   ],
+  "rebuildFence": [
+    {
+      "name": "state-empty",
+      "before": {
+        "generation": null,
+        "lock": null
+      },
+      "operation": "state",
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 0
+      },
+      "after": {
+        "generation": null,
+        "lock": null
+      }
+    },
+    {
+      "name": "state-held",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000060"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "state",
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 5,
+        "leaseExpiresAt": 1790000060,
+        "lockOwner": "job-a"
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000060"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "generation-force-released",
+      "before": {
+        "generation": {
+          "forceReleased": {
+            "BOOL": true
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": null
+      },
+      "operation": "generation",
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 7,
+        "forceReleased": true
+      },
+      "after": {
+        "generation": {
+          "forceReleased": {
+            "BOOL": true
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": null
+      }
+    },
+    {
+      "name": "acquire-first-rebuild",
+      "before": {
+        "generation": null,
+        "lock": null
+      },
+      "operation": "begin",
+      "owner": "job-a",
+      "leaseSeconds": 60,
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Put",
+              "tableName": "evt-compat",
+              "item": {
+                "leaseExpiresAt": {
+                  "N": "1790000060"
+                },
+                "owner": {
+                  "S": "job-a"
+                },
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET #value = if_not_exists(#value, :zero) + :increment",
+              "conditionExpression": "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)",
+              "expressionAttributeNames": {
+                "#value": "value"
+              },
+              "expressionAttributeValues": {
+                ":increment": {
+                  "N": "1"
+                },
+                ":seenEven": {
+                  "N": "0"
+                },
+                ":seenOdd": {
+                  "N": "-1"
+                },
+                ":true": {
+                  "BOOL": true
+                },
+                ":zero": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 1,
+        "leaseExpiresAt": 1790000060
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "1"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000060"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "acquire-from-even",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "4"
+          }
+        },
+        "lock": null
+      },
+      "operation": "begin",
+      "owner": "job-a",
+      "leaseSeconds": 90,
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Put",
+              "tableName": "evt-compat",
+              "item": {
+                "leaseExpiresAt": {
+                  "N": "1790000090"
+                },
+                "owner": {
+                  "S": "job-a"
+                },
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET #value = if_not_exists(#value, :zero) + :increment",
+              "conditionExpression": "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)",
+              "expressionAttributeNames": {
+                "#value": "value"
+              },
+              "expressionAttributeValues": {
+                ":increment": {
+                  "N": "1"
+                },
+                ":seenEven": {
+                  "N": "4"
+                },
+                ":seenOdd": {
+                  "N": "-1"
+                },
+                ":true": {
+                  "BOOL": true
+                },
+                ":zero": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 5,
+        "leaseExpiresAt": 1790000090
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000090"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "acquire-from-force-released",
+      "before": {
+        "generation": {
+          "forceReleased": {
+            "BOOL": true
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": null
+      },
+      "operation": "begin",
+      "owner": "job-b",
+      "leaseSeconds": 60,
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Put",
+              "tableName": "evt-compat",
+              "item": {
+                "leaseExpiresAt": {
+                  "N": "1790000060"
+                },
+                "owner": {
+                  "S": "job-b"
+                },
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "attribute_not_exists(pk)"
+            },
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET #value = if_not_exists(#value, :zero) + :increment",
+              "conditionExpression": "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)",
+              "expressionAttributeNames": {
+                "#value": "value"
+              },
+              "expressionAttributeValues": {
+                ":increment": {
+                  "N": "2"
+                },
+                ":seenEven": {
+                  "N": "-1"
+                },
+                ":seenOdd": {
+                  "N": "5"
+                },
+                ":true": {
+                  "BOOL": true
+                },
+                ":zero": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 7,
+        "leaseExpiresAt": 1790000060
+      },
+      "after": {
+        "generation": {
+          "forceReleased": {
+            "BOOL": true
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000060"
+          },
+          "owner": {
+            "S": "job-b"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "takeover-expired",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1789999999"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "begin",
+      "owner": "job-b",
+      "leaseSeconds": 60,
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Put",
+              "tableName": "evt-compat",
+              "item": {
+                "leaseExpiresAt": {
+                  "N": "1790000060"
+                },
+                "owner": {
+                  "S": "job-b"
+                },
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "leaseExpiresAt < :now AND #owner = :observedOwner",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":now": {
+                  "N": "1790000000"
+                },
+                ":observedOwner": {
+                  "S": "job-a"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET #value = #value + :two",
+              "conditionExpression": "#value = :seenOdd",
+              "expressionAttributeNames": {
+                "#value": "value"
+              },
+              "expressionAttributeValues": {
+                ":seenOdd": {
+                  "N": "5"
+                },
+                ":two": {
+                  "N": "2"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 7,
+        "leaseExpiresAt": 1790000060
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000060"
+          },
+          "owner": {
+            "S": "job-b"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "held-is-refused",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000000"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "begin",
+      "owner": "job-b",
+      "leaseSeconds": 60,
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "error": "lockHeld"
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000000"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "renew",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "renew",
+      "owner": "job-a",
+      "leaseSeconds": 120,
+      "calls": [
+        {
+          "call": "UpdateItem",
+          "actions": [
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET leaseExpiresAt = :expiry",
+              "conditionExpression": "#owner = :owner",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":expiry": {
+                  "N": "1790000120"
+                },
+                ":owner": {
+                  "S": "job-a"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "leaseExpiresAt": 1790000120
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000120"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "renew-lost",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-b"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "renew",
+      "owner": "job-a",
+      "leaseSeconds": 120,
+      "calls": [
+        {
+          "call": "UpdateItem",
+          "actions": [
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET leaseExpiresAt = :expiry",
+              "conditionExpression": "#owner = :owner",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":expiry": {
+                  "N": "1790000120"
+                },
+                ":owner": {
+                  "S": "job-a"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "error": "leaseLost"
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-b"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "release",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "end",
+      "owner": "job-a",
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Delete",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "#owner = :me",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":me": {
+                  "S": "job-a"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET #value = #value + :one REMOVE forceReleased",
+              "conditionExpression": "#value = :seenOdd",
+              "expressionAttributeNames": {
+                "#value": "value"
+              },
+              "expressionAttributeValues": {
+                ":one": {
+                  "N": "1"
+                },
+                ":seenOdd": {
+                  "N": "5"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 6
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "6"
+          }
+        },
+        "lock": null
+      }
+    },
+    {
+      "name": "release-clears-force-released",
+      "before": {
+        "generation": {
+          "forceReleased": {
+            "BOOL": true
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "end",
+      "owner": "job-a",
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Delete",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "#owner = :me",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":me": {
+                  "S": "job-a"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET #value = #value + :one REMOVE forceReleased",
+              "conditionExpression": "#value = :seenOdd",
+              "expressionAttributeNames": {
+                "#value": "value"
+              },
+              "expressionAttributeValues": {
+                ":one": {
+                  "N": "1"
+                },
+                ":seenOdd": {
+                  "N": "7"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 8
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "8"
+          }
+        },
+        "lock": null
+      }
+    },
+    {
+      "name": "release-lost",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-b"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "end",
+      "owner": "job-a",
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Delete",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "#owner = :me",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":me": {
+                  "S": "job-a"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET #value = #value + :one REMOVE forceReleased",
+              "conditionExpression": "#value = :seenOdd",
+              "expressionAttributeNames": {
+                "#value": "value"
+              },
+              "expressionAttributeValues": {
+                ":one": {
+                  "N": "1"
+                },
+                ":seenOdd": {
+                  "N": "7"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "error": "leaseLost"
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-b"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "force-release",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1789999900"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "forceRelease",
+      "owner": "job-a",
+      "calls": [
+        {
+          "call": "GetItem",
+          "consistentRead": true,
+          "actions": [
+            {
+              "operation": "Get",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Delete",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "#owner = :requestedOwner",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":requestedOwner": {
+                  "S": "job-a"
+                }
+              }
+            },
+            {
+              "operation": "Update",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD#GENERATION"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "updateExpression": "SET #value = #value + :two, forceReleased = :true",
+              "conditionExpression": "#value = :seenOdd",
+              "expressionAttributeNames": {
+                "#value": "value"
+              },
+              "expressionAttributeValues": {
+                ":seenOdd": {
+                  "N": "5"
+                },
+                ":true": {
+                  "BOOL": true
+                },
+                ":two": {
+                  "N": "2"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "generation": 7,
+        "forceReleased": true
+      },
+      "after": {
+        "generation": {
+          "forceReleased": {
+            "BOOL": true
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": null
+      }
+    },
+    {
+      "name": "guarded-views",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "writeViews",
+      "owner": "job-a",
+      "calls": [
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Put",
+              "tableName": "views",
+              "item": {
+                "entityID": {
+                  "S": "acct-1"
+                },
+                "entityType": {
+                  "S": "account"
+                },
+                "payload": {
+                  "S": "{\"n\":1}"
+                },
+                "pk": {
+                  "S": "rebuilt"
+                },
+                "sk": {
+                  "S": "row-1"
+                }
+              },
+              "conditionExpression": "attribute_not_exists(pk) OR entityID = :owner",
+              "expressionAttributeValues": {
+                ":owner": {
+                  "S": "acct-1"
+                }
+              }
+            },
+            {
+              "operation": "Delete",
+              "tableName": "views",
+              "key": {
+                "pk": {
+                  "S": "rebuilt"
+                },
+                "sk": {
+                  "S": "row-2"
+                }
+              },
+              "conditionExpression": "attribute_not_exists(pk) OR entityID = :owner",
+              "expressionAttributeValues": {
+                ":owner": {
+                  "S": "acct-2"
+                }
+              }
+            },
+            {
+              "operation": "ConditionCheck",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "#owner = :me AND leaseExpiresAt > :now",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":me": {
+                  "S": "job-a"
+                },
+                ":now": {
+                  "N": "1790000000"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {},
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "5"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-a"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    },
+    {
+      "name": "guarded-views-lease-lost",
+      "before": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-b"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      },
+      "operation": "writeViews",
+      "owner": "job-a",
+      "calls": [
+        {
+          "call": "TransactWriteItems",
+          "actions": [
+            {
+              "operation": "Put",
+              "tableName": "views",
+              "item": {
+                "entityID": {
+                  "S": "acct-1"
+                },
+                "entityType": {
+                  "S": "account"
+                },
+                "payload": {
+                  "S": "{\"n\":1}"
+                },
+                "pk": {
+                  "S": "rebuilt"
+                },
+                "sk": {
+                  "S": "row-1"
+                }
+              },
+              "conditionExpression": "attribute_not_exists(pk) OR entityID = :owner",
+              "expressionAttributeValues": {
+                ":owner": {
+                  "S": "acct-1"
+                }
+              }
+            },
+            {
+              "operation": "Delete",
+              "tableName": "views",
+              "key": {
+                "pk": {
+                  "S": "rebuilt"
+                },
+                "sk": {
+                  "S": "row-2"
+                }
+              },
+              "conditionExpression": "attribute_not_exists(pk) OR entityID = :owner",
+              "expressionAttributeValues": {
+                ":owner": {
+                  "S": "acct-2"
+                }
+              }
+            },
+            {
+              "operation": "ConditionCheck",
+              "tableName": "evt-compat",
+              "key": {
+                "pk": {
+                  "S": "SYSTEM#REBUILD"
+                },
+                "sk": {
+                  "N": "0"
+                }
+              },
+              "conditionExpression": "#owner = :me AND leaseExpiresAt > :now",
+              "expressionAttributeNames": {
+                "#owner": "owner"
+              },
+              "expressionAttributeValues": {
+                ":me": {
+                  "S": "job-a"
+                },
+                ":now": {
+                  "N": "1790000000"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "result": {
+        "error": "leaseLost"
+      },
+      "after": {
+        "generation": {
+          "pk": {
+            "S": "SYSTEM#REBUILD#GENERATION"
+          },
+          "sk": {
+            "N": "0"
+          },
+          "value": {
+            "N": "7"
+          }
+        },
+        "lock": {
+          "leaseExpiresAt": {
+            "N": "1790000010"
+          },
+          "owner": {
+            "S": "job-b"
+          },
+          "pk": {
+            "S": "SYSTEM#REBUILD"
+          },
+          "sk": {
+            "N": "0"
+          }
+        }
+      }
+    }
+  ],
   "postgresSchemas": [
     {
       "eventsTable": "orders",
       "snapshotsTable": "orders_entity_type_idx",
-      "ddl": "\nCREATE TABLE IF NOT EXISTS orders (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS orders__evt_entity_type_idx ON orders (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('orders_entity_type_idx')\n          AND indrelid = 'orders'::regclass\n    ) THEN\n        DROP INDEX orders_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS orders_entity_type_idx (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_command_outcomes (\n    command_id text        PRIMARY KEY,\n    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),\n    digest     text        NOT NULL,\n    response   bytea,\n    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,\n    rejection  jsonb,\n    code       text,\n    created_at timestamptz NOT NULL DEFAULT now(),\n    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)\n           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_stream_heads (\n    entity_id   text   PRIMARY KEY,\n    entity_type text   NOT NULL,\n    head        bigint NOT NULL CHECK (head >= 1)\n);\n"
+      "ddl": "\nCREATE TABLE IF NOT EXISTS orders (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS orders__evt_entity_type_idx ON orders (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('orders_entity_type_idx')\n          AND indrelid = 'orders'::regclass\n    ) THEN\n        DROP INDEX orders_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS orders_entity_type_idx (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_command_outcomes (\n    command_id text        PRIMARY KEY,\n    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),\n    digest     text        NOT NULL,\n    response   bytea,\n    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,\n    rejection  jsonb,\n    code       text,\n    created_at timestamptz NOT NULL DEFAULT now(),\n    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)\n           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_rebuild_lock (\n    id               integer PRIMARY KEY,\n    owner            text        NOT NULL,\n    lease_expires_at timestamptz NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_rebuild_generation (\n    id             integer PRIMARY KEY,\n    value          bigint   NOT NULL,\n    force_released boolean  NOT NULL DEFAULT false\n);\n\nCREATE TABLE IF NOT EXISTS orders__evt_stream_heads (\n    entity_id   text   PRIMARY KEY,\n    entity_type text   NOT NULL,\n    head        bigint NOT NULL CHECK (head >= 1)\n);\n"
     },
     {
       "eventsTable": "evt_events",
       "snapshotsTable": "evt_snapshots",
-      "ddl": "\nCREATE TABLE IF NOT EXISTS evt_events (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS evt_events__evt_entity_type_idx ON evt_events (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('evt_events_entity_type_idx')\n          AND indrelid = 'evt_events'::regclass\n    ) THEN\n        DROP INDEX evt_events_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS evt_snapshots (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_command_outcomes (\n    command_id text        PRIMARY KEY,\n    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),\n    digest     text        NOT NULL,\n    response   bytea,\n    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,\n    rejection  jsonb,\n    code       text,\n    created_at timestamptz NOT NULL DEFAULT now(),\n    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)\n           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (\n    entity_id   text   PRIMARY KEY,\n    entity_type text   NOT NULL,\n    head        bigint NOT NULL CHECK (head >= 1)\n);\n"
+      "ddl": "\nCREATE TABLE IF NOT EXISTS evt_events (\n    entity_id   text   NOT NULL,\n    sequence    bigint NOT NULL,\n    event_id    text   NOT NULL,\n    event_type  text   NOT NULL,\n    version     bigint NOT NULL,\n    entity_type text   NOT NULL,\n    payload     bytea  NOT NULL,\n    metadata    jsonb  NOT NULL DEFAULT '{}'::jsonb,\n    created_at  timestamptz NOT NULL DEFAULT now(),\n    PRIMARY KEY (entity_id, sequence)\n);\nCREATE INDEX IF NOT EXISTS evt_events__evt_entity_type_idx ON evt_events (entity_type);\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_index\n        WHERE indexrelid = to_regclass('evt_events_entity_type_idx')\n          AND indrelid = 'evt_events'::regclass\n    ) THEN\n        DROP INDEX evt_events_entity_type_idx;\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS evt_snapshots (\n    entity_id      text   PRIMARY KEY,\n    entity_type    text   NOT NULL,\n    sequence       bigint NOT NULL,\n    event_sequence bigint NOT NULL,\n    payload        bytea  NOT NULL,\n    updated_at     timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_command_outcomes (\n    command_id text        PRIMARY KEY,\n    status     text        NOT NULL CHECK (status IN ('accepted', 'rejected')),\n    digest     text        NOT NULL,\n    response   bytea,\n    events     jsonb       NOT NULL DEFAULT '[]'::jsonb,\n    rejection  jsonb,\n    code       text,\n    created_at timestamptz NOT NULL DEFAULT now(),\n    CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)\n           OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_features (\n    id                integer PRIMARY KEY,\n    version           bigint NOT NULL,\n    features          text   NOT NULL,\n    history_dependent text   NOT NULL DEFAULT '[]',\n    retention         text   NOT NULL DEFAULT '[]'\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_rebuild_lock (\n    id               integer PRIMARY KEY,\n    owner            text        NOT NULL,\n    lease_expires_at timestamptz NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_rebuild_generation (\n    id             integer PRIMARY KEY,\n    value          bigint   NOT NULL,\n    force_released boolean  NOT NULL DEFAULT false\n);\n\nCREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (\n    entity_id   text   PRIMARY KEY,\n    entity_type text   NOT NULL,\n    head        bigint NOT NULL CHECK (head >= 1)\n);\n"
     }
   ]
 }

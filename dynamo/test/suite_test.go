@@ -51,6 +51,23 @@ func markerCheck(table string) types.TransactWriteItem {
 	}}
 }
 
+// rebuildLockCheck is the commit's mandatory rebuild-lock check, the second action of every commit.
+func rebuildLockCheck(table string) types.TransactWriteItem {
+	return types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+		TableName: aws.String(table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "SYSTEM#REBUILD"},
+			"sk": &types.AttributeValueMemberN{Value: "0"},
+		},
+		ConditionExpression: aws.String("attribute_not_exists(pk)"),
+	}}
+}
+
+// controlChecks are the two control checks that open every commit.
+func controlChecks(table string) []types.TransactWriteItem {
+	return []types.TransactWriteItem{markerCheck(table), rebuildLockCheck(table)}
+}
+
 // Use the mocked TestDynamoClient to initialize the Dynamo EventRepository
 func (s *RepositorySuite) SetupTest() {
 	s.client = mock.NewClient()

@@ -17,7 +17,8 @@ import (
 // items failed, the engine ranks them and every backend reports the same one (storage spec,
 // Stream Heads, Classification). Highest first:
 //
-//  1. the feature-marker check (revalidate and retry), handled by the caller;
+//  1. the feature-marker check (revalidate and retry), then the rebuild-lock check
+//     (RebuildInProgress, transient), handled by the caller;
 //  2. the outcome put (OutcomeConflict), handled by the caller;
 //  3. *evt.StreamHeadDriftError;
 //  4. *evt.SequenceGapError;

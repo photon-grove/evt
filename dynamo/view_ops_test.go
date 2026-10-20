@@ -36,7 +36,7 @@ func newViewsRepo() (*compat.FakeDynamo, *dynamo.Repository) {
 	return fake, dynamo.NewRepository(fake, "events").WithViewsTable("views")
 }
 
-func TestViewOperationsSitBetweenTheMarkerCheckAndTheWrittenStreams(t *testing.T) {
+func TestViewOperationsSitBetweenTheControlChecksAndTheWrittenStreams(t *testing.T) {
 	fake, repo := newViewsRepo()
 
 	require.NoError(t, repo.Commit(context.Background(), evt.SerializedResult{
@@ -65,6 +65,7 @@ func TestViewOperationsSitBetweenTheMarkerCheckAndTheWrittenStreams(t *testing.T
 
 	require.Equal(t, []string{
 		"ConditionCheck events SYSTEM#FEATURES/0",
+		"ConditionCheck events SYSTEM#REBUILD/0",
 		"Put views directory/a",
 		"Delete views directory/old",
 		"Put views audit/commit-1",
@@ -74,7 +75,7 @@ func TestViewOperationsSitBetweenTheMarkerCheckAndTheWrittenStreams(t *testing.T
 		"Put events b/1",
 	}, layout)
 
-	require.Equal(t, "attribute_not_exists(pk)", calls[0][3].Condition)
+	require.Equal(t, "attribute_not_exists(pk)", calls[0][4].Condition)
 	require.Len(t, fake.Views("directory"), 1)
 	require.Len(t, fake.Views("audit"), 1)
 }
@@ -211,12 +212,12 @@ func TestViewOperationsCountInTheBudget(t *testing.T) {
 		return out
 	}
 
-	// The marker check, one event put, and one head update leave 97 actions for view operations.
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{viewEvent("a", 1)}, Views: views(97)}))
+	// The two control checks, one event put, and one head update leave 96 actions for view operations.
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{viewEvent("a", 1)}, Views: views(96)}))
 	require.Len(t, fake.Transactions()[0], 100)
 
 	before := len(fake.Transactions())
-	err := repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{viewEvent("b", 1)}, Views: views(98)})
+	err := repo.Commit(ctx, evt.SerializedResult{Events: []evt.SerializedEvent{viewEvent("b", 1)}, Views: views(97)})
 
 	var tooLarge *evt.CommitTooLargeError
 

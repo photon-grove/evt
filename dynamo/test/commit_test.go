@@ -67,7 +67,7 @@ func (s *RepositorySuite) Test_Commit_Ok() {
 		},
 	}
 
-	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{markerCheck(s.repo.EventsTable)}, expected...)}
+	input := dynamodb.TransactWriteItemsInput{TransactItems: append(controlChecks(s.repo.EventsTable), expected...)}
 
 	// Return an empty output object, because the result isn't used
 	output := new(dynamodb.TransactWriteItemsOutput)
@@ -149,7 +149,7 @@ func (s *RepositorySuite) Test_Commit_WithSnapshot() {
 	}
 
 	// An append needs no read before the commit: the head condition carries continuity.
-	input := dynamodb.TransactWriteItemsInput{TransactItems: append([]types.TransactWriteItem{markerCheck(s.repo.EventsTable)}, expected...)}
+	input := dynamodb.TransactWriteItemsInput{TransactItems: append(controlChecks(s.repo.EventsTable), expected...)}
 
 	// Return an empty output object, because the result isn't used
 	output := new(dynamodb.TransactWriteItemsOutput)
@@ -192,7 +192,7 @@ func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
 	}, put.ExpressionAttributeValues)
 
 	// The append conditions on the head being the sequence before the commit's first.
-	update := input.TransactItems[1].Update
+	update := input.TransactItems[2].Update
 	require.Equal(s.T(), "head = :prev", aws.ToString(update.ConditionExpression))
 	require.Equal(s.T(), map[string]types.AttributeValue{
 		":last": &types.AttributeValueMemberN{Value: "7"},
@@ -302,6 +302,7 @@ func (s *RepositorySuite) Test_Commit_ConditionalCheckFailure() {
 	conditionalCheckErr := &types.TransactionCanceledException{
 		CancellationReasons: []types.CancellationReason{
 			{Code: aws.String("None")},                   // mandatory marker check
+			{Code: aws.String("None")},                   // mandatory rebuild-lock check
 			{Code: aws.String("ConditionalCheckFailed")}, // head update: the stream already exists
 			{Code: aws.String("None")},
 		},
