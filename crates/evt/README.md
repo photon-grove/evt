@@ -670,6 +670,55 @@ without the feature refuse the table.
 - **Backends.** DynamoDB and the in-memory repository. The Rust PostgreSQL repository does not write
   commit-wide views yet.
 
+### Compaction and `410 Gone`
+
+A scope's journal grows without bound, so an operator (or a scheduled job) compacts its oldest rows
+into a snapshot (ADR 0005, X2):
+
+```rust,ignore
+use std::time::Duration;
+
+use photon_evt::journal::{compact_with_lease, page, read_chunk, read_manifest};
+
+// Store rows 1..=4000 as a snapshot, then delete them. Safe to run again.
+let report = compact_with_lease(&repository, &scope, 4000, "compactor-1", Duration::from_secs(60)).await?;
+
+match page(&repository, &scope, after, 100).await {
+    Ok(page) => { /* as before */ }
+    // The reader is below the floor: respond 410 with `gone`, and the client installs the snapshot.
+    Err(Error::JournalGone(gone)) => {
+        let manifest = read_manifest(&repository, &scope).await?.expect("a compacted scope");
+        for index in 0..manifest.chunks.len() {
+            let chunk = read_chunk(&repository, &manifest, index).await?; // digest-checked
+            // ... apply chunk.rows
+        }
+        after = manifest.checkpoint; // resume paging after the checkpoint
+    }
+    Err(other) => return Err(other.into()),
+}
+```
+
+- **Order makes it safe without stopping writers.** A run writes the canonical chunks, swaps the
+  manifest (its checkpoint becomes the scope's floor), then deletes the rows, then writes an audit
+  row. A `page` that meets a gap reads the floor after the rows, so a reader racing a compaction
+  gets `Error::JournalGone` (map it to HTTP 410; `JournalGone::HTTP_STATUS`), never a gap. Rows
+  below the floor that are still there are served. A chunk read for a manifest that has since been
+  replaced is the transient `Error::JournalSnapshotMoved`: read the manifest again.
+- **One run per scope.** `begin_compaction` takes a lease with a fencing token
+  (`CompactionLeaseHeld` while another holds it unexpired; a lapsed one is taken over),
+  `renew_compaction` and `end_compaction` keep or release it, and `force_release_compaction` is the
+  operator's release of a named owner. Every write checks the lease and the rebuild epoch, so a
+  worker that lost its lease or met a rebuild stops with `CompactionLeaseLost` or
+  `RebuildEpochChanged` and has written nothing more. `compact_with_lease` does all of it.
+- **Rebuilds restore compacted rows**, and leave the manifest; compact again at the same checkpoint
+  to prune them. Compaction never deletes events, and adds nothing to a commit's budget. A commit's
+  counter put is a compare-and-set on the counter it read, so a writer whose read went stale cannot
+  claim positions whose rows were compacted, and a commit never allocates at or below a scope's
+  floor, even after a lost counter. `compact` renews its lease in place during a long run.
+- The first lease declares `journal-compaction` on the feature marker, so a build that predates
+  compaction refuses the table. `photon_evt::conformance::compaction_cases` checks a backend
+  (`CompactionStore`: the in-memory and DynamoDB repositories).
+
 The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md#journal),
 and `photon_evt::conformance::journal_cases` (features `journal` and `conformance`) checks a backend.
 

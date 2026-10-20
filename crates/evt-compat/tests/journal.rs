@@ -1,6 +1,6 @@
-//! The sync journal (ADR 0005, X1) against the local DynamoDB emulator: the shared conformance
-//! cases over private tables, the stored items, the feature marker, and a store end to end. Needs
-//! the `drivers` feature and `AWS_ENDPOINT_URL` pointing at the emulator:
+//! The sync journal (ADR 0005, X1) and its compaction (X2) against the local DynamoDB emulator:
+//! the shared conformance cases over private tables, the stored items, the feature marker, and a
+//! store end to end. Needs the `drivers` feature and `AWS_ENDPOINT_URL` pointing at the emulator:
 //!
 //! ```sh
 //! cargo test -p evt-compat --features drivers --test journal
@@ -12,7 +12,7 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use evt_compat::drivers;
-use photon_evt::conformance::{Add, Ledger, journal_cases};
+use photon_evt::conformance::{Add, Ledger, TestClock, compaction_cases, journal_cases};
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository};
 use photon_evt::journal::{
     Journal, JournalRepository, JournalStore, Scope, allocations, high_watermark, page,
@@ -122,6 +122,14 @@ async fn journal_conforms_and_works_end_to_end() {
         let repository = tables.repository();
 
         journal_cases(&repository, &tables.view_repository()).await;
+        tables.drop().await;
+
+        // Compaction (X2) on tables of its own, with a clock its lease cases move.
+        let tables = Tables::new("cmp").await;
+        let clock = TestClock::starting_now();
+        let repository = tables.repository().with_clock(clock.reader());
+
+        compaction_cases(&repository, &tables.view_repository(), &clock).await;
         tables.drop().await;
 
         Box::pin(stored_items_and_marker()).await;

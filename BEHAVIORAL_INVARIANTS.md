@@ -672,6 +672,38 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 - **Every writer of a journal table must commit through the journal.** The marker cannot tell
   a bypassing writer from a journaling one; its events would be missing from the scopes.
 
+## Journal compaction (X2, Rust-first)
+
+The stored shapes are in the [storage format](docs/spec/storage-format.md#compaction-x2).
+
+- **A snapshot before any delete.** A run stores the canonical chunks of rows `1..=checkpoint`,
+  swaps the scope's manifest (the checkpoint becomes the floor) in one atomic write with the one
+  chunk it rewrites, and only then deletes the rows at or below the floor, then writes the audit
+  row. Every step is idempotent; compacting again finishes an interrupted run. Events are never
+  touched. A manifest that would list more than about 5,500 chunks is refused before any write.
+- **Chunks are canonical.** Split from position 1, closed before the row that would exceed 500 rows
+  or 375,000 payload bytes: compacting in steps stores what one compaction stores.
+- **One compaction per scope, fenced.** The lease row carries an owner, a fencing token that rises
+  on every acquire and takeover, and an expiry; an unexpired lease is refused, a lapsed one taken
+  over, and the operator can force-release a named owner. Every write of a run checks the lease's
+  exact payload and the rebuild epoch the run started under, so a run that lost its lease, or that a
+  rebuild began under, writes nothing more. A run renews its own lease when less than half is left.
+  Compaction does not run while the rebuild generation is odd.
+- **Readers below the floor are handed the snapshot.** A page that meets a gap reads the manifest
+  after the rows; if the floor is above its last contiguous position it fails with `JournalGone`
+  (HTTP 410): the checkpoint, chunk count, and manifest digest, nothing of the deleted rows. The
+  reader installs the chunks (each checked against the manifest's digest) and resumes after the
+  checkpoint. A racing compaction never shows as a gap. Rows below the floor that are still there
+  are served.
+- **No position is allocated twice, rows or no rows.** The commit's counter put is a
+  compare-and-set on the counter it read (absent, or its exact payload), so a writer whose read went
+  stale fails even when compaction deleted the rows that would have refused it. A counter that reads
+  0, or that the journal repairs, is raised to the floor before allocating.
+- **A rebuild restores compacted rows** and leaves the compaction partition alone; compacting again
+  at the floor prunes them. Wiping the views table un-compacts the scope; nothing is lost.
+- **The marker declares it.** The first compaction lease declares `journal-compaction: 1`; builds
+  that do not model it refuse the table. Compaction adds no action to any commit.
+
 ## Projector System
 
 ### EventProjector Interface

@@ -323,6 +323,105 @@
       }
     ]
   },
+  "compaction": {
+    "audit": {
+      "entityID": {
+        "S": "SYSTEM#JOURNAL"
+      },
+      "entityType": {
+        "S": "journal-compaction"
+      },
+      "payload": {
+        "S": "{\"scope\":\"world:7\",\"checkpoint\":2,\"digest\":\"391ae5ca1bf87ee4ececdf90d85b1a1efd6d3bc40720535984537d05d1f092af\",\"chunks\":1,\"deleted\":2,\"owner\":\"compactor-1\",\"token\":1,\"completedAt\":1792000000}"
+      },
+      "pk": {
+        "S": "journal-compaction#world:7"
+      },
+      "sk": {
+        "S": "audit#00000000000000000002"
+      }
+    },
+    "chunks": [
+      {
+        "entityID": {
+          "S": "SYSTEM#JOURNAL"
+        },
+        "entityType": {
+          "S": "journal-compaction"
+        },
+        "payload": {
+          "S": "{\"scope\":\"world:7\",\"index\":0,\"from\":1,\"through\":2,\"rows\":[{\"scope\":\"world:7\",\"position\":1,\"event\":{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJjZW50cyI6NTAwfQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"evt.journal\":\"[{\\\"scope\\\":\\\"world:7\\\",\\\"position\\\":1},{\\\"scope\\\":\\\"world:7/place:3\\\",\\\"position\\\":1}]\"},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}},{\"scope\":\"world:7\",\"position\":2,\"event\":{\"id\":\"acct-1:2\",\"sequence\":2,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJjZW50cyI6MjUwfQ==\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{\"evt.journal\":\"[{\\\"scope\\\":\\\"world:7\\\",\\\"position\\\":2},{\\\"scope\\\":\\\"world:7/place:3\\\",\\\"position\\\":2}]\"},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}}]}"
+        },
+        "pk": {
+          "S": "journal-compaction#world:7"
+        },
+        "sk": {
+          "S": "chunk#00000000000000000000"
+        }
+      }
+    ],
+    "gone": {
+      "after": "1",
+      "checkpoint": "2",
+      "chunkCount": 1,
+      "digest": "391ae5ca1bf87ee4ececdf90d85b1a1efd6d3bc40720535984537d05d1f092af",
+      "httpStatus": 410,
+      "resumeAfter": "2"
+    },
+    "keys": {
+      "audit2": "audit#00000000000000000002",
+      "chunk0": "chunk#00000000000000000000",
+      "lease": "LEASE",
+      "manifest": "MANIFEST",
+      "pk": "journal-compaction#world:7"
+    },
+    "lease": {
+      "entityID": {
+        "S": "SYSTEM#JOURNAL"
+      },
+      "entityType": {
+        "S": "journal-compaction"
+      },
+      "payload": {
+        "S": "{\"scope\":\"world:7\",\"token\":1}"
+      },
+      "pk": {
+        "S": "journal-compaction#world:7"
+      },
+      "sk": {
+        "S": "LEASE"
+      }
+    },
+    "limits": {
+      "maxChunkBytes": 375000,
+      "maxChunkRows": 500
+    },
+    "manifest": {
+      "entityID": {
+        "S": "SYSTEM#JOURNAL"
+      },
+      "entityType": {
+        "S": "journal-compaction"
+      },
+      "payload": {
+        "S": "{\"scope\":\"world:7\",\"checkpoint\":2,\"chunks\":[\"b3a9cd3bf2fa399307a8e530e6ba6ad8ee9145562577e0408b61cd6d1ca509f6\"]}"
+      },
+      "pk": {
+        "S": "journal-compaction#world:7"
+      },
+      "sk": {
+        "S": "MANIFEST"
+      }
+    },
+    "manifestDigest": "391ae5ca1bf87ee4ececdf90d85b1a1efd6d3bc40720535984537d05d1f092af",
+    "note": "world:7 compacted through 2 by compactor-1, then read after 1",
+    "remainingRows": [
+      "3"
+    ]
+  },
+  "compactionMarker": {
+    "features": "{\"journal\":1,\"journal-compaction\":1,\"stream-heads\":1}"
+  },
   "keys": [
     {
       "counterPk": "journal-counter#world:7",

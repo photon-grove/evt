@@ -557,7 +557,7 @@ fn take(counter: &AtomicUsize) -> bool {
 /// before another writer committed, and whose next commits can fail transiently. It counts
 /// backoffs.
 #[derive(Clone)]
-struct Lagging<R> {
+pub(super) struct Lagging<R> {
     inner: R,
     stale_reads: Arc<AtomicUsize>,
     /// The counter a stale read returns.
@@ -568,7 +568,7 @@ struct Lagging<R> {
 }
 
 impl<R> Lagging<R> {
-    fn new(inner: R, stale_reads: usize) -> Self {
+    pub(super) fn new(inner: R, stale_reads: usize) -> Self {
         Self {
             inner,
             stale_reads: Arc::new(AtomicUsize::new(stale_reads)),
@@ -596,13 +596,13 @@ impl<R> Lagging<R> {
 
     /// A stale counter read returns `counter` instead of 0: a writer that read the counter some
     /// commits ago.
-    fn stale_at(mut self, counter: u64) -> Self {
+    pub(super) fn stale_at(mut self, counter: u64) -> Self {
         self.stale_counter = counter;
 
         self
     }
 
-    fn backoffs(&self) -> usize {
+    pub(super) fn backoffs(&self) -> usize {
         self.backoffs.load(Ordering::SeqCst)
     }
 
@@ -635,6 +635,14 @@ impl<R: JournalStore> JournalStore for Lagging<R> {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<crate::journal::JournalRow>, Error>> + Send {
         self.inner.read_rows(scope, after, limit)
+    }
+
+    fn read_compaction_row(
+        &self,
+        scope: &Scope,
+        sort_key: &str,
+    ) -> impl Future<Output = Result<Option<ViewRow>, Error>> + Send {
+        self.inner.read_compaction_row(scope, sort_key)
     }
 }
 
@@ -1002,14 +1010,12 @@ where
     )
     .await?;
 
-    // The rows at 3 and 4 are gone (journal compaction deletes rows), and a writer read both counters
+    // The rows at 3 and 4 are gone (compaction deletes rows, X2), and a writer read both counters
     // at 2 before they were written. Its rows at 3 would be absent: only the counter's
     // compare-and-set refuses the stale attempt, which then reads the counters again.
     for scope in [&world, &place] {
         for position in [3, 4] {
-            views
-                .delete_view(&scope.row_pk(), &row_sk(position))
-                .await?;
+            views.delete_view(&scope.row_pk(), &row_sk(position)).await?;
         }
     }
     let lagging = Lagging::new(repo.clone(), 2).stale_at(2);

@@ -396,6 +396,52 @@ pub enum Error {
     #[error("invalid journal: {0}")]
     InvalidJournal(String),
 
+    /// A journal page asked for rows below the scope's compaction floor that are no longer there
+    /// (ADR 0005, X2): the `410 Gone` handoff. It carries the snapshot that replaces them; install
+    /// it and page on from its checkpoint. Not retryable as it is: the same read is gone again.
+    #[cfg(feature = "journal")]
+    #[error(
+        "journal scope {} is compacted through {}: rows after {} are gone; install snapshot {}",
+        .0.scope, .0.checkpoint, .0.after, .0.digest
+    )]
+    JournalGone(Box<crate::journal::JournalGone>),
+
+    /// A snapshot chunk is missing or does not match the manifest it was read for: a compaction
+    /// swapped the manifest in between (ADR 0005, X2). It is **transient**: read the manifest
+    /// again and start over.
+    #[error("the snapshot of journal scope {scope:?} through {checkpoint} has moved")]
+    JournalSnapshotMoved {
+        /// The scope.
+        scope: String,
+        /// The checkpoint of the manifest the chunk was read for.
+        checkpoint: u64,
+    },
+
+    /// [`begin_compaction`](crate::journal::begin_compaction) found another compaction of the
+    /// scope holding an unexpired lease (ADR 0005, X2). Nothing was written.
+    #[error(
+        "the compaction lease of journal scope {scope:?} is held by {owner:?} until {lease_expires_at} (Unix seconds)"
+    )]
+    CompactionLeaseHeld {
+        /// The scope.
+        scope: String,
+        /// The holder's owner token.
+        owner: String,
+        /// When the holder's lease lapses, in whole Unix seconds.
+        lease_expires_at: i64,
+    },
+
+    /// The caller no longer holds the compaction lease it named (ADR 0005, X2): it was taken over,
+    /// released, or force-released, or it lapsed. The worker must stop; nothing more was written,
+    /// and the scope is consistent.
+    #[error("compaction owner {owner:?} does not hold the lease of journal scope {scope:?}")]
+    CompactionLeaseLost {
+        /// The scope.
+        scope: String,
+        /// The owner token the caller named.
+        owner: String,
+    },
+
     /// The backend failed in a way that may succeed on retry, and running the operation again is
     /// safe: throttling, a deadlock, a serialization failure, or a timed-out read. A commit is only
     /// transient when the backend rejected it. A commit whose outcome is unknown, such as one that
@@ -563,6 +609,7 @@ impl Error {
                 | Self::RebuildConflict { .. }
                 | Self::RebuildUnavailable { .. }
                 | Self::RebuildEpochChanged { .. }
+                | Self::JournalSnapshotMoved { .. }
                 | Self::FenceConflict {
                     provenance: crate::repository::FenceProvenance::Engine,
                     ..

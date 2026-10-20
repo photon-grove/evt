@@ -3208,7 +3208,7 @@ where
 
     other
         .update_manifest(|manifest| {
-            manifest.features.insert("journal-compaction".to_owned(), 1);
+            manifest.features.insert("journal-compaction".to_owned(), 2);
         })
         .await?;
     let manifest = other
@@ -3217,7 +3217,7 @@ where
         .ok_or(Failure("no manifest".into()))?;
     ensure_eq!(
         manifest.features.get("journal-compaction"),
-        Some(&1),
+        Some(&2),
         "the declaration"
     );
 
@@ -3225,7 +3225,7 @@ where
     // cached validation predates the declaration. Maintenance snapshots obey the same refusal.
     let before_snapshot = repo.snapshot(&stream.id).await?;
     for writer in [other, repo] {
-        let unsupported = |err: &Error| matches!(err, Error::UnsupportedFeature { feature, version: 1 } if feature == "journal-compaction");
+        let unsupported = |err: &Error| matches!(err, Error::UnsupportedFeature { feature, version: 2 } if feature == "journal-compaction");
         expect_err(
             stream.commit(writer, stream.events(6..=6), None).await,
             "committing to a table that declares an unsupported extension",
@@ -7055,11 +7055,16 @@ async fn rejection_events_caller_fence<R: Repository>(repo: &R) -> CaseResult {
 }
 
 #[cfg(feature = "journal")]
+mod compaction;
+#[cfg(feature = "journal")]
 mod journal;
 mod rebuild;
 mod view_repository;
 mod views;
 
+#[cfg(feature = "journal")]
+#[cfg_attr(docsrs, doc(cfg(feature = "journal")))]
+pub use compaction::compaction_cases;
 #[cfg(feature = "journal")]
 #[cfg_attr(docsrs, doc(cfg(feature = "journal")))]
 pub use journal::journal_cases;

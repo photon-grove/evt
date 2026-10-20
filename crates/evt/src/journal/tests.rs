@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Journal, JournalRepository, Scope, allocations, high_watermark, page, rebuild_with_lock, replay,
 };
-use crate::conformance::{Add, Claim, Ledger, journal_cases};
+use crate::conformance::{Add, Claim, Ledger, TestClock, compaction_cases, journal_cases};
 use crate::{
     Aggregate, Error, FeatureMarker, MemRepository, Metadata, OutcomeCommand, OutcomeConfig,
     Rejection, Repository, RetryPolicy, SerializedEvent, Store, ToRejection, ViewRepository,
@@ -38,6 +38,48 @@ async fn the_journal_conformance_cases_pass_on_the_in_memory_repository() {
     let repository = MemRepository::new();
 
     journal_cases(&repository, &repository.clone()).await;
+}
+
+#[tokio::test]
+async fn the_compaction_conformance_cases_pass_on_the_in_memory_repository() {
+    let clock = TestClock::starting_now();
+    let repository = MemRepository::new().with_clock(clock.reader());
+
+    compaction_cases(&repository, &repository.clone(), &clock).await;
+}
+
+#[tokio::test]
+async fn a_full_tail_chunk_is_kept_when_compaction_extends_it() {
+    let memory = MemRepository::new();
+    let repository = JournalRepository::new(memory.clone(), journal());
+    let store = Store::<Ledger, _>::new(&repository, ());
+    let all = scope("all");
+    let rows = super::MAX_CHUNK_ROWS as u64;
+
+    for _ in 0..=rows {
+        store
+            .execute("l-1", Add(1), Metadata::new("local"))
+            .await
+            .unwrap();
+    }
+
+    let lease = std::time::Duration::from_secs(60);
+    let first = super::compact_with_lease(&memory, &all, rows, "c", lease)
+        .await
+        .unwrap();
+    assert_eq!((first.chunk_count, first.chunks_written), (1, 1));
+    let full = super::read_manifest(&memory, &all).await.unwrap().unwrap();
+
+    // The tail was exactly full: the next row closes it unchanged, so only the new chunk is
+    // written and the first chunk keeps its digest.
+    let second = super::compact_with_lease(&memory, &all, rows + 1, "c", lease)
+        .await
+        .unwrap();
+    assert_eq!((second.chunk_count, second.chunks_written), (2, 1));
+    let extended = super::read_manifest(&memory, &all).await.unwrap().unwrap();
+    assert_eq!(extended.chunks[0], full.chunks[0]);
+    let tail = super::read_chunk(&memory, &extended, 1).await.unwrap();
+    assert_eq!((tail.from, tail.through), (rows + 1, rows + 1));
 }
 
 #[tokio::test]

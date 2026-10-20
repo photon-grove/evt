@@ -1,18 +1,25 @@
-//! [`JournalStore`] for the DynamoDB repository, over the views table the commit path writes to.
-//! Both reads are strongly consistent: a journal reader must see every row a committed
-//! transaction wrote, or its gap detection would report rows still in flight as lost.
+//! [`JournalStore`] and [`CompactionStore`] for the DynamoDB repository, over the views table the
+//! commit path writes to. Every read is strongly consistent: a journal reader must see every row a
+//! committed transaction wrote, or its gap detection would report rows still in flight as lost.
 
 use std::collections::HashMap;
 
-use aws_sdk_dynamodb::types::{AttributeValue, KeysAndAttributes};
+use aws_sdk_dynamodb::types::{
+    AttributeValue, ConditionCheck, Delete, KeysAndAttributes, TransactWriteItem,
+};
 
-use super::{DynamoRepository, from_sdk_item, s, sdk_error};
+use super::{
+    DynamoRepository, cancellation_reasons, from_sdk_item, put, s, sdk_error, to_sdk_item,
+};
 use crate::error::Error;
 use crate::journal::{
-    COUNTER_PARTITION_PREFIX, COUNTER_SORT_KEY, JournalRow, JournalStore, Scope, parse_row_sk,
+    COUNTER_PARTITION_PREFIX, COUNTER_SORT_KEY, CompactionStore, CompactionWrite,
+    CompactionWritten, Expect, JournalRow, JournalStore, Scope, compaction_pk, parse_row_sk,
     read_counter, row_sk,
 };
-use crate::wire::dynamo::{MAX_VIEW_BATCH_GET, view_row_from_item};
+use crate::projection::ViewRow;
+use crate::rebuild::RebuildEpoch;
+use crate::wire::dynamo::{self as wire, MAX_VIEW_BATCH_GET, view_row_from_item};
 
 impl DynamoRepository {
     fn journal_table(&self) -> Result<&str, Error> {
@@ -199,5 +206,178 @@ impl JournalStore for DynamoRepository {
         rows.truncate(limit);
 
         Ok(rows)
+    }
+
+    async fn read_compaction_row(
+        &self,
+        scope: &Scope,
+        sort_key: &str,
+    ) -> Result<Option<ViewRow>, Error> {
+        let output = self
+            .client
+            .get_item()
+            .table_name(self.journal_table()?)
+            .consistent_read(true)
+            .key("pk", s(&compaction_pk(scope)))
+            .key("sk", s(sort_key))
+            .send()
+            .await
+            .map_err(sdk_error)?;
+
+        output
+            .item
+            .filter(|item| !item.is_empty())
+            .map(|item| view_row_from_item(&from_sdk_item(&item)))
+            .transpose()
+    }
+}
+
+/// The text a view payload is stored as: DynamoDB keeps it as a string.
+fn payload_text(payload: &[u8]) -> Result<String, Error> {
+    String::from_utf8(payload.to_vec())
+        .map_err(|_| Error::InvalidArgument("a compaction payload must be UTF-8".into()))
+}
+
+impl DynamoRepository {
+    /// The transaction item of one compaction write.
+    fn compaction_item(
+        &self,
+        table: &str,
+        write: &CompactionWrite,
+    ) -> Result<TransactWriteItem, Error> {
+        let condition = |expect: &Expect| -> Result<_, Error> {
+            Ok(match expect {
+                Expect::Any => (None, None),
+                Expect::Absent => (Some(wire::VIEW_ABSENT_CONDITION), None),
+                Expect::Payload(payload) => (
+                    Some(wire::COMPACTION_PAYLOAD_CONDITION),
+                    Some(s(&payload_text(payload)?)),
+                ),
+            })
+        };
+
+        match write {
+            CompactionWrite::Put { row, expect } => {
+                let (condition, value) = condition(expect)?;
+                let values: Vec<_> = value
+                    .into_iter()
+                    .map(|value| (":expected", value))
+                    .collect();
+
+                put(table, wire::view_row_item(row)?, condition, &values)
+            }
+            CompactionWrite::Delete { pk, sk, owner } => {
+                let delete = Delete::builder()
+                    .table_name(table)
+                    .key("pk", s(pk))
+                    .key("sk", s(sk))
+                    .condition_expression(wire::VIEW_DELETE_CONDITION)
+                    .expression_attribute_values(wire::OWNER_PLACEHOLDER, s(owner))
+                    .build()
+                    .map_err(Error::backend)?;
+
+                Ok(TransactWriteItem::builder().delete(delete).build())
+            }
+            CompactionWrite::Check { pk, sk, expect } => {
+                let (condition, value) = condition(expect)?;
+                let mut check = ConditionCheck::builder()
+                    .table_name(table)
+                    .key("pk", s(pk))
+                    .key("sk", s(sk))
+                    // A check needs a condition; `Any` checks that the key is a key.
+                    .condition_expression(
+                        condition.unwrap_or("attribute_not_exists(pk) OR attribute_exists(pk)"),
+                    );
+                if let Some(value) = value {
+                    check = check.expression_attribute_values(":expected", value);
+                }
+
+                Ok(TransactWriteItem::builder()
+                    .condition_check(check.build().map_err(Error::backend)?)
+                    .build())
+            }
+        }
+    }
+
+    /// The check that the rebuild generation is still `epoch`'s, on the events table.
+    fn epoch_check(&self, epoch: RebuildEpoch) -> Result<TransactWriteItem, Error> {
+        let generation = epoch.generation();
+        let mut check = ConditionCheck::builder()
+            .table_name(&self.table)
+            .set_key(Some(to_sdk_item(&wire::rebuild_generation_key())))
+            .expression_attribute_names(wire::REBUILD_VALUE_NAME, "value");
+
+        check = if generation == 0 {
+            check.condition_expression(wire::COMPACTION_EPOCH_ZERO_CONDITION)
+        } else {
+            check
+                .condition_expression(wire::COMPACTION_EPOCH_CONDITION)
+                .expression_attribute_values(":epoch", super::n(generation))
+        };
+
+        Ok(TransactWriteItem::builder()
+            .condition_check(check.build().map_err(Error::backend)?)
+            .build())
+    }
+}
+
+/// One `TransactWriteItems` per call: the writes in order, then the epoch check on the events
+/// table. A failed condition names the write (or the epoch check) that failed it; a concurrent
+/// transaction or throttling is transient, since every write here can be sent again.
+impl CompactionStore for DynamoRepository {
+    async fn write_compaction(
+        &self,
+        epoch: Option<RebuildEpoch>,
+        writes: &[CompactionWrite],
+    ) -> Result<CompactionWritten, Error> {
+        crate::journal::check_compaction_writes(writes)?;
+
+        let table = self.journal_table()?.to_owned();
+        let mut items = writes
+            .iter()
+            .map(|write| self.compaction_item(&table, write))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(epoch) = epoch {
+            items.push(self.epoch_check(epoch)?);
+        }
+
+        let Err(err) = self
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(items))
+            .send()
+            .await
+        else {
+            return Ok(CompactionWritten::Written);
+        };
+
+        let codes = cancellation_reasons(&err);
+        if codes.get(writes.len()).copied().flatten() == Some("ConditionalCheckFailed") {
+            return Ok(CompactionWritten::EpochChanged);
+        }
+
+        if let Some(at) = codes
+            .iter()
+            .take(writes.len())
+            .position(|code| *code == Some("ConditionalCheckFailed"))
+        {
+            return Ok(CompactionWritten::Refused(at));
+        }
+
+        let transient = codes.iter().any(|code| {
+            matches!(
+                code,
+                Some("TransactionConflict" | "ThrottlingError" | "ProvisionedThroughputExceeded")
+            )
+        });
+        if transient {
+            return Err(Error::Transient(Box::new(err)));
+        }
+
+        Err(sdk_error(err))
+    }
+
+    fn compaction_now(&self) -> i64 {
+        self.now()
     }
 }

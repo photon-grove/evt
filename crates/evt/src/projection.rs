@@ -107,7 +107,7 @@ pub struct ViewOperation {
     /// The projector's own error for the case where the condition fails. The commit's
     /// [`ProjectorOperationError`] reports it as its [`source`](StdError::source).
     pub conflict: Option<Arc<dyn StdError + Send + Sync + 'static>>,
-    /// An engine-only condition on a put (the journal's counter, ADR 0005): the row must exist,
+    /// An engine-only condition on a put (the journal's counter, ADR 0005 X2): the row must exist,
     /// be the owner's, and hold exactly these payload bytes. Projectors cannot set it, and it is
     /// `None` on every operation they emit. A repository that writes the journal must apply it in
     /// the commit (DynamoDB: `entityID = :owner AND payload = :expected`); one that cannot refuses

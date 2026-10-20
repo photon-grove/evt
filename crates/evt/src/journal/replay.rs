@@ -104,6 +104,11 @@ pub const REBUILD_OWNER: &str = "journal-rebuild";
 /// Rows are rewritten as they were: owned by the event's stream, counters by the engine, with no
 /// `absent` condition. It is idempotent, and it does not delete: a scope's rows that no event holds
 /// stay, which cannot happen to a journal written through commits. Returns the state it wrote.
+///
+/// It **restores compacted rows** (X2): every row is derived from the events, those below a scope's
+/// compaction floor included, and the compaction partition (manifest, chunks, lease, audit) is not
+/// read or written. The floor and its snapshot stay valid, readers below the floor are served the
+/// restored rows, and [`compact`](super::compact) at the manifest's checkpoint prunes them again.
 pub async fn rebuild<'a, F: RebuildFence>(
     fence: &F,
     events: impl IntoIterator<Item = &'a SerializedEvent>,

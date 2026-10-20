@@ -63,6 +63,8 @@
 //! # }
 //! ```
 
+mod compact;
+mod compaction;
 mod config;
 mod projector;
 mod read;
@@ -73,6 +75,21 @@ mod scope;
 #[cfg(test)]
 mod tests;
 
+pub use compact::{
+    COMPACTION_OWNER, CompactionReport, begin_compaction, compact, compact_with_lease,
+    end_compaction, force_release_compaction, read_audit, read_chunk, read_floor, read_lease,
+    read_manifest, renew_compaction,
+};
+#[cfg(any(test, feature = "conformance"))]
+pub(crate) use compaction::ChunkBuilder;
+pub use compaction::{
+    AUDIT_SORT_KEY_PREFIX, CHUNK_SORT_KEY_PREFIX, COMPACTION_ENTITY_TYPE,
+    COMPACTION_PARTITION_PREFIX, CompactionAudit, CompactionChunk, CompactionLease,
+    CompactionManifest, CompactionStore, CompactionWrite, CompactionWritten, Expect, JournalGone,
+    LEASE_SORT_KEY, LeaseRow, MANIFEST_SORT_KEY, MAX_CHUNK_BYTES, MAX_CHUNK_ROWS,
+    MAX_COMPACTION_WRITES, audit_sk, chunk_sk, compaction_pk, compaction_view, released_payload,
+};
+pub(crate) use compaction::{check_compaction_writes, meets};
 pub use config::{
     DEFAULT_MAX_ROW_BYTES, DEFAULT_RETRY, IntoScopes, Journal, MAX_ROW_BYTES, ScopeResolver,
 };

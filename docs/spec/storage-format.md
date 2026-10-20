@@ -1596,9 +1596,9 @@ stored-format version of that feature, a number starting at 1 — the features t
 are `journal` and `journal-compaction` (the Rust-first extensions, ADR 0005), both at format
 version 1, and `stream-heads` (ADR 0007), which every writer models and **requires**: a store
 declares it before a writer writes ([Stream Heads](#required-feature)). `photon-evt` models
-`journal` at format version 1 when built with its `journal` cargo feature and declares it with the
-first journaled commit ([Journal](#feature-marker-and-history)); no build models
-`journal-compaction` yet. The `historyDependent` set declares the entity types whose commit-wide projectors are
+`journal` and `journal-compaction` at format version 1 when built with its `journal` cargo feature;
+it declares `journal` with the first journaled commit ([Journal](#feature-marker-and-history)) and
+`journal-compaction` with the first compaction lease ([Compaction](#compaction-x2)). The `historyDependent` set declares the entity types whose commit-wide projectors are
 history-dependent ([Views](#views)) — compaction is forbidden for them; the `retention` set
 declares the entity types configured with retention (a positive `ttl`) — fences are refused for
 them ([Read Fences](#read-fences)). Both sets are JSON arrays of entity-type names, sorted and deduplicated,
@@ -2617,9 +2617,8 @@ otherwise `entityID = :owner AND payload = :expected`, binding the exact payload
 engine-only view condition, `ViewOperation::expected_payload`; projectors cannot set it, and
 PostgreSQL refuses it). A commit allocates a scope's positions from the counter it read, so the rows
 it writes are the positions above it; if any is taken, or the counter moved, the commit fails whole.
-The rows' `absent` conditions alone are not enough once rows can be deleted (journal compaction,
-X2, deletes them by design): a writer whose read went stale could otherwise claim positions whose
-rows are gone. A commit sets a counter only together
+The rows' `absent` conditions alone would not be enough once [compaction](#compaction-x2) deletes
+rows: a writer whose read went stale could otherwise claim positions whose rows are gone. A commit sets a counter only together
 with the rows up to it, so a counter only moves up while the journal is written through commits.
 It can fall out of step by other means (a rebuild running beside writers, a restore, a lost row of
 the table), and the journal heals a counter that is **behind its rows**: a writer whose position
@@ -2762,6 +2761,136 @@ or a force-release left derived state untrustworthy) or `RebuildEpochChanged` (o
 finished during the read). Both are transient: keep the cursor, back off, and read the same page
 again. The engine's regroup-and-replay of the projector
 (`GroupCommits` → `ReplayViews`) reproduces the rows (not the counters) from the same events.
+
+### Compaction (X2)
+
+Compaction (ADR 0005, X2) deletes a scope's oldest rows, `1..=checkpoint`, after storing them as a
+**snapshot**: a manifest and its chunks. The checkpoint becomes the scope's **floor**. A reader
+whose cursor is below the floor gets a `410 Gone` handoff naming the snapshot, installs it, and pages
+on from the checkpoint. Compaction is explicit (an operator or a scheduled job calls it), per scope,
+and never runs in a command or read path. It never touches events: the journaled entity types are
+history-dependent, so their events are never compacted, and every compacted row can always be
+derived again.
+
+**Rows.** Every compaction row is an ordinary [view row](#views) in the views table, in the scope's
+compaction partition, owned by the engine (`SYSTEM#JOURNAL`, like the counters), with `entityType`
+`journal-compaction`:
+
+| `pk`                          | `sk`                            | Row      | `payload`                                                                                          |
+| ----------------------------- | ------------------------------- | -------- | -------------------------------------------------------------------------------------------------- |
+| `journal-compaction#<scope>`  | `LEASE`                         | lease    | held: `{"scope":…,"token":…,"owner":…,"leaseExpiresAt":…}`; released: `{"scope":…,"token":…}`      |
+| `journal-compaction#<scope>`  | `MANIFEST`                      | manifest | `{"scope":…,"checkpoint":…,"chunks":["<chunk digest>",…]}`                                         |
+| `journal-compaction#<scope>`  | `chunk#<index, 20 digits>`      | chunk    | `{"scope":…,"index":…,"from":…,"through":…,"rows":[<journal row payload>,…]}`                      |
+| `journal-compaction#<scope>`  | `audit#<checkpoint, 20 digits>` | audit    | `{"scope":…,"checkpoint":…,"digest":…,"chunks":…,"deleted":…,"owner":…,"token":…,"completedAt":…}` |
+
+Payloads are encoded by the shared JSON rules, fields in the order shown. A chunk embeds each row's
+`payload` (the row's encoding, the same bytes the journal stored for it), joined by `,`. A **digest** is the lowercase hex SHA-256 of a row's
+`payload`: the manifest lists each chunk's digest by index, and the manifest's own digest identifies
+the snapshot. The full items of a compaction are in `compat/fixtures/journal.json` (`compaction`):
+
+```json
+{
+  "pk": "journal-compaction#world:7",
+  "sk": "MANIFEST",
+  "entityID": "SYSTEM#JOURNAL",
+  "entityType": "journal-compaction",
+  "payload": "{\"scope\":\"world:7\",\"checkpoint\":2,\"chunks\":[\"b3a9cd3bf2fa399307a8e530e6ba6ad8ee9145562577e0408b61cd6d1ca509f6\"]}"
+}
+```
+
+Compaction rows are **not projections** of events and no rebuild writes them, but they hold no
+domain state either: the manifest and chunks are a function of the stored rows and the checkpoint,
+the lease is coordination, and the audit row is a log. Wiping them loses nothing a reader needs: a
+rebuild then restores every row, and the scope reads as never compacted.
+
+**Canonical chunks.** The rows `1..=checkpoint` are split into chunks from position 1, in order: a
+chunk is closed before the row that would make it hold more than **500** rows or a `payload` over
+**375,000** bytes. Both limits are part of the format. A closed chunk depends only on the rows up to
+the one that closed it, so compacting through 4 and then 10 stores the same manifest and chunks as
+compacting through 10 at once: a later run resumes the manifest's last chunk and rewrites only it
+and the chunks after it. The manifest is at most 375,000 bytes too (about 5,500 chunks, some 2.7
+million rows): a run that cannot fit is refused before it writes anything (`InvalidJournal`), and
+again before it writes a chunk the manifest could not list.
+
+**Lease.** A scope has at most one compaction at a time. `begin_compaction(scope, owner, lease)`
+reads the lease row and puts a held lease with the next **token** (1 for a scope with none), its
+expiry the repository's clock plus `lease` in whole seconds, conditioned on the row it read (absent,
+or its exact `payload`). An unexpired lease is refused (`CompactionLeaseHeld`, held up to and
+including its expiry second); a lapsed one is **taken over** the same way. `renew_compaction` and
+`end_compaction` (which writes the released payload, keeping the token) are conditioned on the
+lease's exact payload; `force_release_compaction(scope, owner)` is the operator's: it releases the
+named owner's lease whatever its token or expiry. A lease that no longer matches is
+`CompactionLeaseLost`. The first acquire on a table declares `journal-compaction: 1` on the feature
+marker, after validating the marker (a declared feature this build does not model is refused).
+
+**Writes.** Every compaction write is one `TransactWriteItems` of up to 99 view actions followed by
+a `ConditionCheck` on the rebuild generation item (events table) that it still holds the settled
+epoch the run observed (`#value = :epoch`, or `attribute_not_exists(#value)` for epoch 0). A put
+with an expectation is conditioned `attribute_not_exists(pk)` or `payload = :expected`; a row delete
+carries the view delete's owner condition (`attribute_not_exists(pk) OR entityID = :owner`, the
+row's stream). Every write of a run also checks the lease row's exact payload, and the run stops
+first if its lease has lapsed by the repository's clock. A run renews its lease in place (by the
+lease's length) before a write when less than half of it is left. A failed epoch check is
+`RebuildEpochChanged` (or `RebuildUnavailable`), a failed lease or manifest condition
+`CompactionLeaseLost`; nothing of that transaction is written. Throttling and transaction conflicts
+are transient.
+
+**A run.** `compact(lease, through)` with `floor ≤ through ≤ high watermark` and `through ≥ 1`
+(otherwise `InvalidArgument`, before any write), under a settled rebuild epoch:
+
+1. **Build**, if `through` is above the floor: resume the manifest's last chunk (checked against its
+   digest), read the rows above the floor up to `through` (strongly consistent; a missing row is
+   `InvalidJournal`, before any manifest is written), and chunk them. Each new chunk at a new
+   index is written alone; it is unreferenced until the manifest swap.
+2. **Swap the manifest**: put the new manifest, conditioned on the old one's exact payload (or
+   absent), in the same transaction as the rewritten last chunk of the old manifest, if it changed.
+   From here `through` is the floor.
+3. **Delete** every journal row at or below `through` that is there, 98 per transaction.
+4. **Audit**: put `audit#<through>` (overwriting a previous run's of the same checkpoint).
+
+A run with `through` equal to the floor skips steps 1 and 2: it finishes an interrupted run, or
+prunes rows a rebuild restored. Every step is idempotent and leaves the scope consistent, so a run
+that stops for any reason is finished by compacting again. `compact_with_lease` takes a lease,
+runs, and releases it (also after a failure). A crash between writing new chunks and the swap
+leaves unreferenced chunks at indexes the next run overwrites. Compaction is maintenance with its
+own transactions: no commit carries a compaction action, so the commit budget is unchanged
+(97 event and projector operations, 96 with a snapshot).
+
+**Readers and `410 Gone`.** `page` is unchanged until it meets a gap. It then reads the manifest
+(after the rows), and if the floor is above the page's last contiguous position (`next_after`) the
+read fails with `JournalGone`: the scope, `after`, the snapshot's `checkpoint`, its chunk count, and
+its manifest digest, and nothing of the deleted rows. An HTTP layer maps it to status 410. The
+reader fetches the manifest (`read_manifest`) and each chunk (`read_chunk`, checked against the
+manifest's digest; a chunk missing or not matching is the transient `JournalSnapshotMoved`: read the
+manifest again), installs the rows, sets its cursor to `checkpoint`, and pages on. Because a run
+swaps the manifest before it deletes a row, a reader that sees a deleted row always reads the floor
+that explains it, so a compaction racing a reader never shows as a gap. Rows below the floor that
+are still there are served as usual. The `JournalGone` vector is in the fixture (`compaction.gone`).
+
+**Allocation.** A compacted scope's rows below the floor no longer guard their positions. Two rules
+keep positions unique without adding an action to the commit:
+
+- The counter put is a compare-and-set on the counter the commit read (Ownership above). A writer
+  that read the counter before other commits and a compaction deleted their rows fails on the
+  counter, re-reads it, and allocates again.
+- A commit whose counter reads 0 (a new scope, or a lost counter), and every counter the journal
+  repairs, allocates above the scope's floor too (one more strongly consistent read of the
+  manifest), so a lost counter never reallocates a compacted position.
+
+A counter lowered to a nonzero value below the floor by means outside the engine (a partial restore
+of the views table) is not detected; as for X1, restore the views table whole, or rebuild it.
+
+**Rebuild.** A rebuild **restores** compacted rows: it derives every row from the stored events and
+does not read or write the compaction partition. The manifest stays, so the floor and the snapshot
+stay valid (the restored rows are byte for byte the chunks' rows), and readers below the floor are
+served the restored rows. Compacting again at the manifest's checkpoint prunes them. Compaction is
+fenced against rebuilds through the epoch: `begin_compaction` and `compact` refuse an odd generation
+(`RebuildUnavailable`), and a rebuild that begins during a run stops it at its next write. A wipe of
+the views table removes the compaction rows with the journal; the rebuild then yields an
+uncompacted journal.
+
+**Marker.** A build that models `journal` but not `journal-compaction` refuses a compacted table: it
+would read deleted rows as a gap and could allocate below the floor.
 
 ### Backends
 

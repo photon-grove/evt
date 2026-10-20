@@ -132,6 +132,14 @@ impl<R: JournalStore> JournalStore for JournalRepository<R> {
     ) -> impl Future<Output = Result<Vec<JournalRow>, Error>> + Send {
         self.inner.read_rows(scope, after, limit)
     }
+
+    fn read_compaction_row(
+        &self,
+        scope: &Scope,
+        sort_key: &str,
+    ) -> impl Future<Output = Result<Option<crate::projection::ViewRow>, Error>> + Send {
+        self.inner.read_compaction_row(scope, sort_key)
+    }
 }
 
 /// A commit the journal can stage: the streams' event lists in canonical order, and a place to add
@@ -309,10 +317,12 @@ where
     /// lowered counter) allocates from that row's position instead, and the commit writes the
     /// counter back.
     ///
-    /// The commit's counter put is conditioned on the stored counter it read, so a writer whose
-    /// read went stale fails on the counter even when the rows that would have refused it are
-    /// gone (deleted rows; journal compaction, X2, deletes them by design) instead of
-    /// reallocating a position.
+    /// A compacted scope's rows below its floor are gone, so neither a missing counter nor the
+    /// highest row can show positions a compaction deleted. A counter that reads 0 (a new scope,
+    /// or a lost counter), and every counter being repaired, allocates from the scope's compaction
+    /// floor at least. The commit's counter put is conditioned on the stored counter it read, so
+    /// a writer whose read went stale (another commit, then a compaction, deleted the rows that
+    /// would have refused it) fails instead of reallocating a position.
     async fn read_counters(&self, scopes: &[Scope], repair: bool) -> Result<Counters, Error> {
         let values = self.inner.read_counters(scopes).await?;
         let mut counters = Counters::default();
@@ -322,6 +332,10 @@ where
 
             if repair {
                 base = base.max(self.inner.read_last_position(scope).await?);
+            }
+
+            if repair || base == 0 {
+                base = base.max(super::compact::read_floor(&self.inner, scope).await?);
             }
 
             counters.stored.insert(scope.clone(), stored);

@@ -109,6 +109,12 @@ Rust-first is justified because:
   promises against Go and unaware Rust builds; it cannot tell journaling writers from bypassing
   ones in a build that has the feature. Making acceptance per repository means touching every
   backend's marker validation, a commit-path change; it is tracked as a follow-up.
+- **Journal compaction (X2) declares `journal-compaction`.** Its rows live in the views table under
+  `journal-compaction#<scope>`, engine-owned like the counters; they are not projections, but hold
+  no domain state (a snapshot of stored rows, a lease, an audit log), so wiping them only
+  un-compacts the journal. A rebuild restores compacted rows rather than reading the floor, which
+  keeps the journal a pure function of the events; compacting again prunes them. See the storage
+  format, "Compaction (X2)".
 - **Extension tables opt in explicitly.** A table is either journal-enabled (marker row declares
   it, Rust writes, Go refuses) or not (both languages behave as today). There is no partial state
   where a Go writer could half-understand the format.
