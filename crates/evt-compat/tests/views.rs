@@ -110,6 +110,8 @@ struct Query {
     start_key: Option<Value>,
     #[serde(rename = "consistentSet")]
     consistent_set: bool,
+    #[serde(rename = "consistentRead")]
+    consistent_read: bool,
 }
 
 #[derive(Deserialize)]
@@ -251,9 +253,14 @@ fn query_requests_match_go() {
             case.start_key,
             "{name}: start key"
         );
-        // Go reads a list eventually consistently, so the request sets no ConsistentRead; the
-        // Rust repository sets none either.
-        assert!(!case.consistent_set, "{name}: consistent read");
+        // Go reads a partition of the table strongly and leaves ConsistentRead unset on the
+        // entity-type index, which cannot be read consistently. The Rust repository sends
+        // ConsistentRead exactly when the query reads the table (the request bodies are pinned in
+        // view_requests.rs).
+        let table = case.index.is_empty();
+        assert_eq!(case.consistent_set, table, "{name}: consistent read set");
+        assert_eq!(case.consistent_read, table, "{name}: consistent read");
+        assert_eq!(query.reads_base_table(), table, "{name}: reads the table");
     }
 }
 

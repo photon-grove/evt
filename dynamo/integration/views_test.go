@@ -5,9 +5,11 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"testing"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
+	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -88,4 +90,60 @@ func (s *DynamoEventsIntegrationSuite) Test_Views_ListByEntityType() {
 	require.True(s.T(), seen[pk1])
 	require.True(s.T(), seen[pk2])
 	require.False(s.T(), seen[pkOther])
+}
+
+// Test_Views_CommitThenListPage reads a partition page straight after each commit that changes it
+// (put, overwrite, delete) and sees the new state: the partition listing is a strongly consistent
+// base-table query, so a request handler can commit and read its own write. The emulator is always
+// consistent, so the request shape itself is pinned by Test_ViewRepository_ReadConsistency.
+func Test_Views_CommitThenListPage(t *testing.T) {
+	ctx := context.Background()
+	events, _ := newIsolatedEventLog(ctx, t)
+	client := isolatedClient
+	viewsTable := newIsolatedViewsTable(ctx, t, client)
+
+	writer := dynamo.NewRepository(client, events.EventsTable).WithViewsTable(viewsTable)
+	views := dynamo.NewViewRepository(client, viewsTable)
+
+	id := evt.EntityID("ryw-" + newID())
+	pk := "ryw#" + string(id)
+
+	commit := func(sequence evt.EventSequence, op evt.ViewOperation) {
+		t.Helper()
+
+		serialized, err := evt.SerializeEvents(
+			[]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, sequence, id, evt.Metadata{},
+		)
+		require.NoError(t, err)
+		for i := range serialized {
+			serialized[i].EntityType = "test"
+		}
+
+		require.NoError(t, writer.Commit(ctx, evt.SerializedResult{
+			Events: serialized,
+			Views:  []evt.ProjectedView{{Projector: "ryw", Op: op}},
+		}))
+	}
+
+	page := func() []*evt.SerializedView {
+		t.Helper()
+
+		result, err := views.ListViewsByPKPaged(ctx, pk, 10, "")
+		require.NoError(t, err)
+
+		return result.Views
+	}
+
+	commit(0, evt.PutView(pk, "row", id, "test", []byte(`{"v":1}`)))
+	rows := page()
+	require.Len(t, rows, 1, "the committed row")
+	require.JSONEq(t, `{"v":1}`, string(rows[0].Payload))
+
+	commit(1, evt.PutView(pk, "row", id, "test", []byte(`{"v":2}`)))
+	rows = page()
+	require.Len(t, rows, 1, "the overwritten row")
+	require.JSONEq(t, `{"v":2}`, string(rows[0].Payload))
+
+	commit(2, evt.DeleteView(pk, "row", id))
+	require.Empty(t, page(), "the deleted row")
 }

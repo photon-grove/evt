@@ -47,6 +47,16 @@ impl ViewPage {
 
 /// Reads and writes view rows by key, partition, and entity type.
 ///
+/// **Consistency.** A point read ([`get_view_at`](Self::get_view_at),
+/// [`batch_get_views_at`](Self::batch_get_views_at) and their defaults) and a partition listing
+/// ([`list_views_by_pk_paged`](Self::list_views_by_pk_paged),
+/// [`list_views_by_pk`](Self::list_views_by_pk)) see every row a commit wrote once the commit has
+/// returned, so a request handler can commit and then read its own write. The in-memory repository
+/// is trivially consistent; [`DynamoViewRepository`](crate::dynamodb::DynamoViewRepository) reads
+/// its base table strongly consistently (its `with_consistent_read(false)` trades that for half
+/// the read cost on partition listings). An entity-type listing may lag behind a commit: DynamoDB
+/// serves it from a global secondary index, which can only be read eventually consistently.
+///
 /// A `limit` of `None` or `Some(0)` leaves the page size to the backend (DynamoDB: its 1 MB
 /// response cap). A `cursor` is the opaque [`ViewPage::next_cursor`] of an earlier page of the
 /// same listing: base64url JSON of the last key, byte-identical to Go's, so a cursor can move
@@ -69,7 +79,9 @@ pub trait ViewRepository: Send + Sync {
     /// Deleting a row that is not there succeeds.
     fn delete_view(&self, pk: &str, sk: &str) -> impl Future<Output = Result<(), Error>> + Send;
 
-    /// One page of the rows of a partition, ascending by `sk` bytes.
+    /// One page of the rows of a partition, ascending by `sk` bytes. It reflects every commit
+    /// that has returned (DynamoDB: a strongly consistent query of the base table, unless the
+    /// repository opted out).
     fn list_views_by_pk_paged(
         &self,
         pk: &str,
