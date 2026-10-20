@@ -94,7 +94,9 @@ impl DynamoRepository {
             )
         } else {
             (
-                lock.condition_expression(wire::REBUILD_ACQUIRE_LOCK_CONDITION),
+                // The put replaces the item a force-release left; a held lock never matches.
+                lock.condition_expression(wire::REBUILD_ACQUIRE_LOCK_CONDITION)
+                    .expression_attribute_values(":true", sdk::AttributeValue::Bool(true)),
                 generation
                     .update_expression(wire::REBUILD_ACQUIRE_UPDATE)
                     .condition_expression(wire::REBUILD_ACQUIRE_CONDITION)
@@ -137,9 +139,11 @@ impl DynamoRepository {
             .map_err(Error::backend)
     }
 
-    /// A release's or a force-release's two actions: the lock delete (the lease's owner and
-    /// fencing token for a release, the named owner for a force-release) and the bump of the odd
-    /// generation, `seen_odd` (the lease's for a release, the one read for a force-release).
+    /// A release's or a force-release's two actions: the lock delete (a release, conditioned on
+    /// the lease's owner and fencing token) or the put of the force-released item in its place (a
+    /// force-release, conditioned on the named owner), and the bump of the odd generation,
+    /// `seen_odd` (the lease's for a release, the one read for a force-release). The
+    /// force-released item keeps every commit's lock check failing until a rebuild ends.
     pub(super) fn rebuild_release_items(
         &self,
         release: Release,
@@ -159,19 +163,35 @@ impl DynamoRepository {
             ),
         };
 
-        let mut delete = Delete::builder()
-            .table_name(&self.table)
-            .set_key(Some(to_sdk_item(&wire::rebuild_lock_key())))
-            .condition_expression(condition)
-            .expression_attribute_names(wire::REBUILD_OWNER_NAME, "owner")
-            .expression_attribute_values(placeholder, s(owner));
-        if let Release::End = release {
-            // The lease's fencing token is the odd generation it holds the lock at.
-            delete = delete
-                .expression_attribute_names(wire::REBUILD_GENERATION_NAME, "generation")
-                .expression_attribute_values(":generation", n(seen_odd));
-        }
-        let delete = delete.build().map_err(Error::backend)?;
+        let lock = match release {
+            Release::End => {
+                // The lease's fencing token is the odd generation it holds the lock at.
+                let delete = Delete::builder()
+                    .table_name(&self.table)
+                    .set_key(Some(to_sdk_item(&wire::rebuild_lock_key())))
+                    .condition_expression(condition)
+                    .expression_attribute_names(wire::REBUILD_OWNER_NAME, "owner")
+                    .expression_attribute_values(placeholder, s(owner))
+                    .expression_attribute_names(wire::REBUILD_GENERATION_NAME, "generation")
+                    .expression_attribute_values(":generation", n(seen_odd))
+                    .build()
+                    .map_err(Error::backend)?;
+
+                TransactWriteItem::builder().delete(delete).build()
+            }
+            Release::Force => {
+                let put = Put::builder()
+                    .table_name(&self.table)
+                    .set_item(Some(to_sdk_item(&wire::rebuild_force_released_item())))
+                    .condition_expression(condition)
+                    .expression_attribute_names(wire::REBUILD_OWNER_NAME, "owner")
+                    .expression_attribute_values(placeholder, s(owner))
+                    .build()
+                    .map_err(Error::backend)?;
+
+                TransactWriteItem::builder().put(put).build()
+            }
+        };
 
         let mut generation = Update::builder()
             .table_name(&self.table)
@@ -188,7 +208,7 @@ impl DynamoRepository {
         };
 
         Ok(vec![
-            TransactWriteItem::builder().delete(delete).build(),
+            lock,
             TransactWriteItem::builder()
                 .update(generation.build().map_err(Error::backend)?)
                 .build(),
@@ -242,8 +262,9 @@ impl DynamoRepository {
             .map_err(Box::new)
     }
 
-    /// A release or a force-release of the odd generation `seen`: deletes the lock row and bumps
-    /// the generation in one transaction.
+    /// A release or a force-release of the odd generation `seen`: deletes the lock row (or, for a
+    /// force-release, replaces it with the force-released item) and bumps the generation in one
+    /// transaction.
     async fn release_rebuild(
         &self,
         owner: &str,
@@ -292,7 +313,8 @@ impl RebuildFence for DynamoRepository {
             .rebuild_item(wire::rebuild_lock_key())
             .await?
             .map(|item| wire::rebuild_lock_from_item(&item))
-            .transpose()?;
+            .transpose()?
+            .flatten();
 
         Ok(RebuildState { generation, lock })
     }

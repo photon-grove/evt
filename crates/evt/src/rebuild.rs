@@ -3,16 +3,18 @@
 //! Two engine rows in the reserved `SYSTEM#` namespace fence projection rebuilds against live
 //! writers and readers: a **lock row** ([`REBUILD_LOCK_ID`]) naming the rebuild that holds the
 //! fence and when its lease lapses, and a **generation** counter ([`REBUILD_GENERATION_ID`]) that
-//! is odd while a rebuild is in progress. Every commit carries a check that the lock row is absent,
-//! so no commit lands while any rebuild holds the lock, an expired one included
-//! ([`Error::RebuildInProgress`]); readers of derived state fence their reads against the
-//! generation ([`RebuildEpoch`]).
+//! is odd while a rebuild is in progress. Every commit carries a check that the generation is
+//! settled, so no commit lands while any rebuild holds the lock, an expired one included, or after
+//! a force-release until a rebuild ends ([`Error::RebuildInProgress`]); readers of derived state
+//! fence their reads against the generation ([`RebuildEpoch`]). On DynamoDB the check is the
+//! absence of the lock item, which a force-release keeps in place, so it costs no extra action.
 //!
 //! Every backend implements the lifecycle ([`RebuildFence`]): [`begin`](RebuildFence::begin_rebuild)
 //! acquires the lock (or takes over an expired lease) and returns a [`RebuildLease`],
 //! [`renew`](RebuildFence::renew_rebuild) extends it, [`end`](RebuildFence::end_rebuild) releases
 //! it and settles the generation, and [`force_release`](RebuildFence::force_release_rebuild) is the
-//! operator's escape hatch that unblocks commits at once while leaving readers fenced. A rebuild
+//! operator's escape hatch that ends a wedged worker's lease at once, leaving readers fenced and
+//! commits refused until a new rebuild ends. A rebuild
 //! worker writes its view rows through [`write_rebuild_views`](RebuildFence::write_rebuild_views),
 //! whose every batch asserts the worker still holds an unexpired lease.
 //!
@@ -78,8 +80,10 @@ pub(crate) const NO_MATCH: i64 = -1;
 /// whether the last release was a force-release.
 ///
 /// The value is odd if and only if a rebuild is in progress, with one exception: a force-release
-/// deletes the lock but leaves the value odd and sets `force_released`, which means "derived state
-/// untrustworthy", not "rebuild in progress". Readers treat every odd value alike.
+/// releases the lock but leaves the value odd and sets `force_released`, which means "derived
+/// state untrustworthy", not "rebuild in progress". Readers and commits treat every odd value
+/// alike: a reader gets [`Error::RebuildUnavailable`] and a commit [`Error::RebuildInProgress`]
+/// until a rebuild ends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RebuildGeneration {
     /// The counter, bumped by every acquire, takeover, release, and force-release.
@@ -122,7 +126,8 @@ impl RebuildLock {
 pub struct RebuildState {
     /// The generation.
     pub generation: RebuildGeneration,
-    /// The lock row, `None` when none exists.
+    /// The lock row, `None` when no lock is held (none exists, or only the item a force-release
+    /// leaves on DynamoDB).
     pub lock: Option<RebuildLock>,
 }
 
@@ -203,10 +208,12 @@ pub trait RebuildFence: Send + Sync {
     ) -> impl Future<Output = Result<RebuildGeneration, Error>> + Send;
 
     /// The operator's release of a named owner's lock, for a lost or wedged worker (it names the
-    /// owner alone, not a lease, because the operator holds none): deletes the
-    /// lock row, so commits resume at once, but leaves the generation odd (two more) and flagged,
-    /// so readers stay fenced until a later rebuild begins and ends. Fails with
-    /// [`Error::RebuildLeaseLost`] when the lock row is gone or names another owner. It never runs
+    /// owner alone, not a lease, because the operator holds none): ends the lease at once, so a
+    /// new rebuild can begin without waiting for it to lapse, but leaves the generation odd (two
+    /// more) and flagged. The released rebuild may have left derived state half-written (wiped
+    /// rows, cleared journal counters), so readers stay fenced and every commit is still refused
+    /// with [`Error::RebuildInProgress`] until a later rebuild begins and ends. Fails with
+    /// [`Error::RebuildLeaseLost`] when no lock is held or it names another owner. It never runs
     /// the rebuild's cleanup.
     fn force_release_rebuild(
         &self,

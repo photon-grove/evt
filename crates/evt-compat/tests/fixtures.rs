@@ -995,8 +995,8 @@ async fn rebuild_fence_vectors_match_go() {
         serde_json::json!({
             "generation": (state.generation != RebuildGeneration::default())
                 .then(|| dynamo::rebuild_generation_item(state.generation)),
-            "lock": state.lock.as_ref()
-                .map(dynamo::rebuild_lock_item),
+            // The lock, or the item a force-release leaves in its place.
+            "lock": dynamo::rebuild_lock_item_of(state),
         })
     };
     let error = |error: Error| match error {
@@ -1028,7 +1028,7 @@ async fn rebuild_fence_vectors_match_go() {
                 .map(|item| dynamo::rebuild_generation_from_item(&item).unwrap())
                 .unwrap_or_default(),
             lock: item(&vector["before"]["lock"])
-                .map(|item| dynamo::rebuild_lock_from_item(&item).unwrap()),
+                .and_then(|item| dynamo::rebuild_lock_from_item(&item).unwrap()),
         };
         assert_eq!(
             items(&before),

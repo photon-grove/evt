@@ -26,6 +26,12 @@ func (r *memRebuild) state() evt.RebuildState {
 	return state
 }
 
+// unsettled reports whether commits are refused: a lock is held, or a force-release left the
+// generation odd. The caller holds mu.
+func (r *memRebuild) unsettled() bool {
+	return r.lock != nil || r.generation%2 != 0
+}
+
 // WithClock returns a copy of the repository, sharing its streams, that reads the given clock for
 // rebuild lease expiry. Intended for tests; production callers leave it unset to use time.Now.
 func (repo Repository) WithClock(now func() time.Time) *Repository {
@@ -144,7 +150,8 @@ func (f memFence) End(_ context.Context, lease evt.RebuildLease) (evt.RebuildGen
 	return rebuild.state().Generation, nil
 }
 
-// ForceRelease deletes the named owner's lock and leaves the generation odd and flagged.
+// ForceRelease releases the named owner's lock and leaves the generation odd and flagged, so
+// commits stay refused until a rebuild ends.
 func (f memFence) ForceRelease(_ context.Context, owner string) (evt.RebuildGeneration, error) {
 	if err := evt.CheckRebuildOwner(owner); err != nil {
 		return evt.RebuildGeneration{}, err
