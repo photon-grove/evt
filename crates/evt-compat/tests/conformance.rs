@@ -13,9 +13,9 @@ use deadpool_postgres::Pool;
 use evt_compat::drivers::{self, DynamoHeads, PostgresHeads};
 use futures_core::Stream as _;
 use photon_evt::conformance::{
-    Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, Suite, ViewTarget, commit_view_cases,
-    committed_view_cases, enumeration_cases, feature_marker_cases, fresh_store_cases,
-    outcome_cases, view_repository_cases,
+    Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, RebuildSuite, Suite, TestClock,
+    ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, feature_marker_cases,
+    fresh_store_cases, outcome_cases, view_repository_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
@@ -234,6 +234,7 @@ async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
     dynamo_legacy_reserved_reads(&repository).await;
     dynamo_enumeration(&repository).await;
     Box::pin(dynamo_fresh_and_unmigrated_tables(&repository)).await;
+    Box::pin(dynamo_rebuild_rows_leave_a_table_fresh(repository.client())).await;
     Box::pin(dynamo_retained_stream_heads(&repository)).await;
 }
 
@@ -436,6 +437,24 @@ async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
         table: views.clone(),
     };
     commit_view_cases(&writer, &rows).await;
+
+    // The rebuild fence (C10) over the same private tables, with an injected clock: the lock is
+    // table-wide, and every case leaves it settled.
+    let clock = TestClock::starting_now();
+    let rebuilds = writer.clone().with_clock(clock.reader());
+    Box::pin(
+        RebuildSuite::new(&rebuilds, &clock)
+            .with_views(DynamoViewRows {
+                client: client.clone(),
+                table: views.clone(),
+            })
+            .with_head_fixtures(DynamoHeads::new(
+                client.clone(),
+                repository.table().to_owned(),
+            ))
+            .run(),
+    )
+    .await;
 
     // The stored item has exactly the five string attributes, an empty entity type included.
     let store = Store::<Ledger, _>::new(&writer, ()).with_commit_projector(std::sync::Arc::new(
@@ -1668,20 +1687,21 @@ async fn postgres_conforms() {
         .unwrap();
     feature_marker_cases(&repository, &second).await;
     outcome_cases(&repository, &second).await;
-    Box::pin(postgres_commit_wide_views(&repository)).await;
+    Box::pin(postgres_commit_wide_views(&repository, &events)).await;
     postgres_outcome_row_matches_the_wire_format(&repository, &events).await;
     postgres_features_text_matches_the_manifest(&repository, &events).await;
     postgres_refuses_projector_only_transactions(&repository).await;
     postgres_legacy_reserved_reads(&repository, &events, &snapshots).await;
     postgres_enumeration(&repository, &events).await;
     Box::pin(postgres_fresh_and_unmigrated_databases()).await;
+    Box::pin(postgres_rebuild_relations(repository.pool().clone())).await;
     repository
         .pool()
         .get()
         .await
         .unwrap()
         .batch_execute(&format!(
-            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads"
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
         ))
         .await
         .expect("drop the isolated event log");
@@ -1782,7 +1802,7 @@ impl CommitViewTarget<PostgresRepository> for PostgresViewRows {
 
 /// Commit-wide view operations (v0.9, C7) against PostgreSQL: the shared cases, the SQLSTATE
 /// reasons of other statement failures, and the refusals that need no writer or a bad one.
-async fn postgres_commit_wide_views(repository: &PostgresRepository) {
+async fn postgres_commit_wide_views(repository: &PostgresRepository, events: &str) {
     let pool = repository.pool().clone();
     pool.get()
         .await
@@ -1798,6 +1818,18 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository) {
     let writer = repository.clone().with_view_writer(postgres_view_writer());
     let rows = PostgresViewRows { pool: pool.clone() };
     commit_view_cases(&writer, &rows).await;
+
+    // The rebuild fence (C10) over the same private tables, with an injected clock: the lock is
+    // table-wide, and every case leaves it settled.
+    let clock = TestClock::starting_now();
+    let rebuilds = writer.clone().with_clock(clock.reader());
+    Box::pin(
+        RebuildSuite::new(&rebuilds, &clock)
+            .with_views(PostgresViewRows { pool: pool.clone() })
+            .with_head_fixtures(PostgresHeads::new(pool.clone(), events.to_owned()))
+            .run(),
+    )
+    .await;
 
     let id = |label: &str| {
         EntityId::new(format!(
@@ -2708,4 +2740,495 @@ async fn postgres_enumeration(repository: &PostgresRepository, events_table: &st
 
     enumeration_cases(repository).await;
     assert_no_reserved(&batches(repository.stream_all_events(StreamFilter::all())).await);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rebuild fence's DynamoDB requests (C10), against a recording endpoint
+// ---------------------------------------------------------------------------------------------
+
+/// A minimal DynamoDB endpoint on a local port, answering each request with `respond(target,
+/// body)` and recording every request as `(target, body)`. It needs no emulator: it stands in for
+/// one where the cases pin the exact requests and choose the responses.
+struct RecordingEndpoint {
+    url: String,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+type Responder = dyn Fn(&str, &serde_json::Value) -> (u16, serde_json::Value) + Send + Sync;
+
+impl RecordingEndpoint {
+    fn start(
+        respond: impl Fn(&str, &serde_json::Value) -> (u16, serde_json::Value) + Send + Sync + 'static,
+    ) -> Self {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let respond: std::sync::Arc<Responder> = std::sync::Arc::new(respond);
+
+        let recorded = calls.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let (recorded, respond) = (recorded.clone(), respond.clone());
+
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+
+                    // One request after another on a kept-alive connection, until it closes.
+                    loop {
+                        let mut target = String::new();
+                        let mut length = 0;
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let header = line.trim_end();
+                            if header.is_empty() {
+                                break;
+                            }
+                            if let Some((name, value)) = header.split_once(':') {
+                                match name.trim().to_ascii_lowercase().as_str() {
+                                    "x-amz-target" => target = value.trim().to_owned(),
+                                    "content-length" => length = value.trim().parse().unwrap(),
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        let mut body = vec![0; length];
+                        reader.read_exact(&mut body).unwrap();
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let operation = target.rsplit('.').next().unwrap_or_default().to_owned();
+                        let (status, response) = respond(&operation, &body);
+                        recorded.lock().unwrap().push((operation, body));
+
+                        let response = response.to_string();
+                        write!(
+                            writer,
+                            "HTTP/1.1 {status} X\r\nContent-Type: application/x-amz-json-1.0\r\n\
+                             Content-Length: {}\r\n\r\n{response}",
+                            response.len()
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+
+        Self { url, calls }
+    }
+
+    /// A repository over the endpoint, with the given tables, reading `clock`.
+    fn repository(&self, table: &str, views: &str, clock: &TestClock) -> DynamoRepository {
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .region(aws_sdk_dynamodb::config::Region::new("us-west-2"))
+            .endpoint_url(&self.url)
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+            .build();
+
+        DynamoRepository::new(aws_sdk_dynamodb::Client::from_conf(config), table)
+            .with_views_table(views)
+            .with_clock(clock.reader())
+    }
+
+    /// The recorded requests, in the shape of the shared fixtures' `calls`.
+    fn calls(&self) -> Vec<serde_json::Value> {
+        use serde_json::{Value, json};
+
+        let action = |operation: &str, body: &Value| {
+            let mut action = json!({"operation": operation, "tableName": body["TableName"]});
+            for (from, to) in [
+                ("Key", "key"),
+                ("Item", "item"),
+                ("UpdateExpression", "updateExpression"),
+                ("ConditionExpression", "conditionExpression"),
+                ("ExpressionAttributeNames", "expressionAttributeNames"),
+                ("ExpressionAttributeValues", "expressionAttributeValues"),
+            ] {
+                if !body[from].is_null() {
+                    action[to] = body[from].clone();
+                }
+            }
+
+            action
+        };
+
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(operation, body)| match operation.as_str() {
+                "GetItem" => json!({"call": "GetItem",
+                    "consistentRead": body["ConsistentRead"],
+                    "actions": [action("Get", body)]}),
+                "UpdateItem" => json!({"call": "UpdateItem", "actions": [action("Update", body)]}),
+                "TransactWriteItems" => json!({"call": "TransactWriteItems",
+                    "actions": body["TransactItems"].as_array().unwrap().iter().map(|item| {
+                        let (operation, inner) = item.as_object().unwrap().iter().next().unwrap();
+                        action(operation, inner)
+                    }).collect::<Vec<_>>()}),
+                other => panic!("unexpected request {other}"),
+            })
+            .collect()
+    }
+}
+
+/// A cancelled transaction whose failed item is `failed`, of `items`.
+fn cancelled_response(items: usize, failed: usize) -> (u16, serde_json::Value) {
+    let reasons: Vec<_> = (0..items)
+        .map(|index| {
+            serde_json::json!({"Code": if index == failed { "ConditionalCheckFailed" } else { "None" }})
+        })
+        .collect();
+
+    (
+        400,
+        serde_json::json!({
+            "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+            "message": "Transaction cancelled",
+            "CancellationReasons": reasons,
+        }),
+    )
+}
+
+/// The rebuild-fence vectors Go recorded (`rebuildFence` in `feature-marker.json`): run against an
+/// endpoint that holds each vector's state, every lifecycle operation sends exactly the recorded
+/// requests, in order, and returns the recorded result.
+#[tokio::test]
+async fn dynamo_rebuild_requests_replay_the_go_vectors() {
+    use photon_evt::RebuildFence;
+    use serde_json::{Value, json};
+
+    let data =
+        std::fs::read(evt_compat::scenario::compat_dir().join("fixtures/feature-marker.json"))
+            .unwrap();
+    let fixtures: Value = serde_json::from_slice(&data).unwrap();
+
+    for vector in fixtures["rebuildFence"].as_array().unwrap() {
+        let name = vector["name"].as_str().unwrap().to_owned();
+        let before = vector["before"].clone();
+        let lost = vector["result"]["error"] == "leaseLost";
+
+        let endpoint = RecordingEndpoint::start(move |operation, body| match operation {
+            "GetItem" => {
+                let stored = if body["Key"]["pk"]["S"] == "SYSTEM#REBUILD" {
+                    &before["lock"]
+                } else {
+                    &before["generation"]
+                };
+
+                (
+                    200,
+                    if stored.is_null() {
+                        json!({})
+                    } else {
+                        json!({"Item": stored})
+                    },
+                )
+            }
+            "UpdateItem" if lost => (
+                400,
+                json!({"__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+                    "message": "The conditional request failed"}),
+            ),
+            "TransactWriteItems" if lost => {
+                let items = body["TransactItems"].as_array().unwrap().len();
+                // A release fails on its lock delete, a guarded write on its guard, the last item.
+                let guarded = body["TransactItems"][items - 1]["ConditionCheck"].is_object();
+
+                cancelled_response(items, if guarded { items - 1 } else { 0 })
+            }
+            _ => (200, json!({})),
+        });
+        let clock = TestClock::at(1_790_000_000);
+        let repository = endpoint.repository("evt-compat", "views", &clock);
+        let owner = vector["owner"].as_str().unwrap_or_default();
+        // The lease a renew, an end, or a guarded write names: its owner and fencing token.
+        let held = photon_evt::RebuildLease {
+            owner: owner.to_owned(),
+            generation: vector["leaseGeneration"].as_i64().unwrap_or_default(),
+            lease_expires_at: 0,
+        };
+        let lease = Duration::from_secs(vector["leaseSeconds"].as_u64().unwrap_or_default());
+
+        let error = |error: Error| match error {
+            Error::RebuildLockHeld { .. } => json!({"error": "lockHeld"}),
+            Error::RebuildLeaseLost { .. } => json!({"error": "leaseLost"}),
+            other => panic!("{name}: unexpected {other}"),
+        };
+        let generation = |generation: photon_evt::RebuildGeneration| {
+            let mut result = json!({"generation": generation.value});
+            if generation.force_released {
+                result["forceReleased"] = json!(true);
+            }
+
+            result
+        };
+
+        let result = match vector["operation"].as_str().unwrap() {
+            "state" => {
+                let state = repository.rebuild_state().await.unwrap();
+                let mut result = generation(state.generation);
+                if let Some(lock) = state.lock {
+                    result["lockOwner"] = json!(lock.owner);
+                    result["leaseExpiresAt"] = json!(lock.lease_expires_at);
+                }
+
+                result
+            }
+            "generation" => generation(repository.rebuild_generation().await.unwrap()),
+            "begin" => match repository.begin_rebuild(owner, lease).await {
+                Ok(lease) => json!({"generation": lease.generation,
+                    "leaseExpiresAt": lease.lease_expires_at}),
+                Err(err) => error(err),
+            },
+            "renew" => match repository.renew_rebuild(&held, lease).await {
+                Ok(renewed) => json!({"leaseExpiresAt": renewed.lease_expires_at}),
+                Err(err) => error(err),
+            },
+            "end" => repository
+                .end_rebuild(&held)
+                .await
+                .map_or_else(error, generation),
+            "forceRelease" => repository
+                .force_release_rebuild(owner)
+                .await
+                .map_or_else(error, generation),
+            "writeViews" => {
+                let views = [
+                    photon_evt::ProjectedView::new(
+                        "rebuild",
+                        0,
+                        0,
+                        ViewOperation::put("rebuilt", "row-1", "acct-1", "account", r#"{"n":1}"#),
+                    ),
+                    photon_evt::ProjectedView::new(
+                        "rebuild",
+                        0,
+                        1,
+                        ViewOperation::delete("rebuilt", "row-2", "acct-2"),
+                    ),
+                ];
+
+                match repository.write_rebuild_views(&held, &views).await {
+                    Ok(()) => json!({}),
+                    Err(err) => error(err),
+                }
+            }
+            other => panic!("{name}: unknown operation {other}"),
+        };
+
+        assert_eq!(
+            json!(endpoint.calls()),
+            vector["calls"],
+            "{name}: the requests"
+        );
+        assert_eq!(result, vector["result"], "{name}: the result");
+    }
+}
+
+/// `begin_rebuild` reads the generation, then the lock row. A transition that lands between the
+/// two reads shows a pair no transaction produces: it reads both again and decides again, and
+/// only a pair that stays inconsistent through every attempt is reported.
+#[tokio::test]
+async fn dynamo_rebuild_begin_reads_again_after_a_torn_read() {
+    use photon_evt::RebuildFence;
+    use serde_json::json;
+
+    let lock = json!({"pk": {"S": "SYSTEM#REBUILD"}, "sk": {"N": "0"},
+        "owner": {"S": "winner"}, "generation": {"N": "1"},
+        "leaseExpiresAt": {"N": "1790000600"}});
+    let generation = json!({"pk": {"S": "SYSTEM#REBUILD#GENERATION"}, "sk": {"N": "0"},
+        "value": {"N": "1"}});
+
+    // The first generation read sees no item; the winner's acquire lands before the lock read.
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = reads.clone();
+    let (torn_lock, torn_generation) = (lock.clone(), generation.clone());
+    let endpoint = RecordingEndpoint::start(move |operation, body| {
+        assert_eq!(operation, "GetItem", "a held lock is never written");
+        let read = counted.fetch_add(1, Ordering::SeqCst);
+
+        if body["Key"]["pk"]["S"] == "SYSTEM#REBUILD" {
+            (200, json!({"Item": torn_lock}))
+        } else if read == 0 {
+            (200, json!({}))
+        } else {
+            (200, json!({"Item": torn_generation}))
+        }
+    });
+    let clock = TestClock::at(1_790_000_000);
+    let repository = endpoint.repository("evt-compat", "views", &clock);
+    let result = repository
+        .begin_rebuild("loser", Duration::from_secs(60))
+        .await;
+    assert!(
+        matches!(&result, Err(Error::RebuildLockHeld { owner, .. }) if owner == "winner"),
+        "{result:?}"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 4, "two passes of two reads");
+
+    // A pair that stays inconsistent is reported after the last attempt, without a write.
+    let endpoint = RecordingEndpoint::start(move |operation, body| {
+        assert_eq!(
+            operation, "GetItem",
+            "an inconsistent state is never written"
+        );
+
+        if body["Key"]["pk"]["S"] == "SYSTEM#REBUILD" {
+            (200, json!({"Item": lock}))
+        } else {
+            (200, json!({}))
+        }
+    });
+    let repository = endpoint.repository("evt-compat", "views", &clock);
+    let result = repository
+        .begin_rebuild("loser", Duration::from_secs(60))
+        .await;
+    assert!(
+        matches!(result, Err(Error::RebuildStateInvalid(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        endpoint.calls().len(),
+        2 * photon_evt::MAX_REBUILD_BEGIN_ATTEMPTS,
+        "every attempt read both items"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rebuild rows and fresh or older stores (C10)
+// ---------------------------------------------------------------------------------------------
+
+/// The rebuild rows live in the reserved namespace, so a table that holds nothing but them is
+/// still fresh: its first writer declares `stream-heads` itself and commits.
+async fn dynamo_rebuild_rows_leave_a_table_fresh(client: &aws_sdk_dynamodb::Client) {
+    use photon_evt::RebuildFence;
+
+    let table = format!(
+        "evt-conformance-rebuild-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    create_dynamo_table(client, &table).await;
+
+    let repository = DynamoRepository::new(client.clone(), &table);
+    let lease = repository
+        .begin_rebuild("fresh", Duration::from_secs(60))
+        .await
+        .unwrap();
+    repository.end_rebuild(&lease).await.unwrap();
+
+    Store::<Ledger, _>::new(&repository, ())
+        .execute("fresh-ledger", Add(1), Metadata::new("local"))
+        .await
+        .expect("the first writer of a table holding only the rebuild rows commits");
+    let manifest = photon_evt::FeatureMarker::read_manifest(&repository)
+        .await
+        .unwrap()
+        .expect("the writer declared the manifest");
+    assert!(manifest.declares_stream_heads(), "{manifest:?}");
+    assert_eq!(
+        repository.rebuild_generation().await.unwrap().value,
+        2,
+        "the generation survives"
+    );
+
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .expect("delete the table");
+}
+
+/// A schema that predates the rebuild fence has neither relation: commits treat the missing lock
+/// relation as no lock, the lifecycle fails until `ensure_schema` creates them, and a log holding
+/// only the rebuild rows is still fresh for its first writer.
+async fn postgres_rebuild_relations(pool: Pool) {
+    use photon_evt::RebuildFence;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let events = format!("rb_{nanos:x}");
+    let snapshots = format!("{events}s");
+    let repository = PostgresRepository::new(pool.clone())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    repository.ensure_schema().await.unwrap();
+
+    // Fresh: a rebuild before any commit leaves the log fresh for its first writer.
+    let lease = repository
+        .begin_rebuild("fresh", Duration::from_secs(60))
+        .await
+        .unwrap();
+    repository.end_rebuild(&lease).await.unwrap();
+    let store = Store::<Ledger, _>::new(&repository, ());
+    store
+        .execute("fresh-ledger", Add(1), Metadata::new("local"))
+        .await
+        .expect("the first writer of a log holding only the rebuild rows commits");
+
+    // Older: without the relations, a new handle's commits pass the lock check and the lifecycle
+    // fails.
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
+        ))
+        .await
+        .unwrap();
+    let older = PostgresRepository::new(pool.clone())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    Store::<Ledger, _>::new(&older, ())
+        .execute("fresh-ledger", Add(2), Metadata::new("local"))
+        .await
+        .expect("a commit on a log that predates the fence");
+    let result = older.begin_rebuild("older", Duration::from_secs(60)).await;
+    assert!(matches!(result, Err(Error::Backend(_))), "{result:?}");
+
+    // Once the schema is ensured again, the fence works and fences that handle's commits.
+    older.ensure_schema().await.unwrap();
+    let lease = older
+        .begin_rebuild("older", Duration::from_secs(60))
+        .await
+        .unwrap();
+    let refused = Store::<Ledger, _>::new(&older, ())
+        .execute("fresh-ledger", Add(3), Metadata::new("local"))
+        .await;
+    assert!(
+        matches!(
+            refused.as_ref().err().and_then(|err| err.as_store_error()),
+            Some(Error::RebuildInProgress)
+        ),
+        "{refused:?}"
+    );
+    older.end_rebuild(&lease).await.unwrap();
+
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, \
+             {events}__evt_command_outcomes, {events}__evt_stream_heads, \
+             {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
+        ))
+        .await
+        .expect("drop the isolated event log");
 }

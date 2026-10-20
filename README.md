@@ -192,10 +192,10 @@ types in the marker so every process refuses them). Every commit, single
 or multi-stream, is checked against the shared 100-item / 3.8 MB / 380 KB budget and fails with
 `*evt.CommitTooLargeError` before any write, on every backend. The budget counts the actions a
 commit actually emits. Every written stream is protected by one conditional update of its **head
-item** (ADR 0007), so a single-stream commit leaves room for 98 events and projector operations
-whether it creates its stream or appends to it, and 97 when it also writes a snapshot; all drop by
-one when the rebuild-lock check (C10) starts being emitted. A fence is one check of the same head
-item. A commit whose first sequence skips past the stream's stored head is refused with
+item** (ADR 0007), so a single-stream commit leaves room for 97 events and projector operations
+whether it creates its stream or appends to it, and 96 when it also writes a snapshot (the
+feature-marker check and the rebuild-lock check are in every commit). A fence is one check of the
+same head item. A commit whose first sequence skips past the stream's stored head is refused with
 `*evt.SequenceGapError`, and a stream whose head item disagrees with its log fails with
 `*evt.StreamHeadDriftError` (never retried). A store must declare the `stream-heads` feature before
 a writer writes to it; an empty store is declared by its first writer, and a store written before
@@ -232,9 +232,9 @@ store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{}) // evt.Co
 - A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` reports the capability,
   so a decorator reports its wrapped repository's) and `evt.HistoryDeclarer` for history-dependent
   projectors, or the commit is refused.
-- Operations land after the feature-marker check and before the written streams, in projector
+- Operations land after the feature-marker and rebuild-lock checks and before the written streams, in projector
   declaration order then emission order, and count against the shared budget (a single-stream
-  commit leaves room for 98 events and view operations together, 97 with a snapshot).
+  commit leaves room for 97 events and view operations together, 96 with a snapshot).
 - A failed condition returns `*evt.ProjectorOperationError`, which names the projector and the
   operation and wraps the operation's mapped error. It writes nothing, is not a conflict and not
   transient, and is never retried or recorded as an outcome; stream conflicts, drift, gaps, and a
@@ -255,6 +255,55 @@ store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{}) // evt.Co
 
 A custom `Repository` receives these operations as `SerializedResult.Views`; one that cannot write
 them in the commit's transaction **must return an error** rather than ignore them.
+
+### Rebuild fence (v0.9, C10)
+
+Rebuilds are fenced by the framework, not by a flag your jobs pass around. A rebuild worker takes a
+durable lock, and while it holds the lock **every commit is refused** with `*evt.RebuildInProgressError`
+(`errors.Is(err, evt.ErrRebuildInProgress)`): live writers can never interleave with the view rows a
+rebuild is rewriting. Every repository provides the fence (`evt.RebuildFenceProvider`):
+
+```go
+fence := repo.(evt.RebuildFenceProvider).RebuildFence()
+
+lease, err := fence.Begin(ctx, "rebuild-2026-10", 5*time.Minute) // acquire, or take over an expired lease
+// ... wipe and replay, renewing the lease while it runs:
+lease, err = fence.Renew(ctx, lease, 5*time.Minute)
+// ... write view batches under the lease guard (at most 99 operations each):
+err = fence.WriteViews(ctx, lease, batch) // *evt.RebuildLeaseLostError: stop, you were replaced
+// ... and release it:
+_, err = fence.End(ctx, lease)
+```
+
+- **Refusal is transient, never a conflict.** A commit that meets the lock is retried with a backoff
+  by fence-aware retry and returned as `*evt.RebuildInProgressError` when the attempts run out; it
+  is never exhausted into a `stale-fence` rejection, records no outcome (a rejection decided
+  during a rebuild is not recorded either), and the same command ID runs again once the rebuild
+  ends. `policy.Classify` reports it transient. An expired lock still blocks commits until it is
+  taken over or force-released: waiting out a crashed rebuild is the price of never writing beside
+  one.
+- **Generation.** The fence keeps a counter that is odd while a rebuild is in progress and even when
+  it is quiesced. `Begin` takes it up by one (two for a takeover or after a force-release) and `End`
+  by one more. `ForceRelease(ctx, owner)` is the operator's escape hatch for a wedged worker: it
+  deletes the lock so commits resume at once, but leaves the generation odd and flagged, so readers
+  stay fenced until a later rebuild begins and ends — the force-released rebuild may have written
+  only some of its batches.
+- **Readers fence a decision against the generation.** `evt.ReadAtRebuildEpoch(ctx, fence, read)`
+  (or `ObserveRebuildEpoch` and `epoch.Verify`) reads the generation before and after the read and
+  fails with `*evt.RebuildUnavailableError` (odd: a rebuild is running, or a force-release left
+  derived state untrustworthy) or `*evt.RebuildEpochChangedError` (a rebuild began and ended while
+  the read ran). A command handler that read a derived view returns that error as its own: the
+  engine returns it at once and records no outcome, so a decision made on a half-rebuilt view is
+  never persisted as an accepted or rejected outcome.
+- A lease is the owner token **and** the generation `Begin` returned, its fencing token: `Renew`,
+  `End`, and `WriteViews` take the whole `evt.RebuildLease`, so a worker whose lease lapsed cannot
+  renew, write for, or end the lease of a later incarnation that took over under the same owner
+  token (`*evt.RebuildLeaseLostError`).
+- Leases are whole seconds on the repository's clock (`WithClock` in tests); the owner token is any
+  string up to 512 bytes without U+0000. The rows are the reserved `SYSTEM#REBUILD` and `SYSTEM#REBUILD#GENERATION`
+  items on DynamoDB, and the `{events}__evt_rebuild_lock` and `{events}__evt_rebuild_generation`
+  tables on PostgreSQL (`EnsureSchema` creates them). See the [storage
+  format](docs/spec/storage-format.md#rebuild-fence) for the exact transactions.
 
 ### Command outcomes and rejections (v0.9, C3/C4)
 

@@ -421,9 +421,10 @@ func (repo *Repository) commitTransactionItems(
 		return cerr
 	}
 
-	// The rebuild-lock check (C10, action group 2) will sit here, between the marker check and the
-	// projector operations, once the rebuild fence lands; until then no action is emitted for it.
-	control := []types.TransactWriteItem{check}
+	// The rebuild-lock check (C10, action group 2) sits right after the marker check and before
+	// the projector operations: it fails whenever any rebuild holds the lock, an expired one
+	// included (storage spec, Writes).
+	control := []types.TransactWriteItem{check, repo.rebuildLockCheck()}
 
 	combined := make([]types.TransactWriteItem, 0, len(control)+len(transactItems)+len(viewItems)+len(streamItems))
 	combined = append(combined, control...)
@@ -447,12 +448,17 @@ func (repo *Repository) commitTransactionItems(
 	return nil
 }
 
+// controlItems is the number of control checks every commit starts with: the feature-marker check
+// and the rebuild-lock check (storage spec, Writes). The transaction groups' operations, the view
+// operations, and the stream items follow them.
+const controlItems = 2
+
 // classifyCommitFailure routes a failed commit by the transaction items that failed, ranked
-// marker, outcome put, stream head drift, sequence gap, any other conflict on a stream or a fence,
-// then projector operations. Control items (the feature-marker check) are prepended to the
-// transaction, so their failure is classified separately and the remaining indices shift by their
-// count. The projector items — the transaction groups', then the commit-wide views' — sit between
-// the control items and the stream items.
+// marker, rebuild lock, outcome put, stream head drift, sequence gap, any other conflict on a
+// stream or a fence, then projector operations. Control items are prepended to the transaction,
+// so their failure is classified separately and the remaining indices shift by their count. The
+// projector items — the transaction groups', then the commit-wide views' — sit between the control
+// items and the stream items.
 func (repo *Repository) classifyCommitFailure(
 	ctx context.Context,
 	transaction evt.Transaction,
@@ -464,7 +470,7 @@ func (repo *Repository) classifyCommitFailure(
 	if !ok {
 		// A view item can fail for a reason that is not a condition (an invalid item); no retry can
 		// fix it, so it is the projector's typed error.
-		if failure := viewReasonFailure(layout.views, 1+len(transactItems), cancellationCodes(err), err); failure != nil {
+		if failure := viewReasonFailure(layout.views, controlItems+len(transactItems), cancellationCodes(err), err); failure != nil {
 			return failure
 		}
 
@@ -487,11 +493,21 @@ func (repo *Repository) classifyCommitFailure(
 		return repo.features.handleCheckFailure(ctx, err)
 	}
 
+	codes := cancellationCodes(err)
+
+	// A failed rebuild-lock check outranks everything below it: a rebuild holds the lock, so the
+	// commit is refused whatever else its cancellation reasons say, and no failure-path probe runs.
+	// It is transient (the lock may be released, taken over, or force-released) and never a
+	// conflict: fence-aware retry runs the command again after a backoff and returns this error
+	// when the attempts run out.
+	if conditionFailed(codes, 1) {
+		return wrapClassifiedError(&evt.RebuildInProgressError{})
+	}
+
 	// The layout's indexes are relative to the stream items, which sit after the control items
 	// and the projector operations in the combined transaction.
-	viewBase := 1 + len(transactItems)
+	viewBase := controlItems + len(transactItems)
 	base := viewBase + len(layout.views)
-	codes := cancellationCodes(err)
 
 	// A lost outcome put outranks every other item's failure but the marker: the command already
 	// has an outcome, and re-preparing it as a generic conflict can never resolve that. Reading the
@@ -508,8 +524,8 @@ func (repo *Repository) classifyCommitFailure(
 
 	// Only projector operations failed: the first in transaction order is reported, so a projector
 	// condition surfaces only when nothing ranked above it did.
-	if i-1 < len(transactItems) {
-		offset := 1
+	if i-controlItems < len(transactItems) {
+		offset := controlItems
 		for _, group := range transaction {
 			if i-offset < group.Len() {
 				return group.HandleError(err, i-offset)

@@ -1158,7 +1158,108 @@ pub type PrepareFuture<'t> = Pin<Box<dyn Future<Output = Result<Decision, Error>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conformance::{Added, Ledger};
+    use crate::conformance::{Added, Ledger, LedgerEvent};
+
+    /// An aggregate whose handler decides on derived state under the reader epoch check, reading
+    /// the generation through its services.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct Gauge;
+
+    #[derive(Clone)]
+    struct Decide;
+
+    impl OutcomeCommand for Decide {
+        fn command_type(&self) -> String {
+            "gauge:decide".into()
+        }
+
+        fn canonical_payload(&self) -> Result<Option<Vec<u8>>, BoxError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error(transparent)]
+    struct Unready(Error);
+
+    impl ToRejection for Unready {
+        fn to_rejection(&self) -> Option<Rejection> {
+            None
+        }
+    }
+
+    impl Aggregate for Gauge {
+        const TYPE: &'static str = "gauge";
+
+        type Command = Decide;
+        type Event = LedgerEvent;
+        type Error = Unready;
+        /// The fence to read the generation from, and a count of the handler's runs.
+        type Services = (crate::MemRepository, Arc<std::sync::atomic::AtomicUsize>);
+
+        async fn handle(
+            &self,
+            _: Decide,
+            (fence, runs): &Self::Services,
+        ) -> Result<Vec<LedgerEvent>, Unready> {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            crate::read_at_rebuild_epoch(fence, |_| async {
+                Ok::<_, Error>(vec![Added { amount: 1 }.into()])
+            })
+            .await
+            .map_err(Unready)
+        }
+
+        fn apply(&mut self, _: LedgerEvent) {}
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_read_derived_state_during_a_rebuild_fails_at_once_with_no_outcome() {
+        use crate::RebuildFence;
+
+        let repository = crate::MemRepository::new();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = Store::<Gauge, _>::new(repository.clone(), (repository.clone(), runs.clone()))
+            .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(5)));
+        let metadata = || Metadata::default().with_command_id("cmd-1");
+
+        let lease = repository
+            .begin_rebuild("rebuild-1", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let error = store
+            .execute_with_outcome("g-1", Decide, metadata())
+            .await
+            .unwrap_err();
+
+        // The handler's own error: returned at once, never retried, and nothing recorded.
+        let Error::Handler(source) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(
+            matches!(
+                source.downcast_ref::<Unready>(),
+                Some(Unready(Error::RebuildUnavailable { generation: 1, .. }))
+            ),
+            "{source}"
+        );
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the handler ran once"
+        );
+        assert!(repository.outcome(&"cmd-1".into()).await.unwrap().is_none());
+        assert!(repository.events(&"g-1".into()).await.unwrap().is_empty());
+
+        // Once the rebuild is over the same command ID runs.
+        repository.end_rebuild(&lease).await.unwrap();
+        let outcome = store
+            .execute_with_outcome("g-1", Decide, metadata())
+            .await
+            .unwrap();
+        assert!(outcome.is_accepted());
+    }
 
     #[test]
     fn serializing_past_the_maximum_sequence_fails() {

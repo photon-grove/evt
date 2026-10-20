@@ -2151,49 +2151,50 @@ async fn read_fences<R: Repository>(repo: &R) -> CaseResult {
 async fn commit_too_large<R: Repository>(repo: &R) -> CaseResult {
     let stream = Stream::new(&namespace(), "large", "ledger");
 
-    // An append costs the same as a create (ADR 0007): the marker check, the head update, and 98
-    // event puts are exactly 100 actions. There is no continuation check.
+    // An append costs the same as a create (ADR 0007): the feature-marker check, the rebuild-lock
+    // check, the head update, and 97 event puts are exactly 100 actions. There is no continuation
+    // check.
     let grows = Stream::new(&namespace(), "grows", "ledger");
     grows.commit(repo, grows.events(1..=1), None).await?;
-    let result = grows.commit(repo, grows.events(2..=100), None).await;
+    let result = grows.commit(repo, grows.events(2..=99), None).await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "99 appended events are one action too many: {result:?}"
+        "98 appended events are one action too many: {result:?}"
     );
-    grows.commit(repo, grows.events(2..=99), None).await?;
+    grows.commit(repo, grows.events(2..=98), None).await?;
     ensure_eq!(
         repo.events(&grows.id).await?.len(),
-        99,
-        "98 appended events fit"
+        98,
+        "97 appended events fit"
     );
 
-    // The same 98 events fit when the commit creates the stream. Only emitted actions count.
+    // The same 97 events fit when the commit creates the stream. Only emitted actions count.
     let fits = Stream::new(&namespace(), "fits", "ledger");
-    fits.commit(repo, fits.events(1..=98), None).await?;
+    fits.commit(repo, fits.events(1..=97), None).await?;
     ensure_eq!(
         repo.events(&fits.id).await?.len(),
-        98,
+        97,
         "a commit that fills the budget exactly is accepted"
     );
 
     // A snapshot put is one more action beside the head update, so a commit that creates a stream
-    // and writes its first snapshot holds 97 events, not 98: the one case that costs more.
+    // and writes its first snapshot holds 96 events, not 97: the one case that costs more.
     let snapshotted = Stream::new(&namespace(), "snapshotted", "ledger");
     let result = snapshotted
         .commit(
             repo,
-            snapshotted.events(1..=98),
+            snapshotted.events(1..=97),
             Some(snapshotted.new_snapshot(1, "{}")),
         )
         .await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "98 events and a snapshot are one action too many: {result:?}"
+        "97 events and a snapshot are one action too many: {result:?}"
     );
     snapshotted
         .commit(
             repo,
-            snapshotted.events(1..=97),
+            snapshotted.events(1..=96),
             Some(snapshotted.new_snapshot(1, "{}")),
         )
         .await?;
@@ -6441,56 +6442,57 @@ async fn outcome_atomicity<R: Repository>(repo: &R) -> CaseResult {
 async fn outcome_budget<R: Repository>(repo: &R) -> CaseResult {
     let accepted = |command| Outcome::accepted(command, "digest");
 
-    // marker check + head update + 97 event puts + outcome put = 100 actions.
+    // marker check + rebuild-lock check + head update + 96 event puts + outcome put = 100
+    // actions.
     let creates = Stream::new(&namespace(), "creates", "ledger");
     let command = command_id();
     let result = creates
-        .commit_with_outcome(repo, creates.events(1..=98), accepted(command.clone()))
+        .commit_with_outcome(repo, creates.events(1..=97), accepted(command.clone()))
         .await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "98 events plus the outcome are one action too many: {result:?}"
+        "97 events plus the outcome are one action too many: {result:?}"
     );
     ensure!(
         repo.events(&creates.id).await?.is_empty() && repo.outcome(&command).await?.is_none(),
         "an oversized commit writes nothing"
     );
     creates
-        .commit_with_outcome(repo, creates.events(1..=97), accepted(command.clone()))
+        .commit_with_outcome(repo, creates.events(1..=96), accepted(command.clone()))
         .await?;
     ensure_eq!(
         repo.outcome(&command)
             .await?
             .map(|stored| stored.event_ids.len()),
-        Some(97),
-        "97 events fill the budget with the outcome"
+        Some(96),
+        "96 events fill the budget with the outcome"
     );
 
     // Appending costs the same as creating: the head update replaces the continuation check, so
-    // marker + head update + 97 puts + outcome fill the budget.
+    // marker + lock + head update + 96 puts + outcome fill the budget.
     let grows = Stream::new(&namespace(), "grows", "ledger");
     grows.commit(repo, grows.events(1..=1), None).await?;
     let result = grows
-        .commit_with_outcome(repo, grows.events(2..=99), accepted(command_id()))
+        .commit_with_outcome(repo, grows.events(2..=98), accepted(command_id()))
         .await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "98 appended events plus the outcome are one too many: {result:?}"
+        "97 appended events plus the outcome are one too many: {result:?}"
     );
     grows
-        .commit_with_outcome(repo, grows.events(2..=98), accepted(command_id()))
+        .commit_with_outcome(repo, grows.events(2..=97), accepted(command_id()))
         .await?;
     ensure_eq!(
         repo.events(&grows.id).await?.len(),
-        98,
-        "97 appended events fit"
+        97,
+        "96 appended events fit"
     );
 
     // The same arithmetic holds for a transaction.
     let multi = Stream::new(&namespace(), "multi", "ledger");
     let result = repo
         .commit_transaction(
-            TransactionCommit::new(vec![write(&multi, 1..=98)])
+            TransactionCommit::new(vec![write(&multi, 1..=97)])
                 .with_outcome(accepted(command_id())),
         )
         .await;
@@ -6499,11 +6501,11 @@ async fn outcome_budget<R: Repository>(repo: &R) -> CaseResult {
         "a transaction counts the outcome item too: {result:?}"
     );
     repo.commit_transaction(
-        TransactionCommit::new(vec![write(&multi, 1..=97)]).with_outcome(accepted(command_id())),
+        TransactionCommit::new(vec![write(&multi, 1..=96)]).with_outcome(accepted(command_id())),
     )
     .await?;
 
-    // An outcome-only commit is the marker check and the outcome put.
+    // An outcome-only commit is the two control checks and the outcome put.
     let command = command_id();
     repo.commit_transaction(
         TransactionCommit::<R::Operation>::new(Vec::new()).with_outcome(accepted(command.clone())),
@@ -6804,18 +6806,18 @@ async fn rejection_events_rules<R: Repository>(repo: &R) -> CaseResult {
     let creates = Stream::new(&namespace(), "budget", "ledger");
     let command = command_id();
     let result = creates
-        .commit_with_outcome(repo, creates.events(1..=98), rejected(command.clone()))
+        .commit_with_outcome(repo, creates.events(1..=97), rejected(command.clone()))
         .await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "98 events plus the row are one action too many: {result:?}"
+        "97 events plus the row are one action too many: {result:?}"
     );
     ensure!(
         repo.events(&creates.id).await?.is_empty() && repo.outcome(&command).await?.is_none(),
         "an oversized commit writes nothing"
     );
     creates
-        .commit_with_outcome(repo, creates.events(1..=97), rejected(command_id()))
+        .commit_with_outcome(repo, creates.events(1..=96), rejected(command_id()))
         .await?;
 
     // The same bound holds for a command: a transaction that stages too many events with its
@@ -7052,8 +7054,10 @@ async fn rejection_events_caller_fence<R: Repository>(repo: &R) -> CaseResult {
     Ok(())
 }
 
+mod rebuild;
 mod view_repository;
 mod views;
 
+pub use rebuild::{NoViewRows, RebuildSuite, TestClock};
 pub use view_repository::{committed_view_cases, view_repository_cases};
 pub use views::{CommitViewTarget, commit_view_cases};

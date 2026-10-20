@@ -60,6 +60,14 @@ const (
 	ResultIDTooLong = "idTooLong" // CommandIdTooLong, before any write
 	ResultAmbiguous = "ambiguous" // an ambiguous write proven not to have applied
 	ResultAbsent    = "absent"    // resolveOutcome found no outcome row
+
+	// Rebuild-fence results (ADR 0004, C10). ResultRebuildInProgress is a commit refused because a
+	// rebuild holds the lock; the others are the results of the rebuild op's actions.
+	ResultRebuildInProgress = "rebuildInProgress"
+	ResultHeld              = "held"        // Begin found an unexpired lock
+	ResultLeaseLost         = "leaseLost"   // the caller does not hold the lock
+	ResultSettled           = "settled"     // a reader's observe found an even generation
+	ResultUnavailable       = "unavailable" // a reader's observe found an odd generation
 )
 
 // Injected commit faults (the injectCommitFault step field).
@@ -89,6 +97,10 @@ type Scenario struct {
 	// Projector registers the shared LedgerProjector (a commit-wide projector) on the scenario's
 	// stores, so every commit that writes events also writes ledger rows.
 	Projector bool `json:"projector,omitempty"`
+
+	// Exclusive runs the scenario alone, after the interleaved scenarios, because it holds
+	// store-wide state across steps: a rebuild lock refuses every other scenario's commits.
+	Exclusive bool `json:"exclusive,omitempty"`
 
 	Steps []Step `json:"steps"`
 }
@@ -132,6 +144,14 @@ type Step struct {
 	// Snapshot.Sequence covering events through EventSequence.
 	Snapshot      *TransactionSnapshot `json:"snapshot,omitempty"`
 	EventSequence *int64               `json:"eventSequence,omitempty"`
+
+	// Action, Owner, LeaseSeconds, and Seconds drive rebuild steps (C10): the lifecycle action
+	// (begin, renew, end, forceRelease, generation, writeViews, wait), the owner token (scoped to
+	// the run and scenario), the lease, and the length of a wait.
+	Action       string `json:"action,omitempty"`
+	Owner        string `json:"owner,omitempty"`
+	LeaseSeconds int64  `json:"leaseSeconds,omitempty"`
+	Seconds      int64  `json:"seconds,omitempty"`
 }
 
 // Identity is the command identity of an outcomeOnly step: its type string and payload object.
@@ -164,11 +184,19 @@ type Outcome struct {
 	Projector string `json:"projector,omitempty"`
 	Operation int    `json:"operation,omitempty"`
 	Mapped    string `json:"mapped,omitempty"`
+
+	// Delta, ForceReleased, and Rows are the observations of a rebuild step: the generation after
+	// the step minus the generation before it, the force-release flag after it, and (writeViews)
+	// the number of view rows in the scenario's rebuild partition after it.
+	Delta         int64 `json:"delta,omitempty"`
+	ForceReleased bool  `json:"forceReleased,omitempty"`
+	Rows          int   `json:"rows,omitempty"`
 }
 
 func (o Outcome) String() string {
-	return fmt.Sprintf("%s(events=%d, deleted=%d, code=%q, replayed=%t, projector=%q, operation=%d, mapped=%q)",
-		o.Result, o.Events, o.Deleted, o.Code, o.Replayed, o.Projector, o.Operation, o.Mapped)
+	return fmt.Sprintf("%s(events=%d, deleted=%d, code=%q, replayed=%t, projector=%q, operation=%d, mapped=%q, delta=%d, forceReleased=%t, rows=%d)",
+		o.Result, o.Events, o.Deleted, o.Code, o.Replayed, o.Projector, o.Operation, o.Mapped,
+		o.Delta, o.ForceReleased, o.Rows)
 }
 
 // Dir returns the repository's compat/ directory.
@@ -270,6 +298,22 @@ type Runner struct {
 	// the writer a head-aware build must detect. It backs the appendRawBypassingHead step and is
 	// set by the harness for each backend; nil means the backend cannot be bypassed.
 	BypassHead func(ctx context.Context, event evt.SerializedEvent) error
+
+	// Rebuild backs the rebuild op (C10); nil refuses the op.
+	Rebuild *RebuildDriver
+}
+
+// RebuildDriver is what a rebuild step needs of a backend: the fence over the store, a way to wait
+// that sleeps against a live backend and advances the injected clock against a fixture one, and a
+// count of the view rows a scenario's guarded writes left.
+type RebuildDriver struct {
+	Fence evt.RebuildFence
+
+	// Wait lets seconds pass for lease expiry.
+	Wait func(ctx context.Context, seconds int64) error
+
+	// Rows counts the view rows in a partition of the compat views table.
+	Rows func(ctx context.Context, pk string) (int, error)
 }
 
 // metadata builds a step's metadata. On an outcomes runner the command ID is scoped to the run and
@@ -363,6 +407,8 @@ func (r Runner) Execute(ctx context.Context, entityID evt.EntityID, step Step) (
 		return r.outcomeOnly(ctx, entityID, step)
 	case "resolveOutcome":
 		return r.resolveOutcome(ctx, entityID, step)
+	case "rebuild":
+		return r.rebuild(ctx, entityID, step)
 	}
 
 	return Outcome{}, fmt.Errorf("unknown op %q", step.Op)
@@ -687,6 +733,8 @@ func classify(err error) (Outcome, bool) {
 		return Outcome{Result: ResultDuplicateViewKey}, true
 	case evt.IsStreamHeadDriftErr(err):
 		return Outcome{Result: ResultDrift}, true
+	case evt.IsRebuildInProgressErr(err):
+		return Outcome{Result: ResultRebuildInProgress}, true
 	case errors.As(err, &rejected):
 		return Outcome{Result: ResultRejected}, true
 	case evt.IsDuplicateCommandErr(err):

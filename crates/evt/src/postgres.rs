@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use deadpool_postgres::{GenericClient, Pool, PoolError};
 use tokio_postgres::error::SqlState;
@@ -24,12 +26,13 @@ use crate::projection::{
     ProjectedView, ProjectorOperationError, REASON_CONDITION_FAILED, ViewCondition, ViewOperation,
     ViewOperationKind,
 };
+use crate::rebuild::Clock;
 use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 use crate::wire::postgres::{
     DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, FEATURES_LOCK_EXCLUSIVE,
     FEATURES_LOCK_SHARED, OutcomeRow, SnapshotRow, check_table_names, features_lock_key,
-    features_table, insert_outcome_sql, outcomes_table, schema_ddl, select_outcome_sql,
-    stream_heads_table,
+    features_table, insert_outcome_sql, outcomes_table, rebuild_lock_key, rebuild_lock_table,
+    schema_ddl, select_outcome_sql, stream_heads_table,
 };
 
 /// Turns one commit-wide view operation (v0.9, C7) into the statement that writes it. evt defines
@@ -100,6 +103,11 @@ pub struct PostgresRepository {
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
     /// its own writer: clones validate independently, like separate processes.
     validated_marker: Mutex<CachedMarker>,
+    /// The clock rebuild leases are read from.
+    clock: Clock,
+    /// Records that the rebuild-lock relation exists, so a commit's lock assertion probes the
+    /// catalog only until it first finds it. Shared by clones, like the database it describes.
+    rebuild_ready: Arc<AtomicBool>,
 }
 
 impl Clone for PostgresRepository {
@@ -110,6 +118,8 @@ impl Clone for PostgresRepository {
             snapshots_table: self.snapshots_table.clone(),
             view_writer: self.view_writer.clone(),
             validated_marker: Mutex::new(*self.validated_marker()),
+            clock: self.clock.clone(),
+            rebuild_ready: self.rebuild_ready.clone(),
         }
     }
 }
@@ -136,7 +146,17 @@ impl PostgresRepository {
             snapshots_table: DEFAULT_SNAPSHOTS_TABLE.to_owned(),
             view_writer: None,
             validated_marker: Mutex::new(None),
+            clock: Clock::default(),
+            rebuild_ready: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Reads `clock` instead of the system time for rebuild leases (see
+    /// [`RebuildFence`](crate::RebuildFence)). For tests: a lease expires without waiting for it.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> SystemTime + Send + Sync + 'static) -> Self {
+        self.clock = Clock::new(clock);
+        self
     }
 
     /// Writes commit-wide view operations (v0.9, C7) with `writer`. Without one, a commit that
@@ -230,6 +250,7 @@ impl PostgresRepository {
         self.events_table = events_table.to_ascii_lowercase();
         self.snapshots_table = snapshots_table.to_ascii_lowercase();
         *self.validated_marker() = None;
+        self.rebuild_ready = Arc::new(AtomicBool::new(false));
 
         Ok(self)
     }
@@ -661,6 +682,49 @@ impl PostgresRepository {
     }
 }
 
+impl PostgresRepository {
+    /// The commit-time rebuild-lock check (C10): after taking the rebuild fence's shared advisory
+    /// lock, held to `COMMIT`, it asserts the lock row is absent, an expired row included. A schema
+    /// that predates the fence has no lock relation, and nobody can have taken the lock: the
+    /// assertion passes, and the catalog probe stops once the relation has been seen.
+    async fn assert_no_rebuild_lock(
+        &self,
+        tx: &deadpool_postgres::Transaction<'_>,
+    ) -> Result<(), Error> {
+        tx.execute(
+            FEATURES_LOCK_SHARED,
+            &[&rebuild_lock_key(&self.events_table)],
+        )
+        .await
+        .map_err(statement_error)?;
+
+        let table = rebuild_lock_table(&self.events_table);
+        if !self.rebuild_ready.load(Ordering::Acquire) {
+            let exists: bool = tx
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                .await
+                .map_err(statement_error)?
+                .get(0);
+            if !exists {
+                return Ok(());
+            }
+
+            self.rebuild_ready.store(true, Ordering::Release);
+        }
+
+        let held = tx
+            .query_opt(&format!("SELECT 1 FROM {table} WHERE id = 0"), &[])
+            .await
+            .map_err(statement_error)?
+            .is_some();
+        if held {
+            return Err(Error::RebuildInProgress);
+        }
+
+        Ok(())
+    }
+}
+
 /// A written stream's head statement and how it fared (ADR 0007).
 struct HeadStatement<'a> {
     stream: &'a Commit<PgStatement>,
@@ -789,7 +853,8 @@ impl PostgresRepository {
     ///
     /// 1. the per-entity advisory locks, written and fenced streams in ascending entity-ID byte
     ///    order;
-    /// 2. the feature-marker `SELECT` (the rebuild-lock assertion would follow, C10);
+    /// 2. the feature-marker `SELECT`, the retention refusal of fences, then the rebuild-lock
+    ///    assertion (C10) under the shared rebuild advisory lock;
     /// 3. a probe for an existing outcome row for the command, which is `OutcomeConflict` and
     ///    outranks every stream failure, as on DynamoDB;
     /// 4. every head statement and every fence read, each evaluated without stopping at the
@@ -849,6 +914,10 @@ impl PostgresRepository {
         // fenced slots without leaving a successor snapshot. The refusal consults the manifest in
         // this transaction, not this instance's configuration.
         check_retention(manifest.as_ref())?;
+
+        // The rebuild-lock assertion (C10): any lock row, an expired one included, refuses the
+        // commit before the outcome row and every stream is looked at.
+        self.assert_no_rebuild_lock(&tx).await?;
 
         // A recorded outcome outranks every stream failure, as the outcome put does on DynamoDB.
         // The final insert's `23505` still resolves a real race.
@@ -968,26 +1037,8 @@ impl PostgresRepository {
                 .map_err(projector_error)?;
         }
 
-        // The view statements follow the legacy ones, in declaration then emission order. The
-        // statement's outcome decides whether the operation's condition held; any failure maps to
-        // the operation, and the transaction rolls back when `tx` drops.
-        for (view, statement) in views {
-            let params: Vec<&(dyn ToSql + Sync)> = statement
-                .params
-                .iter()
-                .map(|param| param.as_ref() as &(dyn ToSql + Sync))
-                .collect();
-            let affected = tx
-                .execute(&statement.sql, &params)
-                .await
-                .map_err(|err| view_error(view, statement.key_constraint.as_deref(), err))?;
-
-            if view_condition_failed(&view.op, affected) {
-                return Err(Error::ProjectorOperation(Box::new(
-                    ProjectorOperationError::condition_failed(view),
-                )));
-            }
-        }
+        // The view statements follow the legacy ones, in declaration then emission order.
+        run_view_statements(&tx, views).await?;
 
         // Commit snapshots are written in the same transaction as their events, under the same
         // conditions the DynamoDB snapshot put expresses. The commit raised the head to the
@@ -1428,6 +1479,33 @@ fn view_condition_failed(op: &ViewOperation, affected: u64) -> bool {
     }
 }
 
+/// Runs view statements in order. Each statement's outcome decides whether its operation's
+/// condition held; any failure maps to the operation, and the transaction rolls back when it drops.
+async fn run_view_statements(
+    tx: &deadpool_postgres::Transaction<'_>,
+    views: &[(&ProjectedView, &PgStatement)],
+) -> Result<(), Error> {
+    for (view, statement) in views {
+        let params: Vec<&(dyn ToSql + Sync)> = statement
+            .params
+            .iter()
+            .map(|param| param.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+        let affected = tx
+            .execute(&statement.sql, &params)
+            .await
+            .map_err(|err| view_error(view, statement.key_constraint.as_deref(), err))?;
+
+        if view_condition_failed(&view.op, affected) {
+            return Err(Error::ProjectorOperation(Box::new(
+                ProjectorOperationError::condition_failed(view),
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Pairs each view operation with the statement its writer built.
 fn view_writes<'a>(
     views: &'a [ProjectedView],
@@ -1513,6 +1591,7 @@ fn transient(err: &tokio_postgres::Error) -> bool {
 }
 
 mod enumerate;
+mod rebuild;
 
 #[cfg(test)]
 mod tests {
@@ -1635,27 +1714,27 @@ mod tests {
         }
 
         // The writer is asked for every operation, in declaration then emission order, before the
-        // budget is checked: 98 statements are one action too many beside the marker, the head
-        // update, and the event.
+        // budget is checked: 97 statements are one action too many beside the two control checks,
+        // the head update, and the event.
         let seen = Arc::new(Mutex::new(Vec::new()));
         let repository = repository().with_view_writer(recording_writer(seen.clone()));
-        let result = repository.commit(commit(views(98))).await;
-        assert!(
-            matches!(result, Err(Error::CommitTooLarge { actions: 101, .. })),
-            "{result:?}"
-        );
-        assert_eq!(seen.lock().unwrap().len(), 98);
-        assert_eq!(seen.lock().unwrap()[0], "p row-000");
-        assert_eq!(seen.lock().unwrap()[97], "p row-097");
-
-        let result = repository.commit_transaction(transaction(views(98))).await;
-        assert!(
-            matches!(result, Err(Error::CommitTooLarge { actions: 101, .. })),
-            "{result:?}"
-        );
-
-        // 97 fit the budget (the commit then needs a database, which this pool lacks).
         let result = repository.commit(commit(views(97))).await;
+        assert!(
+            matches!(result, Err(Error::CommitTooLarge { actions: 101, .. })),
+            "{result:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 97);
+        assert_eq!(seen.lock().unwrap()[0], "p row-000");
+        assert_eq!(seen.lock().unwrap()[96], "p row-096");
+
+        let result = repository.commit_transaction(transaction(views(97))).await;
+        assert!(
+            matches!(result, Err(Error::CommitTooLarge { actions: 101, .. })),
+            "{result:?}"
+        );
+
+        // 96 fit the budget (the commit then needs a database, which this pool lacks).
+        let result = repository.commit(commit(views(96))).await;
         assert!(
             !matches!(result, Err(Error::CommitTooLarge { .. })),
             "{result:?}"
@@ -1685,7 +1764,7 @@ mod tests {
                 bytes,
                 largest_item,
             }) => {
-                assert_eq!(actions, 15);
+                assert_eq!(actions, 16);
                 assert!(
                     bytes > 3_800_000 && largest_item < 380_000,
                     "{bytes} {largest_item}"

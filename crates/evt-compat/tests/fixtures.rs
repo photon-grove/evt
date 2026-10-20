@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, UNIX_EPOCH};
 
 use evt_compat::scenario::{FIXTURE_RUN, ORIGIN_SOURCE, compat_dir};
-use evt_compat::{Account, Runner, ScenarioFixtures, Scenarios};
+use evt_compat::{Account, ManualClock, RebuildDriver, Runner, ScenarioFixtures, Scenarios};
+
+/// The injected clock of the Go fixture runs of the rebuild fence, in Unix seconds.
+const REBUILD_FIXTURE_CLOCK: i64 = 1_790_000_000;
 use photon_evt::wire::postgres::OutcomeRow;
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
@@ -441,9 +444,13 @@ async fn scenarios_match_go_byte_for_byte() {
 
     for scenario in &scenarios.scenarios {
         // The memory repository stands in for a backend, including its raw access to the heads.
-        let repository = MemRepository::new();
+        // Its rebuild fence reads an injected clock, which a `wait` step advances, starting where
+        // Go's fixture run starts.
+        let clock = ManualClock::at(REBUILD_FIXTURE_CLOCK);
+        let repository = MemRepository::new().with_clock(clock.reader());
         let runner = Runner::for_scenario(repository.clone(), scenario, FIXTURE_RUN)
             .with_head_access(repository.clone())
+            .with_rebuild_access(RebuildDriver::manual(repository.clone(), clock))
             .with_view_access(repository);
         let entity_id = scenario.entity_id(FIXTURE_RUN);
 
@@ -965,5 +972,132 @@ fn the_schema_ddl_defines_the_heads_table_like_go() {
         let rust = squash(&photon_evt::wire::postgres::schema_ddl(events, snapshots));
 
         assert_eq!(rust, go, "{events}: the DDL, whitespace aside");
+    }
+}
+
+/// The rebuild-fence vectors (`rebuildFence` in `feature-marker.json`, C10) as semantics: from
+/// each vector's state of the two rows, under Go's fixed clock, the in-memory fence returns the
+/// recorded result and leaves the recorded items. The DynamoDB requests themselves are asserted
+/// by `photon-evt`'s own tests, and against a recording endpoint by the live suite.
+#[tokio::test]
+async fn rebuild_fence_vectors_match_go() {
+    use photon_evt::{RebuildFence, RebuildGeneration, RebuildState, ViewOperation};
+
+    let data = std::fs::read(compat_dir().join("fixtures/feature-marker.json")).unwrap();
+    let fixtures: Value = serde_json::from_slice(&data).unwrap();
+    let vectors = fixtures["rebuildFence"].as_array().unwrap();
+    assert!(vectors.len() >= 16, "every lifecycle operation is pinned");
+
+    let item = |value: &Value| -> Option<dynamo::Item> {
+        (!value.is_null()).then(|| serde_json::from_value(value.clone()).unwrap())
+    };
+    let items = |state: &RebuildState| {
+        serde_json::json!({
+            "generation": (state.generation != RebuildGeneration::default())
+                .then(|| dynamo::rebuild_generation_item(state.generation)),
+            "lock": state.lock.as_ref()
+                .map(dynamo::rebuild_lock_item),
+        })
+    };
+    let error = |error: Error| match error {
+        Error::RebuildLockHeld { .. } => serde_json::json!({"error": "lockHeld"}),
+        Error::RebuildLeaseLost { .. } => serde_json::json!({"error": "leaseLost"}),
+        other => panic!("unexpected {other}"),
+    };
+    let generation = |generation: RebuildGeneration| {
+        let mut result = serde_json::json!({"generation": generation.value});
+        if generation.force_released {
+            result["forceReleased"] = serde_json::json!(true);
+        }
+
+        result
+    };
+
+    for vector in vectors {
+        let name = vector["name"].as_str().unwrap();
+        let owner = vector["owner"].as_str().unwrap_or_default();
+        // The lease a renew, an end, or a guarded write names: its owner and fencing token.
+        let held = photon_evt::RebuildLease {
+            owner: owner.to_owned(),
+            generation: vector["leaseGeneration"].as_i64().unwrap_or_default(),
+            lease_expires_at: 0,
+        };
+        let lease = Duration::from_secs(vector["leaseSeconds"].as_u64().unwrap_or_default());
+        let before = RebuildState {
+            generation: item(&vector["before"]["generation"])
+                .map(|item| dynamo::rebuild_generation_from_item(&item).unwrap())
+                .unwrap_or_default(),
+            lock: item(&vector["before"]["lock"])
+                .map(|item| dynamo::rebuild_lock_from_item(&item).unwrap()),
+        };
+        assert_eq!(
+            items(&before),
+            vector["before"],
+            "{name}: the items decode and re-encode"
+        );
+
+        let repository =
+            MemRepository::new().with_clock(|| UNIX_EPOCH + Duration::from_secs(1_790_000_000));
+        repository.set_rebuild_state(before);
+
+        let result = match vector["operation"].as_str().unwrap() {
+            "state" => {
+                let state = repository.rebuild_state().await.unwrap();
+                let mut result = generation(state.generation);
+                if let Some(lock) = state.lock {
+                    result["lockOwner"] = serde_json::json!(lock.owner);
+                    result["leaseExpiresAt"] = serde_json::json!(lock.lease_expires_at);
+                }
+
+                result
+            }
+            "generation" => generation(repository.rebuild_generation().await.unwrap()),
+            "begin" => match repository.begin_rebuild(owner, lease).await {
+                Ok(lease) => serde_json::json!({
+                    "generation": lease.generation, "leaseExpiresAt": lease.lease_expires_at}),
+                Err(err) => error(err),
+            },
+            "renew" => match repository.renew_rebuild(&held, lease).await {
+                Ok(renewed) => serde_json::json!({"leaseExpiresAt": renewed.lease_expires_at}),
+                Err(err) => error(err),
+            },
+            "end" => repository
+                .end_rebuild(&held)
+                .await
+                .map_or_else(error, generation),
+            "forceRelease" => repository
+                .force_release_rebuild(owner)
+                .await
+                .map_or_else(error, generation),
+            "writeViews" => {
+                let views = [
+                    photon_evt::ProjectedView::new(
+                        "rebuild",
+                        0,
+                        0,
+                        ViewOperation::put("rebuilt", "row-1", "acct-1", "account", r#"{"n":1}"#),
+                    ),
+                    photon_evt::ProjectedView::new(
+                        "rebuild",
+                        0,
+                        1,
+                        ViewOperation::delete("rebuilt", "row-2", "acct-2"),
+                    ),
+                ];
+
+                match repository.write_rebuild_views(&held, &views).await {
+                    Ok(()) => serde_json::json!({}),
+                    Err(err) => error(err),
+                }
+            }
+            other => panic!("{name}: unknown operation {other}"),
+        };
+
+        assert_eq!(result, vector["result"], "{name}: result");
+        assert_eq!(
+            items(&repository.rebuild_state().await.unwrap()),
+            vector["after"],
+            "{name}: the items after"
+        );
     }
 }

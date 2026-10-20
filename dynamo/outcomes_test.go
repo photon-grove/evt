@@ -137,7 +137,7 @@ func TestOutcomeRowIsTheLastActionAndMatchesTheSharedItemShape(t *testing.T) {
 	require.Equal(t, size, dynamo.ItemSize(stored[0]))
 }
 
-func TestOutcomeOnlyCommitIsTheMarkerCheckAndTheOutcomePut(t *testing.T) {
+func TestOutcomeOnlyCommitIsTheTwoControlChecksAndTheOutcomePut(t *testing.T) {
 	fake := compat.NewFakeDynamo()
 	repo := dynamo.NewRepository(fake, "events")
 
@@ -145,9 +145,10 @@ func TestOutcomeOnlyCommitIsTheMarkerCheckAndTheOutcomePut(t *testing.T) {
 
 	calls := fake.Transactions()
 	require.Len(t, calls, 1)
-	require.Len(t, calls[0], 2)
+	require.Len(t, calls[0], 3)
 	require.Equal(t, "SYSTEM#FEATURES", calls[0][0].PK)
-	require.Equal(t, "command-outcome#cmd-1", calls[0][1].PK)
+	require.Equal(t, "SYSTEM#REBUILD", calls[0][1].PK)
+	require.Equal(t, "command-outcome#cmd-1", calls[0][2].PK)
 }
 
 func TestLostOutcomePutOutranksOtherFailures(t *testing.T) {

@@ -108,6 +108,19 @@ func (f *FakeDynamo) SeedView(pk, sk, owner string) {
 	})
 }
 
+// SeedItem stores an events-table item directly, as a fixture's starting state.
+func (f *FakeDynamo) SeedItem(item map[string]types.AttributeValue) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	pk, sk, err := keyOf(item)
+	if err != nil {
+		panic(err)
+	}
+
+	f.putLocked(pk, sk, item)
+}
+
 // Items returns every item in a partition, ascending by sort key (the snapshot at sk=0 first).
 func (f *FakeDynamo) Items(pk string) []map[string]types.AttributeValue {
 	f.mu.Lock()
@@ -275,9 +288,85 @@ func conditionHolds(
 
 	case "attribute_not_exists(eventSeq) OR eventSeq <= :new":
 		return compareIfExists(existing, "eventSeq", values, ":new", func(have, limit int64) bool { return have <= limit })
+
+	case rebuildAcquireCondition:
+		// attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)
+		if _, ok := existing["value"]; !ok {
+			return true, nil
+		}
+		if even, err := is("value", ":seenEven", equal); err != nil || even {
+			return even, err
+		}
+		odd, err := is("value", ":seenOdd", equal)
+		if err != nil || !odd {
+			return false, err
+		}
+		return flagIs(existing, "forceReleased", values, ":true"), nil
+
+	case rebuildTakeoverCondition:
+		// leaseExpiresAt < :now AND #owner = :observedOwner
+		expired, err := is("leaseExpiresAt", ":now", func(have, now int64) bool { return have < now })
+		if err != nil || !expired {
+			return false, err
+		}
+		return textIs(existing, "owner", values, ":observedOwner"), nil
+
+	case rebuildSeenOddCondition:
+		return is("value", ":seenOdd", equal)
+
+	case "#owner = :owner AND #generation = :generation":
+		if !textIs(existing, "owner", values, ":owner") {
+			return false, nil
+		}
+		return is("generation", ":generation", equal)
+
+	case "#owner = :me AND #generation = :generation":
+		if !textIs(existing, "owner", values, ":me") {
+			return false, nil
+		}
+		return is("generation", ":generation", equal)
+
+	case "#owner = :requestedOwner":
+		return textIs(existing, "owner", values, ":requestedOwner"), nil
+
+	case rebuildGuardCondition:
+		// #owner = :me AND #generation = :generation AND leaseExpiresAt > :now
+		if !textIs(existing, "owner", values, ":me") {
+			return false, nil
+		}
+		if held, err := is("generation", ":generation", equal); err != nil || !held {
+			return false, err
+		}
+		return is("leaseExpiresAt", ":now", func(have, now int64) bool { return have > now })
 	}
 
 	return false, fmt.Errorf("fake dynamo: unsupported condition %q", condition)
+}
+
+// The rebuild fence's condition expressions (storage spec, Rebuild Fence), spelled exactly as the
+// DynamoDB repository sends them.
+const (
+	rebuildAcquireCondition  = "attribute_not_exists(#value) OR #value = :seenEven OR (#value = :seenOdd AND forceReleased = :true)"
+	rebuildTakeoverCondition = "leaseExpiresAt < :now AND #owner = :observedOwner"
+	rebuildSeenOddCondition  = "#value = :seenOdd"
+	rebuildGuardCondition    = "#owner = :me AND #generation = :generation AND leaseExpiresAt > :now"
+)
+
+// textIs reports whether a stored string attribute equals an expression value; it is false when the
+// item or the attribute is absent.
+func textIs(existing map[string]types.AttributeValue, name string, values map[string]types.AttributeValue, value string) bool {
+	have, ok := existing[name].(*types.AttributeValueMemberS)
+	want, wantOK := values[value].(*types.AttributeValueMemberS)
+
+	return ok && wantOK && have.Value == want.Value
+}
+
+// flagIs reports whether a stored boolean attribute equals an expression value.
+func flagIs(existing map[string]types.AttributeValue, name string, values map[string]types.AttributeValue, value string) bool {
+	have, ok := existing[name].(*types.AttributeValueMemberBOOL)
+	want, wantOK := values[value].(*types.AttributeValueMemberBOOL)
+
+	return ok && wantOK && have.Value == want.Value
 }
 
 // compareIfExists evaluates `attribute_not_exists(name) OR <compare(name, value)>` for a numeric
@@ -496,43 +585,167 @@ func (f *FakeDynamo) putViewLocked(pk, sk string, item map[string]types.Attribut
 	f.views[pk][sk] = copied
 }
 
-// updateLocked applies an update expression of the form `SET lhs = :value[, lhs = :value]`, the
-// only shape the repository issues, creating the item when it does not exist (as DynamoDB does).
+// updateLocked applies an update expression to the stored item, creating the item when it does not
+// exist (as DynamoDB does). It understands the shapes the repository issues: `SET lhs = <operand>
+// [+ <operand>][, lhs = ...]` followed by an optional `REMOVE name`, where an operand is a value
+// placeholder, an attribute name or alias, or `if_not_exists(<name>, <value>)`.
 func (f *FakeDynamo) updateLocked(target transactTarget) error {
+	item, err := applyUpdate(f.items[target.pk][target.sk], target)
+	if err != nil {
+		return err
+	}
+
+	f.putLocked(target.pk, target.sk, item)
+
+	return nil
+}
+
+// applyUpdate evaluates the target's update expression against the existing item (nil when it does
+// not exist) and returns the updated item.
+func applyUpdate(existing map[string]types.AttributeValue, target transactTarget) (map[string]types.AttributeValue, error) {
 	expression, ok := strings.CutPrefix(target.update, "SET ")
 	if !ok {
-		return fmt.Errorf("fake dynamo: unsupported update expression %q", target.update)
+		return nil, fmt.Errorf("fake dynamo: unsupported update expression %q", target.update)
+	}
+
+	var remove string
+
+	if before, after, found := strings.Cut(expression, " REMOVE "); found {
+		expression, remove = before, after
 	}
 
 	item := map[string]types.AttributeValue{
 		"pk": &types.AttributeValueMemberS{Value: target.pk},
 		"sk": &types.AttributeValueMemberN{Value: strconv.FormatInt(target.sk, 10)},
 	}
-	for name, value := range f.items[target.pk][target.sk] {
+	for name, value := range existing {
 		item[name] = value
 	}
 
-	for _, assignment := range strings.Split(expression, ", ") {
-		name, placeholder, found := strings.Cut(assignment, " = ")
-		if !found {
-			return fmt.Errorf("fake dynamo: unsupported update expression %q", target.update)
-		}
-
+	resolve := func(name string) string {
 		if resolved, named := target.names[name]; named {
-			name = resolved
+			return resolved
 		}
 
-		value, present := target.values[placeholder]
-		if !present {
-			return fmt.Errorf("fake dynamo: update value %s is missing", placeholder)
-		}
-
-		item[name] = value
+		return name
 	}
 
-	f.putLocked(target.pk, target.sk, item)
+	// operand evaluates a placeholder, an attribute, or if_not_exists against the item as it was
+	// before the update, because DynamoDB evaluates every right-hand side first.
+	var operand func(text string) (types.AttributeValue, error)
 
-	return nil
+	operand = func(text string) (types.AttributeValue, error) {
+		text = strings.TrimSpace(text)
+
+		if inner, found := strings.CutPrefix(text, "if_not_exists("); found {
+			attribute, fallback, split := strings.Cut(strings.TrimSuffix(inner, ")"), ", ")
+			if !split {
+				return nil, fmt.Errorf("fake dynamo: unsupported operand %q", text)
+			}
+
+			if current, present := existing[resolve(attribute)]; present {
+				return current, nil
+			}
+
+			return operand(fallback)
+		}
+
+		if strings.HasPrefix(text, ":") {
+			value, present := target.values[text]
+			if !present {
+				return nil, fmt.Errorf("fake dynamo: update value %s is missing", text)
+			}
+
+			return value, nil
+		}
+
+		current, present := existing[resolve(text)]
+		if !present {
+			return nil, fmt.Errorf("fake dynamo: update attribute %s does not exist", text)
+		}
+
+		return current, nil
+	}
+
+	for _, assignment := range splitAssignments(expression) {
+		name, right, found := strings.Cut(assignment, " = ")
+		if !found {
+			return nil, fmt.Errorf("fake dynamo: unsupported update expression %q", target.update)
+		}
+
+		var (
+			value types.AttributeValue
+			err   error
+		)
+
+		if left, addend, adds := strings.Cut(right, " + "); adds {
+			value, err = sumOperands(operand, left, addend)
+		} else {
+			value, err = operand(right)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		item[resolve(name)] = value
+	}
+
+	if remove != "" {
+		delete(item, resolve(strings.TrimSpace(remove)))
+	}
+
+	return item, nil
+}
+
+// splitAssignments splits a SET clause at the commas outside parentheses, so a function call such
+// as if_not_exists(#value, :zero) stays one operand.
+func splitAssignments(expression string) []string {
+	var (
+		parts []string
+		depth int
+		start int
+	)
+
+	for i, r := range expression {
+		switch {
+		case r == '(':
+			depth++
+		case r == ')':
+			depth--
+		case r == ',' && depth == 0:
+			parts = append(parts, strings.TrimSpace(expression[start:i]))
+			start = i + 1
+		}
+	}
+
+	return append(parts, strings.TrimSpace(expression[start:]))
+}
+
+// sumOperands adds two numeric operands.
+func sumOperands(operand func(string) (types.AttributeValue, error), left, right string) (types.AttributeValue, error) {
+	sum := int64(0)
+
+	for _, text := range []string{left, right} {
+		value, err := operand(text)
+		if err != nil {
+			return nil, err
+		}
+
+		number, ok := value.(*types.AttributeValueMemberN)
+		if !ok {
+			return nil, fmt.Errorf("fake dynamo: operand %q is not a number", text)
+		}
+
+		parsed, err := strconv.ParseInt(number.Value, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		sum += parsed
+	}
+
+	return &types.AttributeValueMemberN{Value: strconv.FormatInt(sum, 10)}, nil
 }
 
 func (f *FakeDynamo) putLocked(pk string, sk int64, item map[string]types.AttributeValue) {
@@ -751,9 +964,39 @@ func (f *FakeDynamo) DeleteItem(context.Context, *dynamodb.DeleteItemInput, ...f
 	return nil, errUnsupported
 }
 
-// UpdateItem is not supported.
-func (f *FakeDynamo) UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
-	return nil, errUnsupported
+// UpdateItem applies one conditional update to an item of the events table.
+func (f *FakeDynamo) UpdateItem(
+	_ context.Context,
+	params *dynamodb.UpdateItemInput,
+	_ ...func(*dynamodb.Options),
+) (*dynamodb.UpdateItemOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	pk, sk, err := keyOf(params.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	ok, err := conditionHolds(f.items[pk][sk], aws.ToString(params.ConditionExpression), params.ExpressionAttributeValues)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, &types.ConditionalCheckFailedException{Message: aws.String("The conditional request failed")}
+	}
+
+	item, err := applyUpdate(f.items[pk][sk], transactTarget{
+		pk: pk, sk: sk, update: aws.ToString(params.UpdateExpression),
+		names: params.ExpressionAttributeNames, values: params.ExpressionAttributeValues,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	f.putLocked(pk, sk, item)
+
+	return &dynamodb.UpdateItemOutput{}, nil
 }
 
 // ExportTableToPointInTime is not supported.

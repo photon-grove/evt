@@ -166,12 +166,16 @@ type ledgerCommand struct {
 
 	// ran counts handler invocations; it is not part of the command's identity.
 	ran *atomic.Int32
+
+	// read, when set, is a read of derived state the handler makes before deciding (kind
+	// "read-derived"): its error is the handler's own. It is not part of the command's identity.
+	read func(ctx context.Context) error
 }
 
 func (c *ledgerCommand) Type() evt.CommandType      { return evt.CommandType("ledger:" + c.Kind) }
 func (c *ledgerCommand) EntityType() evt.EntityType { return ledgerType }
 
-func (l *ledger) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
+func (l *ledger) Handle(ctx context.Context, command evt.Command) (evt.CommandResult, error) {
 	c, ok := command.(*ledgerCommand)
 	if !ok {
 		return evt.CommandResult{}, evt.NewBadCommandError(command)
@@ -226,6 +230,16 @@ func (l *ledger) Handle(_ context.Context, command evt.Command) (evt.CommandResu
 
 	case "check":
 		return evt.CommandResult{Response: total(0)}, nil
+
+	case "read-derived":
+		if err := c.read(ctx); err != nil {
+			return evt.CommandResult{}, err
+		}
+
+		return evt.CommandResult{
+			Events:   []evt.Event{&ledgerEvent{Kind: "deposited", Amount: c.Amount}},
+			Response: total(c.Amount),
+		}, nil
 
 	case "noop":
 		return evt.CommandResult{}, evt.NewNoOpError("nothing to do")
@@ -1016,16 +1030,16 @@ func testOutcomeBudget(t *testing.T, repo evt.OutcomeRepository) {
 		return serialized
 	}
 
-	// The feature-marker check, the head update, 97 event puts, and the outcome put are 100 actions.
+	// The two control checks, the head update, 96 event puts, and the outcome put are 100 actions.
 	fits := evt.EntityID(ns + "-fits")
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(fits, 0, 97), Outcome: outcome("-fits")}))
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(fits, 0, 96), Outcome: outcome("-fits")}))
 
 	stored, err := repo.GetOutcome(ctx, evt.CommandID(ns+"-fits"))
 	require.NoError(t, err)
-	require.Len(t, stored.EventIDs, 97)
+	require.Len(t, stored.EventIDs, 96)
 
 	over := evt.EntityID(ns + "-over")
-	err = repo.Commit(ctx, evt.SerializedResult{Events: events(over, 0, 98), Outcome: outcome("-over")})
+	err = repo.Commit(ctx, evt.SerializedResult{Events: events(over, 0, 97), Outcome: outcome("-over")})
 
 	var tooLarge *evt.CommitTooLargeError
 	require.ErrorAs(t, err, &tooLarge, "the outcome item counts against the 100-action budget")
@@ -1036,19 +1050,19 @@ func testOutcomeBudget(t *testing.T, repo evt.OutcomeRepository) {
 	require.NoError(t, err)
 	require.Nil(t, missing)
 
-	// Appending to an existing stream costs the same one head update: 97 events fit with the
-	// outcome, and 98 do not.
+	// Appending to an existing stream costs the same one head update: 96 events fit with the
+	// outcome, and 97 do not.
 	grows := evt.EntityID(ns + "-grows")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(grows, 0, 1)}))
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(grows, 1, 97), Outcome: outcome("-grows")}))
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(grows, 1, 96), Outcome: outcome("-grows")}))
 
 	growsOver := evt.EntityID(ns + "-grows-over")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(growsOver, 0, 1)}))
 	require.ErrorAs(t,
-		repo.Commit(ctx, evt.SerializedResult{Events: events(growsOver, 1, 98), Outcome: outcome("-grows-over")}),
+		repo.Commit(ctx, evt.SerializedResult{Events: events(growsOver, 1, 97), Outcome: outcome("-grows-over")}),
 		&tooLarge)
 
-	// An outcome-only commit is the marker check plus the outcome put.
+	// An outcome-only commit is the two control checks plus the outcome put.
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Outcome: outcome("-only")}))
 
 	// A response at the 64 KiB bound still fits the byte budgets.
@@ -1661,13 +1675,13 @@ func testRejectionWithEventsCommitRules(t *testing.T, repo evt.OutcomeRepository
 	var projectorOnly *evt.ProjectorOnlyCommitError
 	require.ErrorAs(t, err, &projectorOnly)
 
-	// The outcome row counts against the budget: marker, head update, 97 event puts, and outcome fit;
-	// one more event does not.
+	// The outcome row counts against the budget: the two control checks, the head update, 96 event
+	// puts, and the outcome fit; one more event does not.
 	fits := evt.EntityID(ns + "-fits")
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(fits, 0, 97), Outcome: rejected("-fits")}))
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events(fits, 0, 96), Outcome: rejected("-fits")}))
 
 	over := evt.EntityID(ns + "-over")
-	err = repo.Commit(ctx, evt.SerializedResult{Events: events(over, 0, 98), Outcome: rejected("-over")})
+	err = repo.Commit(ctx, evt.SerializedResult{Events: events(over, 0, 97), Outcome: rejected("-over")})
 
 	var tooLarge *evt.CommitTooLargeError
 	require.ErrorAs(t, err, &tooLarge)

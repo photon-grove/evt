@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, SystemTime};
 
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
@@ -13,6 +14,9 @@ use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::outcome::Outcome;
 use crate::projection::{
     ProjectedView, ProjectorOperationError, ViewCondition, ViewOperationKind, ViewRow,
+};
+use crate::rebuild::{
+    self, Clock, Plan, RebuildFence, RebuildGeneration, RebuildLease, RebuildLock, RebuildState,
 };
 use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 
@@ -30,6 +34,11 @@ use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 /// [`views`](MemRepository::views). A commit evaluates every operation's condition against the
 /// rows as they were before the commit, applies nothing unless all hold, and reports the first
 /// failed operation as [`Error::ProjectorOperation`].
+///
+/// It keeps the rebuild fence (v0.9, C10) like the live backends: it implements [`RebuildFence`]
+/// over a lock and a generation that clones share, and every commit is refused with
+/// [`Error::RebuildInProgress`] while a rebuild holds the lock. Leases read the repository's clock
+/// ([`with_clock`](MemRepository::with_clock)).
 #[derive(Debug, Default)]
 pub struct MemRepository {
     streams: Arc<Mutex<BTreeMap<EntityId, Stream>>>,
@@ -38,6 +47,10 @@ pub struct MemRepository {
     /// The command-outcome rows, keyed by command ID. Shared with clones, like the streams.
     outcomes: Arc<Mutex<BTreeMap<CommandId, Outcome>>>,
     manifest: Arc<Mutex<Option<FeatureManifest>>>,
+    /// The rebuild fence's lock row and generation (C10). Shared with clones, like the streams.
+    rebuild: Arc<Mutex<RebuildState>>,
+    /// The clock rebuild leases are read from.
+    clock: Clock,
     /// The feature-marker version this handle validated, if it has written yet. Per handle, not
     /// shared with clones.
     validated: Mutex<CachedMarker>,
@@ -50,6 +63,8 @@ impl Clone for MemRepository {
             views: self.views.clone(),
             outcomes: self.outcomes.clone(),
             manifest: self.manifest.clone(),
+            rebuild: self.rebuild.clone(),
+            clock: self.clock.clone(),
             validated: Mutex::new(*self.validated()),
         }
     }
@@ -113,6 +128,14 @@ impl MemRepository {
         Self::default()
     }
 
+    /// Reads `clock` instead of the system time for rebuild leases (see [`RebuildFence`]). For
+    /// tests: a lease expires without waiting for it. Clones made afterwards share the clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> SystemTime + Send + Sync + 'static) -> Self {
+        self.clock = Clock::new(clock);
+        self
+    }
+
     /// Appends an event to its stream **without** touching the stream's head, as a writer that
     /// predates stream heads (or a corrupted store) would. The stream then drifts (ADR 0007): the
     /// next commit, fence, or snapshot write that probes it fails with
@@ -145,6 +168,14 @@ impl MemRepository {
             .get(entity_id)
             .map(|stream| stream.head)
             .filter(|head| *head > EventSequence::ZERO)
+    }
+
+    /// Replaces the rebuild fence's lock and generation, as if a writer had stored them, for the
+    /// shared fixtures that start an operation from a given state. Nothing else should call it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "conformance"))]
+    pub fn set_rebuild_state(&self, state: RebuildState) {
+        *self.rebuild_lock() = state;
     }
 
     /// The view row at `(pk, sk)`, if a commit-wide view operation wrote one.
@@ -181,6 +212,12 @@ impl MemRepository {
 
     fn manifest_lock(&self) -> MutexGuard<'_, Option<FeatureManifest>> {
         self.manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn rebuild_lock(&self) -> MutexGuard<'_, RebuildState> {
+        self.rebuild
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -245,6 +282,14 @@ impl MemRepository {
 
         // Fences are refused for entity types durably declared with retention.
         check_retention(stored_manifest.as_ref())?;
+
+        // The rebuild-lock check (C10), second only to the marker: any lock, an expired one
+        // included, refuses the commit before the outcome row and every stream is looked at. The
+        // guard is held through the write, so no rebuild can begin between the check and it.
+        let rebuild = self.rebuild_lock();
+        if rebuild.lock.is_some() {
+            return Err(Error::RebuildInProgress);
+        }
 
         let mut outcomes = self.outcomes_lock();
 
@@ -329,26 +374,9 @@ impl MemRepository {
         }
 
         // View conditions rank last: a projector failure is reported only when nothing ranked
-        // above it failed. Every condition is evaluated against the rows as they were before the
-        // commit, in order, and the first failure is reported. Nothing is applied unless all hold.
-        // Every write is conditioned on the row's owner, as on DynamoDB: the stored `entity_id`
-        // is the owner, so an operation by another stream fails whatever its own condition.
+        // above it failed.
         let mut rows = self.views_lock();
-        for view in views {
-            let stored = rows.get(&(view.op.pk.clone(), view.op.sk.clone()));
-            let owned = stored.is_none_or(|row| row.entity_id == view.op.owner.as_str());
-            let held = match view.op.condition {
-                ViewCondition::None => owned,
-                ViewCondition::Absent => stored.is_none(),
-                ViewCondition::Present => stored.is_some() && owned,
-            };
-
-            if !held {
-                return Err(Error::ProjectorOperation(Box::new(
-                    ProjectorOperationError::condition_failed(view),
-                )));
-            }
-        }
+        check_view_conditions(&rows, views)?;
 
         for stream in streams.iter().filter(|stream| !stream.events.is_empty()) {
             let last_sequence = stream.events.last().map(|event| event.sequence);
@@ -372,22 +400,54 @@ impl MemRepository {
             }
         }
 
-        for view in views {
-            let key = (view.op.pk.clone(), view.op.sk.clone());
-
-            match view.op.kind {
-                ViewOperationKind::Put => {
-                    rows.insert(key, ViewRow::of(&view.op));
-                }
-                ViewOperationKind::Delete => {
-                    rows.remove(&key);
-                }
-            }
-        }
+        apply_views(&mut rows, views);
 
         outcomes.extend(outcome.map(|outcome| (outcome.command_id.clone(), outcome)));
 
         Ok(())
+    }
+}
+
+/// Evaluates every view operation's condition against the rows as they were before the write, in
+/// order, and reports the first failure. Every write is conditioned on the row's owner, as on
+/// DynamoDB: the stored `entity_id` is the owner, so an operation by another owner fails whatever
+/// its own condition.
+fn check_view_conditions(
+    rows: &BTreeMap<(String, String), ViewRow>,
+    views: &[ProjectedView],
+) -> Result<(), Error> {
+    for view in views {
+        let stored = rows.get(&(view.op.pk.clone(), view.op.sk.clone()));
+        let owned = stored.is_none_or(|row| row.entity_id == view.op.owner.as_str());
+        let held = match view.op.condition {
+            ViewCondition::None => owned,
+            ViewCondition::Absent => stored.is_none(),
+            ViewCondition::Present => stored.is_some() && owned,
+        };
+
+        if !held {
+            return Err(Error::ProjectorOperation(Box::new(
+                ProjectorOperationError::condition_failed(view),
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Applies view operations whose conditions [`check_view_conditions`] accepted.
+fn apply_views(rows: &mut BTreeMap<(String, String), ViewRow>, views: &[ProjectedView]) {
+    for view in views {
+        let key = (view.op.pk.clone(), view.op.sk.clone());
+
+        match view.op.kind {
+            ViewOperationKind::Put => {
+                rows.insert(key, ViewRow::of(&view.op));
+            }
+            ViewOperationKind::Delete => {
+                rows.remove(&key);
+            }
+        }
     }
 }
 
@@ -629,6 +689,134 @@ impl FeatureMarker for MemRepository {
     }
 }
 
+/// The rebuild fence over the shared lock and generation. Every operation runs under the fence's
+/// mutex, so its read and its write are one step, as the live backends' conditional writes are.
+impl RebuildFence for MemRepository {
+    async fn rebuild_generation(&self) -> Result<RebuildGeneration, Error> {
+        Ok(self.rebuild_lock().generation)
+    }
+
+    async fn rebuild_state(&self) -> Result<RebuildState, Error> {
+        Ok(self.rebuild_lock().clone())
+    }
+
+    async fn begin_rebuild(&self, owner: &str, lease: Duration) -> Result<RebuildLease, Error> {
+        let seconds = rebuild::check_lease(owner, lease)?;
+
+        let mut state = self.rebuild_lock();
+        let now = self.clock.unix_seconds();
+        let plan = Plan::decide(&state, now)?;
+        let lease_expires_at = now.saturating_add(seconds);
+
+        // The acquire and the takeover leave the force-release flag as it was: only a release
+        // clears it. The lock stores the generation they produce as its fencing token.
+        state.generation.value += plan.increment;
+        state.lock = Some(RebuildLock {
+            owner: owner.to_owned(),
+            generation: state.generation.value,
+            lease_expires_at,
+        });
+
+        Ok(RebuildLease {
+            owner: owner.to_owned(),
+            generation: state.generation.value,
+            lease_expires_at,
+        })
+    }
+
+    async fn renew_rebuild(
+        &self,
+        lease: &RebuildLease,
+        extend: Duration,
+    ) -> Result<RebuildLease, Error> {
+        let seconds = rebuild::check_lease(&lease.owner, extend)?;
+
+        let mut state = self.rebuild_lock();
+        let lease_expires_at = self.clock.unix_seconds().saturating_add(seconds);
+        let Some(lock) = state.lock.as_mut().filter(|lock| lease.holds(lock)) else {
+            return Err(lease_lost(&lease.owner));
+        };
+
+        lock.lease_expires_at = lease_expires_at;
+
+        Ok(RebuildLease {
+            lease_expires_at,
+            ..lease.clone()
+        })
+    }
+
+    async fn end_rebuild(&self, lease: &RebuildLease) -> Result<RebuildGeneration, Error> {
+        rebuild::check_owner(&lease.owner)?;
+
+        self.release(&lease.owner, |lock| lease.holds(lock), 1, false)
+    }
+
+    async fn force_release_rebuild(&self, owner: &str) -> Result<RebuildGeneration, Error> {
+        rebuild::check_owner(owner)?;
+
+        self.release(owner, |lock| lock.owner == owner, 2, true)
+    }
+
+    async fn write_rebuild_views(
+        &self,
+        lease: &RebuildLease,
+        views: &[ProjectedView],
+    ) -> Result<(), Error> {
+        rebuild::check_owner(&lease.owner)?;
+        rebuild::check_view_batch(views)?;
+
+        // The fence's mutex is held through the write, so a takeover cannot slip between the
+        // guard and the rows, like the row lock PostgreSQL holds.
+        let state = self.rebuild_lock();
+        let now = self.clock.unix_seconds();
+        if !state
+            .lock
+            .as_ref()
+            .is_some_and(|lock| lease.holds(lock) && lock.lease_expires_at > now)
+        {
+            return Err(lease_lost(&lease.owner));
+        }
+
+        let mut rows = self.views_lock();
+        check_view_conditions(&rows, views)?;
+        apply_views(&mut rows, views);
+
+        Ok(())
+    }
+}
+
+impl MemRepository {
+    /// A release (`increment` 1, flag cleared) or a force-release (`increment` 2, flag set) of the
+    /// lock `held` accepts: the lease's (owner and fencing token) or, for a force-release, the
+    /// named owner's.
+    fn release(
+        &self,
+        owner: &str,
+        held: impl FnOnce(&RebuildLock) -> bool,
+        increment: i64,
+        force_released: bool,
+    ) -> Result<RebuildGeneration, Error> {
+        let mut state = self.rebuild_lock();
+        if !state.lock.as_ref().is_some_and(held) {
+            return Err(lease_lost(owner));
+        }
+
+        state.lock = None;
+        state.generation = RebuildGeneration {
+            value: state.generation.value + increment,
+            force_released,
+        };
+
+        Ok(state.generation)
+    }
+}
+
+fn lease_lost(owner: &str) -> Error {
+    Error::RebuildLeaseLost {
+        owner: owner.to_owned(),
+    }
+}
+
 mod enumerate;
 mod views;
 
@@ -677,6 +865,18 @@ mod tests {
 
         // The clone is a second writer over the same storage.
         outcome_cases(&first, &first.clone()).await;
+    }
+
+    #[tokio::test]
+    async fn conforms_to_the_rebuild_fence() {
+        let clock = crate::conformance::TestClock::starting_now();
+        let repository = MemRepository::new().with_clock(clock.reader());
+
+        crate::conformance::RebuildSuite::new(&repository, &clock)
+            .with_views(repository.clone())
+            .with_head_fixtures(repository.clone())
+            .run()
+            .await;
     }
 
     #[tokio::test]
@@ -1098,7 +1298,7 @@ mod tests {
         };
 
         let result = repository
-            .commit(Commit::new("a", vec![event("a", 1)]).with_views(views(98, 0)))
+            .commit(Commit::new("a", vec![event("a", 1)]).with_views(views(97, 0)))
             .await;
         assert!(
             matches!(result, Err(Error::CommitTooLarge { actions: 101, .. })),
@@ -1118,10 +1318,10 @@ mod tests {
         );
 
         repository
-            .commit(Commit::new("a", vec![event("a", 1)]).with_views(views(97, 0)))
+            .commit(Commit::new("a", vec![event("a", 1)]).with_views(views(96, 0)))
             .await
             .unwrap();
-        assert_eq!(repository.views().len(), 97);
+        assert_eq!(repository.views().len(), 96);
     }
     /// A history-dependent projector whose rows depend on the events of the commit: one row per
     /// stream, owned by it, listing the commit's event types and the state after them; and a

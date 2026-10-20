@@ -26,6 +26,7 @@ type FeatureMarkerFixtures struct {
 	Commits         []FeatureCommitVector      `json:"commits"`
 	StreamHeads     []StreamHeadVector         `json:"streamHeads"`
 	CommitViews     []CommitViewVector         `json:"commitViews"`
+	RebuildFence    []RebuildFenceVector       `json:"rebuildFence"`
 	PostgresSchemas []FeatureSchemaVector      `json:"postgresSchemas"`
 }
 
@@ -284,6 +285,13 @@ func GenerateFeatureMarkerFixtures(ctx context.Context) (FeatureMarkerFixtures, 
 	}
 
 	fixtures.CommitViews = commitViews
+
+	rebuildFence, err := GenerateRebuildFenceVectors(ctx)
+	if err != nil {
+		return fixtures, err
+	}
+
+	fixtures.RebuildFence = rebuildFence
 
 	for _, tables := range [][2]string{{"orders", "orders_entity_type_idx"}, {"evt_events", "evt_snapshots"}} {
 		capture := &featureSchemaCapture{}

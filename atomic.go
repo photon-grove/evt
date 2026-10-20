@@ -463,7 +463,7 @@ func TransactionItemSizes(result SerializedResult) ([]int, error) {
 // does.
 //
 // The estimate follows the commit's actions (storage spec, Stream Heads): the feature-marker
-// check, every event put, every snapshot put, one head update per written stream, one head check
+// check, the rebuild-lock check, every event put, every snapshot put, one head update per written stream, one head check
 // per fenced stream, and the outcome put. A written stream pays one action beyond its events
 // whether it creates or appends, and the head update is budgeted by the rule every update
 // follows: its key attributes, expression strings, name placeholders and names, and values.
@@ -482,9 +482,9 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 	keySize := func(id EntityID, sequence EventSequence) int {
 		return len("pk") + len("sk") + len(id) + len(strconv.Itoa(int(sequence)))
 	}
-	// Only actions a commit actually emits are budgeted: the feature-marker check today. The
-	// rebuild-lock check (C10) joins this list in the change that starts emitting it.
-	sizes := []int{keySize(SystemNamespacePrefix+"FEATURES", 0)}
+	// Only actions a commit actually emits are budgeted: the two control checks, each sized by
+	// its two key attributes.
+	sizes := []int{keySize(SystemNamespacePrefix+"FEATURES", 0), keySize(RebuildLockID, 0)}
 
 	type written struct {
 		entityType  EntityType

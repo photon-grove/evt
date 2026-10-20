@@ -1,14 +1,18 @@
 //! The Rust driver for the cross-language integration run (`scripts/compat-integration.sh`).
 //!
 //! ```text
-//! evt-compat steps
-//! evt-compat step   --backend dynamo|postgres --run RUN --index N
-//! evt-compat verify --backend dynamo|postgres --run RUN
+//! evt-compat steps     [--only NAME]
+//! evt-compat exclusive
+//! evt-compat step      --backend dynamo|postgres --run RUN --index N [--only NAME]
+//! evt-compat verify    --backend dynamo|postgres --run RUN
 //! evt-compat enumerate --backend dynamo|postgres --run RUN
 //! ```
 //!
-//! `step` executes step N of every scenario whose writer is `rust`, against streams the Go driver
-//! also writes to. `verify` checks every stream against the golden fixtures: the raw stored items
+//! `step` executes step N of every interleaved scenario whose writer is `rust`, against streams the
+//! Go driver also writes to. A scenario marked exclusive holds store-wide state across its steps (a
+//! rebuild lock refuses every other scenario's commits), so the interleaved run skips it and
+//! `--only NAME` runs that scenario alone; `steps` prints the step count of the interleaved
+//! scenarios, or of the named one, and `exclusive` lists the exclusive scenarios. `verify` checks every stream against the golden fixtures: the raw stored items
 //! or rows, the events and snapshot read through the repository, and the loaded state. `enumerate`
 //! prints the run's events as `stream_all_events` yields them (unfiltered and filtered by entity
 //! type), one sorted line each, for the integration script to compare with the Go driver's output.
@@ -17,7 +21,7 @@ use std::process::ExitCode;
 
 use evt_compat::drivers::{self, DynamoHeads, DynamoViews, PostgresHeads, PostgresViews};
 use evt_compat::scenario::{Expectation, WRITER};
-use evt_compat::{HeadAccess, Runner, ScenarioFixtures, Scenarios, ViewAccess};
+use evt_compat::{HeadAccess, RebuildDriver, Runner, ScenarioFixtures, Scenarios, ViewAccess};
 use futures_core::Stream;
 use photon_evt::dynamodb::DynamoRepository;
 use photon_evt::postgres::PostgresRepository;
@@ -41,18 +45,21 @@ struct Args {
     backend: String,
     run: String,
     index: usize,
+    /// The one exclusive scenario to run, when set.
+    only: String,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
     let command = args
         .next()
-        .ok_or("missing command: steps | step | verify")?;
+        .ok_or("missing command: steps | exclusive | step | verify | enumerate")?;
     let mut parsed = Args {
         command,
         backend: String::new(),
         run: String::new(),
         index: 0,
+        only: String::new(),
     };
 
     while let Some(flag) = args.next() {
@@ -60,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
         match flag.as_str() {
             "--backend" => parsed.backend = value,
             "--run" => parsed.run = value,
+            "--only" => parsed.only = value,
             "--index" => {
                 parsed.index = value
                     .parse()
@@ -82,22 +90,43 @@ async fn connect(backend: &str) -> Result<Backend, BoxError> {
     }
 }
 
-async fn step<R: Repository, H: HeadAccess + Clone + 'static>(
+/// Reports whether a step run takes the scenario: the interleaved run takes every scenario that is
+/// not exclusive, and a run with `--only` that one exclusive scenario alone.
+fn selected(scenario: &evt_compat::Scenario, only: &str) -> bool {
+    if only.is_empty() {
+        return !scenario.exclusive;
+    }
+
+    scenario.exclusive && scenario.name == only
+}
+
+async fn step<R, H, V, F>(
     repository: R,
-    heads: H,
+    access: (H, V, F),
     run: &str,
     index: usize,
-) -> Result<Failures, BoxError> {
+    only: &str,
+) -> Result<Failures, BoxError>
+where
+    R: Repository,
+    H: HeadAccess + Clone + 'static,
+    V: ViewAccess + Clone + 'static,
+    F: photon_evt::RebuildFence + Clone + 'static,
+{
+    let (heads, views, fence) = access;
     let scenarios = Scenarios::load()?;
     let mut failures = Vec::new();
 
-    for scenario in &scenarios.scenarios {
+    for scenario in scenarios.scenarios.iter().filter(|s| selected(s, only)) {
         let Some(step) = scenario.steps.get(index).filter(|step| step.by == WRITER) else {
             continue;
         };
 
-        let runner =
-            Runner::for_scenario(&repository, scenario, run).with_head_access(heads.clone());
+        // A live `wait` really sleeps.
+        let runner = Runner::for_scenario(&repository, scenario, run)
+            .with_head_access(heads.clone())
+            .with_view_access(views.clone())
+            .with_rebuild_access(RebuildDriver::sleeping(fence.clone()));
         let outcome = runner.execute(&scenario.entity_id(run), step).await?;
 
         if outcome == step.expect {
@@ -472,7 +501,25 @@ async fn enumerate<R: EventLog>(repository: &R, run: &str) -> Result<Failures, B
 
 async fn run(args: Args) -> Result<Failures, BoxError> {
     if args.command == "steps" {
-        println!("{}", Scenarios::load()?.max_steps());
+        let steps = Scenarios::load()?
+            .scenarios
+            .iter()
+            .filter(|scenario| selected(scenario, &args.only))
+            .map(|scenario| scenario.steps.len())
+            .max()
+            .unwrap_or_default();
+        println!("{steps}");
+
+        return Ok(Vec::new());
+    }
+
+    if args.command == "exclusive" {
+        for scenario in Scenarios::load()?.scenarios {
+            if scenario.exclusive {
+                println!("{}", scenario.name);
+            }
+        }
+
         return Ok(Vec::new());
     }
 
@@ -484,14 +531,22 @@ async fn run(args: Args) -> Result<Failures, BoxError> {
 
     match (args.command.as_str(), backend) {
         ("step", Backend::Dynamo(repository)) => {
-            let heads = DynamoHeads::of(&repository);
+            let access = (
+                DynamoHeads::of(&repository),
+                DynamoViews::of(&repository),
+                repository.clone(),
+            );
 
-            step(repository, heads, &args.run, args.index).await
+            step(repository, access, &args.run, args.index, &args.only).await
         }
         ("step", Backend::Postgres(repository)) => {
-            let heads = PostgresHeads::default_tables(repository.pool().clone());
+            let access = (
+                PostgresHeads::default_tables(repository.pool().clone()),
+                PostgresViews::new(repository.pool().clone()),
+                repository.clone(),
+            );
 
-            step(repository, heads, &args.run, args.index).await
+            step(repository, access, &args.run, args.index, &args.only).await
         }
         ("verify", backend) => verify(backend, &args.run).await,
         ("enumerate", Backend::Dynamo(repository)) => enumerate(&repository, &args.run).await,

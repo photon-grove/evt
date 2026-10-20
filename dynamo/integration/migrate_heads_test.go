@@ -194,6 +194,10 @@ func seedV08Store(ctx context.Context, t *testing.T, repo *dynamo.Repository) []
 			"pk": &types.AttributeValueMemberS{Value: "SYSTEM#REBUILD"}, "sk": number(0),
 			"owner": &types.AttributeValueMemberS{Value: "job"}, "leaseExpiresAt": number(migrationNow + 60),
 		},
+		{
+			"pk": &types.AttributeValueMemberS{Value: "SYSTEM#REBUILD#GENERATION"}, "sk": number(0),
+			"value": number(1),
+		},
 	}
 
 	var queue []map[string]types.AttributeValue
@@ -223,6 +227,15 @@ func seedV08Store(ctx context.Context, t *testing.T, repo *dynamo.Repository) []
 	return streams
 }
 
+// releaseSeededRebuild force-releases the rebuild lock the fixture store carries, as an operator
+// ends a wedged job, so commits can resume.
+func releaseSeededRebuild(ctx context.Context, t *testing.T, repo *dynamo.Repository) {
+	t.Helper()
+
+	_, err := repo.RebuildFence().ForceRelease(ctx, "job")
+	require.NoError(t, err)
+}
+
 // requireHeads asserts every stream of the fixture store has exactly the expected head item.
 func requireHeads(ctx context.Context, t *testing.T, repo *dynamo.Repository, streams []v08Expectation) {
 	t.Helper()
@@ -240,7 +253,7 @@ func requireHeads(ctx context.Context, t *testing.T, repo *dynamo.Repository, st
 		require.Equal(t, stream.headTTL, int64(ttl), "%s head ttl", stream.id)
 	}
 
-	for _, id := range []string{"SYSTEM#REBUILD", "command-outcome#c1"} {
+	for _, id := range []string{"SYSTEM#REBUILD", "SYSTEM#REBUILD#GENERATION", "command-outcome#c1"} {
 		_, _, present := storedHead(ctx, t, repo, id)
 		require.False(t, present, "the reserved namespace %s is skipped", id)
 	}
@@ -330,6 +343,9 @@ func Test_MigrateHeads_HeadAwareWritersWorkAfterwards(t *testing.T) {
 	_, err := migrationFor(repo, nil).Migrate(ctx, dynamo.HeadsMigrateOptions{ConfirmWritersStopped: true})
 	require.NoError(t, err)
 
+	// The fixture's rebuild job holds the fence, which refuses every commit: an operator ends it.
+	releaseSeededRebuild(ctx, t, repo)
+
 	// A fresh head-aware writer appends to a backfilled stream: the head item continues from the
 	// backfilled head, whether the stream ended in events, a snapshot, or both.
 	writer := dynamo.NewRepository(repoClient(), repo.EventsTable)
@@ -393,6 +409,8 @@ func Test_MigrateHeads_RetainedHeadsKeepTheirTTLForAHeadAwareWriter(t *testing.T
 
 	_, err := migrationFor(repo, nil).Migrate(ctx, dynamo.HeadsMigrateOptions{ConfirmWritersStopped: true})
 	require.NoError(t, err)
+
+	releaseSeededRebuild(ctx, t, repo)
 
 	// The writer that loaded the stream learns the head's ttl and appends under the never-lower
 	// rule, so the head item keeps the largest ttl.

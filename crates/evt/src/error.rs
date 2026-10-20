@@ -189,9 +189,75 @@ pub enum Error {
         entity_type: EntityType,
     },
 
-    /// A durable rebuild lock blocks writes, including when its lease expired.
+    /// A commit's rebuild-lock check failed (v0.9, C10): a rebuild holds the `SYSTEM#REBUILD` lock,
+    /// including one whose lease expired. Nothing was written.
+    ///
+    /// It is **transient**, never a conflict: the commit can succeed once the lock is released,
+    /// taken over, or force-released. Fence-aware retry runs the command again after a backoff and
+    /// returns this error when the attempts run out; it never becomes a `stale-fence` rejection
+    /// (even when the commit carried caller-stamped fences) and records no outcome. A failed
+    /// feature-marker check outranks it; it outranks every other failure of the commit.
     #[error("a projection rebuild is in progress")]
     RebuildInProgress,
+
+    /// [`begin_rebuild`](crate::RebuildFence::begin_rebuild) found another rebuild holding an
+    /// unexpired lease. Not retried by the engine. Nothing was written.
+    #[error("the rebuild lock is held by {owner:?} until {lease_expires_at} (Unix seconds)")]
+    RebuildLockHeld {
+        /// The holder's owner token.
+        owner: String,
+        /// When the holder's lease lapses, in whole Unix seconds.
+        lease_expires_at: i64,
+    },
+
+    /// The caller no longer holds the rebuild lock it named: the lock row is gone or names another
+    /// owner or, for a lease (a renew, an end, a guarded view write), another fencing token, as
+    /// after a takeover by a new incarnation under the same owner token; or, for a guarded view
+    /// write, the lease lapsed. The worker must stop. Nothing was written.
+    #[error("rebuild owner {owner:?} does not hold the lock")]
+    RebuildLeaseLost {
+        /// The owner token the caller named.
+        owner: String,
+    },
+
+    /// [`begin_rebuild`](crate::RebuildFence::begin_rebuild) lost its race against other lifecycle
+    /// operations [`MAX_REBUILD_BEGIN_ATTEMPTS`](crate::MAX_REBUILD_BEGIN_ATTEMPTS) times. It is
+    /// **transient**.
+    #[error("the rebuild lock kept changing; gave up after {attempts} attempts")]
+    RebuildConflict {
+        /// The attempts made.
+        attempts: usize,
+    },
+
+    /// The rebuild lock and generation disagree in a way the protocol cannot produce (an odd
+    /// generation with no lock and no force-release flag, or a lock with an even generation),
+    /// because every transition writes both in one transaction. It is reported, never repaired.
+    #[error("the rebuild lock and generation disagree: {0}")]
+    RebuildStateInvalid(String),
+
+    /// A reader found an odd rebuild generation: a rebuild is in progress, or a force-release left
+    /// derived state untrustworthy (`force_released`). It is **transient**: read again once a
+    /// rebuild has ended. See [`RebuildEpoch`](crate::RebuildEpoch).
+    #[error(
+        "derived state is unavailable: rebuild generation {generation} is odd{}",
+        if *force_released { " (left by a force-release)" } else { "" }
+    )]
+    RebuildUnavailable {
+        /// The odd generation.
+        generation: i64,
+        /// The generation was left by a force-release.
+        force_released: bool,
+    },
+
+    /// A reader's rebuild generation changed between its before and after reads: a rebuild
+    /// started, finished, or was taken over while the read ran. It is **transient**.
+    #[error("the rebuild generation changed from {observed} to {current} during the read")]
+    RebuildEpochChanged {
+        /// The epoch the read was made under.
+        observed: i64,
+        /// The settled generation read afterwards.
+        current: i64,
+    },
 
     /// Encoding a payload, metadata, or snapshot failed.
     #[error(transparent)]
@@ -470,7 +536,10 @@ impl Error {
     }
 
     /// Reports whether reloading and running the command again may succeed: a conflict, a
-    /// transient backend failure, or an ambiguous write that provably did not apply.
+    /// transient backend failure, an ambiguous write that provably did not apply, or a transient
+    /// rebuild-fence refusal (a commit refused during a rebuild, a lost
+    /// [`begin_rebuild`](crate::RebuildFence::begin_rebuild) race, an unavailable or changed
+    /// reader epoch).
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -478,6 +547,10 @@ impl Error {
                 | Self::SequenceGap { .. }
                 | Self::Transient(_)
                 | Self::AmbiguousWrite { .. }
+                | Self::RebuildInProgress
+                | Self::RebuildConflict { .. }
+                | Self::RebuildUnavailable { .. }
+                | Self::RebuildEpochChanged { .. }
                 | Self::FenceConflict {
                     provenance: crate::repository::FenceProvenance::Engine,
                     ..

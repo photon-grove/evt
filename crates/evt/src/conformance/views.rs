@@ -1156,15 +1156,15 @@ where
 {
     let ns = namespace();
 
-    // The marker check, the head update, and one event leave 97 actions for views.
+    // The two control checks, the head update, and one event leave 96 actions for views.
     let plain = Stream::new(&ns, "plain", "ledger");
     let pk = format!("{ns}-plain");
     let result = repo
-        .commit(Commit::new(plain.id.clone(), plain.events(1..=1)).with_views(bulk(&pk, 98, "{}")))
+        .commit(Commit::new(plain.id.clone(), plain.events(1..=1)).with_views(bulk(&pk, 97, "{}")))
         .await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "98 views are one action too many: {result:?}"
+        "97 views are one action too many: {result:?}"
     );
     ensure!(
         repo.events(&plain.id).await?.is_empty(),
@@ -1174,11 +1174,11 @@ where
         row(target, &pk, "row-000").await?.is_none(),
         "no view was written"
     );
-    repo.commit(Commit::new(plain.id.clone(), plain.events(1..=1)).with_views(bulk(&pk, 97, "{}")))
+    repo.commit(Commit::new(plain.id.clone(), plain.events(1..=1)).with_views(bulk(&pk, 96, "{}")))
         .await?;
     ensure!(
-        row(target, &pk, "row-096").await?.is_some(),
-        "97 views fit with one event"
+        row(target, &pk, "row-095").await?.is_some(),
+        "96 views fit with one event"
     );
 
     // A snapshot put is one more action.
@@ -1188,25 +1188,25 @@ where
         .commit(
             Commit::new(snapshotted.id.clone(), snapshotted.events(1..=1))
                 .with_snapshot(snapshotted.new_snapshot(1, "{}"))
-                .with_views(bulk(&pk, 97, "{}")),
+                .with_views(bulk(&pk, 96, "{}")),
         )
         .await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "97 views and a snapshot are one action too many: {result:?}"
+        "96 views and a snapshot are one action too many: {result:?}"
     );
     repo.commit(
         Commit::new(snapshotted.id.clone(), snapshotted.events(1..=1))
             .with_snapshot(snapshotted.new_snapshot(1, "{}"))
-            .with_views(bulk(&pk, 96, "{}")),
+            .with_views(bulk(&pk, 95, "{}")),
     )
     .await?;
     ensure!(
-        row(target, &pk, "row-095").await?.is_some(),
-        "96 views fit with a snapshot"
+        row(target, &pk, "row-094").await?.is_some(),
+        "95 views fit with a snapshot"
     );
 
-    // Two written streams cost two head updates: 95 views fit with one event each.
+    // Two written streams cost two head updates: 94 views fit with one event each.
     let (a, b) = (
         Stream::new(&ns, "a", "ledger"),
         Stream::new(&ns, "b", "ledger"),
@@ -1220,18 +1220,18 @@ where
         .with_views(views)
     };
     let result = repo
-        .commit_transaction(transaction(bulk(&pk, 96, "{}")))
+        .commit_transaction(transaction(bulk(&pk, 95, "{}")))
         .await;
     ensure!(
         matches!(&result, Err(Error::CommitTooLarge { actions: 101, .. })),
-        "96 views are one action too many beside two streams: {result:?}"
+        "95 views are one action too many beside two streams: {result:?}"
     );
     ensure!(repo.events(&a.id).await?.is_empty(), "no event was written");
-    repo.commit_transaction(transaction(bulk(&pk, 95, "{}")))
+    repo.commit_transaction(transaction(bulk(&pk, 94, "{}")))
         .await?;
     ensure!(
-        row(target, &pk, "row-094").await?.is_some(),
-        "95 views fit beside two streams"
+        row(target, &pk, "row-093").await?.is_some(),
+        "94 views fit beside two streams"
     );
 
     Ok(())
@@ -1258,7 +1258,7 @@ where
         )
         .await;
     ensure!(
-        matches!(&result, Err(Error::CommitTooLarge { actions: 15, bytes, largest_item })
+        matches!(&result, Err(Error::CommitTooLarge { actions: 16, bytes, largest_item })
             if *bytes > 3_800_000 && *largest_item < 380_000),
         "the aggregate byte budget: {result:?}"
     );

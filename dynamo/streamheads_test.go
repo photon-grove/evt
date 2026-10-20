@@ -119,44 +119,44 @@ func TestCommit_ActionCountsFollowTheWorkedExamples(t *testing.T) {
 	}{
 		{"create one stream, 1 event, no snapshot (+ outcome)", func(_ *testing.T, _ *dynamo.Repository, name string) evt.SerializedResult {
 			return evt.SerializedResult{Events: headEvents(name, 1, 1, "t"), Outcome: outcomeFor(name)}
-		}, 4},
+		}, 5},
 		{"append 1 event, no snapshot (+ outcome)", func(t *testing.T, repo *dynamo.Repository, name string) evt.SerializedResult {
 			seed(t, repo, name)
 
 			return evt.SerializedResult{Events: headEvents(name, 4, 1, "t"), Outcome: outcomeFor(name)}
-		}, 4},
+		}, 5},
 		{"append 1 event that writes a snapshot (+ outcome)", func(t *testing.T, repo *dynamo.Repository, name string) evt.SerializedResult {
 			seed(t, repo, name)
 
 			return evt.SerializedResult{
 				Events: headEvents(name, 4, 1, "t"), Snapshots: []evt.SerializedSnapshot{headSnapshot(name, 1, 4)}, Outcome: outcomeFor(name),
 			}
-		}, 5},
+		}, 6},
 		{"create with 5 events and a snapshot (+ outcome)", func(_ *testing.T, _ *dynamo.Repository, name string) evt.SerializedResult {
 			return evt.SerializedResult{
 				Events: headEvents(name, 1, 5, "t"), Snapshots: []evt.SerializedSnapshot{headSnapshot(name, 1, 5)}, Outcome: outcomeFor(name),
 			}
-		}, 9},
+		}, 10},
 		{"10 single-event appends + 5 fenced reads", func(t *testing.T, repo *dynamo.Repository, name string) evt.SerializedResult {
 			written, read := names(name+"-w", 10), names(name+"-r", 5)
 			seed(t, repo, append(slices.Clone(written), read...)...)
 
 			return evt.SerializedResult{Events: appends(written), Fences: fences(read), Outcome: outcomeFor(name)}
-		}, 27},
+		}, 28},
 		{"12 single-event appends + 9 fenced reads", func(t *testing.T, repo *dynamo.Repository, name string) evt.SerializedResult {
 			written, read := names(name+"-w", 12), names(name+"-r", 9)
 			seed(t, repo, append(slices.Clone(written), read...)...)
 
 			return evt.SerializedResult{Events: appends(written), Fences: fences(read), Outcome: outcomeFor(name)}
-		}, 35},
+		}, 36},
 		{"1 single-event append + 30 fenced reads", func(t *testing.T, repo *dynamo.Repository, name string) evt.SerializedResult {
 			written, read := names(name+"-w", 1), names(name+"-r", 30)
 			seed(t, repo, append(slices.Clone(written), read...)...)
 
 			return evt.SerializedResult{Events: appends(written), Fences: fences(read), Outcome: outcomeFor(name)}
-		}, 34},
+		}, 35},
 		{"the most fenced streams beside one single-event append", func(t *testing.T, repo *dynamo.Repository, name string) evt.SerializedResult {
-			written, read := names(name+"-w", 1), names(name+"-r", 96)
+			written, read := names(name+"-w", 1), names(name+"-r", 95)
 			seed(t, repo, append(slices.Clone(written), read...)...)
 
 			return evt.SerializedResult{Events: appends(written), Fences: fences(read), Outcome: outcomeFor(name)}
@@ -179,8 +179,9 @@ func TestCommit_ActionCountsFollowTheWorkedExamples(t *testing.T) {
 	}
 }
 
-// The single-stream capacity for event and projector operations (marker counted, outcome not): a
-// stream pays one action beyond its events, plus one when it also writes a snapshot.
+// The single-stream capacity for event and projector operations (both control checks counted,
+// outcome not): a stream pays one action beyond its events, plus one when it also writes a
+// snapshot.
 func TestCommit_SingleStreamCapacity(t *testing.T) {
 	ctx := context.Background()
 
@@ -190,10 +191,10 @@ func TestCommit_SingleStreamCapacity(t *testing.T) {
 		fits      int
 		tooLarger int
 	}{
-		"create":               {fits: 98},
-		"append":               {appends: true, fits: 98},
-		"create with snapshot": {snapshot: true, fits: 97},
-		"append with snapshot": {appends: true, snapshot: true, fits: 97},
+		"create":               {fits: 97},
+		"append":               {appends: true, fits: 97},
+		"create with snapshot": {snapshot: true, fits: 96},
+		"append with snapshot": {appends: true, snapshot: true, fits: 96},
 	} {
 		t.Run(name, func(t *testing.T) {
 			fake := compat.NewFakeDynamo()
@@ -269,13 +270,15 @@ func TestCommit_BudgetMatchesTheActionsSent(t *testing.T) {
 			estimate, err := evt.TransactionItemSizesWithTTL(commit, ttlFor)
 			require.NoError(t, err)
 
-			// The marker check is budgeted by its key alone (its first action, 20 bytes); every other
-			// action by the full rule.
+			// The two control checks are budgeted by their keys alone (the marker check's 20 bytes
+			// and the rebuild-lock check's 19, the first two actions); every other action by the
+			// full rule.
 			require.Equal(t, 20, estimate[0])
-			estimate = estimate[1:]
+			require.Equal(t, 19, estimate[1])
+			estimate = estimate[2:]
 
 			actual := make([]int, 0, len(capture.sent[0]))
-			for _, item := range capture.sent[0][1:] {
+			for _, item := range capture.sent[0][2:] {
 				actual = append(actual, dynamo.TransactItemSize(item))
 			}
 
