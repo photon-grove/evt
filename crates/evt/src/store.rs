@@ -1224,7 +1224,7 @@ mod tests {
             .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(5)));
         let metadata = || Metadata::default().with_command_id("cmd-1");
 
-        repository
+        let lease = repository
             .begin_rebuild("rebuild-1", Duration::from_secs(60))
             .await
             .unwrap();
@@ -1253,7 +1253,7 @@ mod tests {
         assert!(repository.events(&"g-1".into()).await.unwrap().is_empty());
 
         // Once the rebuild is over the same command ID runs.
-        repository.end_rebuild("rebuild-1").await.unwrap();
+        repository.end_rebuild(&lease).await.unwrap();
         let outcome = store
             .execute_with_outcome("g-1", Decide, metadata())
             .await

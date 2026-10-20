@@ -8,8 +8,8 @@ use std::sync::atomic::AtomicI64;
 use super::*;
 use crate::projection::{ProjectedView, ViewOperation, ViewRow};
 use crate::rebuild::{
-    MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH, RebuildFence, RebuildGeneration, RebuildState,
-    observe_rebuild_epoch, read_at_rebuild_epoch, verify_rebuild_epoch,
+    MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH, RebuildFence, RebuildGeneration, RebuildLease,
+    RebuildState, observe_rebuild_epoch, read_at_rebuild_epoch, verify_rebuild_epoch,
 };
 
 /// A settable clock in whole Unix seconds for the rebuild cases: a repository reads it through
@@ -140,6 +140,7 @@ where
             repo: self.repo,
             clock: self.clock,
             ns: namespace(),
+            leases: Mutex::new(BTreeMap::new()),
         };
         let mut failures = Vec::new();
 
@@ -172,6 +173,10 @@ where
         case!(
             "a force-release unblocks commits and leaves readers fenced",
             force_release(&env)
+        );
+        case!(
+            "a stale incarnation of an owner token can act on no later lease",
+            stale_incarnation(&env, self.views.as_ref())
         );
         case!(
             "bad owners and leases are refused before any request",
@@ -222,6 +227,8 @@ struct Env<'a, R> {
     repo: &'a R,
     clock: &'a TestClock,
     ns: String,
+    /// The last lease each name began.
+    leases: Mutex<BTreeMap<String, RebuildLease>>,
 }
 
 impl<R: Repository + RebuildFence> Env<'_, R> {
@@ -233,11 +240,11 @@ impl<R: Repository + RebuildFence> Env<'_, R> {
         }
 
         if !self.repo.rebuild_generation().await?.is_settled() {
-            let owner = self.owner("settle");
-            self.repo
-                .begin_rebuild(&owner, Duration::from_secs(60))
+            let lease = self
+                .repo
+                .begin_rebuild(&self.owner("settle"), Duration::from_secs(60))
                 .await?;
-            self.repo.end_rebuild(&owner).await?;
+            self.repo.end_rebuild(&lease).await?;
         }
 
         Ok(())
@@ -247,15 +254,37 @@ impl<R: Repository + RebuildFence> Env<'_, R> {
         format!("{}-{name}", self.ns)
     }
 
-    async fn begin(&self, name: &str, seconds: u64) -> Result<crate::RebuildLease, Failure> {
-        Ok(self
+    /// Begins a rebuild as `name` and remembers its lease.
+    async fn begin(&self, name: &str, seconds: u64) -> Result<RebuildLease, Failure> {
+        let lease = self
             .repo
             .begin_rebuild(&self.owner(name), Duration::from_secs(seconds))
-            .await?)
+            .await?;
+        self.leases().insert(name.to_owned(), lease.clone());
+
+        Ok(lease)
+    }
+
+    /// The last lease `name` began, or one that holds nothing (generation 0) when it began none.
+    fn lease(&self, name: &str) -> RebuildLease {
+        self.leases()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| RebuildLease {
+                owner: self.owner(name),
+                generation: 0,
+                lease_expires_at: 0,
+            })
+    }
+
+    fn leases(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, RebuildLease>> {
+        self.leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     async fn end(&self, name: &str) -> Result<RebuildGeneration, Failure> {
-        Ok(self.repo.end_rebuild(&self.owner(name)).await?)
+        Ok(self.repo.end_rebuild(&self.lease(name)).await?)
     }
 
     async fn generation(&self) -> Result<RebuildGeneration, Failure> {
@@ -328,6 +357,7 @@ async fn lifecycle<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult
             },
             lock: Some(crate::RebuildLock {
                 owner: env.owner("a"),
+                generation: started.generation,
                 lease_expires_at: started.lease_expires_at
             }),
         },
@@ -361,10 +391,18 @@ async fn lifecycle<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult
 
     // Renew extends the lease to the new duration from now, and only for the holder.
     env.clock.advance(30);
-    let expiry = repo
-        .renew_rebuild(&env.owner("a"), Duration::from_secs(120))
+    let renewed = repo
+        .renew_rebuild(&started, Duration::from_secs(120))
         .await?;
-    ensure_eq!(expiry, env.clock.seconds() + 120, "the renewed expiry");
+    let expiry = renewed.lease_expires_at;
+    ensure_eq!(
+        renewed,
+        RebuildLease {
+            lease_expires_at: env.clock.seconds() + 120,
+            ..started.clone()
+        },
+        "the renewed lease"
+    );
     let state = repo.rebuild_state().await?;
     ensure_eq!(
         state.lock.map(|lock| lock.lease_expires_at),
@@ -377,12 +415,12 @@ async fn lifecycle<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult
         "renewing does not touch the generation"
     );
     lease_lost(
-        repo.renew_rebuild(&env.owner("b"), Duration::from_secs(60))
+        repo.renew_rebuild(&env.lease("b"), Duration::from_secs(60))
             .await,
         "another owner's renew",
     )?;
     lease_lost(
-        repo.end_rebuild(&env.owner("b")).await,
+        repo.end_rebuild(&env.lease("b")).await,
         "another owner's end",
     )?;
 
@@ -401,9 +439,9 @@ async fn lifecycle<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult
         !repo.rebuild_state().await?.in_progress(),
         "the lock is gone"
     );
-    lease_lost(repo.end_rebuild(&env.owner("a")).await, "a second end")?;
+    lease_lost(repo.end_rebuild(&env.lease("a")).await, "a second end")?;
     lease_lost(
-        repo.renew_rebuild(&env.owner("a"), Duration::from_secs(60))
+        repo.renew_rebuild(&env.lease("a"), Duration::from_secs(60))
             .await,
         "a renew after the end",
     )?;
@@ -460,12 +498,12 @@ async fn takeover<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult 
 
     // The displaced worker can do nothing.
     lease_lost(
-        repo.renew_rebuild(&env.owner("a"), Duration::from_secs(60))
+        repo.renew_rebuild(&env.lease("a"), Duration::from_secs(60))
             .await,
         "the displaced worker's renew",
     )?;
     lease_lost(
-        repo.end_rebuild(&env.owner("a")).await,
+        repo.end_rebuild(&env.lease("a")).await,
         "the displaced worker's end",
     )?;
     refused(env.commit("taken").await, "a commit after the takeover")?;
@@ -484,7 +522,7 @@ async fn takeover<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult 
     // A renewal keeps a lease from being taken over.
     env.begin("c", 10).await?;
     env.clock.advance(8);
-    repo.renew_rebuild(&env.owner("c"), Duration::from_secs(10))
+    repo.renew_rebuild(&env.lease("c"), Duration::from_secs(10))
         .await?;
     env.clock.advance(8);
     lock_held(
@@ -543,7 +581,7 @@ async fn force_release<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseRe
         repo.force_release_rebuild(&env.owner("a")).await,
         "no lock is left to release",
     )?;
-    lease_lost(repo.end_rebuild(&env.owner("a")).await, "nor to end")?;
+    lease_lost(repo.end_rebuild(&env.lease("a")).await, "nor to end")?;
 
     // A new rebuild acquires from the force-released generation, adding two; the flag stays until
     // it ends.
@@ -587,6 +625,116 @@ async fn force_release<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseRe
     Ok(())
 }
 
+/// A lease is fenced by its generation, not just its owner token: a worker incarnation whose lease
+/// was taken over by a new incarnation under the same token can renew, write, and end nothing.
+async fn stale_incarnation<R, T>(env: &Env<'_, R>, views: Option<&T>) -> CaseResult
+where
+    R: Repository + RebuildFence,
+    T: CommitViewTarget<R>,
+{
+    let repo = env.repo;
+    let pk = format!("{}#incarnations", env.ns);
+    let put = |sk: &str| {
+        [ProjectedView::new(
+            "rebuild",
+            0,
+            0,
+            ViewOperation::put(pk.clone(), sk, "owner", "test", "{}"),
+        )]
+    };
+    let row = |sk: &'static str| {
+        let pk = pk.clone();
+
+        async move {
+            match views {
+                Some(views) => views
+                    .row(&pk, sk)
+                    .await
+                    .map_err(|err| Failure(err.to_string())),
+                None => Ok(None),
+            }
+        }
+    };
+    let token = env.owner("worker");
+
+    let stale = repo.begin_rebuild(&token, Duration::from_secs(10)).await?;
+    env.clock.advance(11);
+    let fresh = repo.begin_rebuild(&token, Duration::from_secs(60)).await?;
+    ensure_eq!(fresh.owner, stale.owner, "the same owner token");
+    ensure_eq!(
+        fresh.generation,
+        stale.generation + 2,
+        "an expired lease is taken over, even by the same owner token"
+    );
+    let before = repo.rebuild_state().await?;
+    ensure_eq!(
+        before.lock.as_ref().map(|lock| lock.generation),
+        Some(fresh.generation),
+        "the lock stores the new lease's fencing token"
+    );
+
+    // The stale incarnation changes nothing.
+    lease_lost(
+        repo.renew_rebuild(&stale, Duration::from_secs(3600)).await,
+        "the stale incarnation's renew",
+    )?;
+    if views.is_some() {
+        lease_lost(
+            repo.write_rebuild_views(&stale, &put("stale")).await,
+            "the stale incarnation's write",
+        )?;
+        ensure!(
+            row("stale").await?.is_none(),
+            "the stale write wrote nothing"
+        );
+    }
+    lease_lost(
+        repo.end_rebuild(&stale).await,
+        "the stale incarnation's end",
+    )?;
+    ensure_eq!(
+        repo.rebuild_state().await?,
+        before,
+        "the new holder's lock, expiry, and generation are untouched"
+    );
+
+    // The new incarnation can.
+    let renewed = repo.renew_rebuild(&fresh, Duration::from_secs(120)).await?;
+    ensure_eq!(
+        renewed.lease_expires_at,
+        env.clock.seconds() + 120,
+        "the renewed expiry"
+    );
+    if views.is_some() {
+        repo.write_rebuild_views(&renewed, &put("fresh")).await?;
+        ensure!(row("fresh").await?.is_some(), "the new holder's row");
+    }
+    let settled = repo.end_rebuild(&renewed).await?;
+    ensure_eq!(
+        settled.value,
+        fresh.generation + 1,
+        "the settled generation"
+    );
+
+    // A lease does not outlive its rebuild: after the end, the same token begins again under a
+    // new generation, and both earlier leases are dead.
+    let again = repo.begin_rebuild(&token, Duration::from_secs(60)).await?;
+    ensure_eq!(again.generation, settled.value + 1, "the next lease");
+    for (name, old) in [("stale", &stale), ("ended", &fresh)] {
+        lease_lost(
+            repo.renew_rebuild(old, Duration::from_secs(3600)).await,
+            &format!("the {name} lease's renew"),
+        )?;
+        lease_lost(
+            repo.end_rebuild(old).await,
+            &format!("the {name} lease's end"),
+        )?;
+    }
+    repo.end_rebuild(&again).await?;
+
+    Ok(())
+}
+
 async fn arguments<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult {
     let repo = env.repo;
     let before = env.generation().await?;
@@ -617,12 +765,17 @@ async fn arguments<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult
         invalid,
     )?;
     expect_err(
-        repo.renew_rebuild(&env.owner("a"), Duration::ZERO).await,
+        repo.renew_rebuild(&env.lease("a"), Duration::ZERO).await,
         "renew with a zero lease",
         invalid,
     )?;
+    let nobody = RebuildLease {
+        owner: String::new(),
+        generation: 1,
+        lease_expires_at: 0,
+    };
     expect_err(
-        repo.end_rebuild("").await,
+        repo.end_rebuild(&nobody).await,
         "end with an empty owner",
         invalid,
     )?;
@@ -632,7 +785,7 @@ async fn arguments<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult
         invalid,
     )?;
     expect_err(
-        repo.write_rebuild_views("", &[]).await,
+        repo.write_rebuild_views(&nobody, &[]).await,
         "a guarded write with an empty owner",
         invalid,
     )?;
@@ -959,7 +1112,7 @@ async fn epochs<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseResult {
     env.end("a").await?;
     let result = read_at_rebuild_epoch(repo, |_| async {
         env.begin("b", 3600).await.map_err(failure_error)?;
-        repo.end_rebuild(&env.owner("b")).await?;
+        repo.end_rebuild(&env.lease("b")).await?;
 
         Ok::<_, Error>(())
     })
@@ -1071,14 +1224,14 @@ where
 
     // Without a lock there is nothing to guard the write: it is refused and writes nothing.
     lease_lost(
-        repo.write_rebuild_views(&env.owner("a"), &[put("none")])
+        repo.write_rebuild_views(&env.lease("a"), &[put("none")])
             .await,
         "a write with no lock",
     )?;
     absent("none").await?;
 
     env.begin("a", 10).await?;
-    repo.write_rebuild_views(&env.owner("a"), &[put("one"), put("two")])
+    repo.write_rebuild_views(&env.lease("a"), &[put("one"), put("two")])
         .await?;
     for sk in ["one", "two"] {
         let row = views
@@ -1093,7 +1246,7 @@ where
 
     // Another owner's batch is refused, whole.
     lease_lost(
-        repo.write_rebuild_views(&env.owner("b"), &[put("foreign")])
+        repo.write_rebuild_views(&env.lease("b"), &[put("foreign")])
             .await,
         "another owner's write",
     )?;
@@ -1104,14 +1257,14 @@ where
         .map(|index| put(&format!("bulk-{index:03}")))
         .collect();
     expect_err(
-        repo.write_rebuild_views(&env.owner("a"), &batch).await,
+        repo.write_rebuild_views(&env.lease("a"), &batch).await,
         "a batch over the limit",
         |err| matches!(err, Error::CommitTooLarge { actions: 101, .. }),
     )?;
-    repo.write_rebuild_views(&env.owner("a"), &batch[..MAX_REBUILD_VIEW_BATCH])
+    repo.write_rebuild_views(&env.lease("a"), &batch[..MAX_REBUILD_VIEW_BATCH])
         .await?;
     expect_err(
-        repo.write_rebuild_views(&env.owner("a"), &[]).await,
+        repo.write_rebuild_views(&env.lease("a"), &[]).await,
         "an empty batch",
         |err| matches!(err, Error::InvalidArgument(_)),
     )?;
@@ -1119,7 +1272,7 @@ where
     // A lapsed lease is no guard, even before anyone takes over.
     env.clock.advance(11);
     lease_lost(
-        repo.write_rebuild_views(&env.owner("a"), &[put("lapsed")])
+        repo.write_rebuild_views(&env.lease("a"), &[put("lapsed")])
             .await,
         "a write under a lapsed lease",
     )?;
@@ -1128,12 +1281,12 @@ where
     // The worker that lost its lock to a takeover writes nothing; the new owner can.
     env.begin("b", 3600).await?;
     lease_lost(
-        repo.write_rebuild_views(&env.owner("a"), &[put("displaced")])
+        repo.write_rebuild_views(&env.lease("a"), &[put("displaced")])
             .await,
         "the displaced worker's write",
     )?;
     absent("displaced").await?;
-    repo.write_rebuild_views(&env.owner("b"), &[put("taken-over")])
+    repo.write_rebuild_views(&env.lease("b"), &[put("taken-over")])
         .await?;
     ensure!(
         views
@@ -1151,7 +1304,7 @@ where
 /// Wraps a repository so a rebuild ends during the engine's `n`-th backoff, and counts them.
 struct EndsDuringBackoff<'a, R> {
     inner: &'a R,
-    owner: Mutex<Option<(String, usize)>>,
+    owner: Mutex<Option<(RebuildLease, usize)>>,
     waits: AtomicUsize,
 }
 
@@ -1164,8 +1317,8 @@ impl<'a, R: Repository + RebuildFence> EndsDuringBackoff<'a, R> {
         }
     }
 
-    /// Ends `owner`'s rebuild during the `wait`-th backoff from now.
-    fn end_during(&self, owner: Option<(String, usize)>) {
+    /// Ends the lease's rebuild during the `wait`-th backoff from now.
+    fn end_during(&self, owner: Option<(RebuildLease, usize)>) {
         *self.owner.lock().unwrap_or_else(|p| p.into_inner()) = owner;
         self.waits.store(0, Ordering::SeqCst);
     }
@@ -1197,12 +1350,12 @@ impl<R: Repository + RebuildFence> Repository for EndsDuringBackoff<'_, R> {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
             .filter(|(_, at)| *at == waits)
-            .map(|(owner, _)| owner);
+            .map(|(lease, _)| lease);
 
         async move {
-            if let Some(owner) = due {
+            if let Some(lease) = due {
                 self.inner
-                    .end_rebuild(&owner)
+                    .end_rebuild(&lease)
                     .await
                     .expect("end the rebuild during the backoff");
             }
@@ -1267,7 +1420,7 @@ async fn engine_retry<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseRes
 
     // The lock is released during the second backoff: the third attempt commits.
     env.begin("worker", 3600).await?;
-    wrapper.end_during(Some((env.owner("worker"), 2)));
+    wrapper.end_during(Some((env.lease("worker"), 2)));
     let command = command_id();
     let outcome = store
         .execute_with_outcome(&id, Add(5), command_metadata(&command))

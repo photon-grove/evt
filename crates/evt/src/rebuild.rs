@@ -9,12 +9,17 @@
 //! generation ([`RebuildEpoch`]).
 //!
 //! Every backend implements the lifecycle ([`RebuildFence`]): [`begin`](RebuildFence::begin_rebuild)
-//! acquires the lock (or takes over an expired lease), [`renew`](RebuildFence::renew_rebuild)
-//! extends it, [`end`](RebuildFence::end_rebuild) releases it and settles the generation, and
-//! [`force_release`](RebuildFence::force_release_rebuild) is the operator's escape hatch that
-//! unblocks commits at once while leaving readers fenced. A rebuild worker writes its view rows
-//! through [`write_rebuild_views`](RebuildFence::write_rebuild_views), whose every batch asserts
-//! the worker still holds an unexpired lease.
+//! acquires the lock (or takes over an expired lease) and returns a [`RebuildLease`],
+//! [`renew`](RebuildFence::renew_rebuild) extends it, [`end`](RebuildFence::end_rebuild) releases
+//! it and settles the generation, and [`force_release`](RebuildFence::force_release_rebuild) is the
+//! operator's escape hatch that unblocks commits at once while leaving readers fenced. A rebuild
+//! worker writes its view rows through [`write_rebuild_views`](RebuildFence::write_rebuild_views),
+//! whose every batch asserts the worker still holds an unexpired lease.
+//!
+//! A lease is bound to its owner token **and** its fencing token: the odd generation its begin
+//! produced, which the lock row stores. Renew, end, and a guarded write name the lease, so a stale
+//! incarnation of a worker that reuses its owner token after a takeover (or a later begin) can
+//! never act on the new holder's lock: its generation no longer matches.
 //!
 //! ```
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -28,7 +33,7 @@
 //! assert_eq!(lease.generation, 1, "odd while the rebuild holds the lock");
 //! assert!(observe_rebuild_epoch(&repository).await.is_err(), "readers are fenced");
 //!
-//! let settled = repository.end_rebuild("rebuild-1").await.unwrap();
+//! let settled = repository.end_rebuild(&lease).await.unwrap();
 //! assert!(settled.is_settled());
 //! assert_eq!(observe_rebuild_epoch(&repository).await.unwrap().generation(), 2);
 //! # });
@@ -90,12 +95,15 @@ impl RebuildGeneration {
     }
 }
 
-/// The rebuild-lock row: the holder's owner token and the second its lease lapses, in whole Unix
-/// seconds.
+/// The rebuild-lock row: the holder's owner token, its fencing token, and the second its lease
+/// lapses, in whole Unix seconds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RebuildLock {
     /// The owner token of the rebuild that holds the lock.
     pub owner: String,
+    /// The fencing token: the odd generation the acquire or takeover that wrote the lock produced.
+    /// While the lock exists it equals the generation row's value.
+    pub generation: i64,
     /// The lease expiry, in whole Unix seconds.
     pub lease_expires_at: i64,
 }
@@ -126,15 +134,23 @@ impl RebuildState {
 }
 
 /// What [`RebuildFence::begin_rebuild`] returns: the owner, the odd generation the transaction
-/// produced, and the second the lease lapses.
+/// produced (the lease's fencing token), and the second the lease lapses. Renew, end, and a guarded
+/// write take it, and act only while the lock still names both its owner and its generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RebuildLease {
     /// The owner token that holds the lock.
     pub owner: String,
-    /// The generation after the acquire or takeover (odd).
+    /// The fencing token: the generation after the acquire or takeover (odd).
     pub generation: i64,
     /// The lease expiry, in whole Unix seconds.
     pub lease_expires_at: i64,
+}
+
+impl RebuildLease {
+    /// Reports whether `lock` is this lease's: it names the same owner and fencing token.
+    pub fn holds(&self, lock: &RebuildLock) -> bool {
+        lock.owner == self.owner && lock.generation == self.generation
+    }
 }
 
 /// The lifecycle of the durable rebuild fence over one event log (v0.9, C10). The in-memory,
@@ -169,24 +185,25 @@ pub trait RebuildFence: Send + Sync {
         lease: Duration,
     ) -> impl Future<Output = Result<RebuildLease, Error>> + Send;
 
-    /// Extends the holder's lease to `lease` from now and returns the new expiry, in whole Unix
-    /// seconds. Fails with [`Error::RebuildLeaseLost`] when the lock row is gone or names another
-    /// owner; it does not require the lease to be unexpired.
+    /// Extends `lease` to `extend` from now and returns it with the new expiry. Fails with
+    /// [`Error::RebuildLeaseLost`] when the lock row is gone or names another owner or fencing
+    /// token; it does not require the lease to be unexpired.
     fn renew_rebuild(
         &self,
-        owner: &str,
-        lease: Duration,
-    ) -> impl Future<Output = Result<i64, Error>> + Send;
+        lease: &RebuildLease,
+        extend: Duration,
+    ) -> impl Future<Output = Result<RebuildLease, Error>> + Send;
 
-    /// Releases the lock and restores the settled generation (one more), clearing the
-    /// force-release flag. Fails with [`Error::RebuildLeaseLost`] when the caller no longer holds
-    /// the lock.
+    /// Releases `lease`'s lock and restores the settled generation (one more than the lease's),
+    /// clearing the force-release flag. Fails with [`Error::RebuildLeaseLost`] when the lock row
+    /// is gone or names another owner or fencing token.
     fn end_rebuild(
         &self,
-        owner: &str,
+        lease: &RebuildLease,
     ) -> impl Future<Output = Result<RebuildGeneration, Error>> + Send;
 
-    /// The operator's release of a named owner's lock, for a lost or wedged worker: deletes the
+    /// The operator's release of a named owner's lock, for a lost or wedged worker (it names the
+    /// owner alone, not a lease, because the operator holds none): deletes the
     /// lock row, so commits resume at once, but leaves the generation odd (two more) and flagged,
     /// so readers stay fenced until a later rebuild begins and ends. Fails with
     /// [`Error::RebuildLeaseLost`] when the lock row is gone or names another owner. It never runs
@@ -197,15 +214,15 @@ pub trait RebuildFence: Send + Sync {
     ) -> impl Future<Output = Result<RebuildGeneration, Error>> + Send;
 
     /// Writes one batch of view operations (the same operations a commit's projectors produce)
-    /// atomically with a guard that `owner` still holds an unexpired lease. A failed guard writes
-    /// nothing and is [`Error::RebuildLeaseLost`]: the worker lost its lock to a takeover or a
-    /// force-release, or let its lease lapse, and must stop. An empty batch is
+    /// atomically with a guard that `lease` still holds the lock, by owner and fencing token, and
+    /// has not lapsed. A failed guard writes nothing and is [`Error::RebuildLeaseLost`]: the worker
+    /// lost its lock to a takeover or a force-release, or let its lease lapse, and must stop. An empty batch is
     /// [`Error::InvalidArgument`] and one over [`MAX_REBUILD_VIEW_BATCH`] operations (or the
     /// commit byte budget) [`Error::CommitTooLarge`], both before any write; a repository with
     /// nowhere to write views refuses with [`Error::ViewsNotConfigured`].
     fn write_rebuild_views(
         &self,
-        owner: &str,
+        lease: &RebuildLease,
         views: &[ProjectedView],
     ) -> impl Future<Output = Result<(), Error>> + Send;
 }
@@ -233,17 +250,17 @@ macro_rules! forward_rebuild_fence {
 
             fn renew_rebuild(
                 &self,
-                owner: &str,
-                lease: Duration,
-            ) -> impl Future<Output = Result<i64, Error>> + Send {
-                (**self).renew_rebuild(owner, lease)
+                lease: &RebuildLease,
+                extend: Duration,
+            ) -> impl Future<Output = Result<RebuildLease, Error>> + Send {
+                (**self).renew_rebuild(lease, extend)
             }
 
             fn end_rebuild(
                 &self,
-                owner: &str,
+                lease: &RebuildLease,
             ) -> impl Future<Output = Result<RebuildGeneration, Error>> + Send {
-                (**self).end_rebuild(owner)
+                (**self).end_rebuild(lease)
             }
 
             fn force_release_rebuild(
@@ -255,10 +272,10 @@ macro_rules! forward_rebuild_fence {
 
             fn write_rebuild_views(
                 &self,
-                owner: &str,
+                lease: &RebuildLease,
                 views: &[ProjectedView],
             ) -> impl Future<Output = Result<(), Error>> + Send {
-                (**self).write_rebuild_views(owner, views)
+                (**self).write_rebuild_views(lease, views)
             }
         }
     )+};
@@ -578,8 +595,30 @@ mod tests {
     fn lock(owner: &str, lease_expires_at: i64) -> Option<RebuildLock> {
         Some(RebuildLock {
             owner: owner.to_owned(),
+            generation: 3,
             lease_expires_at,
         })
+    }
+
+    #[test]
+    fn a_lease_holds_only_the_lock_of_its_owner_and_fencing_token() {
+        let lease = RebuildLease {
+            owner: "w".into(),
+            generation: 3,
+            lease_expires_at: 100,
+        };
+        let lock = |owner: &str, generation| RebuildLock {
+            owner: owner.into(),
+            generation,
+            lease_expires_at: 50,
+        };
+
+        assert!(lease.holds(&lock("w", 3)), "the expiry is not part of it");
+        assert!(
+            !lease.holds(&lock("w", 5)),
+            "a later incarnation of the owner"
+        );
+        assert!(!lease.holds(&lock("v", 3)));
     }
 
     #[test]

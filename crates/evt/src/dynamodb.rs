@@ -3394,6 +3394,12 @@ mod tests {
             let name = vector["name"].as_str().unwrap();
             let owner = vector["owner"].as_str().unwrap_or_default();
             let lease = vector["leaseSeconds"].as_i64().unwrap_or_default();
+            // The lease a renew, an end, or a guarded write names: its owner and fencing token.
+            let held = crate::RebuildLease {
+                owner: owner.to_owned(),
+                generation: vector["leaseGeneration"].as_i64().unwrap_or_default(),
+                lease_expires_at: 0,
+            };
             let generation = item(&vector["before"]["generation"])
                 .map(|item| rebuild_generation_from_item(&item).unwrap())
                 .unwrap_or_default();
@@ -3411,11 +3417,16 @@ mod tests {
                 "begin" => {
                     let mut calls = reads_state;
                     match Plan::decide(&state, now) {
-                        Ok(plan) => calls.push(transaction(
-                            repository
-                                .rebuild_begin_items(&plan, owner, now, now + lease)
-                                .unwrap(),
-                        )),
+                        Ok(plan) => {
+                            let begun = crate::RebuildLease {
+                                owner: owner.to_owned(),
+                                generation: generation.value + plan.increment,
+                                lease_expires_at: now + lease,
+                            };
+                            calls.push(transaction(
+                                repository.rebuild_begin_items(&plan, &begun, now).unwrap(),
+                            ));
+                        }
                         Err(error) => {
                             assert!(
                                 matches!(error, Error::RebuildLockHeld { .. }),
@@ -3428,28 +3439,26 @@ mod tests {
                     calls
                 }
                 "renew" => {
-                    let update = repository.rebuild_renew_update(owner, now + lease).unwrap();
+                    let update = repository.rebuild_renew_update(&held, now + lease).unwrap();
                     let action =
                         fixture_action(&TransactWriteItem::builder().update(update).build());
 
                     vec![json!({"call": "UpdateItem", "actions": [action]})]
                 }
-                operation @ ("end" | "forceRelease") => {
-                    let release = if operation == "end" {
-                        rebuild::Release::End
-                    } else {
-                        rebuild::Release::Force
-                    };
-
-                    vec![
-                        read(wire::rebuild_generation_key()),
-                        transaction(
-                            repository
-                                .rebuild_release_items(release, owner, generation.value)
-                                .unwrap(),
-                        ),
-                    ]
-                }
+                // An end names its lease's generation and reads nothing first.
+                "end" => vec![transaction(
+                    repository
+                        .rebuild_release_items(rebuild::Release::End, owner, held.generation)
+                        .unwrap(),
+                )],
+                "forceRelease" => vec![
+                    read(wire::rebuild_generation_key()),
+                    transaction(
+                        repository
+                            .rebuild_release_items(rebuild::Release::Force, owner, generation.value)
+                            .unwrap(),
+                    ),
+                ],
                 "writeViews" => {
                     let views = [
                         ProjectedView::new(
@@ -3473,7 +3482,7 @@ mod tests {
                     ];
 
                     vec![transaction(
-                        repository.rebuild_view_items(owner, &views, now).unwrap(),
+                        repository.rebuild_view_items(&held, &views, now).unwrap(),
                     )]
                 }
                 other => panic!("{name}: unknown operation {other}"),

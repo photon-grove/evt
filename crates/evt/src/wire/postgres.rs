@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS {features} (
 CREATE TABLE IF NOT EXISTS {rebuild_lock} (
     id               integer PRIMARY KEY,
     owner            text        NOT NULL,
+    generation       bigint      NOT NULL,
     lease_expires_at timestamptz NOT NULL
 );
 

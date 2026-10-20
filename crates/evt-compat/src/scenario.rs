@@ -15,8 +15,8 @@ use photon_evt::{
     Begin, CommandIdentity, CommandOutcome, Commit, DigestInput, EntityId, EntityType, Error,
     EventId, EventSequence, EventType, EventVersion, ExecuteError, FenceProvenance, Metadata,
     NewSnapshot, OutcomeConfig, ProjectedView, ReadFence, RebuildFence, RebuildGeneration,
-    Repository, RetryPolicy, SerializedEvent, SerializedSnapshot, Store, TransactionCommit,
-    ViewOperation, ViewRow, default_digest, json, observe_rebuild_epoch,
+    RebuildLease, RebuildState, Repository, RetryPolicy, SerializedEvent, SerializedSnapshot,
+    Store, TransactionCommit, ViewOperation, ViewRow, default_digest, json, observe_rebuild_epoch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -889,8 +889,12 @@ impl<R: Repository> Runner<R> {
 
         let call = match step.action.as_str() {
             "begin" => rebuild.begin(&owner, lease).await,
-            "renew" => rebuild.renew(&owner, lease).await,
-            "end" => rebuild.end(&owner).await,
+            "renew" => {
+                rebuild
+                    .renew(&held_lease(rebuild, &owner).await?, lease)
+                    .await
+            }
+            "end" => rebuild.end(&held_lease(rebuild, &owner).await?).await,
             "forceRelease" => rebuild.force_release(&owner).await,
             "generation" => rebuild.observe().await,
             "wait" => rebuild.wait(step.seconds).await,
@@ -911,7 +915,9 @@ impl<R: Repository> Runner<R> {
                     ),
                 );
 
-                rebuild.write_views(&owner, vec![view]).await
+                rebuild
+                    .write_views(&held_lease(rebuild, &owner).await?, vec![view])
+                    .await
             }
             other => {
                 return Err(StepError::Unexpected(format!(
@@ -1460,20 +1466,41 @@ pub fn scoped_owner(base: &EntityId, owner: &str) -> String {
     format!("{base}-{owner}")
 }
 
+/// The lease a step of `owner` acts under. Every step is its own process, so the lease is rebuilt
+/// from the store: the lock's fencing token when the lock names the owner, and otherwise
+/// generation 0, which matches no lock.
+async fn held_lease(rebuild: &Arc<dyn RebuildAccess>, owner: &str) -> Result<RebuildLease, Error> {
+    let generation = rebuild
+        .state()
+        .await?
+        .lock
+        .filter(|lock| lock.owner == owner)
+        .map_or(0, |lock| lock.generation);
+
+    Ok(RebuildLease {
+        owner: owner.to_owned(),
+        generation,
+        lease_expires_at: 0,
+    })
+}
+
 /// A backend's rebuild fence, for the `rebuild` steps, and how a `wait` step waits. Boxed futures
 /// keep it object-safe; [`RebuildDriver`] implements it for any [`RebuildFence`].
 pub trait RebuildAccess: Send + Sync {
     /// The generation, read consistently.
     fn generation(&self) -> HeadFuture<'_, RebuildGeneration>;
 
+    /// The generation and the lock row.
+    fn state(&self) -> HeadFuture<'_, RebuildState>;
+
     /// Begins a rebuild.
     fn begin<'a>(&'a self, owner: &'a str, lease: Duration) -> HeadFuture<'a, ()>;
 
     /// Renews a lease.
-    fn renew<'a>(&'a self, owner: &'a str, lease: Duration) -> HeadFuture<'a, ()>;
+    fn renew<'a>(&'a self, lease: &'a RebuildLease, extend: Duration) -> HeadFuture<'a, ()>;
 
     /// Ends a rebuild.
-    fn end<'a>(&'a self, owner: &'a str) -> HeadFuture<'a, ()>;
+    fn end<'a>(&'a self, lease: &'a RebuildLease) -> HeadFuture<'a, ()>;
 
     /// Force-releases a rebuild.
     fn force_release<'a>(&'a self, owner: &'a str) -> HeadFuture<'a, ()>;
@@ -1482,7 +1509,11 @@ pub trait RebuildAccess: Send + Sync {
     fn observe(&self) -> HeadFuture<'_, ()>;
 
     /// One guarded batch of view writes.
-    fn write_views<'a>(&'a self, owner: &'a str, views: Vec<ProjectedView>) -> HeadFuture<'a, ()>;
+    fn write_views<'a>(
+        &'a self,
+        lease: &'a RebuildLease,
+        views: Vec<ProjectedView>,
+    ) -> HeadFuture<'a, ()>;
 
     /// Waits `seconds`: really, on a live backend, or by advancing the injected clock.
     fn wait(&self, seconds: u64) -> HeadFuture<'_, ()>;
@@ -1547,16 +1578,20 @@ impl<F: RebuildFence + 'static> RebuildAccess for RebuildDriver<F> {
         Box::pin(self.fence.rebuild_generation())
     }
 
+    fn state(&self) -> HeadFuture<'_, RebuildState> {
+        Box::pin(self.fence.rebuild_state())
+    }
+
     fn begin<'a>(&'a self, owner: &'a str, lease: Duration) -> HeadFuture<'a, ()> {
         Box::pin(async move { self.fence.begin_rebuild(owner, lease).await.map(drop) })
     }
 
-    fn renew<'a>(&'a self, owner: &'a str, lease: Duration) -> HeadFuture<'a, ()> {
-        Box::pin(async move { self.fence.renew_rebuild(owner, lease).await.map(drop) })
+    fn renew<'a>(&'a self, lease: &'a RebuildLease, extend: Duration) -> HeadFuture<'a, ()> {
+        Box::pin(async move { self.fence.renew_rebuild(lease, extend).await.map(drop) })
     }
 
-    fn end<'a>(&'a self, owner: &'a str) -> HeadFuture<'a, ()> {
-        Box::pin(async move { self.fence.end_rebuild(owner).await.map(drop) })
+    fn end<'a>(&'a self, lease: &'a RebuildLease) -> HeadFuture<'a, ()> {
+        Box::pin(async move { self.fence.end_rebuild(lease).await.map(drop) })
     }
 
     fn force_release<'a>(&'a self, owner: &'a str) -> HeadFuture<'a, ()> {
@@ -1567,8 +1602,12 @@ impl<F: RebuildFence + 'static> RebuildAccess for RebuildDriver<F> {
         Box::pin(async move { observe_rebuild_epoch(&self.fence).await.map(drop) })
     }
 
-    fn write_views<'a>(&'a self, owner: &'a str, views: Vec<ProjectedView>) -> HeadFuture<'a, ()> {
-        Box::pin(async move { self.fence.write_rebuild_views(owner, &views).await })
+    fn write_views<'a>(
+        &'a self,
+        lease: &'a RebuildLease,
+        views: Vec<ProjectedView>,
+    ) -> HeadFuture<'a, ()> {
+        Box::pin(async move { self.fence.write_rebuild_views(lease, &views).await })
     }
 
     fn wait(&self, seconds: u64) -> HeadFuture<'_, ()> {

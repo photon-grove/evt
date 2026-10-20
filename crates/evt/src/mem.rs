@@ -709,12 +709,13 @@ impl RebuildFence for MemRepository {
         let lease_expires_at = now.saturating_add(seconds);
 
         // The acquire and the takeover leave the force-release flag as it was: only a release
-        // clears it.
+        // clears it. The lock stores the generation they produce as its fencing token.
+        state.generation.value += plan.increment;
         state.lock = Some(RebuildLock {
             owner: owner.to_owned(),
+            generation: state.generation.value,
             lease_expires_at,
         });
-        state.generation.value += plan.increment;
 
         Ok(RebuildLease {
             owner: owner.to_owned(),
@@ -723,30 +724,45 @@ impl RebuildFence for MemRepository {
         })
     }
 
-    async fn renew_rebuild(&self, owner: &str, lease: Duration) -> Result<i64, Error> {
-        let seconds = rebuild::check_lease(owner, lease)?;
+    async fn renew_rebuild(
+        &self,
+        lease: &RebuildLease,
+        extend: Duration,
+    ) -> Result<RebuildLease, Error> {
+        let seconds = rebuild::check_lease(&lease.owner, extend)?;
 
         let mut state = self.rebuild_lock();
         let lease_expires_at = self.clock.unix_seconds().saturating_add(seconds);
-        let Some(lock) = state.lock.as_mut().filter(|lock| lock.owner == owner) else {
-            return Err(lease_lost(owner));
+        let Some(lock) = state.lock.as_mut().filter(|lock| lease.holds(lock)) else {
+            return Err(lease_lost(&lease.owner));
         };
 
         lock.lease_expires_at = lease_expires_at;
 
-        Ok(lease_expires_at)
+        Ok(RebuildLease {
+            lease_expires_at,
+            ..lease.clone()
+        })
     }
 
-    async fn end_rebuild(&self, owner: &str) -> Result<RebuildGeneration, Error> {
-        self.release(owner, 1, false)
+    async fn end_rebuild(&self, lease: &RebuildLease) -> Result<RebuildGeneration, Error> {
+        rebuild::check_owner(&lease.owner)?;
+
+        self.release(&lease.owner, |lock| lease.holds(lock), 1, false)
     }
 
     async fn force_release_rebuild(&self, owner: &str) -> Result<RebuildGeneration, Error> {
-        self.release(owner, 2, true)
+        rebuild::check_owner(owner)?;
+
+        self.release(owner, |lock| lock.owner == owner, 2, true)
     }
 
-    async fn write_rebuild_views(&self, owner: &str, views: &[ProjectedView]) -> Result<(), Error> {
-        rebuild::check_owner(owner)?;
+    async fn write_rebuild_views(
+        &self,
+        lease: &RebuildLease,
+        views: &[ProjectedView],
+    ) -> Result<(), Error> {
+        rebuild::check_owner(&lease.owner)?;
         rebuild::check_view_batch(views)?;
 
         // The fence's mutex is held through the write, so a takeover cannot slip between the
@@ -756,9 +772,9 @@ impl RebuildFence for MemRepository {
         if !state
             .lock
             .as_ref()
-            .is_some_and(|lock| lock.owner == owner && lock.lease_expires_at > now)
+            .is_some_and(|lock| lease.holds(lock) && lock.lease_expires_at > now)
         {
-            return Err(lease_lost(owner));
+            return Err(lease_lost(&lease.owner));
         }
 
         let mut rows = self.views_lock();
@@ -771,17 +787,17 @@ impl RebuildFence for MemRepository {
 
 impl MemRepository {
     /// A release (`increment` 1, flag cleared) or a force-release (`increment` 2, flag set) of the
-    /// named owner's lock.
+    /// lock `held` accepts: the lease's (owner and fencing token) or, for a force-release, the
+    /// named owner's.
     fn release(
         &self,
         owner: &str,
+        held: impl FnOnce(&RebuildLock) -> bool,
         increment: i64,
         force_released: bool,
     ) -> Result<RebuildGeneration, Error> {
-        rebuild::check_owner(owner)?;
-
         let mut state = self.rebuild_lock();
-        if !state.lock.as_ref().is_some_and(|lock| lock.owner == owner) {
+        if !state.lock.as_ref().is_some_and(held) {
             return Err(lease_lost(owner));
         }
 

@@ -996,7 +996,7 @@ async fn rebuild_fence_vectors_match_go() {
             "generation": (state.generation != RebuildGeneration::default())
                 .then(|| dynamo::rebuild_generation_item(state.generation)),
             "lock": state.lock.as_ref()
-                .map(|lock| dynamo::rebuild_lock_item(&lock.owner, lock.lease_expires_at)),
+                .map(dynamo::rebuild_lock_item),
         })
     };
     let error = |error: Error| match error {
@@ -1016,6 +1016,12 @@ async fn rebuild_fence_vectors_match_go() {
     for vector in vectors {
         let name = vector["name"].as_str().unwrap();
         let owner = vector["owner"].as_str().unwrap_or_default();
+        // The lease a renew, an end, or a guarded write names: its owner and fencing token.
+        let held = photon_evt::RebuildLease {
+            owner: owner.to_owned(),
+            generation: vector["leaseGeneration"].as_i64().unwrap_or_default(),
+            lease_expires_at: 0,
+        };
         let lease = Duration::from_secs(vector["leaseSeconds"].as_u64().unwrap_or_default());
         let before = RebuildState {
             generation: item(&vector["before"]["generation"])
@@ -1051,12 +1057,12 @@ async fn rebuild_fence_vectors_match_go() {
                     "generation": lease.generation, "leaseExpiresAt": lease.lease_expires_at}),
                 Err(err) => error(err),
             },
-            "renew" => match repository.renew_rebuild(owner, lease).await {
-                Ok(expiry) => serde_json::json!({"leaseExpiresAt": expiry}),
+            "renew" => match repository.renew_rebuild(&held, lease).await {
+                Ok(renewed) => serde_json::json!({"leaseExpiresAt": renewed.lease_expires_at}),
                 Err(err) => error(err),
             },
             "end" => repository
-                .end_rebuild(owner)
+                .end_rebuild(&held)
                 .await
                 .map_or_else(error, generation),
             "forceRelease" => repository
@@ -1079,7 +1085,7 @@ async fn rebuild_fence_vectors_match_go() {
                     ),
                 ];
 
-                match repository.write_rebuild_views(owner, &views).await {
+                match repository.write_rebuild_views(&held, &views).await {
                     Ok(()) => serde_json::json!({}),
                     Err(err) => error(err),
                 }

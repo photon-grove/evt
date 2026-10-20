@@ -211,8 +211,9 @@ pub enum Error {
     },
 
     /// The caller no longer holds the rebuild lock it named: the lock row is gone or names another
-    /// owner (a renew, an end, a force-release), or, for a guarded view write, its lease lapsed.
-    /// The worker must stop. Nothing was written.
+    /// owner or, for a lease (a renew, an end, a guarded view write), another fencing token, as
+    /// after a takeover by a new incarnation under the same owner token; or, for a guarded view
+    /// write, the lease lapsed. The worker must stop. Nothing was written.
     #[error("rebuild owner {owner:?} does not hold the lock")]
     RebuildLeaseLost {
         /// The owner token the caller named.

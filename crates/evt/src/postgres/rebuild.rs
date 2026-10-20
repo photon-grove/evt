@@ -81,7 +81,8 @@ impl PostgresRepository {
         for_update: bool,
     ) -> Result<Option<RebuildLock>, Error> {
         let sql = format!(
-            "SELECT owner, EXTRACT(EPOCH FROM lease_expires_at)::bigint FROM {} WHERE id = 0{}",
+            "SELECT owner, generation, EXTRACT(EPOCH FROM lease_expires_at)::bigint FROM {} \
+             WHERE id = 0{}",
             self.lock_table(),
             if for_update { " FOR UPDATE" } else { "" }
         );
@@ -89,7 +90,8 @@ impl PostgresRepository {
 
         Ok(row.map(|row| RebuildLock {
             owner: row.get(0),
-            lease_expires_at: row.get(1),
+            generation: row.get(1),
+            lease_expires_at: row.get(2),
         }))
     }
 
@@ -103,14 +105,16 @@ impl PostgresRepository {
         let lock = self.read_lock(&tx, true).await?;
         let now = self.clock.unix_seconds();
         let plan = Plan::decide(&RebuildState { generation, lock }, now)?;
-        let lease_expires_at = now.saturating_add(seconds);
+        let lease = RebuildLease {
+            owner: owner.to_owned(),
+            generation: generation.value + plan.increment,
+            lease_expires_at: now.saturating_add(seconds),
+        };
 
         let moved = if plan.kind == PlanKind::Takeover {
-            !self
-                .take_over(&tx, owner, &plan, now, lease_expires_at)
-                .await?
+            !self.take_over(&tx, &lease, &plan, now).await?
         } else {
-            !self.acquire(&tx, owner, &plan, lease_expires_at).await?
+            !self.acquire(&tx, &lease, &plan).await?
         };
         if moved {
             return Ok(Attempt::Moved);
@@ -118,27 +122,25 @@ impl PostgresRepository {
 
         tx.commit().await.map_err(|err| commit_error(err, false))?;
 
-        Ok(Attempt::Begun(RebuildLease {
-            owner: owner.to_owned(),
-            generation: generation.value + plan.increment,
-            lease_expires_at,
-        }))
+        Ok(Attempt::Begun(lease))
     }
 
-    /// The acquire's two statements; `false` when the rows moved.
+    /// The acquire's two statements, writing `lease` (its generation is the fencing token); `false`
+    /// when the rows moved.
     async fn acquire(
         &self,
         tx: &deadpool_postgres::Transaction<'_>,
-        owner: &str,
+        lease: &RebuildLease,
         plan: &Plan,
-        lease_expires_at: i64,
     ) -> Result<bool, Error> {
         let insert = format!(
-            "INSERT INTO {} (id, owner, lease_expires_at) \
-             VALUES (0, $1, to_timestamp($2::bigint::double precision))",
+            "INSERT INTO {} (id, owner, generation, lease_expires_at) \
+             VALUES (0, $1, $3, to_timestamp($2::bigint::double precision))",
             self.lock_table()
         );
-        match tx.execute(&insert, &[&owner, &lease_expires_at]).await {
+        let parameters: [&(dyn tokio_postgres::types::ToSql + Sync); 3] =
+            [&lease.owner, &lease.lease_expires_at, &lease.generation];
+        match tx.execute(&insert, &parameters).await {
             Ok(_) => {}
             // A lock row exists after all: the rows moved.
             Err(err) if err.code() == Some(&SqlState::UNIQUE_VIOLATION) => return Ok(false),
@@ -160,24 +162,34 @@ impl PostgresRepository {
         Ok(affected == 1)
     }
 
-    /// The takeover's two statements; `false` when the rows moved.
+    /// The takeover's two statements, writing `lease` (its generation, the observed odd one plus
+    /// two, is the fencing token); `false` when the rows moved.
     async fn take_over(
         &self,
         tx: &deadpool_postgres::Transaction<'_>,
-        owner: &str,
+        lease: &RebuildLease,
         plan: &Plan,
         now: i64,
-        lease_expires_at: i64,
     ) -> Result<bool, Error> {
         let update = format!(
-            "UPDATE {} SET owner = $1, lease_expires_at = to_timestamp($2::bigint::double precision) \
+            "UPDATE {} SET owner = $1, generation = $5, \
+             lease_expires_at = to_timestamp($2::bigint::double precision) \
              WHERE id = 0 AND owner = $3 \
                AND lease_expires_at < to_timestamp($4::bigint::double precision)",
             self.lock_table()
         );
         let observed = plan.observed_owner.as_deref().unwrap_or_default();
         let affected = tx
-            .execute(&update, &[&owner, &lease_expires_at, &observed, &now])
+            .execute(
+                &update,
+                &[
+                    &lease.owner,
+                    &lease.lease_expires_at,
+                    &observed,
+                    &now,
+                    &lease.generation,
+                ],
+            )
             .await
             .map_err(statement_error)?;
         if affected != 1 {
@@ -196,11 +208,13 @@ impl PostgresRepository {
         Ok(affected == 1)
     }
 
-    /// A release (`increment` 1, flag cleared) or a force-release (`increment` 2, flag set) of the
-    /// named owner's lock, in one transaction under the exclusive advisory lock.
+    /// A release (`token` the lease's generation, `increment` 1, flag cleared) or a force-release
+    /// (no token, `increment` 2, flag set) of the owner's lock, in one transaction under the
+    /// exclusive advisory lock.
     async fn release_rebuild(
         &self,
         owner: &str,
+        token: Option<i64>,
         increment: i64,
         force_released: bool,
     ) -> Result<RebuildGeneration, Error> {
@@ -210,22 +224,36 @@ impl PostgresRepository {
         let tx = client.transaction().await.map_err(Error::backend)?;
         self.lock_fence(&tx).await?;
 
-        // A settled generation means no rebuild holds the fence, so the caller cannot hold it.
+        // A settled generation means no rebuild holds the fence, so the caller cannot hold it; a
+        // lease holds the lock only at its own generation.
         let generation = self.read_generation(&tx, true).await?;
-        if generation.is_settled() {
+        if generation.is_settled() || token.is_some_and(|token| token != generation.value) {
             return Err(lease_lost(owner));
         }
 
-        let deleted = tx
-            .execute(
-                &format!(
-                    "DELETE FROM {} WHERE id = 0 AND owner = $1",
-                    self.lock_table()
-                ),
-                &[&owner],
-            )
-            .await
-            .map_err(statement_error)?;
+        let deleted = match token {
+            Some(token) => {
+                tx.execute(
+                    &format!(
+                        "DELETE FROM {} WHERE id = 0 AND owner = $1 AND generation = $2",
+                        self.lock_table()
+                    ),
+                    &[&owner, &token],
+                )
+                .await
+            }
+            None => {
+                tx.execute(
+                    &format!(
+                        "DELETE FROM {} WHERE id = 0 AND owner = $1",
+                        self.lock_table()
+                    ),
+                    &[&owner],
+                )
+                .await
+            }
+        }
+        .map_err(statement_error)?;
         if deleted != 1 {
             return Err(lease_lost(owner));
         }
@@ -284,8 +312,12 @@ impl RebuildFence for PostgresRepository {
         })
     }
 
-    async fn renew_rebuild(&self, owner: &str, lease: Duration) -> Result<i64, Error> {
-        let seconds = rebuild::check_lease(owner, lease)?;
+    async fn renew_rebuild(
+        &self,
+        lease: &RebuildLease,
+        extend: Duration,
+    ) -> Result<RebuildLease, Error> {
+        let seconds = rebuild::check_lease(&lease.owner, extend)?;
         let lease_expires_at = self.clock.unix_seconds().saturating_add(seconds);
 
         let client = self.pool.get().await.map_err(pool_error)?;
@@ -293,33 +325,43 @@ impl RebuildFence for PostgresRepository {
             .execute(
                 &format!(
                     "UPDATE {} SET lease_expires_at = to_timestamp($2::bigint::double precision) \
-                     WHERE id = 0 AND owner = $1",
+                     WHERE id = 0 AND owner = $1 AND generation = $3",
                     self.lock_table()
                 ),
-                &[&owner, &lease_expires_at],
+                &[&lease.owner, &lease_expires_at, &lease.generation],
             )
             .await
             .map_err(statement_error)?;
         if renewed != 1 {
-            return Err(lease_lost(owner));
+            return Err(lease_lost(&lease.owner));
         }
 
-        Ok(lease_expires_at)
+        Ok(RebuildLease {
+            lease_expires_at,
+            ..lease.clone()
+        })
     }
 
-    async fn end_rebuild(&self, owner: &str) -> Result<RebuildGeneration, Error> {
-        self.release_rebuild(owner, 1, false).await
+    async fn end_rebuild(&self, lease: &RebuildLease) -> Result<RebuildGeneration, Error> {
+        self.release_rebuild(&lease.owner, Some(lease.generation), 1, false)
+            .await
     }
 
     async fn force_release_rebuild(&self, owner: &str) -> Result<RebuildGeneration, Error> {
-        self.release_rebuild(owner, 2, true).await
+        self.release_rebuild(owner, None, 2, true).await
     }
 
-    /// One transaction that takes the lock row `FOR UPDATE` and asserts the owner and an unexpired
-    /// lease before the view statements. The row lock is held to `COMMIT`, so a takeover, which
-    /// must update or delete that row, waits for the batch: the old worker either asserts its lease
-    /// and commits first, or waits and then fails the assertion against the new owner.
-    async fn write_rebuild_views(&self, owner: &str, views: &[ProjectedView]) -> Result<(), Error> {
+    /// One transaction that takes the lock row `FOR UPDATE` and asserts the lease's owner and
+    /// fencing token and an unexpired lease before the view statements. The row lock is held to
+    /// `COMMIT`, so a takeover, which must update or delete that row, waits for the batch: the old
+    /// worker either asserts its lease and commits first, or waits and then fails the assertion
+    /// against the new holder.
+    async fn write_rebuild_views(
+        &self,
+        lease: &RebuildLease,
+        views: &[ProjectedView],
+    ) -> Result<(), Error> {
+        let owner = lease.owner.as_str();
         rebuild::check_owner(owner)?;
         rebuild::check_view_batch(views)?;
         let statements = self.view_statements(views)?;
@@ -329,7 +371,7 @@ impl RebuildFence for PostgresRepository {
 
         let lock = self.read_lock(&tx, true).await?;
         let now = self.clock.unix_seconds();
-        if !lock.is_some_and(|lock| lock.owner == owner && lock.lease_expires_at > now) {
+        if !lock.is_some_and(|lock| lease.holds(&lock) && lock.lease_expires_at > now) {
             return Err(lease_lost(owner));
         }
 

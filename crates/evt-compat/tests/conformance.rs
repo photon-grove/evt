@@ -2952,6 +2952,12 @@ async fn dynamo_rebuild_requests_replay_the_go_vectors() {
         let clock = TestClock::at(1_790_000_000);
         let repository = endpoint.repository("evt-compat", "views", &clock);
         let owner = vector["owner"].as_str().unwrap_or_default();
+        // The lease a renew, an end, or a guarded write names: its owner and fencing token.
+        let held = photon_evt::RebuildLease {
+            owner: owner.to_owned(),
+            generation: vector["leaseGeneration"].as_i64().unwrap_or_default(),
+            lease_expires_at: 0,
+        };
         let lease = Duration::from_secs(vector["leaseSeconds"].as_u64().unwrap_or_default());
 
         let error = |error: Error| match error {
@@ -2985,12 +2991,12 @@ async fn dynamo_rebuild_requests_replay_the_go_vectors() {
                     "leaseExpiresAt": lease.lease_expires_at}),
                 Err(err) => error(err),
             },
-            "renew" => match repository.renew_rebuild(owner, lease).await {
-                Ok(expiry) => json!({"leaseExpiresAt": expiry}),
+            "renew" => match repository.renew_rebuild(&held, lease).await {
+                Ok(renewed) => json!({"leaseExpiresAt": renewed.lease_expires_at}),
                 Err(err) => error(err),
             },
             "end" => repository
-                .end_rebuild(owner)
+                .end_rebuild(&held)
                 .await
                 .map_or_else(error, generation),
             "forceRelease" => repository
@@ -3013,7 +3019,7 @@ async fn dynamo_rebuild_requests_replay_the_go_vectors() {
                     ),
                 ];
 
-                match repository.write_rebuild_views(owner, &views).await {
+                match repository.write_rebuild_views(&held, &views).await {
                     Ok(()) => json!({}),
                     Err(err) => error(err),
                 }
@@ -3039,7 +3045,8 @@ async fn dynamo_rebuild_begin_reads_again_after_a_torn_read() {
     use serde_json::json;
 
     let lock = json!({"pk": {"S": "SYSTEM#REBUILD"}, "sk": {"N": "0"},
-        "owner": {"S": "winner"}, "leaseExpiresAt": {"N": "1790000600"}});
+        "owner": {"S": "winner"}, "generation": {"N": "1"},
+        "leaseExpiresAt": {"N": "1790000600"}});
     let generation = json!({"pk": {"S": "SYSTEM#REBUILD#GENERATION"}, "sk": {"N": "0"},
         "value": {"N": "1"}});
 
@@ -3118,11 +3125,11 @@ async fn dynamo_rebuild_rows_leave_a_table_fresh(client: &aws_sdk_dynamodb::Clie
     create_dynamo_table(client, &table).await;
 
     let repository = DynamoRepository::new(client.clone(), &table);
-    repository
+    let lease = repository
         .begin_rebuild("fresh", Duration::from_secs(60))
         .await
         .unwrap();
-    repository.end_rebuild("fresh").await.unwrap();
+    repository.end_rebuild(&lease).await.unwrap();
 
     Store::<Ledger, _>::new(&repository, ())
         .execute("fresh-ledger", Add(1), Metadata::new("local"))
@@ -3165,11 +3172,11 @@ async fn postgres_rebuild_relations(pool: Pool) {
     repository.ensure_schema().await.unwrap();
 
     // Fresh: a rebuild before any commit leaves the log fresh for its first writer.
-    repository
+    let lease = repository
         .begin_rebuild("fresh", Duration::from_secs(60))
         .await
         .unwrap();
-    repository.end_rebuild("fresh").await.unwrap();
+    repository.end_rebuild(&lease).await.unwrap();
     let store = Store::<Ledger, _>::new(&repository, ());
     store
         .execute("fresh-ledger", Add(1), Metadata::new("local"))
@@ -3198,7 +3205,7 @@ async fn postgres_rebuild_relations(pool: Pool) {
 
     // Once the schema is ensured again, the fence works and fences that handle's commits.
     older.ensure_schema().await.unwrap();
-    older
+    let lease = older
         .begin_rebuild("older", Duration::from_secs(60))
         .await
         .unwrap();
@@ -3212,7 +3219,7 @@ async fn postgres_rebuild_relations(pool: Pool) {
         ),
         "{refused:?}"
     );
-    older.end_rebuild("older").await.unwrap();
+    older.end_rebuild(&lease).await.unwrap();
 
     pool.get()
         .await

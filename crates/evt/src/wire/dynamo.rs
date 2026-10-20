@@ -31,7 +31,8 @@
 //!
 //! The rebuild fence (v0.9, C10) is two engine items in the reserved `SYSTEM#` namespace
 //! ([`rebuild_lock_item`], [`rebuild_generation_item`]): the lock `(SYSTEM#REBUILD, 0)` with
-//! `owner` and `leaseExpiresAt` (epoch seconds), and the generation
+//! `owner`, `generation` (the fencing token: the odd generation its acquire or takeover produced),
+//! and `leaseExpiresAt` (epoch seconds), and the generation
 //! `(SYSTEM#REBUILD#GENERATION, 0)` with `value` and an optional `forceReleased` flag.
 //!
 //! Items are modeled with [`AttributeValue`], whose serde encoding is DynamoDB JSON
@@ -173,6 +174,10 @@ pub const REBUILD_OWNER_NAME: &str = "#owner";
 /// The expression-attribute-name placeholder of the generation's `value`, a reserved word.
 pub const REBUILD_VALUE_NAME: &str = "#value";
 
+/// The expression-attribute-name placeholder of the lock row's `generation`, the fencing token of
+/// the lease that holds the lock.
+pub const REBUILD_GENERATION_NAME: &str = "#generation";
+
 /// The acquire's lock put condition: no lock row exists.
 pub const REBUILD_ACQUIRE_LOCK_CONDITION: &str = "attribute_not_exists(pk)";
 
@@ -196,11 +201,11 @@ pub const REBUILD_SEEN_ODD_CONDITION: &str = "#value = :seenOdd";
 /// The renew's lock update.
 pub const REBUILD_RENEW_UPDATE: &str = "SET leaseExpiresAt = :expiry";
 
-/// The renew's lock condition.
-pub const REBUILD_RENEW_CONDITION: &str = "#owner = :owner";
+/// The renew's lock condition: the lease's owner and fencing token.
+pub const REBUILD_RENEW_CONDITION: &str = "#owner = :owner AND #generation = :generation";
 
-/// The release's lock delete condition.
-pub const REBUILD_RELEASE_CONDITION: &str = "#owner = :me";
+/// The release's lock delete condition: the lease's owner and fencing token.
+pub const REBUILD_RELEASE_CONDITION: &str = "#owner = :me AND #generation = :generation";
 
 /// The release's generation update: back to settled, the force-release flag cleared.
 pub const REBUILD_RELEASE_UPDATE: &str = "SET #value = #value + :one REMOVE forceReleased";
@@ -211,8 +216,10 @@ pub const REBUILD_FORCE_RELEASE_CONDITION: &str = "#owner = :requestedOwner";
 /// The force-release's generation update: odd to odd, flagged.
 pub const REBUILD_FORCE_RELEASE_UPDATE: &str = "SET #value = #value + :two, forceReleased = :true";
 
-/// The guard of a rebuild view write: the caller still holds an unexpired lease.
-pub const REBUILD_GUARD_CONDITION: &str = "#owner = :me AND leaseExpiresAt > :now";
+/// The guard of a rebuild view write: the caller's lease, by owner and fencing token, still holds
+/// the lock unexpired.
+pub const REBUILD_GUARD_CONDITION: &str =
+    "#owner = :me AND #generation = :generation AND leaseExpiresAt > :now";
 
 /// A DynamoDB attribute value. Serializes as DynamoDB JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,12 +346,13 @@ pub fn rebuild_generation_key() -> Item {
     ])
 }
 
-/// Encodes the full rebuild-lock item an acquire or a takeover puts: `pk`, `sk`, `owner`, and
-/// `leaseExpiresAt` (whole Unix seconds).
-pub fn rebuild_lock_item(owner: &str, lease_expires_at: i64) -> Item {
+/// Encodes the full rebuild-lock item an acquire or a takeover puts: `pk`, `sk`, `owner`,
+/// `generation` (the fencing token), and `leaseExpiresAt` (whole Unix seconds).
+pub fn rebuild_lock_item(lock: &RebuildLock) -> Item {
     let mut item = rebuild_lock_key();
-    item.insert("owner".into(), s(owner));
-    item.insert("leaseExpiresAt".into(), n(lease_expires_at));
+    item.insert("owner".into(), s(&lock.owner));
+    item.insert("generation".into(), n(lock.generation));
+    item.insert("leaseExpiresAt".into(), n(lock.lease_expires_at));
 
     item
 }
@@ -353,6 +361,7 @@ pub fn rebuild_lock_item(owner: &str, lease_expires_at: i64) -> Item {
 pub fn rebuild_lock_from_item(item: &Item) -> Result<RebuildLock, Error> {
     Ok(RebuildLock {
         owner: required_string(item, "owner")?.to_owned(),
+        generation: required_number(item, "generation")?,
         lease_expires_at: required_number(item, "leaseExpiresAt")?,
     })
 }

@@ -582,9 +582,9 @@ use photon_evt::{Error, RebuildFence, read_at_rebuild_epoch};
 
 // The worker: take the lock (or an expired lease), write views in guarded batches, release.
 let lease = repository.begin_rebuild("rebuild-7", Duration::from_secs(300)).await?;
-repository.write_rebuild_views("rebuild-7", &batch).await?; // at most 99 operations
-repository.renew_rebuild("rebuild-7", Duration::from_secs(300)).await?;
-repository.end_rebuild("rebuild-7").await?;
+repository.write_rebuild_views(&lease, &batch).await?; // at most 99 operations
+let lease = repository.renew_rebuild(&lease, Duration::from_secs(300)).await?;
+repository.end_rebuild(&lease).await?;
 
 // A reader of derived state: observe the generation, read, verify.
 let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().await }).await?;
@@ -595,9 +595,11 @@ let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().awai
   backoff and returns the error when attempts run out. It is never a conflict, never a
   `stale-fence` rejection, and records no outcome.
 - `begin_rebuild` takes over a lease that expired (the generation grows by two) and refuses one
-  that is held with `Error::RebuildLockHeld`. A worker that lost its lock gets
-  `Error::RebuildLeaseLost` from `renew_rebuild`, `end_rebuild`, and `write_rebuild_views`, and its
-  batch writes nothing.
+  that is held with `Error::RebuildLockHeld`. The `RebuildLease` it returns carries a fencing
+  token, the odd generation it produced, which the lock row stores: `renew_rebuild`,
+  `end_rebuild`, and `write_rebuild_views` take the lease and act only while the lock names both
+  its owner and its token. A worker that lost its lock, including a stale incarnation that reuses
+  its owner token after a takeover, gets `Error::RebuildLeaseLost` and writes nothing.
 - `force_release_rebuild` is the operator's escape hatch: commits resume at once, while readers stay
   fenced (`Error::RebuildUnavailable`) until a later rebuild begins and ends.
 - A command handler that reads a view under the epoch check returns `RebuildUnavailable` or

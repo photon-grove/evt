@@ -1,6 +1,7 @@
 //! [`RebuildFence`] for DynamoDB: the lock and generation items of the rebuild fence (C10), with
 //! the exact requests the storage spec pins ("Rebuild Fence", "Request shapes", "Rebuild view
-//! writes"). Every expression reaches `owner` and `value`, which are reserved words, through the
+//! writes"). Every expression reaches `owner` and `value`, which are reserved words, and the lock's
+//! `generation` (its fencing token), through the
 //! `#owner` and `#value` aliases.
 
 use std::time::Duration;
@@ -18,7 +19,7 @@ use crate::error::{BoxError, Error};
 use crate::projection::{ProjectedView, ProjectorOperationError};
 use crate::rebuild::{
     self, MAX_REBUILD_BEGIN_ATTEMPTS, Plan, PlanKind, RebuildFence, RebuildGeneration,
-    RebuildLease, RebuildState,
+    RebuildLease, RebuildLock, RebuildState,
 };
 use crate::wire::dynamo::{self as wire, Item};
 
@@ -57,19 +58,21 @@ impl DynamoRepository {
     }
 
     /// The acquire's or the takeover's two actions: the lock put and the generation update.
+    /// The lock item stores `lease`'s generation, the one the transaction produces, as its fencing
+    /// token.
     pub(super) fn rebuild_begin_items(
         &self,
         plan: &Plan,
-        owner: &str,
+        lease: &RebuildLease,
         now: i64,
-        lease_expires_at: i64,
     ) -> Result<Vec<TransactWriteItem>, Error> {
         let lock = Put::builder()
             .table_name(&self.table)
-            .set_item(Some(to_sdk_item(&wire::rebuild_lock_item(
-                owner,
-                lease_expires_at,
-            ))));
+            .set_item(Some(to_sdk_item(&wire::rebuild_lock_item(&RebuildLock {
+                owner: lease.owner.clone(),
+                generation: lease.generation,
+                lease_expires_at: lease.lease_expires_at,
+            }))));
         let generation = Update::builder()
             .table_name(&self.table)
             .set_key(Some(to_sdk_item(&wire::rebuild_generation_key())))
@@ -117,7 +120,7 @@ impl DynamoRepository {
     /// `UpdateItem` request).
     pub(super) fn rebuild_renew_update(
         &self,
-        owner: &str,
+        lease: &RebuildLease,
         lease_expires_at: i64,
     ) -> Result<Update, Error> {
         Update::builder()
@@ -126,14 +129,17 @@ impl DynamoRepository {
             .update_expression(wire::REBUILD_RENEW_UPDATE)
             .condition_expression(wire::REBUILD_RENEW_CONDITION)
             .expression_attribute_names(wire::REBUILD_OWNER_NAME, "owner")
+            .expression_attribute_names(wire::REBUILD_GENERATION_NAME, "generation")
             .expression_attribute_values(":expiry", n(lease_expires_at))
-            .expression_attribute_values(":owner", s(owner))
+            .expression_attribute_values(":owner", s(&lease.owner))
+            .expression_attribute_values(":generation", n(lease.generation))
             .build()
             .map_err(Error::backend)
     }
 
-    /// A release's or a force-release's two actions: the owner's lock delete and the bump of the
-    /// odd generation it observed.
+    /// A release's or a force-release's two actions: the lock delete (the lease's owner and
+    /// fencing token for a release, the named owner for a force-release) and the bump of the odd
+    /// generation, `seen_odd` (the lease's for a release, the one read for a force-release).
     pub(super) fn rebuild_release_items(
         &self,
         release: Release,
@@ -153,14 +159,19 @@ impl DynamoRepository {
             ),
         };
 
-        let delete = Delete::builder()
+        let mut delete = Delete::builder()
             .table_name(&self.table)
             .set_key(Some(to_sdk_item(&wire::rebuild_lock_key())))
             .condition_expression(condition)
             .expression_attribute_names(wire::REBUILD_OWNER_NAME, "owner")
-            .expression_attribute_values(placeholder, s(owner))
-            .build()
-            .map_err(Error::backend)?;
+            .expression_attribute_values(placeholder, s(owner));
+        if let Release::End = release {
+            // The lease's fencing token is the odd generation it holds the lock at.
+            delete = delete
+                .expression_attribute_names(wire::REBUILD_GENERATION_NAME, "generation")
+                .expression_attribute_values(":generation", n(seen_odd));
+        }
+        let delete = delete.build().map_err(Error::backend)?;
 
         let mut generation = Update::builder()
             .table_name(&self.table)
@@ -184,15 +195,21 @@ impl DynamoRepository {
         ])
     }
 
-    /// The guard of a rebuild view write, its last action: the caller still holds an unexpired
-    /// lease.
-    pub(super) fn rebuild_guard(&self, owner: &str, now: i64) -> Result<TransactWriteItem, Error> {
+    /// The guard of a rebuild view write, its last action: the caller's lease, by owner and
+    /// fencing token, still holds the lock unexpired.
+    pub(super) fn rebuild_guard(
+        &self,
+        lease: &RebuildLease,
+        now: i64,
+    ) -> Result<TransactWriteItem, Error> {
         let check = ConditionCheck::builder()
             .table_name(&self.table)
             .set_key(Some(to_sdk_item(&wire::rebuild_lock_key())))
             .condition_expression(wire::REBUILD_GUARD_CONDITION)
             .expression_attribute_names(wire::REBUILD_OWNER_NAME, "owner")
-            .expression_attribute_values(":me", s(owner))
+            .expression_attribute_names(wire::REBUILD_GENERATION_NAME, "generation")
+            .expression_attribute_values(":me", s(&lease.owner))
+            .expression_attribute_values(":generation", n(lease.generation))
             .expression_attribute_values(":now", n(now))
             .build()
             .map_err(Error::backend)?;
@@ -203,12 +220,12 @@ impl DynamoRepository {
     /// The items of one guarded rebuild write: the view operations, then the guard.
     pub(super) fn rebuild_view_items(
         &self,
-        owner: &str,
+        lease: &RebuildLease,
         views: &[ProjectedView],
         now: i64,
     ) -> Result<Vec<TransactWriteItem>, Error> {
         let mut items = self.view_items(views)?;
-        items.push(self.rebuild_guard(owner, now)?);
+        items.push(self.rebuild_guard(lease, now)?);
 
         Ok(items)
     }
@@ -225,22 +242,15 @@ impl DynamoRepository {
             .map_err(Box::new)
     }
 
-    /// A release or a force-release: reads the generation, then deletes the owner's lock row and
-    /// bumps the odd generation in one transaction.
+    /// A release or a force-release of the odd generation `seen`: deletes the lock row and bumps
+    /// the generation in one transaction.
     async fn release_rebuild(
         &self,
         owner: &str,
         release: Release,
+        seen: i64,
     ) -> Result<RebuildGeneration, Error> {
-        rebuild::check_owner(owner)?;
-
-        // A settled generation means no rebuild holds the fence, so the caller cannot hold it.
-        let seen = self.rebuild_generation().await?;
-        if seen.is_settled() {
-            return Err(lease_lost(owner));
-        }
-
-        let items = self.rebuild_release_items(release, owner, seen.value)?;
+        let items = self.rebuild_release_items(release, owner, seen)?;
         if let Err(err) = self.transact(items).await {
             // Only a takeover or a force-release changes the generation of a held lock, and both
             // replace or remove the lock row: a failed condition means the caller lost it.
@@ -256,11 +266,11 @@ impl DynamoRepository {
 
         Ok(match release {
             Release::End => RebuildGeneration {
-                value: seen.value + 1,
+                value: seen + 1,
                 force_released: false,
             },
             Release::Force => RebuildGeneration {
-                value: seen.value + 2,
+                value: seen + 2,
                 force_released: true,
             },
         })
@@ -308,17 +318,15 @@ impl RebuildFence for DynamoRepository {
                 Err(error) => return Err(error),
             };
             invalid = None;
-            let lease_expires_at = now.saturating_add(seconds);
+            let lease = RebuildLease {
+                owner: owner.to_owned(),
+                generation: state.generation.value + plan.increment,
+                lease_expires_at: now.saturating_add(seconds),
+            };
 
-            let items = self.rebuild_begin_items(&plan, owner, now, lease_expires_at)?;
+            let items = self.rebuild_begin_items(&plan, &lease, now)?;
             match self.transact(items).await {
-                Ok(()) => {
-                    return Ok(RebuildLease {
-                        owner: owner.to_owned(),
-                        generation: state.generation.value + plan.increment,
-                        lease_expires_at,
-                    });
-                }
+                Ok(()) => return Ok(lease),
                 // Another operation raced the read: read the state again and decide again.
                 Err(err) if race_lost(&*err) => {}
                 Err(err) => return Err(fence_error(*err)),
@@ -330,10 +338,14 @@ impl RebuildFence for DynamoRepository {
         }))
     }
 
-    async fn renew_rebuild(&self, owner: &str, lease: Duration) -> Result<i64, Error> {
-        let seconds = rebuild::check_lease(owner, lease)?;
+    async fn renew_rebuild(
+        &self,
+        lease: &RebuildLease,
+        extend: Duration,
+    ) -> Result<RebuildLease, Error> {
+        let seconds = rebuild::check_lease(&lease.owner, extend)?;
         let lease_expires_at = self.now().saturating_add(seconds);
-        let update = self.rebuild_renew_update(owner, lease_expires_at)?;
+        let update = self.rebuild_renew_update(lease, lease_expires_at)?;
 
         let result = self
             .client
@@ -348,32 +360,54 @@ impl RebuildFence for DynamoRepository {
             .await;
 
         match result {
-            Ok(_) => Ok(lease_expires_at),
+            Ok(_) => Ok(RebuildLease {
+                lease_expires_at,
+                ..lease.clone()
+            }),
             Err(SdkError::ServiceError(err))
                 if matches!(
                     err.err(),
                     UpdateItemError::ConditionalCheckFailedException(_)
                 ) =>
             {
-                Err(lease_lost(owner))
+                Err(lease_lost(&lease.owner))
             }
             Err(err) => Err(sdk_error(err)),
         }
     }
 
-    async fn end_rebuild(&self, owner: &str) -> Result<RebuildGeneration, Error> {
-        self.release_rebuild(owner, Release::End).await
+    /// One transaction, with no read first: the lease names the generation its lock holds.
+    async fn end_rebuild(&self, lease: &RebuildLease) -> Result<RebuildGeneration, Error> {
+        rebuild::check_owner(&lease.owner)?;
+
+        self.release_rebuild(&lease.owner, Release::End, lease.generation)
+            .await
     }
 
+    /// Reads the generation, then runs the force-release transaction against it.
     async fn force_release_rebuild(&self, owner: &str) -> Result<RebuildGeneration, Error> {
-        self.release_rebuild(owner, Release::Force).await
+        rebuild::check_owner(owner)?;
+
+        // A settled generation means no rebuild holds the fence, so there is no lock to release.
+        let seen = self.rebuild_generation().await?;
+        if seen.is_settled() {
+            return Err(lease_lost(owner));
+        }
+
+        self.release_rebuild(owner, Release::Force, seen.value)
+            .await
     }
 
-    async fn write_rebuild_views(&self, owner: &str, views: &[ProjectedView]) -> Result<(), Error> {
+    async fn write_rebuild_views(
+        &self,
+        lease: &RebuildLease,
+        views: &[ProjectedView],
+    ) -> Result<(), Error> {
+        let owner = lease.owner.as_str();
         rebuild::check_owner(owner)?;
         rebuild::check_view_batch(views)?;
 
-        let items = self.rebuild_view_items(owner, views, self.now())?;
+        let items = self.rebuild_view_items(lease, views, self.now())?;
         let guard = items.len() - 1;
 
         let Err(err) = self.transact(items).await else {
