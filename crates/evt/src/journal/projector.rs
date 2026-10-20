@@ -70,6 +70,10 @@ impl CommitProjector for JournalProjector {
         self.journal.entity_types()
     }
 
+    fn engine_metadata(&self) -> bool {
+        true
+    }
+
     fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
         let mut operations = Vec::new();
 

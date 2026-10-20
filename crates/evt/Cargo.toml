@@ -49,6 +49,11 @@ name = "banking"
 required-features = ["testing"]
 test = true
 
+[[example]]
+name = "journal"
+required-features = ["journal", "testing"]
+test = true
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

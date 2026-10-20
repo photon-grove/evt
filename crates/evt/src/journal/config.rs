@@ -44,12 +44,35 @@ pub trait ScopeResolver: Send + Sync {
     fn scopes(&self, event: &SerializedEvent) -> Result<Vec<Scope>, BoxError>;
 }
 
-impl<F> ScopeResolver for F
+/// What a scope-resolver closure may return: the scopes, or a `Result` of them whose error becomes
+/// the failure of the commit (nothing is written).
+pub trait IntoScopes {
+    /// The scopes, or the resolver's error.
+    fn into_scopes(self) -> Result<Vec<Scope>, BoxError>;
+}
+
+impl IntoScopes for Vec<Scope> {
+    fn into_scopes(self) -> Result<Vec<Scope>, BoxError> {
+        Ok(self)
+    }
+}
+
+impl<E: Into<BoxError>> IntoScopes for Result<Vec<Scope>, E> {
+    fn into_scopes(self) -> Result<Vec<Scope>, BoxError> {
+        self.map_err(Into::into)
+    }
+}
+
+/// A closure over the event is a resolver. It returns the scopes, or a `Result` of them so it can
+/// use `?` (for example on [`Scope::new`]); an error is [`Error::InvalidJournal`] at commit time,
+/// before anything is written.
+impl<F, T> ScopeResolver for F
 where
-    F: Fn(&SerializedEvent) -> Vec<Scope> + Send + Sync,
+    F: Fn(&SerializedEvent) -> T + Send + Sync,
+    T: IntoScopes,
 {
     fn scopes(&self, event: &SerializedEvent) -> Result<Vec<Scope>, BoxError> {
-        Ok(self(event))
+        self(event).into_scopes()
     }
 }
 

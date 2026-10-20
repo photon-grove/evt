@@ -2531,7 +2531,8 @@ not (the parity matrix records it as deferred), and a Go writer refuses a table 
 A **scope** is a named, independently ordered sequence: 1 to 512 UTF-8 bytes without U+0000
 (`world:7`, `world:7/place:3`). The engine treats it as opaque. An application maps each event of
 the journaled entity types to zero or more scopes with a function of the event alone (the
-`ScopeResolver`). The event takes the **next position** in each of its scopes: a `u64` starting at
+`ScopeResolver`, which a closure may implement, returning the scopes or a `Result` of them; an error
+fails the commit with `InvalidJournal` before anything is written). The event takes the **next position** in each of its scopes: a `u64` starting at
 1, contiguous, with no hole when every commit succeeds. Positions are written as decimal numbers
 in JSON; read them as unsigned 64-bit integers.
 
@@ -2581,6 +2582,17 @@ allocated** in the scope: the scope's high watermark.
 The full bytes of these items, of a commit's events, and of the marker are in
 `compat/fixtures/journal.json`.
 
+A repository that does not write view operations (`writes_views()` false: a custom backend that
+predates them) is refused with `ViewsUnsupported` before anything is planned or declared, because
+the rows would otherwise be dropped while the events and their allocations were written.
+
+**Metadata seen by other projectors.** The `evt.journal` allocation is added when the journal
+commits, after the store has run the application's commit-wide projectors, so it exists on a stored
+event and not on a live one. To keep a live commit and a replay of the stored events in agreement
+(ADR-0012), the engine **does not show `evt.journal` to any projector but the journal's own**: a
+projector's view of an event has the key removed, live and on replay
+(`CommitProjector::engine_metadata`, default false).
+
 **Ownership.** The journal rows are produced by a commit-wide, **history-dependent** projector
 ([Views](#views)) and obey every rule of it: each row names the stream that wrote its event as
 owner, the row is written only if absent (`attribute_not_exists(pk)`, so a position is claimed
@@ -2619,7 +2631,9 @@ holds. For every commit that writes at least one event of a journaled entity typ
    bytes, each stream's events by sequence), each event taking the next position in each of its
    scopes, scopes ascending by bytes.
 3. It writes the allocations into the events' metadata and **guards every row's size** (below),
-   before anything is written.
+   before anything is written. The staged commit is then validated the way the repository will
+   (event shape, reserved entity IDs, duplicate streams, view-operation keys), so a commit the
+   repository would refuse fails before the marker is touched.
 4. It appends to the commit's view operations, after the operations of the commit's own
    projectors: the journal rows in event then scope order, then one counter put per touched scope,
    ascending by scope.
@@ -2667,7 +2681,9 @@ with none). `page(scope, after, limit)` returns the scope's rows with a position
 ascending, `limit` between 1 and 1000:
 
 - The counter is read first, then the rows with a strongly consistent `Query`
-  (`pk = :pk AND sk > :after`, `Limit`, following `LastEvaluatedKey` until `limit` rows or the end).
+  (`pk = :pk AND sk > :after`, `Limit`, following `LastEvaluatedKey` until the rows are read or the
+  end). It asks for `limit + 1` rows: the extra one is not returned, but it raises the reported
+  watermark, so a full page can show that rows follow it when the counter is missing or behind.
 - The page keeps the **contiguous prefix** starting at `after + 1`. The first **gap** is reported as
   the inclusive range of missing positions `{from, to}`, and the page stops before it. A gap is a
   jump in the rows' positions, or, when the rows end before the counter says they should (and the
@@ -2725,8 +2741,9 @@ or not, fails with `RebuildInProgress`, so the unconditional rewrite of counters
 counter under a live writer, and a worker that lost its lock writes nothing (`RebuildLeaseLost`).
 A rebuild that fails keeps the lock (its rows may be half-written) until the lease lapses and a
 retry takes it over, or an operator force-releases it. It does not delete: wipe the journal
-partitions first to rebuild from scratch. Two events holding one position of a scope never come from
-this journal and fail the rebuild (`InvalidJournal`).
+partitions first to rebuild from scratch. Two records holding one position of a scope never come from
+this journal and fail the rebuild (`InvalidJournal`), whatever their order; only an identical record
+given twice is one row, so the result never depends on the order of the events.
 
 **Consumers.** A page or watermark read while a rebuild rewrites rows would show missing rows or a
 counter that is behind. A consumer of a table whose journal can be rebuilt reads under the reader

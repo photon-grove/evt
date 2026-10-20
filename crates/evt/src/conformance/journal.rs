@@ -77,6 +77,18 @@ where
         Box::pin(counter_behind_rows_is_repaired(repo, views)).await,
     );
     record(
+        "a repository that does not write views is refused before anything is declared",
+        Box::pin(views_unsupported_is_refused(repo)).await,
+    );
+    record(
+        "a commit the repository would refuse declares nothing",
+        Box::pin(invalid_commits_declare_nothing(repo)).await,
+    );
+    record(
+        "a full page shows that rows follow it when the counter is missing or behind",
+        Box::pin(full_pages_show_more_rows(repo, views)).await,
+    );
+    record(
         "a commit that cannot be built declares nothing",
         Box::pin(refused_commits_declare_nothing(repo)).await,
     );
@@ -546,6 +558,7 @@ struct Lagging<R> {
     stale_reads: Arc<AtomicUsize>,
     transient_commits: Arc<AtomicUsize>,
     backoffs: Arc<AtomicUsize>,
+    writes_views: bool,
 }
 
 impl<R> Lagging<R> {
@@ -555,7 +568,16 @@ impl<R> Lagging<R> {
             stale_reads: Arc::new(AtomicUsize::new(stale_reads)),
             transient_commits: Arc::new(AtomicUsize::new(0)),
             backoffs: Arc::new(AtomicUsize::new(0)),
+            writes_views: true,
         }
+    }
+
+    /// Reports that the repository does not write view operations, as a custom backend written
+    /// before they existed does.
+    fn without_views(mut self) -> Self {
+        self.writes_views = false;
+
+        self
     }
 
     /// The next `commits` commits fail with a transient error without being applied.
@@ -642,7 +664,7 @@ impl<R: Repository> Repository for Lagging<R> {
     }
 
     fn writes_views(&self) -> bool {
-        self.inner.writes_views()
+        self.writes_views && self.inner.writes_views()
     }
 
     fn declare_history_dependent(
@@ -1342,6 +1364,164 @@ where
         "a rebuild on a released lease",
         |err| matches!(err, Error::RebuildLeaseLost { .. }),
     )?;
+
+    Ok(())
+}
+
+async fn views_unsupported_is_refused<R>(repo: &R) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalStore + Clone,
+    R::Operation: Clone,
+{
+    let ns = namespace();
+    let stream = Stream::new(&ns, "a", "ledger");
+    let dropping =
+        JournalRepository::new(Lagging::new(repo.clone(), 0).without_views(), journal(&ns));
+
+    expect_err(
+        stream.commit(&dropping, stream.events(1..=1), None).await,
+        "a repository that does not write views",
+        |err| matches!(err, Error::ViewsUnsupported { .. }),
+    )?;
+    ensure!(
+        repo.events(&stream.id).await?.is_empty(),
+        "no event, and so no allocation, was written"
+    );
+    let manifest = repo.read_manifest().await?;
+    ensure!(
+        !manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.is_history_dependent(&stream.entity_type)),
+        "nothing was declared: {manifest:?}"
+    );
+
+    // Events of a type the journal does not cover are not its concern.
+    let other = Stream::new(&ns, "x", "other");
+    other.commit(&dropping, other.events(1..=1), None).await?;
+
+    Ok(())
+}
+
+async fn invalid_commits_declare_nothing<R>(repo: &R) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalStore + Clone,
+    R::Operation: Clone,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let covered = EntityType::new(format!("{ns}-ledger"));
+
+    // Earlier cases declared the journal feature; this type's history is the new declaration.
+    let untouched = |manifest: Option<features::FeatureManifest>| {
+        !manifest.is_some_and(|manifest| manifest.is_history_dependent(&covered))
+    };
+
+    // An event whose ID is not `{entity}:{sequence}`, which the repository refuses.
+    let stream = Stream::new(&ns, "a", "ledger");
+    let mut events = stream.events(1..=1);
+    events[0].id = "not-the-id".into();
+    expect_err(
+        stream.commit(&journaled, events, None).await,
+        "an event with the wrong ID",
+        |err| matches!(err, Error::InvalidCommit(_)),
+    )?;
+    let manifest = repo.read_manifest().await?;
+    ensure!(
+        untouched(manifest.clone()),
+        "a malformed commit declared: {manifest:?}"
+    );
+
+    // A reserved entity ID.
+    let reserved = Stream {
+        id: EntityId::new(format!("SYSTEM#{ns}")),
+        entity_type: covered.clone(),
+    };
+    expect_err(
+        reserved
+            .commit(&journaled, reserved.events(1..=1), None)
+            .await,
+        "a reserved entity ID",
+        |err| matches!(err, Error::ReservedEntityId { .. }),
+    )?;
+
+    // The same through a transaction.
+    let transaction = TransactionCommit::new(vec![Commit {
+        entity_id: reserved.id.clone(),
+        events: reserved.events(1..=1),
+        snapshot: None,
+        operations: Vec::new(),
+        views: Vec::new(),
+        outcome: None,
+    }]);
+    expect_err(
+        journaled.commit_transaction(transaction).await,
+        "a reserved entity ID in a transaction",
+        |err| matches!(err, Error::ReservedEntityId { .. }),
+    )?;
+    let manifest = repo.read_manifest().await?;
+    ensure!(
+        untouched(manifest.clone()),
+        "a refused commit declared: {manifest:?}"
+    );
+
+    Ok(())
+}
+
+async fn full_pages_show_more_rows<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalStore + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let a = Stream::new(&ns, "a", "ledger");
+    let world = scope(&ns, "world");
+
+    a.commit(&journaled, a.events(1..=5), None).await?;
+
+    for (name, lower) in [
+        ("a counter behind its rows", true),
+        ("a missing counter", false),
+    ] {
+        if lower {
+            views.put_view(&counter_view(&world, 1)).await?;
+        } else {
+            views.delete_view(&world.counter_pk(), "COUNTER").await?;
+        }
+
+        let first = journaled.page(&world, 0, 2).await?;
+        ensure_eq!(positions(&first), vec![1, 2], "{name}: the first page");
+        ensure!(
+            first.gap.is_none() && first.has_more() && !first.is_caught_up(),
+            "{name}: a full page with rows after it is not caught up: {first:?}"
+        );
+        ensure_eq!(
+            first.high_watermark,
+            3,
+            "{name}: the watermark follows the next row"
+        );
+
+        let mut after = 0;
+        let mut seen = Vec::new();
+        loop {
+            let page = journaled.page(&world, after, 2).await?;
+            seen.extend(positions(&page));
+            after = page.next_after();
+            if !page.has_more() {
+                ensure!(
+                    page.is_caught_up(),
+                    "{name}: the last page is caught up: {page:?}"
+                );
+                break;
+            }
+        }
+        ensure_eq!(
+            seen,
+            vec![1, 2, 3, 4, 5],
+            "{name}: paging by 2 reads every row"
+        );
+    }
 
     Ok(())
 }

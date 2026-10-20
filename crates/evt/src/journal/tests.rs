@@ -517,3 +517,159 @@ fn a_row_cap_over_the_item_limit_is_refused_and_the_pre_check_headroom_adds_up()
         "headroom counts against the cap in the pre-check"
     );
 }
+
+#[test]
+fn the_readme_example_is_the_compiled_example() {
+    let example = include_str!("../../examples/journal.rs");
+    let readme = include_str!("../../README.md");
+    let body = example
+        .split("// README:begin\n")
+        .nth(1)
+        .and_then(|rest| rest.split("// README:end").next())
+        .expect("the example marks its README block")
+        .trim_end();
+
+    assert!(
+        readme.contains(body),
+        "the journal example in crates/evt/README.md differs from examples/journal.rs"
+    );
+}
+
+#[test]
+fn a_resolver_may_return_a_result_and_its_failure_is_an_invalid_journal() {
+    let journal = Journal::new(["ledger"], |event: &SerializedEvent| {
+        Ok::<_, crate::Error>(vec![Scope::new(format!("l:{}", event.entity_id))?])
+    })
+    .unwrap();
+    let ok = SerializedEvent {
+        entity_id: "a".into(),
+        entity_type: "ledger".into(),
+        ..Default::default()
+    };
+    assert_eq!(journal.scopes_of(&ok).unwrap(), vec![scope("l:a")]);
+
+    // An empty entity ID makes `Scope::new` fail inside the closure: the error is the commit's.
+    let bad = SerializedEvent {
+        entity_type: "ledger".into(),
+        ..ok
+    };
+    let bad = SerializedEvent {
+        entity_id: "".into(),
+        ..bad
+    };
+    let journal = Journal::new(["ledger"], |event: &SerializedEvent| {
+        Ok::<_, crate::Error>(vec![Scope::new(event.entity_id.as_str())?])
+    })
+    .unwrap();
+    assert!(matches!(
+        journal.scopes_of(&bad),
+        Err(Error::InvalidJournal(_))
+    ));
+}
+
+#[test]
+fn replay_refuses_different_records_claiming_one_position_whatever_the_order() {
+    let make = |payload: &str| {
+        let mut event = SerializedEvent {
+            id: "l-1:1".into(),
+            sequence: crate::EventSequence(1),
+            entity_id: "l-1".into(),
+            entity_type: "ledger".into(),
+            payload: payload.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        super::set_allocations(&mut event, &[super::Allocation::new(&scope("s"), 1)]);
+
+        event
+    };
+    let (first, second) = (make(r#"{"amount":1}"#), make(r#"{"amount":2}"#));
+
+    // The same ID and allocation, another payload: not the same record.
+    for events in [[&first, &second], [&second, &first]] {
+        assert!(
+            matches!(replay(events), Err(Error::InvalidJournal(_))),
+            "order must not decide which record wins"
+        );
+    }
+
+    // An exact duplicate is one row.
+    let state = replay([&first, &first]).unwrap();
+    assert_eq!(state.rows.len(), 1);
+    assert_eq!(state.counters[&scope("s")], 1);
+}
+
+/// A projector that writes what it sees of each event's metadata extensions.
+struct SeesMetadata;
+
+impl crate::CommitProjector for SeesMetadata {
+    fn name(&self) -> &str {
+        "sees-metadata"
+    }
+
+    fn history(&self) -> &[crate::EntityType] {
+        static LEDGER: std::sync::OnceLock<[crate::EntityType; 1]> = std::sync::OnceLock::new();
+
+        LEDGER.get_or_init(|| [crate::EntityType::new("ledger")])
+    }
+
+    fn project(
+        &self,
+        commit: &crate::CommitView,
+    ) -> Result<Vec<crate::ViewOperation>, crate::BoxError> {
+        let mut operations = Vec::new();
+
+        for stream in &commit.streams {
+            for event in &stream.events {
+                operations.push(crate::ViewOperation::put(
+                    "seen",
+                    event.id.as_str(),
+                    stream.entity_id.clone(),
+                    "seen",
+                    serde_json::to_vec(&event.metadata.extensions)?,
+                ));
+            }
+        }
+
+        Ok(operations)
+    }
+}
+
+#[tokio::test]
+async fn a_projector_that_reads_metadata_sees_the_same_events_live_and_on_replay() {
+    let memory = MemRepository::new();
+    let repository = JournalRepository::new(memory.clone(), journal());
+    let projector: std::sync::Arc<dyn crate::CommitProjector> = std::sync::Arc::new(SeesMetadata);
+    let store = Store::<Ledger, _>::new(&repository, ()).with_commit_projector(projector.clone());
+
+    for (id, amount) in [("l-1", 1), ("l-2", 2), ("l-1", 3)] {
+        store
+            .execute(id, Add(amount), Metadata::new("local"))
+            .await
+            .unwrap();
+    }
+
+    // The stored events carry the journal's allocation; the projector's live rows never saw it.
+    let stored = memory.events(&"l-1".into()).await.unwrap();
+    assert!(stored[0].metadata.extensions.contains_key("evt.journal"));
+
+    let live: Vec<_> = memory
+        .views()
+        .into_iter()
+        .filter(|row| row.pk == "seen")
+        .collect();
+    assert_eq!(live.len(), 3);
+    assert!(
+        live.iter()
+            .all(|row| !String::from_utf8_lossy(&row.payload).contains("evt.journal"))
+    );
+
+    let mut events = stored;
+    events.extend(memory.events(&"l-2".into()).await.unwrap());
+    let replayed =
+        crate::replay_views(&[projector], &crate::group_commits(events).unwrap()).unwrap();
+
+    assert_eq!(
+        replayed, live,
+        "a replay of the stored events reproduces the live rows"
+    );
+}

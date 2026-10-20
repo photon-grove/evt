@@ -44,9 +44,9 @@ impl JournalState {
 ///
 /// Each event contributes one row per allocation in its metadata and raises the counter of the
 /// scope to its position if higher. An event with no allocation contributes nothing. Two
-/// *different* events holding one position of a scope can never come from this journal (the
-/// position is claimed once, in a transaction) and fail with [`Error::InvalidJournal`]; the same
-/// event given twice is the same row.
+/// *different* records holding one position of a scope can never come from this journal (the
+/// position is claimed once, in a transaction) and fail with [`Error::InvalidJournal`], whatever
+/// order they are given in; only an identical record given twice is the same row.
 pub fn replay<'a>(
     events: impl IntoIterator<Item = &'a SerializedEvent>,
 ) -> Result<JournalState, Error> {
@@ -59,9 +59,13 @@ pub fn replay<'a>(
             let key = (scope.clone(), allocation.position);
 
             if let Some(holder) = claimed.get(&key) {
-                if holder.id != event.id {
+                // The same stored event given twice is one row. Anything else claiming the
+                // position, even a record with the same ID and allocation but another payload or
+                // metadata, is a different event, and keeping the first would make the result
+                // depend on the order the events were given in.
+                if *holder != event {
                     return Err(Error::InvalidJournal(format!(
-                        "position {} of scope {scope} is held by both {} and {}",
+                        "position {} of scope {scope} is held by two different records, {} and {}",
                         allocation.position, holder.id, event.id
                     )));
                 }

@@ -662,6 +662,12 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   through the lease-guarded `write_rebuild_views` (owner and fencing token, at most 99 operations a
   batch); live commits fail with `RebuildInProgress` while the lock is held, and consumers read with
   `page_at_epoch` / `high_watermark_at_epoch`. A failed rebuild keeps the lock. Enable the journal before writing the events it covers: earlier events have no row and no gap.
+- **Live and replayed projector views agree.** The `evt.journal` allocation is added after the
+  store runs the application's projectors, so no projector but the journal's own is shown it
+  (`CommitProjector::engine_metadata`), live or on replay. A repository that does not write views is
+  refused with `ViewsUnsupported`, and a commit the repository would refuse (malformed, reserved
+  entity ID) fails before the marker is touched. Replay refuses two different records claiming one
+  position, whatever the order.
 - **Every writer of a journal table must commit through the journal.** The marker cannot tell
   a bypassing writer from a journaling one; its events would be missing from the scopes.
 

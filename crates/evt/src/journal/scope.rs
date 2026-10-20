@@ -12,7 +12,7 @@ use crate::metadata::Metadata;
 /// The event-metadata extension key that carries an event's allocations. Keys beginning `evt.` are
 /// reserved for the engine's extensions: a journaled commit overwrites (or removes) this key on
 /// every event it writes, so an application cannot forge an allocation.
-pub const ALLOCATION_KEY: &str = "evt.journal";
+pub const ALLOCATION_KEY: &str = crate::projection::ENGINE_ALLOCATION_KEY;
 
 /// The longest scope, in UTF-8 bytes. A row's partition key is the scope behind
 /// [`ROW_PARTITION_PREFIX`], which must stay within the view partition-key limit.

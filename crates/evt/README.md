@@ -576,39 +576,58 @@ that wrote the events ([ADR 0005](https://github.com/photon-grove/evt/blob/main/
 X1; Rust only, Go refuses a table that declares it). A **scope** is a named, independently ordered
 sequence (a world, a place in it). You map each event of the journaled entity types to zero or more
 scopes with a pure function; the event takes the next **position** in each, and a client polls a
-scope with `high_watermark` and `page`.
+scope with `high_watermark` and `page`. The example below is [`examples/journal.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/journal.rs),
+which `cargo test --all-features` compiles and runs, and a test fails if the two drift apart.
 
 ```rust,ignore
+use photon_evt::conformance::{Add, Ledger};
 use photon_evt::journal::{Journal, JournalRepository, Scope};
+use photon_evt::{Error, MemRepository, Metadata, SerializedEvent, Store};
 
-// Each event goes to its world's scope and to the scope of the place it happened in.
-let journal = Journal::new(["match"], |event: &SerializedEvent| {
-    let (world, place) = locate(event); // a pure function of the stored event
-    vec![Scope::new(format!("world:{world}"))?, Scope::new(format!("world:{world}/place:{place}"))?]
-})?
-.with_max_row_bytes(30_000) // the default
-.with_retry(RetryPolicy::new(5)); // the default
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Each event goes to its ledger's scope and to a scope shared by every ledger. The resolver is
+    // a pure function of the stored event; it may return a `Result` and use `?`.
+    let journal = Journal::new(
+        ["ledger"],
+        |event: &SerializedEvent| -> Result<Vec<Scope>, Error> {
+            Ok(vec![
+                Scope::new(format!("ledger:{}", event.entity_id))?,
+                Scope::new("all")?,
+            ])
+        },
+    )?
+    .with_max_row_bytes(30_000)? // the default
+    .with_retry(photon_evt::RetryPolicy::new(5)); // the default
 
-// Wrap a repository that writes views (in memory, or DynamoDB with a views table).
-let repository = JournalRepository::new(
-    DynamoRepository::new(client, "event-log").with_views_table("entity-views"),
-    journal.clone(),
-);
-let store = Store::<Match, _>::new(&repository, journal.clone());
+    // Wrap a repository that writes views: in memory here, DynamoDB with a views table in
+    // production.
+    let repository = JournalRepository::new(MemRepository::new(), journal.clone());
+    let store = Store::<Ledger, _>::new(&repository, ());
 
-// A poller keeps the last position it saw per scope.
-let scope = Scope::new("world:7")?;
-let mut after = 0;
-loop {
-    let page = repository.page(&scope, after, 100).await?;
-    // ... deliver page.rows (each row.event is the stored event) ...
-    after = page.next_after();
+    store.execute("a", Add(5), Metadata::new("local")).await?;
+    store.execute("b", Add(7), Metadata::new("local")).await?;
+    store.execute("a", Add(1), Metadata::new("local")).await?;
 
-    if let Some(gap) = page.gap {
-        // Positions gap.from..=gap.to are missing: retry the page, escalate if it persists.
-        break;
+    // A poller keeps the last position it saw per scope.
+    let scope = Scope::new("all")?;
+    let mut after = 0;
+    loop {
+        let page = repository.page(&scope, after, 100).await?;
+        // ... deliver page.rows (each row.event is the stored event) ...
+        after = page.next_after();
+
+        if let Some(gap) = page.gap {
+            // Positions gap.from..=gap.to are missing: retry the page, escalate if it persists.
+            return Err(format!("journal gap {gap:?}").into());
+        }
+        if !page.has_more() {
+            break; // caught up with repository.high_watermark(&scope)
+        }
     }
-    if !page.has_more() { break } // caught up with repository.high_watermark(&scope)
+    assert_eq!(after, 3);
+
+    Ok(())
 }
 ```
 

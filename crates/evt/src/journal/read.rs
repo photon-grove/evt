@@ -174,7 +174,9 @@ pub async fn page<S: JournalStore>(
     }
 
     let high_watermark = store.read_counter(scope).await?;
-    let found = store.read_rows(scope, after, limit).await?;
+    // One row more than the page holds: a full page can then tell that rows follow it, even when
+    // the counter is missing or behind.
+    let found = store.read_rows(scope, after, limit + 1).await?;
 
     Ok(assemble(scope, after, limit, high_watermark, found))
 }
@@ -215,11 +217,9 @@ fn assemble(
     let mut rows = Vec::with_capacity(found.len().min(limit));
     let mut gap = None;
     let mut expected = after.saturating_add(1);
-    let mut watermark = high_watermark;
+    let watermark = high_watermark.max(found.iter().map(|row| row.position).max().unwrap_or(0));
 
     for row in found.into_iter().take(limit) {
-        watermark = watermark.max(row.position);
-
         if row.position != expected {
             gap = Some(Gap {
                 from: expected,
@@ -364,6 +364,17 @@ mod tests {
         let caught_up = assemble(&scope(), 7, 10, 7, Vec::new());
         assert_eq!(caught_up.gap, None);
         assert!(caught_up.is_caught_up());
+    }
+
+    #[test]
+    fn the_row_after_a_full_page_shows_more_when_the_counter_is_behind() {
+        // The read asks for limit + 1 rows: with the counter at 1, rows 1..=3 are found for a
+        // page of 2. The extra row raises the watermark, so the page is not caught up.
+        let page = assemble(&scope(), 0, 2, 1, rows(&[1, 2, 3]));
+
+        assert_eq!(positions(&page), [1, 2]);
+        assert_eq!(page.high_watermark, 3);
+        assert!(page.gap.is_none() && page.has_more() && !page.is_caught_up());
     }
 
     #[test]

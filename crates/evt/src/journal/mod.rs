@@ -73,7 +73,9 @@ mod scope;
 #[cfg(test)]
 mod tests;
 
-pub use config::{DEFAULT_MAX_ROW_BYTES, DEFAULT_RETRY, Journal, MAX_ROW_BYTES, ScopeResolver};
+pub use config::{
+    DEFAULT_MAX_ROW_BYTES, DEFAULT_RETRY, IntoScopes, Journal, MAX_ROW_BYTES, ScopeResolver,
+};
 pub use projector::{JournalProjector, PROJECTOR_NAME, PositionTaken};
 pub use read::{
     Gap, JournalPage, JournalStore, MAX_PAGE_ROWS, high_watermark, high_watermark_at_epoch, page,

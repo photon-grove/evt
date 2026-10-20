@@ -149,6 +149,11 @@ trait Staged: Send {
 
     /// The commit-level view operations, which the journal appends to.
     fn views(&mut self) -> &mut Vec<ProjectedView>;
+
+    /// The checks the wrapped repository makes before it writes: event shape, reserved entity IDs,
+    /// duplicate streams, view-operation keys. Run on the staged attempt, before the marker is
+    /// touched.
+    fn validate(&self) -> Result<(), Error>;
 }
 
 fn duplicate_commit<Op: Clone>(commit: &Commit<Op>) -> Commit<Op> {
@@ -181,6 +186,12 @@ impl<Op: Clone + Send> Staged for Commit<Op> {
 
     fn views(&mut self) -> &mut Vec<ProjectedView> {
         &mut self.views
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        Commit::validate(self)?;
+
+        crate::features::check_not_reserved(&self.entity_id)
     }
 }
 
@@ -216,6 +227,10 @@ impl<Op: Clone + Send> Staged for TransactionCommit<Op> {
 
     fn views(&mut self) -> &mut Vec<ProjectedView> {
         &mut self.views
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        self.duplicate().normalize()
     }
 }
 
@@ -413,12 +428,22 @@ where
         F: Fn(C) -> Fut,
         Fut: Future<Output = Result<(), Error>>,
     {
-        let plan = self.plan(&mut base)?;
         let covered = base
             .event_streams()
             .into_iter()
             .flatten()
             .any(|event| self.journal.covers(&event.entity_type));
+
+        // The rows and counters are view operations: a repository that does not write them would
+        // commit the events and their allocations and drop the rows. Refused before anything is
+        // planned or declared.
+        if covered && !self.inner.writes_views() {
+            return Err(Error::ViewsUnsupported {
+                repository: std::any::type_name::<R>().to_owned(),
+            });
+        }
+
+        let plan = self.plan(&mut base)?;
 
         if !covered {
             // Nothing here is journaled, but the key is the engine's: a forged allocation on an
@@ -446,6 +471,9 @@ where
             let counters = self.read_counters(&scopes, repair).await?;
             let mut attempt = base.duplicate();
             self.stage(&mut attempt, &plan, &counters)?;
+
+            // What the repository will refuse is refused here, before the marker is written.
+            attempt.validate()?;
 
             let declared_now = self.ensure_declared().await?;
             let error = match send(attempt).await {
