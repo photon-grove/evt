@@ -57,6 +57,8 @@
 - Go and Rust share one storage format (`docs/spec/storage-format.md`). Any change to it must
   regenerate `compat/fixtures` (`go test ./internal/compat -run TestFixtures -update`), pass in both
   languages, and pass `scripts/compat-integration.sh dynamo|postgres`. Never hand-edit fixtures.
+  The exception is a Rust-first extension's fixtures (`compat/fixtures/journal.json`, ADR 0005):
+  Rust generates them (`EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test journal_fixtures`).
 - Update documentation when behavior changes, especially `README.md`, `BEHAVIORAL_INVARIANTS.md`,
   and relevant files under `docs/`.
 

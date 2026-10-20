@@ -619,6 +619,49 @@ transaction as the events. The byte-level rules are in the
   nothing above it failed. The first failed operation in transaction order is the one named.
 - Nothing from the commit is written: not its events, not its other rows.
 
+## Journal (X1, Rust-first)
+
+Rust only (`photon-evt` with the `journal` cargo feature). Go does not implement the journal and
+refuses a table that declares it (`UnsupportedFeatureError` on the first commit after the
+declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes are in the
+[storage format](docs/spec/storage-format.md#journal).
+
+- **Allocations live on the event.** An event's `(scope, position)` pairs are stored in its
+  metadata extension `evt.journal`, ascending by scope with no repeat. Every journal row and every
+  counter is a function of stored events alone, so a rebuild needs no commit order and no
+  grouping. The scope resolver is a pure function of the event and is never consulted after the
+  commit. The engine replaces the key on every event a journaled commit writes, so it cannot be
+  forged.
+- **Rows and counters commit with the events.** Journal rows come from a history-dependent
+  commit-wide projector: owned by the event's stream, written only if absent, owner never changes.
+  Counters (the highest position per scope) are shared by every stream of a scope, so they are
+  the one exception to "the owner is a written stream": their constant owner is `SYSTEM#JOURNAL`.
+  A position is claimed exactly once; a taken position fails the commit whole.
+- **Positions are contiguous per scope** and allocated in the commit's canonical order (streams by
+  entity-ID bytes, then sequence; scopes ascending). A refused or failed commit moves no counter.
+- **Size guard before any write.** Every row's stored payload is measured against the cap
+  (default 30,000 bytes, at most 370,000) after allocation; the widest offender fails the commit
+  with `JournalRowTooLarge`. A store with outcomes records that as the command's
+  `journal-row-too-large` rejection. The pre-check measures at the widest position; for the same
+  metadata, a pre-check that passes means the guard passes, and otherwise it is advisory (headroom
+  can widen it). An application turns it into its own recorded rejection.
+- **Contention is retried by the journal, conflicts are not.** A taken position re-reads the
+  counters (allocating from the highest row when none moved, which heals a counter behind its
+  rows) under the journal's retry policy; a transient failure is retried too. A plain conflict, a
+  failed outcome, or an unknown result goes to the caller. Exhausted taken positions return
+  `Conflict`. A hot scope serializes on its counter item.
+- **Reads detect gaps.** `page` returns the contiguous prefix after `after` and the first missing
+  range; a reader never advances past a gap. `high_watermark` is the strongly consistent counter.
+- **The marker declares it.** The first journaled commit, once it is built (counters read, rows
+  allocated and guarded), adds `journal: 1` and the journaled entity types to `historyDependent`
+  (so they are never compacted); a commit that cannot be built declares nothing, and one refused
+  for an unmigrated table retracts the `journal` declaration. A build without the cargo feature
+  refuses the table; a build with it, wrapped or not, accepts it.
+- **Rebuilds need quiesced writers.** `rebuild` rewrites rows and counters unconditionally.
+  Enable the journal before writing the events it covers: earlier events have no row and no gap.
+- **Every writer of a journal table must commit through the journal.** The marker cannot tell
+  a bypassing writer from a journaling one; its events would be missing from the scopes.
+
 ## Projector System
 
 ### EventProjector Interface
