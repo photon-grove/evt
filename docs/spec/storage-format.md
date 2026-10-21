@@ -2853,6 +2853,15 @@ the snapshot. The full items of a compaction are in `compat/fixtures/journal.jso
 }
 ```
 
+Every compaction row is **trusted only if it is the engine's**: at its key, owned by
+`SYSTEM#JOURNAL` (which no stream, and so no projector, can be), with `entityType`
+`journal-compaction`. A row anything else wrote there is `ForeignJournalRow`, and compaction,
+leases, and readers refuse it rather than act on it; the conditions of compaction's own writes
+also require the engine owner (`entityID = :engine AND payload = :expected`). This defends against
+projectors and stream-owned writes; direct write access to the views table (a `ViewRepository`
+put, which takes any owner) is trusted, as it is for the counters. A foreign manifest also fails
+the scope's commits that read the floor (a new or repaired counter) until it is deleted.
+
 Compaction rows are **not projections** of events and no rebuild writes them, but they hold no
 domain state either: the manifest and chunks are a function of the stored rows and the checkpoint,
 the lease is coordination, and the audit row is a log. Wiping them loses nothing a reader needs: a
@@ -2864,8 +2873,8 @@ chunk is closed before the row that would make it hold more than **500** rows or
 the one that closed it, so compacting through 4 and then 10 stores the same manifest and chunks as
 compacting through 10 at once: a later run resumes the manifest's last chunk and rewrites only it
 and the chunks after it. The manifest is at most 375,000 bytes too (about 5,500 chunks, some 2.7
-million rows): a run that cannot fit is refused before it writes anything (`InvalidJournal`), and
-again before it writes a chunk the manifest could not list.
+million rows): a run that cannot fit is refused by its preflight, before it writes anything
+(`InvalidJournal`); compact such a scope in smaller steps.
 
 **Lease.** A scope has at most one compaction at a time. `begin_compaction(scope, owner, lease)`
 reads the lease row and puts a held lease with the next **token** (1 for a scope with none), its
@@ -2881,7 +2890,8 @@ marker, after validating the marker (a declared feature this build does not mode
 **Writes.** Every compaction write is one `TransactWriteItems` of up to 99 view actions followed by
 a `ConditionCheck` on the rebuild generation item (events table) that it still holds the settled
 epoch the run observed (`#value = :epoch`, or `attribute_not_exists(#value)` for epoch 0). A put
-with an expectation is conditioned `attribute_not_exists(pk)` or `payload = :expected`; a row delete
+with an expectation is conditioned `attribute_not_exists(pk)` or `entityID = :engine AND payload =
+:expected` (`:engine` binding `SYSTEM#JOURNAL`); a row delete
 carries the view delete's owner condition (`attribute_not_exists(pk) OR entityID = :owner`, the
 row's stream). Every write of a run also checks the lease row's exact payload, and the run stops
 first if its lease has lapsed by the repository's clock. A run renews its lease in place (by the
@@ -2893,10 +2903,13 @@ are transient.
 **A run.** `compact(lease, through)` with `floor ≤ through ≤ high watermark` and `through ≥ 1`
 (otherwise `InvalidArgument`, before any write), under a settled rebuild epoch:
 
-1. **Build**, if `through` is above the floor: resume the manifest's last chunk (checked against its
-   digest), read the rows above the floor up to `through` (strongly consistent; a missing row is
-   `InvalidJournal`, before any manifest is written), and chunk them. Each new chunk at a new
-   index is written alone; it is unreferenced until the manifest swap.
+1. **Build**, if `through` is above the floor. A **preflight** first streams the whole range and
+   writes nothing: it resumes the manifest's last chunk (checked against its digest), reads the
+   rows above the floor up to `through` (strongly consistent), and chunks them, so a missing row
+   anywhere in the range, or a manifest over its limit, is refused (`InvalidJournal`) before any
+   write. A second pass then writes the chunks, each checked against the preflight's digest, so a
+   run reads the range above the floor twice. The run keeps its lease during the preflight too.
+   Each new chunk at a new index is written alone; it is unreferenced until the manifest swap.
 2. **Swap the manifest**: put the new manifest, conditioned on the old one's exact payload (or
    absent), in the same transaction as the rewritten last chunk of the old manifest, if it changed.
    From here `through` is the floor.
@@ -2911,7 +2924,12 @@ leaves unreferenced chunks at indexes the next run overwrites. Compaction is mai
 own transactions: no commit carries a compaction action, so the commit budget is unchanged
 (97 event and projector operations, 96 with a snapshot).
 
-**Readers and `410 Gone`.** `page` is unchanged until it meets a gap. It then reads the manifest
+**Readers and `410 Gone`.** Reading a compaction row takes the extension trait
+`JournalCompactionStore` (`read_compaction_row`); `JournalStore` is unchanged since X1. `page`,
+`page_at_epoch`, `JournalRepository`, and every compaction function require the extension, so a
+store that cannot read the floor fails to compile with them rather than skip the `410` check or
+allocate below a floor (`high_watermark` needs only `JournalStore`). The in-memory and DynamoDB
+repositories implement it. `page` is unchanged until it meets a gap. It then reads the manifest
 (after the rows), and if the floor is above the page's last contiguous position (`next_after`) the
 read fails with `JournalGone`: the scope, `after`, the snapshot's `checkpoint`, its chunk count, and
 its manifest digest, and nothing of the deleted rows. An HTTP layer maps it to status 410. The

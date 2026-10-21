@@ -78,6 +78,14 @@ where
         Box::pin(refusals(repo, views)).await,
     );
     record(
+        "a gap after chunks that would close is refused before any chunk is written",
+        Box::pin(gapped_range_writes_nothing(repo, views)).await,
+    );
+    record(
+        "a compaction row the engine did not write is refused, never trusted",
+        Box::pin(foreign_rows_are_refused(repo, views)).await,
+    );
+    record(
         "a chunk read for a superseded manifest is reported moved",
         Box::pin(moved_snapshot(repo)).await,
     );
@@ -763,6 +771,122 @@ where
         |err| matches!(err, Error::InvalidArgument(_)),
     )?;
     end_compaction(repo, &held).await?;
+
+    Ok(())
+}
+
+async fn gapped_range_writes_nothing<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + CompactionStore + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let scope = world(&ns);
+    // Rows of about 133,000 bytes, so a chunk holds two: [1,2] and [3,4] close before the gap.
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns).with_max_row_bytes(200_000)?);
+    let stream = Stream::new(&ns, "a", "ledger");
+    for sequence in 1..=6 {
+        let mut event = stream.event(sequence, sequence);
+        event.payload = format!(
+            r#"{{"amount":{sequence},"note":"{}"}}"#,
+            "x".repeat(100_000)
+        )
+        .into_bytes();
+        stream.commit(&journaled, vec![event], None).await?;
+    }
+    views.delete_view(&scope.row_pk(), &row_sk(5)).await?;
+
+    expect_err(
+        compact_with_lease(repo, &scope, 6, &owner(&ns), LEASE).await,
+        "a compaction over a gap after closed chunks",
+        |err| matches!(err, Error::InvalidJournal(_)),
+    )?;
+    for sort_key in [chunk_sk(0), chunk_sk(1), MANIFEST_SORT_KEY.to_owned()] {
+        ensure_eq!(
+            repo.read_compaction_row(&scope, &sort_key).await?,
+            None,
+            format!("{sort_key} was not written")
+        );
+    }
+    ensure_eq!(
+        positions(&repo.read_rows(&scope, 0, 10).await?),
+        vec![1, 2, 3, 4, 6],
+        "no row was deleted"
+    );
+
+    Ok(())
+}
+
+async fn foreign_rows_are_refused<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + CompactionStore + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let scope = world(&ns);
+    let stream = Stream::new(&ns, "a", "ledger");
+    fill(repo, &ns, 4).await?;
+
+    // A row at the manifest's key, written by a stream (as an application projector or a direct
+    // view write would): it claims the scope is compacted through 4 with a well-formed payload.
+    let forged = crate::journal::CompactionManifest {
+        scope: scope.clone(),
+        checkpoint: 4,
+        chunks: vec!["0".repeat(64)],
+    };
+    let foreign = ViewRow::new(
+        compaction_pk(&scope),
+        MANIFEST_SORT_KEY,
+        stream.id.as_str(),
+        "journal-compaction",
+        forged.payload(),
+    );
+    views.put_view(&foreign).await?;
+
+    let refused = |err: &Error| matches!(err, Error::ForeignJournalRow { .. });
+    expect_err(
+        compact_with_lease(repo, &scope, 4, &owner(&ns), LEASE).await,
+        "a compaction over a foreign manifest",
+        refused,
+    )?;
+    expect_err(
+        read_manifest(repo, &scope).await,
+        "reading a foreign manifest",
+        refused,
+    )?;
+    ensure_eq!(
+        positions(&repo.read_rows(&scope, 0, 10).await?),
+        vec![1, 2, 3, 4],
+        "no row was deleted"
+    );
+
+    // A reader that meets a gap does not take a foreign floor for a 410.
+    views.delete_view(&scope.row_pk(), &row_sk(1)).await?;
+    expect_err(
+        page(repo, &scope, 0, 10).await,
+        "a page under a foreign manifest",
+        refused,
+    )?;
+
+    // A foreign lease row is refused the same way.
+    views
+        .delete_view(&compaction_pk(&scope), MANIFEST_SORT_KEY)
+        .await?;
+    let lease = ViewRow::new(
+        compaction_pk(&scope),
+        LEASE_SORT_KEY,
+        stream.id.as_str(),
+        "journal-compaction",
+        crate::journal::released_payload(&scope, 7),
+    );
+    views.put_view(&lease).await?;
+    expect_err(
+        begin_compaction(repo, &scope, &owner(&ns), LEASE).await,
+        "a lease over a foreign lease row",
+        refused,
+    )?;
 
     Ok(())
 }

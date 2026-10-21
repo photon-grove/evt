@@ -242,8 +242,8 @@ pub const COMPACTION_EPOCH_CONDITION: &str = "#value = :epoch";
 pub const COMPACTION_EPOCH_ZERO_CONDITION: &str = "attribute_not_exists(#value)";
 
 /// The condition of a journal compaction write that expects a row's exact payload (its lease or
-/// manifest).
-pub const COMPACTION_PAYLOAD_CONDITION: &str = "payload = :expected";
+/// manifest), owned by the engine (`:engine` binds `SYSTEM#JOURNAL`).
+pub const COMPACTION_PAYLOAD_CONDITION: &str = "entityID = :engine AND payload = :expected";
 
 /// A DynamoDB attribute value. Serializes as DynamoDB JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

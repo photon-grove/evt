@@ -54,9 +54,19 @@ pub trait JournalStore: Send + Sync {
         after: u64,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<JournalRow>, Error>> + Send;
+}
 
-    /// The row at `sort_key` in the scope's compaction partition (`journal-compaction#<scope>`, X2):
-    /// its lease, manifest, a chunk, or an audit row. Strongly consistent.
+/// A [`JournalStore`] that can also read a scope's compaction rows (X2): its manifest (the floor),
+/// lease, chunks, and audit rows. [`page`], [`page_at_epoch`],
+/// [`JournalRepository`](super::JournalRepository), and every compaction function require it, so a
+/// store that cannot read the floor fails to compile with them instead of skipping the `410 Gone`
+/// check or allocating below a floor. [`JournalStore`] itself is unchanged since X1.
+///
+/// [`MemRepository`](crate::MemRepository) and the DynamoDB repository implement it.
+pub trait JournalCompactionStore: JournalStore {
+    /// The row at `sort_key` in the scope's compaction partition (`journal-compaction#<scope>`),
+    /// as stored, strongly consistent. Callers check it is the engine's
+    /// ([`check_compaction_row`](super::check_compaction_row)); the compaction functions do.
     fn read_compaction_row(
         &self,
         scope: &Scope,
@@ -93,7 +103,9 @@ macro_rules! forward_journal_store {
             ) -> impl Future<Output = Result<Vec<JournalRow>, Error>> + Send {
                 (**self).read_rows(scope, after, limit)
             }
+        }
 
+        impl<S: JournalCompactionStore + ?Sized> JournalCompactionStore for $pointer {
             fn read_compaction_row(
                 &self,
                 scope: &Scope,
@@ -185,7 +197,7 @@ pub async fn high_watermark<S: JournalStore>(store: &S, scope: &Scope) -> Result
 /// [`Error::JournalGone`], which names the snapshot to install instead (the `410 Gone` handoff).
 /// Rows below the floor that are still there (a run that has not deleted them yet, or a rebuild
 /// that restored them) are served as usual.
-pub async fn page<S: JournalStore>(
+pub async fn page<S: JournalCompactionStore>(
     store: &S,
     scope: &Scope,
     after: u64,
@@ -232,7 +244,7 @@ pub async fn high_watermark_at_epoch<S: JournalStore + RebuildFence>(
 /// rows and counters would show rows that are missing or counters that are behind, and the epoch
 /// check turns that into a retryable error instead of a gap to interpret. On a failure, keep the
 /// cursor and retry the same page after a backoff.
-pub async fn page_at_epoch<S: JournalStore + RebuildFence>(
+pub async fn page_at_epoch<S: JournalCompactionStore + RebuildFence>(
     store: &S,
     scope: &Scope,
     after: u64,

@@ -5,7 +5,9 @@
 //! correct without stopping writers:
 //!
 //! 1. it builds the scope's **canonical chunks** of rows `1..=checkpoint` (resuming the previous
-//!    manifest's chunks, so only the tail is rebuilt) and writes the new chunks;
+//!    manifest's chunks, so only the tail is rebuilt): a preflight streams the whole range and
+//!    writes nothing, so a missing row or an oversized manifest is refused before any write, and a
+//!    second pass writes the new chunks;
 //! 2. it **swaps the manifest** in one atomic write with the one chunk it replaces, which makes the
 //!    checkpoint the scope's floor;
 //! 3. it **deletes the journal rows** at or below the checkpoint, in batches;
@@ -21,13 +23,14 @@ use std::time::Duration;
 use super::compaction::{
     BuiltChunk, ChunkBuilder, CompactionAudit, CompactionChunk, CompactionLease,
     CompactionManifest, CompactionStore, CompactionWrite, CompactionWritten, Expect,
-    LEASE_SORT_KEY, LeaseRow, MANIFEST_SORT_KEY, MAX_CHUNK_BYTES, MAX_CHUNK_ROWS,
-    MAX_COMPACTION_WRITES, audit_sk, chunk_sk, compaction_pk, compaction_view, released_payload,
+    LEASE_SORT_KEY, LeaseRow, MANIFEST_SORT_KEY, MAX_CHUNK_BYTES, MAX_COMPACTION_WRITES, audit_sk,
+    check_compaction_row, chunk_sk, compaction_pk, compaction_view, released_payload,
 };
-use super::read::{JournalStore, MAX_PAGE_ROWS};
+use super::read::{JournalCompactionStore, MAX_PAGE_ROWS};
 use super::scope::{Scope, row_sk};
 use crate::error::Error;
 use crate::features::{JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION};
+use crate::projection::ViewRow;
 use crate::rebuild::{self, RebuildEpoch, observe_rebuild_epoch};
 
 /// How often a lease acquire reads the lease again after losing a race, before it fails with a
@@ -57,20 +60,37 @@ pub struct CompactionReport {
     pub rows_deleted: u64,
 }
 
+/// The compaction row at `sort_key`, if any, checked to be the engine's
+/// ([`check_compaction_row`]): a row another writer put there (an application projector, a direct
+/// view write) is [`Error::ForeignJournalRow`], never trusted.
+async fn read_engine_row<S: JournalCompactionStore + ?Sized>(
+    store: &S,
+    scope: &Scope,
+    sort_key: &str,
+) -> Result<Option<ViewRow>, Error> {
+    store
+        .read_compaction_row(scope, sort_key)
+        .await?
+        .map(|row| check_compaction_row(scope, sort_key, row))
+        .transpose()
+}
+
 /// The scope's manifest, if it has been compacted. Strongly consistent.
-pub async fn read_manifest<S: JournalStore + ?Sized>(
+pub async fn read_manifest<S: JournalCompactionStore + ?Sized>(
     store: &S,
     scope: &Scope,
 ) -> Result<Option<CompactionManifest>, Error> {
-    store
-        .read_compaction_row(scope, MANIFEST_SORT_KEY)
+    read_engine_row(store, scope, MANIFEST_SORT_KEY)
         .await?
         .map(|row| CompactionManifest::decode(scope, &row.payload))
         .transpose()
 }
 
 /// The scope's floor: the checkpoint of its manifest, `0` when it has none.
-pub async fn read_floor<S: JournalStore + ?Sized>(store: &S, scope: &Scope) -> Result<u64, Error> {
+pub async fn read_floor<S: JournalCompactionStore + ?Sized>(
+    store: &S,
+    scope: &Scope,
+) -> Result<u64, Error> {
     Ok(read_manifest(store, scope)
         .await?
         .map_or(0, |manifest| manifest.checkpoint))
@@ -81,7 +101,7 @@ pub async fn read_floor<S: JournalStore + ?Sized>(store: &S, scope: &Scope) -> R
 /// A chunk that is missing or does not match is [`Error::JournalSnapshotMoved`]: a compaction
 /// swapped the manifest since it was read. Read the manifest again and start over; it is
 /// transient.
-pub async fn read_chunk<S: JournalStore + ?Sized>(
+pub async fn read_chunk<S: JournalCompactionStore + ?Sized>(
     store: &S,
     manifest: &CompactionManifest,
     index: usize,
@@ -98,8 +118,7 @@ pub async fn read_chunk<S: JournalStore + ?Sized>(
         scope: scope.as_str().to_owned(),
         checkpoint: manifest.checkpoint,
     };
-    let row = store
-        .read_compaction_row(scope, &chunk_sk(index as u64))
+    let row = read_engine_row(store, scope, &chunk_sk(index as u64))
         .await?
         .ok_or_else(moved)?;
 
@@ -119,25 +138,23 @@ pub async fn read_chunk<S: JournalStore + ?Sized>(
 }
 
 /// The audit row of `checkpoint`, if a run completed it.
-pub async fn read_audit<S: JournalStore + ?Sized>(
+pub async fn read_audit<S: JournalCompactionStore + ?Sized>(
     store: &S,
     scope: &Scope,
     checkpoint: u64,
 ) -> Result<Option<CompactionAudit>, Error> {
-    store
-        .read_compaction_row(scope, &audit_sk(checkpoint))
+    read_engine_row(store, scope, &audit_sk(checkpoint))
         .await?
         .map(|row| CompactionAudit::decode(scope, &row.payload))
         .transpose()
 }
 
 /// The scope's lease row, if one was ever written.
-pub async fn read_lease<S: JournalStore + ?Sized>(
+pub async fn read_lease<S: JournalCompactionStore + ?Sized>(
     store: &S,
     scope: &Scope,
 ) -> Result<Option<LeaseRow>, Error> {
-    store
-        .read_compaction_row(scope, LEASE_SORT_KEY)
+    read_engine_row(store, scope, LEASE_SORT_KEY)
         .await?
         .map(|row| LeaseRow::decode(scope, &row.payload))
         .transpose()
@@ -212,7 +229,7 @@ pub async fn begin_compaction<S: CompactionStore + ?Sized>(
     ensure_declared(store).await?;
 
     for _ in 0..MAX_LEASE_ATTEMPTS {
-        let stored = store.read_compaction_row(scope, LEASE_SORT_KEY).await?;
+        let stored = read_engine_row(store, scope, LEASE_SORT_KEY).await?;
         let now = store.compaction_now();
         let (token, expect) = match &stored {
             None => (1, Expect::Absent),
@@ -310,7 +327,7 @@ pub async fn force_release_compaction<S: CompactionStore + ?Sized>(
 ) -> Result<(), Error> {
     rebuild::check_owner(owner)?;
 
-    let Some(row) = store.read_compaction_row(scope, LEASE_SORT_KEY).await? else {
+    let Some(row) = read_engine_row(store, scope, LEASE_SORT_KEY).await? else {
         return Err(lease_lost(scope, owner));
     };
     let LeaseRow::Held(held) = LeaseRow::decode(scope, &row.payload)? else {
@@ -335,21 +352,7 @@ impl<S: CompactionStore + ?Sized> Run<'_, S> {
     /// repository's clock: a lapsed lease may be taken over, so the worker stops. A lease with
     /// less than half of its length left is renewed first, so a long run keeps it.
     async fn write(&mut self, mut writes: Vec<CompactionWrite>) -> Result<(), Error> {
-        let now = self.store.compaction_now();
-
-        if self.lease.lease_expires_at < now {
-            return Err(lease_lost(&self.lease.scope, &self.lease.owner));
-        }
-
-        let seconds = self.lease.lease_seconds;
-        if seconds > 0 && self.lease.lease_expires_at.saturating_sub(now) < (seconds + 1) / 2 {
-            *self.lease = renew_compaction(
-                self.store,
-                self.lease,
-                Duration::from_secs(seconds.unsigned_abs()),
-            )
-            .await?;
-        }
+        self.keep().await?;
 
         let scope = &self.lease.scope;
         let check = writes.len();
@@ -378,6 +381,29 @@ impl<S: CompactionStore + ?Sized> Run<'_, S> {
                 writes[at].key()
             ))),
         }
+    }
+
+    /// Stops a worker whose lease lapsed by the repository's clock (it may be taken over), and
+    /// renews a lease with less than half of its length left, in place. Called before every write
+    /// and between the chunks of the preflight, which reads for as long as the range takes.
+    async fn keep(&mut self) -> Result<(), Error> {
+        let now = self.store.compaction_now();
+
+        if self.lease.lease_expires_at < now {
+            return Err(lease_lost(&self.lease.scope, &self.lease.owner));
+        }
+
+        let seconds = self.lease.lease_seconds;
+        if seconds > 0 && self.lease.lease_expires_at.saturating_sub(now) < (seconds + 1) / 2 {
+            *self.lease = renew_compaction(
+                self.store,
+                self.lease,
+                Duration::from_secs(seconds.unsigned_abs()),
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     fn chunk_write(&self, chunk: &BuiltChunk) -> CompactionWrite {
@@ -426,7 +452,7 @@ pub async fn compact<S: CompactionStore + ?Sized>(
         epoch,
     };
 
-    let stored = store.read_compaction_row(scope, MANIFEST_SORT_KEY).await?;
+    let stored = read_engine_row(store, scope, MANIFEST_SORT_KEY).await?;
     let old = stored
         .as_ref()
         .map(|row| CompactionManifest::decode(scope, &row.payload))
@@ -498,96 +524,119 @@ pub async fn compact_with_lease<S: CompactionStore + ?Sized>(
     }
 }
 
-/// Builds the snapshot through `through` and swaps the manifest. Returns the new manifest and how
-/// many chunks were written.
-///
-/// Closed chunks never change (the canonical rule closes a chunk on rows before it only), so it
-/// resumes the previous manifest's last chunk and rebuilds from there. Chunks at new indexes are
-/// written first, unreferenced; the rewritten last chunk goes in the same atomic write as the
-/// manifest, so a reader never finds a manifest whose chunks are not there.
-async fn build<S: CompactionStore + ?Sized>(
-    run: &mut Run<'_, S>,
-    old: Option<CompactionManifest>,
-    old_payload: Option<Vec<u8>>,
+/// The rows `floor + 1..=through` of a scope, chunked: every chunk the canonical rule closes,
+/// then the last one. It resumes the previous manifest's last chunk, so closed chunks before it are
+/// not rebuilt. It never writes.
+struct Chunks<'a, S: ?Sized> {
+    store: &'a S,
+    scope: Scope,
+    builder: Option<ChunkBuilder>,
+    after: u64,
     through: u64,
-) -> Result<(CompactionManifest, usize), Error> {
-    let scope = &run.lease.scope.clone();
-    let floor = old.as_ref().map_or(0, |manifest| manifest.checkpoint);
+    rows: std::collections::VecDeque<super::row::JournalRow>,
+}
 
-    let (mut digests, mut builder, tail) = match &old {
-        None => (Vec::new(), ChunkBuilder::new(scope, 0, 1), None),
-        Some(manifest) => {
-            let tail = manifest.chunks.len() - 1;
-            let row = run
-                .store
-                .read_compaction_row(scope, &chunk_sk(tail as u64))
-                .await?
-                .filter(|row| crate::sha256::sha256_hex(&row.payload) == manifest.chunks[tail])
-                .ok_or_else(|| {
-                    Error::InvalidJournal(format!(
-                        "chunk {tail} of {scope} does not match its manifest"
-                    ))
-                })?;
+impl<'a, S: JournalCompactionStore + ?Sized> Chunks<'a, S> {
+    /// Starts after `old`'s floor, from its last chunk (checked against its digest).
+    async fn start(
+        store: &'a S,
+        scope: &Scope,
+        old: Option<&CompactionManifest>,
+        through: u64,
+    ) -> Result<Self, Error> {
+        let builder = match old {
+            None => ChunkBuilder::new(scope, 0, 1),
+            Some(manifest) => {
+                let tail = manifest.chunks.len() - 1;
+                let row = read_engine_row(store, scope, &chunk_sk(tail as u64))
+                    .await?
+                    .filter(|row| crate::sha256::sha256_hex(&row.payload) == manifest.chunks[tail])
+                    .ok_or_else(|| {
+                        Error::InvalidJournal(format!(
+                            "chunk {tail} of {scope} does not match its manifest"
+                        ))
+                    })?;
 
-            (
-                manifest.chunks[..tail].to_vec(),
-                ChunkBuilder::resume(scope, &row.payload)?,
-                Some(tail as u64),
-            )
-        }
-    };
-
-    // The fewest chunks the manifest can list: refused before any write when even those overflow
-    // it, and checked again as each chunk closes, before it is written.
-    let fewest = digests.len() as u64 + (through - builder.from()) / MAX_CHUNK_ROWS as u64 + 1;
-    check_manifest_size(scope, through, fewest)?;
-
-    let mut written = 0;
-    let mut held_back = None;
-    let mut after = floor;
-
-    while after < through {
-        let rows = run.store.read_rows(scope, after, MAX_PAGE_ROWS).await?;
-        let mut progressed = false;
-
-        for row in rows.into_iter().take_while(|row| row.position <= through) {
-            if row.position != after + 1 {
-                break;
+                ChunkBuilder::resume(scope, &row.payload)?
             }
+        };
 
-            if let Some(closed) = builder.push(&row)? {
-                digests.push(closed.digest.clone());
-                check_manifest_size(scope, through, digests.len() as u64 + 1)?;
-
-                if Some(closed.index) == tail {
-                    held_back = Some(closed);
-                } else {
-                    run.write(vec![run.chunk_write(&closed)]).await?;
-                    written += 1;
-                }
-            }
-
-            after = row.position;
-            progressed = true;
-        }
-
-        if !progressed {
-            return Err(Error::InvalidJournal(format!(
-                "{scope} has no row at position {} to compact",
-                after + 1
-            )));
-        }
+        Ok(Self {
+            store,
+            scope: scope.clone(),
+            builder: Some(builder),
+            after: old.map_or(0, |manifest| manifest.checkpoint),
+            through,
+            rows: std::collections::VecDeque::new(),
+        })
     }
 
-    let last = builder.build();
-    digests.push(last.digest.clone());
-    let mut swap = Vec::new();
+    /// The next chunk, closed or the last, or `None` once the last was returned. A missing row is
+    /// [`Error::InvalidJournal`].
+    async fn next(&mut self) -> Result<Option<BuiltChunk>, Error> {
+        loop {
+            if self.builder.is_none() {
+                return Ok(None);
+            }
 
-    if Some(last.index) == tail {
-        held_back = Some(last);
-    } else {
-        run.write(vec![run.chunk_write(&last)]).await?;
-        written += 1;
+            if self.after >= self.through {
+                return Ok(self.builder.take().map(ChunkBuilder::build));
+            }
+
+            if self.rows.is_empty() {
+                let page = self
+                    .store
+                    .read_rows(&self.scope, self.after, MAX_PAGE_ROWS)
+                    .await?;
+                self.rows.extend(
+                    page.into_iter()
+                        .take_while(|row| row.position <= self.through),
+                );
+            }
+
+            let row = match self.rows.pop_front() {
+                Some(row) if row.position == self.after + 1 => row,
+                _ => {
+                    return Err(Error::InvalidJournal(format!(
+                        "{} has no row at position {} to compact",
+                        self.scope,
+                        self.after + 1
+                    )));
+                }
+            };
+            self.after = row.position;
+
+            let builder = self.builder.as_mut().expect("checked above");
+            if let Some(closed) = builder.push(&row)? {
+                return Ok(Some(closed));
+            }
+        }
+    }
+}
+
+/// Plans the snapshot through `through` without writing anything: every chunk's digest, over the
+/// full range, and the manifest, refused when a row is missing or the manifest would exceed
+/// `limit` bytes. With a run, it keeps the run's lease between chunks ([`Run::keep`]): reading a
+/// large range can outlast the lease.
+async fn preflight<S: CompactionStore + ?Sized>(
+    store: &S,
+    scope: &Scope,
+    old: Option<&CompactionManifest>,
+    through: u64,
+    limit: usize,
+    mut run: Option<&mut Run<'_, S>>,
+) -> Result<CompactionManifest, Error> {
+    let mut digests = old.map_or_else(Vec::new, |manifest| {
+        manifest.chunks[..manifest.chunks.len() - 1].to_vec()
+    });
+    let mut chunks = Chunks::start(store, scope, old, through).await?;
+
+    while let Some(chunk) = chunks.next().await? {
+        digests.push(chunk.digest);
+
+        if let Some(run) = run.as_mut() {
+            run.keep().await?;
+        }
     }
 
     let manifest = CompactionManifest {
@@ -595,12 +644,71 @@ async fn build<S: CompactionStore + ?Sized>(
         checkpoint: through,
         chunks: digests,
     };
-    let payload = manifest.payload();
+    let size = manifest.payload().len();
+    if size > limit {
+        return Err(Error::InvalidJournal(format!(
+            "the manifest of {scope} through {through} would list {} chunks in {size} bytes, over \
+             {limit}; compact in smaller steps",
+            manifest.chunks.len()
+        )));
+    }
 
-    swap.push(CompactionWrite::Put {
-        row: compaction_view(scope, MANIFEST_SORT_KEY, payload),
+    Ok(manifest)
+}
+
+/// Builds the snapshot through `through` and swaps the manifest. Returns the new manifest and how
+/// many chunks were written.
+///
+/// A preflight streams the whole range first and writes nothing: a missing row, or a manifest
+/// over [`MAX_CHUNK_BYTES`], is refused before any write. A second pass then writes the chunks,
+/// each checked against the preflight's digest. Closed chunks never change (the canonical rule
+/// closes a chunk on rows before it only), so both passes resume the previous manifest's last
+/// chunk. Chunks at new indexes are written first, unreferenced; the rewritten last chunk goes in
+/// the same atomic write as the manifest, so a reader never finds a manifest whose chunks are not
+/// there.
+async fn build<S: CompactionStore + ?Sized>(
+    run: &mut Run<'_, S>,
+    old: Option<CompactionManifest>,
+    old_payload: Option<Vec<u8>>,
+    through: u64,
+) -> Result<(CompactionManifest, usize), Error> {
+    let scope = &run.lease.scope.clone();
+    let store = run.store;
+    let manifest = preflight(
+        store,
+        scope,
+        old.as_ref(),
+        through,
+        MAX_CHUNK_BYTES,
+        Some(run),
+    )
+    .await?;
+    let tail = old.as_ref().map(|old| old.chunks.len() as u64 - 1);
+
+    let mut written = 0;
+    let mut held_back = None;
+    let mut chunks = Chunks::start(run.store, scope, old.as_ref(), through).await?;
+
+    while let Some(chunk) = chunks.next().await? {
+        if manifest.chunks.get(chunk.index as usize) != Some(&chunk.digest) {
+            return Err(Error::InvalidJournal(format!(
+                "chunk {} of {scope} changed between the preflight and the write",
+                chunk.index
+            )));
+        }
+
+        if Some(chunk.index) == tail {
+            held_back = Some(chunk);
+        } else {
+            run.write(vec![run.chunk_write(&chunk)]).await?;
+            written += 1;
+        }
+    }
+
+    let mut swap = vec![CompactionWrite::Put {
+        row: compaction_view(scope, MANIFEST_SORT_KEY, manifest.payload()),
         expect: old_payload.map_or(Expect::Absent, Expect::Payload),
-    });
+    }];
 
     // The rewritten last chunk of the old manifest, if it changed.
     if let Some(chunk) = held_back.filter(|chunk| {
@@ -614,27 +722,6 @@ async fn build<S: CompactionStore + ?Sized>(
     run.write(swap).await?;
 
     Ok((manifest, written))
-}
-
-/// Refuses a manifest of `chunks` chunks through `through` that would exceed [`MAX_CHUNK_BYTES`]:
-/// about 5,500 chunks. Compact a scope before it grows past that, or in smaller steps.
-fn check_manifest_size(scope: &Scope, through: u64, chunks: u64) -> Result<(), Error> {
-    let empty = CompactionManifest {
-        scope: scope.clone(),
-        checkpoint: through,
-        chunks: Vec::new(),
-    };
-    // Each digest is 64 hex digits in quotes, with a comma between two.
-    let size = empty.payload().len() as u64 + chunks * 67 - 1;
-
-    if size > MAX_CHUNK_BYTES as u64 {
-        return Err(Error::InvalidJournal(format!(
-            "the manifest of {scope} through {through} would list {chunks} chunks in {size} bytes, \
-             over {MAX_CHUNK_BYTES}"
-        )));
-    }
-
-    Ok(())
 }
 
 /// Deletes every journal row of the scope at or below `through`, each by its owner, in batches.
@@ -681,26 +768,98 @@ async fn delete_rows<S: CompactionStore + ?Sized>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_manifest_over_the_byte_cap_is_refused_by_its_chunk_count() {
-        let scope = Scope::new("world:7").unwrap();
+    use crate::MemRepository;
+    use crate::journal::row_view;
+    use crate::journal::scope::{Allocation, set_allocations};
 
-        assert!(check_manifest_size(&scope, u64::MAX, 5_000).is_ok());
+    fn scope() -> Scope {
+        Scope::new("world:7").unwrap()
+    }
+
+    /// A store holding the journal rows `positions` of the scope, written directly.
+    async fn store_with(positions: &[u64]) -> MemRepository {
+        let store = MemRepository::new();
+        let epoch = crate::rebuild::observe_rebuild_epoch(&store).await.unwrap();
+        let writes: Vec<CompactionWrite> = positions
+            .iter()
+            .map(|position| {
+                let mut event = crate::SerializedEvent {
+                    id: format!("acct-1:{position}").into(),
+                    entity_id: "acct-1".into(),
+                    payload: b"{}".to_vec(),
+                    ..Default::default()
+                };
+                set_allocations(&mut event, &[Allocation::new(&scope(), *position)]);
+
+                CompactionWrite::Put {
+                    row: row_view(&scope(), *position, &event).unwrap(),
+                    expect: Expect::Any,
+                }
+            })
+            .collect();
+        store.write_compaction(Some(epoch), &writes).await.unwrap();
+
+        store
+    }
+
+    #[tokio::test]
+    async fn a_preflight_plans_every_chunk_and_writes_nothing() {
+        let store = store_with(&[1, 2, 3]).await;
+        let manifest = preflight(&store, &scope(), None, 3, MAX_CHUNK_BYTES, None)
+            .await
+            .unwrap();
+
+        assert_eq!((manifest.checkpoint, manifest.chunks.len()), (3, 1));
+        assert!(store.views().iter().all(|row| row.pk == scope().row_pk()));
+    }
+
+    #[tokio::test]
+    async fn a_preflight_keeps_the_run_lease_while_it_reads() {
+        let clock = crate::conformance::TestClock::starting_now();
+        let store = store_with(&[1, 2, 3]).await.with_clock(clock.reader());
+        let mut lease = begin_compaction(&store, &scope(), "c", Duration::from_secs(10))
+            .await
+            .unwrap();
+        let epoch = observe_rebuild_epoch(&store).await.unwrap();
+
+        // Less than half the lease is left: the preflight renews it before any write.
+        clock.advance(6);
+        let mut run = Run {
+            store: &store,
+            lease: &mut lease,
+            epoch,
+        };
+        preflight(&store, &scope(), None, 3, MAX_CHUNK_BYTES, Some(&mut run))
+            .await
+            .unwrap();
+        assert_eq!(lease.lease_expires_at, clock.seconds() + 10);
+
+        // A lease that lapsed during the reads stops the run before it writes.
+        clock.advance(11);
+        let mut run = Run {
+            store: &store,
+            lease: &mut lease,
+            epoch,
+        };
         assert!(matches!(
-            check_manifest_size(&scope, u64::MAX, 6_000),
+            preflight(&store, &scope(), None, 3, MAX_CHUNK_BYTES, Some(&mut run)).await,
+            Err(Error::CompactionLeaseLost { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_preflight_refuses_a_gap_or_a_manifest_over_its_limit() {
+        let gapped = store_with(&[1, 2, 4]).await;
+        assert!(matches!(
+            preflight(&gapped, &scope(), None, 4, MAX_CHUNK_BYTES, None).await,
             Err(Error::InvalidJournal(_))
         ));
 
-        // The estimate is the exact payload size.
-        let manifest = CompactionManifest {
-            scope: scope.clone(),
-            checkpoint: 12,
-            chunks: vec!["a".repeat(64); 3],
-        };
-        let empty = CompactionManifest {
-            chunks: Vec::new(),
-            ..manifest.clone()
-        };
-        assert_eq!(empty.payload().len() + 3 * 67 - 1, manifest.payload().len());
+        // Over the limit: the manifest of one chunk is about 120 bytes.
+        let store = store_with(&[1, 2]).await;
+        assert!(matches!(
+            preflight(&store, &scope(), None, 2, 100, None).await,
+            Err(Error::InvalidJournal(message)) if message.contains("smaller steps")
+        ));
     }
 }

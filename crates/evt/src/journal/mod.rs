@@ -87,7 +87,8 @@ pub use compaction::{
     COMPACTION_PARTITION_PREFIX, CompactionAudit, CompactionChunk, CompactionLease,
     CompactionManifest, CompactionStore, CompactionWrite, CompactionWritten, Expect, JournalGone,
     LEASE_SORT_KEY, LeaseRow, MANIFEST_SORT_KEY, MAX_CHUNK_BYTES, MAX_CHUNK_ROWS,
-    MAX_COMPACTION_WRITES, audit_sk, chunk_sk, compaction_pk, compaction_view, released_payload,
+    MAX_COMPACTION_WRITES, audit_sk, check_compaction_row, chunk_sk, compaction_pk,
+    compaction_view, released_payload,
 };
 pub(crate) use compaction::{check_compaction_writes, meets};
 pub use config::{
@@ -95,8 +96,8 @@ pub use config::{
 };
 pub use projector::{JournalProjector, PROJECTOR_NAME, PositionTaken};
 pub use read::{
-    Gap, JournalPage, JournalStore, MAX_PAGE_ROWS, high_watermark, high_watermark_at_epoch, page,
-    page_at_epoch,
+    Gap, JournalCompactionStore, JournalPage, JournalStore, MAX_PAGE_ROWS, high_watermark,
+    high_watermark_at_epoch, page, page_at_epoch,
 };
 pub use replay::{JournalState, REBUILD_OWNER, rebuild, rebuild_with_lock, replay};
 pub use repository::JournalRepository;

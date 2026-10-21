@@ -433,6 +433,24 @@ pub enum Error {
         checkpoint: u64,
     },
 
+    /// A row in a journal compaction partition (`journal-compaction#<scope>`) is not the engine's:
+    /// its owner is not `SYSTEM#JOURNAL`, or its entity type, key, or partition is not a
+    /// compaction row's (ADR 0005, X2). Something other than the engine wrote it, so it is never
+    /// trusted: compaction refuses to run and readers refuse to use it. Nothing was written.
+    #[error(
+        "the journal row {pk:?}/{sk:?} is not the engine's (owner {owner:?}, type {entity_type:?})"
+    )]
+    ForeignJournalRow {
+        /// The partition key.
+        pk: String,
+        /// The sort key.
+        sk: String,
+        /// The row's owner.
+        owner: String,
+        /// The row's entity type.
+        entity_type: String,
+    },
+
     /// [`begin_compaction`](crate::journal::begin_compaction) found another compaction of the
     /// scope holding an unexpired lease (ADR 0005, X2). Nothing was written.
     #[error(

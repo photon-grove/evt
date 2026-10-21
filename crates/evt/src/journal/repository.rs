@@ -10,7 +10,7 @@ use futures_core::Stream;
 
 use super::config::{Journal, allocate};
 use super::projector::{JournalProjector, PROJECTOR_NAME, PositionTaken};
-use super::read::{self, JournalPage, JournalStore};
+use super::read::{self, JournalCompactionStore, JournalPage, JournalStore};
 use super::row::{JournalRow, counter_payload};
 use super::scope::{COUNTER_ENTITY_TYPE, COUNTER_OWNER, COUNTER_SORT_KEY, Scope, set_allocations};
 use crate::enumerate::{EventBatch, EventLog, StreamFilter};
@@ -96,7 +96,9 @@ impl<R: JournalStore> JournalRepository<R> {
     pub async fn high_watermark(&self, scope: &Scope) -> Result<u64, Error> {
         read::high_watermark(&self.inner, scope).await
     }
+}
 
+impl<R: JournalCompactionStore> JournalRepository<R> {
     /// A page of the scope's rows after `after`. See [`page`](super::page).
     pub async fn page(
         &self,
@@ -132,7 +134,9 @@ impl<R: JournalStore> JournalStore for JournalRepository<R> {
     ) -> impl Future<Output = Result<Vec<JournalRow>, Error>> + Send {
         self.inner.read_rows(scope, after, limit)
     }
+}
 
+impl<R: JournalCompactionStore> JournalCompactionStore for JournalRepository<R> {
     fn read_compaction_row(
         &self,
         scope: &Scope,
@@ -244,7 +248,7 @@ impl<Op: Clone + Send> Staged for TransactionCommit<Op> {
 
 impl<R> JournalRepository<R>
 where
-    R: Repository + FeatureMarker + JournalStore,
+    R: Repository + FeatureMarker + JournalCompactionStore,
 {
     /// Declares the `journal` feature and the journaled entity types history-dependent, once per
     /// repository (clones share the flag). Nothing is written if the marker already declares them.
@@ -584,7 +588,7 @@ fn taken(error: &Error) -> bool {
 
 impl<R> Repository for JournalRepository<R>
 where
-    R: Repository + FeatureMarker + JournalStore,
+    R: Repository + FeatureMarker + JournalCompactionStore,
     R::Operation: Clone,
 {
     type Operation = R::Operation;

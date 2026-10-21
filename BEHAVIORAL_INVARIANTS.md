@@ -682,7 +682,12 @@ The stored shapes are in the [storage format](docs/spec/storage-format.md#compac
   swaps the scope's manifest (the checkpoint becomes the floor) in one atomic write with the one
   chunk it rewrites, and only then deletes the rows at or below the floor, then writes the audit
   row. Every step is idempotent; compacting again finishes an interrupted run. Events are never
-  touched. A manifest that would list more than about 5,500 chunks is refused before any write.
+  touched. A preflight streams the whole range first, so a missing row anywhere in it, or a
+  manifest over its limit (about 5,500 chunks), is refused before any write.
+- **Only the engine's compaction rows are trusted.** A lease, manifest, chunk, or audit row not
+  owned by `SYSTEM#JOURNAL` with the compaction entity type is `ForeignJournalRow`: compaction and
+  readers refuse it. This guards against projectors and stream-owned writes; direct views-table
+  writes are trusted.
 - **Chunks are canonical.** Split from position 1, closed before the row that would exceed 500 rows
   or 375,000 payload bytes: compacting in steps stores what one compaction stores.
 - **One compaction per scope, fenced.** The lease row carries an owner, a fencing token that rises

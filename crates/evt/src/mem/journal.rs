@@ -6,8 +6,8 @@ use std::ops::Bound;
 use super::MemRepository;
 use crate::error::Error;
 use crate::journal::{
-    COUNTER_SORT_KEY, CompactionStore, CompactionWrite, CompactionWritten, JournalRow,
-    JournalStore, Scope, compaction_pk, parse_row_sk, read_counter, row_sk,
+    COUNTER_SORT_KEY, CompactionStore, CompactionWrite, CompactionWritten, JournalCompactionStore,
+    JournalRow, JournalStore, Scope, compaction_pk, parse_row_sk, read_counter, row_sk,
 };
 use crate::projection::ViewRow;
 use crate::rebuild::RebuildEpoch;
@@ -53,7 +53,9 @@ impl JournalStore for MemRepository {
         .map(|(_, row)| JournalRow::from_view(scope, row))
         .collect()
     }
+}
 
+impl JournalCompactionStore for MemRepository {
     async fn read_compaction_row(
         &self,
         scope: &Scope,

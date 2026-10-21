@@ -719,6 +719,10 @@ match page(&repository, &scope, after, 100).await {
   counter put is a compare-and-set on the counter it read, so a writer whose read went stale cannot
   claim positions whose rows were compacted, and a commit never allocates at or below a scope's
   floor, even after a lost counter. `compact` renews its lease in place during a long run.
+- Reading the floor takes `JournalCompactionStore` (an extension of `JournalStore`, which is
+  unchanged since X1); `page`, `JournalRepository`, and compaction require it. Compaction rows
+  that are not the engine's (`SYSTEM#JOURNAL`) are refused with `Error::ForeignJournalRow`, and a
+  preflight refuses a gapped range or an oversized manifest before anything is written.
 - The first lease declares `journal-compaction` on the feature marker, so a build that predates
   compaction refuses the table. `photon_evt::conformance::compaction_cases` checks a backend
   (`CompactionStore`: the in-memory and DynamoDB repositories).

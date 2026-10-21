@@ -13,9 +13,9 @@ use super::{
 };
 use crate::error::Error;
 use crate::journal::{
-    COUNTER_PARTITION_PREFIX, COUNTER_SORT_KEY, CompactionStore, CompactionWrite,
-    CompactionWritten, Expect, JournalRow, JournalStore, Scope, compaction_pk, parse_row_sk,
-    read_counter, row_sk,
+    COUNTER_OWNER, COUNTER_PARTITION_PREFIX, COUNTER_SORT_KEY, CompactionStore, CompactionWrite,
+    CompactionWritten, Expect, JournalCompactionStore, JournalRow, JournalStore, Scope,
+    compaction_pk, parse_row_sk, read_counter, row_sk,
 };
 use crate::projection::ViewRow;
 use crate::rebuild::RebuildEpoch;
@@ -207,7 +207,9 @@ impl JournalStore for DynamoRepository {
 
         Ok(rows)
     }
+}
 
+impl JournalCompactionStore for DynamoRepository {
     async fn read_compaction_row(
         &self,
         scope: &Scope,
@@ -261,7 +263,7 @@ impl DynamoRepository {
                 let (condition, value) = condition(expect)?;
                 let values: Vec<_> = value
                     .into_iter()
-                    .map(|value| (":expected", value))
+                    .flat_map(|value| [(":expected", value), (":engine", s(COUNTER_OWNER))])
                     .collect();
 
                 put(table, wire::view_row_item(row)?, condition, &values)
@@ -289,7 +291,9 @@ impl DynamoRepository {
                         condition.unwrap_or("attribute_not_exists(pk) OR attribute_exists(pk)"),
                     );
                 if let Some(value) = value {
-                    check = check.expression_attribute_values(":expected", value);
+                    check = check
+                        .expression_attribute_values(":expected", value)
+                        .expression_attribute_values(":engine", s(COUNTER_OWNER));
                 }
 
                 Ok(TransactWriteItem::builder()

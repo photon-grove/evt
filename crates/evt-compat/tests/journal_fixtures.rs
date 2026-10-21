@@ -13,9 +13,10 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use photon_evt::journal::{
     ALLOCATION_KEY, Allocation, CompactionChunk, CompactionManifest, DEFAULT_MAX_ROW_BYTES,
-    Journal, JournalRepository, JournalStore, LEASE_SORT_KEY, MANIFEST_SORT_KEY, MAX_CHUNK_BYTES,
-    MAX_CHUNK_ROWS, MAX_SCOPE_BYTES, POSITION_WIDTH, Scope, audit_sk, chunk_sk, compact_with_lease,
-    counter_view, encode_allocations, page, replay, row_size, row_view,
+    Journal, JournalCompactionStore, JournalRepository, JournalStore, LEASE_SORT_KEY,
+    MANIFEST_SORT_KEY, MAX_CHUNK_BYTES, MAX_CHUNK_ROWS, MAX_SCOPE_BYTES, POSITION_WIDTH, Scope,
+    audit_sk, chunk_sk, compact_with_lease, counter_view, encode_allocations, page, replay,
+    row_size, row_view,
 };
 use photon_evt::wire::dynamo;
 use photon_evt::{

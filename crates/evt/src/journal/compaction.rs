@@ -28,7 +28,7 @@ use crate::projection::ViewRow;
 use crate::rebuild::{RebuildEpoch, RebuildFence};
 use crate::sha256::sha256_hex;
 
-use super::read::JournalStore;
+use super::read::JournalCompactionStore;
 
 /// The partition-key prefix of a scope's compaction rows (`journal-compaction#<scope>`).
 pub const COMPACTION_PARTITION_PREFIX: &str = "journal-compaction#";
@@ -91,6 +91,29 @@ pub fn compaction_view(scope: &Scope, sk: impl Into<String>, payload: Vec<u8>) -
         COMPACTION_ENTITY_TYPE,
         payload,
     )
+}
+
+/// Checks that a row read from the scope's compaction partition is the engine's: at the key asked
+/// for, owned by [`COUNTER_OWNER`] (`SYSTEM#JOURNAL`, which no stream can be, so no projector can
+/// write it), with the entity type [`COMPACTION_ENTITY_TYPE`]. Anything else is
+/// [`Error::ForeignJournalRow`]: compaction and readers refuse to act on it.
+pub fn check_compaction_row(scope: &Scope, sort_key: &str, row: ViewRow) -> Result<ViewRow, Error> {
+    let pk = compaction_pk(scope);
+
+    if row.pk != pk
+        || row.sk != sort_key
+        || row.entity_id != COUNTER_OWNER
+        || row.entity_type != COMPACTION_ENTITY_TYPE
+    {
+        return Err(Error::ForeignJournalRow {
+            pk: row.pk,
+            sk: row.sk,
+            owner: row.entity_id,
+            entity_type: row.entity_type,
+        });
+    }
+
+    Ok(row)
 }
 
 fn corrupt(scope: &Scope, what: &str, why: impl std::fmt::Display) -> Error {
@@ -451,11 +474,6 @@ impl ChunkBuilder {
         Ok(builder)
     }
 
-    /// The first position the chunk holds.
-    pub(crate) fn from(&self) -> u64 {
-        self.from
-    }
-
     fn through(&self) -> u64 {
         self.from + self.rows.len() as u64 - 1
     }
@@ -625,7 +643,7 @@ pub enum Expect {
     Any,
     /// No row at the key.
     Absent,
-    /// A row whose payload is exactly these bytes.
+    /// An engine-owned row (`SYSTEM#JOURNAL`) whose payload is exactly these bytes.
     Payload(Vec<u8>),
 }
 
@@ -687,7 +705,7 @@ pub enum CompactionWritten {
 /// [`MemRepository`](crate::MemRepository) and the DynamoDB repository with a views table
 /// implement it. Application code uses [`compact`](super::compact) and the lease functions rather
 /// than this primitive.
-pub trait CompactionStore: JournalStore + RebuildFence + FeatureMarker {
+pub trait CompactionStore: JournalCompactionStore + RebuildFence + FeatureMarker {
     /// Applies `writes` atomically to the views table: all of them, or none when one of their
     /// conditions fails ([`CompactionWritten::Refused`]) or, with an `epoch`, when the rebuild
     /// generation is not that epoch's ([`CompactionWritten::EpochChanged`]). Between 1 and
@@ -733,7 +751,9 @@ pub(crate) fn meets(expect: &Expect, row: Option<&ViewRow>) -> bool {
     match expect {
         Expect::Any => true,
         Expect::Absent => row.is_none(),
-        Expect::Payload(payload) => row.is_some_and(|row| row.payload == *payload),
+        Expect::Payload(payload) => {
+            row.is_some_and(|row| row.entity_id == COUNTER_OWNER && row.payload == *payload)
+        }
     }
 }
 
@@ -953,11 +973,51 @@ mod tests {
             .collect();
         assert!(check_compaction_writes(&many).is_err());
 
-        let row = ViewRow::new("p", "s", "o", "t", b"x".to_vec());
+        let row = ViewRow::new("p", "s", COUNTER_OWNER, "t", b"x".to_vec());
         assert!(meets(&Expect::Any, None));
         assert!(meets(&Expect::Absent, None) && !meets(&Expect::Absent, Some(&row)));
         assert!(meets(&Expect::Payload(b"x".to_vec()), Some(&row)));
         assert!(!meets(&Expect::Payload(b"y".to_vec()), Some(&row)));
         assert!(!meets(&Expect::Payload(b"x".to_vec()), None));
+
+        // The same bytes under another owner are not the engine's row.
+        let foreign = ViewRow::new("p", "s", "acct-1", "t", b"x".to_vec());
+        assert!(!meets(&Expect::Payload(b"x".to_vec()), Some(&foreign)));
+
+        // A compaction row is trusted only at its key, engine-owned, with its entity type.
+        let scope = Scope::new("world:7").unwrap();
+        let engine = compaction_view(&scope, MANIFEST_SORT_KEY, b"{}".to_vec());
+        assert!(check_compaction_row(&scope, MANIFEST_SORT_KEY, engine.clone()).is_ok());
+        for (name, bad) in [
+            (
+                "owner",
+                ViewRow {
+                    entity_id: "acct-1".into(),
+                    ..engine.clone()
+                },
+            ),
+            (
+                "type",
+                ViewRow {
+                    entity_type: "ledger".into(),
+                    ..engine.clone()
+                },
+            ),
+            (
+                "key",
+                ViewRow {
+                    sk: LEASE_SORT_KEY.into(),
+                    ..engine.clone()
+                },
+            ),
+        ] {
+            assert!(
+                matches!(
+                    check_compaction_row(&scope, MANIFEST_SORT_KEY, bad),
+                    Err(Error::ForeignJournalRow { .. })
+                ),
+                "{name}"
+            );
+        }
     }
 }

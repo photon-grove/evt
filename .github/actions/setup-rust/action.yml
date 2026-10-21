@@ -32,3 +32,11 @@ runs:
         key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ inputs.cache-key }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-cargo-${{ inputs.cache-key }}-
+
+    # The restored target/ may hold the workspace's own crates built from other sources moments ago
+    # (a run on another ref that saved the cache after this checkout), with artifacts newer than
+    # these files. Cargo's freshness check compares mtimes, so it would reuse them. Touching the
+    # workspace sources makes Cargo rebuild the workspace crates; dependencies stay cached.
+    - name: Invalidate workspace crates in the cache
+      shell: bash
+      run: find crates -type f -exec touch {} +
