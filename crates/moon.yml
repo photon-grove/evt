@@ -32,7 +32,11 @@ tasks:
   test:
     # photon-evt's unit tests include the DynamoDB and PostgreSQL modules, which need their features.
     # evt-compat stays on default features: its drivers tests need live backends.
-    script: cargo test -p photon-evt --all-features && cargo test -p evt-compat
+    # photon-evt-lambda runs without features too, so its default build keeps compiling and passing
+    # without photon-evt's build-wide journal feature.
+    script: >-
+      cargo test -p photon-evt --all-features && cargo test -p evt-compat &&
+      cargo test -p photon-evt-lambda && cargo test -p photon-evt-lambda --all-features
     inputs:
       - '@globs(sources)'
       - '@globs(compat)'

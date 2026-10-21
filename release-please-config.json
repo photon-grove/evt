@@ -29,6 +29,28 @@
           "type": "toml",
           "path": "/Cargo.lock",
           "jsonpath": "$.package[?(@.name.value==='photon-evt')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/crates/evt-lambda/Cargo.toml",
+          "jsonpath": "$.dependencies['photon-evt'].version"
+        }
+      ]
+    },
+    "crates/evt-lambda": {
+      "release-type": "rust",
+      "package-name": "photon-evt-lambda",
+      "initial-version": "0.1.0",
+      "component": "photon-evt-lambda",
+      "include-component-in-tag": true,
+      "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==='photon-evt-lambda')].version"
         }
       ]
     }
