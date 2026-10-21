@@ -159,6 +159,7 @@ jobs:
           msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
           rustup toolchain install "$msrv" --profile minimal
           cargo "+$msrv" check -p photon-evt --features postgres,conformance,journal --locked
+          cargo "+$msrv" check -p photon-evt-lambda --all-features --locked
 
   integration:
     name: DynamoDB integration

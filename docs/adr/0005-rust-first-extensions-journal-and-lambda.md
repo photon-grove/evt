@@ -93,7 +93,10 @@ Rust-first is justified because:
   journal's storage helpers sit behind it like `dynamodb` and `postgres` do today
   ([`crates/evt/README.md`](../../crates/evt/README.md)).
 - **`photon-evt-lambda` is a new crate** in the workspace, released separately (release-please
-  package), depending on the core and the `dynamodb` feature.
+  package), depending on the core. As built (#133) it needs no AWS SDK: stream records are
+  DynamoDB JSON, which the core's `wire::dynamo` codecs already read, so it does not enable the
+  `dynamodb` feature. Its journal wake-ups sit behind its own `journal` feature, off by default,
+  because the core's `journal` feature is build-wide (below).
 - **The Go port has a defined entry point.** When a Go consumer appears, the work is: port from
   spec + Rust-generated fixtures, extend `conformance` and the shared scenario list, and flip the
   Go column in [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md). Until the port

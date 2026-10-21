@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/evt", "crates/evt-compat"]
+members = ["crates/evt", "crates/evt-compat", "crates/evt-lambda"]
 default-members = ["crates/evt"]
 
 [workspace.package]
