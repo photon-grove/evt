@@ -285,6 +285,34 @@ func (p *pagedScan) UpdateItem(
 	return &dynamodb.UpdateItemOutput{}, nil
 }
 
+// The rebuild fence's rows are engine rows, the item a force-release leaves in place of the lock
+// included, so a store left force-released can still be migrated.
+func TestTheRebuildFenceRowsAreEngineRows(t *testing.T) {
+	forceReleased := map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: evt.RebuildLockID}, "sk": n(0),
+		"forceReleased": &types.AttributeValueMemberBOOL{Value: true},
+	}
+
+	client := &pagedScan{pageSize: 2, items: []map[string]types.AttributeValue{
+		tallyItem("a", 1, nil),
+		forceReleased,
+		tallyItem(evt.RebuildGenerationID, 0, map[string]int64{"value": 3}),
+	}}
+
+	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{
+		PageSize: 2, Now: func() time.Time { return time.Unix(tallyNow, 0) },
+	})
+
+	scanned, err := migration.scan(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, scanned.reserved)
+	require.Len(t, scanned.tallies, 1)
+
+	require.True(t, isEngineRow(evt.RebuildLockID, tallyItem(evt.RebuildLockID, 0, map[string]int64{"owner": 1, "leaseExpiresAt": 1})))
+	require.False(t, isEngineRow(evt.RebuildLockID, tallyItem(evt.RebuildLockID, 0, map[string]int64{"owner": 1})))
+	require.False(t, isEngineRow(evt.RebuildLockID, tallyItem(evt.RebuildLockID, 1, nil)))
+}
+
 func TestScanAccumulatesAPartitionSplitAcrossPages(t *testing.T) {
 	// Two partitions interleaved, so every page boundary splits one.
 	client := &pagedScan{pageSize: 2, items: []map[string]types.AttributeValue{

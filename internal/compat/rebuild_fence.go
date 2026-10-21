@@ -133,6 +133,8 @@ var _ dynamo.Client = (*rebuildCaptureDynamo)(nil)
 type rebuildSeed struct {
 	generation *int64
 	forced     bool
+	// released seeds the lock item a force-release leaves in place of the lock.
+	released   bool
 	lockOwner  string
 	lockGen    int64
 	lockExpiry int64
@@ -152,6 +154,14 @@ func (seed rebuildSeed) apply(fake *FakeDynamo) {
 		}
 
 		fake.SeedItem(item)
+	}
+
+	if seed.released {
+		fake.SeedItem(map[string]types.AttributeValue{
+			"pk":            &types.AttributeValueMemberS{Value: evt.RebuildLockID},
+			"sk":            &types.AttributeValueMemberN{Value: "0"},
+			"forceReleased": &types.AttributeValueMemberBOOL{Value: true},
+		})
 	}
 
 	if seed.lockOwner != "" {
@@ -197,13 +207,20 @@ func GenerateRebuildFenceVectors(ctx context.Context) ([]RebuildFenceVector, err
 		return rebuildSeed{generation: int64Ptr(generation), lockOwner: owner, lockGen: generation, lockExpiry: expiry}
 	}
 
+	// forceReleased is the state a force-release leaves: the generation odd and flagged, and the
+	// force-released lock item in place of the lock.
+	forceReleased := func(generation int64) rebuildSeed {
+		return rebuildSeed{generation: int64Ptr(generation), forced: true, released: true}
+	}
+
 	specs := []spec{
 		{name: "state-empty", operation: "state"},
 		{name: "state-held", seed: held(5, "job-a", now+60), operation: "state"},
-		{name: "generation-force-released", seed: rebuildSeed{generation: int64Ptr(7), forced: true}, operation: "generation"},
+		{name: "state-force-released", seed: forceReleased(7), operation: "state"},
+		{name: "generation-force-released", seed: forceReleased(7), operation: "generation"},
 		{name: "acquire-first-rebuild", operation: "begin", owner: "job-a", lease: 60},
 		{name: "acquire-from-even", seed: rebuildSeed{generation: int64Ptr(4)}, operation: "begin", owner: "job-a", lease: 90},
-		{name: "acquire-from-force-released", seed: rebuildSeed{generation: int64Ptr(5), forced: true}, operation: "begin", owner: "job-b", lease: 60},
+		{name: "acquire-from-force-released", seed: forceReleased(5), operation: "begin", owner: "job-b", lease: 60},
 		{name: "takeover-expired", seed: held(5, "job-a", now-1), operation: "begin", owner: "job-b", lease: 60},
 		{name: "held-is-refused", seed: held(5, "job-a", now), operation: "begin", owner: "job-b", lease: 60},
 		{name: "renew", seed: held(5, "job-a", now+10), operation: "renew", owner: "job-a", lease: 120, token: 5},
@@ -218,6 +235,10 @@ func GenerateRebuildFenceVectors(ctx context.Context) ([]RebuildFenceVector, err
 		{name: "release-lost", seed: held(7, "job-b", now+10), operation: "end", owner: "job-a", token: 7},
 		{name: "release-stale-incarnation", seed: held(7, "job-a", now+10), operation: "end", owner: "job-a", token: 5},
 		{name: "force-release", seed: held(5, "job-a", now-100), operation: "forceRelease", owner: "job-a"},
+		{name: "force-release-again", seed: forceReleased(7), operation: "forceRelease", owner: "job-a"},
+		{name: "renew-after-force-release", seed: forceReleased(7), operation: "renew", owner: "job-a", lease: 120, token: 5},
+		{name: "release-after-force-release", seed: forceReleased(7), operation: "end", owner: "job-a", token: 5},
+		{name: "guarded-views-after-force-release", seed: forceReleased(7), operation: "writeViews", owner: "job-a", token: 5},
 		{name: "guarded-views", seed: held(5, "job-a", now+10), operation: "writeViews", owner: "job-a", token: 5},
 		{name: "guarded-views-lease-lost", seed: held(7, "job-b", now+10), operation: "writeViews", owner: "job-a", token: 7},
 		{name: "guarded-views-stale-incarnation", seed: held(7, "job-a", now+10), operation: "writeViews", owner: "job-a", token: 5},

@@ -706,6 +706,17 @@ pub trait Repository: Send + Sync {
         false
     }
 
+    /// Reports whether the repository applies a view put's engine-only expected-payload condition
+    /// (the journal's counter compare-and-set): the row must exist, be the owner's, and hold
+    /// exactly those bytes, or the commit fails with [`Error::ProjectorOperation`]. The default is
+    /// `false`, and the journal refuses to commit through a repository that does not opt in
+    /// ([`Error::ExpectedPayloadUnsupported`]), so a backend that ignored the condition cannot
+    /// write an unconditional counter. The in-memory and DynamoDB repositories return `true`;
+    /// PostgreSQL does not. A wrapper must forward it.
+    fn applies_expected_payload(&self) -> bool {
+        false
+    }
+
     /// Durably adds the entity types to the feature manifest's `historyDependent` set, so
     /// compaction refuses them in every process; types already declared are left alone and nothing
     /// is written. The default refuses with [`Error::HistoryDeclarationUnsupported`]. The
@@ -855,6 +866,10 @@ macro_rules! forward_repository {
 
             fn writes_views(&self) -> bool {
                 (**self).writes_views()
+            }
+
+            fn applies_expected_payload(&self) -> bool {
+                (**self).applies_expected_payload()
             }
 
             fn declare_history_dependent(

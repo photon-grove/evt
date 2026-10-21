@@ -759,11 +759,12 @@ type tableScan struct {
 // scan collects those too (the same rule as evt-doctor's reserved-namespace check).
 func (m *HeadsMigration) scan(ctx context.Context) (tableScan, error) {
 	// version, owner, leaseExpiresAt, value, and status are DynamoDB reserved words, and they are the
-	// attributes that tell an engine row from a user stream.
+	// attributes that tell an engine row from a user stream, with forceReleased, which marks the
+	// lock item a force-release leaves in place of the lock.
 	input := dynamodb.ScanInput{
 		TableName:            &m.repo.EventsTable,
 		ConsistentRead:       aws.Bool(true),
-		ProjectionExpression: aws.String("pk, sk, eventSeq, head, #ttl, #ver, #own, #lease, #val, #status"),
+		ProjectionExpression: aws.String("pk, sk, eventSeq, head, #ttl, #ver, #own, #lease, #val, #status, forceReleased"),
 		ExpressionAttributeNames: map[string]string{
 			streamheads.TTLPlaceholder: streamheads.TTLName,
 			"#ver":                     "version",
@@ -845,7 +846,8 @@ func isEngineRow(id evt.EntityID, item map[string]types.AttributeValue) bool {
 	case string(id) == evt.SystemNamespacePrefix+"FEATURES":
 		return sk == 0 && has("version")
 	case string(id) == evt.SystemNamespacePrefix+"REBUILD":
-		return sk == 0 && has("owner") && has("leaseExpiresAt")
+		// A held lock, or the item a force-release leaves in its place.
+		return sk == 0 && (has("owner") && has("leaseExpiresAt") || has("forceReleased"))
 	case string(id) == evt.SystemNamespacePrefix+"REBUILD#GENERATION":
 		return sk == 0 && has("value")
 	case strings.HasPrefix(string(id), evt.CommandOutcomeNamespacePrefix):

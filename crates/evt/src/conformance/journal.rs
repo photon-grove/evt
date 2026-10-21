@@ -14,7 +14,7 @@ use crate::journal::{
     ALLOCATION_KEY, Gap, Journal, JournalRepository, JournalStore, Scope, allocations,
     counter_view, encode_allocations, rebuild_with_lock, replay, row_size, row_sk,
 };
-use crate::projection::{ViewRow, group_commits, replay_views};
+use crate::projection::{ProjectedView, ViewOperation, ViewRow, group_commits, replay_views};
 use crate::rebuild::RebuildFence;
 use crate::repository::TransactionCommit;
 use crate::views::ViewRepository;
@@ -81,7 +81,7 @@ where
         Box::pin(stale_counter_reads_fail_on_the_counter(repo, views)).await,
     );
     record(
-        "a repository that does not write views is refused before anything is declared",
+        "a repository that does not write views, or ignores the counter's condition, is refused",
         Box::pin(views_unsupported_is_refused(repo)).await,
     );
     record(
@@ -107,6 +107,13 @@ where
     record(
         "a rebuild under the lock refuses live commits and reproduces the live journal",
         Box::pin(rebuild_under_the_lock(repo, views)).await,
+    );
+    record(
+        "a failed rebuild that wiped the counters keeps journaled commits refused after a force-release",
+        Box::pin(force_released_rebuild_refuses_journaled_commits(
+            repo, views,
+        ))
+        .await,
     );
     record(
         "replaying stored events in any order reproduces the live rows and counters",
@@ -565,6 +572,7 @@ pub(super) struct Lagging<R> {
     transient_commits: Arc<AtomicUsize>,
     backoffs: Arc<AtomicUsize>,
     writes_views: bool,
+    applies_expected_payload: bool,
 }
 
 impl<R> Lagging<R> {
@@ -576,6 +584,7 @@ impl<R> Lagging<R> {
             transient_commits: Arc::new(AtomicUsize::new(0)),
             backoffs: Arc::new(AtomicUsize::new(0)),
             writes_views: true,
+            applies_expected_payload: true,
         }
     }
 
@@ -583,6 +592,14 @@ impl<R> Lagging<R> {
     /// before they existed does.
     fn without_views(mut self) -> Self {
         self.writes_views = false;
+
+        self
+    }
+
+    /// Reports that the repository writes views but ignores the expected-payload condition, as a
+    /// third-party backend written before it existed does.
+    fn ignoring_expected_payload(mut self) -> Self {
+        self.applies_expected_payload = false;
 
         self
     }
@@ -688,6 +705,10 @@ impl<R: Repository> Repository for Lagging<R> {
 
     fn writes_views(&self) -> bool {
         self.writes_views && self.inner.writes_views()
+    }
+
+    fn applies_expected_payload(&self) -> bool {
+        self.applies_expected_payload && self.inner.applies_expected_payload()
     }
 
     fn declare_history_dependent(
@@ -1015,7 +1036,9 @@ where
     // compare-and-set refuses the stale attempt, which then reads the counters again.
     for scope in [&world, &place] {
         for position in [3, 4] {
-            views.delete_view(&scope.row_pk(), &row_sk(position)).await?;
+            views
+                .delete_view(&scope.row_pk(), &row_sk(position))
+                .await?;
         }
     }
     let lagging = Lagging::new(repo.clone(), 2).stale_at(2);
@@ -1434,6 +1457,116 @@ where
     Ok(())
 }
 
+/// A rebuild wipes the journal's rows and counters, writes its first batch, and fails; an operator
+/// force-releases it. A journaled commit would now allocate positions from the wiped counters and
+/// stamp duplicates of positions earlier events hold into its immutable metadata, so it is refused
+/// with the error a held lock gives, and writes nothing. A rebuild that runs to its end restores
+/// the counters, and the same commit then continues each scope at the next position.
+async fn force_released_rebuild_refuses_journaled_commits<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let stream = Stream::new(&ns, "a", "ledger");
+    let (world, place) = (scope(&ns, "world"), scope(&ns, "place-a"));
+
+    stream
+        .commit(&journaled, stream.events(1..=3), None)
+        .await?;
+    let events = repo.events(&stream.id).await?;
+    let state = replay(&events)?;
+
+    // The rebuild wipes the derived state, writes its first batch, and fails without ending.
+    let lease = repo.begin_rebuild(&format!("{ns}-failed"), LEASE).await?;
+    for scope in [&world, &place] {
+        for row in views.list_views_by_pk(&scope.row_pk()).await? {
+            views.delete_view(&row.pk, &row.sk).await?;
+        }
+        views.delete_view(&scope.counter_pk(), "COUNTER").await?;
+    }
+    let first = state.views().remove(0);
+    repo.write_rebuild_views(
+        &lease,
+        &[ProjectedView::new(
+            "journal-rebuild",
+            0,
+            0,
+            ViewOperation::put(
+                first.pk,
+                first.sk,
+                first.entity_id,
+                first.entity_type,
+                first.payload,
+            ),
+        )],
+    )
+    .await?;
+    ensure_eq!(
+        journaled.high_watermark(&world).await?,
+        0,
+        "the failed rebuild left the counter wiped"
+    );
+
+    let forced = repo.force_release_rebuild(&lease.owner).await?;
+    ensure!(forced.force_released, "{forced:?}");
+
+    // The journaled commit is refused, and writes no event and no allocation.
+    expect_err(
+        stream.commit(&journaled, stream.events(4..=4), None).await,
+        "a journaled commit after the force-release",
+        |err| matches!(err, Error::RebuildInProgress),
+    )?;
+    ensure_eq!(
+        repo.events(&stream.id).await?.len(),
+        3,
+        "the refused commit wrote no event"
+    );
+    ensure_eq!(
+        journaled.high_watermark(&world).await?,
+        0,
+        "the refused commit allocated nothing"
+    );
+    expect_err(
+        crate::journal::page_at_epoch(repo, &world, 0, 10).await,
+        "an epoch-checked page after the force-release",
+        |err| {
+            matches!(
+                err,
+                Error::RebuildUnavailable {
+                    force_released: true,
+                    ..
+                }
+            )
+        },
+    )?;
+
+    // A rebuild that runs to its end restores the counters and settles the generation; the commit
+    // then continues each scope at the next position.
+    rebuild_with_lock(repo, &events, LEASE).await?;
+    stream
+        .commit(&journaled, stream.events(4..=4), None)
+        .await?;
+    for scope in [&world, &place] {
+        ensure_eq!(
+            journaled.high_watermark(scope).await?,
+            4,
+            "the commit continued {scope} after the rebuilt counter"
+        );
+    }
+    let page = crate::journal::page_at_epoch(repo, &world, 0, 10).await?;
+    ensure_eq!(
+        positions(&page),
+        vec![1, 2, 3, 4],
+        "no position is held twice"
+    );
+    ensure!(page.is_caught_up(), "{page:?}");
+
+    Ok(())
+}
+
 async fn views_unsupported_is_refused<R>(repo: &R) -> CaseResult
 where
     R: Repository + FeatureMarker + JournalStore + Clone,
@@ -1464,6 +1597,23 @@ where
     // Events of a type the journal does not cover are not its concern.
     let other = Stream::new(&ns, "x", "other");
     other.commit(&dropping, other.events(1..=1), None).await?;
+
+    // A repository that writes views but does not apply the counter's compare-and-set would write
+    // the counter unconditionally: refused the same way, before anything is planned or declared.
+    let unconditional = JournalRepository::new(
+        Lagging::new(repo.clone(), 0).ignoring_expected_payload(),
+        journal(&ns),
+    );
+    let next = Stream::new(&ns, "b", "ledger");
+    expect_err(
+        next.commit(&unconditional, next.events(1..=1), None).await,
+        "a repository that ignores the expected-payload condition",
+        |err| matches!(err, Error::ExpectedPayloadUnsupported { .. }),
+    )?;
+    ensure!(
+        repo.events(&next.id).await?.is_empty(),
+        "the refused commit wrote nothing"
+    );
 
     Ok(())
 }

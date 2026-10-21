@@ -64,7 +64,8 @@ lockstep with the Go types that read and write it:
   rebuild that holds it, and the generation counts `value`, odd while a rebuild is in progress,
   with a `force_released` flag. Every commit takes the shared advisory lock
   `pg_advisory_xact_lock_shared(1702261761, hashtext('evt_events:rebuild'))` and asserts the lock
-  row is absent, an expired row included, failing with `*evt.RebuildInProgressError`; the lifecycle
+  row is absent, an expired row included, and the generation even (a force-release leaves it odd
+  until a rebuild ends), failing with `*evt.RebuildInProgressError`; the lifecycle
   (`Repository.RebuildFence()`: `Begin`, `Renew`, `End`, `ForceRelease`, `WriteViews`) takes the same
   advisory lock exclusively for its short transactions, so no acquire or release can slip between a
   commit's assertion and its `COMMIT`. A guarded view write selects the lock row `FOR UPDATE`

@@ -116,9 +116,10 @@ func (repo Repository) Commit(
 		return err
 	}
 
-	// The rebuild-lock check (C10): any lock row, including one whose lease expired, refuses the
-	// commit, ahead of the outcome row and every stream check (storage spec, Writes).
-	if repo.features.rebuild.lock != nil {
+	// The rebuild-lock check (C10): an unsettled generation — any lock, including one whose lease
+	// expired, or a force-release no rebuild has finished since — refuses the commit, ahead of the
+	// outcome row and every stream check (storage spec, Writes).
+	if repo.features.rebuild.unsettled() {
 		return &evt.RebuildInProgressError{}
 	}
 

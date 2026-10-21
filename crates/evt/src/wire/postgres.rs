@@ -279,7 +279,7 @@ pub fn features_lock_key(events_table: &str) -> String {
 
 /// The advisory-lock key of an events table's rebuild fence (C10): commits take
 /// [`FEATURES_LOCK_SHARED`]'s statement with it (shared, held to `COMMIT`) before they assert the
-/// lock row is absent, and the lifecycle transactions take [`FEATURES_LOCK_EXCLUSIVE`]'s, so no
+/// generation is settled (no lock row, an even generation), and the lifecycle transactions take [`FEATURES_LOCK_EXCLUSIVE`]'s, so no
 /// acquire or release slips between a commit's assertion and its `COMMIT`. Like the feature key, it
 /// derives from the configured events table name.
 pub fn rebuild_lock_key(events_table: &str) -> String {

@@ -31,8 +31,8 @@ use crate::repository::{Commit, ReadFence, Repository, TransactionCommit};
 use crate::wire::postgres::{
     DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, FEATURES_LOCK_EXCLUSIVE,
     FEATURES_LOCK_SHARED, OutcomeRow, SnapshotRow, check_table_names, features_lock_key,
-    features_table, insert_outcome_sql, outcomes_table, rebuild_lock_key, rebuild_lock_table,
-    schema_ddl, select_outcome_sql, stream_heads_table,
+    features_table, insert_outcome_sql, outcomes_table, rebuild_generation_table, rebuild_lock_key,
+    rebuild_lock_table, schema_ddl, select_outcome_sql, stream_heads_table,
 };
 
 /// Turns one commit-wide view operation (v0.9, C7) into the statement that writes it. evt defines
@@ -692,9 +692,11 @@ impl PostgresRepository {
 
 impl PostgresRepository {
     /// The commit-time rebuild-lock check (C10): after taking the rebuild fence's shared advisory
-    /// lock, held to `COMMIT`, it asserts the lock row is absent, an expired row included. A schema
-    /// that predates the fence has no lock relation, and nobody can have taken the lock: the
-    /// assertion passes, and the catalog probe stops once the relation has been seen.
+    /// lock, held to `COMMIT`, it asserts the generation is settled: the lock row is absent, an
+    /// expired row included, and the generation is even, so a force-release no rebuild has
+    /// finished since refuses the commit too. A schema that predates the fence has no lock
+    /// relation, and nobody can have taken the lock: the assertion passes, and the catalog probe
+    /// stops once the relation has been seen.
     async fn assert_no_rebuild_lock(
         &self,
         tx: &deadpool_postgres::Transaction<'_>,
@@ -720,11 +722,21 @@ impl PostgresRepository {
             self.rebuild_ready.store(true, Ordering::Release);
         }
 
-        let held = tx
-            .query_opt(&format!("SELECT 1 FROM {table} WHERE id = 0"), &[])
+        // A lock row, an expired one included, or an odd generation (a force-release no rebuild
+        // has finished since) refuses the commit. The schema DDL creates the generation relation
+        // with the lock relation, so seeing one is seeing both.
+        let generation = rebuild_generation_table(&self.events_table);
+        let held: bool = tx
+            .query_one(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = 0) \
+                     OR EXISTS (SELECT 1 FROM {generation} WHERE id = 0 AND value % 2 <> 0)"
+                ),
+                &[],
+            )
             .await
             .map_err(statement_error)?
-            .is_some();
+            .get(0);
         if held {
             return Err(Error::RebuildInProgress);
         }
@@ -923,8 +935,9 @@ impl PostgresRepository {
         // this transaction, not this instance's configuration.
         check_retention(manifest.as_ref())?;
 
-        // The rebuild-lock assertion (C10): any lock row, an expired one included, refuses the
-        // commit before the outcome row and every stream is looked at.
+        // The rebuild-lock assertion (C10): an unsettled generation — any lock row, an expired one
+        // included, or a force-release no rebuild has finished since — refuses the commit before
+        // the outcome row and every stream is looked at.
         self.assert_no_rebuild_lock(&tx).await?;
 
         // A recorded outcome outranks every stream failure, as the outcome put does on DynamoDB.

@@ -107,12 +107,20 @@ pub struct ViewOperation {
     /// The projector's own error for the case where the condition fails. The commit's
     /// [`ProjectorOperationError`] reports it as its [`source`](StdError::source).
     pub conflict: Option<Arc<dyn StdError + Send + Sync + 'static>>,
-    /// An engine-only condition on a put (the journal's counter, ADR 0005 X2): the row must exist,
-    /// be the owner's, and hold exactly these payload bytes. Projectors cannot set it, and it is
-    /// `None` on every operation they emit. A repository that writes the journal must apply it in
-    /// the commit (DynamoDB: `entityID = :owner AND payload = :expected`); one that cannot refuses
-    /// the operation with [`Error::InvalidViewOperation`].
-    pub expected_payload: Option<Vec<u8>>,
+    /// An engine-only condition on a put (the journal's counter, ADR 0005): the row must exist,
+    /// be the owner's, and hold exactly these payload bytes. It is private to the crate, so a
+    /// projector cannot set it; only the journal does. A repository that writes the journal must
+    /// apply it in the commit (DynamoDB: `entityID = :owner AND payload = :expected`) and say so
+    /// ([`Repository::applies_expected_payload`](crate::Repository::applies_expected_payload));
+    /// PostgreSQL refuses the operation with [`Error::InvalidViewOperation`].
+    ///
+    /// ```compile_fail,E0616
+    /// use photon_evt::ViewOperation;
+    ///
+    /// let mut op = ViewOperation::put("pk", "sk", "owner", "type", "{}");
+    /// op.expected_payload = Some(b"{}".to_vec());
+    /// ```
+    pub(crate) expected_payload: Option<Vec<u8>>,
 }
 
 impl ViewOperation {

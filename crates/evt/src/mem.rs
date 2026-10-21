@@ -283,11 +283,12 @@ impl MemRepository {
         // Fences are refused for entity types durably declared with retention.
         check_retention(stored_manifest.as_ref())?;
 
-        // The rebuild-lock check (C10), second only to the marker: any lock, an expired one
-        // included, refuses the commit before the outcome row and every stream is looked at. The
-        // guard is held through the write, so no rebuild can begin between the check and it.
+        // The rebuild-lock check (C10), second only to the marker: an unsettled generation — any
+        // lock, an expired one included, or a force-release no rebuild has finished since —
+        // refuses the commit before the outcome row and every stream is looked at. The guard is
+        // held through the write, so no rebuild can begin between the check and it.
         let rebuild = self.rebuild_lock();
-        if rebuild.lock.is_some() {
+        if rebuild.lock.is_some() || !rebuild.generation.is_settled() {
             return Err(Error::RebuildInProgress);
         }
 
@@ -459,6 +460,10 @@ impl Repository for MemRepository {
     type Operation = Infallible;
 
     fn writes_views(&self) -> bool {
+        true
+    }
+
+    fn applies_expected_payload(&self) -> bool {
         true
     }
 

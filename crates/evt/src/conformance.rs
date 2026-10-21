@@ -2580,6 +2580,10 @@ impl<R: Repository> Repository for Interfering<'_, R> {
         self.inner.writes_views()
     }
 
+    fn applies_expected_payload(&self) -> bool {
+        self.inner.applies_expected_payload()
+    }
+
     fn declare_history_dependent(
         &self,
         types: &[EntityType],
@@ -3806,6 +3810,10 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
 
     fn writes_views(&self) -> bool {
         self.inner.writes_views()
+    }
+
+    fn applies_expected_payload(&self) -> bool {
+        self.inner.applies_expected_payload()
     }
 
     fn declare_history_dependent(
@@ -5603,6 +5611,10 @@ impl<R: Repository> Repository for Meddling<'_, R> {
 
     fn writes_views(&self) -> bool {
         self.inner.writes_views()
+    }
+
+    fn applies_expected_payload(&self) -> bool {
+        self.inner.applies_expected_payload()
     }
 
     fn declare_history_dependent(
