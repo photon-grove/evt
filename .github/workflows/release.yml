@@ -21,6 +21,8 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
       crate_release_created: ${{ steps.release.outputs['crates/evt--release_created'] }}
       crate_tag_name: ${{ steps.release.outputs['crates/evt--tag_name'] }}
+      lambda_release_created: ${{ steps.release.outputs['crates/evt-lambda--release_created'] }}
+      lambda_tag_name: ${{ steps.release.outputs['crates/evt-lambda--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
@@ -90,3 +92,45 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
         run: cargo publish -p photon-evt --locked
+
+  # Publishes photon-evt-lambda when release-please tags it (photon-evt-lambda-vX.Y.Z), after
+  # photon-evt when both release together: its photon-evt requirement is the version just released.
+  # The first release needs the CARGO_REGISTRY_TOKEN secret too, as for photon-evt.
+  publish-lambda-crate:
+    needs: [release-please, publish-crate]
+    if: >-
+      ${{ always() && needs.release-please.outputs.lambda_release_created == 'true' &&
+      (needs.publish-crate.result == 'success' || needs.publish-crate.result == 'skipped') }}
+    runs-on: ubuntu-24.04-arm
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.lambda_tag_name }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: publish
+
+      - name: Check for a bootstrap token
+        id: bootstrap
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "token=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: steps.bootstrap.outputs.token != 'true'
+
+      - name: Publish photon-evt-lambda
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+        run: cargo publish -p photon-evt-lambda --locked
