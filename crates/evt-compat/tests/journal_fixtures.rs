@@ -9,9 +9,14 @@
 //! ```
 
 use evt_compat::scenario::compat_dir;
+use std::time::{Duration, UNIX_EPOCH};
+
 use photon_evt::journal::{
-    ALLOCATION_KEY, Allocation, DEFAULT_MAX_ROW_BYTES, Journal, JournalRepository, MAX_SCOPE_BYTES,
-    POSITION_WIDTH, Scope, counter_view, encode_allocations, replay, row_size, row_view,
+    ALLOCATION_KEY, Allocation, CompactionChunk, CompactionManifest, DEFAULT_MAX_ROW_BYTES,
+    Journal, JournalCompactionStore, JournalRepository, JournalStore, LEASE_SORT_KEY,
+    MANIFEST_SORT_KEY, MAX_CHUNK_BYTES, MAX_CHUNK_ROWS, MAX_SCOPE_BYTES, POSITION_WIDTH, Scope,
+    audit_sk, chunk_sk, compact_with_lease, counter_view, encode_allocations, page, replay,
+    row_size, row_view,
 };
 use photon_evt::wire::dynamo;
 use photon_evt::{
@@ -21,6 +26,9 @@ use photon_evt::{
 use serde_json::{Value, json};
 
 const COMMIT_ID: &str = "01JDXK7Q3W9B5N2M8P4R6TAVHY";
+
+/// The clock the fixture's compaction runs at, in Unix seconds.
+const FIXTURE_CLOCK: u64 = 1_792_000_000;
 
 fn scope(name: &str) -> Scope {
     Scope::new(name).unwrap()
@@ -49,6 +57,17 @@ fn event(entity_id: &str, sequence: i64, payload: &str) -> SerializedEvent {
             metadata
         },
     }
+}
+
+/// The DynamoDB item of a compaction row.
+async fn compaction_item(memory: &MemRepository, scope: &Scope, sort_key: &str) -> Value {
+    item(
+        &memory
+            .read_compaction_row(scope, sort_key)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
 }
 
 /// Every vector of the fixture, computed from the implementation.
@@ -104,7 +123,9 @@ async fn generate() -> Value {
 
     // A real commit through the journal: two events of one stream, one of another, into a world
     // scope and a place scope. The stored events, rows, and counters are what the journal wrote.
-    let memory = MemRepository::new();
+    // A fixed clock, so the lease expiry and the audit's completion time are stable.
+    let memory =
+        MemRepository::new().with_clock(|| UNIX_EPOCH + Duration::from_secs(FIXTURE_CLOCK));
     let journal = Journal::new(["account"], |event: &SerializedEvent| {
         let place = if event.entity_id.as_str() == "acct-1" {
             "place:3"
@@ -167,6 +188,53 @@ async fn generate() -> Value {
         }
     }
 
+    // Compaction (X2): world:7 through position 2, under a 60-second lease taken and released.
+    let world = scope("world:7");
+    let report = compact_with_lease(&memory, &world, 2, "compactor-1", Duration::from_secs(60))
+        .await
+        .unwrap();
+    let gone = match page(&memory, &world, 1, 10).await {
+        Err(photon_evt::Error::JournalGone(gone)) => gone,
+        other => panic!("a page below the floor: {other:?}"),
+    };
+    let compaction = json!({
+        "note": "world:7 compacted through 2 by compactor-1, then read after 1",
+        "limits": { "maxChunkRows": MAX_CHUNK_ROWS, "maxChunkBytes": MAX_CHUNK_BYTES },
+        "keys": {
+            "pk": photon_evt::journal::compaction_pk(&world),
+            "lease": LEASE_SORT_KEY,
+            "manifest": MANIFEST_SORT_KEY,
+            "chunk0": chunk_sk(0),
+            "audit2": audit_sk(2),
+        },
+        "manifestDigest": report.digest,
+        "lease": compaction_item(&memory, &world, LEASE_SORT_KEY).await,
+        "manifest": compaction_item(&memory, &world, MANIFEST_SORT_KEY).await,
+        "chunks": [compaction_item(&memory, &world, &chunk_sk(0)).await],
+        "audit": compaction_item(&memory, &world, &audit_sk(2)).await,
+        "remainingRows": memory
+            .read_rows(&world, 0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.position.to_string())
+            .collect::<Vec<_>>(),
+        "gone": {
+            "httpStatus": photon_evt::journal::JournalGone::HTTP_STATUS,
+            "after": gone.after.to_string(),
+            "checkpoint": gone.checkpoint.to_string(),
+            "chunkCount": gone.chunk_count,
+            "digest": gone.digest,
+            "resumeAfter": gone.resume_after().to_string(),
+        },
+    });
+    let mut compacted = FeatureManifest::default();
+    compacted.declare_stream_heads();
+    compacted.declare_journal();
+    compacted
+        .features
+        .insert(photon_evt::JOURNAL_COMPACTION_FEATURE.into(), 1);
+
     // The widest-row measure, which the pre-check and the guard share.
     let measured = row_size(&scope("world:7"), 1, &events[0]).unwrap();
 
@@ -196,6 +264,8 @@ async fn generate() -> Value {
             "counters": counters,
             "measuredRowSize": { "scope": "world:7", "position": "1", "event": "acct-1:1", "bytes": measured },
         },
+        "compaction": compaction,
+        "compactionMarker": { "features": compacted.features_json() },
         "marker": {
             "features": manifest.features_json(),
             "historyDependent": manifest.history_dependent_json(),
@@ -272,6 +342,37 @@ async fn the_fixture_events_replay_to_the_fixture_rows() {
         assert_eq!(state.counters[&scope], position);
         assert_eq!(item(&counter_view(&scope, position)), counter["dynamoItem"]);
     }
+
+    // The compaction rows decode: the manifest's digest is its payload's, its chunk digests are
+    // the chunks', and the chunk holds the replayed rows 1..=2 of world:7.
+    let world = scope("world:7");
+    let payload = |item: &Value| item["payload"]["S"].as_str().unwrap().as_bytes().to_vec();
+    let compaction = &stored["compaction"];
+    let manifest = CompactionManifest::decode(&world, &payload(&compaction["manifest"])).unwrap();
+    assert_eq!(
+        manifest.digest(),
+        compaction["manifestDigest"].as_str().unwrap()
+    );
+    assert_eq!(
+        manifest.digest(),
+        compaction["gone"]["digest"].as_str().unwrap()
+    );
+    let chunk_payload = payload(&compaction["chunks"][0]);
+    let chunk = CompactionChunk::decode(&world, &chunk_payload).unwrap();
+    assert_eq!((chunk.from, chunk.through), (1, 2));
+    for row in &chunk.rows {
+        let replayed = &state.rows[&(world.clone(), row.position)];
+        assert_eq!(
+            photon_evt::journal::encode_row(&world, row.position, &row.event).unwrap(),
+            replayed.payload
+        );
+    }
+    let fresh = photon_evt::journal::CompactionManifest {
+        scope: world.clone(),
+        checkpoint: 2,
+        chunks: manifest.chunks.clone(),
+    };
+    assert_eq!(fresh, manifest);
 
     // The row of an event is its stored form: the payload parses back to the stored event.
     let first = row_view(&scope("world:7"), 1, &events[0]).unwrap();

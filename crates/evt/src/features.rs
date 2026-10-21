@@ -47,12 +47,20 @@ pub const JOURNAL_FEATURE: &str = "journal";
 /// cargo feature is enabled.
 pub const JOURNAL_VERSION: i64 = 1;
 
+/// The feature name a table declares before its journal is first compacted (ADR 0005, X2).
+pub const JOURNAL_COMPACTION_FEATURE: &str = "journal-compaction";
+
+/// The stored-format version of [`JOURNAL_COMPACTION_FEATURE`] this build reads and writes when the
+/// `journal` cargo feature is enabled.
+pub const JOURNAL_COMPACTION_VERSION: i64 = 1;
+
 /// The `(name, stored-format version)` pairs this build of the crate models. A writer refuses a
 /// table whose manifest declares anything else. The extensions this spec defines (`journal`,
 /// `journal-compaction`) are Rust-first: this build models `stream-heads`, which every writer here
 /// also *requires* (see [`validate_marker_for_write`]), and, with the `journal` cargo feature,
-/// `journal` at format version 1. A build without the feature refuses a journal table, so a writer
-/// that cannot maintain the journal cannot leave it short.
+/// `journal` and `journal-compaction` at format version 1. A build without the feature refuses a
+/// journal table, so a writer that cannot maintain the journal cannot leave it short, and a build
+/// that predates compaction refuses a compacted one.
 #[cfg(not(feature = "journal"))]
 pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[(STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION)];
 
@@ -60,11 +68,13 @@ pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[(STREAM_HEADS_FEATURE, STREAM_H
 /// table whose manifest declares anything else. The extensions this spec defines (`journal`,
 /// `journal-compaction`) are Rust-first: this build models `stream-heads`, which every writer here
 /// also *requires* (see [`validate_marker_for_write`]), and, with the `journal` cargo feature,
-/// `journal` at format version 1. A build without the feature refuses a journal table, so a writer
-/// that cannot maintain the journal cannot leave it short.
+/// `journal` and `journal-compaction` at format version 1. A build without the feature refuses a
+/// journal table, so a writer that cannot maintain the journal cannot leave it short, and a build
+/// that predates compaction refuses a compacted one.
 #[cfg(feature = "journal")]
 pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[
     (JOURNAL_FEATURE, JOURNAL_VERSION),
+    (JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION),
     (STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION),
 ];
 
@@ -423,11 +433,11 @@ mod tests {
     #[test]
     fn refuses_unsupported_declared_features() {
         let mut manifest = FeatureManifest::default();
-        manifest.features.insert("journal-compaction".into(), 1);
+        manifest.features.insert("journal-compaction".into(), 2);
         assert!(matches!(
             manifest.validate_supported(),
             Err(Error::UnsupportedFeature { feature, version })
-                if feature == "journal-compaction" && version == 1
+                if feature == "journal-compaction" && version == 2
         ));
 
         // The declared version matters, not just the name: this build models stream-heads at
@@ -498,7 +508,7 @@ mod tests {
 
         // An unsupported pair is refused first, whatever else is missing.
         let mut unsupported = FeatureManifest::default();
-        unsupported.features.insert("journal-compaction".into(), 1);
+        unsupported.features.insert("journal-compaction".into(), 2);
         assert!(matches!(
             validate_marker_for_write(Some(&unsupported)),
             Err(Error::UnsupportedFeature { .. })

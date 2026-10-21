@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::*;
 use crate::features::{JOURNAL_FEATURE, JOURNAL_VERSION};
 use crate::journal::{
-    ALLOCATION_KEY, Gap, Journal, JournalRepository, JournalStore, Scope, allocations,
-    counter_view, encode_allocations, rebuild_with_lock, replay, row_size, row_sk,
+    ALLOCATION_KEY, Gap, Journal, JournalCompactionStore, JournalRepository, JournalStore, Scope,
+    allocations, counter_view, encode_allocations, rebuild_with_lock, replay, row_size, row_sk,
 };
 use crate::projection::{ProjectedView, ViewOperation, ViewRow, group_commits, replay_views};
 use crate::rebuild::RebuildFence;
@@ -26,7 +26,7 @@ use crate::views::ViewRepository;
 /// feature manifest and leave them there, so run them on a table you can reset.
 pub async fn journal_cases<R, V>(repo: &R, views: &V)
 where
-    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -157,7 +157,7 @@ fn positions(page: &crate::journal::JournalPage) -> Vec<u64> {
 
 async fn allocates_and_writes<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -301,7 +301,7 @@ where
 
 async fn forged_allocations<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -344,7 +344,7 @@ where
 
 async fn multi_stream_commit<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -400,7 +400,7 @@ where
 
 async fn size_guard<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -564,7 +564,7 @@ fn take(counter: &AtomicUsize) -> bool {
 /// before another writer committed, and whose next commits can fail transiently. It counts
 /// backoffs.
 #[derive(Clone)]
-struct Lagging<R> {
+pub(super) struct Lagging<R> {
     inner: R,
     stale_reads: Arc<AtomicUsize>,
     /// The counter a stale read returns.
@@ -576,7 +576,7 @@ struct Lagging<R> {
 }
 
 impl<R> Lagging<R> {
-    fn new(inner: R, stale_reads: usize) -> Self {
+    pub(super) fn new(inner: R, stale_reads: usize) -> Self {
         Self {
             inner,
             stale_reads: Arc::new(AtomicUsize::new(stale_reads)),
@@ -613,13 +613,13 @@ impl<R> Lagging<R> {
 
     /// A stale counter read returns `counter` instead of 0: a writer that read the counter some
     /// commits ago.
-    fn stale_at(mut self, counter: u64) -> Self {
+    pub(super) fn stale_at(mut self, counter: u64) -> Self {
         self.stale_counter = counter;
 
         self
     }
 
-    fn backoffs(&self) -> usize {
+    pub(super) fn backoffs(&self) -> usize {
         self.backoffs.load(Ordering::SeqCst)
     }
 
@@ -652,6 +652,16 @@ impl<R: JournalStore> JournalStore for Lagging<R> {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<crate::journal::JournalRow>, Error>> + Send {
         self.inner.read_rows(scope, after, limit)
+    }
+}
+
+impl<R: JournalCompactionStore> JournalCompactionStore for Lagging<R> {
+    fn read_compaction_row(
+        &self,
+        scope: &Scope,
+        sort_key: &str,
+    ) -> impl Future<Output = Result<Option<ViewRow>, Error>> + Send {
+        self.inner.read_compaction_row(scope, sort_key)
     }
 }
 
@@ -778,7 +788,7 @@ impl<R: Repository> Repository for Lagging<R> {
 
 async fn contention_is_retried<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -832,7 +842,7 @@ where
 
 async fn contention_is_bounded<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -871,7 +881,7 @@ where
 
 async fn stream_conflicts_are_not_retried<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -924,7 +934,7 @@ where
 
 async fn transient_failures_are_retried<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -965,7 +975,7 @@ where
 
 async fn counter_behind_rows_is_repaired<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -1009,7 +1019,7 @@ where
 
 async fn stale_counter_reads_fail_on_the_counter<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -1023,7 +1033,7 @@ where
     )
     .await?;
 
-    // The rows at 3 and 4 are gone (journal compaction deletes rows), and a writer read both counters
+    // The rows at 3 and 4 are gone (compaction deletes rows, X2), and a writer read both counters
     // at 2 before they were written. Its rows at 3 would be absent: only the counter's
     // compare-and-set refuses the stale attempt, which then reads the counters again.
     for scope in [&world, &place] {
@@ -1054,7 +1064,7 @@ where
 
 async fn refused_commits_declare_nothing<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -1107,7 +1117,7 @@ where
 
 async fn pages_and_gaps<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -1179,7 +1189,7 @@ where
 
 async fn declares_feature_and_history<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -1245,7 +1255,7 @@ where
 
 async fn replay_reproduces_the_journal<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -1355,7 +1365,7 @@ where
 
 async fn rebuild_under_the_lock<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -1456,7 +1466,7 @@ where
 /// the counters, and the same commit then continues each scope at the next position.
 async fn force_released_rebuild_refuses_journaled_commits<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + RebuildFence + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -1561,7 +1571,7 @@ where
 
 async fn views_unsupported_is_refused<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -1612,7 +1622,7 @@ where
 
 async fn invalid_commits_declare_nothing<R>(repo: &R) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
 {
     let ns = namespace();
@@ -1677,7 +1687,7 @@ where
 
 async fn full_pages_show_more_rows<R, V>(repo: &R, views: &V) -> CaseResult
 where
-    R: Repository + FeatureMarker + JournalStore + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {

@@ -115,6 +115,28 @@ pub fn read_counter(scope: &Scope, row: &ViewRow) -> Result<u64, Error> {
     Ok(payload.position)
 }
 
+/// Decodes a journal row's stored payload (as a chunk embeds it), checking it is a row of
+/// `scope`. Its owner is its event's stream.
+pub(crate) fn decode_row_payload(scope: &Scope, payload: &[u8]) -> Result<JournalRow, Error> {
+    let payload: RowIn = json::from_slice(payload).map_err(|err| {
+        Error::InvalidRecord(format!("a compacted journal row of {scope}: {err}"))
+    })?;
+
+    if payload.scope != scope.as_str() || payload.position == 0 {
+        return Err(Error::InvalidRecord(format!(
+            "a compacted journal row of {scope} says {:?} at {}",
+            payload.scope, payload.position
+        )));
+    }
+
+    Ok(JournalRow {
+        scope: scope.clone(),
+        position: payload.position,
+        owner: payload.event.entity_id.clone(),
+        event: payload.event,
+    })
+}
+
 impl JournalRow {
     /// Decodes a stored journal row, checking that its key, owner, and payload agree. A mismatch
     /// is [`Error::InvalidRecord`]: the row is not one this journal wrote.

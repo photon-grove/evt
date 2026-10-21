@@ -10,7 +10,7 @@ use futures_core::Stream;
 
 use super::config::{Journal, allocate};
 use super::projector::{JournalProjector, PROJECTOR_NAME, PositionTaken};
-use super::read::{self, JournalPage, JournalStore};
+use super::read::{self, JournalCompactionStore, JournalPage, JournalStore};
 use super::row::{JournalRow, counter_payload};
 use super::scope::{COUNTER_ENTITY_TYPE, COUNTER_OWNER, COUNTER_SORT_KEY, Scope, set_allocations};
 use crate::enumerate::{EventBatch, EventLog, StreamFilter};
@@ -96,7 +96,9 @@ impl<R: JournalStore> JournalRepository<R> {
     pub async fn high_watermark(&self, scope: &Scope) -> Result<u64, Error> {
         read::high_watermark(&self.inner, scope).await
     }
+}
 
+impl<R: JournalCompactionStore> JournalRepository<R> {
     /// A page of the scope's rows after `after`. See [`page`](super::page).
     pub async fn page(
         &self,
@@ -131,6 +133,16 @@ impl<R: JournalStore> JournalStore for JournalRepository<R> {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<JournalRow>, Error>> + Send {
         self.inner.read_rows(scope, after, limit)
+    }
+}
+
+impl<R: JournalCompactionStore> JournalCompactionStore for JournalRepository<R> {
+    fn read_compaction_row(
+        &self,
+        scope: &Scope,
+        sort_key: &str,
+    ) -> impl Future<Output = Result<Option<crate::projection::ViewRow>, Error>> + Send {
+        self.inner.read_compaction_row(scope, sort_key)
     }
 }
 
@@ -236,7 +248,7 @@ impl<Op: Clone + Send> Staged for TransactionCommit<Op> {
 
 impl<R> JournalRepository<R>
 where
-    R: Repository + FeatureMarker + JournalStore,
+    R: Repository + FeatureMarker + JournalCompactionStore,
 {
     /// Declares the `journal` feature and the journaled entity types history-dependent, once per
     /// repository (clones share the flag). Nothing is written if the marker already declares them.
@@ -309,10 +321,12 @@ where
     /// lowered counter) allocates from that row's position instead, and the commit writes the
     /// counter back.
     ///
-    /// The commit's counter put is conditioned on the stored counter it read, so a writer whose
-    /// read went stale fails on the counter even when the rows that would have refused it are
-    /// gone (deleted rows; journal compaction, X2, deletes them by design) instead of
-    /// reallocating a position.
+    /// A compacted scope's rows below its floor are gone, so neither a missing counter nor the
+    /// highest row can show positions a compaction deleted. A counter that reads 0 (a new scope,
+    /// or a lost counter), and every counter being repaired, allocates from the scope's compaction
+    /// floor at least. The commit's counter put is conditioned on the stored counter it read, so
+    /// a writer whose read went stale (another commit, then a compaction, deleted the rows that
+    /// would have refused it) fails instead of reallocating a position.
     async fn read_counters(&self, scopes: &[Scope], repair: bool) -> Result<Counters, Error> {
         let values = self.inner.read_counters(scopes).await?;
         let mut counters = Counters::default();
@@ -322,6 +336,10 @@ where
 
             if repair {
                 base = base.max(self.inner.read_last_position(scope).await?);
+            }
+
+            if repair || base == 0 {
+                base = base.max(super::compact::read_floor(&self.inner, scope).await?);
             }
 
             counters.stored.insert(scope.clone(), stored);
@@ -570,7 +588,7 @@ fn taken(error: &Error) -> bool {
 
 impl<R> Repository for JournalRepository<R>
 where
-    R: Repository + FeatureMarker + JournalStore,
+    R: Repository + FeatureMarker + JournalCompactionStore,
     R::Operation: Clone,
 {
     type Operation = R::Operation;

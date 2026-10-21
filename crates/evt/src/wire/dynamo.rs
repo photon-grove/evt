@@ -229,9 +229,21 @@ pub const REBUILD_GUARD_CONDITION: &str =
 /// The placeholder an expected-payload condition binds.
 pub const EXPECTED_PAYLOAD_PLACEHOLDER: &str = ":expected";
 
-/// The condition of a view put that expects the row's exact payload (the journal's counter): the
+/// The condition of a view put that expects the row's exact payload (the journal's counter, X2): the
 /// row exists, is the owner's, and holds the bytes the writer read.
 pub const VIEW_EXPECTED_PAYLOAD_CONDITION: &str = "entityID = :owner AND payload = :expected";
+
+/// The rebuild-epoch check of a journal compaction write (X2), for a settled epoch above 0: the
+/// generation item still holds it.
+pub const COMPACTION_EPOCH_CONDITION: &str = "#value = :epoch";
+
+/// The rebuild-epoch check of a journal compaction write for epoch 0: no rebuild ever ran, so the
+/// generation item does not exist yet.
+pub const COMPACTION_EPOCH_ZERO_CONDITION: &str = "attribute_not_exists(#value)";
+
+/// The condition of a journal compaction write that expects a row's exact payload (its lease or
+/// manifest), owned by the engine (`:engine` binds `SYSTEM#JOURNAL`).
+pub const COMPACTION_PAYLOAD_CONDITION: &str = "entityID = :engine AND payload = :expected";
 
 /// A DynamoDB attribute value. Serializes as DynamoDB JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
