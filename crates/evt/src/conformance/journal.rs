@@ -77,7 +77,11 @@ where
         Box::pin(counter_behind_rows_is_repaired(repo, views)).await,
     );
     record(
-        "a repository that does not write views is refused before anything is declared",
+        "a writer whose counter read went stale fails on the counter even where its rows are gone",
+        Box::pin(stale_counter_reads_fail_on_the_counter(repo, views)).await,
+    );
+    record(
+        "a repository that does not write views, or ignores the counter's condition, is refused",
         Box::pin(views_unsupported_is_refused(repo)).await,
     );
     record(
@@ -563,9 +567,12 @@ fn take(counter: &AtomicUsize) -> bool {
 struct Lagging<R> {
     inner: R,
     stale_reads: Arc<AtomicUsize>,
+    /// The counter a stale read returns.
+    stale_counter: u64,
     transient_commits: Arc<AtomicUsize>,
     backoffs: Arc<AtomicUsize>,
     writes_views: bool,
+    applies_expected_payload: bool,
 }
 
 impl<R> Lagging<R> {
@@ -573,9 +580,11 @@ impl<R> Lagging<R> {
         Self {
             inner,
             stale_reads: Arc::new(AtomicUsize::new(stale_reads)),
+            stale_counter: 0,
             transient_commits: Arc::new(AtomicUsize::new(0)),
             backoffs: Arc::new(AtomicUsize::new(0)),
             writes_views: true,
+            applies_expected_payload: true,
         }
     }
 
@@ -587,9 +596,25 @@ impl<R> Lagging<R> {
         self
     }
 
+    /// Reports that the repository writes views but ignores the expected-payload condition, as a
+    /// third-party backend written before it existed does.
+    fn ignoring_expected_payload(mut self) -> Self {
+        self.applies_expected_payload = false;
+
+        self
+    }
+
     /// The next `commits` commits fail with a transient error without being applied.
     fn failing(self, commits: usize) -> Self {
         self.transient_commits.store(commits, Ordering::SeqCst);
+
+        self
+    }
+
+    /// A stale counter read returns `counter` instead of 0: a writer that read the counter some
+    /// commits ago.
+    fn stale_at(mut self, counter: u64) -> Self {
+        self.stale_counter = counter;
 
         self
     }
@@ -606,7 +631,7 @@ impl<R> Lagging<R> {
 impl<R: JournalStore> JournalStore for Lagging<R> {
     async fn read_counter(&self, scope: &Scope) -> Result<u64, Error> {
         if take(&self.stale_reads) {
-            return Ok(0);
+            return Ok(self.stale_counter);
         }
 
         self.inner.read_counter(scope).await
@@ -672,6 +697,10 @@ impl<R: Repository> Repository for Lagging<R> {
 
     fn writes_views(&self) -> bool {
         self.writes_views && self.inner.writes_views()
+    }
+
+    fn applies_expected_payload(&self) -> bool {
+        self.applies_expected_payload && self.inner.applies_expected_payload()
     }
 
     fn declare_history_dependent(
@@ -974,6 +1003,51 @@ where
         "a lost counter is repaired the same way"
     );
     ensure_eq!(journaled.high_watermark(&world).await?, 5, "counter");
+
+    Ok(())
+}
+
+async fn stale_counter_reads_fail_on_the_counter<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalStore + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let a = Stream::new(&ns, "a", "ledger");
+    let (world, place) = (scope(&ns, "world"), scope(&ns, "place-a"));
+    a.commit(
+        &JournalRepository::new(repo.clone(), journal(&ns)),
+        a.events(1..=4),
+        None,
+    )
+    .await?;
+
+    // The rows at 3 and 4 are gone (journal compaction deletes rows), and a writer read both counters
+    // at 2 before they were written. Its rows at 3 would be absent: only the counter's
+    // compare-and-set refuses the stale attempt, which then reads the counters again.
+    for scope in [&world, &place] {
+        for position in [3, 4] {
+            views
+                .delete_view(&scope.row_pk(), &row_sk(position))
+                .await?;
+        }
+    }
+    let lagging = Lagging::new(repo.clone(), 2).stale_at(2);
+    let journaled = JournalRepository::new(lagging.clone(), journal(&ns));
+    a.commit(&journaled, a.events(5..=5), None).await?;
+
+    let stored = repo.events(&a.id).await?;
+    ensure_eq!(
+        allocations(&stored[4].metadata)?
+            .iter()
+            .map(|allocation| allocation.position)
+            .collect::<Vec<_>>(),
+        vec![5, 5],
+        "the positions after the live counters"
+    );
+    ensure!(lagging.backoffs() >= 1, "the stale attempt was retried");
+    ensure_eq!(journaled.high_watermark(&world).await?, 5, "the counter");
 
     Ok(())
 }
@@ -1515,6 +1589,23 @@ where
     // Events of a type the journal does not cover are not its concern.
     let other = Stream::new(&ns, "x", "other");
     other.commit(&dropping, other.events(1..=1), None).await?;
+
+    // A repository that writes views but does not apply the counter's compare-and-set would write
+    // the counter unconditionally: refused the same way, before anything is planned or declared.
+    let unconditional = JournalRepository::new(
+        Lagging::new(repo.clone(), 0).ignoring_expected_payload(),
+        journal(&ns),
+    );
+    let next = Stream::new(&ns, "b", "ledger");
+    expect_err(
+        next.commit(&unconditional, next.events(1..=1), None).await,
+        "a repository that ignores the expected-payload condition",
+        |err| matches!(err, Error::ExpectedPayloadUnsupported { .. }),
+    )?;
+    ensure!(
+        repo.events(&next.id).await?.is_empty(),
+        "the refused commit wrote nothing"
+    );
 
     Ok(())
 }

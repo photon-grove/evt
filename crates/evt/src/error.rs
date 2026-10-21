@@ -366,6 +366,19 @@ pub enum Error {
         repository: String,
     },
 
+    /// The journal was asked to commit through a repository that does not apply a view put's
+    /// expected-payload condition
+    /// ([`applies_expected_payload`](crate::Repository::applies_expected_payload)): its counter
+    /// compare-and-set would be written unconditionally, which can duplicate positions once rows
+    /// are deleted. Refused before anything is planned, declared, or written.
+    #[error(
+        "repository {repository} does not apply the expected-payload view condition; refusing to journal"
+    )]
+    ExpectedPayloadUnsupported {
+        /// The refusing repository's Rust type.
+        repository: String,
+    },
+
     /// A history-dependent projector was registered over a repository that cannot declare history
     /// dependence durably; compaction could then delete the commits its rebuild replays. Nothing
     /// was written.

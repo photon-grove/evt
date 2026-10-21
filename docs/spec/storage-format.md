@@ -2625,7 +2625,11 @@ The full bytes of these items, of a commit's events, and of the marker are in
 
 A repository that does not write view operations (`writes_views()` false: a custom backend that
 predates them) is refused with `ViewsUnsupported` before anything is planned or declared, because
-the rows would otherwise be dropped while the events and their allocations were written.
+the rows would otherwise be dropped while the events and their allocations were written. Likewise,
+a repository that does not declare that it applies the counter's compare-and-set
+(`Repository::applies_expected_payload`, default false; true for the in-memory and DynamoDB
+repositories) is refused with `ExpectedPayloadUnsupported`, so a backend that ignored the condition
+cannot write a counter unconditionally.
 
 **Metadata seen by other projectors.** The `evt.journal` allocation is added when the journal
 commits, after the store has run the application's commit-wide projectors, so it exists on a stored
@@ -2648,10 +2652,15 @@ stream the commit wrote does not apply. Its owner is the constant `SYSTEM#JOURNA
 owner still never changes and the repository's owner condition (`attribute_not_exists(pk) OR
 entityID = :owner`) passes for every writer. This leans on no repository checking that an
 operation's owner is a stream: the engine's check (`InvalidViewOperation`) runs in the projector
-pipeline, which the journal's counter operations do not go through. A counter write is a plain put,
-not conditioned on the previous value: the journal rows' `absent` conditions serialize the writers.
+pipeline, which the journal's counter operations do not go through. A counter write is a
+**compare-and-set** on the counter the commit read: `attribute_not_exists(pk)` when it read none,
+otherwise `entityID = :owner AND payload = :expected`, binding the exact payload it read (an
+engine-only view condition, crate-private, so projectors cannot set it; PostgreSQL refuses it).
 A commit allocates a scope's positions from the counter it read, so the rows it writes are the
-positions above it; if any is taken, the commit fails whole. A commit sets a counter only together
+positions above it; if any is taken, or the counter moved, the commit fails whole.
+The rows' `absent` conditions alone are not enough once rows can be deleted (journal compaction,
+X2, deletes them by design): a writer whose read went stale could otherwise claim positions whose
+rows are gone. A commit sets a counter only together
 with the rows up to it, so a counter only moves up while the journal is written through commits.
 It can fall out of step by other means (a rebuild running beside writers, a restore, a lost row of
 the table), and the journal heals a counter that is **behind its rows**: a writer whose position
@@ -2685,9 +2694,9 @@ Each row and each counter is one projector operation of the commit's action budg
 the `e × s` rows, and one counter per distinct scope must fit: `e + e × s + (distinct scopes) ≤ 97`.
 A commit over the budget fails with `CommitTooLarge` before any write, like any other.
 
-**Contention.** If another commit took a position first, the row put fails its `absent` condition,
-which the repository reports as a projector-operation failure that carries the journal's own
-`PositionTaken` error (a failed condition on any other item ranks above it, per
+**Contention.** If another commit took a position first, the row put fails its `absent` condition
+(or, when the rows are gone, the counter put fails its compare-and-set), which the repository
+reports as a projector-operation failure that carries the journal's own `PositionTaken` error (a failed condition on any other item ranks above it, per
 [Views](#views)). The journal then re-reads the counters (from the highest row, when none moved:
 see Ownership above), allocates again on the same events, and retries, waiting between attempts
 ([Fence-Aware Retry](#fence-aware-retry)'s policy: attempts, exponential backoff with jitter,

@@ -1505,6 +1505,10 @@ impl<R: Repository + RebuildFence> Repository for EndsDuringBackoff<'_, R> {
         self.inner.writes_views()
     }
 
+    fn applies_expected_payload(&self) -> bool {
+        self.inner.applies_expected_payload()
+    }
+
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
         self.inner.commit(commit).await
     }
