@@ -1,0 +1,839 @@
+{
+  "batches": [
+    {
+      "name": "events: every record succeeds",
+      "response": {
+        "batchItemFailures": []
+      },
+      "sequenceNumbers": [
+        "100",
+        "104",
+        "110"
+      ]
+    },
+    {
+      "name": "events: the handler fails on the third record",
+      "response": {
+        "batchItemFailures": [
+          {
+            "itemIdentifier": "110"
+          }
+        ]
+      },
+      "sequenceNumbers": [
+        "100",
+        "104",
+        "110"
+      ]
+    },
+    {
+      "name": "events: the second record does not decode",
+      "response": {
+        "batchItemFailures": [
+          {
+            "itemIdentifier": "108"
+          }
+        ]
+      },
+      "sequenceNumbers": [
+        "100",
+        "108",
+        "101"
+      ]
+    },
+    {
+      "name": "journal rows: one wake-up per scope, the highest position",
+      "response": {
+        "batchItemFailures": []
+      },
+      "sequenceNumbers": [
+        "200",
+        "205",
+        "208",
+        "202",
+        "207",
+        "203"
+      ],
+      "wakeups": [
+        {
+          "position": "5",
+          "scope": "world:7",
+          "sequenceNumber": "200"
+        },
+        {
+          "position": "1",
+          "scope": "world:7/place:3",
+          "sequenceNumber": "208"
+        }
+      ]
+    }
+  ],
+  "emptyResponse": {
+    "batchItemFailures": []
+  },
+  "events": [
+    {
+      "decoded": {
+        "event": {
+          "entityId": "acct-1",
+          "entityType": "account",
+          "id": "acct-1:1",
+          "metadata": {
+            "address": null,
+            "causationId": "cmd-0001",
+            "commandId": "cmd-0001",
+            "commitId": "01JDXK7Q3W9B5N2M8P4R6TAVHY",
+            "extensions": {},
+            "origin": null,
+            "principalId": null,
+            "region": "us-west-2",
+            "timestamp": "2026-10-20T00:00:00Z",
+            "trace": null
+          },
+          "payload": "eyJhbW91bnQiOjV9",
+          "sequence": 1,
+          "type": "account:opened",
+          "version": 1
+        },
+        "idempotencyKey": "acct-1:1"
+      },
+      "everyEventFilter": true,
+      "name": "an inserted event",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            }
+          },
+          "NewImage": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-20T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}"
+            },
+            "payload": {
+              "S": "{\"amount\":5}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "SequenceNumber": "100",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-100",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    },
+    {
+      "decoded": {
+        "event": {
+          "entityId": "acct-1",
+          "entityType": "account",
+          "id": "acct-1:1",
+          "metadata": {
+            "address": null,
+            "causationId": "cmd-0001",
+            "commandId": "cmd-0001",
+            "commitId": "01JDXK7Q3W9B5N2M8P4R6TAVHY",
+            "extensions": {},
+            "origin": null,
+            "principalId": null,
+            "region": "us-west-2",
+            "timestamp": "2026-10-20T00:00:00Z",
+            "trace": null
+          },
+          "payload": "eyJhbW91bnQiOjV9",
+          "sequence": 1,
+          "type": "account:opened",
+          "version": 1
+        },
+        "idempotencyKey": "acct-1:1"
+      },
+      "everyEventFilter": true,
+      "name": "an inserted event, both images",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            }
+          },
+          "NewImage": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-20T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}"
+            },
+            "payload": {
+              "S": "{\"amount\":5}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "SequenceNumber": "101",
+          "StreamViewType": "NEW_AND_OLD_IMAGES"
+        },
+        "eventID": "record-101",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    },
+    {
+      "decoded": {
+        "skip": true
+      },
+      "everyEventFilter": false,
+      "name": "a modified event item",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            }
+          },
+          "NewImage": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": "{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-20T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}"
+            },
+            "payload": {
+              "S": "{\"amount\":5}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "type": {
+              "S": "account:opened"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "SequenceNumber": "102",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-102",
+        "eventName": "MODIFY",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    },
+    {
+      "decoded": {
+        "skip": true
+      },
+      "everyEventFilter": false,
+      "name": "a removed event item (compaction or TTL)",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            }
+          },
+          "SequenceNumber": "103",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-103",
+        "eventName": "REMOVE",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    },
+    {
+      "decoded": {
+        "skip": true
+      },
+      "everyEventFilter": false,
+      "name": "the stream head",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "NewImage": {
+            "head": {
+              "N": "1"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "-1"
+            }
+          },
+          "SequenceNumber": "104",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-104",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    },
+    {
+      "decoded": {
+        "skip": true
+      },
+      "everyEventFilter": false,
+      "name": "the inline snapshot",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "NewImage": {
+            "entityType": {
+              "S": "account"
+            },
+            "eventSeq": {
+              "N": "1"
+            },
+            "payload": {
+              "S": "{\"balance\":5}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "seq": {
+              "N": "1"
+            },
+            "sk": {
+              "N": "0"
+            }
+          },
+          "SequenceNumber": "105",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-105",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    },
+    {
+      "decoded": {
+        "skip": true
+      },
+      "everyEventFilter": false,
+      "name": "a command outcome",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "command-outcome#cmd-0001"
+            },
+            "sk": {
+              "N": "1"
+            }
+          },
+          "NewImage": {
+            "digest": {
+              "S": "sha256:00"
+            },
+            "events": {
+              "S": "[\"acct-1:1\"]"
+            },
+            "pk": {
+              "S": "command-outcome#cmd-0001"
+            },
+            "sk": {
+              "N": "1"
+            },
+            "status": {
+              "S": "accepted"
+            }
+          },
+          "SequenceNumber": "106",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-106",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    },
+    {
+      "decoded": {
+        "error": "missingNewImage"
+      },
+      "everyEventFilter": false,
+      "name": "an inserted event, keys only",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "1"
+            }
+          },
+          "SequenceNumber": "107",
+          "StreamViewType": "KEYS_ONLY"
+        },
+        "eventID": "record-107",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    },
+    {
+      "decoded": {
+        "error": "invalidRecord"
+      },
+      "everyEventFilter": true,
+      "name": "an event item with empty metadata",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "2"
+            }
+          },
+          "NewImage": {
+            "entityType": {
+              "S": "account"
+            },
+            "metadata": {
+              "S": ""
+            },
+            "payload": {
+              "S": "{\"amount\":5}"
+            },
+            "pk": {
+              "S": "acct-1"
+            },
+            "sk": {
+              "N": "2"
+            },
+            "type": {
+              "S": "account:deposited"
+            },
+            "version": {
+              "N": "1"
+            }
+          },
+          "SequenceNumber": "108",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-108",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      }
+    }
+  ],
+  "filters": {
+    "accountEvents": "{\"eventName\":[\"INSERT\"],\"dynamodb\":{\"NewImage\":{\"entityType\":{\"S\":[\"account\"]},\"metadata\":{\"S\":[{\"exists\":true}]},\"type\":{\"S\":[\"account:opened\",{\"prefix\":\"account:closed\"}]}}}}",
+    "everyEvent": "{\"eventName\":[\"INSERT\"],\"dynamodb\":{\"NewImage\":{\"metadata\":{\"S\":[{\"exists\":true}]},\"type\":{\"S\":[{\"exists\":true}]}}}}",
+    "journalCounters": "{\"eventName\":[\"INSERT\",\"MODIFY\"],\"dynamodb\":{\"Keys\":{\"pk\":{\"S\":[{\"prefix\":\"journal-counter#\"}]}}}}",
+    "journalRows": "{\"eventName\":[\"INSERT\",\"MODIFY\"],\"dynamodb\":{\"Keys\":{\"pk\":{\"S\":[{\"prefix\":\"journal#\"}]}}}}",
+    "journalScopes": "{\"eventName\":[\"INSERT\",\"MODIFY\"],\"dynamodb\":{\"Keys\":{\"pk\":{\"S\":[\"journal-counter#world:7\",{\"prefix\":\"journal-counter#world:7/\"}]}}}}"
+  },
+  "rowSortKey": "00000000000000000004",
+  "wakeups": [
+    {
+      "countersFilter": false,
+      "decoded": {
+        "wakeup": {
+          "position": "4",
+          "scope": "world:7",
+          "sequenceNumber": "200"
+        }
+      },
+      "name": "a journal row, keys only",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "journal#world:7"
+            },
+            "sk": {
+              "S": "00000000000000000004"
+            }
+          },
+          "SequenceNumber": "200",
+          "StreamViewType": "KEYS_ONLY"
+        },
+        "eventID": "record-200",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": true
+    },
+    {
+      "countersFilter": false,
+      "decoded": {
+        "wakeup": {
+          "position": "4",
+          "scope": "world:7",
+          "sequenceNumber": "201"
+        }
+      },
+      "name": "a journal row, new image",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "journal#world:7"
+            },
+            "sk": {
+              "S": "00000000000000000004"
+            }
+          },
+          "NewImage": {
+            "entityID": {
+              "S": "acct-1"
+            },
+            "entityType": {
+              "S": "journal"
+            },
+            "payload": {
+              "S": "{\"scope\":\"world:7\",\"position\":4,\"event\":{\"id\":\"acct-1:1\",\"sequence\":1,\"type\":\"account:opened\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnQiOjV9\",\"metadata\":{\"commandId\":\"cmd-0001\",\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"2026-10-20T00:00:00Z\",\"principalId\":null,\"causationId\":\"cmd-0001\",\"extensions\":{},\"commitId\":\"01JDXK7Q3W9B5N2M8P4R6TAVHY\"}}}"
+            },
+            "pk": {
+              "S": "journal#world:7"
+            },
+            "sk": {
+              "S": "00000000000000000004"
+            }
+          },
+          "SequenceNumber": "201",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-201",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": true
+    },
+    {
+      "countersFilter": true,
+      "decoded": {
+        "wakeup": {
+          "position": null,
+          "scope": "world:7",
+          "sequenceNumber": "202"
+        }
+      },
+      "name": "a journal counter, keys only",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "journal-counter#world:7"
+            },
+            "sk": {
+              "S": "COUNTER"
+            }
+          },
+          "SequenceNumber": "202",
+          "StreamViewType": "KEYS_ONLY"
+        },
+        "eventID": "record-202",
+        "eventName": "MODIFY",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": false
+    },
+    {
+      "countersFilter": true,
+      "decoded": {
+        "wakeup": {
+          "position": "12",
+          "scope": "world:7",
+          "sequenceNumber": "203"
+        }
+      },
+      "name": "a journal counter, new image",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "journal-counter#world:7"
+            },
+            "sk": {
+              "S": "COUNTER"
+            }
+          },
+          "NewImage": {
+            "entityID": {
+              "S": "SYSTEM#JOURNAL"
+            },
+            "entityType": {
+              "S": "journal-counter"
+            },
+            "payload": {
+              "S": "{\"scope\":\"world:7\",\"position\":12}"
+            },
+            "pk": {
+              "S": "journal-counter#world:7"
+            },
+            "sk": {
+              "S": "COUNTER"
+            }
+          },
+          "SequenceNumber": "203",
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "eventID": "record-203",
+        "eventName": "MODIFY",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": false
+    },
+    {
+      "countersFilter": false,
+      "decoded": {
+        "skip": true
+      },
+      "name": "a removed journal row (compaction)",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "journal#world:7"
+            },
+            "sk": {
+              "S": "00000000000000000004"
+            }
+          },
+          "SequenceNumber": "204",
+          "StreamViewType": "KEYS_ONLY"
+        },
+        "eventID": "record-204",
+        "eventName": "REMOVE",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": false
+    },
+    {
+      "countersFilter": false,
+      "decoded": {
+        "skip": true
+      },
+      "name": "another view row",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "account#acct-1"
+            },
+            "sk": {
+              "S": "VIEW"
+            }
+          },
+          "SequenceNumber": "205",
+          "StreamViewType": "KEYS_ONLY"
+        },
+        "eventID": "record-205",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": false
+    },
+    {
+      "countersFilter": false,
+      "decoded": {
+        "skip": true
+      },
+      "name": "a stray row in a journal partition (not a position)",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "journal#world:7"
+            },
+            "sk": {
+              "S": "4"
+            }
+          },
+          "SequenceNumber": "206",
+          "StreamViewType": "KEYS_ONLY"
+        },
+        "eventID": "record-206",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": true
+    },
+    {
+      "countersFilter": false,
+      "decoded": {
+        "wakeup": {
+          "position": "5",
+          "scope": "world:7",
+          "sequenceNumber": "207"
+        }
+      },
+      "name": "the next journal row of the scope",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "journal#world:7"
+            },
+            "sk": {
+              "S": "00000000000000000005"
+            }
+          },
+          "SequenceNumber": "207",
+          "StreamViewType": "KEYS_ONLY"
+        },
+        "eventID": "record-207",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": true
+    },
+    {
+      "countersFilter": false,
+      "decoded": {
+        "wakeup": {
+          "position": "1",
+          "scope": "world:7/place:3",
+          "sequenceNumber": "208"
+        }
+      },
+      "name": "a journal row of another scope",
+      "record": {
+        "awsRegion": "us-west-2",
+        "dynamodb": {
+          "ApproximateCreationDateTime": 1792454400.0,
+          "Keys": {
+            "pk": {
+              "S": "journal#world:7/place:3"
+            },
+            "sk": {
+              "S": "00000000000000000001"
+            }
+          },
+          "SequenceNumber": "208",
+          "StreamViewType": "KEYS_ONLY"
+        },
+        "eventID": "record-208",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "eventSourceARN": "arn:aws:dynamodb:us-west-2:000000000000:table/evt-local/stream/2026-10-20T00:00:00.000",
+        "eventVersion": "1.1"
+      },
+      "rowsFilter": true
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+[package]
+name = "photon-evt-lambda"
+version = "0.1.0"
+description = "AWS Lambda helpers for photon-evt: DynamoDB Streams event decode, event-source filter patterns, journal wake-ups, and partial batch failures."
+readme = "README.md"
+keywords = ["event-sourcing", "dynamodb", "lambda", "aws", "streams"]
+categories = ["database", "asynchronous"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
+
+[features]
+default = []
+# Journal wake-ups (ADR 0005, X3) for consumers of the sync journal. It enables photon-evt's
+# `journal` feature, which is build-wide: every repository in the build then accepts a table that
+# declares the journal. A Lambda that also commits events must commit them through the journal.
+journal = ["photon-evt/journal"]
+
+[dependencies]
+# No SDK and no runtime: stream records are DynamoDB JSON, which photon-evt's wire module models.
+# release-please keeps this requirement at photon-evt's released version (release-please-config.json).
+photon-evt = { path = "../evt", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# The golden fixture compat/fixtures/lambda.json covers the journal wake-ups too.
+[[test]]
+name = "fixtures"
+required-features = ["journal"]
