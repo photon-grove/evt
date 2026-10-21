@@ -28,7 +28,9 @@ your application needs.
   SNS publisher runtime that used to sit in the middle is deprecated in v0.9.0 — K5.)
 - **A Rust crate shares the log.** [`photon-evt`](crates/evt) reads and writes the
   same DynamoDB items, PostgreSQL rows, and stream envelopes, so Go and Rust
-  services can append to the same streams.
+  services can append to the same streams. [`photon-evt-lambda`](crates/evt-lambda)
+  is its Lambda side: DynamoDB Streams event decode, filter patterns, journal
+  wake-ups, and partial batch failures.
 
 ## Install
 

@@ -669,6 +669,10 @@ without the feature refuse the table.
   off, and read the same page again.
 - **Backends.** DynamoDB and the in-memory repository. The Rust PostgreSQL repository does not write
   commit-wide views yet.
+- **Waking consumers.** On DynamoDB, a consumer learns of new rows from the views table's stream,
+  filtered to the journal's keys, and then reads `page` from its cursor. The
+  [`photon-evt-lambda`](https://github.com/photon-grove/evt/tree/main/crates/evt-lambda) crate
+  (feature `journal`) has the filter patterns, the wake-up decode, and the batch handling.
 
 The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md#journal),
 and `photon_evt::conformance::journal_cases` (features `journal` and `conformance`) checks a backend.

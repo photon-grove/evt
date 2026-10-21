@@ -512,9 +512,10 @@ Each path that adds, removes, or snapshots events either maintains the head or i
   ```
 
   The pattern also drops the snapshot at `sk = 0`, which consumers already skip. The Lambda
-  `NEW_IMAGE` decoder (X3) skips `sk < 1` itself. `KEYS_ONLY` wake-ups (the journal's) fire on every
-  head update unless filtered, so they need the filter; consumers that do not filter pay for the
-  extra records.
+  `NEW_IMAGE` decoder (X3, `photon-evt-lambda`) skips `sk < 1` itself, and its `EventFilter`
+  pattern drops head items by requiring a `metadata` attribute. The journal's `KEYS_ONLY` wake-ups
+  read the views table's stream instead, which holds no head items. Event-log consumers that do not
+  filter pay for the extra records.
 
 - `dynamo.Delete` (cut, K7) and fixture cleanups must delete the head item too, or a deleted stream
   keeps its head and rejects its own recreation.

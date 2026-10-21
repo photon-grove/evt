@@ -57,8 +57,10 @@
 - Go and Rust share one storage format (`docs/spec/storage-format.md`). Any change to it must
   regenerate `compat/fixtures` (`go test ./internal/compat -run TestFixtures -update`), pass in both
   languages, and pass `scripts/compat-integration.sh dynamo|postgres`. Never hand-edit fixtures.
-  The exception is a Rust-first extension's fixtures (`compat/fixtures/journal.json`, ADR 0005):
-  Rust generates them (`EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test journal_fixtures`).
+  The exception is a Rust-first extension's fixtures (ADR 0005): Rust generates them,
+  `compat/fixtures/journal.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test
+  journal_fixtures` and `compat/fixtures/lambda.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p
+  photon-evt-lambda --all-features --test fixtures`.
 - Update documentation when behavior changes, especially `README.md`, `BEHAVIORAL_INVARIANTS.md`,
   and relevant files under `docs/`.
 
@@ -72,7 +74,8 @@
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
   - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
   - `examples/`: public examples; keep names and scenarios neutral.
-  - `crates/evt` (`photon-evt`): the Rust crate. `crates/evt-compat` (unpublished) and
+  - `crates/evt` (`photon-evt`): the Rust crate. `crates/evt-lambda` (`photon-evt-lambda`): its
+    DynamoDB Streams / Lambda helpers (ADR 0005, X3). `crates/evt-compat` (unpublished) and
     `internal/compat` (Go) are the two halves of the compatibility harness. `compat/` holds the
     shared scenarios and generated fixtures.
 - Rust:

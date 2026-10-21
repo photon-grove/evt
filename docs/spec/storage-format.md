@@ -2741,6 +2741,16 @@ eventually consistent storage), or lost (a deleted row, an interrupted rebuild).
 and escalates when it persists. A lost counter does not hide rows: the watermark follows the rows
 the page finds.
 
+**Wake-ups (X3).** A consumer learns that a scope has new rows from the views table's DynamoDB
+stream, filtered to the journal's partitions: `pk` beginning `journal#` (one record per row) or
+`journal-counter#` (one per scope per commit), `eventName` `INSERT` or `MODIFY`. The keys are
+enough (`KEYS_ONLY`); a `MODIFY` of a counter with a new image also carries its position. A
+record is a wake-up, not a delivery: stream order is per item, not per scope, so the consumer reads
+the scope with `page` from its own cursor. Removals are not wake-ups, and neither are keys in those
+partitions that the journal does not write (another sort key, an invalid scope): a decoder skips
+them rather than failing the batch, and the page read reports a corrupt journal. `photon-evt-lambda` (feature
+`journal`) implements the filter patterns and the decode; `compat/fixtures/lambda.json` pins them.
+
 ### Feature marker and history
 
 The first journaled commit **declares** the journal on the marker row ([Feature Marker](#feature-marker)):
