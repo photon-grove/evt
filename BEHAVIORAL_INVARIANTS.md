@@ -637,7 +637,9 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   commit-wide projector: owned by the event's stream, written only if absent, owner never changes.
   Counters (the highest position per scope) are shared by every stream of a scope, so they are
   the one exception to "the owner is a written stream": their constant owner is `SYSTEM#JOURNAL`.
-  A commit's counter put is conditioned on the counter it read (absent, or its exact payload).
+  A commit's counter put is conditioned on the counter it read (absent, or its exact payload); a
+  repository that does not declare `applies_expected_payload` is refused before anything is
+  written.
   A position is claimed exactly once; a taken position fails the commit whole.
 - **Positions are contiguous per scope** and allocated in the commit's canonical order (streams by
   entity-ID bytes, then sequence; scopes ascending). A refused or failed commit moves no counter.

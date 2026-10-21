@@ -2625,7 +2625,11 @@ The full bytes of these items, of a commit's events, and of the marker are in
 
 A repository that does not write view operations (`writes_views()` false: a custom backend that
 predates them) is refused with `ViewsUnsupported` before anything is planned or declared, because
-the rows would otherwise be dropped while the events and their allocations were written.
+the rows would otherwise be dropped while the events and their allocations were written. Likewise,
+a repository that does not declare that it applies the counter's compare-and-set
+(`Repository::applies_expected_payload`, default false; true for the in-memory and DynamoDB
+repositories) is refused with `ExpectedPayloadUnsupported`, so a backend that ignored the condition
+cannot write a counter unconditionally.
 
 **Metadata seen by other projectors.** The `evt.journal` allocation is added when the journal
 commits, after the store has run the application's commit-wide projectors, so it exists on a stored
@@ -2651,9 +2655,9 @@ operation's owner is a stream: the engine's check (`InvalidViewOperation`) runs 
 pipeline, which the journal's counter operations do not go through. A counter write is a
 **compare-and-set** on the counter the commit read: `attribute_not_exists(pk)` when it read none,
 otherwise `entityID = :owner AND payload = :expected`, binding the exact payload it read (an
-engine-only view condition, `ViewOperation::expected_payload`; projectors cannot set it, and
-PostgreSQL refuses it). A commit allocates a scope's positions from the counter it read, so the rows
-it writes are the positions above it; if any is taken, or the counter moved, the commit fails whole.
+engine-only view condition, crate-private, so projectors cannot set it; PostgreSQL refuses it).
+A commit allocates a scope's positions from the counter it read, so the rows it writes are the
+positions above it; if any is taken, or the counter moved, the commit fails whole.
 The rows' `absent` conditions alone are not enough once rows can be deleted (journal compaction,
 X2, deletes them by design): a writer whose read went stale could otherwise claim positions whose
 rows are gone. A commit sets a counter only together

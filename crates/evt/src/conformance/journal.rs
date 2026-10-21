@@ -81,7 +81,7 @@ where
         Box::pin(stale_counter_reads_fail_on_the_counter(repo, views)).await,
     );
     record(
-        "a repository that does not write views is refused before anything is declared",
+        "a repository that does not write views, or ignores the counter's condition, is refused",
         Box::pin(views_unsupported_is_refused(repo)).await,
     );
     record(
@@ -572,6 +572,7 @@ struct Lagging<R> {
     transient_commits: Arc<AtomicUsize>,
     backoffs: Arc<AtomicUsize>,
     writes_views: bool,
+    applies_expected_payload: bool,
 }
 
 impl<R> Lagging<R> {
@@ -583,6 +584,7 @@ impl<R> Lagging<R> {
             transient_commits: Arc::new(AtomicUsize::new(0)),
             backoffs: Arc::new(AtomicUsize::new(0)),
             writes_views: true,
+            applies_expected_payload: true,
         }
     }
 
@@ -590,6 +592,14 @@ impl<R> Lagging<R> {
     /// before they existed does.
     fn without_views(mut self) -> Self {
         self.writes_views = false;
+
+        self
+    }
+
+    /// Reports that the repository writes views but ignores the expected-payload condition, as a
+    /// third-party backend written before it existed does.
+    fn ignoring_expected_payload(mut self) -> Self {
+        self.applies_expected_payload = false;
 
         self
     }
@@ -687,6 +697,10 @@ impl<R: Repository> Repository for Lagging<R> {
 
     fn writes_views(&self) -> bool {
         self.writes_views && self.inner.writes_views()
+    }
+
+    fn applies_expected_payload(&self) -> bool {
+        self.applies_expected_payload && self.inner.applies_expected_payload()
     }
 
     fn declare_history_dependent(
@@ -1575,6 +1589,23 @@ where
     // Events of a type the journal does not cover are not its concern.
     let other = Stream::new(&ns, "x", "other");
     other.commit(&dropping, other.events(1..=1), None).await?;
+
+    // A repository that writes views but does not apply the counter's compare-and-set would write
+    // the counter unconditionally: refused the same way, before anything is planned or declared.
+    let unconditional = JournalRepository::new(
+        Lagging::new(repo.clone(), 0).ignoring_expected_payload(),
+        journal(&ns),
+    );
+    let next = Stream::new(&ns, "b", "ledger");
+    expect_err(
+        next.commit(&unconditional, next.events(1..=1), None).await,
+        "a repository that ignores the expected-payload condition",
+        |err| matches!(err, Error::ExpectedPayloadUnsupported { .. }),
+    )?;
+    ensure!(
+        repo.events(&next.id).await?.is_empty(),
+        "the refused commit wrote nothing"
+    );
 
     Ok(())
 }

@@ -460,6 +460,14 @@ where
             });
         }
 
+        // The counter put is a compare-and-set: a repository that would write it unconditionally
+        // is refused, fail-closed, before anything is planned or declared.
+        if covered && !self.inner.applies_expected_payload() {
+            return Err(Error::ExpectedPayloadUnsupported {
+                repository: std::any::type_name::<R>().to_owned(),
+            });
+        }
+
         let plan = self.plan(&mut base)?;
 
         if !covered {
@@ -581,6 +589,10 @@ where
 
     fn writes_views(&self) -> bool {
         self.inner.writes_views()
+    }
+
+    fn applies_expected_payload(&self) -> bool {
+        self.inner.applies_expected_payload()
     }
 
     fn declare_history_dependent(

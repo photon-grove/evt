@@ -463,6 +463,10 @@ impl Repository for MemRepository {
         true
     }
 
+    fn applies_expected_payload(&self) -> bool {
+        true
+    }
+
     async fn declare_history_dependent(&self, types: &[EntityType]) -> Result<(), Error> {
         crate::features::declare_history(self, types).await
     }
