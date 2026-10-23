@@ -1,19 +1,21 @@
-# Streams, Projectors, and Publishers
+# Streams and Projectors
 
 Once events land in the [DynamoDB event log](dynamodb.md), they fan out to
 asynchronous consumers — read-model projectors, change-detection
 [heads](projections.md), search indexers, feeds, webhooks — through a single hop:
 
 ```text
-event log ──DynamoDB Stream──▶ publisher ──▶ SNS topic ──┬──▶ SNS→SQS ──▶ projector
-              (NEW_IMAGE)      (one reader)               ├──▶ SNS→SQS ──▶ heads / search / …
+event log ──DynamoDB Stream──▶ your handler ──▶ SNS topic ──┬──▶ SNS→SQS ──▶ projector
+              (NEW_IMAGE)      (one reader)                ├──▶ SNS→SQS ──▶ heads / search / …
                                                           └──▶ SNS→Lambda ──▶ feeds / webhooks
 ```
 
-Use SNS fan-out: one publisher reads the DynamoDB Stream and republishes each
-**`INSERT`** of an event to SNS. Consumers subscribe, usually through SNS→SQS with raw delivery,
-and can scale and fail independently while the publisher remains the only stream
-reader. The `publishers` and `projectors` packages provide the Lambda runtimes.
+One handler reads the DynamoDB Stream and republishes each **`INSERT`** of an event to SNS.
+Consumers subscribe, usually through SNS→SQS with raw delivery, and can scale and fail
+independently while that handler remains the only stream reader. The library doesn't ship the SNS
+publisher, so you write that handler yourself (see [Publishing onward](#publishing-onward)). The
+`projectors` package provides the consumer-side Lambda runtimes, and it can also read the stream
+directly with no topic hop.
 
 ### Head items are not events
 
@@ -22,8 +24,7 @@ format](spec/storage-format.md#stream-heads)), updated by every commit that writ
 stream therefore carries one `INSERT` for it with a stream's first commit, one `MODIFY` per later
 commit, and one record per stream from the head migration. They are concurrency metadata, not
 events, and a consumer skips them. The consumers in this module do: `stream.DynamoDBHandler` drops
-such `INSERT` records, `stream.SNSPublisher` counts them as skipped (not as malformed events), and
-`projectors.NewLambdaHandler` skips any record whose sort key is below 1 (as it does the
+such `INSERT` records, and `projectors.NewLambdaHandler` skips any record whose sort key is below 1 (as it does the
 snapshot at `sk = 0`). A consumer you write decodes `NEW_IMAGE`, so skip `sk < 1` the same way.
 
 An event source mapping or EventBridge Pipe filter can drop them before your function runs. The
@@ -41,13 +42,6 @@ record per stream (see the [migration runbook](migrating-to-stream-heads.md)).
 Every consumer follows the same reliability contract: process records
 independently, return **partial-batch failures** so only affected records retry,
 and stay **idempotent** because the same event can be delivered more than once.
-
-*SNS fan-out via `evt/publishers` is deprecated in v0.9.0*
-([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K5). The shipped, supported paths for
-new consumers are reading the DynamoDB Stream **directly** with
-`projectors.NewLambdaHandler` (no topic hop), or consuming the stream with your own handler and
-publishing onward yourself — see [Publishers](#publishers) for the full migration notes. The
-consumer-side guidance below (projectors, idempotency, retry classification) is unaffected.
 
 ## Projectors
 
@@ -71,14 +65,13 @@ func main() {
 }
 ```
 
-`NewSQSHandler` decodes each SQS message — the CloudWatchEvent envelope the
-(deprecated) publisher emitted, or that your own handler emitted — into a
+`NewSQSHandler` decodes each SQS message — the CloudWatchEvent envelope that your own
+handler emitted — into a
 `StreamRecord` with `StreamRecordFromEnvelope`, runs the batch through the runtime, and returns
 an `events.SQSEventResponse` so Lambda redelivers only the failed messages. For a
 latency-sensitive consumer wired as a **direct** SNS→Lambda subscription, use `NewSNSHandler`
 instead; SNS has no partial-batch protocol, so a failure retries the whole invocation — give
-that subscription a redrive policy. (`NewLambdaHandler` reads the DynamoDB Stream directly —
-the shipped path now that the publisher is deprecated.)
+that subscription a redrive policy. (`NewLambdaHandler` reads the DynamoDB Stream directly, with no topic hop.)
 
 The runtime adds:
 
@@ -96,60 +89,38 @@ The runtime adds:
 - **structured logging** through the `*slog.Logger` you pass in (falling back to
   `slog.Default()` when nil).
 
-## Publishers
+## Publishing onward
 
-*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K5):*
-`evt/publishers`, `BudgetController`, and the SNS/FIFO publisher are removed in the next minor
-release **without an in-library replacement**. Command outcomes ship in v0.9.0
-([C3/C4](../README.md#command-outcomes-and-rejections-v09-c3c4)), but they make commands
-idempotent and record their results; they are not a publisher replacement. They do not consume
-the stream or publish anything, and the envelope is only the wire format — it neither consumes
-the stream nor publishes to SNS. What to do today:
+The library no longer ships an SNS publisher or ingress budgets ([ADR
+0006](adr/0006-parity-policy-and-feature-cuts.md), K5), so there are two ways to feed consumers.
 
-- **Projector-style consumers** — switch to the direct-from-stream handler
-  (`projectors.NewLambdaHandler`), which is shipped and skips the SNS hop entirely.
-- **Anything else** — consume the DynamoDB Stream with your own handler (a stream-targeted
-  Lambda or a worker) and publish onward yourself. To keep the existing envelope shape for
-  downstream subscribers, emit the documented CloudWatchEvent-style envelope — the format stays
-  as the cross-language wire format (Rust encodes it with `photon_evt::wire::envelope::encode`;
-  Go decodes it with `projectors.StreamRecordFromEnvelope`).
-- **Ingress/retry budgets** — implement backpressure around your own handler; nothing ships.
+Projector-style consumers can read the DynamoDB Stream directly with
+`projectors.NewLambdaHandler`, which skips the SNS hop entirely.
 
-The rest of this section describes the pre-v0.9 runtime for readers still on it.
-
-`evt/publishers` is the single DynamoDB-Stream consumer: it reads committed
-events and republishes them to the SNS topic the consumers above subscribe to.
-The handler takes a `StreamPublisher` and a `BudgetController`:
+For anything else, subscribe your own Lambda or worker to the stream and publish onward from it.
+`stream.DynamoDBHandler` does the filtering half of that job. It keeps only `INSERT` records and
+drops head items and other non-event rows, and you hand the survivors to whatever publishes them:
 
 ```go
-func HandleDynamoDBEvent(
-    ctx context.Context,
-    event events.DynamoDBEvent,
-    publisher StreamPublisher,
-    budget BudgetController,
-    loggers ...*slog.Logger,
-) (events.DynamoDBEventResponse, error)
+handler := stream.NewDynamoDBHandler(logger)
+
+inserts, err := handler.Handle(ctx, event) // []events.DynamoDBEventRecord
+if err != nil {
+    return err
+}
+// Encode each record as the envelope below and publish it with your own SNS, SQS or
+// EventBridge client. Apply your own backpressure here if a burst could overrun a topic.
 ```
 
-The included **SNS publisher** (from the `stream` package) wraps each event in a
-CloudWatchEvent-shaped envelope — `{ID, Source, DetailType, Detail}`, with the full
-serialized event in `Detail` — and adds SNS message attributes (`entityType`,
-`eventType`, `commandId`, `correlationId`) so subscribers can filter without
-parsing the body:
+To keep downstream subscribers working, emit the stream envelope: a CloudWatchEvent-shaped
+`{ID, Source, DetailType, Detail}` object with the full serialized event in `Detail`. The envelope
+is the cross-language wire format, so it stays. Rust encodes it with
+`photon_evt::wire::envelope::encode`, and Go decodes it with `projectors.StreamRecordFromEnvelope`.
+If you publish to SNS, add message attributes such as `entityType`, `eventType`, `commandId` and
+`correlationId` so subscribers can filter without parsing the body.
 
-```go
-publisher, err := stream.NewSNSPublisher(snsClient, topicARN, "account-service",
-    // Optional: also publish to a FIFO companion topic for ordered consumers,
-    // deduplicated by event ID, grouped by whatever key you extract.
-    stream.WithFIFOTarget(fifoTopicARN, groupIDForEvent),
-)
-```
-
-A `BudgetController` (`publishers.NewBudgetController(eventsPerMinute,
-retriesPerMinute, now)`) is a soft per-minute rate limit on ingress and retries,
-so a flood of events can't overrun downstream topics. `publishers.LoadConfigFromEnv`
-reads the topic ARNs and budgets from the environment for a typical Lambda
-deployment.
+Command outcomes ([C3/C4](../README.md#command-outcomes-and-rejections-v09-c3c4)) make commands
+idempotent and record their results, but they don't consume the stream or publish anything.
 
 ## Reliability checklist
 

@@ -68,7 +68,7 @@
 
 - Structure:
   - Root Go module: core `evt` package and support packages such as `dynamo`, `postgres`, `mem`,
-    `snapshots`, `projectors`, `publishers`, `viewstore`, and `test`.
+    `snapshots`, `projectors`, `viewstore`, and `test`.
   - `website/`: Vite documentation site.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
