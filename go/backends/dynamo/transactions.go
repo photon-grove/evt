@@ -8,11 +8,7 @@ import (
 // Transactions
 // ------------
 
-// A Transaction is a collection of operations organized into TransactionGroups that should be
-// executed together. If any one operation fails, they should all fail.
-type Transaction = []TransactionGroup
-
-// A TransactionGroup is a set of related operations that should be included in a Transaction
+// A TransactionGroup is a set of related operations that should be included in an evt.Transaction
 type TransactionGroup interface {
 	ToWriteItems() []types.TransactWriteItem
 	MergeDynamo(with TransactionGroup) (TransactionGroup, error)
