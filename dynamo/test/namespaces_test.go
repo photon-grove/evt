@@ -32,7 +32,7 @@ func Test_NamespacesSuite(t *testing.T) {
 func (s *NamespacesSuite) repo() (*dynamo_mock.Client, *dynamo.Repository) {
 	client := dynamo_mock.NewClient()
 
-	return client, dynamo.NewRepository(client, "test-events")
+	return client, dynamo.NewRepository(client, "test-events").WithLazyInitialization(true)
 }
 
 func nsEventItem(pk string, sk int64, withMetadata bool) map[string]types.AttributeValue {

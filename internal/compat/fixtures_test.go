@@ -100,7 +100,7 @@ func TestMalformedOutcomeRowsAreCorrupt(t *testing.T) {
 			_, err := fake.PutItem(context.Background(), &dynamodb.PutItemInput{Item: item})
 			require.NoError(t, err)
 
-			stored, err := dynamo.NewRepository(fake, fakeTable).GetOutcome(context.Background(), "bad")
+			stored, err := dynamo.NewRepository(fake, fakeTable).WithLazyInitialization(true).GetOutcome(context.Background(), "bad")
 			require.ErrorIs(t, err, evt.ErrCorruptOutcome)
 			require.Nil(t, stored)
 		})

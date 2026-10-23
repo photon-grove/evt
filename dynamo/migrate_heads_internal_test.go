@@ -299,7 +299,7 @@ func TestTheRebuildFenceRowsAreEngineRows(t *testing.T) {
 		tallyItem(evt.RebuildGenerationID, 0, map[string]int64{"value": 3}),
 	}}
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{
 		PageSize: 2, Now: func() time.Time { return time.Unix(tallyNow, 0) },
 	})
 
@@ -322,7 +322,7 @@ func TestScanAccumulatesAPartitionSplitAcrossPages(t *testing.T) {
 		tallyItem("b", 9, nil),
 	}}
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{
 		PageSize: 2, Now: func() time.Time { return time.Unix(tallyNow, 0) },
 	})
 
@@ -346,7 +346,7 @@ func TestBackfillWritesConditionalHeadItems(t *testing.T) {
 		tallyItem("zero", 0, map[string]int64{"eventSeq": 0}),
 	}}
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{
 		Concurrency: 1, Now: func() time.Time { return time.Unix(tallyNow, 0) },
 	})
 
@@ -384,7 +384,7 @@ func TestRepairWritesAreConditionedOnTheObservedHead(t *testing.T) {
 		tallyItem("immortal", 1, nil), tallyItem("immortal", -1, map[string]int64{"head": 1, "ttl": 2000}),
 	}}
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{
 		Concurrency: 1, Now: func() time.Time { return time.Unix(tallyNow, 0) },
 	})
 
@@ -441,7 +441,7 @@ func TestRepairWritesAreConditionedOnTheObservedHead(t *testing.T) {
 
 func TestMutatingStepsNeedTheOperatorsConfirmation(t *testing.T) {
 	client := &pagedScan{pageSize: 10, items: []map[string]types.AttributeValue{tallyItem("a", 1, nil)}}
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{})
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{})
 
 	_, err := migration.Migrate(context.Background(), HeadsMigrateOptions{})
 	require.ErrorIs(t, err, evt.ErrWritersNotConfirmed)
@@ -466,7 +466,7 @@ func TestALostConditionIsRacedNotFatal(t *testing.T) {
 		return nil
 	}
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{Concurrency: 2})
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{Concurrency: 2})
 
 	report, err := migration.backfill(context.Background(), false)
 	require.NoError(t, err)
@@ -488,7 +488,7 @@ func TestAFailedWriteStopsTheMigrationBeforeDeclaring(t *testing.T) {
 	client := &pagedScan{pageSize: 100, items: items}
 	client.updateErr = func(*dynamodb.UpdateItemInput) error { return boom }
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{Concurrency: 4})
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{Concurrency: 4})
 
 	report, err := migration.Migrate(context.Background(), HeadsMigrateOptions{ConfirmWritersStopped: true})
 	require.ErrorIs(t, err, boom)
@@ -507,7 +507,7 @@ func TestEveryReadIsStronglyConsistent(t *testing.T) {
 		tallyItem("a", 1, nil), tallyItem("a", 2, nil), tallyItem("b", 1, nil),
 	}}
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{
 		Concurrency: 1, Now: func() time.Time { return time.Unix(tallyNow, 0) },
 	})
 
@@ -545,7 +545,7 @@ func TestARacedRepairReVerifies(t *testing.T) {
 		return &types.ConditionalCheckFailedException{}
 	}
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{Concurrency: 1})
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{Concurrency: 1})
 
 	report, err := migration.Repair(context.Background(), HeadsRepairOptions{ConfirmWritersStopped: true})
 	require.NoError(t, err)
@@ -575,7 +575,7 @@ func TestReservedStreamsStopTheMigrationBeforeAnyWrite(t *testing.T) {
 		tallyItem("SYSTEM#expired", 1, map[string]int64{"ttl": 5}),
 	}}
 
-	migration := NewRepository(client, "table").HeadsMigration(HeadsMigrationConfig{
+	migration := NewRepository(client, "table").WithLazyInitialization(true).HeadsMigration(HeadsMigrationConfig{
 		Now: func() time.Time { return time.Unix(tallyNow, 0) },
 	})
 

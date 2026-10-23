@@ -19,7 +19,10 @@ store := snapshots.NewStore(repo, 25)
 ```
 
 `NewRepository(client, eventsTable)` takes an AWS SDK v2 DynamoDB client and the
-event-log table name. Tune it with chainable options:
+event-log table name. The table must be **initialized** once before writers start
+(`evt-doctor init`, or `repo.Initialize(ctx)` in a deploy step); until then every write is refused
+with `*evt.StoreNotInitializedError`. See **Permissions and billing** below.
+Tune it with chainable options:
 
 | Option | Effect |
 | --- | --- |
@@ -27,6 +30,7 @@ event-log table name. Tune it with chainable options:
 | `WithConsistentRead(true)` | Strongly consistent reads on loads. |
 | `WithRetention(retention)` | Stamp a DynamoDB `ttl` on policed entity types (see [Retention](#retention)). |
 | `WithLogger(logger)` | Inject a `*slog.Logger` for structured logs. |
+| `WithLazyInitialization(true)` | Initialize an uninitialized table on the first write instead of refusing it (tests and local use; needs `dynamodb:Scan`). |
 
 ## Event-log table
 
@@ -58,12 +62,26 @@ emits.
 
 **Permissions and billing.** The head update is an `Update` action inside `TransactWriteItems`, so a
 writer's role needs `dynamodb:UpdateItem` on the event-log table as well as `PutItem`,
-`ConditionCheckItem` and `TransactWriteItems`. The first write to a table that does not declare
-`stream-heads` runs a strongly consistent `Scan` to prove the table holds no data, declares the
-feature, and scans once more to prove no stream without a head item slipped in before the
-declaration (`dynamodb:Scan`); a writer to a table that already declares the feature never scans.
-Writers older than the head item never read the marker, so they must be stopped before the first
-head-aware writer runs against a table ([the obligation](spec/storage-format.md#required-feature)). Every
+`ConditionCheckItem` and `TransactWriteItems`. A writer never scans the event log, so its role
+needs **no `dynamodb:Scan`**: it refuses a table that does not declare `stream-heads` with
+`*evt.StoreNotInitializedError` (Rust `Error::StoreNotInitialized`) and writes nothing. The table is
+**initialized** once instead, at deploy time, before any writer starts:
+
+```sh
+evt-doctor init -events-table event-log
+```
+
+or `repo.Initialize(ctx)` (Rust `repository.initialize().await`) from a deploy step. Initialization
+runs a strongly consistent `Scan` to prove the table holds no data, declares the feature, and scans
+once more to prove no stream without a head item slipped in before the declaration, so the
+initializing role needs `dynamodb:GetItem`, `dynamodb:Scan`, and `dynamodb:PutItem` on the event-log
+table. It is idempotent: on a table that already declares the feature it reads the marker and stops,
+so it is safe in every deploy. Tests, local emulators, and quickstarts can skip the step with
+`dynamo.NewRepository(client, table).WithLazyInitialization(true)` (Rust
+`.with_lazy_initialization(true)`): the first write then initializes the table itself, and that
+writer needs `dynamodb:Scan`. Writers older than the head item never read the marker, so they must
+be stopped before the first head-aware writer runs against a table
+([the obligation](spec/storage-format.md#required-feature)). Every
 transactional action is billed as two writes of the checked or written item's size, rounded up to
 1 KB; the head item stays well under 1 KB, so a head update or a fence is the cheapest action a commit
 can send, and it no longer scales with the size of a snapshot. (Whether a `ConditionCheck` bills by
@@ -73,9 +91,9 @@ DynamoDB with the `dynamo/awsmeasure` script: [#159](https://github.com/photon-g
 There are no reads before a commit. A failed commit is told apart by reading the stream on the
 failure path only ([Classification](spec/storage-format.md#failure-classification)). A head item
 that disagrees with its log is `*evt.StreamHeadDriftError`, and a store that holds data without
-declaring the `stream-heads` feature is refused with `*evt.StreamHeadsNotMigratedError` until it is
-migrated; an empty table is declared by its first writer, so a fresh table needs no step. A table
-written by v0.8 is migrated with `evt-doctor migrate-heads` (stop-the-world, one-way): see the
+declaring the `stream-heads` feature is refused until it is migrated (initialization refuses it with
+`*evt.StreamHeadsNotMigratedError`); an empty table is initialized once with `evt-doctor init`. A
+table written by v0.8 is migrated with `evt-doctor migrate-heads` (stop-the-world, one-way): see the
 [migration runbook](migrating-to-stream-heads.md).
 
 The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C2/C3/C10) is:

@@ -96,7 +96,7 @@ func TestCommit_PreflightSizesNonPutProjectorItems(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			fake := compat.NewFakeDynamo()
-			repo := dynamo.NewRepository(fake, "events")
+			repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 			err := repo.Commit(context.Background(), evt.SerializedResult{
 				Events: []evt.SerializedEvent{{
@@ -116,7 +116,7 @@ func TestCommit_PreflightSizesNonPutProjectorItems(t *testing.T) {
 func TestCommit_NamesTheStreamWhoseItemFailed(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	event := func(id string, sequence evt.EventSequence) evt.SerializedEvent {
 		return evt.SerializedEvent{
@@ -141,7 +141,7 @@ func TestCommit_NamesTheStreamWhoseItemFailed(t *testing.T) {
 func TestCommitStream_Refuses(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	entry := evt.SerializedResult{Events: []evt.SerializedEvent{{
 		ID: evt.GetEventID("batch-plain", 1), Sequence: 1, Type: "t:created", Version: 1,
@@ -167,7 +167,7 @@ func TestCommitStream_Refuses(t *testing.T) {
 func TestCommit_RefusesFencesForLocallyRetainedTypesWithoutAManifest(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events").WithRetention(dynamo.Retention{"scratch": time.Hour})
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithRetention(dynamo.Retention{"scratch": time.Hour})
 
 	fenced := func(entityType evt.EntityType) evt.SerializedResult {
 		return evt.SerializedResult{
