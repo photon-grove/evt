@@ -71,7 +71,7 @@ err := evt.ReadAtRebuildEpoch(ctx, fence, func(ctx context.Context) error {
   both are transient (`policy.IsTransient`), so retry the command later. A rebuild that begins
   after the read is stopped by the commit's lock check instead.
 
-See the [storage format](spec/storage-format.md#rebuild-fence) for the rows, the transactions, and
+See the [storage format](../reference/storage-format.md#rebuild-fence) for the rows, the transactions, and
 the PostgreSQL equivalent.
 
 ## Commit-wide projectors
@@ -169,7 +169,7 @@ every delete as a claim, whether or not it removes a row.
 written. A put overwrites unless it is `IfAbsent`; a delete of a missing row succeeds unless it is
 `IfPresent`. `OnConflict(err)` names the error to return when the condition fails. Projectors are
 appended in the order `WithCommitProjectors` was called, each one's operations in emission order,
-after the marker and rebuild-lock checks and before the written streams ([layout](spec/storage-format.md#writes)).
+after the marker and rebuild-lock checks and before the written streams ([layout](../reference/storage-format.md#writes)).
 Before any write, on every backend, the engine refuses an operation with an empty or non-UTF-8 key,
 a `pk` over 2,048 or an `sk` over 1,024 UTF-8 bytes (`*evt.ViewKeyTooLongError`), and two
 operations on the same row (`*evt.DuplicateViewKeyError`). Operations count against the
@@ -204,7 +204,7 @@ over the groups with `evt.ReplayViews`. For a **history-dependent** projector th
 `go/snapshots/projectors_test.go`). For a **current-state** projector the same replay works because
 the state is yours to supply, but there is no engine entry point yet that rebuilds current-state
 rows from the current state of the streams alone (the state-based rebuild is specified in the
-[storage format](spec/storage-format.md#views) and lands with the rebuild ports); until then,
+[storage format](../reference/storage-format.md#views) and lands with the rebuild ports); until then,
 treat a current-state projector's rows as reproducible only by replaying with folded state.
 Nothing rebuilds the rows of a durable view table by itself today.
 
@@ -302,7 +302,7 @@ queries each partition (seeding from the `sk=0` snapshot and applying events aft
 bounded by the entity count, and it does not depend on scan ordering. If `SeedAggregate` is set but
 the repository does not implement `evt.SnapshotStreamer`, `RebuildProjections` returns an error
 rather than silently producing partial state. See
-[ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
+[ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
 
 To drive it yourself, the DynamoDB repository exposes `StreamEntitiesFromSnapshotsWithOptions`:
 

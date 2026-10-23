@@ -126,14 +126,14 @@ consumer repos). Backends opt in by implementing the methods; `dynamo` and `mem`
   `eventSeq < :first` term below are superseded by the stream's head item: a commit conditions on
   `head = first - 1`, and a snapshot never covers more than the head, so a commit at or below the
   snapshot's `eventSeq` still conflicts without any transaction item on `sk = 0`. Compaction never
-  touches the head item. See `docs/spec/storage-format.md`, Stream Heads.
+  touches the head item. See `docs/reference/storage-format.md`, Stream Heads.
 - **Amendment (2026-10-12): the floor is enforced on commit.** The stale-context window also let the
   stale commit's projector operations apply, regressing views. Commits now reject a first sequence at
   or below the snapshot's `eventSeq`. DynamoDB adds a `ConditionCheck` on the `sk = 0` item
   (`attribute_not_exists(eventSeq) OR eventSeq < :first`), folded into the snapshot put's condition
   when the commit writes a snapshot. PostgreSQL checks the snapshot row after inserting the events,
   in the same transaction. The Go and Rust implementations share these conditions; see
-  `docs/spec/storage-format.md`. On DynamoDB the floor check is one more transaction item per
+  `docs/reference/storage-format.md`. On DynamoDB the floor check is one more transaction item per
   commit without a snapshot (per entity, for `CommitStream`). It is billed as a write and counts
   toward the 100-item limit.
 - **Amendment (v0.9, C9): history-dependent projectors forbid compaction.** An aggregate snapshot

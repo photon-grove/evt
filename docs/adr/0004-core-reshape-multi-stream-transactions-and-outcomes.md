@@ -6,7 +6,7 @@ Accepted (2026-10-13). Capabilities C1–C11 of the vNext plan: the core reshape
 transactions, read fences, command outcomes, rejections, fence-aware retry, metadata additions,
 commit-wide projectors, `latest(n)` and reserved namespaces, the feature marker, the rebuild
 fence, and shared conformance. Tracking:
-[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
+[`docs/reference/feature-matrix.md`](../reference/feature-matrix.md).
 
 _Amended by [ADR 0007](0007-per-stream-head-item.md): a per-stream head item replaces the
 continuation check, the floor check, and the fence's snapshot companion in C1 and C2._
@@ -33,7 +33,7 @@ Meanwhile the framework itself only executes one aggregate per commit:
 
 At the same time the duplicate-command check only covers events replayed since the latest snapshot
 (`Loaded::has_seen`, `crates/evt/src/store.rs`; the dedupe window is documented in
-[`docs/spec/storage-format.md`](../spec/storage-format.md)), so a command whose first attempt also
+[`docs/reference/storage-format.md`](../reference/storage-format.md)), so a command whose first attempt also
 wrote a snapshot can run twice. Rebuilds have no fence: a rebuild and a live writer can interleave
 unchecked. And retry is blind: `policy.ExecuteWithRetry` (Go,
 `policy/commit.go`) and `execute_with_retry` (Rust,
@@ -60,7 +60,7 @@ anything in the commit path or storage contract lands in **both** languages:
   as it does today.
 - Both implementations run the shared conformance suite, extended to cover C1–C10, and both pass
   the live interleaved cross-language run (`scripts/compat-integration.sh dynamo|postgres`).
-- The spec ([`docs/spec/storage-format.md`](../spec/storage-format.md)) gains byte-level examples
+- The spec ([`docs/reference/storage-format.md`](../reference/storage-format.md)) gains byte-level examples
   for every new item shape before either implementation ships.
 
 Single-aggregate execution stays: Go's `Store`/`Execute` and Rust's `Store::execute` remain the
@@ -578,7 +578,7 @@ The rows live in the reserved `SYSTEM#` namespace (C8), skipped by enumeration a
 PostgreSQL the same rows are table rows checked in the commit transaction.
 
 **Implementation (E2.7/E3.7).** The decision above is implemented in both languages on every
-backend; the storage spec's [Rebuild Fence](../spec/storage-format.md#rebuild-fence) is normative
+backend; the storage spec's [Rebuild Fence](../reference/storage-format.md#rebuild-fence) is normative
 and pins the bytes. What the decision left open:
 
 - The commit-time check sits at action 2 of every commit, after the marker check, and costs one
@@ -649,7 +649,7 @@ core golden fixtures as today. The suite, not the ADR, is the executable contrac
   collide with entity IDs. Entity IDs beginning with these prefixes are rejected at commit, and
   pre-existing streams in a reserved namespace must be renamed (migrated) before enabling the
   v0.9 features — `evt-doctor` reports them (C8), so no stored data is silently skipped.
-- **Spec and fixtures first.** No code lands before `docs/spec/storage-format.md` carries the
+- **Spec and fixtures first.** No code lands before `docs/reference/storage-format.md` carries the
   byte-level shapes (plan E1.1); both implementations then pass the regenerated fixtures and the
   shared conformance suite.
 

@@ -5,7 +5,7 @@
 Accepted (2026-10-13). Capabilities X1–X3 of the vNext plan; plan decision D2 (extensions are
 Rust-first) and plan decision D4 (the feature-marker row enforces declared extensions, see
 [ADR 0004](0004-core-reshape-multi-stream-transactions-and-outcomes.md) C9). Tracking:
-[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
+[`docs/reference/feature-matrix.md`](../reference/feature-matrix.md).
 
 ## Context
 
@@ -67,7 +67,7 @@ Rust-first is justified because:
 
 1. **Rust-generated fixtures with byte-level spec examples.** The journal, its compaction, and the
    Lambda wire formats get fixtures (`compat/fixtures/`, extension namespace) generated from the
-   Rust implementation, and `docs/spec/storage-format.md` gains byte-level examples for every new
+   Rust implementation, and `docs/reference/storage-format.md` gains byte-level examples for every new
    row — the same discipline the core follows, with the generator role swapped. A future Go port
    writes code until it passes the Rust-generated fixtures byte for byte, exactly as Rust does
    today for Go-generated core fixtures.
@@ -99,7 +99,7 @@ Rust-first is justified because:
   because the core's `journal` feature is build-wide (below).
 - **The Go port has a defined entry point.** When a Go consumer appears, the work is: port from
   spec + Rust-generated fixtures, extend `conformance` and the shared scenario list, and flip the
-  Go column in [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md). Until the port
+  Go column in [`docs/reference/feature-matrix.md`](../reference/feature-matrix.md). Until the port
   lands, the matrix records the extension as Rust ⏳ / Go —; once it ships, it moves to
   Rust ✅ / Go ⏸ deferred.
 - **Fixtures gain a second generator.** `go/internal/compat` (Go) keeps generating core fixtures;

@@ -11,7 +11,7 @@ Accepted (2026-10-12)
   compaction rules, without a translation layer between them.
 - The storage format was defined by the Go code: DynamoDB item layout, PostgreSQL schema, the
   `encoding/json` output of serialized events, metadata, and snapshots, the SNS envelope, and the
-  snapshot policy. Most of it was written down in `BEHAVIORAL_INVARIANTS.md`, but byte-level details
+  snapshot policy. Most of it was written down in `docs/internal/behavioral-invariants.md`, but byte-level details
   (key order, HTML escaping, base64 payloads, null handling) existed only in the code.
 - There are three ways to give Rust access to the log:
   1. **Shared core through FFI or WASM.** Compile one implementation and call it from the other
@@ -32,7 +32,7 @@ cross-language test run instead of shared code.
 
 ### 1. The storage format is a written contract
 
-[`docs/spec/storage-format.md`](../spec/storage-format.md) documents every byte both
+[`docs/reference/storage-format.md`](../reference/storage-format.md) documents every byte both
 implementations depend on, including the deliberate differences between them.
 
 ### 2. Go generates golden fixtures; both languages assert them

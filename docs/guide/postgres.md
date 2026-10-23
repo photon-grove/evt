@@ -6,7 +6,7 @@ projector, and snapshot code you write does not change between backends — only
 the wiring does. The backend passes `conformance.RunRepositorySuite` with
 `SupportsSnapshots` and `EnforcesOptimisticConcurrency` enabled. The Rust
 `photon-evt` crate reads and writes the same tables (see the
-[storage format](spec/storage-format.md)).
+[storage format](../reference/storage-format.md)).
 
 ## Wiring
 
@@ -72,7 +72,7 @@ lockstep with the Go types that read and write it:
   and asserts the owner and an unexpired lease in the transaction that carries the view statements,
   so a takeover waits for it and a worker that lost the lock aborts without writing. A database
   created before the fence has neither table: commits pass until `EnsureSchema` creates them. See
-  [Rebuild fence](../README.md#rebuild-fence-v09-c10).
+  [Rebuild fence](../../README.md#rebuild-fence-v09-c10).
 
 Every `SerializedResult` is committed inside a single SQL transaction, so events
 and their snapshot are never observable apart.
@@ -87,7 +87,7 @@ its own table and is never touched, so it remains the authoritative floor.
 Uncovered requests return `evt.ErrCompactionUncovered` and delete nothing.
 Rebuild compacted streams via the snapshot-aware path
 (`evt.SnapshotStreamer.StreamEntitiesFromSnapshots` / `RebuildConfig.SeedAggregate`).
-See [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
+See [ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
 
 ### Incremental rebuilds
 

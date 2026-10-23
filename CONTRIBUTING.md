@@ -36,7 +36,7 @@ stack.
 ## Storage Format Changes
 
 The Go and Rust implementations share one storage format
-([spec](docs/spec/storage-format.md)). A change to DynamoDB items, PostgreSQL rows,
+([spec](docs/reference/storage-format.md)). A change to DynamoDB items, PostgreSQL rows,
 serialized JSON, envelopes, or the snapshot policy must:
 
 1. regenerate the fixtures with `go -C go test ./internal/compat -run TestFixtures -update`;

@@ -31,7 +31,7 @@ describe('humanizeSlug', () => {
 
 describe('slugFromPath', () => {
   it('strips the docs prefix and .md extension, preserving nesting', () => {
-    expect(slugFromPath('../../docs/projections.md')).toBe('projections')
+    expect(slugFromPath('../../docs/guide/projections.md')).toBe('guide/projections')
     expect(slugFromPath('../../docs/adr/0001-event-compaction-and-snapshot-truncation.md')).toBe(
       'adr/0001-event-compaction-and-snapshot-truncation',
     )

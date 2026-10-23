@@ -6,7 +6,7 @@ Go [`evt`](https://github.com/photon-grove/evt) framework.
 Events written by this crate and by Go's `evt` are interchangeable: the same DynamoDB items,
 PostgreSQL rows, serialized JSON, and stream envelopes, byte for byte. Services in either language
 can append to and load the same streams. The
-[storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md) is
+[storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md) is
 documented, and shared fixtures plus a live cross-language test run enforce it.
 
 - Define events with `domain_events!` and state with the `Aggregate` trait.
@@ -727,7 +727,7 @@ match page(&repository, &scope, after, 100).await {
   compaction refuses the table. `photon_evt::conformance::compaction_cases` checks a backend
   (`CompactionStore`: the in-memory and DynamoDB repositories).
 
-The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md#journal),
+The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#journal),
 and `photon_evt::conformance::journal_cases` (features `journal` and `conformance`) checks a backend.
 
 ## Rebuild fence
@@ -932,9 +932,9 @@ photon_evt::conformance::enumeration_cases(&my_repository).await;
   readers before writers when you bump an event version.
 
 The known differences are listed in the
-[storage format](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md#known-differences).
+[storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#known-differences).
 
-The [feature parity matrix](https://github.com/photon-grove/evt/blob/main/docs/parity/feature-matrix.md)
+The [feature parity matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks every capability across languages. The vNext plan's core reshape (multi-stream
 transactions, command outcomes, fences —
 [ADR 0004](https://github.com/photon-grove/evt/blob/main/docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md)),

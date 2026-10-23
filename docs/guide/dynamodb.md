@@ -7,8 +7,8 @@ the snapshot, compaction, and retention options for growing logs.
 
 > The key patterns, attribute names, and serialized formats below are a stability
 > contract. Treat changes to them as breaking and document them. See
-> [`BEHAVIORAL_INVARIANTS.md`](https://github.com/photon-grove/evt/blob/main/BEHAVIORAL_INVARIANTS.md)
-> and the [storage format](spec/storage-format.md), which the Rust `photon-evt`
+> [`docs/internal/behavioral-invariants.md`](https://github.com/photon-grove/evt/blob/main/docs/internal/behavioral-invariants.md)
+> and the [storage format](../reference/storage-format.md), which the Rust `photon-evt`
 > crate implements too: Go and Rust services can share one table.
 
 ## Wiring
@@ -37,7 +37,7 @@ A single table holds events and inline snapshots for every entity.
 - `sk = 0` — the inline **snapshot** row for that entity
 - plus `type`, `version`, `entityType`, `payload`, and `metadata` attributes
 - `sk = -1` — the stream's **head item** (`head`, and `ttl` for retained types), the one item a
-  commit conditions on for concurrency ([Stream Heads](spec/storage-format.md#stream-heads))
+  commit conditions on for concurrency ([Stream Heads](../reference/storage-format.md#stream-heads))
 - optional `ttl` (`N`) when a [retention](#retention) policy applies
 - **DynamoDB Streams** with `NEW_IMAGE` when using async [projectors](streams.md)
 
@@ -47,7 +47,7 @@ entity stay correctly ordered. Each written stream also starts its group with on
 `Update` of its head item: `head = first − 1` (or `attribute_not_exists(head)` for a stream that
 starts at 1), so no sequence is ever skipped and a commit that starts at or below a snapshot's
 `eventSequence` is rejected, which keeps a writer that loaded before a compaction from recreating the
-deleted events ([Continuity](spec/storage-format.md#continuity)). Compaction never moves the head,
+deleted events ([Continuity](../reference/storage-format.md#continuity)). Compaction never moves the head,
 so a writer whose load is current never conflicts with it. Every v0.9 commit also carries a
 feature-marker check and a rebuild-lock check. Of the 100 transaction items, a single-stream commit
 reserves three (head update + marker + rebuild lock), leaving **97 event/projector operations**
@@ -63,7 +63,7 @@ writer's role needs `dynamodb:UpdateItem` on the event-log table as well as `Put
 feature, and scans once more to prove no stream without a head item slipped in before the
 declaration (`dynamodb:Scan`); a writer to a table that already declares the feature never scans.
 Writers older than the head item never read the marker, so they must be stopped before the first
-head-aware writer runs against a table ([the obligation](spec/storage-format.md#required-feature)). Every
+head-aware writer runs against a table ([the obligation](../reference/storage-format.md#required-feature)). Every
 transactional action is billed as two writes of the checked or written item's size, rounded up to
 1 KB; the head item stays well under 1 KB, so a head update or a fence is the cheapest action a commit
 can send, and it no longer scales with the size of a snapshot. (Whether a `ConditionCheck` bills by
@@ -71,14 +71,14 @@ the size of the item it reads is documented only indirectly, and is still to be 
 DynamoDB with the `go/backends/dynamo/awsmeasure_test.go` script: [#159](https://github.com/photon-grove/evt/issues/159).)
 
 There are no reads before a commit. A failed commit is told apart by reading the stream on the
-failure path only ([Classification](spec/storage-format.md#failure-classification)). A head item
+failure path only ([Classification](../reference/storage-format.md#failure-classification)). A head item
 that disagrees with its log is `*evt.StreamHeadDriftError`, and a store that holds data without
 declaring the `stream-heads` feature is refused with `*evt.StreamHeadsNotMigratedError` until it is
 migrated; an empty table is declared by its first writer, so a fresh table needs no step. A table
 written by v0.8 is migrated with `evt-doctor migrate-heads` (stop-the-world, one-way): see the
 [migration runbook](migrating-to-stream-heads.md).
 
-The full v0.9 target ([storage item budget](spec/storage-format.md#writes), C1/C2/C3/C10) is:
+The full v0.9 target ([storage item budget](../reference/storage-format.md#writes), C1/C2/C3/C10) is:
 
 ```text
 items = Σ(events per written stream + 1 head update + 1 snapshot put if the commit writes one)
@@ -102,7 +102,7 @@ the lock, an expired one included, and is reported as `*evt.RebuildInProgressErr
 other failure but the marker check. It is billed as one write unit like the marker check.
 Every lease-guarded write is conditioned on the lock item's `owner` and `generation` (the fencing token
 `Begin` returned), so `End` sends only its one transaction, with no read first. Rebuild workers manage the lock and its generation counter through `Repository.RebuildFence()`
-([Rebuild fence](../README.md#rebuild-fence-v09-c10)); the lifecycle's transactions write only the
+([Rebuild fence](../../README.md#rebuild-fence-v09-c10)); the lifecycle's transactions write only the
 two `SYSTEM#REBUILD*` items, and a worker's role needs `dynamodb:PutItem`, `dynamodb:UpdateItem`,
 `dynamodb:DeleteItem` and `dynamodb:ConditionCheckItem` on the table for them, and `GetItem` for
 the consistent reads of the generation.
@@ -150,13 +150,13 @@ already committed prefix, leaving the stream partially compacted. A history-depe
 then reports `CompactionUncovered`, rather than silently replaying incomplete history. Declare
 history dependence **before writing data of that entity type**. PostgreSQL instead holds its
 shared feature advisory lock through validation and all deletes in one transaction. See
-[Feature Marker](spec/storage-format.md#feature-marker).
+[Feature Marker](../reference/storage-format.md#feature-marker).
 
 There is no raw delete helper. For fixture teardown or reset, delete the items with the AWS SDK or
 recreate the table. `CompactBelow` is for snapshot-verified truncation, not fixture cleanup: it only
 deletes a snapshot-covered prefix and never deletes the snapshot row.
 Prefer `CompactBelow` for principled truncation in any environment. Background and rationale
-live in [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
+live in [ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
 
 ### Retention
 

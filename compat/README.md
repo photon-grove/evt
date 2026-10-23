@@ -2,12 +2,12 @@
 
 This directory holds the shared inputs and golden outputs that keep the Go `evt` packages and the
 Rust `photon-evt` crate wire-compatible. The contract itself is
-[`docs/spec/storage-format.md`](../docs/spec/storage-format.md), and the reasoning is in
+[`docs/reference/storage-format.md`](../docs/reference/storage-format.md), and the reasoning is in
 [ADR 0003](../docs/adr/0003-rust-implementation-and-cross-language-compatibility.md).
 
 | Path                      | Written by   | Contents                                                                                                                                                                                              |
 | ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes the C6 `metadata-extensions` handoff; remaining v0.9 scenarios for E2.8/E3.8 are listed in the [storage format](../docs/spec/storage-format.md#compat-scenarios-to-add). Includes the C10 `rebuild-fence` scenario, which is `exclusive`. |
+| `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes the C6 `metadata-extensions` handoff; remaining v0.9 scenarios for E2.8/E3.8 are listed in the [storage format](../docs/reference/storage-format.md#compat-scenarios-to-add). Includes the C10 `rebuild-fence` scenario, which is `exclusive`. |
 | `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
 | `fixtures/views.json`     | Go generator | P1/P2/P10 view repository vectors: the items `PutView` writes (default `VIEW` sort key, `ttl`), delete and get keys, items read back (lenient decoding), the `Query` requests of the paged lists (with their `ConsistentRead`: strong on the table, unset on the index), pagination cursors (encode and decode), and the payload bytes of the typed `viewcodec.Codec`. |
 | `fixtures/outcomes.json`  | Go generator | C3/C4 identity-digest vectors (canonical bytes and SHA-256, keyed by `targets`, including a rename whose write set comes from state), the encodings of outcome rows (DynamoDB item, budgeted item size, PostgreSQL row, rejection and event-ID JSON, including both stale-fence rejections and a rejection that lists the events it committed), the canonical text of rejection-detail numbers, and the C5 retry-policy defaults both languages assert. |

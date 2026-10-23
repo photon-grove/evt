@@ -4,7 +4,7 @@
 
 Accepted (2026-10-13). Plan decision D6, defined below (port/defer/cut thresholds); rows
 P1–P10, F1–F5, K1–K7. Tracking:
-[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
+[`docs/reference/feature-matrix.md`](../reference/feature-matrix.md).
 
 ## Context
 
@@ -17,7 +17,7 @@ decision: which Go features does Rust need in the port window, which can wait, a
 stop existing anywhere?
 
 Deciding per feature ad hoc produces half-finished ports. Plan decision D6 fixes the policy, and
-the [feature matrix](../parity/feature-matrix.md) is where the decisions live.
+the [feature matrix](../reference/feature-matrix.md) is where the decisions live.
 
 ## Decision
 
@@ -40,7 +40,7 @@ languages.
 ### Feature verdicts
 
 Go features `photon-evt` lacks, and their verdicts. The matrix
-([`docs/parity/feature-matrix.md`](../parity/feature-matrix.md)) carries the authoritative current
+([`docs/reference/feature-matrix.md`](../reference/feature-matrix.md)) carries the authoritative current
 state; the reasoning lives here.
 
 | ID  | Feature                                                                                                                                                        | Near-term need | Verdict                   | Why                                                                                                                                                                                                                                                                                                              |
@@ -86,7 +86,7 @@ cross-language storage format, so the format lives on even as the publisher runt
 
 ### Matrix upkeep (D7)
 
-[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md) is the tracking source of truth,
+[`docs/reference/feature-matrix.md`](../reference/feature-matrix.md) is the tracking source of truth,
 not this ADR. The rules:
 
 - **Every capability-changing PR updates its row** in the matrix — status, tier, or a new row for

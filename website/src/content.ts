@@ -28,27 +28,27 @@ export const capabilities: ContentCard[] = [
   {
     title: 'Command execution',
     body: 'Load an aggregate, run a command, serialize produced events, and commit them with optimistic concurrency.',
-    doc: 'getting-started',
+    doc: 'guide/getting-started',
   },
   {
     title: 'DynamoDB event log',
     body: 'Store immutable event rows under stable pk/sk keys, with inline snapshots at sk=0 and conditional writes for ordering.',
-    doc: 'dynamodb',
+    doc: 'guide/dynamodb',
   },
   {
     title: 'Materialized views',
     body: 'Write deterministic read-model rows through projection transactions and rebuild them by replaying events.',
-    doc: 'projections',
+    doc: 'guide/projections',
   },
   {
     title: 'Snapshots and upcasters',
     body: 'Keep replay fast while allowing old event payloads to evolve through explicit versioned upcasters.',
-    doc: 'concepts',
+    doc: 'guide/concepts',
   },
   {
     title: 'Fan-out projectors',
     body: 'Projectors read the DynamoDB Stream directly (or through SNS→SQS) with idempotency, retry classification, and partial-batch failure responses.',
-    doc: 'streams',
+    doc: 'guide/streams',
   },
 ]
 
@@ -76,32 +76,32 @@ export const cookbook: ContentCard[] = [
   {
     title: 'Single-table event log',
     body: 'Keep one DynamoDB event-log table for events and inline snapshots — pk as entity ID, sk as numeric sequence.',
-    doc: 'dynamodb',
+    doc: 'guide/dynamodb',
   },
   {
     title: 'Projection rebuilds',
     body: 'Treat view tables as disposable. Wipe a bad read model, replay entities, and write deterministic rows again.',
-    doc: 'projections',
+    doc: 'guide/projections',
   },
   {
     title: 'Command deduplication',
     body: 'Pass a stable command ID in metadata so duplicate retries fail safely instead of recording duplicate facts.',
-    doc: 'integration-cookbook',
+    doc: 'guide/integration',
   },
   {
     title: 'Schema evolution',
     body: 'Bump event versions when payload shape changes and register upcasters with fixtures for every historical shape.',
-    doc: 'concepts',
+    doc: 'guide/concepts',
   },
   {
     title: 'Stream fanout',
     body: 'Publish only event-log INSERT records. Drop malformed rows deliberately and return partial-batch failures.',
-    doc: 'streams',
+    doc: 'guide/streams',
   },
   {
     title: 'Local integration',
     body: 'Run Moto, apply infra/local Terraform, then run the integration task with AWS_ENDPOINT_URL on the emulator.',
-    doc: 'integration-cookbook',
+    doc: 'guide/integration',
   },
 ]
 

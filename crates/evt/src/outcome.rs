@@ -6,7 +6,7 @@
 //! repeat with another digest is [`Error::IdempotencyKeyReuse`]; a domain error becomes a durable
 //! rejected outcome that a retried command replays verbatim.
 //!
-//! See `docs/spec/storage-format.md` ("Command Outcomes", "Rejections") for the stored shape. The
+//! See `docs/reference/storage-format.md` ("Command Outcomes", "Rejections") for the stored shape. The
 //! pieces here are:
 //!
 //! - [`Outcome`], the stored row, and [`CommandOutcome`], what an execution returns;

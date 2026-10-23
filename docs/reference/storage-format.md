@@ -2482,7 +2482,7 @@ On PostgreSQL steps 3 to 5 are one transaction (see [PostgreSQL](#postgresql-hea
 stopped before it and started after it.
 
 The operator procedure, with the commands, the verification and repair findings, and the rollback,
-is the [migration runbook](../migrating-to-stream-heads.md). `migrate-heads` is Go only (the Rust
+is the [migration runbook](../guide/migrating-to-stream-heads.md). `migrate-heads` is Go only (the Rust
 crate has no doctor); Rust writers run against a migrated store like any head-aware writer.
 
 A v0.8 writer that runs after the declaration leaves the head item stale: head-aware writers then
@@ -2549,8 +2549,8 @@ stored items gain the head item, and each PostgreSQL stream a heads row recorded
 `commits`) and edited `compat/scenarios.json` (new `stream-heads-snapshot-guard` and
 `stream-heads-drift`, with the `putSnapshot` and `appendRawBypassingHead` ops). It also touched
 `go/internal/compat/fakedynamo.go` (an `Update` action and the new condition strings), the in-memory
-backends, both conformance suites, `BEHAVIORAL_INVARIANTS.md`, `docs/dynamodb.md`, and
-`docs/streams.md`. The migration scenarios (`stream-heads-migration`, `stream-heads-compaction`)
+backends, both conformance suites, `docs/internal/behavioral-invariants.md`, `docs/guide/dynamodb.md`, and
+`docs/guide/streams.md`. The migration scenarios (`stream-heads-migration`, `stream-heads-compaction`)
 are not in the shared scenarios yet. The migration is Go only, and a shared fixture table cannot be
 re-declared mid-run, so the Go live suites exercise it on both backends instead (v0.8-layout
 stores, resume, verify, repair, the declare re-verify, and head-aware writers afterwards); the
@@ -3538,4 +3538,4 @@ The format changes only on purpose. A change must:
 3. Pass the live cross-language suite on both backends (`scripts/compat-integration.sh`).
 4. Keep older stored data readable: add upcasters for changed event payloads and fixture coverage
    for the old shape.
-5. Update this document and `BEHAVIORAL_INVARIANTS.md`.
+5. Update this document and `docs/internal/behavioral-invariants.md`.

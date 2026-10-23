@@ -27,7 +27,7 @@ at-least-once retry duplicates.
 
 For retries that must return the original answer, and that must keep working after the first
 attempt's events were folded into a snapshot, enable
-[command outcomes](../README.md#command-outcomes-and-rejections-v09-c3c4) with
+[command outcomes](../../README.md#command-outcomes-and-rejections-v09-c3c4) with
 `store.WithOutcomes()` and call `ExecuteWithOutcome`: a retry with the same ID and the same
 command returns the stored outcome (`Replayed`), a different command under the same ID is
 `evt.ErrIdempotencyKeyReuse`, and a command whose result was lost to a timeout is resolved by
@@ -35,7 +35,7 @@ re-reading the outcome row rather than re-running it. Use a stable idempotency k
 request, never one per attempt.
 
 A command that loses a race with another writer is re-prepared for you
-([fence-aware retry](../README.md#command-outcomes-and-rejections-v09-c3c4)): the handler runs again
+([fence-aware retry](../../README.md#command-outcomes-and-rejections-v09-c3c4)): the handler runs again
 against fresh state, up to `store.WithRetry(...)` attempts, and when they run out the command is
 recorded as a `stale-fence` rejection that a replay of the same ID returns. Write handlers that are
 safe to run more than once, and use a new key to try again after a stale-fence rejection. Give a
@@ -56,7 +56,7 @@ second step is not atomic, and accepting the command gives the client the wrong 
 event with the rejection instead: in Go, mark the handler's error with `evt.RejectWithEvents` (in a
 `Prepare` function, stage the event with `tx.Append` first); in Rust, return it from
 `Aggregate::rejection_events` or finish with `Decision::reject_with_events`. The event and the
-rejected [outcome](../README.md#command-outcomes-and-rejections-v09-c3c4) commit together or not
+rejected [outcome](../../README.md#command-outcomes-and-rejections-v09-c3c4) commit together or not
 at all, a replay of the command ID returns the rejection without writing the event again, and a
 command that loses a race is re-prepared and may decide differently. Decide which events belong
 there as you would for an accepted command: record facts, never view state.

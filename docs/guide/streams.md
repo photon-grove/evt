@@ -20,7 +20,7 @@ directly with no topic hop.
 ### Head items are not events
 
 Every written stream also has a **head item** at `sk = -1` (ADR 0007, [storage
-format](spec/storage-format.md#stream-heads)), updated by every commit that writes the stream. The
+format](../reference/storage-format.md#stream-heads)), updated by every commit that writes the stream. The
 stream therefore carries one `INSERT` for it with a stream's first commit, one `MODIFY` per later
 commit, and one record per stream from the head migration. They are concurrency metadata, not
 events, and a consumer skips them. The consumers in this module do: `stream.DynamoDBHandler` drops
@@ -92,7 +92,7 @@ The runtime adds:
 ## Publishing onward
 
 The library no longer ships an SNS publisher or ingress budgets ([ADR
-0006](adr/0006-parity-policy-and-feature-cuts.md), K5), so there are two ways to feed consumers.
+0006](../adr/0006-parity-policy-and-feature-cuts.md), K5), so there are two ways to feed consumers.
 
 Projector-style consumers can read the DynamoDB Stream directly with
 `projectors.NewLambdaHandler`, which skips the SNS hop entirely.
@@ -119,7 +119,7 @@ is the cross-language wire format, so it stays. Rust encodes it with
 If you publish to SNS, add message attributes such as `entityType`, `eventType`, `commandId` and
 `correlationId` so subscribers can filter without parsing the body.
 
-Command outcomes ([C3/C4](../README.md#command-outcomes-and-rejections-v09-c3c4)) make commands
+Command outcomes ([C3/C4](../../README.md#command-outcomes-and-rejections-v09-c3c4)) make commands
 idempotent and record their results, but they don't consume the stream or publish anything.
 
 ## Reliability checklist

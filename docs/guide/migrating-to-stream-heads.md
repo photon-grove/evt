@@ -1,11 +1,11 @@
 # Migrating a v0.8 store to stream heads
 
 Runbook for `evt-doctor migrate-heads`. A table or database written by v0.8 has streams with no
-[head items](spec/storage-format.md#stream-heads). A head-aware writer refuses it
+[head items](../reference/storage-format.md#stream-heads). A head-aware writer refuses it
 (`*evt.StreamHeadsNotMigratedError`, Rust `Error::StreamHeadsNotMigrated`) until the stream heads
 are backfilled, verified, and the required `stream-heads` feature is declared. This page is the
 operator procedure. The rules it implements are the [storage format's
-Migration](spec/storage-format.md#migration) and [ADR 0007](adr/0007-per-stream-head-item.md#migration-and-compatibility).
+Migration](../reference/storage-format.md#migration) and [ADR 0007](../adr/0007-per-stream-head-item.md#migration-and-compatibility).
 
 **You need this only for a store that already holds streams written by v0.8.** A fresh table or
 database needs no step: its first head-aware writer declares the feature. A store that already

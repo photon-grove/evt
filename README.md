@@ -2,7 +2,7 @@
 
 **Event sourcing for Go without a framework runtime.**
 
-[Documentation](https://photon-grove.github.io/evt/) · [Concepts](docs/concepts.md) · [Getting Started](docs/getting-started.md) · [Invariants](BEHAVIORAL_INVARIANTS.md) · [Storage Format](docs/spec/storage-format.md) · [Feature Matrix](docs/parity/feature-matrix.md)
+[Documentation](https://photon-grove.github.io/evt/) · [Concepts](docs/guide/concepts.md) · [Getting Started](docs/guide/getting-started.md) · [Invariants](docs/internal/behavioral-invariants.md) · [Storage Format](docs/reference/storage-format.md) · [Feature Matrix](docs/reference/feature-matrix.md)
 
 `evt` provides append-only logs, optimistic concurrency, snapshots, replayable
 read models, and DynamoDB or PostgreSQL persistence as small Go packages. There
@@ -118,7 +118,7 @@ All packages live under `github.com/photon-grove/evt/go`.
 ## Removals
 
 The features cut by plan decision D6 ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md))
-are deleted. The [parity matrix](docs/parity/feature-matrix.md) records each one (K1 to K7). In
+are deleted. The [parity matrix](docs/reference/feature-matrix.md) records each one (K1 to K7). In
 short:
 
 - `Repository.CommitStream` is gone. Commit batched commands through the normal commit path.
@@ -184,8 +184,8 @@ same head item. A commit whose first sequence skips past the stream's stored hea
 a writer writes to it; an empty store is declared by its first writer, and a store written before
 head items is migrated first (`*evt.StreamHeadsNotMigratedError` until then) with
 `evt-doctor migrate-heads`, a stop-the-world, one-way procedure documented in the [migration
-runbook](docs/migrating-to-stream-heads.md). The exact contract is specified in the [storage
-format](docs/spec/storage-format.md#writes).
+runbook](docs/guide/migrating-to-stream-heads.md). The exact contract is specified in the [storage
+format](docs/reference/storage-format.md#writes).
 
 ### Commit-wide projectors (v0.9, C7)
 
@@ -211,7 +211,7 @@ store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{}) // evt.Co
   of a declared type. The repository stores the owner and refuses any write to the row by another
   stream, so **a row's owner must never change**; to reuse a key, rewrite the row with a tombstone
   as its owner rather than deleting it. A PostgreSQL view writer must enforce the owner in its SQL
-  ([PostgreSQL](docs/postgres.md#views)).
+  ([PostgreSQL](docs/guide/postgres.md#views)).
 - A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` reports the capability,
   so a decorator reports its wrapped repository's) and `evt.HistoryDeclarer` for history-dependent
   projectors, or the commit is refused.
@@ -233,8 +233,8 @@ store := snapshots.NewStore(repo, 5).WithCommitProjectors(directory{}) // evt.Co
   deterministic in its `evt.CommitView`, so a rebuild can reproduce its rows by regrouping the
   stored events with `evt.GroupCommits` (ordered by each stream's sequence) and `evt.ReplayViews`,
   which refuses a row two streams write. See [Commit-wide
-  projectors](docs/projections.md#commit-wide-projectors) and the [storage
-  format](docs/spec/storage-format.md#views).
+  projectors](docs/guide/projections.md#commit-wide-projectors) and the [storage
+  format](docs/reference/storage-format.md#views).
 
 A custom `Repository` receives these operations as `SerializedResult.Views`; one that cannot write
 them in the commit's transaction **must return an error** rather than ignore them.
@@ -288,7 +288,7 @@ _, err = fence.End(ctx, lease)
   string up to 512 bytes without U+0000. The rows are the reserved `SYSTEM#REBUILD` and `SYSTEM#REBUILD#GENERATION`
   items on DynamoDB, and the `{events}__evt_rebuild_lock` and `{events}__evt_rebuild_generation`
   tables on PostgreSQL (`EnsureSchema` creates them). See the [storage
-  format](docs/spec/storage-format.md#rebuild-fence) for the exact transactions.
+  format](docs/reference/storage-format.md#rebuild-fence) for the exact transactions.
 
 ### Command outcomes and rejections (v0.9, C3/C4)
 
@@ -423,7 +423,7 @@ default:
 - A repository opts in by implementing `evt.OutcomeRepository`; the in-memory, DynamoDB, and
   PostgreSQL repositories do (PostgreSQL keeps the rows in `{events}__evt_command_outcomes`, created
   by `EnsureSchema`). On an upgraded log, command IDs recorded before outcomes were enabled keep
-  only the old window check; see the [storage format](docs/spec/storage-format.md#command-outcomes).
+  only the old window check; see the [storage format](docs/reference/storage-format.md#command-outcomes).
   The bare `Store.Commit` does not record outcomes and refuses them.
 
 A custom `Repository` written before v0.9 compiles unchanged but now receives
@@ -440,7 +440,7 @@ only once its `Commit` honors the full contract above. `snapshots.Store.Transact
 `*evt.TransactionsUnsupportedError` (`errors.Is(err, evt.ErrTransactionsUnsupported)`) before
 anything is loaded or written. The in-memory, DynamoDB, and PostgreSQL repositories declare it.
 The Go PostgreSQL repository executes commit-wide view operations through a view writer
-(`WithViewWriter`; see [PostgreSQL](docs/postgres.md#views)), and refuses the operations of a
+(`WithViewWriter`; see [PostgreSQL](docs/guide/postgres.md#views)), and refuses the operations of a
 transaction group built for another storage type with `*evt.ProjectorOperationsUnsupportedError`
 before writing, instead of dropping the view writes.
 To use transactions on a custom backend, make `Commit` atomic over every stream, snapshot, and
@@ -473,7 +473,7 @@ outside this result. Mocks must implement the same signature and bounded-read co
 The [`photon-evt`](crates/evt) crate is a native Rust implementation of the same
 event log: aggregates, a snapshotting store, upcasters, compaction, in-band
 projectors, and DynamoDB and PostgreSQL repositories. It is not a binding to the Go
-code. The [storage format](docs/spec/storage-format.md) is the contract between the
+code. The [storage format](docs/reference/storage-format.md) is the contract between the
 two. Golden fixtures and a live run where Go and Rust take turns writing the same
 streams enforce it (see [`compat/`](compat) and
 [ADR 0003](docs/adr/0003-rust-implementation-and-cross-language-compatibility.md)).
@@ -500,7 +500,7 @@ trim them safely:
   stream then fails with a conflict. For accumulating streams, keep a snapshot and
   compact instead.
 
-All durable Go repositories enforce the [feature marker](docs/spec/storage-format.md#feature-marker)
+All durable Go repositories enforce the [feature marker](docs/reference/storage-format.md#feature-marker)
 by default, with no supported extensions. Unsupported declarations refuse commits and standalone
 snapshot writes atomically. Compaction checks declarations across handles: PostgreSQL holds one
 transaction lock; DynamoDB fences each delete batch, with no whole-operation lease or rollback of
@@ -513,7 +513,7 @@ client and events table; attaching a marker from another client or table is a ty
 error.
 
 See
-[`BEHAVIORAL_INVARIANTS.md`](BEHAVIORAL_INVARIANTS.md) for the exact serialization
+[`docs/internal/behavioral-invariants.md`](docs/internal/behavioral-invariants.md) for the exact serialization
 and DynamoDB schema guarantees.
 
 ## Local Development
@@ -558,7 +558,7 @@ backend.
 ## Documentation
 
 The [docs site](https://photon-grove.github.io/evt/) covers architecture, the
-integration cookbook, the [stream-heads migration runbook](docs/migrating-to-stream-heads.md),
+integration cookbook, the [stream-heads migration runbook](docs/guide/migrating-to-stream-heads.md),
 and runnable examples. Static docs live in [`docs/`](docs/);
 the interactive site lives in [`website/`](website/).
 
@@ -570,7 +570,7 @@ the vNext core reshape — multi-stream transactions, command outcomes, and the 
 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md)), Rust-first
 extensions ([ADR 0005](docs/adr/0005-rust-first-extensions-journal-and-lambda.md)), and the parity
 policy ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md)). The
-[feature parity matrix](docs/parity/feature-matrix.md) tracks every capability across languages.
+[feature parity matrix](docs/reference/feature-matrix.md) tracks every capability across languages.
 
 ```sh
 moon run website:dev

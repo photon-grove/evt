@@ -56,7 +56,7 @@ type CommandResult struct {
 Returning zero events is valid — a command can legitimately decide nothing
 happened. A command carries [metadata](#metadata); a stable `CommandID` makes a
 retried command fail as a `DuplicateCommandError` rather than recording the same
-fact twice. A store with [command outcomes](../README.md#command-outcomes-and-rejections-v09-c3c4)
+fact twice. A store with [command outcomes](../../README.md#command-outcomes-and-rejections-v09-c3c4)
 enabled goes further: it records every command (accepted, accepted with no events, or rejected)
 on a durable `command-outcome#<id>` row and answers a retry with the stored outcome, even when
 the original events were folded into a snapshot long ago. A handler error that implements
@@ -136,7 +136,7 @@ metadata use the struct's field values (including nil values), so embedding
 Use `md.Equal(other)` to compare metadata: it compares effective causation IDs
 and treats nil and empty extension maps as equal, so encoded round trips remain
 equal. `Metadata` contains a map and cannot be compared with `==`. See the
-[storage format](spec/storage-format.md#metadata) for the full encoding contract.
+[storage format](../reference/storage-format.md#metadata) for the full encoding contract.
 
 ## Repository
 
@@ -233,7 +233,7 @@ per commit that writes at least one event, again each time fence-aware retry re-
 command, and not for commands that write no event. When an operation's condition fails the commit
 fails with a typed `*evt.ProjectorOperationError` naming the projector and the operation; it is not
 retried. See [Commit-wide projectors](projections.md#commit-wide-projectors) and the
-[storage format](spec/storage-format.md#views).
+[storage format](../reference/storage-format.md#views).
 
 ## Transaction
 
@@ -246,7 +246,7 @@ commit and its `TransactionGroup` is merged into the same atomic write as the co
 
 A command handler can't attach related writes to its `CommandResult`. Return zero transactions and let
 projectors produce the view writes. [Commit-wide projectors](#commit-wide-projectors) ([ADR
-0004](adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7) emit backend-neutral
+0004](../adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7) emit backend-neutral
 operations for every event in a commit, not just one entity's. The groups of `EventProjector` come
 first in a commit, then the commit-wide projectors'.
 
