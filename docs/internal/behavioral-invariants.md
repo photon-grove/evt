@@ -673,7 +673,7 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 
 ## Journal compaction (X2, Rust-first)
 
-The stored shapes are in the [storage format](../reference/storage-format.md#compaction-x2).
+The stored shapes are in the [storage format](../reference/storage-format.md#journal-compaction).
 
 - **A snapshot before any delete.** A run stores the canonical chunks of rows `1..=checkpoint`,
   swaps the scope's manifest (the checkpoint becomes the floor) in one atomic write with the one
