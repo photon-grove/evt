@@ -1,64 +1,78 @@
 # photon-evt
 
-Event sourcing for Rust with DynamoDB and PostgreSQL event logs that are wire-compatible with the
-Go [`evt`](https://github.com/photon-grove/evt) framework.
+Event sourcing for Rust, with DynamoDB and PostgreSQL event logs that are wire-compatible with the
+Go module, [`github.com/photon-grove/evt/go`](https://github.com/photon-grove/evt/tree/main/go).
+Event sourcing means the log of events is the record of truth, and an aggregate's state is whatever
+you get by folding its events in order. This crate isn't a binding to the Go code. It's a native
+implementation of the same format, so a Go service and a Rust service can append to and load the
+same streams: the same DynamoDB items, PostgreSQL rows, JSON and stream envelopes, byte for byte.
+The [storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md) is written down, and shared fixtures plus a
+live cross-language run hold both languages to it.
 
-Events written by this crate and by Go's `evt` are interchangeable: the same DynamoDB items,
-PostgreSQL rows, serialized JSON, and stream envelopes, byte for byte. Services in either language
-can append to and load the same streams. The
-[storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md) is
-documented, and shared fixtures plus a live cross-language test run enforce it.
+```sh
+cargo add photon-evt                       # the core and the in-memory backend
+cargo add photon-evt --features dynamodb   # or postgres, journal, conformance, testing
+```
 
-- Define events with `domain_events!` and state with the `Aggregate` trait.
-- A `Store` loads aggregates from snapshots, handles commands, and commits events with optimistic
-  concurrency and duplicate-command detection.
-- Backends: `MemRepository` for tests, DynamoDB (feature `dynamodb`), and PostgreSQL (feature
-  `postgres`).
-- `testing` feature: given/when/then `Scenario` and multi-stream `Fixture` over `MemRepository`
-  (see [Testing your domain](#testing-your-domain)).
-- Upcasters migrate old payload versions on read. `compact_below` deletes only events a snapshot
-  covers.
-- In-band projectors write views in the same transaction as the events.
-- **Stream heads (ADR 0007).** Every stream has one small head item (DynamoDB `sk = -1`, or a row
-  in `{events}__evt_stream_heads` on PostgreSQL) recording the highest event sequence committed to
-  it. A commit raises the head with an `Update` conditioned on the head it saw, and a read fence is
-  one check on it, so appends no longer carry a continuation or floor check and fences cost one
-  action instead of two. A stream whose head disagrees with its events or snapshot fails with
-  `Error::StreamHeadDrift`, which is never retried and never recorded as a rejection. Every writer
-  requires the `stream-heads` feature in the marker: a table written before stream heads is
-  refused with `Error::StreamHeadsNotMigrated` until `evt-doctor migrate-heads` has backfilled it
-  and declared the feature (`FeatureMarker::declare_stream_heads` is the hook for that call), and
-  a fresh table is declared by its first writer. DynamoDB scanners skip the head item (`sk < 1`),
-  and a Streams consumer must skip its records (see the storage format spec).
-- `latest(n)` reads a stream's last `n` events newest-first. The `SYSTEM#` and `command-outcome#`
-  namespaces are reserved for engine rows: writes to them are refused, entity heads skip them,
-  and a `SYSTEM#FEATURES` marker row declares the extensions a table uses — a writer that does
-  not support a declared feature refuses to write, including maintenance snapshots. Declaration
-  invalidates the writer's cache; it never grants feature support. Durable history-dependent
-  declarations fence each compaction batch under a marker check (DynamoDB) or all deletes under
-  one transaction lock (PostgreSQL). DynamoDB has no whole-operation lease: a declaration racing
-  multi-batch compaction can leave a partially compacted stream, whose history-dependent rebuild
-  reports `CompactionUncovered`. Declare history dependence before writing data of that type.
-- `EventLog` walks the whole log lazily as a `futures_core::Stream`: `stream_all_events` yields
-  batches of events and `stream_entities` yields folded aggregates, both optionally filtered by
-  entity type (see [Enumerating the log](#enumerating-the-log)).
-- `Store::transaction` loads several aggregates, appends decided events to any of them, and
-  commits once: all streams land or none does. Reads that were not written are fenced at the head
-  they saw, and every event of the commit carries one `commitId` (the command ID when present,
-  else a generated ULID). The shared 100-item / 3.8 MB / 380 KB budget fails an oversized commit
-  with `CommitTooLarge` before any write, identically across backends and languages. Every commit
-  carries two control checks (the feature marker and the rebuild lock), so a single-stream commit
-  holds at most 97 events or projector operations, 96 with a snapshot, and one fewer with an
-  outcome.
-- `Store::with_outcomes` records every command as a durable outcome in the same transaction as
-  its events, so a retried command returns the stored answer instead of running twice
-  ([command outcomes](#command-outcomes)).
-- **Rebuild fence (C10).** `RebuildFence` (every backend) holds a durable `SYSTEM#REBUILD` lock
-  while a projection rebuild runs: every commit is refused with the transient
-  `Error::RebuildInProgress`, readers of derived state check a `RebuildEpoch`, and the worker's
-  view writes are guarded by its lease ([Rebuild fence](#rebuild-fence)).
+You define events with `domain_events!` and state with the `Aggregate` trait. A `Store` loads an
+aggregate (from its latest snapshot when there is one), runs a command against it, and commits the
+decided events with optimistic concurrency, meaning the commit fails if another writer got to the
+stream first. `MemRepository` backs tests, and the `dynamodb` and `postgres` features add the
+durable backends. Upcasters migrate old payload versions as they're read, `compact_below` deletes
+only events a snapshot already covers, and in-band projectors write views in the same transaction
+as the events. The [concepts guide](https://github.com/photon-grove/evt/blob/main/docs/guide/concepts.md) walks through each of these, and the
+[getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md) builds one end to end in Go.
 
-## Example
+`Store::transaction` goes further. It loads several aggregates, appends decided events to any of
+them, and commits once, so all the streams land or none does. Streams it read but didn't write are
+fenced at the head it saw. Every event of the commit carries one `commitId` (the command ID when
+there is one, else a generated ULID). Every commit, in both languages and on every backend, fits a
+shared budget of 100 items, 3.8 MB and 380 KB, or it fails with `CommitTooLarge` before anything is
+written. Each commit also spends two items on control checks (the feature marker and the rebuild
+lock), so a single-stream commit holds at most 97 events or projector operations, 96 with a
+snapshot, and one fewer with an outcome.
+
+Each stream has one small head item (DynamoDB `sk = -1`, or a row in `{events}__evt_stream_heads`
+on PostgreSQL) recording the highest sequence committed to it. A commit raises the head with an
+update conditioned on the head it saw, and a read fence is one check on that same item. A stream
+whose head disagrees with its events or snapshot fails with `Error::StreamHeadDrift`, which is never
+retried and never recorded as a rejection. Every writer requires the `stream-heads` feature in the
+feature marker. A fresh table is declared by its first writer, but a table written before stream
+heads is refused with `Error::StreamHeadsNotMigrated` until `evt-doctor migrate-heads` has backfilled
+it and declared the feature (`FeatureMarker::declare_stream_heads` is the hook for that call). See
+the [migration runbook](https://github.com/photon-grove/evt/blob/main/docs/guide/migrating-to-stream-heads.md) and
+[ADR 0007](https://github.com/photon-grove/evt/blob/main/docs/adr/0007-per-stream-head-item.md). DynamoDB scanners skip the head item
+(`sk < 1`), and a Streams consumer has to skip its records too.
+
+The `SYSTEM#` and `command-outcome#` namespaces are reserved for engine rows. Writes to them are
+refused and entity heads skip them. A `SYSTEM#FEATURES` marker row declares the extensions a table
+uses, and a writer that doesn't support a declared feature refuses to write, maintenance snapshots
+included. Declaring a feature invalidates the writer's cache, but it never grants support for it.
+Durable history-dependent declarations fence each compaction batch under a marker check on DynamoDB,
+or all deletes under one transaction lock on PostgreSQL. DynamoDB has no whole-operation lease, so a
+declaration that races a multi-batch compaction can leave a stream partly compacted, and its
+history-dependent rebuild then reports `CompactionUncovered`. Declare history dependence before you
+write data of that type.
+
+The rest of this page covers the larger features. [Command outcomes](#command-outcomes) make a
+retried command return its stored answer instead of running twice. Then come
+[commit-wide projectors](#commit-wide-projectors), the [sync journal](#the-sync-journal), the
+[rebuild fence](#rebuild-fence), and [enumerating the log](#enumerating-the-log) with `EventLog`.
+There's also `latest(n)`, which reads a stream's last `n` events newest-first. The guide pages on
+[commands and retries](https://github.com/photon-grove/evt/blob/main/docs/guide/commands.md), [projections](https://github.com/photon-grove/evt/blob/main/docs/guide/projections.md),
+[DynamoDB](https://github.com/photon-grove/evt/blob/main/docs/guide/dynamodb.md) and [PostgreSQL](https://github.com/photon-grove/evt/blob/main/docs/guide/postgres.md) explain the same
+ideas from the Go side.
+
+This crate is versioned on its own and tagged `photon-evt-vX.Y.Z` on crates.io releases. The Go
+module is versioned separately and tagged `go/vX.Y.Z`. The two share a storage format, not a
+version number.
+
+## Quick start
+
+Here's a whole program against the in-memory backend. The account folds `Deposited` events into a
+balance, the store refuses a second command with the same command ID as a duplicate, and
+`execute_with_retry` retries conflicts and transient backend failures with backoff, sleeping on the
+function you pass it.
 
 ```rust
 use photon_evt::{Aggregate, MemRepository, Metadata, RetryPolicy, Store, domain_events};
@@ -145,65 +159,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Command outcomes
 
-A store built with `with_outcomes` writes one `command-outcome#<commandId>` row per command,
-once and in its final state, inside the commit transaction. Every command needs a command ID
-(at most 512 UTF-8 bytes, no U+0000, which PostgreSQL cannot store; the same goes for digests and
-rejection codes, messages, and details) and a type that implements `OutcomeCommand`, and `Aggregate::Error`
-implements `ToRejection`:
+A store built with `with_outcomes` writes one `command-outcome#<commandId>` row per command, once
+and in its final state, inside the commit transaction. Every command needs a command ID of at most
+512 UTF-8 bytes with no U+0000, which PostgreSQL can't store. The same rule covers digests and
+rejection codes, messages and details. The command type implements `OutcomeCommand`, and
+`Aggregate::Error` implements `ToRejection`. The
+[commands guide](https://github.com/photon-grove/evt/blob/main/docs/guide/commands.md) explains the model in more depth.
 
 - A repeat of a command (same ID, same identity digest) returns the stored outcome and does not
   run the handler or write. The dedupe is global, so it survives snapshots and compaction. The
   digest is a SHA-256 over the command's type, the target streams the request names, canonical
-  payload JSON, and principal (the caller's intent, never the streams the command ends up writing), and `OutcomeConfig::with_digester` replaces it. The same ID with another digest is
-  `Error::IdempotencyKeyReuse`, carrying the stored `prior_outcome`; it is never stored.
-- An error from `handle` that `ToRejection` maps to `Some` is a domain rejection: it is persisted
+  payload JSON, and principal. That's the caller's intent, never the streams the command ends up
+  writing, and `OutcomeConfig::with_digester` replaces it. The same ID with another digest is
+  `Error::IdempotencyKeyReuse`, carrying the stored `prior_outcome`. That error is never stored.
+- An error from `handle` that `ToRejection` maps to `Some` is a domain rejection. It's persisted
   as a `rejected` outcome (`Rejection { code, message, details }`) and a retried command replays it
-  verbatim. A `None` is an internal failure the handler could not decide: it is returned as
+  verbatim. A `None` is an internal failure the handler couldn't decide. It's returned as
   `Error::Handler` and records nothing, like every other internal failure, so a retry after the fix
   starts clean.
 - A rejection can carry events. A proposal whose apply finds its base revision stale should answer
-  the client with a rejection *and* leave an `apply-failed` event on the proposal. Implement
+  the client with a rejection and also leave an `apply-failed` event on the proposal. Implement
   `Aggregate::rejection_events(&self, error)` to return those events for the errors that map to a
-  rejection (the default is none): they commit in the same atomic transaction as the rejected row,
+  rejection (the default is none). They commit in the same atomic transaction as the rejected row,
   which lists them, and a replay returns the stored rejection without writing them again. They are
   applied, snapshotted, and projected like an accepted command's events. In a transaction, stage
   the events with `append` and return `Decision::reject_with_events` (or call
-  `Transaction::reject_with_events`); `Decision::reject` and `Transaction::reject` still discard
+  `Transaction::reject_with_events`). `Decision::reject` and `Transaction::reject` still discard
   what was staged. Every rule of an accepted commit applies (continuity, fences, reserved streams,
-  the commit budget). A conflict re-prepares the command, which may then decide differently; when
+  the commit budget). A conflict re-prepares the command, which may then decide differently. When
   attempts run out, the `stale-fence` rejection is recorded without these events. A rejection
   stores no response.
 - A command that decides no events is an accepted no-op, and a response (at most 65536 bytes) is
   stored with the outcome. See `Store::execute_with_response`.
-- A commit whose result is unknown (`Error::Indeterminate`: a timeout, a dropped connection, a server fault; a definitive refusal such as a validation or authorization error stays `Error::Backend` and is not recovered) is settled by polling the outcome row for the recovery window
-  (`OutcomeConfig::with_recovery_wait`, 10 s), never by running the handler again: the stored outcome
-  comes back with `replayed` set, or a row that never appears is the retryable `Error::AmbiguousWrite`
-  (never "not applied": a transaction can land after any single read).
-- **Backend authors:** a commit that carries an outcome and whose result is genuinely unknown
+- A commit whose result is unknown (`Error::Indeterminate`: a timeout, a dropped connection, a
+  server fault) is settled by polling the outcome row for the recovery window
+  (`OutcomeConfig::with_recovery_wait`, 10 s), never by running the handler again. The stored outcome
+  comes back with `replayed` set, or a row that never appears becomes the retryable
+  `Error::AmbiguousWrite`. It's never reported as "not applied", because a transaction can land
+  after any single read. A definitive refusal, such as a validation or authorization error, stays
+  `Error::Backend` and isn't recovered.
+- For backend authors: a commit that carries an outcome and whose result is truly unknown
   (timeout, lost connection or response, server fault, a dropped `COMMIT`) must fail with
-  `Error::Indeterminate`, the only error the store recovers by re-reading the outcome row; a
+  `Error::Indeterminate`. That's the only error the store recovers by re-reading the outcome row. A
   definitive failure (validation, missing table, authorization, a constraint error) must stay
-  `Error::Backend`. `Repository::backoff` is the timer recovery polling sleeps on and `Repository::deadline` the timer
-  that bounds each recovery read (override both if your runtime has one; a backend with no timer must
-  bound its own reads). Decoded outcome rows must pass `Outcome::validate_stored`.
+  `Error::Backend`. `Repository::backoff` is the timer recovery polling sleeps on, and
+  `Repository::deadline` is the timer that bounds each recovery read. Override both if your runtime
+  has one. A backend with no timer must bound its own reads. Decoded outcome rows must pass
+  `Outcome::validate_stored`.
 - `Store::transaction` records multi-stream commands with `Transaction::begin_command`, which must
-  be the first call on the transaction (`Error::CommandOrder` after any read, append, or fence; a
+  be the first call on the transaction (`Error::CommandOrder` after any read, append, or fence, and a
   replayed result finishes the transaction), then
   `commit_with_outcome` or `reject`, attempting once. A failed caller-stamped fence persists a
-  `stale-fence` rejection instead of retrying; the remedy is a new command ID.
-- **Fence-aware retry (C5).** `execute_with_outcome`, `execute_with_response`, and
+  `stale-fence` rejection instead of retrying, and the remedy is a new command ID.
+- Fence-aware retry. `execute_with_outcome`, `execute_with_response`, and
   `Store::execute_transaction` retry a command that conflicts with another writer, up to the
-  store's `RetryPolicy` (`OutcomeConfig::with_retry`; the default is 5 attempts, 25 ms doubling to
-  1 s, jittered, waiting on `Repository::backoff`; `RetryPolicy::immediate` opts out of waiting for
-  tests and `with_deadline` bounds the whole command; with the defaults the waits total about
-  0.4 s, but an ambiguous write that never resolves costs a recovery window per attempt). A conflict on anything the engine can
-  re-derive (an event put, a snapshot or continuity check, an engine-filled fence)
-  **re-prepares** the command: the aggregate is loaded again, the handler (or your `prepare`
+  store's `RetryPolicy`, set with `OutcomeConfig::with_retry`. The default is 5 attempts, 25 ms
+  doubling to 1 s, jittered, waiting on `Repository::backoff`. `RetryPolicy::immediate` opts out of
+  waiting for tests, and `with_deadline` bounds the whole command. With the defaults the waits total
+  about 0.4 s, but an ambiguous write that never resolves costs a recovery window per attempt. A
+  conflict on anything the engine can re-derive (an event put, a snapshot or continuity check, an
+  engine-filled fence) re-prepares the command: the aggregate is loaded again, the handler (or your `prepare`
   closure) runs again against fresh state, and only the attempt that commits writes anything. A
-  failed **caller-stamped** fence fails fast with the `stale-fence` rejection instead, because the
+  failed caller-stamped fence fails fast with the `stale-fence` rejection instead, because the
   engine cannot know your decision still holds. When the last attempt also conflicts, the engine
   persists `Rejection::retries_exhausted(attempts)` (code `stale-fence`) as the command's outcome,
-  so a replay of the ID gets the same answer; submit a new command ID to try again. Handlers and
+  so a replay of the ID gets the same answer. Submit a new command ID to try again. Handlers and
   `prepare` closures may therefore run more than once and must be safe to repeat, and a command
   passed to `execute_with_outcome` must be `Clone`. A transient failure that is not a conflict
   (throttling, an ambiguous write that never resolved) is retried the same way but returned as an
@@ -311,10 +331,10 @@ A multi-stream command runs under the same retry with `Store::execute_transactio
 the command's decision step, run again from scratch whenever the engine re-prepares it, and the
 streams it reads and writes can depend on what it reads. The identity names only what the request
 names (`with_targets`), so the digest is the same on every attempt however the write set changes.
-The flip side is a contract: **everything that distinguishes the request must be in the targets or
-the payload.** A transfer whose destination is chosen only inside the closure has the same identity
+The flip side is a contract: everything that distinguishes the request must be in the targets or
+the payload. A transfer whose destination is chosen only inside the closure has the same identity
 whichever destination it picks, so a second request with the same command ID and a different
-destination replays the first's outcome instead of running; put the destination in the payload (or
+destination replays the first's outcome instead of running. Put the destination in the payload (or
 the targets):
 
 ```rust
@@ -456,7 +476,7 @@ The table needs a string partition key `pk` and a number sort key `sk`, the same
 
 Enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
 `ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`. Engine relations use the
-reserved `__evt_` infix; schema setup migrates the old `{events}_entity_type_idx` index to
+reserved `__evt_` infix. Schema setup migrates the old `{events}_entity_type_idx` index to
 `{events}__evt_entity_type_idx`, and it creates the rebuild fence's `{events}__evt_rebuild_lock`
 and `{events}__evt_rebuild_generation` (a schema created before them treats a commit's lock check
 as passing until `ensure_schema` runs again). Configured unquoted names are lowercase-canonicalized,
@@ -518,34 +538,34 @@ The repository decides where the rows go: `DynamoRepository::with_views_table`, 
 table, or `MemRepository` (read back with `view` and `views`). A repository with nowhere to write
 them refuses the commit with `Error::ViewsNotConfigured`. A failed condition is
 `Error::ProjectorOperation`, naming the projector and the operation, with your mapped error as its
-`source()`; it is never retried and records no outcome. Keys over 2,048 bytes (`pk`) or 1,024 bytes
+`source()`. It's never retried and records no outcome. Keys over 2,048 bytes (`pk`) or 1,024 bytes
 (`sk`), a repeated key, and operations with no event are refused before any write.
 
 ### Row owners
 
-Every operation names an **owner**: the stream the row belongs to, which is stored as the row's
+Every operation names an owner: the stream the row belongs to, which is stored as the row's
 `entityID` attribute. The owner must be a stream the commit wrote. Every write to a row is
 conditioned on its owner, so a stream never overwrites or deletes a row another stream owns: the
 operation fails with `Error::ProjectorOperation` (reason `ConditionalCheckFailed`), and nothing of
 the commit is written. A row that does not exist yet can be written by anyone.
 
-**A row's owner must never change.** Never delete a row to hand its key to another stream: keep the
+A row's owner must never change. Never delete a row to hand its key to another stream: keep the
 row and rewrite it, as its owner, with a tombstone payload. A rebuild orders the writes to a row by
 its owner's sequence, the only commit order the log keeps, and `replay_views` refuses a row that
 two streams write (`Error::SharedViewKey`).
 
-**A PostgreSQL view writer must enforce the owner in SQL**; the engine cannot. The statements it
-returns must have these semantics (see `PostgresRepository::with_view_writer`):
+A PostgreSQL view writer has to enforce the owner in SQL, because the engine can't. The statements
+it returns must have these semantics (see `PostgresRepository::with_view_writer`):
 
 - a put with `if_absent` is a plain `INSERT` (no `ON CONFLICT`), and the statement names the
   table's `(pk, sk)` key constraint with `PgStatement::with_key_constraint`: only a violation of
-  that constraint is a failed `if_absent` condition;
+  that constraint is a failed `if_absent` condition.
 - any other put is an upsert that only the owner may overwrite:
   `INSERT ... ON CONFLICT (pk, sk) DO UPDATE SET ... WHERE <table>.entity_id = EXCLUDED.entity_id`.
-  A put that affects no row (the row is another stream's) fails its condition;
+  A put that affects no row (the row is another stream's) fails its condition.
 - a delete with `if_present` removes the owner's row only:
   `DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3`, and a delete that affects no row fails
-  its condition;
+  its condition.
 - a delete without a condition succeeds on an absent row but refuses another stream's row, so its
   statement reports the foreign rows it found rather than the rows it deleted:
   `WITH gone AS (DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3) SELECT 1 FROM <table>
@@ -555,10 +575,10 @@ returns must have these semantics (see `PostgresRepository::with_view_writer`):
 ### Current-state and history-dependent projectors
 
 A projector says which entity types it reads the *events* of with `history()`. The default, none,
-is a **current-state** projector: it is given an empty commit ID and streams without events, and
+is a current-state projector. It's given an empty commit ID and streams without events, and
 the state of every stream, so a rebuild reproduces its rows from the final states alone. One that
-names types is **history-dependent**: it is given the commit ID, and the events and state of the
-streams of those types; every other stream arrives without events and without state. A
+names types is history-dependent. It's given the commit ID, and the events and state of the
+streams of those types, and every other stream arrives without events and without state. A
 history-dependent projector may only own rows by streams of the types it names. The store durably
 adds those types to the manifest's `historyDependent` set before the projector's first commit
 (`compact_below` then refuses them), so the repository must implement `declare_history_dependent`
@@ -573,10 +593,10 @@ every stream agrees with, so a rebuild, or a test, can run the projector again o
 
 Enable the `journal` feature for per-scope ordered, replayable delivery rows written in the commit
 that wrote the events ([ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md),
-X1; Rust only, Go refuses a table that declares it). A **scope** is a named, independently ordered
-sequence (a world, a place in it). You map each event of the journaled entity types to zero or more
-scopes with a pure function; the event takes the next **position** in each, and a client polls a
-scope with `high_watermark` and `page`. The example below is [`examples/journal.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/journal.rs),
+Rust only for now, and Go refuses a table that declares it). A scope is a named, independently
+ordered sequence (a world, or a place in it). You map each event of the journaled entity types to
+zero or more scopes with a pure function. The event takes the next position in each, and a client
+polls a scope with `high_watermark` and `page`. The example below is [`examples/journal.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/journal.rs),
 which `cargo test --all-features` compiles and runs, and a test fails if the two drift apart.
 
 ```rust,ignore
@@ -639,37 +659,37 @@ from stored events in any order. The journaled entity types are declared history
 feature marker with the `journal` feature (`journal: 1`), so they are never compacted and builds
 without the feature refuse the table.
 
-- **Row-size guard.** A row over the cap (default 30,000 bytes of stored payload, at most 370,000)
-  fails the commit before any write with `Error::JournalRowTooLarge`; a store with outcomes records
+- Row-size guard. A row over the cap (default 30,000 bytes of stored payload, at most 370,000)
+  fails the commit before any write with `Error::JournalRowTooLarge`. A store with outcomes records
   that as the command's `journal-row-too-large` rejection. `Journal::pre_check` (or
   `pre_check_events` for typed events) measures the same rows without a counter, at the widest
   position. It is exact for the metadata you give it and advisory otherwise (a handler does not see
   the commit's principal, extensions, or command ID), so pass the commit's metadata or add
   `with_pre_check_headroom`. Call it in your command handler and turn the error into a recorded
   rejection with `RowTooLarge::to_rejection`.
-- **Contention.** Writers racing for a scope lose positions to each other. The journal re-reads the
-  counters and allocates again under its `RetryPolicy` (and retries transient failures); when
+- Contention. Writers racing for a scope lose positions to each other. The journal re-reads the
+  counters and allocates again under its `RetryPolicy` (and retries transient failures). When
   attempts run out on taken positions it returns `Error::Conflict`. A conflict on the stream itself
   is yours to re-prepare. A hot scope serializes on its counter item. A counter that falls behind its
   rows (a restore, a rebuild beside writers) is healed from the highest row.
-- **A cursor ahead of the journal.** `page` flags `cursor_ahead` when `after` is above the high
-  watermark (after a restore, say); the page is not caught up, and the consumer should resync.
-- **Every writer of the table must commit through a `JournalRepository`.** The marker stops builds
+- A cursor ahead of the journal. `page` flags `cursor_ahead` when `after` is above the high
+  watermark (after a restore, say). The page isn't caught up, and the consumer should resync.
+- Every writer of the table must commit through a `JournalRepository`. The marker stops builds
   without the feature, not a writer that bypasses the journal, and the `journal` cargo feature is
   build-wide, so a build that enables it accepts a journal table through every repository,
-  wrapped or not; a bypassing writer's events would be missing from the scopes. Enable the journal
+  wrapped or not. A bypassing writer's events would be missing from the scopes. Enable the journal
   before writing the events it covers: earlier events have no row and no gap shows it. A commit's
   journal rows and counters count toward the commit budget (97 event and projector operations, 96 with a snapshot).
-- **Rebuilds** (`journal::rebuild`, or `rebuild_with_lock`) run under the [rebuild lock](#rebuild-fence)
+- Rebuilds (`journal::rebuild`, or `rebuild_with_lock`) run under the [rebuild lock](#rebuild-fence)
   and write the rows and counters through `write_rebuild_views`, fenced on the lease's owner and
   fencing token. Live commits fail with `Error::RebuildInProgress` while the lock is held, so a
   rebuild cannot lower a counter under a writer. Readers that can overlap a rebuild use
   `page_at_epoch` / `high_watermark_at_epoch`: they fail with `RebuildUnavailable` or
   `RebuildEpochChanged` (both transient) instead of showing half-written rows. Keep the cursor, back
   off, and read the same page again.
-- **Backends.** DynamoDB and the in-memory repository. The Rust PostgreSQL repository does not write
+- Backends. DynamoDB and the in-memory repository. The Rust PostgreSQL repository does not write
   commit-wide views yet.
-- **Waking consumers.** On DynamoDB, a consumer learns of new rows from the views table's stream,
+- Waking consumers. On DynamoDB, a consumer learns of new rows from the views table's stream,
   filtered to the journal's keys, and then reads `page` from its cursor. The
   [`photon-evt-lambda`](https://github.com/photon-grove/evt/tree/main/crates/evt-lambda) crate
   (feature `journal`) has the filter patterns, the wake-up decode, and the batch handling.
@@ -677,7 +697,7 @@ without the feature refuse the table.
 ### Compaction and `410 Gone`
 
 A scope's journal grows without bound, so an operator (or a scheduled job) compacts its oldest rows
-into a snapshot (ADR 0005, X2):
+into a snapshot. This is journal compaction:
 
 ```rust,ignore
 use std::time::Duration;
@@ -702,30 +722,30 @@ match page(&repository, &scope, after, 100).await {
 }
 ```
 
-- **Order makes it safe without stopping writers.** A run writes the canonical chunks, swaps the
+- Order makes it safe without stopping writers. A run writes the canonical chunks, swaps the
   manifest (its checkpoint becomes the scope's floor), then deletes the rows, then writes an audit
   row. A `page` that meets a gap reads the floor after the rows, so a reader racing a compaction
-  gets `Error::JournalGone` (map it to HTTP 410; `JournalGone::HTTP_STATUS`), never a gap. Rows
+  gets `Error::JournalGone` (map it to HTTP 410 with `JournalGone::HTTP_STATUS`), never a gap. Rows
   below the floor that are still there are served. A chunk read for a manifest that has since been
   replaced is the transient `Error::JournalSnapshotMoved`: read the manifest again.
-- **One run per scope.** `begin_compaction` takes a lease with a fencing token
-  (`CompactionLeaseHeld` while another holds it unexpired; a lapsed one is taken over),
+- One run per scope. `begin_compaction` takes a lease with a fencing token
+  (`CompactionLeaseHeld` while another holds it unexpired, and a lapsed one is taken over),
   `renew_compaction` and `end_compaction` keep or release it, and `force_release_compaction` is the
   operator's release of a named owner. Every write checks the lease and the rebuild epoch, so a
   worker that lost its lease or met a rebuild stops with `CompactionLeaseLost` or
   `RebuildEpochChanged` and has written nothing more. `compact_with_lease` does all of it.
-- **Rebuilds restore compacted rows**, and leave the manifest; compact again at the same checkpoint
+- Rebuilds restore compacted rows and leave the manifest. Compact again at the same checkpoint
   to prune them. Compaction never deletes events, and adds nothing to a commit's budget. A commit's
   counter put is a compare-and-set on the counter it read, so a writer whose read went stale cannot
   claim positions whose rows were compacted, and a commit never allocates at or below a scope's
   floor, even after a lost counter. `compact` renews its lease in place during a long run.
 - Reading the floor takes `JournalCompactionStore` (an extension of `JournalStore`, which is
-  unchanged since X1); `page`, `JournalRepository`, and compaction require it. Compaction rows
+  unchanged). `page`, `JournalRepository`, and compaction require it. Compaction rows
   that are not the engine's (`SYSTEM#JOURNAL`) are refused with `Error::ForeignJournalRow`, and a
   preflight refuses a gapped range or an oversized manifest before anything is written.
 - The first lease declares `journal-compaction` on the feature marker, so a build that predates
   compaction refuses the table. `photon_evt::conformance::compaction_cases` checks a backend
-  (`CompactionStore`: the in-memory and DynamoDB repositories).
+  (`CompactionStore`, implemented by the in-memory and DynamoDB repositories).
 
 The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#journal),
 and `photon_evt::conformance::journal_cases` (features `journal` and `conformance`) checks a backend.
@@ -752,7 +772,7 @@ let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().awai
 ```
 
 - While the lock exists, an expired one included, every commit fails with
-  `Error::RebuildInProgress`, which is transient: fence-aware retry runs the command again after a
+  `Error::RebuildInProgress`, which is transient. Fence-aware retry runs the command again after a
   backoff and returns the error when attempts run out. It is never a conflict, never a
   `stale-fence` rejection, and records no outcome.
 - `begin_rebuild` takes over a lease that expired (the generation grows by two) and refuses one
@@ -761,15 +781,15 @@ let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().awai
   `end_rebuild`, and `write_rebuild_views` take the lease and act only while the lock names both
   its owner and its token. A worker that lost its lock, including a stale incarnation that reuses
   its owner token after a takeover, gets `Error::RebuildLeaseLost` and writes nothing.
-- `force_release_rebuild` is the operator's escape hatch for a wedged worker: it ends the lease at
+- `force_release_rebuild` is the operator's escape hatch for a wedged worker. It ends the lease at
   once, so a new rebuild can begin, but leaves the generation unsettled, so readers stay fenced
   (`Error::RebuildUnavailable`) and every commit is still refused (`Error::RebuildInProgress`) until
   a later rebuild begins and ends. A failed rebuild may have cleared journal counters, and a
   journaled commit would otherwise allocate positions from them. To resume writes, run the rebuild
   again to its end (for the journal, `rebuild_with_lock`).
 - A command handler that reads a view under the epoch check returns `RebuildUnavailable` or
-  `RebuildEpochChanged` as its own error: the engine returns it at once and records nothing.
-- Leases are whole seconds read from the repository's clock; `with_clock` injects one in tests.
+  `RebuildEpochChanged` as its own error. The engine returns it at once and records nothing.
+- Leases are whole seconds read from the repository's clock, and `with_clock` injects one in tests.
 
 ## Enumerating the log
 
@@ -792,25 +812,25 @@ while let Some(batch) = batches.next().await {
 let mut accounts = std::pin::pin!(repository.stream_entities::<Account>(StreamFilter::all()));
 ```
 
-- **Lazy and cancellable.** Nothing is read until the stream is polled, and dropping it cancels the
+- Lazy and cancellable. Nothing is read until the stream is polled, and dropping it cancels the
   read. A PostgreSQL stream returns its pooled connection when dropped.
-- **Ordering.** PostgreSQL and the in-memory repository yield one batch per entity, entities
+- Ordering. PostgreSQL and the in-memory repository yield one batch per entity, entities
   ascending by ID and each entity's events ascending by sequence. DynamoDB yields one batch per
   Scan page: no order, and an entity's events can span pages. `stream_entities` yields entities in
   the order their first event was seen and folds each in sequence order.
-- **Memory.** One entity (PostgreSQL, in memory) or one page (DynamoDB) for `stream_all_events`.
+- Memory. One entity (PostgreSQL, in memory) or one page (DynamoDB) for `stream_all_events`.
   On DynamoDB `stream_entities` buffers every matched event until the Scan completes, as Go does,
   because a Scan does not group an entity's events. `DynamoRepository::with_scan_page_size` caps
   the page.
-- **Filter.** `StreamFilter::all()` matches everything (Go's zero filter). `of_type("")` matches
+- Filter. `StreamFilter::all()` matches everything (Go's zero filter). `of_type("")` matches
   only entities stored with an empty type. `stream_entities::<A>` narrows to `A::TYPE` unless the
   filter names a type.
-- **Skipped.** Entities in the reserved `SYSTEM#` and `command-outcome#` namespaces, and snapshot
+- Skipped. Entities in the reserved `SYSTEM#` and `command-outcome#` namespaces, and snapshot
   items, are never yielded.
-- **Errors.** A backend error ends the stream as its last item. An entity that fails to fold (an
+- Errors. A backend error ends the stream as its last item. An entity that fails to fold (an
   unknown event type, a failed upcast, a sequence gap from compaction) is yielded as an error and
   the stream continues. Entities fold from events only, as in Go, so a compacted stream reports
-  `SequenceGap`: load it with `Store::load` instead.
+  `SequenceGap`. Load it with `Store::load` instead.
 
 ## Reading and writing views
 
@@ -845,18 +865,18 @@ loop {
 ```
 
 A cursor is Go's: base64url JSON of the last key, so it moves between a Go and a Rust process. A
-page can come back empty with a cursor on DynamoDB; keep going until the cursor is `None`.
+page can come back empty with a cursor on DynamoDB, so keep going until the cursor is `None`.
 
 Point reads and partition listings see every commit that has returned, so a handler can commit and
 read its own write. `DynamoViewRepository` gets that with strongly consistent reads of the base
-table, at twice the read capacity of an eventual read; `with_consistent_read(false)` opts the
+table, at twice the read capacity of an eventual read. `with_consistent_read(false)` opts the
 partition listings out when a stale page is acceptable. Entity-type listings read the
 `entityType-index` global secondary index, which DynamoDB only reads eventually consistently, so
 they can briefly miss a row a commit just wrote.
 
 `ViewCodec<T, R>` (Go's `viewcodec.Codec`, `viewcodec.Single`, and the `GetJSONView` family) binds a
 repository, an entity type and a serde type. It writes `T` as the payload with `json::to_vec`, so
-the bytes are Go's `json.Marshal` of the same shape, and reads it back; `with_decoder` stands in
+the bytes are Go's `json.Marshal` of the same shape, and reads it back. `with_decoder` stands in
 for Go's factory when a value needs constructor-injected dependencies.
 
 ```rust,ignore
@@ -871,9 +891,9 @@ let ada: Option<Profile> = profiles.get("profile#ada").await?;
 let all = profiles.list_all(|row, err| eprintln!("skipped {}/{}: {err}", row.pk, row.sk)).await?;
 ```
 
-Where Go's decoder differs from serde's, serde wins: a JSON `null` does not decode into a struct
+Where Go's decoder differs from serde's, serde wins. A JSON `null` does not decode into a struct
 and field names match exactly, so mark fields `#[serde(default)]` that older or Go-written rows may
-omit. Views are projections: replaying the events must be able to rebuild every row, so keep the
+omit. Views are projections, so replaying the events must be able to rebuild every row, so keep the
 mutable state behind these writes in events.
 
 ## Testing your domain
@@ -902,7 +922,7 @@ stream. `Scenario::on(&fixture)` runs a single-stream scenario against it.
 [`examples/banking.rs`](examples/banking.rs) puts it together: `domain_events!` enums, two
 aggregates, a balance read model fed only from committed events, and a two-account transfer as a multi-stream transaction with a
 read-fenced `bank` stream. Run it with
-`cargo run -p photon-evt --example banking --features testing`; its tests run with
+`cargo run -p photon-evt --example banking --features testing`, and its tests run with
 `cargo test -p photon-evt --features testing --example banking`.
 
 ## Testing a backend
@@ -921,7 +941,7 @@ photon_evt::conformance::enumeration_cases(&my_repository).await;
 
 ## Compatibility with Go
 
-- Keep payload numbers integral (for example, cents): Go and Rust format some floats differently.
+- Keep payload numbers integral (cents, for example), because Go and Rust format some floats differently.
 - Declare payload and aggregate fields in the same order as the Go structs, and use `BTreeMap` for
   maps, so the JSON bytes match. Go sorts map keys as strings, so a map with integer keys needs
   `#[serde(serialize_with = "photon_evt::json::go_key_order")]`.
@@ -934,16 +954,22 @@ photon_evt::conformance::enumeration_cases(&my_repository).await;
 The known differences are listed in the
 [storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#known-differences).
 
-The [feature parity matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
-tracks every capability across languages. The vNext plan's core reshape (multi-stream
-transactions, command outcomes, fences —
-[ADR 0004](https://github.com/photon-grove/evt/blob/main/docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md)),
-Rust-first extensions such as the journal and the Lambda toolkit
-([ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md)),
-and the port/defer/cut parity policy
-([ADR 0006](https://github.com/photon-grove/evt/blob/main/docs/adr/0006-parity-policy-and-feature-cuts.md))
-decide what lands here and when. Core changes land in Go and Rust together; extensions are
-Rust-first, and Go ports them from the spec and fixtures rather than hand-rolling them in apps.
+The [feature parity matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md) tracks what each language
+implements. Core changes land in Go and Rust together. Extensions such as the journal and the Lambda
+toolkit land in Rust first, and Go ports them from the spec and fixtures. The reasoning is in
+[ADR 0004](https://github.com/photon-grove/evt/blob/main/docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md) (multi-stream
+transactions, command outcomes and fences),
+[ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md) (Rust-first extensions) and
+[ADR 0006](https://github.com/photon-grove/evt/blob/main/docs/adr/0006-parity-policy-and-feature-cuts.md) (the parity policy).
+
+## Features
+
+None are on by default. `dynamodb` adds the DynamoDB event log through the AWS SDK, and you bring
+your own `aws_sdk_dynamodb::Client`. `postgres` adds the PostgreSQL event log through
+`tokio-postgres` and a deadpool pool. Both run on Tokio. `journal` adds the sync journal and lets
+this build write to a table that declares it, while a build without it refuses such a table.
+`conformance` adds the backend conformance suite, and `testing` adds the given/when/then helpers
+(it turns on `conformance`, whose fixtures back its examples).
 
 ## Minimum Rust version
 
