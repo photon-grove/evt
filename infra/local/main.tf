@@ -53,19 +53,6 @@ resource "aws_dynamodb_table" "event_log" {
   }
 }
 
-# Heads table: one row per entity (pk) stores its highest sequence for incremental rebuilds.
-# The heads projector maintains it; entityType is a scanned, non-key attribute.
-resource "aws_dynamodb_table" "entity_heads" {
-  name         = "evt-local-entity-heads"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pk"
-
-  attribute {
-    name = "pk"
-    type = "S"
-  }
-}
-
 resource "aws_dynamodb_table" "entity_views" {
   name         = "evt-local-entity-views"
   billing_mode = "PAY_PER_REQUEST"
