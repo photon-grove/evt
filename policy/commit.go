@@ -1,23 +1,9 @@
 package policy
 
 import (
-	"context"
 	"math/rand"
 	"sync"
 	"time"
-
-	"github.com/photon-grove/evt"
-)
-
-const (
-	// DefaultMaxAttempts is the default number of retry attempts for commit paths.
-	DefaultMaxAttempts = 5
-
-	// DefaultBaseDelay is the default base delay between retries.
-	DefaultBaseDelay = 100 * time.Millisecond
-
-	// DefaultMaxDelay is the default maximum delay between retries.
-	DefaultMaxDelay = 2 * time.Second
 )
 
 var (
@@ -25,53 +11,15 @@ var (
 	commitRand   = rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // non-crypto jitter for retry backoff
 )
 
-// DefaultConfig returns a Config with sensible defaults for
-// optimistic-concurrency retry on evt Store commit paths.
-func DefaultConfig() Config {
-	return Config{
-		MaxAttempts: DefaultMaxAttempts,
-		BaseDelay:   DefaultBaseDelay,
-		MaxDelay:    DefaultMaxDelay,
-		Jitter: func(jitterMax time.Duration) time.Duration {
-			if jitterMax <= 0 {
-				return 0
-			}
-			commitRandMu.Lock()
-			defer commitRandMu.Unlock()
-			return time.Duration(commitRand.Int63n(int64(jitterMax) + 1)) //nolint:gosec // non-crypto jitter
-		},
-		Sleep: SleepWithContext,
+// DefaultJitter returns a random duration in [0, jitterMax] for retry backoff. It is safe for
+// concurrent use and is the jitter source snapshots.DefaultRetryPolicy uses.
+func DefaultJitter(jitterMax time.Duration) time.Duration {
+	if jitterMax <= 0 {
+		return 0
 	}
-}
 
-// ExecuteWithRetry runs Store.Execute inside a bounded retry loop. On transient
-// commit failures the entity is reloaded from scratch via the factory before the
-// next attempt. Errors returned on give-up are wrapped in ClassifiedError.
-//
-// Deprecated: Cut in ADR-0006 (K6): blind whole-command retry is replaced by fence-aware retry
-// (ADR 0004, C5). On a store with outcomes (snapshots.Store.WithOutcomes), ExecuteWithOutcome and
-// ExecuteTransaction re-prepare a command when the engine can re-derive what failed, are bounded
-// by snapshots.RetryPolicy, and record a stale-fence rejection when attempts run out. It will be
-// removed in the next minor release.
-func ExecuteWithRetry(
-	ctx context.Context,
-	store evt.Store,
-	factory evt.EntityFactory,
-	entityID evt.EntityID,
-	command evt.Command,
-	metadata evt.Metadata,
-	cfg Config,
-	hooks Hooks,
-) (evt.Entity, error) {
-	var entity evt.Entity
+	commitRandMu.Lock()
+	defer commitRandMu.Unlock()
 
-	err := Execute(ctx, cfg, func() error {
-		e, execErr := evt.ExecuteWithFactory(ctx, store, factory, entityID, command, metadata) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-		if execErr == nil {
-			entity = e
-		}
-		return execErr
-	}, hooks)
-
-	return entity, err
+	return time.Duration(commitRand.Int63n(int64(jitterMax) + 1)) //nolint:gosec // non-crypto jitter
 }

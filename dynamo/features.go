@@ -523,7 +523,7 @@ func (m *FeatureMarker) handleCheckFailure(ctx context.Context, err error) error
 }
 
 // transientFeatureChanged returns the transient error a failed marker check classifies as, so
-// policy.ExecuteWithRetry retries with a re-validation.
+// a retry re-validates the marker.
 func transientFeatureChanged(detail string) error {
 	return &policy.ClassifiedError{
 		Class: policy.ClassTransient,

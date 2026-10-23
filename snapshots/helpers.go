@@ -31,7 +31,7 @@ func createInitialContext(entity evt.Entity, entityID evt.EntityID) evt.Context 
 // Sequences must continue from the context's current sequence without a gap. A gap means another
 // writer snapshotted and compacted the stream between reading the snapshot and reading the events,
 // or events expired. Applying events across it would build the wrong state, so it returns a
-// conflict classified as transient: policy.ExecuteWithRetry retries it with a fresh entity, and
+// conflict classified as transient: a caller that retries the command reloads a fresh entity, and
 // evt.IsConflictErr still matches it.
 func applyEventsToEntity(serializedEvents []evt.SerializedEvent, eventContext *evt.Context) error {
 	for _, serializedEvent := range serializedEvents {

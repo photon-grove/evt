@@ -15,7 +15,7 @@ const uniqueViolation = "23505"
 // classifyWriteError maps a unique-constraint violation — the symptom of two commits racing on the
 // same (entity_id, sequence) pair — to an evt.ConflictError so callers can detect the
 // optimistic-concurrency failure. Other errors pass through unchanged. The conflict is classified
-// as transient, as DynamoDB's is, so policy.ExecuteWithRetry reloads and retries it.
+// as transient, as DynamoDB's is, so a retry reloads and tries again.
 func classifyWriteError(err error) error {
 	if err == nil {
 		return nil

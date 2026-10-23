@@ -261,7 +261,7 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_RevalidatesAndRefuses() {
 
 // Test_Commit_CheckFailure_SupportedChangeIsTransient asserts a failed per-commit check against a
 // manifest the writer still supports re-validates, caches the new version, and classifies the
-// failure as transient so policy.ExecuteWithRetry retries.
+// failure as transient so a retry follows.
 func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").

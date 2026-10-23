@@ -1,10 +1,8 @@
 package policy_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -36,20 +34,4 @@ func TestClassify_RebuildFenceRefusalsAreTransient(t *testing.T) {
 	// An explicit classification wins over the fence's default.
 	permanent := &policy.ClassifiedError{Class: policy.ClassPermanent, Err: &evt.RebuildInProgressError{}}
 	require.Equal(t, policy.ClassPermanent, policy.Classify(permanent))
-}
-
-func TestExecuteWithRetry_WaitsOutARebuild(t *testing.T) {
-	attempts := 0
-	cfg := policy.Config{MaxAttempts: 3, Sleep: func(_ context.Context, _ time.Duration) error { return nil }}
-
-	err := policy.Execute(context.Background(), cfg, func() error {
-		attempts++
-		if attempts < 3 {
-			return &evt.RebuildInProgressError{}
-		}
-
-		return nil
-	}, policy.Hooks{})
-	require.NoError(t, err)
-	require.Equal(t, 3, attempts)
 }

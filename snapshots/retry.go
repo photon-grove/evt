@@ -80,7 +80,7 @@ func DefaultRetryPolicy() RetryPolicy {
 		MaxAttempts: DefaultRetryAttempts,
 		BaseDelay:   DefaultRetryBaseDelay,
 		MaxDelay:    DefaultRetryMaxDelay,
-		Jitter:      policy.DefaultConfig().Jitter,
+		Jitter:      policy.DefaultJitter,
 	}
 }
 
@@ -118,7 +118,7 @@ func (p RetryPolicy) delay(retry int) time.Duration {
 	}
 
 	if jitter == nil {
-		jitter = policy.DefaultConfig().Jitter
+		jitter = policy.DefaultJitter
 	}
 
 	return policy.ExponentialJitterDelay(base, ceiling, retry-1, jitter)
