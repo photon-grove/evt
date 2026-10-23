@@ -221,7 +221,21 @@ Error() → err.Error()  // Returns underlying error message
   `Error::StreamHeadsNotMigrated`) refuses a write to a store whose feature marker does not declare
   `stream-heads` while the store holds data: every write path that validates the marker (commits,
   including outcome-only and rejection commits, `PutSnapshot`, `CompactBelow`) returns it. A store
-  with no data is declared by its first writer. It is not a conflict and not transient
+  with no data is declared by initializing it. It is not a conflict and not transient
+- A store is **initialized** once, before writers start: `StoreInitializer.Initialize` (Rust
+  `FeatureMarker::initialize`, or `evt-doctor init`) declares `stream-heads` on a store that holds
+  no non-reserved item, with the same verification as the migration's declaration (on DynamoDB a
+  strongly consistent Scan, the declaration, then a second Scan that retracts it if a stream without
+  a head item appeared), and refuses a populated store with `*StreamHeadsNotMigratedError`. It is
+  idempotent: a store that already declares the feature is neither scanned nor written, and the call
+  reports `false`. It declares nothing but `stream-heads`
+- `*StoreNotInitializedError` (`evt.ErrStoreNotInitialized`; Rust `Error::StoreNotInitialized`)
+  refuses every write path of a DynamoDB writer to a store that does not declare `stream-heads`,
+  without scanning and without writing anything, so a DynamoDB writer never needs `dynamodb:Scan`.
+  It is not a conflict and not transient. A writer that opts into lazy initialization
+  (`WithLazyInitialization(true)`, Rust `with_lazy_initialization(true)`), and every PostgreSQL and
+  in-memory writer, initializes the store on its first write instead (and refuses a populated one
+  with `*StreamHeadsNotMigratedError`)
 
 ## Transaction System
 

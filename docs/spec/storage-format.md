@@ -1595,7 +1595,8 @@ The manifest has three parts. The `features` map declares extensions by name; ea
 stored-format version of that feature, a number starting at 1 — the features this spec defines
 are `journal` and `journal-compaction` (the Rust-first extensions, ADR 0005), both at format
 version 1, and `stream-heads` (ADR 0007), which every writer models and **requires**: a store
-declares it before a writer writes ([Stream Heads](#required-feature)). `photon-evt` models
+declares it before a writer writes, by an explicit initialization or a lazily initializing writer
+([Stream Heads](#required-feature)). `photon-evt` models
 `journal` and `journal-compaction` at format version 1 when built with its `journal` cargo feature;
 it declares `journal` with the first journaled commit ([Journal](#feature-marker-and-history)) and
 `journal-compaction` with the first compaction lease ([Compaction](#compaction-x2)). The `historyDependent` set declares the entity types whose commit-wide projectors are
@@ -2411,39 +2412,64 @@ The feature is `stream-heads`, format version 1, in the `features` map:
 }
 ```
 
-A writer that implements this section **requires** `stream-heads: 1` in the manifest and otherwise
-refuses with a typed `StreamHeadsNotMigrated` error (Go `*StreamHeadsNotMigratedError`, Rust
-`Error::StreamHeadsNotMigrated`), the first time it validates the marker. The refusal covers every
-write path that validates the marker: commits (outcome-only and rejection commits included),
-`PutSnapshot`, `CompactBelow`, and the mutating `evt-doctor` commands other than `migrate-heads`.
-Read-only paths do not need it. A store whose marker does not declare the feature (no marker row, or
-a row without it) may be declared by the writer itself, but only after it finds no non-reserved item
-in the store. On DynamoDB that is a **strongly consistent** scan that reads until it finds one item
-outside the `SYSTEM#` and `command-outcome#` namespaces or the table ends, so a populated table stops
-it at once; the declaration is the ordinary declaration transaction (`version` created at 1, or
-bumped by one), and the writer's first commit conditions on the version it declared. The scan and
-the declaration are two steps, and no transaction can exclude a writer that never reads the marker,
-so the order closes the window instead: the declaration is committed **first**, and the table is then
-scanned once more, strongly consistently, for a **headless stream** (a partition with a snapshot or
-event items and no head item, confirmed by a strongly consistent read of its head item because a scan
-is not atomic across items). From the declaration on, a marker-reading writer fails its per-commit
-check or refuses the table; one that committed before it is durable by the second scan. A headless
-stream means the table was not fresh after all: the writer **retracts** the declaration (removes
-`stream-heads` from the manifest in a further declaration transaction, so every cached validation is
-dropped) and refuses with `StreamHeadsNotMigrated`. A stream that has a head item is another
-head-aware writer's and never causes a retraction. A writer that predates the marker cannot be
-excluded by any protocol: the **operator obligation** is that no writer older than the first
-head-aware writer touches the store once that writer has run, and `migrate-heads` verifies the store
-for headless streams before it declares. On PostgreSQL
-the declaration transaction, under the exclusive feature lock, first checks that the events and
+A writer that implements this section **requires** `stream-heads: 1` in the manifest, the first time
+it validates the marker. The refusal covers every write path that validates the marker: commits
+(outcome-only and rejection commits included), `PutSnapshot`, `CompactBelow`, and the mutating
+`evt-doctor` commands other than `init` and `migrate-heads`. Read-only paths do not need it.
+
+**Initialization.** A store whose marker does not declare the feature (no marker row, or a row
+without it) is declared by **initializing** it: Go `StoreInitializer.Initialize` (every repository
+implements it), Rust `FeatureMarker::initialize`, or `evt-doctor init`. Initialization is idempotent:
+a store that already declares the feature is left alone after one manifest read, with nothing scanned
+or written, and the call reports that it declared nothing (Go `false`, Rust `Ok(false)`). A manifest
+that declares a pair the caller does not support is refused with `UnsupportedFeature` first.
+Otherwise it declares the feature only after it finds no non-reserved item in the store, and refuses
+a populated store with a typed `StreamHeadsNotMigrated` error (Go `*StreamHeadsNotMigratedError`,
+Rust `Error::StreamHeadsNotMigrated`), declaring nothing; such a store is migrated instead. It
+declares `stream-heads` and nothing else: the extensions (`journal`, `journal-compaction`) are
+declared by their first use, which reads and writes only the marker row.
+
+On DynamoDB the check is a **strongly consistent** scan that reads until it finds one item outside
+the `SYSTEM#` and `command-outcome#` namespaces or the table ends, so a populated table stops it at
+once; the declaration is the ordinary declaration transaction (`version` created at 1, or bumped by
+one). The scan and the declaration are two steps, and no transaction can exclude a writer that never
+reads the marker, so the order closes the window instead: the declaration is committed **first**,
+and the table is then scanned once more, strongly consistently, for a **headless stream** (a
+partition with a snapshot or event items and no head item, confirmed by a strongly consistent read of
+its head item because a scan is not atomic across items). From the declaration on, a marker-reading
+writer fails its per-commit check or refuses the table; one that committed before it is durable by
+the second scan. A headless stream means the table was not fresh after all: initialization
+**retracts** the declaration (removes `stream-heads` from the manifest in a further declaration
+transaction, so every cached validation is dropped) and refuses with `StreamHeadsNotMigrated`. A
+stream that has a head item is another head-aware writer's and never causes a retraction. A writer
+that predates the marker cannot be excluded by any protocol: the **operator obligation** is that no
+writer older than the first head-aware writer touches the store once that writer has run, and
+`migrate-heads` verifies the store for headless streams before it declares. On PostgreSQL the
+declaration transaction, under the exclusive feature lock, first checks that the events and
 snapshots tables hold no non-reserved row; a log whose schema predates the marker has no features
 table and no head table, so it cannot write until `EnsureSchema` upgrades it. The in-memory
-repository declares when it holds no events and no snapshots. A pure validation of a marker (Go
+repository checks that it holds no events and no snapshots.
+
+**Writers do not scan.** A DynamoDB writer refuses a store that does not declare the feature with a
+typed `StoreNotInitialized` error (Go `*StoreNotInitializedError`, `evt.ErrStoreNotInitialized`; Rust
+`Error::StoreNotInitialized`) on every write path above, without scanning it and without writing
+anything: it cannot tell a fresh table from one written before stream heads without a scan. So a
+DynamoDB writer's role needs no `dynamodb:Scan` on the event log; only the initializing role does. A
+DynamoDB writer may opt into **lazy initialization** (Go `Repository.WithLazyInitialization(true)`,
+Rust `DynamoRepository::with_lazy_initialization(true)`), for tests, local emulators, and
+quickstarts: its first write to a store that does not declare the feature initializes the store as
+above (and is refused with `StreamHeadsNotMigrated` when the store is populated), and its
+`CompactBelow`, which never declares, refuses with `StreamHeadsNotMigrated`. PostgreSQL and in-memory
+writers always initialize lazily: their check is two `EXISTS` probes (PostgreSQL, under the lock a
+declaration takes anyway, needing no privilege a writer lacks) or an in-process check, and their
+`CompactBelow` refuses an undeclared store with `StreamHeadsNotMigrated`. A writer's first commit
+conditions on the version it validated or declared. A pure validation of a marker (Go
 `FeatureMarker.Validate`) applies the same refusal but never writes. A writer that does not
 implement this section refuses a table that declares `stream-heads`, by the existing rule. The
-declaration is never removed once a writer has committed under it (the retraction above happens before any commit), so a pre-heads build cannot be returned to. The migration tool
-declares a populated store with `FeatureMarker.DeclareStreamHeads` (Go) after it has backfilled and
-verified every head.
+declaration is never removed once a writer has committed under it (the retraction above happens
+before any commit), so a pre-heads build cannot be returned to. The migration tool declares a
+populated store with `FeatureMarker.DeclareStreamHeads` (Go) after it has backfilled and verified
+every head.
 
 ### Migration
 
