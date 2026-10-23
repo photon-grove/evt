@@ -206,9 +206,9 @@ checks and before the written streams. A put carries all five attributes (`pk`, 
 `IfPresent` delete on `attribute_exists(pk)`. A failed condition is a
 `*evt.ProjectorOperationError`. See [commit-wide projectors](projections.md#commit-wide-projectors).
 
-Views are a **rebuildable cache, not a source of truth**. The `viewstore` package
+Views are a **rebuildable cache, not a source of truth**. The `viewcodec` package
 offers a typed JSON helper over `evt.ViewRepository` so projectors and readers
-share one codec — `viewstore.New[T]` for arbitrary pk/sk, or `viewstore.NewSingle`
+share one codec — `viewcodec.New[T]` for arbitrary pk/sk, or `viewcodec.NewSingle`
 for the common "one row per entity" pattern. See
 [Projections and rebuilds](projections.md).
 

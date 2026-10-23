@@ -66,7 +66,7 @@
 - Structure:
   - `go/`: the Go module (`github.com/photon-grove/evt/go`, package `evt`). Run Go commands from
     there. The backends are `go/backends/dynamo`, `go/backends/postgres` and `go/backends/mem`, and
-    the other packages sit beside them: `snapshots`, `projectors`, `viewstore`, `test` and so on.
+    the other packages sit beside them: `snapshots`, `projectors`, `viewcodec`, `test` and so on.
   - `website/`: Vite documentation site.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.

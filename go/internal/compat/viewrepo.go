@@ -13,12 +13,12 @@ import (
 
 	evt "github.com/photon-grove/evt/go"
 	"github.com/photon-grove/evt/go/backends/dynamo"
-	"github.com/photon-grove/evt/go/viewstore"
+	"github.com/photon-grove/evt/go/viewcodec"
 )
 
 // ViewRepoFixtureFile holds the view repository and typed view codec vectors (P1, P2, P10): the
 // items and requests Go's dynamo.ViewRepository sends, its pagination cursors, and the payload
-// bytes of viewstore.Codec.
+// bytes of viewcodec.Codec.
 const ViewRepoFixtureFile = "views.json"
 
 // ViewRepoFixtures pins the Go view repository's encoding for the Rust crate.
@@ -149,7 +149,7 @@ type ViewStartKeyVector struct {
 	Error    bool           `json:"error"`
 }
 
-// ViewCodecPutVector is a typed value written through viewstore.Codec and the item that resulted.
+// ViewCodecPutVector is a typed value written through viewcodec.Codec and the item that resulted.
 type ViewCodecPutVector struct {
 	Name     string         `json:"name"`
 	PK       string         `json:"pk"`
@@ -242,7 +242,7 @@ func viewRepoRows() []struct {
 	}
 }
 
-// GenerateViewRepoFixtures sends every case through the real Go view repository and viewstore
+// GenerateViewRepoFixtures sends every case through the real Go view repository and viewcodec
 // codec against a recording client.
 func GenerateViewRepoFixtures(ctx context.Context) (ViewRepoFixtures, error) {
 	fixtures := ViewRepoFixtures{Limits: ViewLimits{Write: 25, Get: 100}}
@@ -539,7 +539,7 @@ func fillViewCodec(ctx context.Context, fixtures *ViewRepoFixtures) error {
 
 	for _, c := range values {
 		script := &viewScript{FakeDynamo: NewFakeDynamo()}
-		codec := viewstore.New[CodecProfile](dynamo.NewViewRepository(script, viewsFixtureTable), CodecEntityType)
+		codec := viewcodec.New[CodecProfile](dynamo.NewViewRepository(script, viewsFixtureTable), CodecEntityType)
 
 		if err := codec.Put(ctx, c.pk, c.sk, evt.EntityID(c.entityID), c.value); err != nil {
 			return fmt.Errorf("codec %s: %w", c.name, err)

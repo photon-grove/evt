@@ -484,7 +484,7 @@ key `entityType` (no range key).
   string attribute as its text; a `ttl` that is not an integer is a corrupt row.
 
 `compat/fixtures/views.json` pins the items, request keys and expressions, cursors, and the
-payload bytes of the typed codec (`viewstore.Codec` in Go, `ViewCodec` in Rust: the payload is the
+payload bytes of the typed codec (`viewcodec.Codec` in Go, `ViewCodec` in Rust: the payload is the
 `json.Marshal` of the value).
 
 **Commit-wide projectors (v0.9, C7).** A commit-wide projector is a pure function over the whole

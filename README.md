@@ -110,7 +110,7 @@ err := store.Execute(ctx, aggregate, "acct-1", command, metadata)
 | `evt/go/stream` | Stream envelope and DynamoDB Streams handler |
 | `evt/go/projectors` | Projector runtime (SNS/SQS envelope decode, or direct stream) with idempotency and retry classification |
 | `evt/go/policy` | Backend-neutral retry helpers for commit paths |
-| `evt/go/viewstore` | Typed JSON helper around `evt.ViewRepository` |
+| `evt/go/viewcodec` | Typed JSON helper around `evt.ViewRepository` |
 | `evt/go/test` | Test aggregate, commands, events, and helpers for adopters and framework tests |
 
 All packages live under `github.com/photon-grove/evt/go`.

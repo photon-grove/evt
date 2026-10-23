@@ -68,7 +68,7 @@ export const packages = [
   {name: 'evt/go/stream', body: 'Stream envelope and DynamoDB Streams handler.'},
   {name: 'evt/go/projectors', body: 'Projector runtime for SNS/SQS envelopes (or the direct stream) with idempotency and retry classification.'},
   {name: 'evt/go/policy', body: 'Backend-neutral retry helpers for commit paths.'},
-  {name: 'evt/go/viewstore', body: 'Typed JSON helper around evt.ViewRepository.'},
+  {name: 'evt/go/viewcodec', body: 'Typed JSON helper around evt.ViewRepository.'},
   {name: 'evt/go/test', body: 'Shared test aggregate, commands, events, and helpers for adopters.'},
 ]
 

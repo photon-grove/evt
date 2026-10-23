@@ -1,4 +1,4 @@
-package viewstore
+package viewcodec
 
 import (
 	"context"
@@ -94,7 +94,7 @@ type testItem struct {
 	Name string `json:"name"`
 }
 
-const testEntityType evt.EntityType = "viewstore.test.item"
+const testEntityType evt.EntityType = "viewcodec.test.item"
 
 func TestCodecGetPut(t *testing.T) {
 	repo := newFakeRepo()
