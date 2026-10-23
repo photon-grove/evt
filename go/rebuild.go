@@ -216,7 +216,7 @@ func selectRebuildStream(
 	streamer, ok := repo.(SnapshotStreamer)
 	if !ok {
 		return nil, fmt.Errorf(
-			"repository %T does not support snapshot-aware rebuild (SnapshotStreamer); omit SeedEntity to use full replay",
+			"repository %T does not support snapshot-aware rebuild (SnapshotStreamer); omit SeedAggregate to use full replay",
 			repo,
 		)
 	}

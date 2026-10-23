@@ -132,7 +132,7 @@ func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_NoSnapshotFullReplay(
 		aggregates = append(aggregates, aggregate)
 	}
 
-	require.False(s.T(), seeded, "no snapshot row means seedEntity is never called")
+	require.False(s.T(), seeded, "no snapshot row means seedAggregate is never called")
 	require.Equal(s.T(), []evt.EventSequence{1, 2}, applied)
 	require.Len(s.T(), aggregates, 1)
 	s.client.AssertExpectations(s.T())

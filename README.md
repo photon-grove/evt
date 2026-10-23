@@ -389,7 +389,7 @@ default:
   error when attempts run out.
 
   A command whose write set depends on state — a rename that releases whichever handle the
-  entity currently holds — keeps one identity across attempts, because only the targets in its
+  aggregate currently holds — keeps one identity across attempts, because only the targets in its
   `evt.CommandIdentity` are digested. The flip side is a contract: **everything that distinguishes
   the request must be in `Targets` or the payload.** A transfer whose destination is chosen only
   inside `Prepare` has the same identity whichever destination it picks, so a second request with

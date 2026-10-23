@@ -47,7 +47,7 @@ func (e AggregateUpdated) EntityType() evt.EntityType {
 	return EntityType
 }
 
-// EntityID returns the Aggregate entity ID
+// EntityID returns the ID of the aggregate's stream
 func (e AggregateUpdated) EntityID() evt.EntityID {
 	return e.ID
 }

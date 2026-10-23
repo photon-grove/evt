@@ -85,11 +85,11 @@ type ViewStreamer interface {
 
 // NewJSONViewValueFunc creates a destination value for JSON view decoding.
 //
-// For pointer-backed domain entities that need constructor-injected
+// For pointer-backed domain values that need constructor-injected
 // dependencies, pass the app-specific constructor:
 //
-//	entity, found, err := evt.GetJSONView(ctx, repo, pk, func() *Aggregate {
-//		return NewAggregate(projectors...)
+//	account, found, err := evt.GetJSONView(ctx, repo, pk, func() *Account {
+//		return NewAccount(projectors...)
 //	})
 //
 // For plain value types, callers may pass nil and the zero value of T will be
