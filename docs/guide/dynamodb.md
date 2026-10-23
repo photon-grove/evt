@@ -1,15 +1,16 @@
 # DynamoDB Integration
 
 The `dynamo` package is the DynamoDB storage backend. It implements the same
-[`evt.Repository`](concepts.md#repository) contract as `mem`, so aggregates move
-between them unchanged. This page documents the required table shapes, wiring, and
-the snapshot, compaction, and retention options for growing logs.
+[`evt.Repository`](concepts.md#repository) contract as `mem`, so aggregates move between the two
+unchanged. This page covers the table shapes, the wiring, what a commit actually sends, and the
+snapshot, compaction and retention options for logs that keep growing.
 
-> The key patterns, attribute names, and serialized formats below are a stability
-> contract. Treat changes to them as breaking and document them. See
-> [`docs/internal/behavioral-invariants.md`](https://github.com/photon-grove/evt/blob/main/docs/internal/behavioral-invariants.md)
-> and the [storage format](../reference/storage-format.md), which the Rust `photon-evt`
-> crate implements too: Go and Rust services can share one table.
+The key patterns, attribute names and serialized formats below are a stability contract, so any
+change to them is breaking and gets documented. The Rust `photon-evt` crate implements the same
+[storage format](../reference/storage-format.md), which means Go and Rust services can share one
+table. The
+[behavioral invariants](https://github.com/photon-grove/evt/blob/main/docs/internal/behavioral-invariants.md)
+have the full list of guarantees.
 
 ## Wiring
 
@@ -18,67 +19,45 @@ repo := dynamo.NewRepository(client, "evt-local-event-log")
 store := snapshots.NewStore(repo, 25)
 ```
 
-`NewRepository(client, eventsTable)` takes an AWS SDK v2 DynamoDB client and the
-event-log table name. Tune it with chainable options:
+`NewRepository(client, eventsTable)` takes an AWS SDK v2 DynamoDB client and the event-log table
+name. You tune it with chainable options:
 
 | Option | Effect |
 | --- | --- |
 | `WithScanSegments(n)` | Parallel-scan the table with `n` segments during rebuilds (faster, more capacity). |
 | `WithConsistentRead(true)` | Strongly consistent reads on loads. |
 | `WithRetention(retention)` | Stamp a DynamoDB `ttl` on policed entity types (see [Retention](#retention)). |
+| `WithViewsTable(name)` | Where commit-wide projectors write their rows (see [Entity-views table](#entity-views-table)). |
 | `WithLogger(logger)` | Inject a `*slog.Logger` for structured logs. |
 
 ## Event-log table
 
-A single table holds events and inline snapshots for every entity.
+One table holds the events and inline snapshots for every entity. The partition key `pk` (`S`) is
+the entity ID and the sort key `sk` (`N`) is the event sequence, so an entity's events sit at
+`sk = 1, 2, 3, …`. Two sort keys are reserved. `sk = 0` is the entity's inline snapshot row, and
+`sk = -1` is the stream's head item, which holds `head` (and a `ttl` for retained types) and is the
+one item a commit conditions on for concurrency
+([Stream Heads](../reference/storage-format.md#stream-heads)). Event rows also carry `type`,
+`version`, `entityType`, `payload` and `metadata`, plus an optional `ttl` (`N`) when a
+[retention](#retention) policy applies. Turn on DynamoDB Streams with `NEW_IMAGE` if you use async
+[projectors](streams.md).
 
-- `pk` (`S`) — the entity ID
-- `sk` (`N`) — the event sequence (`1, 2, 3, …`)
-- `sk = 0` — the inline **snapshot** row for that entity
-- plus `type`, `version`, `entityType`, `payload`, and `metadata` attributes
-- `sk = -1` — the stream's **head item** (`head`, and `ttl` for retained types), the one item a
-  commit conditions on for concurrency ([Stream Heads](../reference/storage-format.md#stream-heads))
-- optional `ttl` (`N`) when a [retention](#retention) policy applies
-- **DynamoDB Streams** with `NEW_IMAGE` when using async [projectors](streams.md)
+Event rows are append-only and protected by conditional writes. A commit succeeds only if the next
+sequence is unclaimed, and that's how concurrent writers on one entity stay ordered. Each written
+stream starts its group with one conditional `Update` of its head item, `head = first − 1` (or
+`attribute_not_exists(head)` for a stream that starts at 1). So no sequence is ever skipped, and a
+commit that starts at or below a snapshot's `eventSequence` is rejected. That second rule stops a
+writer that loaded before a compaction from recreating the deleted events
+([Continuity](../reference/storage-format.md#continuity)). Compaction never moves the head, so a
+writer whose load is current never conflicts with it.
 
-Event rows are **append-only and protected by conditional writes** — a commit only
-succeeds if the next sequence is unclaimed, which is how concurrent writers on one
-entity stay correctly ordered. Each written stream also starts its group with one conditional
-`Update` of its head item: `head = first − 1` (or `attribute_not_exists(head)` for a stream that
-starts at 1), so no sequence is ever skipped and a commit that starts at or below a snapshot's
-`eventSequence` is rejected, which keeps a writer that loaded before a compaction from recreating the
-deleted events ([Continuity](../reference/storage-format.md#continuity)). Compaction never moves the head,
-so a writer whose load is current never conflicts with it. Every v0.9 commit also carries a
-feature-marker check and a rebuild-lock check. Of the 100 transaction items, a single-stream commit
-reserves three (head update + marker + rebuild lock), leaving **97 event/projector operations**
-whether it creates its stream or appends to it, and **96** when it also writes a snapshot (the
-snapshot put sits beside the head update).
-These actions are billed as writes. The commit budget counts only the actions a commit actually
-emits.
-
-**Permissions and billing.** The head update is an `Update` action inside `TransactWriteItems`, so a
-writer's role needs `dynamodb:UpdateItem` on the event-log table as well as `PutItem`,
-`ConditionCheckItem` and `TransactWriteItems`. The first write to a table that does not declare
-`stream-heads` runs a strongly consistent `Scan` to prove the table holds no data, declares the
-feature, and scans once more to prove no stream without a head item slipped in before the
-declaration (`dynamodb:Scan`); a writer to a table that already declares the feature never scans.
-Writers older than the head item never read the marker, so they must be stopped before the first
-head-aware writer runs against a table ([the obligation](../reference/storage-format.md#required-feature)). Every
-transactional action is billed as two writes of the checked or written item's size, rounded up to
-1 KB; the head item stays well under 1 KB, so a head update or a fence is the cheapest action a commit
-can send, and it no longer scales with the size of a snapshot. (Whether a `ConditionCheck` bills by
-the size of the item it reads is documented only indirectly, and is still to be measured on real
-DynamoDB with the `go/backends/dynamo/awsmeasure_test.go` script: [#159](https://github.com/photon-grove/evt/issues/159).)
-
-There are no reads before a commit. A failed commit is told apart by reading the stream on the
-failure path only ([Classification](../reference/storage-format.md#failure-classification)). A head item
-that disagrees with its log is `*evt.StreamHeadDriftError`, and a store that holds data without
-declaring the `stream-heads` feature is refused with `*evt.StreamHeadsNotMigratedError` until it is
-migrated; an empty table is declared by its first writer, so a fresh table needs no step. A table
-written by v0.8 is migrated with `evt-doctor migrate-heads` (stop-the-world, one-way): see the
-[migration runbook](migrating-to-stream-heads.md).
-
-The full v0.9 target ([storage item budget](../reference/storage-format.md#writes), C1/C2/C3/C10) is:
+Every commit also carries a feature-marker check and a rebuild-lock check. Of DynamoDB's 100
+transaction items, a single-stream commit reserves three (the head update, the marker and the
+rebuild lock). That leaves 97 events and projector operations whether the commit creates its
+stream or appends to it, or 96 when it also writes a snapshot, since the snapshot put sits beside
+the head update. These actions are billed as writes, and the commit budget counts only the actions
+a commit actually emits. The full budget
+([storage item budget](../reference/storage-format.md#writes)) is:
 
 ```text
 items = Σ(events per written stream + 1 head update + 1 snapshot put if the commit writes one)
@@ -89,145 +68,170 @@ items = Σ(events per written stream + 1 head update + 1 snapshot put if the com
       + projector operations
 ```
 
-With command outcomes enabled (C3), the outcome row is the last action of every commit and counts
-as one more item, so a single-stream commit leaves **96** event/projector operations, creating or
-appending (95 when it also writes a snapshot). The outcome is a `Put` on
-`(command-outcome#<id>, sk = 1)` conditioned on `attribute_not_exists(pk)`; it is read back with a
-strongly consistent `GetItem`, whatever the repository's read-consistency setting. An outcome-only
-commit (an accepted no-op or a persisted rejection) is the two control checks plus that put.
+With [command outcomes](commands.md) enabled, the outcome row is the last action of every commit
+and counts as one more item. A single-stream commit then leaves 96 events and projector
+operations, creating or appending, or 95 with a snapshot. The outcome is a `Put` on
+`(command-outcome#<id>, sk = 1)` conditioned on `attribute_not_exists(pk)`, and it's read back with
+a strongly consistent `GetItem` whatever the repository's read-consistency setting. An
+outcome-only commit, meaning an accepted no-op or a persisted rejection, is the two control checks
+plus that put.
 
-The rebuild-lock check (C10) is a `ConditionCheck` of `attribute_not_exists(pk)` on
-`(SYSTEM#REBUILD, sk = 0)`, the second action of every commit: it fails whenever a rebuild holds
-the lock, an expired one included, and is reported as `*evt.RebuildInProgressError` ahead of every
-other failure but the marker check. It is billed as one write unit like the marker check.
-Every lease-guarded write is conditioned on the lock item's `owner` and `generation` (the fencing token
-`Begin` returned), so `End` sends only its one transaction, with no read first. Rebuild workers manage the lock and its generation counter through `Repository.RebuildFence()`
-([Rebuild fence](../../README.md#rebuild-fence-v09-c10)); the lifecycle's transactions write only the
-two `SYSTEM#REBUILD*` items, and a worker's role needs `dynamodb:PutItem`, `dynamodb:UpdateItem`,
-`dynamodb:DeleteItem` and `dynamodb:ConditionCheckItem` on the table for them, and `GetItem` for
-the consistent reads of the generation.
+There are no reads before a commit. A failed commit is told apart by reading the stream on the
+failure path only ([Classification](../reference/storage-format.md#failure-classification)). A head
+item that disagrees with its log is `*evt.StreamHeadDriftError`. A store that holds data without
+declaring the `stream-heads` feature is refused with `*evt.StreamHeadsNotMigratedError` until it's
+migrated. An empty table is declared by its first writer, so a fresh table needs no step. A table
+written by v0.8 is migrated with `evt-doctor migrate-heads`, which is stop-the-world and one-way
+(see the [migration runbook](migrating-to-stream-heads.md)).
 
-Every commit checks the lock item, so it is a hot item under heavy write traffic: a lifecycle
-transaction that writes it can lose a race against the commits' checks (or another `Begin`), and
+The `sk = 0` snapshot row records the entity's serialized state plus the `eventSequence` it
+covers. Snapshot writes are monotonic. A write that would move the covered sequence backwards is a
+no-op, so a slow background writer can never regress the floor.
+
+### Permissions and billing
+
+The head update is an `Update` action inside `TransactWriteItems`, so a writer's role needs
+`dynamodb:UpdateItem` on the event-log table as well as `PutItem`, `ConditionCheckItem` and
+`TransactWriteItems`. The first write to a table that doesn't declare `stream-heads` runs a
+strongly consistent `Scan` to prove the table holds no data, declares the feature, then scans once
+more to prove no stream without a head item slipped in before the declaration. That needs
+`dynamodb:Scan`. A writer to a table that already declares the feature never scans. Writers older
+than the head item never read the marker, so they have to be stopped before the first head-aware
+writer runs against a table ([the obligation](../reference/storage-format.md#required-feature)).
+
+Every transactional action is billed as two writes of the checked or written item's size, rounded
+up to 1 KB. The head item stays well under 1 KB, so a head update or a fence is the cheapest action
+a commit can send, and it no longer scales with the size of a snapshot. Whether a `ConditionCheck`
+bills by the size of the item it reads is documented only indirectly. It's still to be measured on
+real DynamoDB with the `go/backends/dynamo/awsmeasure_test.go` script
+([#159](https://github.com/photon-grove/evt/issues/159)).
+
+### The rebuild lock
+
+The rebuild-lock check is a `ConditionCheck` of `attribute_not_exists(pk)` on
+`(SYSTEM#REBUILD, sk = 0)`, and it's the second action of every commit. It fails whenever a rebuild
+holds the lock, an expired one included, and it's reported as `*evt.RebuildInProgressError` ahead
+of every other failure except the marker check. Like the marker check, it's billed as one write
+unit.
+
+Rebuild workers manage the lock and its generation counter through `Repository.RebuildFence()`
+(see [Fencing a rebuild](projections.md#fencing-a-rebuild)). Every lease-guarded write is
+conditioned on the lock item's `owner` and `generation`, the fencing token `Begin` returned, so
+`End` sends only its one transaction with no read first. The lifecycle's transactions write only
+the two `SYSTEM#REBUILD*` items. A worker's role needs `dynamodb:PutItem`, `dynamodb:UpdateItem`,
+`dynamodb:DeleteItem` and `dynamodb:ConditionCheckItem` on the table for them, and `GetItem` for the
+consistent reads of the generation.
+
+Because every commit checks the lock item, it's a hot item under heavy write traffic. A lifecycle
+transaction that writes it can lose a race against the commits' checks (or another `Begin`), so
 `Begin` retries from a fresh read up to eight times before returning the transient
-`*evt.RebuildConflictError`. Retry it; the commits that meet the lock are refused meanwhile, which
-is the point of the fence.
-
-The `sk = 0` snapshot row records the entity's serialized state plus the
-`eventSequence` it covers, and snapshot writes are monotonic: a write that would move
-the covered sequence backwards is a no-op, so a slow background writer can never
-regress the floor.
+`*evt.RebuildConflictError`. Retry it. The commits that meet the lock are refused in the meantime,
+which is the point of the fence.
 
 ### Snapshots
 
-`snapshots.NewStore(repo, snapshotSize)` wraps the repository and writes a snapshot
-roughly every `snapshotSize` committed events. Loading then reads the latest
-snapshot and only the events after it, instead of replaying from sequence 1. The
-snapshot is a [performance optimization, never a source of truth](concepts.md#snapshot)
-— it is always reproducible by replay.
+`snapshots.NewStore(repo, snapshotSize)` wraps the repository and writes a snapshot roughly every
+`snapshotSize` committed events. A load then reads the latest snapshot and only the events after
+it, instead of replaying from sequence 1. The snapshot is a
+[performance optimization, never a source of truth](concepts.md#snapshot), and replay can always
+reproduce it.
 
 ### Compaction
 
-Event rows are retained in full by default. A stream may opt into compaction with:
+Event rows are kept in full by default. A stream can opt into compaction:
 
 ```go
 deleted, err := repo.CompactBelow(ctx, entityID, throughSequence)
 ```
 
-`CompactBelow` deletes events in `[1, throughSequence]` — but **only after
-confirming the inline `sk = 0` snapshot already covers them**
-(`snapshot.EventSequence >= throughSequence`), and it never deletes the snapshot
-row itself. An uncovered request returns `evt.ErrCompactionUncovered` and deletes
-nothing. After a stream is compacted you **must** rebuild it through the
-snapshot-aware path (`RebuildConfig.SeedAggregate` / `evt.SnapshotStreamer`), never a
-full replay from sequence 1 — the early events are gone.
+`CompactBelow` deletes the events in `[1, throughSequence]`, but only after confirming the inline
+`sk = 0` snapshot already covers them (`snapshot.EventSequence >= throughSequence`), and it never
+deletes the snapshot row itself. An uncovered request returns `evt.ErrCompactionUncovered` and
+deletes nothing. Once a stream is compacted, rebuild it through the snapshot-aware path
+(`RebuildConfig.SeedAggregate` and `evt.SnapshotStreamer`) and never with a full replay from
+sequence 1, because the early events are gone.
 
-Feature-marker checks also refuse unsupported features and history-dependent entity types
-across repository handles. DynamoDB fences **each delete batch** (at most 99 events plus
-one marker check), not the entire compaction: there is no whole-operation lease. A declaration
-racing an in-progress multi-batch compaction can stop later batches but cannot roll back an
-already committed prefix, leaving the stream partially compacted. A history-dependent rebuild
-then reports `CompactionUncovered`, rather than silently replaying incomplete history. Declare
-history dependence **before writing data of that entity type**. PostgreSQL instead holds its
-shared feature advisory lock through validation and all deletes in one transaction. See
-[Feature Marker](../reference/storage-format.md#feature-marker).
+Feature-marker checks also refuse unsupported features and history-dependent entity types across
+repository handles. Here's the tradeoff on DynamoDB. It fences each delete batch (at most 99 events
+plus one marker check) rather than the whole compaction, because there's no whole-operation lease.
+A declaration racing a multi-batch compaction can stop the later batches but can't roll back a
+prefix that already committed, which leaves the stream partially compacted. A history-dependent
+rebuild then reports `CompactionUncovered` instead of quietly replaying incomplete history. So
+declare history dependence before writing data of that entity type. PostgreSQL holds its shared
+feature advisory lock through validation and all deletes in one transaction instead (see
+[Feature Marker](../reference/storage-format.md#feature-marker)).
 
-There is no raw delete helper. For fixture teardown or reset, delete the items with the AWS SDK or
-recreate the table. `CompactBelow` is for snapshot-verified truncation, not fixture cleanup: it only
-deletes a snapshot-covered prefix and never deletes the snapshot row.
-Prefer `CompactBelow` for principled truncation in any environment. Background and rationale
-live in [ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
+There's no raw delete helper. For fixture teardown or a reset, delete the items with the AWS SDK or
+recreate the table. `CompactBelow` is for snapshot-verified truncation in any environment, not
+fixture cleanup, since it only deletes a snapshot-covered prefix.
+[ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md) has the background.
 
 ### Retention
 
-For **terminal, short-lived, fully transient** streams that no rebuild replays,
-`WithRetention` stamps a DynamoDB `ttl`:
+For terminal, short-lived, fully transient streams that no rebuild replays, `WithRetention` stamps
+a DynamoDB `ttl`:
 
 ```go
 repo := dynamo.NewRepository(client, eventsTable).
     WithRetention(dynamo.Retention{"scratch_job": 24 * time.Hour})
 ```
 
-Only policed types receive `ttl`; durable types never expire. A retained stream's head item
-carries a `ttl` too, at least that of every other item of the stream and never lowered: each commit
-raises it to the larger of its own and the largest `ttl` this repository loaded for the stream
-(a writer that has not loaded the stream conflicts on the `ttl` condition and passes on its retry),
-and an out-of-band `PutSnapshot` refreshes it in the same transaction. TTL deletion is lazy and
-unordered, so a stream can be partly deleted for a while; a commit that finds a head item absent
-while every remaining item has expired gets a conflict that heals once they are deleted, not
-`StreamHeadDriftError`. TTL expires items
-individually, so an older prefix can disappear while newer events remain. Use
-retention only for streams never replayed and never appended after becoming
-terminal. For accumulating streams, keep a snapshot and use [compaction](#compaction).
+Only policed types get a `ttl`, and durable types never expire. A retained stream's head item
+carries a `ttl` too, at least that of every other item in the stream and never lowered. Each commit
+raises it to the larger of its own and the largest `ttl` this repository loaded for the stream. A
+writer that hasn't loaded the stream conflicts on the `ttl` condition and passes on its retry. An
+out-of-band `PutSnapshot` refreshes it in the same transaction.
 
-**Read fences refuse retained types.** TTL deletion is lazy, so a fence on a retained stream is not
-incarnation-proof (the stream can expire and be created again at the same head), and a fence on a
-retained entity type is refused with a retention conflict.
-The refusal is the union of two sources: this repository's own `WithRetention` configuration
-(checked without any I/O) and the retention set in the durable feature marker. Local
-configuration alone protects only this process. Also declare each retained type in the marker
-(`FeatureMarker.Declare`, adding it to `Retention`) so every other writer refuses fences on it too;
-the Rust crate's `with_retention` follows the same rule.
+TTL deletion is lazy and unordered, so a stream can be partly deleted for a while. A commit that
+finds a head item absent while every remaining item has expired gets a conflict that heals once
+they're deleted, not `StreamHeadDriftError`. And because TTL expires items individually, an older
+prefix can disappear while newer events remain. So use retention only for streams that are never
+replayed and never appended to after they become terminal. For streams that accumulate, keep a
+snapshot and use [compaction](#compaction).
+
+Read fences refuse retained types. Since TTL deletion is lazy, a fence on a retained stream isn't
+incarnation-proof (the stream can expire and be created again at the same head), so a fence on a
+retained entity type is refused with a retention conflict. The refusal combines two sources: this
+repository's own `WithRetention` configuration, checked without any I/O, and the retention set in
+the durable feature marker. Local configuration alone protects only this process. So also declare
+each retained type in the marker (`FeatureMarker.Declare`, adding it to `Retention`) and every
+other writer refuses fences on it too. The Rust crate's `with_retention` follows the same rule.
 
 ## Entity-views table
 
-Read models live in their own table, separate from the log:
+Read models live in their own table, separate from the log. Its `pk` (`S`) is the
+projection-owned lookup key and its `sk` (`S`) is the view sort key, defaulting to `VIEW`
+(`evt.DefaultViewSK`). An `entityType` (`S`) attribute backs the `entityType-index` GSI for
+type-wide queries, and a `ttl` (`N`) is there for when expiring derived rows is useful.
 
-- `pk` (`S`) — the projection-owned lookup key
-- `sk` (`S`) — the view sort key, defaulting to `VIEW` (`evt.DefaultViewSK`)
-- `entityType` (`S`) — backing the `entityType-index` GSI for type-wide queries
-- `ttl` (`N`) — when expiring derived rows is useful
+Commit-wide projectors write to this table too. Configure the repository with
+`dynamo.NewRepository(client, events).WithViewsTable("views")`, and every view operation in a commit
+becomes one `Put` or `Delete` in the commit's transaction, after the feature-marker and
+rebuild-lock checks and before the written streams. A put carries all five attributes (`pk`, `sk`,
+`entityID`, `entityType`, `payload`) and never a `ttl`. An `IfAbsent` put is conditioned on
+`attribute_not_exists(pk)` and an `IfPresent` delete on `attribute_exists(pk)`. A failed condition
+is a `*evt.ProjectorOperationError`. The rules are in
+[commit-wide projectors](projections.md#commit-wide-projectors).
 
-Commit-wide projectors write to this table too: configure the repository with
-`dynamo.NewRepository(client, events).WithViewsTable("views")` and every view operation of a commit
-becomes one `Put` or `Delete` in the commit's transaction, after the feature-marker and rebuild-lock
-checks and before the written streams. A put carries all five attributes (`pk`, `sk`, `entityID`, `entityType`,
-`payload`) and never a `ttl`; an `IfAbsent` put is conditioned on `attribute_not_exists(pk)` and an
-`IfPresent` delete on `attribute_exists(pk)`. A failed condition is a
-`*evt.ProjectorOperationError`. See [commit-wide projectors](projections.md#commit-wide-projectors).
-
-Views are a **rebuildable cache, not a source of truth**. The `viewcodec` package
-offers a typed JSON helper over `evt.ViewRepository` so projectors and readers
-share one codec — `viewcodec.New[T]` for arbitrary pk/sk, or `viewcodec.NewSingle`
-for the common "one row per entity" pattern. See
+Views are a rebuildable cache, not a source of truth. The `viewcodec` package offers a typed JSON
+helper over `evt.ViewRepository` so projectors and readers share one codec. Use `viewcodec.New[T]`
+for arbitrary pk/sk, or `viewcodec.NewSingle` for the common one-row-per-entity pattern. See
 [Projections and rebuilds](projections.md).
 
-**Read consistency.** `dynamo.ViewRepository` reads the base table strongly consistently:
-`GetView` and `BatchGetViews` always, and the partition listings (`ListViewsByPK`,
-`ListViewsByPKPaged`, `ListViewsByPKEach`) by default. A handler that commits and then reads the
-rows its commit wrote, to return them or to validate the next step, sees them. A strongly
-consistent read costs twice the read capacity of an eventually consistent one (one read unit per
-4 KB instead of per 8 KB); a listing that can tolerate a stale page can opt out with
-`WithConsistentRead(false)` on the `*dynamo.ViewRepository` (`NewViewRepository` returns the
-interface, so type-assert it). Point reads stay strong either way. The entity-type listings read
-the `entityType-index` global secondary index, which DynamoDB can only read eventually
-consistently, so a row a commit just wrote can be missing from them for a moment. Rust's
-`DynamoViewRepository` behaves the same (`with_consistent_read`).
+`dynamo.ViewRepository` reads the base table strongly consistently. `GetView` and `BatchGetViews`
+always do, and the partition listings (`ListViewsByPK`, `ListViewsByPKPaged`, `ListViewsByPKEach`)
+do by default. So a handler that commits and then reads the rows its commit wrote, to return them
+or to validate the next step, sees them. A strongly consistent read costs twice the read capacity
+of an eventually consistent one (one read unit per 4 KB instead of per 8 KB). A listing that can
+tolerate a stale page can opt out with `WithConsistentRead(false)` on the `*dynamo.ViewRepository`.
+`NewViewRepository` returns the interface, so type-assert it first. Point reads stay strong either
+way. The entity-type listings read the `entityType-index` global secondary index, which DynamoDB
+can only read eventually consistently, so a row a commit just wrote can be missing from them for a
+moment. Rust's `DynamoViewRepository` behaves the same way (`with_consistent_read`).
 
 ## Local tables
 
-The [`infra/local`](https://github.com/photon-grove/evt/tree/main/infra/local)
-Terraform stack creates emulator tables that match the integration suite —
-`evt-local-event-log` and `evt-local-entity-views`.
-Apply it against a local DynamoDB-compatible emulator (Moto) before running
-integration tests; keep real account IDs, ARNs, and hostnames out of this repo.
+The [`infra/local`](https://github.com/photon-grove/evt/tree/main/infra/local) Terraform stack
+creates emulator tables that match the integration suite, `evt-local-event-log` and
+`evt-local-entity-views`. Apply it against a local DynamoDB-compatible emulator (Moto) before you
+run the integration tests, and keep real account IDs, ARNs and hostnames out of this repo.
