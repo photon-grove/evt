@@ -82,7 +82,7 @@ func Test_MaintenanceHoldsFeatureLock(t *testing.T) {
 			defer cancel()
 			repo, marker, name := newIsolatedEventLog(ctx, t)
 			id := evt.EntityID("account-1")
-			events := serializeAs(t, id, "account", 0, &test.EntityCreated{ID: id, Value: "one"})
+			events := serializeAs(t, id, "account", 0, &test.AggregateCreated{ID: id, Value: "one"})
 			require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "account", id, []byte(`{}`), 1))
 			db := &pausedManifestDB{DB: newPool(ctx, t), paused: make(chan struct{}), resume: make(chan struct{})}
 			// Mixed-case handles address the same unquoted table and must share the lowercase lock.
@@ -134,7 +134,7 @@ func Test_DefaultAndDeclaringWritersRefuseUnsupported(t *testing.T) {
 	repo, marker, _ := newIsolatedEventLog(ctx, t)
 	declaring := repo.WithFeatureMarker(marker)
 	id := evt.EntityID("account-1")
-	events := serializeAs(t, id, "account", 0, &test.EntityCreated{ID: id, Value: "one"})
+	events := serializeAs(t, id, "account", 0, &test.AggregateCreated{ID: id, Value: "one"})
 	_, err := marker.Declare(ctx, func(m *evt.FeatureManifest) { m.Features[evt.FeatureJournal] = 1 })
 	require.NoError(t, err)
 
@@ -156,7 +156,7 @@ func Test_CompactionRefusesUnsupportedFeature(t *testing.T) {
 	ctx := context.Background()
 	repo, marker, _ := newIsolatedEventLog(ctx, t)
 	id := evt.EntityID("account-1")
-	events := serializeAs(t, id, "account", 0, &test.EntityCreated{ID: id, Value: "one"})
+	events := serializeAs(t, id, "account", 0, &test.AggregateCreated{ID: id, Value: "one"})
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "account", id, []byte(`{}`), 1))
 	_, err := marker.Declare(ctx, func(m *evt.FeatureManifest) { m.Features[evt.FeatureJournal] = 1 })
 	require.NoError(t, err)
@@ -182,12 +182,12 @@ func Test_PreMarkerSchemaNeedsAnUpgrade(t *testing.T) {
 	require.Nil(t, manifest)
 
 	id := evt.EntityID("account-1")
-	events := serializeAs(t, id, "account", 0, &test.EntityCreated{ID: id, Value: "one"})
+	events := serializeAs(t, id, "account", 0, &test.AggregateCreated{ID: id, Value: "one"})
 	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: events}), "the marker table is missing")
 
 	require.NoError(t, repo.EnsureSchema(ctx))
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events}))
-	events = serializeAs(t, id, "account", 1, &test.EntityUpdated{ID: id, Value: "two"})
+	events = serializeAs(t, id, "account", 1, &test.AggregateUpdated{ID: id, Value: "two"})
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "account", id, []byte(`{}`), 1))
 	require.NoError(t, repo.PutSnapshot(ctx, "account", id, []byte(`{"new":true}`), 2, 2))
 	deleted, err := repo.CompactBelow(ctx, id, 1)
@@ -222,7 +222,7 @@ func Test_PopulatedLogWithoutHeadsIsRefused(t *testing.T) {
 	require.NoError(t, err)
 
 	id := evt.EntityID("account-1")
-	events := serializeAs(t, id, "account", 1, &test.EntityUpdated{ID: id, Value: "two"})
+	events := serializeAs(t, id, "account", 1, &test.AggregateUpdated{ID: id, Value: "two"})
 	err = repo.Commit(ctx, evt.SerializedResult{Events: events})
 	require.ErrorIs(t, err, evt.ErrStreamHeadsNotMigrated)
 	require.ErrorIs(t, repo.PutSnapshot(ctx, "account", id, []byte(`{}`), 1, 1), evt.ErrStreamHeadsNotMigrated)

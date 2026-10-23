@@ -6,13 +6,16 @@ everything else is derived state you can rebuild.** This page defines the
 vocabulary and shows the contract behind each type. The [getting-started
 guide](getting-started.md) puts them together end to end.
 
-## Entity
+## Aggregate
 
-An entity is an aggregate root whose state is reconstructed from events. It owns
-business invariants and applies facts. It implements:
+An aggregate is an object whose state is reconstructed from events. It owns
+business invariants and applies facts. Each aggregate instance is one stream in the log,
+identified by an `EntityType` and an `EntityID`. Those two names describe the stream's identity,
+which is why they keep the word "entity" while the object itself is an `Aggregate` (the same
+trait name the Rust crate uses). An aggregate implements:
 
 ```go
-type Entity interface {
+type Aggregate interface {
     Type() EntityType
     GetID() EntityID
     Handle(context.Context, Command) (CommandResult, error)
@@ -23,7 +26,7 @@ type Entity interface {
 }
 ```
 
-An entity defines its own identity and lifecycle fields, such as an `ID` that `GetID()` returns.
+An aggregate defines its own identity and lifecycle fields, such as an `ID` that `GetID()` returns.
 The critical discipline is the split between `Handle` and `Apply`: **`Handle` validates and
 decides; `Apply` mutates and trusts.** `Handle` produces events without changing
 state; `Apply` folds an already-recorded event into state without re-validating
@@ -160,20 +163,25 @@ contract is small:
 
 ```go
 type Store interface {
-    LoadEntity(ctx, entity, entityID) (Context, error)
-    Commit(ctx, result, context, metadata) ([]SerializedEvent, error)
-    Execute(ctx, entity, entityID, command, metadata) error
+    LoadAggregate(ctx, aggregate, entityID) (CommandContext, error)
+    Commit(ctx, result, cc, metadata) ([]SerializedEvent, error)
+    Execute(ctx, aggregate, entityID, command, metadata) error
 }
 ```
 
-`Execute` is the everyday entry point: it loads the entity from the log, handles
+`CommandContext` is what `LoadAggregate` returns and `Commit` takes back: the loaded aggregate, its
+`EntityID`, the sequence and snapshot the stream stood at when it was read, and the command IDs seen
+during replay. It travels beside `context.Context` as its own explicit argument, so cancellation and
+deadlines stay on `ctx` while the stream's state stays on `cc`.
+
+`Execute` is the everyday entry point: it loads the aggregate from the log, handles
 the command, and commits the result in one call. When an aggregate needs injected
-dependencies, construct a fresh instance yourself and pass it to `store.Execute(ctx, entity,
+dependencies, construct a fresh instance yourself and pass it to `store.Execute(ctx, aggregate,
 entityID, command, metadata)`.
 
 ## Snapshot
 
-A snapshot is a serialized checkpoint of entity state at a known sequence. It is a
+A snapshot is a serialized checkpoint of aggregate state at a known sequence. It is a
 **performance optimization, never a source of truth** — `snapshots.NewStore(repo,
 size)` writes one roughly every `size` events so loading a long stream reads the
 latest snapshot plus the tail instead of replaying from sequence 1. On DynamoDB
@@ -185,7 +193,7 @@ A projector turns event-sourced state into deterministic read models:
 
 ```go
 type EventProjector interface {
-    Project(context.Context, Entity, []Event) (TransactionGroup, error)
+    Project(context.Context, Aggregate, []Event) (TransactionGroup, error)
 }
 ```
 
@@ -196,7 +204,7 @@ over the log. That is what makes a projection table disposable. See
 
 ### Commit-wide projectors
 
-An `EventProjector` sees one entity. A **commit-wide projector** (v0.9, C7) sees the whole commit
+An `EventProjector` sees one aggregate. A **commit-wide projector** (v0.9, C7) sees the whole commit
 — every stream it wrote, with each stream's events and its state after the commit — and returns
 **view operations**: puts and deletes of rows at any `pk`/`sk`, with optional conditions and
 mapped errors. The rows commit in the same transaction as the events, so a cross-entity read model
@@ -267,5 +275,5 @@ of "views are derived." `evt.RebuildProjections` streams entities, reconstitutes
 each one, runs its projectors, and commits the resulting groups (or, in dry-run
 mode, reports what it would write). Streams that have been
 [compacted](dynamodb.md#compaction) must rebuild from their snapshot via
-`RebuildConfig.SeedEntity`, never by replaying from sequence 1. Full details in
+`RebuildConfig.SeedAggregate`, never by replaying from sequence 1. Full details in
 [Projections and rebuilds](projections.md).

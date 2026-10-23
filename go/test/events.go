@@ -5,60 +5,60 @@ import evt "github.com/photon-grove/evt/go"
 // CreatedEvent is an event type
 const CreatedEvent evt.EventType = evt.EventType(string(EntityType) + ":created")
 
-// EntityCreated is the "created" event
-type EntityCreated struct {
+// AggregateCreated is the "created" event
+type AggregateCreated struct {
 	ID    evt.EntityID `json:"id"`
 	Value string       `json:"value"`
 	Other *string      `json:"other"`
 }
 
 // EntityType returns the entity type constant for this event
-func (e EntityCreated) EntityType() evt.EntityType {
+func (e AggregateCreated) EntityType() evt.EntityType {
 	return EntityType
 }
 
 // EntityID returns the ID for this entity
-func (e EntityCreated) EntityID() evt.EntityID {
+func (e AggregateCreated) EntityID() evt.EntityID {
 	return e.ID
 }
 
 // Type returns the event type constant
-func (e EntityCreated) Type() evt.EventType {
+func (e AggregateCreated) Type() evt.EventType {
 	return CreatedEvent
 }
 
 // Version returns the version of the event schema - when changed, increment this
-func (e EntityCreated) Version() evt.EventVersion {
+func (e AggregateCreated) Version() evt.EventVersion {
 	return 1
 }
 
 // UpdatedEvent represents the event type with a string unique to the entity type
 const UpdatedEvent evt.EventType = evt.EventType(string(EntityType) + ":updated")
 
-// EntityUpdated is the "updated" event
-type EntityUpdated struct {
+// AggregateUpdated is the "updated" event
+type AggregateUpdated struct {
 	ID    evt.EntityID `json:"id"`
 	Value string       `json:"value"`
 	Other *string      `json:"other"`
 }
 
 // EntityType returns the Entity type constant for this event
-func (e EntityUpdated) EntityType() evt.EntityType {
+func (e AggregateUpdated) EntityType() evt.EntityType {
 	return EntityType
 }
 
-// EntityID returns the Entity entity ID
-func (e EntityUpdated) EntityID() evt.EntityID {
+// EntityID returns the ID of the aggregate's stream
+func (e AggregateUpdated) EntityID() evt.EntityID {
 	return e.ID
 }
 
 // Type returns the event type constant
-func (e EntityUpdated) Type() evt.EventType {
+func (e AggregateUpdated) Type() evt.EventType {
 	return UpdatedEvent
 }
 
 // Version returns the version of the event schema - when changed, increment this
-func (e EntityUpdated) Version() evt.EventVersion {
+func (e AggregateUpdated) Version() evt.EventVersion {
 	return 1
 }
 

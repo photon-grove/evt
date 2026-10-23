@@ -84,68 +84,68 @@ func Test_GetEventID_ConsistentFormatting(t *testing.T) {
 	require.Equal(t, "test-entity:5", string(result1))
 }
 
-func Test_Context_StructFields(t *testing.T) {
-	// Test Context struct creation and field access
+func Test_CommandContext_StructFields(t *testing.T) {
+	// Test CommandContext struct creation and field access
 	entityID := EntityID("test-entity-123")
 	currentSeq := EventSequence(10)
 	snapshotSeq := EventSequence(5)
 
 	// Create a mock entity (we'll use nil since we're just testing the struct)
-	var entity Entity
+	var aggregate Aggregate
 
-	ctx := Context{
-		Entity:          entity,
+	cc := CommandContext{
+		Aggregate:       aggregate,
 		EntityID:        entityID,
 		CurrentSequence: &currentSeq,
 		CurrentSnapshot: &snapshotSeq,
 	}
 
-	require.Equal(t, entity, ctx.Entity)
-	require.Equal(t, entityID, ctx.EntityID)
-	require.NotNil(t, ctx.CurrentSequence)
-	require.Equal(t, currentSeq, *ctx.CurrentSequence)
-	require.NotNil(t, ctx.CurrentSnapshot)
-	require.Equal(t, snapshotSeq, *ctx.CurrentSnapshot)
+	require.Equal(t, aggregate, cc.Aggregate)
+	require.Equal(t, entityID, cc.EntityID)
+	require.NotNil(t, cc.CurrentSequence)
+	require.Equal(t, currentSeq, *cc.CurrentSequence)
+	require.NotNil(t, cc.CurrentSnapshot)
+	require.Equal(t, snapshotSeq, *cc.CurrentSnapshot)
 }
 
-func Test_Context_NilPointers(t *testing.T) {
-	// Test Context with nil pointer fields
+func Test_CommandContext_NilPointers(t *testing.T) {
+	// Test CommandContext with nil pointer fields
 	entityID := EntityID("test-entity")
 
-	ctx := Context{
-		Entity:          nil,
+	cc := CommandContext{
+		Aggregate:       nil,
 		EntityID:        entityID,
 		CurrentSequence: nil,
 		CurrentSnapshot: nil,
 	}
 
-	require.Nil(t, ctx.Entity)
-	require.Equal(t, entityID, ctx.EntityID)
-	require.Nil(t, ctx.CurrentSequence)
-	require.Nil(t, ctx.CurrentSnapshot)
+	require.Nil(t, cc.Aggregate)
+	require.Equal(t, entityID, cc.EntityID)
+	require.Nil(t, cc.CurrentSequence)
+	require.Nil(t, cc.CurrentSnapshot)
 }
 
-func Test_Context_PointerManipulation(t *testing.T) {
+func Test_CommandContext_PointerManipulation(t *testing.T) {
 	// Test working with sequence pointers
 	seq1 := EventSequence(5)
 	seq2 := EventSequence(10)
 
-	ctx := Context{
+	cc := CommandContext{
 		EntityID:        "test",
 		CurrentSequence: &seq1,
 		CurrentSnapshot: &seq2,
 	}
 
 	// Verify initial values
-	require.Equal(t, EventSequence(5), *ctx.CurrentSequence)
-	require.Equal(t, EventSequence(10), *ctx.CurrentSnapshot)
+	require.Equal(t, EventSequence(5), *cc.CurrentSequence)
+	require.Equal(t, EventSequence(10), *cc.CurrentSnapshot)
 
 	// Modify the values through the pointers
-	*ctx.CurrentSequence = 15
-	*ctx.CurrentSnapshot = 8
+	*cc.CurrentSequence = 15
+	*cc.CurrentSnapshot = 8
 
-	require.Equal(t, EventSequence(15), *ctx.CurrentSequence)
-	require.Equal(t, EventSequence(8), *ctx.CurrentSnapshot)
+	require.Equal(t, EventSequence(15), *cc.CurrentSequence)
+	require.Equal(t, EventSequence(8), *cc.CurrentSnapshot)
 
 	// The original variables should also be changed since they share the same memory
 	require.Equal(t, EventSequence(15), seq1)
@@ -348,50 +348,50 @@ func Test_Types_ZeroValues(t *testing.T) {
 	require.Equal(t, 0, int(eventVersion))
 }
 
-func Test_Context_ZeroValue(t *testing.T) {
-	// Test zero value of Context
-	var ctx Context
+func Test_CommandContext_ZeroValue(t *testing.T) {
+	// Test zero value of CommandContext
+	var cc CommandContext
 
-	require.Nil(t, ctx.Entity)
-	require.Equal(t, EntityID(""), ctx.EntityID)
-	require.Nil(t, ctx.CurrentSequence)
-	require.Nil(t, ctx.CurrentSnapshot)
-	require.Nil(t, ctx.SeenCommandIDs)
+	require.Nil(t, cc.Aggregate)
+	require.Equal(t, EntityID(""), cc.EntityID)
+	require.Nil(t, cc.CurrentSequence)
+	require.Nil(t, cc.CurrentSnapshot)
+	require.Nil(t, cc.SeenCommandIDs)
 }
 
-func Test_Context_HasCommandID_NilMap(t *testing.T) {
-	ctx := Context{}
-	require.False(t, ctx.HasCommandID("cmd-1"))
+func Test_CommandContext_HasCommandID_NilMap(t *testing.T) {
+	cc := CommandContext{}
+	require.False(t, cc.HasCommandID("cmd-1"))
 }
 
-func Test_Context_RecordAndHasCommandID(t *testing.T) {
-	ctx := Context{}
-	ctx.RecordCommandID("cmd-1")
+func Test_CommandContext_RecordAndHasCommandID(t *testing.T) {
+	cc := CommandContext{}
+	cc.RecordCommandID("cmd-1")
 
-	require.True(t, ctx.HasCommandID("cmd-1"))
-	require.False(t, ctx.HasCommandID("cmd-2"))
+	require.True(t, cc.HasCommandID("cmd-1"))
+	require.False(t, cc.HasCommandID("cmd-2"))
 }
 
-func Test_Context_RecordCommandID_MultipleIDs(t *testing.T) {
-	ctx := Context{}
-	ctx.RecordCommandID("a")
-	ctx.RecordCommandID("b")
-	ctx.RecordCommandID("c")
+func Test_CommandContext_RecordCommandID_MultipleIDs(t *testing.T) {
+	cc := CommandContext{}
+	cc.RecordCommandID("a")
+	cc.RecordCommandID("b")
+	cc.RecordCommandID("c")
 
-	require.True(t, ctx.HasCommandID("a"))
-	require.True(t, ctx.HasCommandID("b"))
-	require.True(t, ctx.HasCommandID("c"))
-	require.False(t, ctx.HasCommandID("d"))
+	require.True(t, cc.HasCommandID("a"))
+	require.True(t, cc.HasCommandID("b"))
+	require.True(t, cc.HasCommandID("c"))
+	require.False(t, cc.HasCommandID("d"))
 }
 
-func Test_Context_EmptyCommandIDIsAbsent(t *testing.T) {
-	var ctx Context
-	ctx.RecordCommandID("")
-	require.Empty(t, ctx.SeenCommandIDs, "an empty CommandID is not recorded")
-	require.False(t, ctx.HasCommandID(""))
+func Test_CommandContext_EmptyCommandIDIsAbsent(t *testing.T) {
+	var cc CommandContext
+	cc.RecordCommandID("")
+	require.Empty(t, cc.SeenCommandIDs, "an empty CommandID is not recorded")
+	require.False(t, cc.HasCommandID(""))
 
 	// Even a seen set that somehow holds the empty ID never reports it as a duplicate.
-	ctx.SeenCommandIDs = map[CommandID]struct{}{"": {}, "cmd-1": {}}
-	require.False(t, ctx.HasCommandID(""))
-	require.True(t, ctx.HasCommandID("cmd-1"))
+	cc.SeenCommandIDs = map[CommandID]struct{}{"": {}, "cmd-1": {}}
+	require.False(t, cc.HasCommandID(""))
+	require.True(t, cc.HasCommandID("cmd-1"))
 }

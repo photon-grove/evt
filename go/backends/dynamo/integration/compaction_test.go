@@ -15,31 +15,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// seedIntegrationEntity reconstructs a test.Entity from a durable snapshot payload.
-func seedIntegrationEntity(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Entity, error) {
-	entity := test.NewEntity(snapshot.EntityID)
-	if err := json.Unmarshal(snapshot.Payload, entity); err != nil {
+// seedIntegrationAggregate reconstructs a test.Aggregate from a durable snapshot payload.
+func seedIntegrationAggregate(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Aggregate, error) {
+	aggregate := test.NewAggregate(snapshot.EntityID)
+	if err := json.Unmarshal(snapshot.Payload, aggregate); err != nil {
 		return nil, err
 	}
 
-	return entity, nil
+	return aggregate, nil
 }
 
 // applyIntegrationEvent deserializes and applies one serialized event.
-func applyIntegrationEvent(_ context.Context, serialized evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-	if entity == nil {
-		entity = test.NewEntity(serialized.EntityID)
+func applyIntegrationEvent(_ context.Context, serialized evt.SerializedEvent, aggregate evt.Aggregate) (evt.Aggregate, error) {
+	if aggregate == nil {
+		aggregate = test.NewAggregate(serialized.EntityID)
 	}
 
-	event, err := entity.DeserializeEvent(serialized)
+	event, err := aggregate.DeserializeEvent(serialized)
 	if err != nil {
 		return nil, err
 	}
-	if err := entity.Apply(event); err != nil {
+	if err := aggregate.Apply(event); err != nil {
 		return nil, err
 	}
 
-	return entity, nil
+	return aggregate, nil
 }
 
 func (s *DynamoEventsIntegrationSuite) sequencesFor(ctx context.Context, id evt.EntityID) []evt.EventSequence {
@@ -61,12 +61,12 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_RebuildAfterCompaction(
 	ctx := context.Background()
 
 	id := evt.EntityID(newID())
-	s.SetupEntity(id, 2) // snapshot every 2 events
+	s.SetupAggregate(id, 2) // snapshot every 2 events
 	metadata := s.getMetadata(ctx)
 
-	require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.CreateEntity{Value: "v1"}, metadata))
+	require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.CreateAggregate{Value: "v1"}, metadata))
 	for i := 2; i <= 7; i++ {
-		require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.ReplaceEntity{Value: "v" + strconv.Itoa(i)}, metadata))
+		require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.ReplaceAggregate{Value: "v" + strconv.Itoa(i)}, metadata))
 	}
 
 	snapshot, err := s.repo.GetSnapshot(ctx, id)
@@ -81,26 +81,26 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_RebuildAfterCompaction(
 	require.Equal(s.T(), []evt.EventSequence{7}, s.sequencesFor(ctx, id))
 
 	// Snapshot-aware load reconstructs v7 from snapshot(v6) + event 7.
-	loaded := test.NewEntity(id)
-	_, err = s.store.LoadEntity(ctx, loaded, id)
+	loaded := test.NewAggregate(id)
+	_, err = s.store.LoadAggregate(ctx, loaded, id)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), "v7", loaded.Value)
 
 	// Snapshot-aware rebuild reproduces the same state from snapshot + tail.
-	var rebuilt evt.Entity
+	var rebuilt evt.Aggregate
 	count := 0
-	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, test.EntityType, seedIntegrationEntity, applyIntegrationEvent) {
-		entity, uerr := res.Unwrap()
+	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, test.EntityType, seedIntegrationAggregate, applyIntegrationEvent) {
+		aggregate, uerr := res.Unwrap()
 		require.NoError(s.T(), uerr)
-		if entity.GetID() == id {
-			rebuilt = entity
+		if aggregate.GetID() == id {
+			rebuilt = aggregate
 			count++
 		}
 	}
 	require.Equal(s.T(), 1, count)
-	rebuiltEntity, ok := rebuilt.(*test.Entity)
+	rebuiltAggregate, ok := rebuilt.(*test.Aggregate)
 	require.True(s.T(), ok)
-	require.Equal(s.T(), "v7", rebuiltEntity.Value)
+	require.Equal(s.T(), "v7", rebuiltAggregate.Value)
 }
 
 // Test_CompactBelow_RefusesWithoutCoveringSnapshot verifies the safety guard against an
@@ -109,12 +109,12 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_RefusesWithoutCoveringS
 	ctx := context.Background()
 
 	id := evt.EntityID(newID())
-	s.SetupEntity(id, 2)
+	s.SetupAggregate(id, 2)
 	metadata := s.getMetadata(ctx)
 
-	require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.CreateEntity{Value: "v1"}, metadata))
-	require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.ReplaceEntity{Value: "v2"}, metadata))
-	require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.ReplaceEntity{Value: "v3"}, metadata))
+	require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.CreateAggregate{Value: "v1"}, metadata))
+	require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.ReplaceAggregate{Value: "v2"}, metadata))
+	require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.ReplaceAggregate{Value: "v3"}, metadata))
 
 	snapshot, err := s.repo.GetSnapshot(ctx, id)
 	require.NoError(s.T(), err)
@@ -139,7 +139,7 @@ func (s *DynamoEventsIntegrationSuite) Test_PutSnapshot_MonotonicFloor() {
 	// A snapshot never covers more than the stream's head, so the stream has events first.
 	events := make([]evt.Event, 0, 8)
 	for range 8 {
-		events = append(events, &test.EntityUpdated{ID: id, Value: "v"})
+		events = append(events, &test.AggregateUpdated{ID: id, Value: "v"})
 	}
 
 	serialized, err := evt.SerializeEvents(events, 0, id, evt.NewMetadata(ctx, aws.String(s.awsRegion)))
@@ -174,12 +174,12 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_ConcurrentWithAppends()
 	ctx := context.Background()
 
 	id := evt.EntityID(newID())
-	s.SetupEntity(id, 2)
+	s.SetupAggregate(id, 2)
 	metadata := s.getMetadata(ctx)
 
-	require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.CreateEntity{Value: "v1"}, metadata))
+	require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.CreateAggregate{Value: "v1"}, metadata))
 	for i := 2; i <= 6; i++ {
-		require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.ReplaceEntity{Value: "v" + strconv.Itoa(i)}, metadata))
+		require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.ReplaceAggregate{Value: "v" + strconv.Itoa(i)}, metadata))
 	}
 
 	snapshot, err := s.repo.GetSnapshot(ctx, id)
@@ -189,7 +189,7 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_ConcurrentWithAppends()
 	// A dedicated entity/store handle for the appender so the two goroutines do not share a
 	// mutable entity instance.
 	appendStore := snapshots.NewStore(s.repo, 2)
-	appendEntity := test.NewEntity(id)
+	appendAggregate := test.NewAggregate(id)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -205,7 +205,7 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_ConcurrentWithAppends()
 	go func() {
 		defer wg.Done()
 		for i := 7; i <= 9; i++ {
-			if execErr := appendStore.Execute(ctx, appendEntity, id, &test.ReplaceEntity{Value: "v" + strconv.Itoa(i)}, metadata); execErr != nil {
+			if execErr := appendStore.Execute(ctx, appendAggregate, id, &test.ReplaceAggregate{Value: "v" + strconv.Itoa(i)}, metadata); execErr != nil {
 				appendErr = execErr
 				return
 			}
@@ -223,8 +223,8 @@ func (s *DynamoEventsIntegrationSuite) Test_CompactBelow_ConcurrentWithAppends()
 	}
 
 	// The stream still loads to the final appended value.
-	loaded := test.NewEntity(id)
-	_, err = s.store.LoadEntity(ctx, loaded, id)
+	loaded := test.NewAggregate(id)
+	_, err = s.store.LoadAggregate(ctx, loaded, id)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), "v9", loaded.Value)
 }
@@ -236,12 +236,12 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_RejectsBelowTheCompactedFloor
 	ctx := context.Background()
 
 	id := evt.EntityID(newID())
-	s.SetupEntity(id, 2) // snapshot every 2 events
+	s.SetupAggregate(id, 2) // snapshot every 2 events
 	metadata := s.getMetadata(ctx)
 
-	require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.CreateEntity{Value: "v1"}, metadata))
+	require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.CreateAggregate{Value: "v1"}, metadata))
 	for i := 2; i <= 4; i++ {
-		require.NoError(s.T(), s.store.Execute(ctx, s.entity, id, &test.ReplaceEntity{Value: "v" + strconv.Itoa(i)}, metadata))
+		require.NoError(s.T(), s.store.Execute(ctx, s.aggregate, id, &test.ReplaceAggregate{Value: "v" + strconv.Itoa(i)}, metadata))
 	}
 
 	deleted, err := s.repo.CompactBelow(ctx, id, 4)
@@ -249,7 +249,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_RejectsBelowTheCompactedFloor
 	require.Equal(s.T(), 4, deleted)
 
 	commit := func(from evt.EventSequence) error {
-		events, serr := evt.SerializeEvents([]evt.Event{&test.EntityUpdated{ID: id, Value: "stale"}}, from, id, metadata)
+		events, serr := evt.SerializeEvents([]evt.Event{&test.AggregateUpdated{ID: id, Value: "stale"}}, from, id, metadata)
 		require.NoError(s.T(), serr)
 
 		return s.repo.Commit(ctx, evt.SerializedResult{Events: events})

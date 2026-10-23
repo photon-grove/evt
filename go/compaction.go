@@ -14,7 +14,7 @@ var ErrCompactionUncovered = errors.New("compaction refused: no durable snapshot
 // Compactor optionally deletes events covered by a durable snapshot. It remains separate from
 // Repository for compatibility and is detected by type assertion.
 //
-// After CompactBelow, rebuild with SnapshotStreamer and RebuildConfig.SeedEntity, not from sequence 1.
+// After CompactBelow, rebuild with SnapshotStreamer and RebuildConfig.SeedAggregate, not from sequence 1.
 type Compactor interface {
 	// CompactBelow deletes events for the given entity whose sequence is in the range
 	// [1, throughSequence], but only after verifying that a durable snapshot exists whose
@@ -31,7 +31,7 @@ type Compactor interface {
 // builds an entity from its events, while a SnapshotSeeder builds one from the JSON state a
 // snapshot captured. Callers typically look up the concrete type by snapshot.EntityType and
 // json.Unmarshal(snapshot.Payload, entity).
-type SnapshotSeeder func(ctx context.Context, snapshot SerializedSnapshot) (Entity, error)
+type SnapshotSeeder func(ctx context.Context, snapshot SerializedSnapshot) (Aggregate, error)
 
 // SnapshotStreamer is an optional capability implemented by Repositories that can rebuild
 // entities starting from each stream's durable snapshot instead of from sequence 1. It is the
@@ -41,7 +41,7 @@ type SnapshotSeeder func(ctx context.Context, snapshot SerializedSnapshot) (Enti
 // detected via a type assertion (repo.(SnapshotStreamer)).
 type SnapshotStreamer interface {
 	// StreamEntitiesFromSnapshots streams completed entities, seeding each from its latest durable
-	// snapshot (the sk=0 row) via seedEntity before applying only the events recorded after that
+	// snapshot (the sk=0 row) via seedAggregate before applying only the events recorded after that
 	// snapshot. Events at or below the snapshot's EventSequence are skipped because the snapshot
 	// already captures them. Streams with no snapshot fall back to full replay from sequence 1 via
 	// applyEvent. entityType, when non-empty, restricts the rebuild to entities of that type.
@@ -52,7 +52,7 @@ type SnapshotStreamer interface {
 	StreamEntitiesFromSnapshots(
 		ctx context.Context,
 		entityType EntityType,
-		seedEntity SnapshotSeeder,
-		applyEvent func(context.Context, SerializedEvent, Entity) (Entity, error),
-	) <-chan result.Result[Entity]
+		seedAggregate SnapshotSeeder,
+		applyEvent func(context.Context, SerializedEvent, Aggregate) (Aggregate, error),
+	) <-chan result.Result[Aggregate]
 }

@@ -105,7 +105,7 @@ func Test_FeatureMarker(t *testing.T) {
 
 		// The first commit validates the empty table and succeeds.
 		require.NoError(t, enforcing.Commit(ctx, evt.SerializedResult{
-			Events: serializeAs(t, id, entityType, 0, &test.EntityCreated{ID: id, Value: "one"}),
+			Events: serializeAs(t, id, entityType, 0, &test.AggregateCreated{ID: id, Value: "one"}),
 		}))
 
 		// Another writer declares an extension this writer does not model.
@@ -116,7 +116,7 @@ func Test_FeatureMarker(t *testing.T) {
 
 		id2 := evt.EntityID(ns + "-b")
 		err = enforcing.Commit(ctx, evt.SerializedResult{
-			Events: serializeAs(t, id2, entityType, 0, &test.EntityCreated{ID: id2, Value: "b"}),
+			Events: serializeAs(t, id2, entityType, 0, &test.AggregateCreated{ID: id2, Value: "b"}),
 		})
 		require.Error(t, err)
 		require.True(t, evt.IsUnsupportedFeatureErr(err), "expected UnsupportedFeatureError, got %v", err)
@@ -136,7 +136,7 @@ func Test_FeatureMarker(t *testing.T) {
 		enforcing := repo.WithFeatureMarker(repo.FeatureMarker(evt.SupportedFeatures{"journal": 1}))
 
 		require.NoError(t, enforcing.Commit(ctx, evt.SerializedResult{
-			Events: serializeAs(t, id, entityType, 0, &test.EntityCreated{ID: id, Value: "one"}),
+			Events: serializeAs(t, id, entityType, 0, &test.AggregateCreated{ID: id, Value: "one"}),
 		}))
 
 		// A set change bumps the version under the writer.
@@ -146,14 +146,14 @@ func Test_FeatureMarker(t *testing.T) {
 		require.NoError(t, err)
 
 		err = enforcing.Commit(ctx, evt.SerializedResult{
-			Events: serializeAs(t, id, entityType, 1, &test.EntityUpdated{ID: id, Value: "two"}),
+			Events: serializeAs(t, id, entityType, 1, &test.AggregateUpdated{ID: id, Value: "two"}),
 		})
 		require.Error(t, err)
 		require.True(t, errors.Is(err, evt.ErrFeatureManifestChanged), "expected ErrFeatureManifestChanged, got %v", err)
 
 		// The retry commits against the freshly cached version.
 		require.NoError(t, enforcing.Commit(ctx, evt.SerializedResult{
-			Events: serializeAs(t, id, entityType, 1, &test.EntityUpdated{ID: id, Value: "three"}),
+			Events: serializeAs(t, id, entityType, 1, &test.AggregateUpdated{ID: id, Value: "three"}),
 		}))
 
 		stored, gerr := repo.GetEvents(ctx, id)
@@ -169,8 +169,8 @@ func Test_FeatureMarker(t *testing.T) {
 		id := evt.EntityID(ns + "-a")
 
 		serialized := serializeAs(t, id, entityType, 0,
-			&test.EntityCreated{ID: id, Value: "one"},
-			&test.EntityUpdated{ID: id, Value: "two"},
+			&test.AggregateCreated{ID: id, Value: "one"},
+			&test.AggregateUpdated{ID: id, Value: "two"},
 		)
 		payload := []byte(fmt.Sprintf(`{"id":%q,"value":"two"}`, id))
 		require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialized}, entityType, id, payload, 1))
@@ -205,7 +205,7 @@ func Test_Namespaces(t *testing.T) {
 	entityType := evt.EntityType(ns)
 	id := evt.EntityID(ns + "-a")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serializeAs(t, id, entityType, 0, &test.EntityCreated{ID: id, Value: "one"}),
+		Events: serializeAs(t, id, entityType, 0, &test.AggregateCreated{ID: id, Value: "one"}),
 	}))
 
 	t.Run("WritePathsRefuseReservedEntityIds", func(t *testing.T) {
@@ -216,13 +216,13 @@ func Test_Namespaces(t *testing.T) {
 
 		for _, rid := range reserved {
 			err := repo.Commit(ctx, evt.SerializedResult{
-				Events: serializeAs(t, rid, entityType, 0, &test.EntityCreated{ID: rid, Value: "r"}),
+				Events: serializeAs(t, rid, entityType, 0, &test.AggregateCreated{ID: rid, Value: "r"}),
 			})
 			require.Error(t, err)
 			require.True(t, evt.IsReservedEntityIdErr(err), "expected ReservedEntityIdError, got %v", err)
 
 			err = repo.CommitWithSnapshot(ctx, evt.SerializedResult{
-				Events: serializeAs(t, rid, entityType, 0, &test.EntityCreated{ID: rid, Value: "r"}),
+				Events: serializeAs(t, rid, entityType, 0, &test.AggregateCreated{ID: rid, Value: "r"}),
 			}, entityType, rid, []byte("{}"), 1)
 			require.Error(t, err)
 			require.True(t, evt.IsReservedEntityIdErr(err))
@@ -278,9 +278,9 @@ func Test_Namespaces(t *testing.T) {
 
 			count = 0
 			for r := range repo.StreamEntities(ctx, filter, applyTestEvent) {
-				entity, err := r.Unwrap()
+				aggregate, err := r.Unwrap()
 				require.NoError(t, err)
-				require.Equal(t, id, entity.GetID())
+				require.Equal(t, id, aggregate.GetID())
 				count++
 			}
 			require.Equal(t, 1, count)
@@ -291,7 +291,7 @@ func Test_Namespaces(t *testing.T) {
 		for i := 2; i <= 5; i++ {
 			require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 				Events: serializeAs(t, id, entityType, evt.EventSequence(i-1),
-					&test.EntityUpdated{ID: id, Value: fmt.Sprintf("v%d", i)}),
+					&test.AggregateUpdated{ID: id, Value: fmt.Sprintf("v%d", i)}),
 			}))
 		}
 

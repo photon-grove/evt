@@ -112,7 +112,7 @@ func Test_Views_CommitThenListPage(t *testing.T) {
 		t.Helper()
 
 		serialized, err := evt.SerializeEvents(
-			[]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, sequence, id, evt.Metadata{},
+			[]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}}, sequence, id, evt.Metadata{},
 		)
 		require.NoError(t, err)
 		for i := range serialized {

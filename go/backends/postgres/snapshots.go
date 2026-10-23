@@ -70,17 +70,17 @@ func (repo *Repository) PutSnapshot(
 func (repo *Repository) StreamEntitiesFromSnapshots(
 	ctx context.Context,
 	entityType evt.EntityType,
-	seedEntity evt.SnapshotSeeder,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
-	channel := make(chan result.Result[evt.Entity])
+	seedAggregate evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
+	channel := make(chan result.Result[evt.Aggregate])
 
 	go func() {
 		defer close(channel)
 
 		ids, err := repo.distinctEntityIDs(ctx, entityType)
 		if err != nil {
-			channel <- result.Err[evt.Entity](err)
+			channel <- result.Err[evt.Aggregate](err)
 			return
 		}
 
@@ -89,14 +89,14 @@ func (repo *Repository) StreamEntitiesFromSnapshots(
 				return
 			}
 
-			entity, err := repo.rebuildFromSnapshot(ctx, id, seedEntity, applyEvent)
+			aggregate, err := repo.rebuildFromSnapshot(ctx, id, seedAggregate, applyEvent)
 			if err != nil {
-				channel <- result.Err[evt.Entity](err)
+				channel <- result.Err[evt.Aggregate](err)
 				continue
 			}
 
-			if entity != nil {
-				channel <- result.Ok(entity)
+			if aggregate != nil {
+				channel <- result.Ok(aggregate)
 			}
 		}
 	}()
@@ -109,21 +109,21 @@ func (repo *Repository) StreamEntitiesFromSnapshots(
 func (repo *Repository) rebuildFromSnapshot(
 	ctx context.Context,
 	id evt.EntityID,
-	seedEntity evt.SnapshotSeeder,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) (evt.Entity, error) {
+	seedAggregate evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) (evt.Aggregate, error) {
 	snapshot, err := repo.GetSnapshot(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
 	var (
-		entity  evt.Entity
-		through evt.EventSequence
+		aggregate evt.Aggregate
+		through   evt.EventSequence
 	)
 
 	if snapshot != nil {
-		entity, err = seedEntity(ctx, *snapshot)
+		aggregate, err = seedAggregate(ctx, *snapshot)
 		if err != nil {
 			return nil, err
 		}
@@ -136,7 +136,7 @@ func (repo *Repository) rebuildFromSnapshot(
 		return nil, err
 	}
 
-	return foldEntity(ctx, events, entity, through, applyEvent)
+	return foldAggregate(ctx, events, aggregate, through, applyEvent)
 }
 
 // distinctEntityIDs returns the entity IDs present in the event log or as a snapshot-only entity

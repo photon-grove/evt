@@ -420,15 +420,15 @@ func testSingleAggregateRetry(t *testing.T, repo evt.OutcomeRepository) {
 	// Another writer appends between the command's load and its commit, once.
 	env.interfere(true, hasEvents, func() { env.deposit(t, env.id, 1) })
 
-	entity := newLedger(env.id)
+	aggregate := newLedger(env.id)
 
-	outcome, err := env.store.ExecuteWithOutcome(ctx, entity, env.id,
+	outcome, err := env.store.ExecuteWithOutcome(ctx, aggregate, env.id,
 		&ledgerCommand{Kind: "deposit", Amount: 2, ran: ran}, withCommand(env.commandID("shortcut")))
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
 	require.EqualValues(t, 2, ran.Load(), "the handler re-ran against the fresh state")
 	require.JSONEq(t, `{"total":4}`, string(outcome.Response))
-	require.Equal(t, 4, entity.Total, "events applied by the failed attempt were reset, not double-counted")
+	require.Equal(t, 4, aggregate.Total, "events applied by the failed attempt were reset, not double-counted")
 	require.Len(t, env.events(t, env.id), 3)
 
 	// Every attempt loses: the rejection is recorded and the entity is what storage holds.
@@ -436,9 +436,9 @@ func testSingleAggregateRetry(t *testing.T, repo evt.OutcomeRepository) {
 	env.interfere(false, hasEvents, func() { env.deposit(t, env.id, 1) })
 	ran.Store(0)
 
-	entity = newLedger(env.id)
+	aggregate = newLedger(env.id)
 
-	outcome, err = env.store.ExecuteWithOutcome(ctx, entity, env.id,
+	outcome, err = env.store.ExecuteWithOutcome(ctx, aggregate, env.id,
 		&ledgerCommand{Kind: "deposit", Amount: 2, ran: ran}, withCommand(exhausted))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected())
@@ -447,7 +447,7 @@ func testSingleAggregateRetry(t *testing.T, repo evt.OutcomeRepository) {
 
 	durable := env.events(t, env.id)
 	require.Len(t, durable, 6, "three rival events; the command committed none")
-	require.Equal(t, 7, entity.Total, "the caller's entity reflects durable state")
+	require.Equal(t, 7, aggregate.Total, "the caller's entity reflects durable state")
 
 	env.faulty.Intercept = nil
 

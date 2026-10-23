@@ -16,7 +16,7 @@ and `projectors` subpackages where you actually need it.
 
 ## 1. Define an aggregate
 
-An aggregate implements [`evt.Entity`](concepts.md#entity). It does three jobs:
+An aggregate implements [`evt.Aggregate`](concepts.md#aggregate). It does three jobs:
 **handle** commands into new events, **apply** events to its own state, and
 **deserialize** historical events back into current Go types.
 
@@ -117,7 +117,7 @@ you [upcast](concepts.md#upcaster) old payloads later.
 `mem.NewStore()` gives you the full [`evt.Store`](concepts.md#store) contract with
 zero infrastructure, so behavior tests run in microseconds. The store loads a
 **fresh aggregate from the log on every `Execute`**, so give each command its own
-instance — reusing an already-applied entity double-applies events.
+instance — reusing an already-applied aggregate double-applies events.
 
 ```go
 func TestOpenThenDepositAndReplay(t *testing.T) {
@@ -138,7 +138,7 @@ func TestOpenThenDepositAndReplay(t *testing.T) {
 
     // Replay from the log into a fresh instance — state is fully reconstructed.
     reloaded := NewAccount("acct-1")
-    if _, err := store.LoadEntity(ctx, reloaded, "acct-1"); err != nil {
+    if _, err := store.LoadAggregate(ctx, reloaded, "acct-1"); err != nil {
         t.Fatalf("reload: %v", err)
     }
     if reloaded.Balance != 125 {
@@ -191,7 +191,7 @@ repo := dynamo.NewRepository(dynamoClient, "evt-local-event-log")
 store := snapshots.NewStore(repo, 25) // write a snapshot every ~25 events
 ```
 
-`snapshots.NewStore` keeps replay fast by checkpointing entity state inline in the
+`snapshots.NewStore` keeps replay fast by checkpointing aggregate state inline in the
 event log, so loading a long-lived stream reads the latest snapshot plus the tail
 rather than every event from sequence 1. You provision two tables — an event log
 and a views table — both detailed in the [DynamoDB guide](dynamodb.md). Run them

@@ -27,7 +27,7 @@ func fenceOf(t *testing.T, repo evt.Repository) evt.RebuildFence {
 func commitOne(t *testing.T, repo evt.Repository, id evt.EntityID) error {
 	t.Helper()
 
-	events, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 0, id, evt.Metadata{})
+	events, err := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}}, 0, id, evt.Metadata{})
 	require.NoError(t, err)
 
 	for i := range events {

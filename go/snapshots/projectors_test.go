@@ -581,14 +581,14 @@ func foldState(t *testing.T, stored []evt.SerializedEvent, id evt.EntityID, thro
 
 	slices.SortFunc(events, func(a, b evt.SerializedEvent) int { return int(a.Sequence - b.Sequence) })
 
-	entity := &counter{id: id}
+	aggregate := &counter{id: id}
 	for _, serialized := range events {
-		event, err := entity.DeserializeEvent(serialized)
+		event, err := aggregate.DeserializeEvent(serialized)
 		require.NoError(t, err)
-		require.NoError(t, entity.Apply(event))
+		require.NoError(t, aggregate.Apply(event))
 	}
 
-	state, err := json.Marshal(entity)
+	state, err := json.Marshal(aggregate)
 	require.NoError(t, err)
 
 	return state

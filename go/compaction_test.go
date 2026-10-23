@@ -29,45 +29,45 @@ func mustCompactor(t *testing.T, repo evt.Repository) evt.Compactor {
 }
 
 // entityValue extracts the Value field from a streamed test entity with a checked assertion.
-func entityValue(t *testing.T, entity evt.Entity) string {
+func aggregateValue(t *testing.T, aggregate evt.Aggregate) string {
 	t.Helper()
 
-	typed, ok := entity.(*evttest.Entity)
+	typed, ok := aggregate.(*evttest.Aggregate)
 	require.True(t, ok, "entity must be *test.Entity")
 
 	return typed.Value
 }
 
-// seedTestEntity reconstructs a test.Entity from a durable snapshot payload.
-func seedTestEntity(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Entity, error) {
-	entity := evttest.NewEntity(snapshot.EntityID)
-	if err := json.Unmarshal(snapshot.Payload, entity); err != nil {
+// seedTestAggregate reconstructs a test.Aggregate from a durable snapshot payload.
+func seedTestAggregate(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Aggregate, error) {
+	aggregate := evttest.NewAggregate(snapshot.EntityID)
+	if err := json.Unmarshal(snapshot.Payload, aggregate); err != nil {
 		return nil, err
 	}
 
-	return entity, nil
+	return aggregate, nil
 }
 
 // applyTestEvent deserializes and applies a serialized event, creating the entity on first use.
-func applyTestEvent(_ context.Context, serialized evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-	if entity == nil {
-		entity = evttest.NewEntity(serialized.EntityID)
+func applyTestEvent(_ context.Context, serialized evt.SerializedEvent, aggregate evt.Aggregate) (evt.Aggregate, error) {
+	if aggregate == nil {
+		aggregate = evttest.NewAggregate(serialized.EntityID)
 	}
 
-	event, err := entity.DeserializeEvent(serialized)
+	event, err := aggregate.DeserializeEvent(serialized)
 	if err != nil {
 		return nil, err
 	}
-	if err := entity.Apply(event); err != nil {
+	if err := aggregate.Apply(event); err != nil {
 		return nil, err
 	}
 
-	return entity, nil
+	return aggregate, nil
 }
 
 // buildStream commits one create + (count-1) replace events for entityID, taking snapshots along
 // the way, and returns the repository plus the entity's fully-replayed final state.
-func buildStream(t *testing.T, entityID evt.EntityID, count int) (evt.Repository, *evttest.Entity) {
+func buildStream(t *testing.T, entityID evt.EntityID, count int) (evt.Repository, *evttest.Aggregate) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -75,35 +75,35 @@ func buildStream(t *testing.T, entityID evt.EntityID, count int) (evt.Repository
 	store := snapshots.NewStore(repo, compactionSnapshotSize)
 	metadata := evt.Metadata{Region: "us-west-2"}
 
-	require.NoError(t, store.Execute(ctx, evttest.NewEntity(entityID), entityID,
-		&evttest.CreateEntity{Value: "v1"}, metadata))
+	require.NoError(t, store.Execute(ctx, evttest.NewAggregate(entityID), entityID,
+		&evttest.CreateAggregate{Value: "v1"}, metadata))
 
 	for i := 2; i <= count; i++ {
 		value := "v" + strconv.Itoa(i)
-		require.NoError(t, store.Execute(ctx, evttest.NewEntity(entityID), entityID,
-			&evttest.ReplaceEntity{Value: value}, metadata))
+		require.NoError(t, store.Execute(ctx, evttest.NewAggregate(entityID), entityID,
+			&evttest.ReplaceAggregate{Value: value}, metadata))
 	}
 
-	loaded := evttest.NewEntity(entityID)
-	_, err := store.LoadEntity(ctx, loaded, entityID)
+	loaded := evttest.NewAggregate(entityID)
+	_, err := store.LoadAggregate(ctx, loaded, entityID)
 	require.NoError(t, err)
 
 	return repo, loaded
 }
 
 // rebuildOne drains a SnapshotStreamer for a single entity and returns it.
-func rebuildOne(t *testing.T, repo evt.Repository) evt.Entity {
+func rebuildOne(t *testing.T, repo evt.Repository) evt.Aggregate {
 	t.Helper()
 
 	streamer, ok := repo.(evt.SnapshotStreamer)
 	require.True(t, ok, "repository must implement SnapshotStreamer")
 
-	var got evt.Entity
+	var got evt.Aggregate
 	count := 0
-	for res := range streamer.StreamEntitiesFromSnapshots(context.Background(), "", seedTestEntity, applyTestEvent) {
-		entity, err := res.Unwrap()
+	for res := range streamer.StreamEntitiesFromSnapshots(context.Background(), "", seedTestAggregate, applyTestEvent) {
+		aggregate, err := res.Unwrap()
 		require.NoError(t, err)
-		got = entity
+		got = aggregate
 		count++
 	}
 	require.Equal(t, 1, count, "expected exactly one entity")
@@ -141,15 +141,15 @@ func TestCompactBelow_RebuildCorrectAfterCompaction(t *testing.T) {
 	require.Equal(t, []evt.EventSequence{6, 7}, remainingSequences(t, repo, entityID))
 
 	// A snapshot-aware load still reconstructs the correct state.
-	loaded := evttest.NewEntity(entityID)
+	loaded := evttest.NewAggregate(entityID)
 	store := snapshots.NewStore(repo, compactionSnapshotSize)
-	_, err = store.LoadEntity(context.Background(), loaded, entityID)
+	_, err = store.LoadAggregate(context.Background(), loaded, entityID)
 	require.NoError(t, err)
 	require.Equal(t, expected.Value, loaded.Value)
 
 	// A snapshot-aware rebuild reproduces the same state from snapshot + tail.
 	rebuilt := rebuildOne(t, repo)
-	require.Equal(t, expected.Value, entityValue(t, rebuilt))
+	require.Equal(t, expected.Value, aggregateValue(t, rebuilt))
 	require.Equal(t, expected.GetID(), rebuilt.GetID())
 }
 
@@ -175,7 +175,7 @@ func TestCompactBelow_BoundaryEqualsSnapshot(t *testing.T) {
 	require.Equal(t, evt.EventSequence(5), snap.EventSequence)
 
 	rebuilt := rebuildOne(t, repo)
-	require.Equal(t, "v5", entityValue(t, rebuilt))
+	require.Equal(t, "v5", aggregateValue(t, rebuilt))
 }
 
 func TestCompactBelow_RefusesWithoutSnapshot(t *testing.T) {
@@ -222,14 +222,14 @@ func TestCompactBelow_Idempotent(t *testing.T) {
 	require.Equal(t, []evt.EventSequence{6, 7}, remainingSequences(t, repo, entityID))
 }
 
-func TestRebuildProjections_SeedEntityRequiresSnapshotStreamer(t *testing.T) {
+func TestRebuildProjections_SeedAggregateRequiresSnapshotStreamer(t *testing.T) {
 	// fakeRepo (defined in rebuild_test.go) does not implement SnapshotStreamer.
 	repo := &fakeRepo{}
 
 	_, err := evt.RebuildProjections(context.Background(), repo, applyTestEvent, evt.RebuildConfig{
-		Projectors: []evt.EventProjector{&stubProjector{}},
-		DryRun:     true,
-		SeedEntity: seedTestEntity,
+		Projectors:    []evt.EventProjector{&stubProjector{}},
+		DryRun:        true,
+		SeedAggregate: seedTestAggregate,
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "SnapshotStreamer")
@@ -246,16 +246,16 @@ func TestRebuildProjections_SnapshotAwarePathAfterCompaction(t *testing.T) {
 	projector := &stubProjector{group: &stubTransactionGroup{size: 1}}
 
 	res, err := evt.RebuildProjections(context.Background(), repo, applyTestEvent, evt.RebuildConfig{
-		Projectors: []evt.EventProjector{projector},
-		DryRun:     true,
-		SeedEntity: seedTestEntity,
+		Projectors:    []evt.EventProjector{projector},
+		DryRun:        true,
+		SeedAggregate: seedTestAggregate,
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, res.Processed)
 
 	calls := projector.getCalls()
 	require.Len(t, calls, 1)
-	require.Equal(t, expected.Value, entityValue(t, calls[0]))
+	require.Equal(t, expected.Value, aggregateValue(t, calls[0]))
 }
 
 // Sanity check that the test helpers and a clean (uncompacted) rebuild agree.
@@ -264,7 +264,7 @@ func TestStreamEntitiesFromSnapshots_NoSnapshotFallsBackToFullReplay(t *testing.
 	repo, expected := buildStream(t, entityID, 3) // no snapshot taken yet
 
 	rebuilt := rebuildOne(t, repo)
-	require.Equal(t, expected.Value, entityValue(t, rebuilt))
+	require.Equal(t, expected.Value, aggregateValue(t, rebuilt))
 }
 
 // Guard: the wrapped compaction error remains identifiable via errors.Is.

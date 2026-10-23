@@ -19,9 +19,9 @@ func TestCatchUpSnapshotAppliedWhenThresholdExceeded(t *testing.T) {
 
 	store := snapshots.NewStore(repo, 25).WithCatchUpSnapshotThreshold(2)
 
-	_, err := store.LoadEntity(context.Background(), test.NewEntity("e1"), "e1")
+	_, err := store.LoadAggregate(context.Background(), test.NewAggregate("e1"), "e1")
 	if err != nil {
-		t.Fatalf("LoadEntity() error = %v", err)
+		t.Fatalf("LoadAggregate() error = %v", err)
 	}
 
 	if repo.putSnapshotCalls != 1 {

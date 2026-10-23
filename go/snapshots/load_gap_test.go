@@ -14,25 +14,25 @@ import (
 
 // A sequence gap after the snapshot (here, sequence 3 missing) must fail the load rather than
 // apply later events to the wrong state. Compaction racing a load produces this gap.
-func TestLoadEntityRejectsSequenceGap(t *testing.T) {
+func TestLoadAggregateRejectsSequenceGap(t *testing.T) {
 	ctx := context.Background()
 	repo := mem.NewRepository()
 	store := snapshots.NewStore(repo, 2)
 	id := evt.EntityID("gap-1")
 
 	for _, value := range []string{"one", "two"} {
-		require.NoError(t, store.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: value}, newTestMetadata()))
+		require.NoError(t, store.Execute(ctx, test.NewAggregate(id), id, &test.ReplaceAggregate{Value: value}, newTestMetadata()))
 	}
 
 	// Two more events land after the snapshot at 2, and then sequence 3 goes missing from the
 	// reads, the way a compaction racing the load would leave it.
 	plain := snapshots.NewStore(repo, 100)
 	for _, value := range []string{"three", "four"} {
-		require.NoError(t, plain.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: value}, newTestMetadata()))
+		require.NoError(t, plain.Execute(ctx, test.NewAggregate(id), id, &test.ReplaceAggregate{Value: value}, newTestMetadata()))
 	}
 	store = snapshots.NewStore(&hideSequence{Repository: repo, hidden: 3}, 2)
 
-	_, err := store.LoadEntity(ctx, test.NewEntity(id), id)
+	_, err := store.LoadAggregate(ctx, test.NewAggregate(id), id)
 	require.True(t, evt.IsConflictErr(err), "want a conflict, got %v", err)
 	require.ErrorIs(t, err, evt.ErrSequenceGap)
 
@@ -86,18 +86,18 @@ func TestLoadGapIsTransientAndTheRetrySucceeds(t *testing.T) {
 	// Snapshot at 3, then events 4 and 5 after it.
 	store := snapshots.NewStore(repo, 3)
 	for _, value := range []string{"one", "two", "three", "four", "five"} {
-		require.NoError(t, store.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: value}, newTestMetadata()))
+		require.NoError(t, store.Execute(ctx, test.NewAggregate(id), id, &test.ReplaceAggregate{Value: value}, newTestMetadata()))
 	}
 
 	gapped := snapshots.NewStore(&gapOnce{Repository: repo}, 3)
-	err := gapped.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: "six"}, newTestMetadata())
+	err := gapped.Execute(ctx, test.NewAggregate(id), id, &test.ReplaceAggregate{Value: "six"}, newTestMetadata())
 	require.Error(t, err)
 	require.True(t, policy.IsTransient(err), "the gap is classified as transient")
 
-	require.NoError(t, gapped.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: "six"}, newTestMetadata()))
+	require.NoError(t, gapped.Execute(ctx, test.NewAggregate(id), id, &test.ReplaceAggregate{Value: "six"}, newTestMetadata()))
 
-	loaded := test.NewEntity(id)
-	_, err = gapped.LoadEntity(ctx, loaded, id)
+	loaded := test.NewAggregate(id)
+	_, err = gapped.LoadAggregate(ctx, loaded, id)
 	require.NoError(t, err)
 	require.Equal(t, "six", loaded.Value)
 }
@@ -129,7 +129,7 @@ func TestFloorRejectsACommitFromALoadBehindACompaction(t *testing.T) {
 	store := snapshots.NewStore(repo, 3)
 	execute := func(values ...string) {
 		for _, value := range values {
-			require.NoError(t, store.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: value}, newTestMetadata()))
+			require.NoError(t, store.Execute(ctx, test.NewAggregate(id), id, &test.ReplaceAggregate{Value: value}, newTestMetadata()))
 		}
 	}
 	execute("one", "two", "three")
@@ -143,6 +143,6 @@ func TestFloorRejectsACommitFromALoadBehindACompaction(t *testing.T) {
 		require.NoError(t, err)
 	}}
 
-	err := snapshots.NewStore(racing, 3).Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: "stale"}, newTestMetadata())
+	err := snapshots.NewStore(racing, 3).Execute(ctx, test.NewAggregate(id), id, &test.ReplaceAggregate{Value: "stale"}, newTestMetadata())
 	require.True(t, evt.IsConflictErr(err), "want a conflict, got %v", err)
 }

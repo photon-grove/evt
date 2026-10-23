@@ -84,12 +84,12 @@ func (repo *Repository) streamAllEventsFiltered(
 func (repo *Repository) StreamEntities(
 	ctx context.Context,
 	filter evt.StreamFilter,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
 	expr, err := filterExpression(filter)
 	if err != nil {
-		channel := make(chan result.Result[evt.Entity], 1)
-		channel <- result.Err[evt.Entity](err)
+		channel := make(chan result.Result[evt.Aggregate], 1)
+		channel <- result.Err[evt.Aggregate](err)
 		close(channel)
 		return channel
 	}
@@ -98,7 +98,7 @@ func (repo *Repository) StreamEntities(
 }
 
 // streamEntitiesFiltered streams Events from the table, optionally filtered by a raw DynamoDB
-// expression, and yields each completed Entity after all of its Events have been applied in
+// expression, and yields each completed Aggregate after all of its Events have been applied in
 // sequence order.
 //
 // A DynamoDB Scan does not guarantee that the Events for a given entity arrive contiguously or in
@@ -113,11 +113,11 @@ func (repo *Repository) StreamEntities(
 func (repo *Repository) streamEntitiesFiltered(
 	ctx context.Context,
 	expr *expression.Expression,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
 	logger := repo.loggerOrDefault()
 
-	results := make(chan result.Result[evt.Entity])
+	results := make(chan result.Result[evt.Aggregate])
 
 	go func() {
 		defer close(results)
@@ -141,7 +141,7 @@ func (repo *Repository) streamEntitiesFiltered(
 					// entities — a failed or partial scan means some events are missing, so the
 					// reconstituted entities would be incomplete.
 					scanFailed = true
-					repo.sendEntity(ctx, results, result.Err[evt.Entity](err))
+					repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](err))
 					cancel()
 				}
 
@@ -172,17 +172,17 @@ func (repo *Repository) streamEntitiesFiltered(
 		}
 
 		if ctx.Err() != nil {
-			repo.sendEntity(ctx, results, result.Err[evt.Entity](ctx.Err()))
+			repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](ctx.Err()))
 			return
 		}
 
 		for _, id := range order {
-			entity, ok := repo.buildEntity(ctx, id, grouped[id], applyEvent, results, logger)
+			aggregate, ok := repo.buildAggregate(ctx, id, grouped[id], applyEvent, results, logger)
 			if !ok {
 				continue
 			}
 
-			if !repo.sendEntity(ctx, results, result.Ok(entity)) {
+			if !repo.sendAggregate(ctx, results, result.Ok(aggregate)) {
 				return
 			}
 		}
@@ -191,25 +191,25 @@ func (repo *Repository) streamEntitiesFiltered(
 	return results
 }
 
-// buildEntity applies an entity's events in sequence order and returns the reconstituted entity.
+// buildAggregate applies an entity's events in sequence order and returns the reconstituted aggregate.
 // It returns ok=false (after forwarding the error) when an event fails to apply, or when no events
-// produced an entity.
-func (repo *Repository) buildEntity(
+// produced an aggregate.
+func (repo *Repository) buildAggregate(
 	ctx context.Context,
 	id evt.EntityID,
 	events []evt.SerializedEvent,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-	results chan<- result.Result[evt.Entity],
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+	results chan<- result.Result[evt.Aggregate],
 	logger *slog.Logger,
-) (evt.Entity, bool) {
+) (evt.Aggregate, bool) {
 	sort.SliceStable(events, func(i, j int) bool {
 		return events[i].Sequence < events[j].Sequence
 	})
 
-	var entity evt.Entity
+	var aggregate evt.Aggregate
 
 	for _, event := range events {
-		applied, err := applyEvent(ctx, event, entity)
+		applied, err := applyEvent(ctx, event, aggregate)
 		if err != nil {
 			logger.
 				With("id", event.ID).
@@ -218,15 +218,15 @@ func (repo *Repository) buildEntity(
 				With("event_type", event.Type).
 				Error("Error during applyEvent", "error", err.Error())
 
-			repo.sendEntity(ctx, results, result.Err[evt.Entity](err))
+			repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](err))
 
 			return nil, false
 		}
 
-		entity = applied
+		aggregate = applied
 	}
 
-	if entity == nil {
+	if aggregate == nil {
 		return nil, false
 	}
 
@@ -235,5 +235,5 @@ func (repo *Repository) buildEntity(
 		With("entity_event_count", len(events)).
 		Debug("Entity Processed")
 
-	return entity, true
+	return aggregate, true
 }

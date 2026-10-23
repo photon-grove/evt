@@ -127,7 +127,7 @@ func (e *rebuildEnv) commit(name string) error {
 	id := evt.EntityID(e.ns + "-" + name)
 
 	return e.repo.Commit(context.Background(), evt.SerializedResult{
-		Events: serialize(e.t, id, "test", 0, &test.EntityCreated{ID: id, Value: name}),
+		Events: serialize(e.t, id, "test", 0, &test.AggregateCreated{ID: id, Value: name}),
 	})
 }
 
@@ -528,7 +528,7 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 
 	// A stream that exists before the rebuild, a fence target.
 	existing := evt.EntityID(env.ns + "-existing")
-	commitEvents(t, env.repo, existing, "test", 0, &test.EntityCreated{ID: existing, Value: "before"})
+	commitEvents(t, env.repo, existing, "test", 0, &test.AggregateCreated{ID: existing, Value: "before"})
 
 	env.begin("worker", time.Hour)
 
@@ -536,15 +536,15 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 	// accepted outcome with events are all refused, and write nothing.
 	plain := evt.EntityID(env.ns + "-plain")
 	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"}),
+		Events: serialize(t, plain, "test", 0, &test.AggregateCreated{ID: plain, Value: "plain"}),
 	}))
 	requireNoEvents(t, env.repo, plain)
 
 	left, right := evt.EntityID(env.ns+"-left"), evt.EntityID(env.ns+"-right")
 	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
 		Events: append(
-			serialize(t, left, "test", 0, &test.EntityCreated{ID: left, Value: "l"}),
-			serialize(t, right, "test", 0, &test.EntityCreated{ID: right, Value: "r"})...,
+			serialize(t, left, "test", 0, &test.AggregateCreated{ID: left, Value: "l"}),
+			serialize(t, right, "test", 0, &test.AggregateCreated{ID: right, Value: "r"})...,
 		),
 	}))
 	requireNoEvents(t, env.repo, left)
@@ -554,7 +554,7 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 	fenced := evt.EntityID(env.ns + "-fenced")
 	for _, head := range []evt.EventSequence{1, 7} {
 		err := env.repo.Commit(ctx, evt.SerializedResult{
-			Events: serialize(t, fenced, "test", 0, &test.EntityCreated{ID: fenced, Value: "f"}),
+			Events: serialize(t, fenced, "test", 0, &test.AggregateCreated{ID: fenced, Value: "f"}),
 			Fences: []evt.ReadFence{{EntityID: existing, EntityType: "test", Head: head}},
 		})
 		requireRefused(t, err)
@@ -577,7 +577,7 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 
 		withEvents := &evt.Outcome{CommandID: evt.CommandID(env.ns + "-events"), Status: evt.OutcomeAccepted, Digest: "digest"}
 		requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
-			Events:  serialize(t, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"}),
+			Events:  serialize(t, plain, "test", 0, &test.AggregateCreated{ID: plain, Value: "plain"}),
 			Outcome: withEvents,
 		}))
 		requireNoEvents(t, env.repo, plain)
@@ -588,7 +588,7 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 	if opts.SupportsViews {
 		viewed := evt.EntityID(env.ns + "-viewed")
 		requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
-			Events: serialize(t, viewed, "test", 0, &test.EntityCreated{ID: viewed, Value: "viewed"}),
+			Events: serialize(t, viewed, "test", 0, &test.AggregateCreated{ID: viewed, Value: "viewed"}),
 			Views:  []evt.ProjectedView{{Projector: "live", Op: evt.PutView(env.ns+"#live", "row", viewed, "test", []byte(`{}`))}},
 		}))
 		requireNoEvents(t, env.repo, viewed)
@@ -600,7 +600,7 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 	over := evt.EntityID(env.ns + "-over")
 	events := make([]evt.Event, 0, 120)
 	for range 120 {
-		events = append(events, &test.EntityUpdated{ID: over, Value: "x"})
+		events = append(events, &test.AggregateUpdated{ID: over, Value: "x"})
 	}
 
 	var tooLarge *evt.CommitTooLargeError
@@ -608,7 +608,7 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 
 	reserved := evt.EntityID("SYSTEM#" + env.ns)
 	require.True(t, evt.IsReservedEntityIdErr(env.repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, reserved, "test", 0, &test.EntityCreated{ID: reserved, Value: "r"}),
+		Events: serialize(t, reserved, "test", 0, &test.AggregateCreated{ID: reserved, Value: "r"}),
 	})))
 
 	var projectorOnly *evt.ProjectorOnlyCommitError
@@ -617,7 +617,7 @@ func testRebuildRefusesCommits(t *testing.T, env *rebuildEnv, opts SuiteOptions)
 	// The lock is released: commits resume, and the same streams commit as if nothing happened.
 	_, err := env.fence.End(ctx, env.lease("worker"))
 	require.NoError(t, err)
-	commitEvents(t, env.repo, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"})
+	commitEvents(t, env.repo, plain, "test", 0, &test.AggregateCreated{ID: plain, Value: "plain"})
 	require.Len(t, mustEventsOf(t, env.repo, plain), 1)
 
 	// An expired lock still refuses commits, and so does a force-release of it: only a rebuild
@@ -680,14 +680,14 @@ func testRebuildForceReleasedRefusesCommits(t *testing.T, env *rebuildEnv, opts 
 	// Every commit is refused with the error a held lock gives, and writes nothing.
 	plain := evt.EntityID(env.ns + "-plain")
 	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"}),
+		Events: serialize(t, plain, "test", 0, &test.AggregateCreated{ID: plain, Value: "plain"}),
 	}))
 	requireNoEvents(t, env.repo, plain)
 
 	viewed := evt.EntityID(env.ns + "-viewed")
 	live := func() evt.SerializedResult {
 		return evt.SerializedResult{
-			Events: serialize(t, viewed, "test", 0, &test.EntityCreated{ID: viewed, Value: "viewed"}),
+			Events: serialize(t, viewed, "test", 0, &test.AggregateCreated{ID: viewed, Value: "viewed"}),
 			Views:  []evt.ProjectedView{{Projector: "live", Op: evt.PutView(env.ns+"#live", "row", viewed, "test", []byte(`{}`))}},
 		}
 	}
@@ -721,7 +721,7 @@ func testRebuildForceReleasedRefusesCommits(t *testing.T, env *rebuildEnv, opts 
 	// A new rebuild runs to its end: commits stay refused while it runs, and resume once it ends.
 	env.begin("recovery", time.Hour)
 	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"}),
+		Events: serialize(t, plain, "test", 0, &test.AggregateCreated{ID: plain, Value: "plain"}),
 	}))
 
 	if opts.SupportsViews {
@@ -733,7 +733,7 @@ func testRebuildForceReleasedRefusesCommits(t *testing.T, env *rebuildEnv, opts 
 	require.True(t, settled.Settled())
 	require.False(t, settled.ForceReleased)
 
-	commitEvents(t, env.repo, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "plain"})
+	commitEvents(t, env.repo, plain, "test", 0, &test.AggregateCreated{ID: plain, Value: "plain"})
 	require.Len(t, mustEventsOf(t, env.repo, plain), 1)
 
 	if opts.SupportsViews {
@@ -767,7 +767,7 @@ func testRebuildPrecedence(t *testing.T, env *rebuildEnv, opts SuiteOptions) {
 
 	// A head conflict: the stream moved since the loser read it.
 	moved := evt.EntityID(env.ns + "-moved")
-	commitEvents(t, env.repo, moved, "test", 0, &test.EntityCreated{ID: moved, Value: "one"})
+	commitEvents(t, env.repo, moved, "test", 0, &test.AggregateCreated{ID: moved, Value: "one"})
 
 	// An existing outcome row for the command.
 	var duplicate *evt.Outcome
@@ -779,24 +779,24 @@ func testRebuildPrecedence(t *testing.T, env *rebuildEnv, opts SuiteOptions) {
 
 	// A gap: the commit starts above the head plus one.
 	gap := evt.EntityID(env.ns + "-gap")
-	commitEvents(t, env.repo, gap, "test", 0, &test.EntityCreated{ID: gap, Value: "one"})
+	commitEvents(t, env.repo, gap, "test", 0, &test.AggregateCreated{ID: gap, Value: "one"})
 
 	// Drift: an event with no head update.
 	drifted := evt.EntityID(env.ns + "-drifted")
-	commitEvents(t, env.repo, drifted, "test", 0, &test.EntityCreated{ID: drifted, Value: "one"})
+	commitEvents(t, env.repo, drifted, "test", 0, &test.AggregateCreated{ID: drifted, Value: "one"})
 
 	if opts.BypassHead != nil {
-		bypass := serialize(t, drifted, "test", 1, &test.EntityUpdated{ID: drifted, Value: "bypass"})
+		bypass := serialize(t, drifted, "test", 1, &test.AggregateUpdated{ID: drifted, Value: "bypass"})
 		require.NoError(t, opts.BypassHead(ctx, env.repo, bypass[0]))
 	}
 
 	env.begin("worker", time.Hour)
 
 	// Without the lock each of these would fail with its own error; with it, all report the lock.
-	stale := serialize(t, moved, "test", 0, &test.EntityCreated{ID: moved, Value: "again"})
+	stale := serialize(t, moved, "test", 0, &test.AggregateCreated{ID: moved, Value: "again"})
 	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{Events: stale}))
 
-	skipped := serialize(t, gap, "test", 5, &test.EntityUpdated{ID: gap, Value: "skipped"})
+	skipped := serialize(t, gap, "test", 5, &test.AggregateUpdated{ID: gap, Value: "skipped"})
 	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{Events: skipped}))
 
 	if duplicate != nil {
@@ -804,14 +804,14 @@ func testRebuildPrecedence(t *testing.T, env *rebuildEnv, opts SuiteOptions) {
 	}
 
 	if opts.BypassHead != nil {
-		next := serialize(t, drifted, "test", 2, &test.EntityUpdated{ID: drifted, Value: "next"})
+		next := serialize(t, drifted, "test", 2, &test.AggregateUpdated{ID: drifted, Value: "next"})
 		requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{Events: next}))
 	}
 
 	// A stale fence beside an unrelated write: the lock, not a fence conflict.
 	other := evt.EntityID(env.ns + "-other")
 	requireRefused(t, env.repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, other, "test", 0, &test.EntityCreated{ID: other, Value: "o"}),
+		Events: serialize(t, other, "test", 0, &test.AggregateCreated{ID: other, Value: "o"}),
 		Fences: []evt.ReadFence{{EntityID: moved, EntityType: "test", Head: 9}},
 	}))
 

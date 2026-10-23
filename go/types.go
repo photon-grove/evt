@@ -32,7 +32,7 @@ type EventType string
 // EventID combines the entity ID and event sequence.
 type EventID string
 
-// EventSequence is a unique sequence number within an entity instance.
+// EventSequence is a unique sequence number within an aggregate instance.
 type EventSequence int
 
 // EventVersion is the schema version of an event.
@@ -46,9 +46,11 @@ type Event interface {
 	EntityID() EntityID
 }
 
-// Context carries entity context for the EventStore.
-type Context struct {
-	Entity          Entity
+// CommandContext is the per-command state the store carries beside a context.Context: the loaded
+// Aggregate, its stream identity, where the stream stood when it was loaded, and the CommandIDs seen
+// during replay. Pass it explicitly. It is never embedded in, or recovered from, a context.Context.
+type CommandContext struct {
+	Aggregate       Aggregate
 	EntityID        EntityID
 	CurrentSequence *EventSequence
 	CurrentSnapshot *EventSequence
@@ -57,28 +59,28 @@ type Context struct {
 
 // HasCommandID reports whether the given CommandID was already seen during event replay. An empty
 // CommandID is absent, never a duplicate, as in CommitMetadata.
-func (c Context) HasCommandID(id CommandID) bool {
-	if id == "" || c.SeenCommandIDs == nil {
+func (cc CommandContext) HasCommandID(id CommandID) bool {
+	if id == "" || cc.SeenCommandIDs == nil {
 		return false
 	}
 
-	_, ok := c.SeenCommandIDs[id]
+	_, ok := cc.SeenCommandIDs[id]
 
 	return ok
 }
 
 // RecordCommandID adds a CommandID to the seen set (initializing the map if needed). An empty
 // CommandID is absent and is not recorded.
-func (c *Context) RecordCommandID(id CommandID) {
+func (cc *CommandContext) RecordCommandID(id CommandID) {
 	if id == "" {
 		return
 	}
 
-	if c.SeenCommandIDs == nil {
-		c.SeenCommandIDs = make(map[CommandID]struct{})
+	if cc.SeenCommandIDs == nil {
+		cc.SeenCommandIDs = make(map[CommandID]struct{})
 	}
 
-	c.SeenCommandIDs[id] = struct{}{}
+	cc.SeenCommandIDs[id] = struct{}{}
 }
 
 // GetEventID builds a stable event ID from the entity ID and sequence.
@@ -86,14 +88,15 @@ func GetEventID(entityID EntityID, sequence EventSequence) EventID {
 	return EventID(fmt.Sprintf("%s:%d", entityID, sequence))
 }
 
-// EntityType is the type of an aggregated Entity.
+// EntityType names the type of a stream's Aggregate, such as "account".
 type EntityType string
 
-// EntityID is a unique identifier for an aggregated Entity instance.
+// EntityID is the unique identifier of an Aggregate instance, which is also the identity of its stream.
 type EntityID string
 
-// Entity is an object whose state is made up of aggregated immutable change Events.
-type Entity interface {
+// Aggregate is an object whose state is rebuilt by folding its immutable Events. Each instance is
+// one stream, identified by its EntityType and EntityID.
+type Aggregate interface {
 	Type() EntityType
 	GetID() EntityID
 	Handle(context.Context, Command) (CommandResult, error)
@@ -105,7 +108,7 @@ type Entity interface {
 
 // EventProjector generates transactional view operations that should be committed alongside events.
 type EventProjector interface {
-	// Project produces a transaction group for the given entity state. Returning nil
+	// Project produces a transaction group for the given aggregate state. Returning nil
 	// indicates no operations are required.
-	Project(context.Context, Entity, []Event) (TransactionGroup, error)
+	Project(context.Context, Aggregate, []Event) (TransactionGroup, error)
 }

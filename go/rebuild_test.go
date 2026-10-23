@@ -16,43 +16,43 @@ import (
 
 // --- Test doubles ---
 
-type stubEntity struct {
+type stubAggregate struct {
 	ID    evt.EntityID `json:"id"`
 	Value string       `json:"value"`
 }
 
-func (e *stubEntity) Type() evt.EntityType                { return "stub" }
-func (e *stubEntity) GetID() evt.EntityID                 { return e.ID }
-func (e *stubEntity) Reset() evt.Entity                   { return &stubEntity{} }
-func (e *stubEntity) EventUpcasters() []evt.EventUpcaster { return nil }
-func (e *stubEntity) Projectors() []evt.EventProjector    { return nil }
-func (e *stubEntity) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {
+func (e *stubAggregate) Type() evt.EntityType                { return "stub" }
+func (e *stubAggregate) GetID() evt.EntityID                 { return e.ID }
+func (e *stubAggregate) Reset() evt.Aggregate                { return &stubAggregate{} }
+func (e *stubAggregate) EventUpcasters() []evt.EventUpcaster { return nil }
+func (e *stubAggregate) Projectors() []evt.EventProjector    { return nil }
+func (e *stubAggregate) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {
 	return evt.CommandResult{}, nil
 }
-func (e *stubEntity) Apply(_ evt.Event) error { return nil }
-func (e *stubEntity) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
+func (e *stubAggregate) Apply(_ evt.Event) error { return nil }
+func (e *stubAggregate) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
 // stubProjector records calls and returns a configurable TransactionGroup.
 type stubProjector struct {
 	mu    sync.Mutex
-	calls []evt.Entity
+	calls []evt.Aggregate
 	group evt.TransactionGroup
 	err   error
 }
 
-func (p *stubProjector) Project(_ context.Context, entity evt.Entity, _ []evt.Event) (evt.TransactionGroup, error) {
+func (p *stubProjector) Project(_ context.Context, aggregate evt.Aggregate, _ []evt.Event) (evt.TransactionGroup, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.calls = append(p.calls, entity)
+	p.calls = append(p.calls, aggregate)
 	return p.group, p.err
 }
 
-func (p *stubProjector) getCalls() []evt.Entity {
+func (p *stubProjector) getCalls() []evt.Aggregate {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	cp := make([]evt.Entity, len(p.calls))
+	cp := make([]evt.Aggregate, len(p.calls))
 	copy(cp, p.calls)
 	return cp
 }
@@ -72,8 +72,8 @@ func (g *stubTransactionGroup) HandleError(err error, _ int) error   { return er
 
 // fakeRepo yields a fixed set of entities via StreamEntities.
 type fakeRepo struct {
-	entities  []evt.Entity
-	streamErr error
+	aggregates []evt.Aggregate
+	streamErr  error
 }
 
 func (r *fakeRepo) Commit(_ context.Context, _ evt.SerializedResult) error { return nil }
@@ -100,19 +100,19 @@ func (r *fakeRepo) StreamAllEvents(_ context.Context, _ evt.StreamFilter) <-chan
 func (r *fakeRepo) StreamEntities(
 	ctx context.Context,
 	_ evt.StreamFilter,
-	_ func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
-	ch := make(chan result.Result[evt.Entity])
+	_ func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
+	ch := make(chan result.Result[evt.Aggregate])
 	go func() {
 		defer close(ch)
 		if r.streamErr != nil {
 			select {
-			case ch <- result.Err[evt.Entity](r.streamErr):
+			case ch <- result.Err[evt.Aggregate](r.streamErr):
 			case <-ctx.Done():
 			}
 			return
 		}
-		for _, e := range r.entities {
+		for _, e := range r.aggregates {
 			// Honor cancellation so an early-returning consumer does not strand this producer.
 			select {
 			case ch <- result.Ok(e):
@@ -125,7 +125,7 @@ func (r *fakeRepo) StreamEntities(
 }
 
 // noopApplyEvent is a stub for tests where the fakeRepo yields pre-built entities.
-func noopApplyEvent(_ context.Context, _ evt.SerializedEvent, e evt.Entity) (evt.Entity, error) {
+func noopApplyEvent(_ context.Context, _ evt.SerializedEvent, e evt.Aggregate) (evt.Aggregate, error) {
 	return e, nil
 }
 
@@ -169,9 +169,9 @@ func TestRebuildProjections_EmptyRepo(t *testing.T) {
 }
 
 func TestRebuildProjections_ProcessesEntities(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "hello"}
-	e2 := &stubEntity{ID: "e2", Value: "world"}
-	repo := &fakeRepo{entities: []evt.Entity{e1, e2}}
+	e1 := &stubAggregate{ID: "e1", Value: "hello"}
+	e2 := &stubAggregate{ID: "e2", Value: "world"}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1, e2}}
 
 	txnGroup := &stubTransactionGroup{size: 1}
 	proj := &stubProjector{group: txnGroup}
@@ -200,8 +200,8 @@ func TestRebuildProjections_ProcessesEntities(t *testing.T) {
 }
 
 func TestRebuildProjections_DryRunSkipsCommit(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "hello"}
-	repo := &fakeRepo{entities: []evt.Entity{e1}}
+	e1 := &stubAggregate{ID: "e1", Value: "hello"}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1}}
 
 	txnGroup := &stubTransactionGroup{size: 1}
 	proj := &stubProjector{group: txnGroup}
@@ -217,12 +217,12 @@ func TestRebuildProjections_DryRunSkipsCommit(t *testing.T) {
 }
 
 func TestRebuildProjections_FiltersEntityType(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "match"}
+	e1 := &stubAggregate{ID: "e1", Value: "match"}
 
 	// otherEntity has a different type
-	other := &otherTypeEntity{ID: "e2", Value: "skip"}
+	other := &otherTypeAggregate{ID: "e2", Value: "skip"}
 
-	repo := &fakeRepo{entities: []evt.Entity{e1, other}}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1, other}}
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
 
 	var committed int
@@ -243,8 +243,8 @@ func TestRebuildProjections_FiltersEntityType(t *testing.T) {
 }
 
 func TestRebuildProjections_ProjectorError(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "hello"}
-	repo := &fakeRepo{entities: []evt.Entity{e1}}
+	e1 := &stubAggregate{ID: "e1", Value: "hello"}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1}}
 
 	proj := &stubProjector{err: errors.New("projection failed")}
 
@@ -260,8 +260,8 @@ func TestRebuildProjections_ProjectorError(t *testing.T) {
 }
 
 func TestRebuildProjections_CommitError(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "hello"}
-	repo := &fakeRepo{entities: []evt.Entity{e1}}
+	e1 := &stubAggregate{ID: "e1", Value: "hello"}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1}}
 
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
 
@@ -295,8 +295,8 @@ func TestRebuildProjections_StreamError(t *testing.T) {
 }
 
 func TestRebuildProjections_NilProjectorResult(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "hello"}
-	repo := &fakeRepo{entities: []evt.Entity{e1}}
+	e1 := &stubAggregate{ID: "e1", Value: "hello"}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1}}
 
 	// Projector returns nil group (no-op)
 	proj := &stubProjector{group: nil}
@@ -312,9 +312,9 @@ func TestRebuildProjections_NilProjectorResult(t *testing.T) {
 }
 
 func TestRebuildProjections_OnProgress(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "a"}
-	e2 := &stubEntity{ID: "e2", Value: "b"}
-	repo := &fakeRepo{entities: []evt.Entity{e1, e2}}
+	e1 := &stubAggregate{ID: "e1", Value: "a"}
+	e2 := &stubAggregate{ID: "e2", Value: "b"}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1, e2}}
 
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
 
@@ -337,8 +337,8 @@ func TestRebuildProjections_OnProgress(t *testing.T) {
 }
 
 func TestRebuildProjections_MultipleProjectors(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "hello"}
-	repo := &fakeRepo{entities: []evt.Entity{e1}}
+	e1 := &stubAggregate{ID: "e1", Value: "hello"}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1}}
 
 	proj1 := &stubProjector{group: &stubTransactionGroup{size: 1}}
 	proj2 := &stubProjector{group: &stubTransactionGroup{size: 2}}
@@ -359,8 +359,8 @@ func TestRebuildProjections_MultipleProjectors(t *testing.T) {
 	assert.Equal(t, 2, committed) // one commit per projector per entity
 }
 
-func TestRebuildProjections_NilEntity(t *testing.T) {
-	repo := &fakeRepo{entities: []evt.Entity{nil}}
+func TestRebuildProjections_NilAggregate(t *testing.T) {
+	repo := &fakeRepo{aggregates: []evt.Aggregate{nil}}
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
 
 	res, err := evt.RebuildProjections(context.Background(), repo, noopApplyEvent, evt.RebuildConfig{
@@ -375,11 +375,11 @@ func TestRebuildProjections_NilEntity(t *testing.T) {
 
 func TestRebuildProjections_ContextCancellation(t *testing.T) {
 	// Create a slow repo that yields many entities
-	entities := make([]evt.Entity, 100)
-	for i := range entities {
-		entities[i] = &stubEntity{ID: evt.EntityID(fmt.Sprintf("e%d", i))}
+	aggregates := make([]evt.Aggregate, 100)
+	for i := range aggregates {
+		aggregates[i] = &stubAggregate{ID: evt.EntityID(fmt.Sprintf("e%d", i))}
 	}
-	repo := &fakeRepo{entities: entities}
+	repo := &fakeRepo{aggregates: aggregates}
 
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
 
@@ -407,10 +407,10 @@ func TestRebuildProjections_ContextCancellation(t *testing.T) {
 }
 
 func TestRebuildProjections_MaxErrors(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "a"}
-	e2 := &stubEntity{ID: "e2", Value: "b"}
-	e3 := &stubEntity{ID: "e3", Value: "c"}
-	repo := &fakeRepo{entities: []evt.Entity{e1, e2, e3}}
+	e1 := &stubAggregate{ID: "e1", Value: "a"}
+	e2 := &stubAggregate{ID: "e2", Value: "b"}
+	e3 := &stubAggregate{ID: "e3", Value: "c"}
+	repo := &fakeRepo{aggregates: []evt.Aggregate{e1, e2, e3}}
 
 	proj := &stubProjector{err: errors.New("always fails")}
 
@@ -428,31 +428,31 @@ func TestRebuildProjections_MaxErrors(t *testing.T) {
 
 // --- Helper types ---
 
-// otherTypeEntity returns a different entity type for filtering tests.
-type otherTypeEntity struct {
+// otherTypeAggregate returns a different entity type for filtering tests.
+type otherTypeAggregate struct {
 	ID    evt.EntityID `json:"id"`
 	Value string       `json:"value"`
 }
 
-func (e *otherTypeEntity) Type() evt.EntityType                { return "other" }
-func (e *otherTypeEntity) GetID() evt.EntityID                 { return e.ID }
-func (e *otherTypeEntity) Reset() evt.Entity                   { return &otherTypeEntity{} }
-func (e *otherTypeEntity) EventUpcasters() []evt.EventUpcaster { return nil }
-func (e *otherTypeEntity) Projectors() []evt.EventProjector    { return nil }
-func (e *otherTypeEntity) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {
+func (e *otherTypeAggregate) Type() evt.EntityType                { return "other" }
+func (e *otherTypeAggregate) GetID() evt.EntityID                 { return e.ID }
+func (e *otherTypeAggregate) Reset() evt.Aggregate                { return &otherTypeAggregate{} }
+func (e *otherTypeAggregate) EventUpcasters() []evt.EventUpcaster { return nil }
+func (e *otherTypeAggregate) Projectors() []evt.EventProjector    { return nil }
+func (e *otherTypeAggregate) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {
 	return evt.CommandResult{}, nil
 }
-func (e *otherTypeEntity) Apply(_ evt.Event) error { return nil }
-func (e *otherTypeEntity) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
+func (e *otherTypeAggregate) Apply(_ evt.Event) error { return nil }
+func (e *otherTypeAggregate) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
 // streamOf returns a closed channel yielding the given entities as Ok results.
-func streamOf(entities ...evt.Entity) <-chan result.Result[evt.Entity] {
-	ch := make(chan result.Result[evt.Entity])
+func streamOf(aggregates ...evt.Aggregate) <-chan result.Result[evt.Aggregate] {
+	ch := make(chan result.Result[evt.Aggregate])
 	go func() {
 		defer close(ch)
-		for _, e := range entities {
+		for _, e := range aggregates {
 			ch <- result.Ok(e)
 		}
 	}()
@@ -460,8 +460,8 @@ func streamOf(entities ...evt.Entity) <-chan result.Result[evt.Entity] {
 }
 
 func TestRebuildProjectionsFromStream_ProcessesEntities(t *testing.T) {
-	e1 := &stubEntity{ID: "e1", Value: "hello"}
-	e2 := &stubEntity{ID: "e2", Value: "world"}
+	e1 := &stubAggregate{ID: "e1", Value: "hello"}
+	e2 := &stubAggregate{ID: "e2", Value: "world"}
 
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
 	var committed int
@@ -484,10 +484,10 @@ func TestRebuildProjectionsFromStream_RequiresProjectors(t *testing.T) {
 }
 
 func TestRebuildProjectionsFromStream_PropagatesStreamError(t *testing.T) {
-	ch := make(chan result.Result[evt.Entity])
+	ch := make(chan result.Result[evt.Aggregate])
 	go func() {
 		defer close(ch)
-		ch <- result.Err[evt.Entity](errors.New("stream broke"))
+		ch <- result.Err[evt.Aggregate](errors.New("stream broke"))
 	}()
 
 	res, err := evt.RebuildProjectionsFromStream(context.Background(), ch, evt.RebuildConfig{

@@ -13,7 +13,7 @@ type MockProjector struct {
 	lastEvents   []evt.Event
 }
 
-func (p *MockProjector) Project(_ context.Context, _ evt.Entity, events []evt.Event) (evt.TransactionGroup, error) {
+func (p *MockProjector) Project(_ context.Context, _ evt.Aggregate, events []evt.Event) (evt.TransactionGroup, error) {
 	p.called = true
 	p.lastEvents = events
 	if p.projectError != nil {

@@ -28,8 +28,8 @@ func Test_Capabilities(t *testing.T) {
 	// Entity A: two events plus a durable snapshot covering through event 2.
 	idA := evt.EntityID(ns + "-a")
 	withSnapshot := serializeAs(t, idA, entityType, 0,
-		&test.EntityCreated{ID: idA, Value: "one"},
-		&test.EntityUpdated{ID: idA, Value: "two"},
+		&test.AggregateCreated{ID: idA, Value: "one"},
+		&test.AggregateUpdated{ID: idA, Value: "two"},
 	)
 	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"two"}`, idA))
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: withSnapshot}, entityType, idA, payload, 1))
@@ -51,7 +51,7 @@ func Test_Capabilities(t *testing.T) {
 	t.Run("CompactBelowRequiresCoveringSnapshot", func(t *testing.T) {
 		idB := evt.EntityID(ns + "-b")
 		require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-			Events: serializeAs(t, idB, entityType, 0, &test.EntityCreated{ID: idB, Value: "b"}),
+			Events: serializeAs(t, idB, entityType, 0, &test.AggregateCreated{ID: idB, Value: "b"}),
 		}))
 
 		// No snapshot covers entity B, so compaction is refused and nothing is deleted.
@@ -86,16 +86,16 @@ func Test_Capabilities(t *testing.T) {
 	})
 
 	t.Run("StreamEntitiesFromSnapshotsSeedsCompactedStreams", func(t *testing.T) {
-		seed := func(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Entity, error) {
-			return test.NewEntity(snapshot.EntityID), nil
+		seed := func(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Aggregate, error) {
+			return test.NewAggregate(snapshot.EntityID), nil
 		}
 
 		var seen []evt.EntityID
 		for r := range repo.StreamEntitiesFromSnapshots(ctx, entityType, seed, applyTestEvent) {
-			entity, err := r.Unwrap()
+			aggregate, err := r.Unwrap()
 			require.NoError(t, err)
-			if entity != nil {
-				seen = append(seen, entity.GetID())
+			if aggregate != nil {
+				seen = append(seen, aggregate.GetID())
 			}
 		}
 
@@ -124,11 +124,11 @@ func serializeAs(
 	return serialized
 }
 
-// applyTestEvent reconstitutes a test.Entity from serialized events, deserializing by event Type so
+// applyTestEvent reconstitutes a test.Aggregate from serialized events, deserializing by event Type so
 // it works regardless of the overridden EntityType.
-func applyTestEvent(_ context.Context, se evt.SerializedEvent, current evt.Entity) (evt.Entity, error) {
+func applyTestEvent(_ context.Context, se evt.SerializedEvent, current evt.Aggregate) (evt.Aggregate, error) {
 	if current == nil {
-		current = test.NewEntity(se.EntityID)
+		current = test.NewAggregate(se.EntityID)
 	}
 
 	event, err := current.DeserializeEvent(se)

@@ -332,7 +332,7 @@ error before any write and is never split.
   non-UTF-8, or oversized command ID is the same typed error on every backend, never "absent"
 - Go's error-returning `Execute` keeps its contract on an outcomes store: when
   the outcome is replayed (a duplicate, or a lost race settled by the winner's row) the supplied
-  entity is restored and loaded again, so it reflects durable state. Rust's outcome methods return
+  aggregate is restored and loaded again, so it reflects durable state. Rust's outcome methods return
   a `CommandOutcome`, not an aggregate
 - A multi-stream command begins with the outcome pre-check (`BeginCommand` /
   `Transaction::begin_command`) before any read, append, or fence; a transaction whose pre-check
@@ -462,10 +462,10 @@ error before any write and is never split.
 - The write set may differ between attempts without changing the command: identity is the request's
   intent, computed once before any attempt, so re-preparation, a client retry after the command
   landed, and recovery all digest to the same value (never `IdempotencyKeyReuse`)
-- Go resets the caller's entity before each re-preparation (exported fields from a deep copy,
+- Go resets the caller's aggregate before each re-preparation (exported fields from a deep copy,
   unexported fields shallowly, so state `Apply` changes belongs in exported fields) and attempts an
-  entity it cannot reset (not a pointer to a struct) once; the command value is reused by every
-  attempt and must not be mutated by a handler. After a replayed or exhausted result the entity is
+  aggregate it cannot reset (not a pointer to a struct) once; the command value is reused by every
+  attempt and must not be mutated by a handler. After a replayed or exhausted result the aggregate is
   reloaded so it reflects durable state. Rust loads a fresh aggregate and clones the command per
   attempt
 - Rust's `execute_with_retry` (a store without outcomes) remains blind whole-command retry for
@@ -489,7 +489,7 @@ error before any write and is never split.
 3. Record the last event sequence (`eventSeq`)
 4. Marshal entity state to JSON payload
 
-### Entity Loading Priority
+### Aggregate Loading Priority
 
 1. Check for snapshot first
 2. If found: unmarshal snapshot, then load events after `eventSeq`
@@ -528,11 +528,11 @@ its coordination with consumer wipe-and-replay guarantees.
 
 ### Snapshot-aware rebuild
 
-`SnapshotStreamer.StreamEntitiesFromSnapshots(ctx, expr, seedEntity, applyEvent)` (optional
+`SnapshotStreamer.StreamEntitiesFromSnapshots(ctx, expr, seedAggregate, applyEvent)` (optional
 capability) seeds each entity from its `sk = 0` snapshot, then applies only events with
 `sequence > snapshot.EventSequence`. Streams without a snapshot fall back to full replay from
-sequence 1. `RebuildProjections` uses this path when `RebuildConfig.SeedEntity` is set, and errors
-if `SeedEntity` is set on a repository that is not a `SnapshotStreamer`.
+sequence 1. `RebuildProjections` uses this path when `RebuildConfig.SeedAggregate` is set, and errors
+if `SeedAggregate` is set on a repository that is not a `SnapshotStreamer`.
 
 ## Commit-Wide Projectors (v0.9, C7)
 
@@ -714,14 +714,14 @@ The stored shapes are in the [storage format](docs/spec/storage-format.md#compac
 
 ```go
 type EventProjector interface {
-    Project(ctx context.Context, entity Entity, events []Event) (TransactionGroup, error)
+    Project(ctx context.Context, aggregate Aggregate, events []Event) (TransactionGroup, error)
 }
 ```
 
 ### ViewProjector Behavior
 
 - Creates `ViewPutGroup` transactions
-- Nil entity or empty entity ID returns `nil, nil`
+- Nil aggregate or empty entity ID returns `nil, nil`
 - JSON marshal errors are propagated
 - View PK defaults to `string(entityID)`
 
@@ -741,13 +741,13 @@ type EventUpcaster interface {
 1. Check each upcaster with `CanUpcast(type, version)`
 2. If true, call `Upcast` to transform the serialized event
 3. Multiple upcasters can chain transformations
-4. Final event is passed to `entity.DeserializeEvent`
+4. Final event is passed to `aggregate.DeserializeEvent`
 
 ## Testing Patterns
 
-### Mock Entity Requirements
+### Mock Aggregate Requirements
 
-Implement all `Entity` interface methods:
+Implement all `Aggregate` interface methods:
 
 - `Type() EntityType`
 - `GetID() EntityID`
@@ -977,10 +977,10 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 
 ### StreamEntitiesFromSnapshots (optional: `evt.SnapshotStreamer`)
 
-- Like `StreamEntities`, but seeds each entity from its `sk = 0` snapshot via `seedEntity`
+- Like `StreamEntities`, but seeds each entity from its `sk = 0` snapshot via `seedAggregate`
 - Skips events with `sequence <= snapshot.EventSequence` (already captured by the seed)
 - Entities without a snapshot fall back to full replay from sequence 1 via `applyEvent`
-- A `seedEntity` error is yielded to the channel and that entity's remaining events are skipped
+- A `seedAggregate` error is yielded to the channel and that entity's remaining events are skipped
 
 ### CompactBelow (optional: `evt.Compactor`)
 

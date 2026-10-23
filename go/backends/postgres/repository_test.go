@@ -103,7 +103,7 @@ func TestNewRepositoryTableNames(t *testing.T) {
 	})
 }
 
-func TestFoldEntityAppliesOnlyEventsAboveThrough(t *testing.T) {
+func TestFoldAggregateAppliesOnlyEventsAboveThrough(t *testing.T) {
 	ctx := context.Background()
 
 	events := []evt.SerializedEvent{
@@ -113,25 +113,25 @@ func TestFoldEntityAppliesOnlyEventsAboveThrough(t *testing.T) {
 	}
 
 	var applied []evt.EventSequence
-	apply := func(_ context.Context, e evt.SerializedEvent, current evt.Entity) (evt.Entity, error) {
+	apply := func(_ context.Context, e evt.SerializedEvent, current evt.Aggregate) (evt.Aggregate, error) {
 		applied = append(applied, e.Sequence)
 		return current, nil
 	}
 
-	_, err := foldEntity(ctx, events, nil, 1, apply)
+	_, err := foldAggregate(ctx, events, nil, 1, apply)
 	require.NoError(t, err)
 	require.Equal(t, []evt.EventSequence{2, 3}, applied, "events at or below the snapshot floor are skipped")
 }
 
-func TestFoldEntityPropagatesApplyError(t *testing.T) {
+func TestFoldAggregatePropagatesApplyError(t *testing.T) {
 	ctx := context.Background()
 	boom := errors.New("apply failed")
 
-	apply := func(_ context.Context, _ evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
+	apply := func(_ context.Context, _ evt.SerializedEvent, _ evt.Aggregate) (evt.Aggregate, error) {
 		return nil, boom
 	}
 
-	_, err := foldEntity(ctx, []evt.SerializedEvent{{Sequence: 1}}, nil, 0, apply)
+	_, err := foldAggregate(ctx, []evt.SerializedEvent{{Sequence: 1}}, nil, 0, apply)
 	require.ErrorIs(t, err, boom)
 }
 

@@ -1,5 +1,5 @@
-//! Typed JSON views over a [`ViewRepository`] (P2): the Rust counterpart of Go's `viewstore.Codec`
-//! and `viewstore.Single`, merged with the `evt.GetJSONView` family.
+//! Typed JSON views over a [`ViewRepository`] (P2): the Rust counterpart of Go's `viewcodec.Codec`
+//! and `viewcodec.Single`, merged with the `evt.GetJSONView` family.
 //!
 //! A [`ViewCodec`] binds a repository, an entity type, and a value type `T`. It writes `T` as the
 //! row's `payload` with [`json::to_vec`], so the bytes are Go's `json.Marshal` of the same shape
@@ -75,7 +75,7 @@ type EntityIdOf<T> = dyn Fn(&T) -> String + Send + Sync;
 type Decoder<T> = dyn Fn(&[u8]) -> Result<T, serde_json::Error> + Send + Sync;
 
 /// A [`ViewRepository`] bound to a JSON value type `T` and an entity type. The caller supplies
-/// `pk`, `sk` and the owner's entity ID per call (Go `viewstore.Codec`).
+/// `pk`, `sk` and the owner's entity ID per call (Go `viewcodec.Codec`).
 pub struct ViewCodec<T, R> {
     repo: R,
     entity_type: String,
@@ -279,7 +279,7 @@ where
     }
 
     /// Binds a function from a key to its `pk`, for the common one-row-per-entity shape (Go
-    /// `viewstore.NewSingle`).
+    /// `viewcodec.NewSingle`).
     pub fn single<K>(
         self,
         pk_for: impl Fn(&K) -> String + Send + Sync + 'static,
@@ -293,7 +293,7 @@ where
 }
 
 /// A [`ViewCodec`] with a `pk` function: concise `get(id)` and `put(id, value)` for a view with
-/// one row per entity (Go `viewstore.Single`).
+/// one row per entity (Go `viewcodec.Single`).
 pub struct SingleView<K, T, R> {
     codec: ViewCodec<T, R>,
     pk_for: Box<dyn Fn(&K) -> String + Send + Sync>,

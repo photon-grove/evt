@@ -18,7 +18,7 @@ func Test_LegacyReservedStreamsRemainReadable(t *testing.T) {
 
 	for _, id := range []evt.EntityID{"SYSTEM#account", "command-outcome#account"} {
 		require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serializeAs(t, "account", test.EntityType, 0,
-			&test.EntityCreated{ID: "account", Value: "v"}, &test.EntityUpdated{ID: "account", Value: "v2"})}))
+			&test.AggregateCreated{ID: "account", Value: "v"}, &test.AggregateUpdated{ID: "account", Value: "v2"})}))
 		require.NoError(t, repo.PutSnapshot(ctx, test.EntityType, "account", []byte(`{"value":"v"}`), 1, 1))
 		for _, name := range []string{table, table + "_snapshots"} {
 			_, err := pool.Exec(ctx, "UPDATE "+name+" SET entity_id = $1 WHERE entity_id = 'account'", string(id))
