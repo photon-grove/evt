@@ -233,7 +233,7 @@ func connect(ctx context.Context, name string) (backend, error) {
 		client := dynamodb.NewFromConfig(cfg)
 
 		return backend{
-			repo:   dynamo.NewRepository(client, table).WithViewsTable(viewsTable),
+			repo:   dynamo.NewRepository(client, table).WithLazyInitialization(true).WithViewsTable(viewsTable),
 			dynamo: client, table: table, viewsTable: viewsTable,
 		}, nil
 

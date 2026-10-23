@@ -90,7 +90,7 @@ func accepted(id string) *evt.Outcome {
 
 func TestOutcomeRowIsTheLastActionAndMatchesTheSharedItemShape(t *testing.T) {
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	outcome := &evt.Outcome{
 		CommandID: "cmd-1", Status: evt.OutcomeAccepted, Digest: "digest",
@@ -139,7 +139,7 @@ func TestOutcomeRowIsTheLastActionAndMatchesTheSharedItemShape(t *testing.T) {
 
 func TestOutcomeOnlyCommitIsTheTwoControlChecksAndTheOutcomePut(t *testing.T) {
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	require.NoError(t, repo.Commit(context.Background(), evt.SerializedResult{Outcome: accepted("cmd-1")}))
 
@@ -153,7 +153,7 @@ func TestOutcomeOnlyCommitIsTheTwoControlChecksAndTheOutcomePut(t *testing.T) {
 
 func TestLostOutcomePutOutranksOtherFailures(t *testing.T) {
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 	ctx := context.Background()
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
@@ -183,7 +183,7 @@ func TestLostOutcomePutOutranksOtherFailures(t *testing.T) {
 
 func TestGetOutcomeReadsStronglyConsistentlyWhateverTheRepositorySetting(t *testing.T) {
 	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo()}
-	repo := dynamo.NewRepository(client, "events").WithConsistentRead(false)
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true).WithConsistentRead(false)
 	ctx := context.Background()
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Outcome: accepted("cmd-1")}))
@@ -238,7 +238,7 @@ func TestIndeterminateCommitFailuresAreAmbiguousWrites(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), transactErr: test.err}
-			repo := dynamo.NewRepository(client, "events")
+			repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
 
 			err := repo.Commit(context.Background(), evt.SerializedResult{Outcome: accepted("cmd-1")})
 			require.Error(t, err)
@@ -273,7 +273,7 @@ func deposit(amount int) *scriptedCommand { return &scriptedCommand{Amount: amou
 
 func TestTransactionInProgressIsPolledForByTheStoreNotCalledNotApplied(t *testing.T) {
 	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), inProgress: true, landAfter: 3}
-	repo := dynamo.NewRepository(client, "events")
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
 	store := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(5 * time.Second))
 	ctx := context.Background()
 
@@ -295,7 +295,7 @@ func TestTransactionInProgressIsPolledForByTheStoreNotCalledNotApplied(t *testin
 
 func TestTransactionInProgressThatNeverLandsIsARetryableAmbiguousWrite(t *testing.T) {
 	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), inProgress: true}
-	repo := dynamo.NewRepository(client, "events")
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
 	store := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(60 * time.Millisecond))
 	ctx := context.Background()
 
@@ -317,7 +317,7 @@ func TestACancelledCallerStillGetsAPolledRecovery(t *testing.T) {
 	// A client timeout while the transaction is still executing: the caller's context is cancelled,
 	// the commit lands a moment later, and recovery still finds it on a detached context.
 	client := &scriptedClient{FakeDynamo: compat.NewFakeDynamo(), inProgress: true, landAfter: 2}
-	repo := dynamo.NewRepository(client, "events")
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
 	store := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(5 * time.Second))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -357,7 +357,7 @@ func TestWrongAttributeTypesAreACorruptRowNotAnEmptyValue(t *testing.T) {
 				_, err := fake.PutItem(context.Background(), &dynamodb.PutItemInput{Item: item})
 				require.NoError(t, err)
 
-				stored, err := dynamo.NewRepository(fake, "events").GetOutcome(context.Background(), "bad")
+				stored, err := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).GetOutcome(context.Background(), "bad")
 				require.ErrorIs(t, err, evt.ErrCorruptOutcome)
 				require.Nil(t, stored)
 			})

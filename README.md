@@ -90,6 +90,9 @@ repo := dynamo.NewRepository(dynamoClient, "event-log")
 store := snapshots.NewStore(repo, 25) // snapshot every 25 events
 ```
 
+Initialize the table once at deploy time with `evt-doctor init` (or `repo.Initialize(ctx)`); writers
+refuse an uninitialized table rather than scan it.
+
 When aggregates carry injected dependencies, construct them and pass the instance to `Execute`:
 
 ```go
@@ -200,10 +203,24 @@ feature-marker check and the rebuild-lock check are in every commit). A fence is
 same head item. A commit whose first sequence skips past the stream's stored head is refused with
 `*evt.SequenceGapError`, and a stream whose head item disagrees with its log fails with
 `*evt.StreamHeadDriftError` (never retried). A store must declare the `stream-heads` feature before
-a writer writes to it; an empty store is declared by its first writer, and a store written before
-head items is migrated first (`*evt.StreamHeadsNotMigratedError` until then) with
-`evt-doctor migrate-heads`, a stop-the-world, one-way procedure documented in the [migration
-runbook](docs/migrating-to-stream-heads.md). The exact contract is specified in the [storage
+a writer writes to it: an empty store is **initialized** once (`evt-doctor init`, or
+`StoreInitializer.Initialize`), and a store written before head items is migrated first
+(`*evt.StreamHeadsNotMigratedError` until then) with `evt-doctor migrate-heads`, a stop-the-world,
+one-way procedure documented in the [migration runbook](docs/migrating-to-stream-heads.md).
+
+**Behaviour change: a fresh DynamoDB table needs one initialization step.** A DynamoDB writer no
+longer declares `stream-heads` on a fresh table itself, because that took a strongly consistent
+`Scan` of the table on the first write, so every writer role needed `dynamodb:Scan`. It now refuses
+an uninitialized table with `*evt.StoreNotInitializedError` (Rust `Error::StoreNotInitialized`),
+writing nothing, and the table is initialized once at deploy time by a role that may Scan:
+`evt-doctor init -events-table <table>`, or `repo.Initialize(ctx)` (Rust `initialize()`). It is
+idempotent, so it can run on every deploy, concurrent deploys included: two jobs initializing the
+same empty table let exactly one of them write. Tables that already declare `stream-heads` need nothing,
+and writer roles can drop `dynamodb:Scan` (keep it only on roles that run rebuilds, enumeration, or
+`evt-doctor`). Tests and local emulators can keep the old behaviour with
+`WithLazyInitialization(true)` (Rust `with_lazy_initialization(true)`). PostgreSQL and in-memory
+writers still initialize a fresh store themselves; both implement `Initialize` too, so one deploy
+step can serve every backend. The exact contract is specified in the [storage
 format](docs/spec/storage-format.md#writes).
 
 ### Commit-wide projectors (v0.9, C7)

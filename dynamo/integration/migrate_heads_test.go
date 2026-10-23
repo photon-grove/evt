@@ -358,7 +358,7 @@ func Test_MigrateHeads_HeadAwareWritersWorkAfterwards(t *testing.T) {
 
 	// A fresh head-aware writer appends to a backfilled stream: the head item continues from the
 	// backfilled head, whether the stream ended in events, a snapshot, or both.
-	writer := dynamo.NewRepository(repoClient(), repo.EventsTable)
+	writer := dynamo.NewRepository(repoClient(), repo.EventsTable).WithLazyInitialization(true)
 	require.NoError(t, writer.Commit(ctx, evt.SerializedResult{Events: scratchEvents("a-events-only", 4, 2)}))
 	require.NoError(t, writer.Commit(ctx, evt.SerializedResult{Events: scratchEvents("b-snapshot-only", 6, 1)}))
 	require.NoError(t, writer.Commit(ctx, evt.SerializedResult{Events: scratchEvents("c-compacted", 7, 1)}))
@@ -425,7 +425,7 @@ func Test_MigrateHeads_RetainedHeadsKeepTheirTTLForAHeadAwareWriter(t *testing.T
 	// The writer that loaded the stream learns the head's ttl and appends under the never-lower
 	// rule, so the head item keeps the largest ttl.
 	retention := dynamo.Retention{"scratch": time.Hour}
-	writer := dynamo.NewRepository(repoClient(), repo.EventsTable).WithRetention(retention).WithClock(migrationClock)
+	writer := dynamo.NewRepository(repoClient(), repo.EventsTable).WithLazyInitialization(true).WithRetention(retention).WithClock(migrationClock)
 
 	_, err = writer.GetEvents(ctx, "f-retained")
 	require.NoError(t, err)
@@ -534,7 +534,7 @@ func Test_MigrateHeads_ResumesAfterAnInterruption(t *testing.T) {
 	streams := seedV08Store(ctx, t, repo)
 
 	flaky := &failingWrites{Client: repoClient(), failAfter: 3}
-	interrupted := dynamo.NewRepository(flaky, repo.EventsTable).HeadsMigration(dynamo.HeadsMigrationConfig{
+	interrupted := dynamo.NewRepository(flaky, repo.EventsTable).WithLazyInitialization(true).HeadsMigration(dynamo.HeadsMigrationConfig{
 		PageSize: 3, Concurrency: 1, Now: migrationClock,
 	})
 
@@ -857,7 +857,7 @@ func Test_MigrateHeads_RepairNeverLowersAConcurrentlyRefreshedTTL(t *testing.T) 
 	refreshed := int64(migrationNow + 9000)
 	racing := dynamo.NewRepository(&refreshingClient{
 		Client: repoClient(), ctx: ctx, table: repo.EventsTable, id: "f-retained", ttl: refreshed,
-	}, repo.EventsTable).HeadsMigration(dynamo.HeadsMigrationConfig{Concurrency: 1, Now: migrationClock})
+	}, repo.EventsTable).WithLazyInitialization(true).HeadsMigration(dynamo.HeadsMigrationConfig{Concurrency: 1, Now: migrationClock})
 
 	report, err := racing.Repair(ctx, dynamo.HeadsRepairOptions{ConfirmWritersStopped: true})
 	require.NoError(t, err)

@@ -9,6 +9,7 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/conformance"
 	"github.com/photon-grove/evt/mem"
+	"github.com/stretchr/testify/require"
 )
 
 // Test_RepositoryConformance runs the backend-neutral storage contract suite against the in-memory
@@ -93,4 +94,31 @@ func (projectorGroup) TransactionType() evt.TransactionType { return "conformanc
 func (projectorGroup) HandleError(err error, _ int) error   { return err }
 func (g projectorGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
 	return g, nil
+}
+
+// Test_StoreInitializationConformance runs the store-initialization cases. The in-memory writer
+// initializes a fresh store on its first write, so it does not refuse an uninitialized one.
+func Test_StoreInitializationConformance(t *testing.T) {
+	repo, ok := mem.NewRepository().(*mem.Repository)
+	require.True(t, ok)
+
+	conformance.RunInitializationSuite(t, repo, repo, conformance.InitializationOptions{
+		Manifest: repo.Manifest,
+		Unmigrate: func(ctx context.Context, _ evt.Repository) (func(), error) {
+			_, err := repo.Declare(ctx, func(manifest *evt.FeatureManifest) {
+				delete(manifest.Features, evt.FeatureStreamHeads)
+			})
+
+			return func() {
+				_, _ = repo.Declare(context.Background(), func(manifest *evt.FeatureManifest) { //nolint:errcheck // the in-memory declaration cannot fail
+					manifest.Features[evt.FeatureStreamHeads] = evt.StreamHeadsFormat
+				})
+			}, err
+		},
+		BypassHead: func(_ context.Context, _ evt.Repository, event evt.SerializedEvent) error {
+			mem.AppendWithoutHead(repo, event)
+
+			return nil
+		},
+	})
 }

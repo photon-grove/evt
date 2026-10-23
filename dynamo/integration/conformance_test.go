@@ -33,7 +33,7 @@ func Test_RepositoryConformance(t *testing.T) {
 	viewsTable := newIsolatedViewsTable(ctx, t, client)
 
 	newRepo := func() evt.Repository {
-		return dynamo.NewRepository(client, events.EventsTable).WithViewsTable(viewsTable)
+		return dynamo.NewRepository(client, events.EventsTable).WithLazyInitialization(true).WithViewsTable(viewsTable)
 	}
 
 	conformance.RunRepositorySuite(t, newRepo, conformance.SuiteOptions{
@@ -107,4 +107,34 @@ func Test_RepositoryConformance(t *testing.T) {
 			}, err
 		},
 	})
+}
+
+// Test_StoreInitializationConformance runs the store-initialization cases on a table of its own,
+// with the default (non-lazy) writers: they refuse the uninitialized table, and only Initialize
+// scans it.
+func Test_StoreInitializationConformance(t *testing.T) {
+	ctx := context.Background()
+
+	events, marker := newIsolatedEventLog(ctx, t)
+	client := isolatedClient
+
+	conformance.RunInitializationSuite(t,
+		dynamo.NewRepository(client, events.EventsTable),
+		dynamo.NewRepository(client, events.EventsTable),
+		conformance.InitializationOptions{
+			RefusesUninitialized: true,
+			Manifest:             marker.Manifest,
+			Unmigrate: func(ctx context.Context, _ evt.Repository) (func(), error) {
+				_, err := marker.Declare(ctx, func(manifest *evt.FeatureManifest) {
+					delete(manifest.Features, evt.FeatureStreamHeads)
+				})
+
+				return func() {
+					_, _ = marker.DeclareStreamHeads(context.Background()) //nolint:errcheck // best-effort restore of a test-only table
+				}, err
+			},
+			BypassHead: func(ctx context.Context, _ evt.Repository, event evt.SerializedEvent) error {
+				return compat.DynamoBypassHead(client, events.EventsTable)(ctx, event)
+			},
+		})
 }

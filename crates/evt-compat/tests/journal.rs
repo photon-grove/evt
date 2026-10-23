@@ -90,7 +90,9 @@ impl Tables {
     }
 
     fn repository(&self) -> DynamoRepository {
-        DynamoRepository::new(self.client.clone(), &self.events).with_views_table(&self.views)
+        DynamoRepository::new(self.client.clone(), &self.events)
+            .with_views_table(&self.views)
+            .with_lazy_initialization(true)
     }
 
     fn view_repository(&self) -> DynamoViewRepository {
@@ -343,7 +345,8 @@ async fn store_end_to_end() {
 /// No views table: the journal has nowhere to write, and says so before any write.
 async fn without_a_views_table() {
     let tables = Tables::new("noviews").await;
-    let repository = DynamoRepository::new(tables.client.clone(), &tables.events);
+    let repository =
+        DynamoRepository::new(tables.client.clone(), &tables.events).with_lazy_initialization(true);
     let journal =
         Journal::new(["ledger"], |_: &SerializedEvent| vec![scope("everything")]).unwrap();
     let journaled = JournalRepository::new(repository.clone(), journal);
