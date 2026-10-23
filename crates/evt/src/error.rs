@@ -78,6 +78,21 @@ pub enum Error {
     )]
     StreamHeadsNotMigrated,
 
+    /// The table's feature manifest does not declare `stream-heads`, and this writer does not
+    /// initialize a store itself (the DynamoDB default), so it refuses to write instead of
+    /// scanning the table to find out whether it is fresh. Initialize a fresh store once, at deploy
+    /// time, with [`FeatureMarker::initialize`](crate::FeatureMarker::initialize) (or `evt-doctor
+    /// init`); migrate a store written before stream heads with `evt-doctor migrate-heads`. Every
+    /// write path that validates the feature marker refuses with it: commits (outcome-only and
+    /// rejection commits included), [`Repository::put_snapshot`](crate::Repository::put_snapshot),
+    /// and [`Repository::compact_below`](crate::Repository::compact_below). Reads do not need the
+    /// feature. Nothing was written.
+    #[error(
+        "the store is not initialized: the feature manifest does not declare stream-heads; \
+         initialize a fresh store, or migrate one written before stream heads, before writing"
+    )]
+    StoreNotInitialized,
+
     /// Compaction was refused because no durable snapshot covers the requested range.
     #[error(
         "compaction refused: no durable snapshot covers the requested range (entity {entity_id}, \

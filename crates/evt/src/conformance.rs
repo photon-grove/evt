@@ -3632,6 +3632,210 @@ where
     println!("ok   a fresh store declares stream-heads on the first write");
 }
 
+/// Runs against two handles over an **empty** store that has never been written to (no events,
+/// no snapshots, no marker row): explicit store initialization ([`FeatureMarker::initialize`],
+/// issue #188).
+///
+/// With `refuses_uninitialized` (the handles are writers that do not initialize a store
+/// themselves, the DynamoDB default), every write path first refuses the uninitialized store with
+/// [`Error::StoreNotInitialized`] and writes nothing. Then, on every backend: initialization
+/// declares `stream-heads` at version 1, a second initialization by either handle declares
+/// nothing, both handles write, and initializing a store that holds data but does not declare
+/// the feature is refused with [`Error::StreamHeadsNotMigrated`] and declares nothing, as the
+/// first writer's verification always did. `fixtures`, when it has raw storage access, adds a
+/// stream with no head item to that store.
+///
+/// The store must be fresh: a durable backend needs its own empty table or schema for this case.
+pub async fn initialization_cases<R, F>(
+    fresh: &R,
+    other: &R,
+    fixtures: &F,
+    refuses_uninitialized: bool,
+) where
+    R: FeatureMarker + Repository,
+    F: HeadFixtures<R>,
+{
+    let result: CaseResult = async {
+        ensure!(
+            fresh.read_manifest().await?.is_none(),
+            "the store starts with no marker row"
+        );
+
+        let ns = namespace();
+        let stream = Stream::new(&ns, "initialized", "ledger");
+        if refuses_uninitialized {
+            uninitialized_store_refuses_writes(fresh, &stream).await?;
+        }
+
+        ensure!(
+            fresh.initialize().await?,
+            "the first initialization declares"
+        );
+        let manifest = fresh
+            .read_manifest()
+            .await?
+            .ok_or(Failure("the initialization declared nothing".into()))?;
+        ensure_eq!(
+            (manifest.version, manifest.features_json()),
+            (1, r#"{"stream-heads":1}"#.to_owned()),
+            "the initialization creates the row at version 1 declaring stream-heads"
+        );
+
+        ensure!(
+            !fresh.initialize().await? && !other.initialize().await?,
+            "a second initialization, by either handle, declares nothing"
+        );
+
+        stream.commit(fresh, stream.events(1..=2), None).await?;
+        stream.commit(other, stream.events(3..=3), None).await?;
+        ensure_eq!(
+            fresh.events(&stream.id).await?,
+            stream.events(1..=3),
+            "both writers write to the initialized store"
+        );
+        ensure!(
+            !fresh.initialize().await?,
+            "initializing a store that holds data and declares the feature declares nothing"
+        );
+        ensure_eq!(
+            fresh
+                .read_manifest()
+                .await?
+                .map(|manifest| manifest.version),
+            Some(1),
+            "idempotent initialization leaves the manifest version alone"
+        );
+
+        initializing_a_populated_store_is_refused(fresh, other, fixtures, &ns).await?;
+
+        // Declared again (the migration's hook), the store takes writes.
+        other.declare_stream_heads().await?;
+        stream.commit(fresh, stream.events(4..=4), None).await?;
+        ensure_eq!(
+            fresh.events(&stream.id).await?,
+            stream.events(1..=4),
+            "the writer writes once the feature is declared again"
+        );
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(Failure(message)) = result {
+        panic!("store initialization case failed: {message}");
+    }
+    println!("ok   explicit store initialization");
+}
+
+/// Every write path refuses an uninitialized store with [`Error::StoreNotInitialized`], and none
+/// of them writes anything: no event, snapshot, outcome, or marker row.
+async fn uninitialized_store_refuses_writes<R>(writer: &R, stream: &Stream) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+{
+    let not_initialized = |err: &Error| matches!(err, Error::StoreNotInitialized);
+    let command = command_id();
+
+    expect_err(
+        stream
+            .commit(
+                writer,
+                stream.events(1..=1),
+                Some(stream.new_snapshot(1, "{}")),
+            )
+            .await,
+        "a commit to an uninitialized store",
+        not_initialized,
+    )?;
+    expect_err(
+        writer
+            .commit(
+                Commit::new(stream.id.clone(), Vec::new())
+                    .with_outcome(Outcome::accepted(command.clone(), "digest")),
+            )
+            .await,
+        "an outcome-only commit to an uninitialized store",
+        not_initialized,
+    )?;
+    let mut fenced = TransactionCommit::<R::Operation>::new(Vec::new())
+        .with_outcome(Outcome::accepted(command_id(), "digest"));
+    fenced.fences = vec![ReadFence::new(
+        stream.id.clone(),
+        stream.entity_type.clone(),
+        EventSequence::ZERO,
+        FenceProvenance::Engine,
+    )];
+    expect_err(
+        writer.commit_transaction(fenced).await,
+        "a fenced transaction on an uninitialized store",
+        not_initialized,
+    )?;
+    expect_err(
+        writer.put_snapshot(&stream.snapshot(1, 1, "{}")).await,
+        "a snapshot write to an uninitialized store",
+        not_initialized,
+    )?;
+    expect_err(
+        writer.compact_below(&stream.id, EventSequence(1)).await,
+        "compaction on an uninitialized store",
+        not_initialized,
+    )?;
+
+    ensure!(
+        writer.read_manifest().await?.is_none(),
+        "a refused write declares nothing"
+    );
+    ensure!(
+        writer.events(&stream.id).await?.is_empty() && writer.snapshot(&stream.id).await?.is_none(),
+        "a refused write stores no event or snapshot"
+    );
+    ensure!(
+        writer.outcome(&command).await?.is_none(),
+        "a refused write records no outcome"
+    );
+
+    Ok(())
+}
+
+/// A store that holds data without declaring `stream-heads` (here: the declaration taken back, and,
+/// with raw storage access, a stream with no head item) is refused, and nothing is declared.
+async fn initializing_a_populated_store_is_refused<R, F>(
+    fresh: &R,
+    other: &R,
+    fixtures: &F,
+    ns: &str,
+) -> CaseResult
+where
+    R: FeatureMarker + Repository,
+    F: HeadFixtures<R>,
+{
+    other
+        .update_manifest(|manifest| {
+            manifest.features.remove(features::STREAM_HEADS_FEATURE);
+        })
+        .await?;
+
+    let headless = Stream::new(ns, "headless", "ledger");
+    match fixtures.append_bypassing_head(&headless.event(1, 1)).await {
+        Ok(()) | Err(Error::InvalidConfig(_)) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let before = fresh.read_manifest().await?;
+    expect_err(
+        fresh.initialize().await,
+        "initializing a populated store that does not declare stream-heads",
+        |err| matches!(err, Error::StreamHeadsNotMigrated),
+    )?;
+    ensure_eq!(
+        fresh.read_manifest().await?,
+        before,
+        "a refused initialization declares nothing"
+    );
+
+    Ok(())
+}
+
 /// The refusal must consult the manifest, not the calling instance's configuration: retention is
 /// declared on one writer and the fenced transaction is committed by the other. This case runs
 /// before the unsupported-feature declaration case, whose leftover manifest would refuse every

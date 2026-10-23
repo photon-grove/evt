@@ -573,6 +573,8 @@ pub(super) struct Lagging<R> {
     backoffs: Arc<AtomicUsize>,
     writes_views: bool,
     applies_expected_payload: bool,
+    /// Every commit is refused as a DynamoDB writer refuses an uninitialized store.
+    uninitialized: bool,
 }
 
 impl<R> Lagging<R> {
@@ -585,7 +587,17 @@ impl<R> Lagging<R> {
             backoffs: Arc::new(AtomicUsize::new(0)),
             writes_views: true,
             applies_expected_payload: true,
+            uninitialized: false,
         }
+    }
+
+    /// Refuses every commit with [`Error::StoreNotInitialized`], as a DynamoDB writer refuses a
+    /// store nobody initialized, without writing anything.
+    #[cfg(test)]
+    fn uninitialized(mut self) -> Self {
+        self.uninitialized = true;
+
+        self
     }
 
     /// Reports that the repository does not write view operations, as a custom backend written
@@ -678,6 +690,10 @@ impl<R: FeatureMarker> FeatureMarker for Lagging<R> {
     ) -> impl Future<Output = Result<(), Error>> + Send {
         self.inner.update_manifest(change)
     }
+
+    fn initialize(&self) -> impl Future<Output = Result<bool, Error>> + Send {
+        self.inner.initialize()
+    }
 }
 
 impl<R: Repository> Repository for Lagging<R> {
@@ -688,8 +704,13 @@ impl<R: Repository> Repository for Lagging<R> {
         commit: Commit<Self::Operation>,
     ) -> impl Future<Output = Result<(), Error>> + Send {
         let fail = take(&self.transient_commits);
+        let uninitialized = self.uninitialized;
 
         async move {
+            if uninitialized {
+                return Err(Error::StoreNotInitialized);
+            }
+
             if fail {
                 return Err(Error::Transient("an injected transient failure".into()));
             }
@@ -702,7 +723,15 @@ impl<R: Repository> Repository for Lagging<R> {
         &self,
         commit: TransactionCommit<Self::Operation>,
     ) -> impl Future<Output = Result<(), Error>> + Send {
-        self.inner.commit_transaction(commit)
+        let uninitialized = self.uninitialized;
+
+        async move {
+            if uninitialized {
+                return Err(Error::StoreNotInitialized);
+            }
+
+            self.inner.commit_transaction(commit).await
+        }
     }
 
     fn writes_views(&self) -> bool {
@@ -1742,4 +1771,39 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemRepository;
+
+    /// A journaled commit to a store that is not initialized declares `journal` first (creating
+    /// the marker row) and is then refused: the declaration is taken back, so the marker does not
+    /// claim an extension on a store nothing journaled into.
+    #[tokio::test]
+    async fn a_commit_to_an_uninitialized_store_leaves_no_journal_declaration() {
+        let memory = MemRepository::new();
+        let ns = namespace();
+        let stream = Stream::new(&ns, "a", "ledger");
+        let journaled = JournalRepository::new(
+            Lagging::new(memory.clone(), 0).uninitialized(),
+            journal(&ns),
+        );
+
+        let result = stream.commit(&journaled, stream.events(1..=1), None).await;
+        assert!(
+            matches!(result, Err(Error::StoreNotInitialized)),
+            "{result:?}"
+        );
+
+        let manifest = memory.read_manifest().await.unwrap();
+        assert!(
+            manifest
+                .as_ref()
+                .is_none_or(|manifest| !manifest.declares_journal()),
+            "the journal declaration was retracted: {manifest:?}"
+        );
+        assert!(memory.events(&stream.id).await.unwrap().is_empty());
+    }
 }

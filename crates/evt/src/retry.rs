@@ -203,8 +203,11 @@ impl Retry {
             | Error::RebuildEpochChanged { .. } => Self::Transient,
             // Stream head drift says the log is damaged, not that a decision went stale: it is
             // returned at once, never retried and never exhausted into a stale-fence rejection.
-            // A table that is not migrated stays that way until an operator migrates it.
-            Error::StreamHeadDrift { .. } | Error::StreamHeadsNotMigrated => Self::Never,
+            // A table that is not migrated (or not initialized) stays that way until an operator
+            // migrates (or initializes) it.
+            Error::StreamHeadDrift { .. }
+            | Error::StreamHeadsNotMigrated
+            | Error::StoreNotInitialized => Self::Never,
             _ => Self::Never,
         }
     }
@@ -359,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_and_a_table_that_is_not_migrated_are_never_retried() {
+    fn drift_and_a_table_that_is_not_migrated_or_initialized_are_never_retried() {
         use crate::Error;
         use crate::ids::{EntityId, EventSequence};
 
@@ -375,6 +378,8 @@ mod tests {
             Failed::internal(drift()),
             Failed::committing(Error::StreamHeadsNotMigrated),
             Failed::deciding(Error::StreamHeadsNotMigrated),
+            Failed::committing(Error::StoreNotInitialized),
+            Failed::deciding(Error::StoreNotInitialized),
         ] {
             assert_eq!(failed.retry(), Retry::Never, "{}", failed.error);
             assert!(!failed.error.is_retryable() && !failed.error.is_conflict());

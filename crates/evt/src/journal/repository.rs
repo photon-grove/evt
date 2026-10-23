@@ -289,8 +289,8 @@ where
     }
 
     /// Takes back a `journal` declaration this repository just wrote, for a commit that then
-    /// failed because the table has not been migrated to stream heads: the marker must not be left
-    /// declaring an extension on a table nothing journaled into. Best effort; the
+    /// failed because the table has not been migrated to stream heads (or initialized): the marker
+    /// must not be left declaring an extension on a table nothing journaled into. Best effort; the
     /// history-dependent declaration stays, which only forbids compacting the types.
     async fn retract(&self) {
         self.declared.store(false, Ordering::Release);
@@ -524,7 +524,12 @@ where
                 Err(error) => error,
             };
 
-            if declared_now && matches!(error, Error::StreamHeadsNotMigrated) {
+            if declared_now
+                && matches!(
+                    error,
+                    Error::StreamHeadsNotMigrated | Error::StoreNotInitialized
+                )
+            {
                 self.retract().await;
 
                 return Err(error);

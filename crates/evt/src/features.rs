@@ -258,9 +258,10 @@ pub fn marker_matches(validated: CachedMarker, observed: Option<&FeatureManifest
 /// feature is [`Error::StreamHeadsNotMigrated`]. A manifest that declares a pair this build does
 /// not support is refused first, with [`Error::UnsupportedFeature`].
 ///
-/// A backend that finds the feature missing may declare it itself, but only on a table it has
-/// confirmed holds no data (see [`FeatureMarker::declare_stream_heads`] for the unconditional
-/// declaration a migration performs).
+/// A backend that finds the feature missing either refuses with [`Error::StoreNotInitialized`]
+/// (DynamoDB by default) or initializes the store itself, but only one it has confirmed holds no
+/// data (see [`FeatureMarker::initialize`], and [`FeatureMarker::declare_stream_heads`] for the
+/// unconditional declaration a migration performs).
 pub fn validate_marker_for_write(
     observed: Option<&FeatureManifest>,
 ) -> Result<ValidatedMarker, Error> {
@@ -301,11 +302,30 @@ pub trait FeatureMarker: Send + Sync {
     /// and verified a head item for every stream, with every v0.8 writer stopped, it declares the
     /// feature with this call. Calling it on a populated table whose streams have no head items
     /// makes every later commit to those streams fail with [`Error::StreamHeadDrift`]. A fresh
-    /// table needs no call: the first writer declares the feature itself after confirming the
-    /// table is empty.
+    /// store is declared with [`initialize`](Self::initialize) instead, which verifies it first.
     fn declare_stream_heads(&self) -> impl Future<Output = Result<(), Error>> + Send {
         self.update_manifest(FeatureManifest::declare_stream_heads)
     }
+
+    /// Initializes the store: declares `stream-heads` on a store that holds no data, with the
+    /// verification ADR 0007 requires, and returns whether this call declared it.
+    ///
+    /// It is an operator step, run once at deploy time before any writer starts (`evt-doctor init`
+    /// runs it), and it is idempotent: a store that already declares the feature is left alone
+    /// and returns `Ok(false)` after one manifest read, with nothing scanned or written. A store
+    /// that does not declare it must hold no item outside the reserved namespaces, or the call
+    /// refuses with [`Error::StreamHeadsNotMigrated`] (migrate it with `evt-doctor migrate-heads`
+    /// instead). The declaration is the ordinary declaration transaction, and on DynamoDB the
+    /// table is then looked at once more for a stream with no head item, retracting the
+    /// declaration and refusing if one appeared in the window. A manifest that declares a feature
+    /// this build does not support is refused with [`Error::UnsupportedFeature`]. Only
+    /// `stream-heads` is declared: extensions such as `journal` declare themselves on first use,
+    /// which needs no scan.
+    ///
+    /// On DynamoDB the verification is a strongly consistent Scan, so the caller needs
+    /// `dynamodb:Scan` on the event log; writers, which refuse an uninitialized store with
+    /// [`Error::StoreNotInitialized`] by default, then never scan.
+    fn initialize(&self) -> impl Future<Output = Result<bool, Error>> + Send;
 }
 
 /// Durably adds the entity types to the manifest's `historyDependent` set, once: types already

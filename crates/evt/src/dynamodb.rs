@@ -147,6 +147,9 @@ pub struct DynamoRepository {
     consistent_read: bool,
     scan_page_size: Option<i32>,
     retention: BTreeMap<EntityType, Duration>,
+    /// Whether a write to a store that does not declare `stream-heads` initializes it (scanning
+    /// the table) instead of refusing with [`Error::StoreNotInitialized`].
+    lazy_initialization: bool,
     /// The clock `ttl` expiries and rebuild leases are read from.
     clock: Clock,
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
@@ -165,6 +168,7 @@ impl Clone for DynamoRepository {
             consistent_read: self.consistent_read,
             scan_page_size: self.scan_page_size,
             retention: self.retention.clone(),
+            lazy_initialization: self.lazy_initialization,
             clock: self.clock.clone(),
             validated_marker: Mutex::new(*self.validated_marker()),
             // Like a separate process, a clone remembers nothing it did not load itself.
@@ -176,6 +180,10 @@ impl Clone for DynamoRepository {
 impl DynamoRepository {
     /// Creates a repository over the given event-log table. Reads are strongly consistent.
     /// The table binding is immutable: event writes and feature-marker checks always use it.
+    ///
+    /// Writes require an initialized store (one that declares `stream-heads`): run
+    /// [`initialize`](Self::initialize) once at deploy time, or opt into
+    /// [`with_lazy_initialization`](Self::with_lazy_initialization) for tests and local use.
     pub fn new(client: Client, table: impl Into<String>) -> Self {
         Self {
             client,
@@ -184,6 +192,7 @@ impl DynamoRepository {
             consistent_read: true,
             scan_page_size: None,
             retention: BTreeMap::new(),
+            lazy_initialization: false,
             clock: Clock::default(),
             validated_marker: Mutex::new(None),
             loaded_ttls: Mutex::new(LoadedTtls::default()),
@@ -213,6 +222,18 @@ impl DynamoRepository {
     #[must_use]
     pub fn with_clock(mut self, clock: impl Fn() -> SystemTime + Send + Sync + 'static) -> Self {
         self.clock = Clock::new(clock);
+        self
+    }
+
+    /// With `true`, the first write to a store that does not declare `stream-heads` initializes it
+    /// itself, as [`initialize`](Self::initialize) does, instead of refusing with
+    /// [`Error::StoreNotInitialized`]. That costs a strongly consistent Scan of the table at first
+    /// write (two when the store is fresh) and needs `dynamodb:Scan` on the event log, so it is
+    /// for tests, local emulators, and quickstarts; production writers keep the default (`false`)
+    /// and the store is initialized by an operator step.
+    #[must_use]
+    pub fn with_lazy_initialization(mut self, lazy: bool) -> Self {
+        self.lazy_initialization = lazy;
         self
     }
 
@@ -299,25 +320,25 @@ impl DynamoRepository {
     /// cache afterwards. A stale snapshot is safe: the transaction condition forces revalidation.
     ///
     /// A writer requires the `stream-heads` feature (ADR 0007). A table whose manifest lacks it is
-    /// declared by the writer itself, but only after a strongly consistent scan finds no
-    /// non-reserved item in the table; a populated table is refused with
-    /// [`Error::StreamHeadsNotMigrated`].
+    /// refused with [`Error::StoreNotInitialized`], without scanning, unless the repository opted
+    /// into [lazy initialization](Self::with_lazy_initialization): then the writer initializes the
+    /// table itself, as [`initialize`](Self::initialize) does.
     async fn ensure_manifest_validated(&self) -> Result<ValidatedMarker, Error> {
         if let Some(cached) = *self.validated_marker() {
             return Ok(cached);
         }
 
-        let mut declared = false;
+        let mut initialized = false;
         let validated = loop {
             let observed = self.read_manifest().await?;
 
-            match features::validate_marker_for_write(observed.as_ref()) {
+            match self.validate_for_write(observed.as_ref()) {
                 Ok(validated) => break validated,
-                Err(Error::StreamHeadsNotMigrated) if !declared => {
-                    // Boxed: a first write is rare, and its scan and declaration must not widen
-                    // every commit's future.
-                    Box::pin(self.declare_on_empty_table()).await?;
-                    declared = true;
+                Err(Error::StreamHeadsNotMigrated) if !initialized => {
+                    // Lazy initialization only. Boxed: a first write is rare, and its scan and
+                    // declaration must not widen every commit's future.
+                    Box::pin(self.initialize()).await?;
+                    initialized = true;
                 }
                 Err(error) => return Err(error),
             }
@@ -328,9 +349,28 @@ impl DynamoRepository {
         Ok(*cached.get_or_insert(validated))
     }
 
-    /// Declares `stream-heads` on a table with no data: a strongly consistent scan must find no
-    /// item outside the reserved namespaces, or the table is refused with
-    /// [`Error::StreamHeadsNotMigrated`].
+    /// [`features::validate_marker_for_write`] for this writer: without lazy initialization, a
+    /// table that does not declare `stream-heads` is [`Error::StoreNotInitialized`], because the
+    /// writer will not scan it to tell a fresh table from one written before stream heads.
+    fn validate_for_write(
+        &self,
+        observed: Option<&FeatureManifest>,
+    ) -> Result<ValidatedMarker, Error> {
+        match features::validate_marker_for_write(observed) {
+            Err(Error::StreamHeadsNotMigrated) if !self.lazy_initialization => {
+                Err(Error::StoreNotInitialized)
+            }
+            validated => validated,
+        }
+    }
+
+    /// Initializes the table: declares `stream-heads` on a table with no data, and returns
+    /// whether this call declared it (see [`FeatureMarker::initialize`]). Run it once, at deploy
+    /// time, with a role that may Scan the event log; writers then never scan.
+    ///
+    /// A table that already declares the feature is left alone after one strongly consistent
+    /// read. Otherwise a strongly consistent scan must find no item outside the reserved
+    /// namespaces, or the table is refused with [`Error::StreamHeadsNotMigrated`].
     ///
     /// The scan and the declaration are two steps, and no transaction can exclude a writer that
     /// never reads the marker, so the order does the work: the declaration is committed first,
@@ -341,7 +381,14 @@ impl DynamoRepository {
     /// manifest version, so every cached validation is dropped) and the table is refused. Streams
     /// other head-aware writers created in the meantime have a head item and are no reason to
     /// retract.
-    async fn declare_on_empty_table(&self) -> Result<(), Error> {
+    pub async fn initialize(&self) -> Result<bool, Error> {
+        if let Some(manifest) = self.read_manifest().await? {
+            manifest.validate_supported()?;
+            if manifest.declares_stream_heads() {
+                return Ok(false);
+            }
+        }
+
         if self.holds_stream_data().await? {
             return Err(Error::StreamHeadsNotMigrated);
         }
@@ -359,7 +406,12 @@ impl DynamoRepository {
             return Err(Error::StreamHeadsNotMigrated);
         }
 
-        Ok(())
+        // A concurrent declaration may have added a feature this build does not model.
+        if let Some(manifest) = self.read_manifest().await? {
+            manifest.validate_supported()?;
+        }
+
+        Ok(true)
     }
 
     /// Reports whether any stream in the table has items but no head item. A scan is not atomic
@@ -526,10 +578,9 @@ impl DynamoRepository {
     ///
     /// This is the hook for a migration tool: after it has backfilled and verified a head item
     /// for every stream, with every writer that predates stream heads stopped, it declares the
-    /// feature with this call. A fresh table needs no call: the first writer declares the
-    /// feature itself after confirming the table is empty. Declaring on a populated table whose
-    /// streams have no head items makes every later commit to those streams fail with
-    /// [`Error::StreamHeadDrift`].
+    /// feature with this call. A fresh table is declared with [`initialize`](Self::initialize)
+    /// instead, which verifies it first. Declaring on a populated table whose streams have no head
+    /// items makes every later commit to those streams fail with [`Error::StreamHeadDrift`].
     pub async fn declare_stream_heads(&self) -> Result<(), Error> {
         self.update_manifest(FeatureManifest::declare_stream_heads)
             .await
@@ -1419,8 +1470,8 @@ impl DynamoRepository {
     ) -> Result<TransactWriteItem, Error> {
         let manifest = self.read_manifest().await?;
         // Compaction is a write path: it refuses an unsupported feature and a table that is not
-        // migrated to stream heads. It never touches a head item.
-        let observed = features::validate_marker_for_write(manifest.as_ref())?;
+        // migrated to stream heads (or not initialized). It never touches a head item.
+        let observed = self.validate_for_write(manifest.as_ref())?;
         if manifest
             .as_ref()
             .is_some_and(|manifest| manifest.is_history_dependent(&snapshot.entity_type))
@@ -1966,8 +2017,8 @@ impl Repository for DynamoRepository {
 
         // Compaction is a write path: a table that does not declare `stream-heads` (or declares a
         // feature this build does not model) is refused before anything is read, so the refusal
-        // wins over `CompactionUncovered`. It never declares the feature itself.
-        features::validate_marker_for_write(self.read_manifest().await?.as_ref())?;
+        // wins over `CompactionUncovered`. It never declares the feature itself, lazily or not.
+        self.validate_for_write(self.read_manifest().await?.as_ref())?;
 
         // Strongly consistent regardless of `with_consistent_read`, like the key query below.
         let snapshot = self.read_snapshot(entity_id, true).await?;
@@ -2052,6 +2103,10 @@ impl FeatureMarker for DynamoRepository {
         change: impl Fn(&mut FeatureManifest) + Send,
     ) -> Result<(), Error> {
         DynamoRepository::update_manifest(self, change).await
+    }
+
+    async fn initialize(&self) -> Result<bool, Error> {
+        DynamoRepository::initialize(self).await
     }
 }
 
@@ -2760,6 +2815,61 @@ mod tests {
             .build();
 
         DynamoRepository::new(Client::from_conf(config), "events")
+    }
+
+    #[test]
+    fn a_writer_refuses_an_uninitialized_table_unless_it_initializes_lazily() {
+        let strict = offline_repository();
+        let lazy = offline_repository().with_lazy_initialization(true);
+        let undeclared = FeatureManifest {
+            version: 3,
+            ..FeatureManifest::default()
+        };
+
+        for observed in [None, Some(&undeclared)] {
+            assert!(
+                matches!(
+                    strict.validate_for_write(observed),
+                    Err(Error::StoreNotInitialized)
+                ),
+                "a writer refuses without scanning: {observed:?}"
+            );
+            assert!(
+                matches!(
+                    lazy.validate_for_write(observed),
+                    Err(Error::StreamHeadsNotMigrated)
+                ),
+                "a lazy writer goes on to initialize: {observed:?}"
+            );
+        }
+
+        // An unsupported pair is refused first, in both modes.
+        let mut unsupported = FeatureManifest::default();
+        unsupported.features.insert("journal-compaction".into(), 2);
+        for writer in [&strict, &lazy] {
+            assert!(matches!(
+                writer.validate_for_write(Some(&unsupported)),
+                Err(Error::UnsupportedFeature { .. })
+            ));
+        }
+
+        let mut declared = FeatureManifest {
+            version: 4,
+            ..FeatureManifest::default()
+        };
+        declared.declare_stream_heads();
+        for writer in [&strict, &lazy] {
+            assert!(matches!(
+                writer.validate_for_write(Some(&declared)),
+                Ok(ValidatedMarker::Version(4))
+            ));
+        }
+
+        // The mode survives a clone, like every other setting.
+        assert!(matches!(
+            lazy.clone().validate_for_write(None),
+            Err(Error::StreamHeadsNotMigrated)
+        ));
     }
 
     #[test]
