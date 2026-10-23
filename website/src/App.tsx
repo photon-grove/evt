@@ -88,9 +88,10 @@ function Home() {
             Immutable events as truth. <span className="accent">Views you can rebuild.</span>
           </h1>
           <p className="lede">
-            <strong>evt</strong> is a Go framework for event-sourced services with aggregate commands,
-            append-only event logs, snapshots, rebuildable projections, DynamoDB Streams projectors,
-            and publisher helpers.
+            evt is a Go framework for event-sourced services. Aggregates handle commands, the events
+            they decide on go into an append-only log in DynamoDB or PostgreSQL, and views are
+            projections you can wipe and rebuild from that log. A Rust crate reads and writes the same
+            log.
           </p>
           <div className="install">
             <span className="prompt">$</span>
@@ -116,7 +117,7 @@ function Home() {
           <p className="eyebrow">Framework surface</p>
           <h2>Components for event-sourced Go services.</h2>
           <p className="section-lead">
-            Small, explicit packages with stable contracts. Each capability links to its guide.{' '}
+            Each piece is a small package with a stable contract, and each card links to its guide.{' '}
             <a href="#/docs">Browse all documentation →</a>
           </p>
         </div>
@@ -130,10 +131,10 @@ function Home() {
       <section className="band split-band" id="start">
         <div className="split-copy">
           <p className="eyebrow">First path</p>
-          <h2>Use the same aggregate model with memory and DynamoDB.</h2>
+          <h2>One aggregate, in memory and on DynamoDB.</h2>
           <p className="section-sub">
-            Aggregates use the same contracts with both stores. Test behavior in memory, then use
-            DynamoDB for production writes without rewriting domain code.
+            The memory store and the DynamoDB store take the same aggregate. So you test the domain
+            logic in memory and run it on DynamoDB in production without changing it.
           </p>
           <ol className="steps">
             {gettingStarted.map((step) => (
@@ -160,7 +161,7 @@ function Home() {
       <section className="band diagram-section" id="diagrams">
         <div className="section-heading">
           <p className="eyebrow">Interactive architecture</p>
-          <h2>Trace the runtime from command to projection and async fanout.</h2>
+          <h2>Follow a command through to its projections and the stream.</h2>
         </div>
         <div className="diagram-frame">
           <DiagramViewer diagrams={diagrams} title="evt" subtitle="Architecture guide" />
@@ -170,7 +171,7 @@ function Home() {
       <section className="band packages-band" id="packages">
         <div className="section-heading">
           <p className="eyebrow">Package reference</p>
-          <h2>Import only what the service uses.</h2>
+          <h2>Import only the packages you use.</h2>
           <p className="section-sub">
             Every package lives under <code>github.com/photon-grove/evt/go</code>.
           </p>

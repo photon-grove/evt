@@ -41,45 +41,52 @@ const DOC_CONFIG: Record<string, DocConfig> = {
   'guide/getting-started': {
     group: GUIDES,
     order: 1,
-    summary: 'Model an aggregate, commit events, and read it back — in memory first, then DynamoDB.',
+    summary: 'Model an aggregate, commit events and read it back, in memory first and then on DynamoDB.',
   },
   'guide/concepts': {
     group: GUIDES,
     order: 2,
-    summary: 'Events, entities, snapshots, projections, and framework invariants.',
+    summary: 'Aggregates, commands, events, snapshots, projections and the rules that tie them together.',
   },
   'guide/projections': {
     group: GUIDES,
     order: 3,
-    summary:
-      'Rebuild views from the log with scan-based streaming and snapshot-aware seeds.',
+    summary: 'Rebuild views from the log, fence rebuilds against live writers, and write cross-entity views in the commit\'s own transaction.',
   },
   'guide/streams': {
     group: GUIDES,
     order: 4,
-    summary:
-      'DynamoDB Streams projectors with idempotency and retry classification.',
+    summary: 'Read the DynamoDB Stream with idempotent projectors, skip head items, and publish onward from your own handler.',
   },
   'guide/dynamodb': {
     group: GUIDES,
     order: 5,
-    summary: 'The single-table event-log layout, key patterns, and conditional-write ordering.',
+    summary: 'The single-table event log, what a commit sends, and the snapshot, compaction and retention options.',
   },
   'guide/postgres': {
     group: GUIDES,
     order: 6,
-    summary: 'The relational event-log schema, optimistic concurrency, and snapshot-aware compaction.',
+    summary: 'The relational schema, the engine tables EnsureSchema creates, and view writers that enforce row owners.',
+  },
+  'guide/commands': {
+    group: GUIDES,
+    order: 9,
+    summary: 'Durable command outcomes, rejections that carry events, and fence-aware retry.',
+  },
+  'guide/upgrading-to-v0.9': {
+    group: GUIDES,
+    order: 10,
+    summary: 'What v0.9 removed, what breaks at compile time, and what a custom repository must honor.',
   },
   'guide/integration': {
     group: GUIDES,
     order: 7,
-    summary: 'Copy-ready patterns for adopters: rebuilds, dedup, schema evolution, and local testing.',
+    summary: 'Integration rules and the reasons behind them: rebuilds, retry keys, schema evolution and local testing.',
   },
   'guide/migrating-to-stream-heads': {
     group: GUIDES,
     order: 8,
-    summary:
-      'Runbook for moving a v0.8 store to per-stream head items: stop, back up, backfill, verify, declare.',
+    summary: 'The runbook for moving a v0.8 store to per-stream head items: stop writers, back up, backfill, verify, declare.',
   },
   'reference/storage-format': {
     group: REFERENCE,
