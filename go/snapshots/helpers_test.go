@@ -14,12 +14,12 @@ import (
 
 // testSetup represents a test setup with store, entity, and context
 type testSetup struct {
-	store        evt.Store
-	repo         evt.Repository
-	entityID     evt.EntityID
-	aggregate    *test.Aggregate
-	eventContext evt.Context
-	entityType   evt.EntityType
+	store      evt.Store
+	repo       evt.Repository
+	entityID   evt.EntityID
+	aggregate  *test.Aggregate
+	cc         evt.CommandContext
+	entityType evt.EntityType
 }
 
 // newTestSetup creates a new test setup with the given entity ID and snapshot size
@@ -32,18 +32,18 @@ func newTestSetup(t *testing.T, entityID evt.EntityID, snapshotSize int) *testSe
 	aggregate := test.NewAggregate(entityID)
 	entityType := aggregate.Type()
 
-	eventContext, err := store.LoadAggregate(ctx, aggregate, entityID)
+	cc, err := store.LoadAggregate(ctx, aggregate, entityID)
 	if err != nil {
 		t.Fatalf("Error loading Entity: %v", err)
 	}
 
 	return &testSetup{
-		store:        store,
-		repo:         repo,
-		entityID:     entityID,
-		aggregate:    aggregate,
-		eventContext: eventContext,
-		entityType:   entityType,
+		store:      store,
+		repo:       repo,
+		entityID:   entityID,
+		aggregate:  aggregate,
+		cc:         cc,
+		entityType: entityType,
 	}
 }
 
@@ -95,15 +95,15 @@ func combineResults(results ...evt.CommandResult) evt.CommandResult {
 // Per the Store.Commit contract, the entity must already reflect result.Events before Commit (in
 // production, Execute applies them first). These tests construct results without going through
 // Execute, so apply the events to the context entity here before committing.
-func commitEvents(t *testing.T, store evt.Store, result evt.CommandResult, eventContext evt.Context, metadata evt.Metadata) []evt.SerializedEvent {
+func commitEvents(t *testing.T, store evt.Store, result evt.CommandResult, cc evt.CommandContext, metadata evt.Metadata) []evt.SerializedEvent {
 	t.Helper()
 	ctx := context.Background()
 
 	for _, event := range result.Events {
-		require.NoError(t, eventContext.Aggregate.Apply(event), "Error applying event before commit")
+		require.NoError(t, cc.Aggregate.Apply(event), "Error applying event before commit")
 	}
 
-	serializedEvents, err := store.Commit(ctx, result, eventContext, metadata)
+	serializedEvents, err := store.Commit(ctx, result, cc, metadata)
 	require.NoError(t, err, "Error committing events")
 	return serializedEvents
 }
@@ -177,9 +177,9 @@ func (s *testSetup) refresh(t *testing.T) {
 	ctx := context.Background()
 
 	aggregate := test.NewAggregate(s.entityID)
-	eventContext, err := s.store.LoadAggregate(ctx, aggregate, s.entityID)
+	cc, err := s.store.LoadAggregate(ctx, aggregate, s.entityID)
 	require.NoError(t, err, "Error refreshing entity")
 
 	s.aggregate = aggregate
-	s.eventContext = eventContext
+	s.cc = cc
 }

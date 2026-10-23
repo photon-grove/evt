@@ -257,14 +257,14 @@ func TestCommit_UpdateSnapshotError(t *testing.T) {
 		snapshotError: true,
 	}
 
-	eventContext := evt.Context{
+	cc := evt.CommandContext{
 		Aggregate:       mockAggregate,
 		EntityID:        setup.entityID,
 		CurrentSequence: intPtr(0),
 		CurrentSnapshot: intPtr(0),
 	}
 
-	_, err := setup.store.Commit(ctx, result, eventContext, metadata)
+	_, err := setup.store.Commit(ctx, result, cc, metadata)
 	require.Error(t, err)
 	// The snapshot payload is captured from the entity's current state, so the failure surfaces
 	// from MarshalJSON during snapshot generation.
@@ -281,14 +281,14 @@ func TestUpdateSnapshotSequence_NilSnapshot(t *testing.T) {
 	result := handleCommand(t, setup.aggregate, command)
 
 	// Manually create event context with nil CurrentSnapshot to test initialization behavior
-	eventContext := evt.Context{
+	cc := evt.CommandContext{
 		Aggregate:       setup.aggregate,
 		EntityID:        setup.entityID,
 		CurrentSequence: intPtr(0),
 		CurrentSnapshot: nil,
 	}
 
-	serialized, err := setup.store.Commit(ctx, result, eventContext, metadata)
+	serialized, err := setup.store.Commit(ctx, result, cc, metadata)
 	require.NoError(t, err)
 	require.NotEmpty(t, serialized)
 }
@@ -317,7 +317,7 @@ func Test_EventStore_CommitSimpleEvents_Success(t *testing.T) {
 		),
 	}
 
-	commitEvents(t, setup.store, result, setup.eventContext, metadata)
+	commitEvents(t, setup.store, result, setup.cc, metadata)
 	committedEvents := getEvents(t, setup.repo, setup.entityID)
 
 	// The engine assigns the commit ID, which is a fresh ULID for a command without one.
@@ -342,7 +342,7 @@ func Test_EventStore_LoadWithEvents_Success(t *testing.T) {
 	// Combine results
 	combinedResult := combineResults(result, updateResult)
 
-	commitEvents(t, setup.store, combinedResult, setup.eventContext, metadata)
+	commitEvents(t, setup.store, combinedResult, setup.cc, metadata)
 
 	// Load the entity again to retrieve events from memory
 	setup.refresh(t)
@@ -371,7 +371,7 @@ func Test_EventStore_SnapshotCommit_Success(t *testing.T) {
 
 	// Combine all results
 	firstBatchResult := combineResults(result, updateValueResult, updateOtherResult)
-	commitEvents(t, setup.store, firstBatchResult, setup.eventContext, metadata)
+	commitEvents(t, setup.store, firstBatchResult, setup.cc, metadata)
 
 	// Retrieve the initial snapshot
 	snapshot := getSnapshot(t, setup.repo, setup.entityID)
@@ -394,7 +394,7 @@ func Test_EventStore_SnapshotCommit_Success(t *testing.T) {
 	nextResult2 := handleCommand(t, setup.aggregate, &nextCommand2)
 
 	secondBatchResult := combineResults(nextResult1, nextResult2)
-	commitEvents(t, setup.store, secondBatchResult, setup.eventContext, metadata)
+	commitEvents(t, setup.store, secondBatchResult, setup.cc, metadata)
 
 	// Retrieve the updated snapshot
 	snapshot = getSnapshot(t, setup.repo, setup.entityID)
@@ -412,7 +412,7 @@ func Test_EventStore_SnapshotCommit_Success(t *testing.T) {
 	// Verify all events were captured
 	committedSerializedEvents := getEvents(t, setup.repo, setup.entityID)
 	expectedCombinedResult := combineResults(firstBatchResult, secondBatchResult)
-	committedEvents := deserializeEvents(t, committedSerializedEvents, setup.eventContext.Aggregate)
+	committedEvents := deserializeEvents(t, committedSerializedEvents, setup.cc.Aggregate)
 	require.Equal(t, expectedCombinedResult.Events, committedEvents)
 }
 
@@ -436,12 +436,12 @@ func Test_EventStore_LoadWithSnapshot_Success(t *testing.T) {
 
 	// Combine and commit first batch (this will create a snapshot)
 	firstBatchResult := combineResults(result, updateValueResult, updateOtherResult)
-	commitEvents(t, setup.store, firstBatchResult, setup.eventContext, metadata)
+	commitEvents(t, setup.store, firstBatchResult, setup.cc, metadata)
 
 	// Add one more event (this will be after the snapshot)
 	finalCommand := replaceAggregateCommand(updatedValue, &updatedOther)
 	finalResult := handleCommand(t, setup.aggregate, &finalCommand)
-	commitEvents(t, setup.store, finalResult, setup.eventContext, metadata)
+	commitEvents(t, setup.store, finalResult, setup.cc, metadata)
 
 	// Refresh the setup to load from snapshot + events
 	setup.refresh(t)
@@ -466,7 +466,7 @@ func TestCommit_DuplicateCommandID_ReturnsError(t *testing.T) {
 	// First commit succeeds
 	command := &test.CreateAggregate{Value: "initial", Other: stringPtr("other")}
 	result := handleCommand(t, setup.aggregate, command)
-	_, err := setup.store.Commit(ctx, result, setup.eventContext, metadata)
+	_, err := setup.store.Commit(ctx, result, setup.cc, metadata)
 	require.NoError(t, err)
 
 	// Reload entity so SeenCommandIDs are populated from event log
@@ -475,7 +475,7 @@ func TestCommit_DuplicateCommandID_ReturnsError(t *testing.T) {
 	// Second commit with the same commandId must be rejected
 	command2 := &test.CreateAggregate{Value: "retry"}
 	result2 := handleCommand(t, setup.aggregate, command2)
-	_, err = setup.store.Commit(ctx, result2, setup.eventContext, metadata)
+	_, err = setup.store.Commit(ctx, result2, setup.cc, metadata)
 	require.Error(t, err)
 	require.True(t, evt.IsDuplicateCommandErr(err), "expected DuplicateCommandError, got: %v", err)
 }
@@ -490,7 +490,7 @@ func TestCommit_DifferentCommandIDs_Accepted(t *testing.T) {
 
 	command := &test.CreateAggregate{Value: "v1", Other: stringPtr("o1")}
 	result := handleCommand(t, setup.aggregate, command)
-	_, err := setup.store.Commit(ctx, result, setup.eventContext, meta1)
+	_, err := setup.store.Commit(ctx, result, setup.cc, meta1)
 	require.NoError(t, err)
 
 	// Reload to pick up seen IDs
@@ -501,7 +501,7 @@ func TestCommit_DifferentCommandIDs_Accepted(t *testing.T) {
 
 	command2 := &test.ReplaceAggregate{Value: "v2", Other: stringPtr("o2")}
 	result2 := handleCommand(t, setup.aggregate, command2)
-	_, err = setup.store.Commit(ctx, result2, setup.eventContext, meta2)
+	_, err = setup.store.Commit(ctx, result2, setup.cc, meta2)
 	require.NoError(t, err)
 }
 
@@ -598,14 +598,14 @@ func TestCommit_NilCommandID_Bypasses(t *testing.T) {
 
 	command := &test.CreateAggregate{Value: "v1"}
 	result := handleCommand(t, setup.aggregate, command)
-	_, err := setup.store.Commit(ctx, result, setup.eventContext, metadata)
+	_, err := setup.store.Commit(ctx, result, setup.cc, metadata)
 	require.NoError(t, err)
 
 	// Reload and commit again without commandId — should succeed
 	setup.refresh(t)
 	command2 := &test.ReplaceAggregate{Value: "v2"}
 	result2 := handleCommand(t, setup.aggregate, command2)
-	_, err = setup.store.Commit(ctx, result2, setup.eventContext, metadata)
+	_, err = setup.store.Commit(ctx, result2, setup.cc, metadata)
 	require.NoError(t, err)
 }
 
@@ -663,7 +663,7 @@ func Test_EventStore_MultiBoundaryBatch_ReloadIsCurrent(t *testing.T) {
 		results = append(results, handleCommand(t, setup.aggregate, &test.ReplaceAggregate{Value: finalValue, Other: &otherValue}))
 	}
 
-	commitEvents(t, setup.store, combineResults(results...), setup.eventContext, metadata)
+	commitEvents(t, setup.store, combineResults(results...), setup.cc, metadata)
 
 	// The snapshot should cover the full batch (eventSeq == 10).
 	snapshot := getSnapshot(t, setup.repo, setup.entityID)

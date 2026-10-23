@@ -19,29 +19,29 @@ func NewMockStore() *MockStore {
 }
 
 // LoadAggregate mocks the corresponding method on the Store
-func (store *MockStore) LoadAggregate(ctx context.Context, aggregate evt.Aggregate, entityID evt.EntityID) (evt.Context, error) {
+func (store *MockStore) LoadAggregate(ctx context.Context, aggregate evt.Aggregate, entityID evt.EntityID) (evt.CommandContext, error) {
 	args := store.Called(ctx, aggregate, entityID)
 
 	arg := args.Get(0)
 	if arg == nil {
-		return evt.Context{}, args.Error(1)
+		return evt.CommandContext{}, args.Error(1)
 	}
 
-	eventContext, ok := arg.(evt.Context)
+	cc, ok := arg.(evt.CommandContext)
 	if !ok {
 		// Also support pointer for backward compatibility
-		if ptr, ok := arg.(*evt.Context); ok && ptr != nil {
+		if ptr, ok := arg.(*evt.CommandContext); ok && ptr != nil {
 			return *ptr, args.Error(1)
 		}
-		return evt.Context{}, fmt.Errorf("expected evt.Context, got %T", arg)
+		return evt.CommandContext{}, fmt.Errorf("expected evt.CommandContext, got %T", arg)
 	}
 
-	return eventContext, args.Error(1)
+	return cc, args.Error(1)
 }
 
 // Commit mocks the corresponding method on the Store
-func (store *MockStore) Commit(ctx context.Context, result evt.CommandResult, eventContext evt.Context, metadata evt.Metadata) ([]evt.SerializedEvent, error) {
-	args := store.Called(ctx, result, eventContext, metadata)
+func (store *MockStore) Commit(ctx context.Context, result evt.CommandResult, cc evt.CommandContext, metadata evt.Metadata) ([]evt.SerializedEvent, error) {
+	args := store.Called(ctx, result, cc, metadata)
 
 	arg := args.Get(0)
 	if arg == nil {

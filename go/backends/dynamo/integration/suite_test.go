@@ -28,14 +28,14 @@ const callTimeout = 30 * time.Second
 // DynamoEventsIntegrationSuite tests DynamoDB against the local AWS emulator
 type DynamoEventsIntegrationSuite struct {
 	suite.Suite
-	client       *dynamodb.Client
-	repo         *dynamo.Repository
-	awsRegion    string
-	store        evt.Store
-	entityType   evt.EntityType
-	entityID     evt.EntityID
-	aggregate    *test.Aggregate
-	eventContext evt.Context
+	client     *dynamodb.Client
+	repo       *dynamo.Repository
+	awsRegion  string
+	store      evt.Store
+	entityType evt.EntityType
+	entityID   evt.EntityID
+	aggregate  *test.Aggregate
+	cc         evt.CommandContext
 }
 
 // TestDynamoEventsIntegrationSuite runs the test suite
@@ -82,10 +82,10 @@ func (s *DynamoEventsIntegrationSuite) SetupAggregate(entityID evt.EntityID, sna
 	s.aggregate = test.NewAggregate(entityID)
 	s.entityType = s.aggregate.Type()
 
-	eventContext, err := s.store.LoadAggregate(ctx, s.aggregate, entityID)
+	cc, err := s.store.LoadAggregate(ctx, s.aggregate, entityID)
 	require.NoError(s.T(), err)
 
-	s.eventContext = eventContext
+	s.cc = cc
 }
 
 func (s *DynamoEventsIntegrationSuite) getMetadata(ctx context.Context) evt.Metadata {

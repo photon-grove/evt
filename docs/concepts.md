@@ -163,11 +163,16 @@ contract is small:
 
 ```go
 type Store interface {
-    LoadAggregate(ctx, aggregate, entityID) (Context, error)
-    Commit(ctx, result, context, metadata) ([]SerializedEvent, error)
+    LoadAggregate(ctx, aggregate, entityID) (CommandContext, error)
+    Commit(ctx, result, cc, metadata) ([]SerializedEvent, error)
     Execute(ctx, aggregate, entityID, command, metadata) error
 }
 ```
+
+`CommandContext` is what `LoadAggregate` returns and `Commit` takes back: the loaded aggregate, its
+`EntityID`, the sequence and snapshot the stream stood at when it was read, and the command IDs seen
+during replay. It travels beside `context.Context` as its own explicit argument, so cancellation and
+deadlines stay on `ctx` while the stream's state stays on `cc`.
 
 `Execute` is the everyday entry point: it loads the aggregate from the log, handles
 the command, and commits the result in one call. When an aggregate needs injected

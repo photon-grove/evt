@@ -42,19 +42,19 @@ func (stubRepo) StreamEntities(context.Context, evt.StreamFilter, func(context.C
 }
 
 type stubStore struct {
-	load   func(ctx context.Context, aggregate evt.Aggregate, id evt.EntityID) (evt.Context, error)
+	load   func(ctx context.Context, aggregate evt.Aggregate, id evt.EntityID) (evt.CommandContext, error)
 	exec   func(ctx context.Context, aggregate evt.Aggregate, id evt.EntityID, cmd evt.Command, meta evt.Metadata) error
-	commit func(ctx context.Context, result evt.CommandResult, c evt.Context, meta evt.Metadata) ([]evt.SerializedEvent, error)
+	commit func(ctx context.Context, result evt.CommandResult, cc evt.CommandContext, meta evt.Metadata) ([]evt.SerializedEvent, error)
 }
 
-func (s stubStore) LoadAggregate(ctx context.Context, aggregate evt.Aggregate, id evt.EntityID) (evt.Context, error) {
+func (s stubStore) LoadAggregate(ctx context.Context, aggregate evt.Aggregate, id evt.EntityID) (evt.CommandContext, error) {
 	return s.load(ctx, aggregate, id)
 }
 func (s stubStore) Execute(ctx context.Context, aggregate evt.Aggregate, id evt.EntityID, cmd evt.Command, meta evt.Metadata) error {
 	return s.exec(ctx, aggregate, id, cmd, meta)
 }
-func (s stubStore) Commit(ctx context.Context, result evt.CommandResult, c evt.Context, meta evt.Metadata) ([]evt.SerializedEvent, error) {
-	return s.commit(ctx, result, c, meta)
+func (s stubStore) Commit(ctx context.Context, result evt.CommandResult, cc evt.CommandContext, meta evt.Metadata) ([]evt.SerializedEvent, error) {
+	return s.commit(ctx, result, cc, meta)
 }
 func Test_Commands_And_Events_Accessors(t *testing.T) {
 	other := "x"
@@ -93,13 +93,13 @@ func Test_Framework_WithEvents_Execute_Load(t *testing.T) {
 	ctx := context.Background()
 
 	store := stubStore{
-		load: func(_ context.Context, aggregate evt.Aggregate, _ evt.EntityID) (evt.Context, error) {
+		load: func(_ context.Context, aggregate evt.Aggregate, _ evt.EntityID) (evt.CommandContext, error) {
 			seq := evt.EventSequence(0)
 			snap := evt.EventSequence(0)
-			return evt.Context{Aggregate: aggregate, EntityID: "e1", CurrentSequence: &seq, CurrentSnapshot: &snap}, nil
+			return evt.CommandContext{Aggregate: aggregate, EntityID: "e1", CurrentSequence: &seq, CurrentSnapshot: &snap}, nil
 		},
 		exec: func(context.Context, evt.Aggregate, evt.EntityID, evt.Command, evt.Metadata) error { return nil },
-		commit: func(context.Context, evt.CommandResult, evt.Context, evt.Metadata) ([]evt.SerializedEvent, error) {
+		commit: func(context.Context, evt.CommandResult, evt.CommandContext, evt.Metadata) ([]evt.SerializedEvent, error) {
 			return nil, nil
 		},
 	}
@@ -126,13 +126,13 @@ func Test_FrameworkWithFactory_UsesFactoryForEachFreshLoad(t *testing.T) {
 
 	factoryCalls := 0
 	store := stubStore{
-		load: func(_ context.Context, aggregate evt.Aggregate, _ evt.EntityID) (evt.Context, error) {
+		load: func(_ context.Context, aggregate evt.Aggregate, _ evt.EntityID) (evt.CommandContext, error) {
 			seq := evt.EventSequence(0)
 			snap := evt.EventSequence(0)
-			return evt.Context{Aggregate: aggregate, EntityID: "e1", CurrentSequence: &seq, CurrentSnapshot: &snap}, nil
+			return evt.CommandContext{Aggregate: aggregate, EntityID: "e1", CurrentSequence: &seq, CurrentSnapshot: &snap}, nil
 		},
 		exec: func(context.Context, evt.Aggregate, evt.EntityID, evt.Command, evt.Metadata) error { return nil },
-		commit: func(context.Context, evt.CommandResult, evt.Context, evt.Metadata) ([]evt.SerializedEvent, error) {
+		commit: func(context.Context, evt.CommandResult, evt.CommandContext, evt.Metadata) ([]evt.SerializedEvent, error) {
 			return nil, nil
 		},
 	}
@@ -163,32 +163,32 @@ func Test_MockStore_Methods(t *testing.T) {
 	ms.On("LoadAggregate", mock.Anything, mock.Anything, evt.EntityID("e1")).Return("bad", nil).Once()
 	_, err = ms.LoadAggregate(context.Background(), NewAggregate("e1"), "e1")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "expected evt.Context")
+	require.Contains(t, err.Error(), "expected evt.CommandContext")
 
 	// LoadAggregate: success with pointer (backward compatible)
-	ms.On("LoadAggregate", mock.Anything, mock.Anything, evt.EntityID("e1")).Return(&evt.Context{EntityID: "e1"}, nil).Once()
+	ms.On("LoadAggregate", mock.Anything, mock.Anything, evt.EntityID("e1")).Return(&evt.CommandContext{EntityID: "e1"}, nil).Once()
 	_, err = ms.LoadAggregate(context.Background(), NewAggregate("e1"), "e1")
 	require.NoError(t, err)
 
 	// LoadAggregate: success with value
-	ms.On("LoadAggregate", mock.Anything, mock.Anything, evt.EntityID("e1")).Return(evt.Context{EntityID: "e1"}, nil).Once()
+	ms.On("LoadAggregate", mock.Anything, mock.Anything, evt.EntityID("e1")).Return(evt.CommandContext{EntityID: "e1"}, nil).Once()
 	_, err = ms.LoadAggregate(context.Background(), NewAggregate("e1"), "e1")
 	require.NoError(t, err)
 
 	// Commit: nil return
 	ms.On("Commit", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("nope")).Once()
-	_, err = ms.Commit(context.Background(), evt.CommandResult{}, evt.Context{}, evt.Metadata{})
+	_, err = ms.Commit(context.Background(), evt.CommandResult{}, evt.CommandContext{}, evt.Metadata{})
 	require.Error(t, err)
 
 	// Commit: wrong type return
 	ms.On("Commit", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return("bad", nil).Once()
-	_, err = ms.Commit(context.Background(), evt.CommandResult{}, evt.Context{}, evt.Metadata{})
+	_, err = ms.Commit(context.Background(), evt.CommandResult{}, evt.CommandContext{}, evt.Metadata{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "expected []evt.SerializedEvent")
 
 	// Commit: success
 	ms.On("Commit", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]evt.SerializedEvent{}, nil).Once()
-	_, err = ms.Commit(context.Background(), evt.CommandResult{}, evt.Context{}, evt.Metadata{})
+	_, err = ms.Commit(context.Background(), evt.CommandResult{}, evt.CommandContext{}, evt.Metadata{})
 	require.NoError(t, err)
 
 	// Execute: error propagation

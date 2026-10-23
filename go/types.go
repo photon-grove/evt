@@ -46,8 +46,10 @@ type Event interface {
 	EntityID() EntityID
 }
 
-// Context carries entity context for the EventStore.
-type Context struct {
+// CommandContext is the per-command state the store carries beside a context.Context: the loaded
+// Aggregate, its stream identity, where the stream stood when it was loaded, and the CommandIDs seen
+// during replay. Pass it explicitly. It is never embedded in, or recovered from, a context.Context.
+type CommandContext struct {
 	Aggregate       Aggregate
 	EntityID        EntityID
 	CurrentSequence *EventSequence
@@ -57,28 +59,28 @@ type Context struct {
 
 // HasCommandID reports whether the given CommandID was already seen during event replay. An empty
 // CommandID is absent, never a duplicate, as in CommitMetadata.
-func (c Context) HasCommandID(id CommandID) bool {
-	if id == "" || c.SeenCommandIDs == nil {
+func (cc CommandContext) HasCommandID(id CommandID) bool {
+	if id == "" || cc.SeenCommandIDs == nil {
 		return false
 	}
 
-	_, ok := c.SeenCommandIDs[id]
+	_, ok := cc.SeenCommandIDs[id]
 
 	return ok
 }
 
 // RecordCommandID adds a CommandID to the seen set (initializing the map if needed). An empty
 // CommandID is absent and is not recorded.
-func (c *Context) RecordCommandID(id CommandID) {
+func (cc *CommandContext) RecordCommandID(id CommandID) {
 	if id == "" {
 		return
 	}
 
-	if c.SeenCommandIDs == nil {
-		c.SeenCommandIDs = make(map[CommandID]struct{})
+	if cc.SeenCommandIDs == nil {
+		cc.SeenCommandIDs = make(map[CommandID]struct{})
 	}
 
-	c.SeenCommandIDs[id] = struct{}{}
+	cc.SeenCommandIDs[id] = struct{}{}
 }
 
 // GetEventID builds a stable event ID from the entity ID and sequence.

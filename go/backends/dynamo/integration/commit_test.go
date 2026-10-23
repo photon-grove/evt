@@ -51,7 +51,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Success() {
 		},
 	}
 
-	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, result, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	committedEvents, err := s.repo.GetEvents(ctx, s.entityID)
@@ -73,7 +73,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Empty() {
 
 	result := evt.CommandResult{Events: resultEvents}
 
-	_, err := s.store.Commit(ctx, result, s.eventContext, metadata)
+	_, err := s.store.Commit(ctx, result, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	committedEvents, err := s.repo.GetEvents(ctx, s.entityID)

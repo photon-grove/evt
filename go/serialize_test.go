@@ -49,13 +49,13 @@ func TestSerializeEvents(t *testing.T) {
 	assert.Equal(t, mockEvent, unmarshaled)
 }
 
-func TestSerializeEventsWithContext(t *testing.T) {
+func TestSerializeEventsWithCommandContext(t *testing.T) {
 	// Setup
 	entityID := EntityID("test-entity-1")
 	seq := EventSequence(5)
 	snapshot := EventSequence(0)
 
-	ctx := &Context{
+	cc := &CommandContext{
 		Aggregate:       nil,
 		EntityID:        entityID,
 		CurrentSequence: &seq,
@@ -73,7 +73,7 @@ func TestSerializeEventsWithContext(t *testing.T) {
 	events := []Event{mockEvent}
 
 	// Execute
-	serialized, err := SerializeEventsWithContext(events, ctx, metadata)
+	serialized, err := SerializeEventsWithCommandContext(events, cc, metadata)
 
 	// Verify
 	require.NoError(t, err)
@@ -85,11 +85,11 @@ func TestSerializeEventsWithContext(t *testing.T) {
 	assert.Equal(t, entityID, sEvent.EntityID)
 }
 
-func TestSerializeEventsWithContext_NilContext(t *testing.T) {
+func TestSerializeEventsWithCommandContext_NilContext(t *testing.T) {
 	events := []Event{MockEvent{}}
 	metadata := NewMetadata(context.Background(), nil)
 
-	_, err := SerializeEventsWithContext(events, nil, metadata)
+	_, err := SerializeEventsWithCommandContext(events, nil, metadata)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "context not found")
 }

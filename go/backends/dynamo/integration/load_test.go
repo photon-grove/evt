@@ -36,7 +36,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithEvents() {
 
 	result.Events = append(result.Events, updateResult.Events...)
 
-	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, result, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	// Load the entity again to retrieve events from memory

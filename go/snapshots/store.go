@@ -82,13 +82,13 @@ func (store *Store) LoadAggregate(
 	ctx context.Context,
 	aggregate evt.Aggregate,
 	entityID evt.EntityID,
-) (evt.Context, error) {
-	var eventContext evt.Context
+) (evt.CommandContext, error) {
+	var cc evt.CommandContext
 
 	// Look for a Snapshot first
 	snapshot, err := store.repo.GetSnapshot(ctx, entityID)
 	if err != nil {
-		return eventContext, err
+		return cc, err
 	}
 
 	var serializedEvents []evt.SerializedEvent
@@ -96,60 +96,60 @@ func (store *Store) LoadAggregate(
 	if snapshot != nil {
 		// If found, rehydrate the current state at the point the Snapshot captured it
 		if err = json.Unmarshal(snapshot.Payload, aggregate); err != nil {
-			return eventContext, err
+			return cc, err
 		}
 
-		eventContext = createContext(aggregate, entityID, &snapshot.EventSequence, &snapshot.Sequence)
+		cc = createCommandContext(aggregate, entityID, &snapshot.EventSequence, &snapshot.Sequence)
 
 		// Then get any additional Events after the Snapshot, based on the last Event sequence
 		events, ierr := store.repo.GetLatestEvents(ctx, entityID, snapshot.EventSequence)
 		if ierr != nil {
-			return eventContext, ierr
+			return cc, ierr
 		}
 
 		serializedEvents = events
 	} else {
 		// Otherwise, get /all/ Events for this Aggregate
-		eventContext = createInitialContext(aggregate, entityID)
+		cc = createInitialCommandContext(aggregate, entityID)
 
 		events, ierr := store.repo.GetEvents(ctx, entityID)
 		if ierr != nil {
-			return eventContext, ierr
+			return cc, ierr
 		}
 
 		serializedEvents = events
 	}
 
 	// Apply all events to the entity to build up the current state
-	if err = applyEventsToAggregate(serializedEvents, &eventContext); err != nil {
-		return eventContext, err
+	if err = applyEventsToAggregate(serializedEvents, &cc); err != nil {
+		return cc, err
 	}
 
 	eventsSinceSnapshot := len(serializedEvents)
-	if snapshot == nil && eventContext.CurrentSequence != nil {
-		eventsSinceSnapshot = int(*eventContext.CurrentSequence)
+	if snapshot == nil && cc.CurrentSequence != nil {
+		eventsSinceSnapshot = int(*cc.CurrentSequence)
 	}
 	if eventsSinceSnapshot < 0 {
 		eventsSinceSnapshot = 0
 	}
 
-	store.maybeCatchUpSnapshot(ctx, aggregate, entityID, &eventContext, eventsSinceSnapshot)
+	store.maybeCatchUpSnapshot(ctx, aggregate, entityID, &cc, eventsSinceSnapshot)
 
-	return eventContext, nil
+	return cc, nil
 }
 
 // Commit persists result events and snapshots the entity when needed. A previously replayed
 // CommandID returns DuplicateCommandError for idempotent success.
 //
-// eventContext.Aggregate must already reflect result.Events; otherwise a snapshot would be stale.
+// cc.Aggregate must already reflect result.Events; otherwise a snapshot would be stale.
 // Execute maintains this contract.
 func (store *Store) Commit(
 	ctx context.Context,
 	result evt.CommandResult,
-	eventContext evt.Context,
+	cc evt.CommandContext,
 	metadata evt.Metadata,
 ) ([]evt.SerializedEvent, error) {
-	return store.commitWithTransaction(ctx, result, nil, eventContext, metadata)
+	return store.commitWithTransaction(ctx, result, nil, cc, metadata)
 }
 
 // commitWithTransaction is Commit with the in-band projectors' transaction attached to the commit.
@@ -157,7 +157,7 @@ func (store *Store) commitWithTransaction(
 	ctx context.Context,
 	result evt.CommandResult,
 	transaction evt.Transaction,
-	eventContext evt.Context,
+	cc evt.CommandContext,
 	metadata evt.Metadata,
 ) ([]evt.SerializedEvent, error) {
 	// A store with outcomes records every command; a bare Commit has no command identity to digest.
@@ -166,24 +166,24 @@ func (store *Store) commitWithTransaction(
 	}
 
 	// Dedupe guard: reject duplicate CommandIDs (reads from event log, never projections)
-	if metadata.CommandID != nil && eventContext.HasCommandID(*metadata.CommandID) {
+	if metadata.CommandID != nil && cc.HasCommandID(*metadata.CommandID) {
 		return nil, evt.NewDuplicateCommandError(*metadata.CommandID)
 	}
 
-	entityType := eventContext.Aggregate.Type()
+	entityType := cc.Aggregate.Type()
 
 	// The engine stamps the commit ID once per commit: every event of this commit — and of every
 	// stream a multi-stream commit touches — carries the same value.
 	metadata = evt.CommitMetadata(metadata)
 
-	serializedEvents, err := evt.SerializeEventsWithContext(result.Events, &eventContext, metadata)
+	serializedEvents, err := evt.SerializeEventsWithCommandContext(result.Events, &cc, metadata)
 	if err != nil {
 		return nil, err
 	}
 
 	// Determine if a Snapshot is needed, and what sequence to capture it at
 	commitSnapshotToEvent := evt.CalculateAdditionalEvents(
-		*eventContext.CurrentSequence,
+		*cc.CurrentSequence,
 		len(result.Events),
 		store.effectiveSnapshotSize(entityType),
 	)
@@ -194,12 +194,12 @@ func (store *Store) commitWithTransaction(
 		// If not needed, execute a simple commit, with the commit-wide projectors' operations.
 		// A commit that writes no event runs no projector, so its state is never encoded.
 		if len(serializedEvents) > 0 {
-			state, serr := store.commitState(eventContext.Aggregate)
+			state, serr := store.commitState(cc.Aggregate)
 			if serr != nil {
 				return nil, serr
 			}
 
-			if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{eventContext.EntityID: state}); err != nil {
+			if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{cc.EntityID: state}); err != nil {
 				return nil, err
 			}
 		}
@@ -214,14 +214,14 @@ func (store *Store) commitWithTransaction(
 	// Otherwise, capture the Snapshot payload from the (already-applied) entity state
 	payload, err := store.updateSnapshotWithEvents(
 		serializedEvents,
-		&eventContext,
+		&cc,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	// The snapshot payload is the stream's state after the commit, the same bytes the projectors see.
-	if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{eventContext.EntityID: payload}); err != nil {
+	if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{cc.EntityID: payload}); err != nil {
 		return nil, err
 	}
 
@@ -230,9 +230,9 @@ func (store *Store) commitWithTransaction(
 		ctx,
 		serializedResult,
 		entityType,
-		eventContext.EntityID,
+		cc.EntityID,
 		payload,
-		*eventContext.CurrentSnapshot,
+		*cc.CurrentSnapshot,
 	); err != nil {
 		return nil, err
 	}
@@ -261,7 +261,7 @@ func (store *Store) Execute(
 		return store.executeForError(ctx, aggregate, entityID, command, metadata)
 	}
 
-	context, err := store.LoadAggregate(ctx, aggregate, entityID)
+	cc, err := store.LoadAggregate(ctx, aggregate, entityID)
 	if err != nil {
 		return err
 	}
@@ -275,7 +275,7 @@ func (store *Store) Execute(
 	}
 
 	// Early dedupe check before command handling (avoids side effects)
-	if metadata.CommandID != nil && context.HasCommandID(*metadata.CommandID) {
+	if metadata.CommandID != nil && cc.HasCommandID(*metadata.CommandID) {
 		return evt.NewDuplicateCommandError(*metadata.CommandID)
 	}
 
@@ -299,7 +299,7 @@ func (store *Store) Execute(
 		return err
 	}
 
-	if _, err = store.commitWithTransaction(ctx, result, projectorTransaction, context, metadata); err != nil {
+	if _, err = store.commitWithTransaction(ctx, result, projectorTransaction, cc, metadata); err != nil {
 		return err
 	}
 
@@ -310,18 +310,18 @@ func (store *Store) Execute(
 // The entity must already include the events; they are not reapplied to avoid corrupting additive state.
 func (store *Store) updateSnapshotWithEvents(
 	serializedEvents []evt.SerializedEvent,
-	eventContext *evt.Context,
+	cc *evt.CommandContext,
 ) ([]byte, error) {
 	// Advance the running event sequence to account for the committed batch.
-	if eventContext.CurrentSequence != nil {
-		*eventContext.CurrentSequence += evt.EventSequence(len(serializedEvents))
+	if cc.CurrentSequence != nil {
+		*cc.CurrentSequence += evt.EventSequence(len(serializedEvents))
 	}
 
 	// Update snapshot sequence
-	updateSnapshotSequence(eventContext)
+	updateSnapshotSequence(cc)
 
 	// Capture the entity's current (already-applied) state as the snapshot payload
-	return generateSnapshotPayload(eventContext.Aggregate)
+	return generateSnapshotPayload(cc.Aggregate)
 }
 
 func buildProjectorTransaction(
@@ -374,13 +374,13 @@ func (store *Store) maybeCatchUpSnapshot(
 	ctx context.Context,
 	aggregate evt.Aggregate,
 	entityID evt.EntityID,
-	eventContext *evt.Context,
+	cc *evt.CommandContext,
 	eventsSinceSnapshot int,
 ) {
 	if store.catchUpSnapshotThreshold <= 0 || eventsSinceSnapshot < store.catchUpSnapshotThreshold {
 		return
 	}
-	if aggregate == nil || eventContext == nil || eventContext.CurrentSequence == nil || eventContext.CurrentSnapshot == nil {
+	if aggregate == nil || cc == nil || cc.CurrentSequence == nil || cc.CurrentSnapshot == nil {
 		return
 	}
 
@@ -395,8 +395,8 @@ func (store *Store) maybeCatchUpSnapshot(
 		return
 	}
 
-	nextSnapshot := *eventContext.CurrentSnapshot + 1
-	err = writer.PutSnapshot(ctx, aggregate.Type(), entityID, payload, nextSnapshot, *eventContext.CurrentSequence)
+	nextSnapshot := *cc.CurrentSnapshot + 1
+	err = writer.PutSnapshot(ctx, aggregate.Type(), entityID, payload, nextSnapshot, *cc.CurrentSequence)
 	if err != nil {
 		logCatchUpError(ctx, aggregate.Type(), entityID, "write", err)
 		return

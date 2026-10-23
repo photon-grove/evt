@@ -128,20 +128,20 @@ func SerializeEvents(
 	return serializedEvents, nil
 }
 
-// SerializeEventsWithContext serializes Events with the Aggregate within the given Context.
-func SerializeEventsWithContext(events []Event, eventContext *Context, metadata Metadata) ([]SerializedEvent, error) {
-	if eventContext == nil {
+// SerializeEventsWithCommandContext serializes Events with the Aggregate within the given CommandContext.
+func SerializeEventsWithCommandContext(events []Event, cc *CommandContext, metadata Metadata) ([]SerializedEvent, error) {
+	if cc == nil {
 		return nil, fmt.Errorf("context not found")
 	}
 
 	// Initialize the sequence with the last one from the context, but dereference
 	// it so that the sequence in the context is not iterated, just this inner value.
-	sequence := *eventContext.CurrentSequence
+	sequence := *cc.CurrentSequence
 
 	return SerializeEvents(
 		events,
 		sequence,
-		eventContext.EntityID,
+		cc.EntityID,
 		metadata,
 	)
 }
@@ -149,7 +149,7 @@ func SerializeEventsWithContext(events []Event, eventContext *Context, metadata 
 // SerializeResult creates a SerializedResult from events using the given context and entity.
 // This is a convenience function for testing and integration scenarios.
 func SerializeResult(
-	eventContext Context,
+	cc CommandContext,
 	aggregate Aggregate,
 	events []Event,
 	transaction Transaction,
@@ -158,13 +158,13 @@ func SerializeResult(
 	if aggregate != nil {
 		entityID = aggregate.GetID()
 	}
-	if eventContext.EntityID != "" {
-		entityID = eventContext.EntityID
+	if cc.EntityID != "" {
+		entityID = cc.EntityID
 	}
 
 	sequence := EventSequence(0)
-	if eventContext.CurrentSequence != nil {
-		sequence = *eventContext.CurrentSequence
+	if cc.CurrentSequence != nil {
+		sequence = *cc.CurrentSequence
 	}
 
 	serializedEvents, err := SerializeEvents(events, sequence, entityID, Metadata{})
@@ -178,7 +178,7 @@ func SerializeResult(
 	}, nil
 }
 
-// DeserializeEvent decodes Events with the Aggregate within the given Context, applying upcasters.
+// DeserializeEvent decodes Events with the Aggregate within the given CommandContext, applying upcasters.
 func DeserializeEvent(serializedEvent SerializedEvent, aggregate Aggregate) (Event, error) {
 	event := serializedEvent
 

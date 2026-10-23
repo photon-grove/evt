@@ -388,7 +388,7 @@ func (store *Store) attemptOutcome(
 		return executed{outcome: replayed}, nil
 	}
 
-	eventContext, err := store.LoadAggregate(ctx, aggregate, entityID)
+	cc, err := store.LoadAggregate(ctx, aggregate, entityID)
 	if err != nil {
 		return executed{}, load(err)
 	}
@@ -400,13 +400,13 @@ func (store *Store) attemptOutcome(
 
 	// The event window is superseded by the outcome row, but pre-v0.9 commands have no row: an
 	// event that carries this command ID without an outcome is one of those.
-	if eventContext.HasCommandID(cmd.id) {
+	if cc.HasCommandID(cmd.id) {
 		return executed{}, internal(evt.NewDuplicateCommandError(cmd.id))
 	}
 
 	result, err := aggregate.Handle(ctx, command)
 	if err != nil {
-		return store.handlerFailed(ctx, cmd, aggregate, &eventContext, entityID, result, err)
+		return store.handlerFailed(ctx, cmd, aggregate, &cc, entityID, result, err)
 	}
 
 	if len(result.Events) == 0 {
@@ -422,7 +422,7 @@ func (store *Store) attemptOutcome(
 		return executed{outcome: outcome}, cerr
 	}
 
-	staged, err := store.prepareEvents(ctx, cmd, aggregate, &eventContext, entityID, result)
+	staged, err := store.prepareEvents(ctx, cmd, aggregate, &cc, entityID, result)
 	if err != nil {
 		return executed{}, err
 	}
@@ -440,7 +440,7 @@ func (store *Store) prepareEvents(
 	ctx context.Context,
 	cmd *command,
 	aggregate evt.Aggregate,
-	eventContext *evt.Context,
+	cc *evt.CommandContext,
 	entityID evt.EntityID,
 	result evt.CommandResult,
 ) (evt.SerializedResult, error) {
@@ -455,7 +455,7 @@ func (store *Store) prepareEvents(
 		return evt.SerializedResult{}, internal(err)
 	}
 
-	serialized, snapshots, err := store.stage(aggregate, eventContext, entityID, result.Events, evt.CommitMetadata(cmd.metadata))
+	serialized, snapshots, err := store.stage(aggregate, cc, entityID, result.Events, evt.CommitMetadata(cmd.metadata))
 	if err != nil {
 		return evt.SerializedResult{}, internal(err)
 	}
@@ -488,7 +488,7 @@ func (store *Store) handlerFailed(
 	ctx context.Context,
 	cmd *command,
 	aggregate evt.Aggregate,
-	eventContext *evt.Context,
+	cc *evt.CommandContext,
 	entityID evt.EntityID,
 	result evt.CommandResult,
 	handlerErr error,
@@ -511,7 +511,7 @@ func (store *Store) handlerFailed(
 	if evt.RejectsWithEvents(handlerErr) && len(result.Events) > 0 {
 		var err error
 
-		if staged, err = store.prepareEvents(ctx, cmd, aggregate, eventContext, entityID, result); err != nil {
+		if staged, err = store.prepareEvents(ctx, cmd, aggregate, cc, entityID, result); err != nil {
 			return executed{}, err
 		}
 	}
@@ -532,23 +532,23 @@ func (store *Store) handlerFailed(
 // already include the events.
 func (store *Store) stage(
 	aggregate evt.Aggregate,
-	eventContext *evt.Context,
+	cc *evt.CommandContext,
 	entityID evt.EntityID,
 	events []evt.Event,
 	metadata evt.Metadata,
 ) ([]evt.SerializedEvent, []evt.SerializedSnapshot, error) {
-	serialized, err := evt.SerializeEventsWithContext(events, eventContext, metadata)
+	serialized, err := evt.SerializeEventsWithCommandContext(events, cc, metadata)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if evt.CalculateAdditionalEvents(
-		*eventContext.CurrentSequence, len(events), store.effectiveSnapshotSize(aggregate.Type()),
+		*cc.CurrentSequence, len(events), store.effectiveSnapshotSize(aggregate.Type()),
 	) == 0 {
 		return serialized, nil, nil
 	}
 
-	payload, err := store.updateSnapshotWithEvents(serialized, eventContext)
+	payload, err := store.updateSnapshotWithEvents(serialized, cc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -556,7 +556,7 @@ func (store *Store) stage(
 	return serialized, []evt.SerializedSnapshot{{
 		EntityType:    aggregate.Type(),
 		EntityID:      entityID,
-		Sequence:      *eventContext.CurrentSnapshot,
+		Sequence:      *cc.CurrentSnapshot,
 		EventSequence: serialized[len(serialized)-1].Sequence,
 		Payload:       payload,
 	}}, nil

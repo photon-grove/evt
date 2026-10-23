@@ -7,9 +7,9 @@ import (
 	"github.com/photon-grove/evt/go/policy"
 )
 
-// createContext returns a new event context with the given entity and sequences.
-func createContext(aggregate evt.Aggregate, entityID evt.EntityID, currentSequence, currentSnapshot *evt.EventSequence) evt.Context {
-	return evt.Context{
+// createCommandContext returns a new CommandContext with the given entity and sequences.
+func createCommandContext(aggregate evt.Aggregate, entityID evt.EntityID, currentSequence, currentSnapshot *evt.EventSequence) evt.CommandContext {
+	return evt.CommandContext{
 		Aggregate:       aggregate,
 		EntityID:        entityID,
 		CurrentSequence: currentSequence,
@@ -17,12 +17,12 @@ func createContext(aggregate evt.Aggregate, entityID evt.EntityID, currentSequen
 	}
 }
 
-// createInitialContext returns an event context with zero sequences for new entities.
-func createInitialContext(aggregate evt.Aggregate, entityID evt.EntityID) evt.Context {
+// createInitialCommandContext returns a CommandContext with zero sequences for new entities.
+func createInitialCommandContext(aggregate evt.Aggregate, entityID evt.EntityID) evt.CommandContext {
 	currentSequence := evt.EventSequence(0)
 	currentSnapshot := evt.EventSequence(0)
 
-	return createContext(aggregate, entityID, &currentSequence, &currentSnapshot)
+	return createCommandContext(aggregate, entityID, &currentSequence, &currentSnapshot)
 }
 
 // applyEventsToAggregate applies events to an entity and updates the current sequence.
@@ -33,35 +33,35 @@ func createInitialContext(aggregate evt.Aggregate, entityID evt.EntityID) evt.Co
 // or events expired. Applying events across it would build the wrong state, so it returns a
 // conflict classified as transient: a caller that retries the command reloads a fresh entity, and
 // evt.IsConflictErr still matches it.
-func applyEventsToAggregate(serializedEvents []evt.SerializedEvent, eventContext *evt.Context) error {
+func applyEventsToAggregate(serializedEvents []evt.SerializedEvent, cc *evt.CommandContext) error {
 	for _, serializedEvent := range serializedEvents {
 		var current evt.EventSequence
-		if eventContext.CurrentSequence != nil {
-			current = *eventContext.CurrentSequence
+		if cc.CurrentSequence != nil {
+			current = *cc.CurrentSequence
 		}
 		if serializedEvent.Sequence != current+1 {
 			return &policy.ClassifiedError{Class: policy.ClassTransient, Err: &evt.SequenceGapError{
-				EntityID: eventContext.EntityID,
+				EntityID: cc.EntityID,
 				After:    current,
 				Found:    serializedEvent.Sequence,
 			}}
 		}
 
-		event, err := evt.DeserializeEvent(serializedEvent, eventContext.Aggregate)
+		event, err := evt.DeserializeEvent(serializedEvent, cc.Aggregate)
 		if err != nil {
 			return err
 		}
 
 		seq := serializedEvent.Sequence
-		eventContext.CurrentSequence = &seq
+		cc.CurrentSequence = &seq
 
 		// Track CommandIDs for the dedupe guard
 		if serializedEvent.Metadata.CommandID != nil {
-			eventContext.RecordCommandID(*serializedEvent.Metadata.CommandID)
+			cc.RecordCommandID(*serializedEvent.Metadata.CommandID)
 		}
 
 		// Apply each Event to the Aggregate, to build up the current state
-		if err = eventContext.Aggregate.Apply(event); err != nil {
+		if err = cc.Aggregate.Apply(event); err != nil {
 			return err
 		}
 	}
@@ -70,12 +70,12 @@ func applyEventsToAggregate(serializedEvents []evt.SerializedEvent, eventContext
 }
 
 // updateSnapshotSequence sets or increments the snapshot sequence in the context.
-func updateSnapshotSequence(eventContext *evt.Context) {
-	if eventContext.CurrentSnapshot == nil {
+func updateSnapshotSequence(cc *evt.CommandContext) {
+	if cc.CurrentSnapshot == nil {
 		one := evt.EventSequence(1)
-		eventContext.CurrentSnapshot = &one
+		cc.CurrentSnapshot = &one
 	} else {
-		*eventContext.CurrentSnapshot++
+		*cc.CurrentSnapshot++
 	}
 }
 

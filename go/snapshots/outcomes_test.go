@@ -86,10 +86,10 @@ func TestOutcomes_BareCommitIsRefusedOnAnOutcomeStore(t *testing.T) {
 	ctx := context.Background()
 	aggregate := etest.NewAggregate("e-1")
 
-	eventContext, err := store.LoadAggregate(ctx, aggregate, "e-1")
+	cc, err := store.LoadAggregate(ctx, aggregate, "e-1")
 	require.NoError(t, err)
 
-	_, err = store.Commit(ctx, evt.CommandResult{Events: []evt.Event{&etest.AggregateCreated{ID: "e-1", Value: "v"}}}, eventContext, commandMetadata("cmd-1"))
+	_, err = store.Commit(ctx, evt.CommandResult{Events: []evt.Event{&etest.AggregateCreated{ID: "e-1", Value: "v"}}}, cc, commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrInvalidArgument, "a bare commit has no command identity to digest")
 
 	tx := store.Transaction()

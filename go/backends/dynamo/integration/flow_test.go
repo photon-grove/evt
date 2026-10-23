@@ -69,12 +69,12 @@ func (s *DynamoEventsIntegrationSuite) Test_Flow_Snapshotting() {
 
 	// Load from scratch - should use snapshot + 1 event
 	loaded := test.NewAggregate(entityID)
-	context, err := s.store.LoadAggregate(ctx, loaded, entityID)
+	cc, err := s.store.LoadAggregate(ctx, loaded, entityID)
 	require.NoError(s.T(), err)
 
 	assert.Equal(s.T(), "after1", loaded.Value)
-	assert.Equal(s.T(), evt.EventSequence(3), *context.CurrentSequence)
-	assert.Equal(s.T(), evt.EventSequence(1), *context.CurrentSnapshot)
+	assert.Equal(s.T(), evt.EventSequence(3), *cc.CurrentSequence)
+	assert.Equal(s.T(), evt.EventSequence(1), *cc.CurrentSnapshot)
 	// Note: CurrentSnapshot tracks snapshot SEQUENCE (1st snapshot), not event sequence.
 }
 
@@ -90,23 +90,23 @@ func (s *DynamoEventsIntegrationSuite) Test_Flow_ConcurrentConflict() {
 
 	// Load two separate instances (simulating two threads/processes)
 	aggregateA := test.NewAggregate(entityID)
-	ctxA, err := s.store.LoadAggregate(ctx, aggregateA, entityID)
+	ccA, err := s.store.LoadAggregate(ctx, aggregateA, entityID)
 	require.NoError(s.T(), err)
 
 	aggregateB := test.NewAggregate(entityID)
-	ctxB, err := s.store.LoadAggregate(ctx, aggregateB, entityID)
+	ccB, err := s.store.LoadAggregate(ctx, aggregateB, entityID)
 	require.NoError(s.T(), err)
 
 	// A modifies
 	resA, err := aggregateA.Handle(ctx, &test.ReplaceAggregate{Value: "A"})
 	require.NoError(s.T(), err)
-	_, err = s.store.Commit(ctx, resA, ctxA, metadata)
+	_, err = s.store.Commit(ctx, resA, ccA, metadata)
 	require.NoError(s.T(), err)
 
 	// B modifies (using STALE context)
 	resB, err := aggregateB.Handle(ctx, &test.ReplaceAggregate{Value: "B"})
 	require.NoError(s.T(), err)
-	_, err = s.store.Commit(ctx, resB, ctxB, metadata)
+	_, err = s.store.Commit(ctx, resB, ccB, metadata)
 
 	// Should fail
 	require.Error(s.T(), err)

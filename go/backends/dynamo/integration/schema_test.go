@@ -23,7 +23,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Schema_EventItemStructure() {
 	// Create and commit an event
 	result, err := s.aggregate.Handle(ctx, &test.CreateAggregate{Value: "test-value"})
 	require.NoError(s.T(), err)
-	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, result, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	// Fetch directly from DynamoDB to verify schema
@@ -152,11 +152,11 @@ func (s *DynamoEventsIntegrationSuite) Test_Schema_OptimisticLocking() {
 	// Commit event 1
 	res1, err := s.aggregate.Handle(ctx, &test.CreateAggregate{Value: "val1"})
 	require.NoError(s.T(), err)
-	_, err = s.store.Commit(ctx, res1, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, res1, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	// Try to commit event 1 AGAIN (duplicate sequence)
-	_, err = s.store.Commit(ctx, res1, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, res1, s.cc, metadata)
 	require.Error(s.T(), err)
 
 	// Verify it is a race condition error (wrapper around ConditionalCheckFailedException)

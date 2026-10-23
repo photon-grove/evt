@@ -16,10 +16,10 @@ func NewTestAggregate(id string) *Aggregate {
 	return NewAggregate(evt.EntityID(id))
 }
 
-// NewTestEventContext creates a new test event context with default values
-func NewTestEventContext() evt.Context {
+// NewTestCommandContext creates a new test CommandContext with default values
+func NewTestCommandContext() evt.CommandContext {
 	seq := evt.EventSequence(0)
-	return evt.Context{
+	return evt.CommandContext{
 		Aggregate:       nil,
 		EntityID:        "",
 		CurrentSequence: &seq,

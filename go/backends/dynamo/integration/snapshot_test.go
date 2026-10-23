@@ -56,7 +56,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	result.Events = append(result.Events, updateOtherResult.Events...)
 
 	s.applyEvents(result.Events)
-	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, result, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	// Retrieve the initial snapshot
@@ -98,7 +98,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	newResult.Events = append(newResult.Events, newOtherResult.Events...)
 
 	s.applyEvents(newResult.Events)
-	_, err = s.store.Commit(ctx, newResult, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, newResult, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	// Retrieve the updated snapshot
@@ -132,7 +132,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	// Convert the serialized committed events to domain events
 	committedEvents := make([]evt.Event, 0, len(committedSerializedEvents))
 	for _, serializedEvent := range committedSerializedEvents {
-		event, err := evt.DeserializeEvent(serializedEvent, s.eventContext.Aggregate)
+		event, err := evt.DeserializeEvent(serializedEvent, s.cc.Aggregate)
 		require.NoError(s.T(), err)
 
 		committedEvents = append(committedEvents, event)
@@ -178,7 +178,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	result.Events = append(result.Events, updateOtherResult.Events...)
 
 	s.applyEvents(result.Events)
-	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, result, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	// Set "other" to the final expected value
@@ -190,7 +190,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 
 	// This sequence of events should leave 1 trailing event after the last snapshot
 	s.applyEvents(newResult.Events)
-	_, err = s.store.Commit(ctx, newResult, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, newResult, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	// Load the entity again to retrieve events from memory

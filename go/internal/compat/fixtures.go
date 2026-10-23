@@ -300,7 +300,7 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 	}
 
 	aggregate := NewAccount(entityID)
-	eventContext, err := runner.Store.LoadAggregate(ctx, aggregate, entityID)
+	cc, err := runner.Store.LoadAggregate(ctx, aggregate, entityID)
 	if err != nil && !errors.Is(err, evt.ErrSequenceGap) {
 		return expectation, err
 	}
@@ -317,8 +317,8 @@ func Observe(ctx context.Context, runner Runner, name string, entityID evt.Entit
 	}
 
 	expectation.State = string(state)
-	expectation.Sequence = int64(*eventContext.CurrentSequence)
-	expectation.SnapshotSequence = int64(*eventContext.CurrentSnapshot)
+	expectation.Sequence = int64(*cc.CurrentSequence)
+	expectation.SnapshotSequence = int64(*cc.CurrentSnapshot)
 
 	return expectation, nil
 }

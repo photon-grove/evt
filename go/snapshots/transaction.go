@@ -49,7 +49,7 @@ type Transaction struct {
 // transactionStream is one read aggregate and the events appended to it since the read.
 type transactionStream struct {
 	aggregate evt.Aggregate
-	context   evt.Context
+	cc        evt.CommandContext
 	pending   []evt.Event
 }
 
@@ -81,7 +81,7 @@ func (tx *Transaction) Read(ctx context.Context, aggregate evt.Aggregate, entity
 		return fmt.Errorf("snapshots: duplicate read of %s", entityID)
 	}
 
-	context, err := tx.store.LoadAggregate(ctx, aggregate, entityID)
+	cc, err := tx.store.LoadAggregate(ctx, aggregate, entityID)
 	if err != nil {
 		tx.used = true
 		tx.readErr = err
@@ -95,7 +95,7 @@ func (tx *Transaction) Read(ctx context.Context, aggregate evt.Aggregate, entity
 		setter.SetID(entityID)
 	}
 
-	tx.streams[entityID] = &transactionStream{aggregate: aggregate, context: context}
+	tx.streams[entityID] = &transactionStream{aggregate: aggregate, cc: cc}
 	tx.order = append(tx.order, entityID)
 
 	return nil
@@ -317,7 +317,7 @@ func (tx *Transaction) checkLegacyDuplicate() error {
 	id := tx.command.id
 
 	for _, entityID := range tx.order {
-		if tx.streams[entityID].context.HasCommandID(id) {
+		if tx.streams[entityID].cc.HasCommandID(id) {
 			return evt.NewDuplicateCommandError(id)
 		}
 	}
@@ -352,7 +352,7 @@ func (tx *Transaction) fencedReads() evt.SerializedResult {
 		result.Fences = append(result.Fences, evt.ReadFence{
 			EntityID:   entityID,
 			EntityType: stream.aggregate.Type(),
-			Head:       streamHead(stream.context),
+			Head:       streamHead(stream.cc),
 		})
 	}
 
@@ -376,7 +376,7 @@ func (tx *Transaction) prepare(ctx context.Context, metadata evt.Metadata) (evt.
 	for _, entityID := range tx.order {
 		stream := tx.streams[entityID]
 
-		if metadata.CommandID != nil && stream.context.HasCommandID(*metadata.CommandID) {
+		if metadata.CommandID != nil && stream.cc.HasCommandID(*metadata.CommandID) {
 			return evt.SerializedResult{}, evt.NewDuplicateCommandError(*metadata.CommandID)
 		}
 
@@ -386,13 +386,13 @@ func (tx *Transaction) prepare(ctx context.Context, metadata evt.Metadata) (evt.
 			result.Fences = append(result.Fences, evt.ReadFence{
 				EntityID:   entityID,
 				EntityType: stream.aggregate.Type(),
-				Head:       streamHead(stream.context),
+				Head:       streamHead(stream.cc),
 			})
 
 			continue
 		}
 
-		serialized, snapshots, err := tx.store.stage(stream.aggregate, &stream.context, entityID, stream.pending, metadata)
+		serialized, snapshots, err := tx.store.stage(stream.aggregate, &stream.cc, entityID, stream.pending, metadata)
 		if err != nil {
 			return evt.SerializedResult{}, err
 		}
@@ -430,10 +430,10 @@ func (tx *Transaction) prepare(ctx context.Context, metadata evt.Metadata) (evt.
 // sequence. LoadAggregate seeds it from the snapshot's event sequence and advances it over later
 // events, so it is already the larger of the stream's highest event sequence and its snapshot's
 // event sequence — including a compacted stream, whose events a snapshot covers.
-func streamHead(context evt.Context) evt.EventSequence {
-	if context.CurrentSequence == nil {
+func streamHead(cc evt.CommandContext) evt.EventSequence {
+	if cc.CurrentSequence == nil {
 		return 0
 	}
 
-	return *context.CurrentSequence
+	return *cc.CurrentSequence
 }

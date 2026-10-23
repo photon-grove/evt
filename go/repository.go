@@ -35,13 +35,13 @@ type Store interface {
 		ctx context.Context,
 		aggregate Aggregate,
 		entityID EntityID,
-	) (Context, error)
+	) (CommandContext, error)
 
 	// Commit new Events to the Aggregate within the given context, with optional Metadata.
 	Commit(
 		ctx context.Context,
 		result CommandResult,
-		context Context,
+		cc CommandContext,
 		metadata Metadata,
 	) ([]SerializedEvent, error)
 
