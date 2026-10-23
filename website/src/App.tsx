@@ -172,7 +172,7 @@ function Home() {
           <p className="eyebrow">Package reference</p>
           <h2>Import only what the service uses.</h2>
           <p className="section-sub">
-            Every package lives under <code>github.com/photon-grove/evt</code>.
+            Every package lives under <code>github.com/photon-grove/evt/go</code>.
           </p>
         </div>
         <ul className="package-list">

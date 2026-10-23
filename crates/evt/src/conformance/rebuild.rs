@@ -1,6 +1,6 @@
 //! The rebuild-fence cases (v0.9, C10): the lock and generation lifecycle, the commit-time lock
 //! check and its precedence, the reader epoch check, guarded view writes, and fence-aware retry
-//! around a rebuild. The Rust counterpart of Go's `conformance/rebuild.go`.
+//! around a rebuild. The Rust counterpart of Go's `go/conformance/rebuild.go`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;

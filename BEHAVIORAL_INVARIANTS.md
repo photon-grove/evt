@@ -1005,7 +1005,7 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 ## Backend Storage Contract
 
 The `evt.Repository` interface is backend-neutral: it carries no DynamoDB (or other vendor) types,
-so the same contract is satisfied by the in-memory backend, DynamoDB, and PostgreSQL (`evt/postgres`).
+so the same contract is satisfied by the in-memory backend, DynamoDB, and PostgreSQL (`evt/go/backends/postgres`).
 Any backend that implements `evt.Repository` MUST uphold the following invariants. They are
 exercised by the backend-neutral suite in `conformance` (`conformance.RunRepositorySuite`); each
 backend wires that suite and declares the optional guarantees it provides via `conformance.SuiteOptions`.
@@ -1061,7 +1061,7 @@ services can append to and load the same streams in DynamoDB or PostgreSQL. See
 - **One format, two implementations.** DynamoDB items, PostgreSQL rows, serialized event, snapshot,
   and metadata JSON, SNS envelopes and message attributes, conditional-write expressions, and the
   snapshot policy are identical in both languages, byte for byte except for the differences below.
-- **Fixtures enforce the contract.** `go test ./internal/compat -run TestFixtures -update` regenerates
+- **Fixtures enforce the contract.** `go -C go test ./internal/compat -run TestFixtures -update` regenerates
   `compat/fixtures/` from the Go implementation. `go test ./...` and `cargo test --workspace` both
   fail when either language drifts from them.
 - **Format changes regenerate fixtures and pass in both languages**, including the live

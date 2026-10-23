@@ -1,4 +1,4 @@
-//! The shared account domain. It mirrors `internal/compat/account.go` field for field and rule
+//! The shared account domain. It mirrors `go/internal/compat/account.go` field for field and rule
 //! for rule, so both languages write identical payloads and snapshots.
 
 use std::collections::BTreeMap;

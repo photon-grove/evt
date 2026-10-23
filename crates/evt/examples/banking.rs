@@ -1,4 +1,4 @@
-//! A runnable banking example: the Rust port of Go's `examples/banking`, extended to show the
+//! A runnable banking example: the Rust port of Go's `go/examples/banking`, extended to show the
 //! multi-stream reshape surface.
 //!
 //! - `domain_events!` declares each aggregate's events.

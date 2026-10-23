@@ -2,12 +2,12 @@
 
 This guide builds a replayable aggregate, tests it with in-memory storage, and
 then switches it to DynamoDB. The complete runnable example lives in
-[`examples/banking`](https://github.com/photon-grove/evt/tree/main/examples/banking).
+[`go/examples/banking`](https://github.com/photon-grove/evt/tree/main/go/examples/banking).
 
 ## Install
 
 ```sh
-go get github.com/photon-grove/evt
+go get github.com/photon-grove/evt/go
 ```
 
 The core `evt` and `mem` packages have no cloud dependencies, so unit tests stay

@@ -55,7 +55,7 @@ Rust-first is justified because:
   arrives mid-incident. The alternative (hand-rolling journal writes inside a Go app) is exactly
   the failure mode this program exists to eliminate.
 - **Go tooling vs extension tables.** Go-side tooling that walks the event log — `evt-doctor`
-  ([`cmd/evt-doctor`](../../cmd/evt-doctor)), enumeration, heads, rebuild — does not understand
+  ([`go/cmd/evt-doctor`](../../go/cmd/evt-doctor)), enumeration, heads, rebuild — does not understand
   journal rows, manifests, or lease rows. Run against an extension-using table, it can misreport
   or, worse, act on rows it does not model.
 - **Split fixture authority.** Today Go generates every golden fixture
@@ -102,7 +102,7 @@ Rust-first is justified because:
   Go column in [`docs/parity/feature-matrix.md`](../parity/feature-matrix.md). Until the port
   lands, the matrix records the extension as Rust ⏳ / Go —; once it ships, it moves to
   Rust ✅ / Go ⏸ deferred.
-- **Fixtures gain a second generator.** `internal/compat` (Go) keeps generating core fixtures;
+- **Fixtures gain a second generator.** `go/internal/compat` (Go) keeps generating core fixtures;
   the Rust side gains a generator for extension fixtures. Both live in `compat/fixtures/` and the
   `compat/README.md` table is updated to say which side writes which file.
 - **The `journal` cargo feature is build-wide.** It makes the build model `journal` at format

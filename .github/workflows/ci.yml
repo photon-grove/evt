@@ -55,11 +55,12 @@ jobs:
                 rust=true compat=true ;;
               .moon/* | package.json | pnpm-lock.yaml | pnpm-workspace.yaml)
                 go=true rust=true ;;
-              compat/* | internal/compat/* | scripts/compat-integration.sh)
+              compat/* | go/internal/compat/* | scripts/compat-integration.sh)
                 go=true rust=true compat=true ;;
-              serialization.go | metadata.go | compaction.go | types.go | repository.go | transactions.go | \
-                dynamo/* | postgres/* | stream/* | projectors/* | snapshots/* | policy/* | \
-                go.mod | go.sum | infra/*)
+              go/serialization.go | go/metadata.go | go/compaction.go | go/types.go | \
+                go/repository.go | go/transactions.go | \
+                go/backends/* | go/stream/* | go/projectors/* | go/snapshots/* | go/policy/* | \
+                go/go.mod | go/go.sum | infra/*)
                 go=true compat=true ;;
               *)
                 go=true ;;
@@ -81,7 +82,8 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
 
       - uses: pnpm/action-setup@v6
         with:
@@ -112,6 +114,7 @@ jobs:
           install-only: true
 
       - name: Go checks
+        working-directory: go
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
@@ -174,7 +177,8 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
 
       - uses: pnpm/action-setup@v6
         with:
@@ -262,7 +266,8 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
 
       - uses: pnpm/action-setup@v6
         with:
