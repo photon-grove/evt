@@ -1,0 +1,296 @@
+package dynamo
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	evt "github.com/photon-grove/evt/go"
+	"github.com/photon-grove/evt/go/policy"
+	"github.com/stretchr/testify/require"
+)
+
+// mockTransGroup implements TransactionGroup for testing handleConditionalCheckFailure
+type mockTransGroup struct {
+	length   int
+	errToRet error
+}
+
+func (g *mockTransGroup) ToWriteItems() []types.TransactWriteItem                  { return nil }
+func (g *mockTransGroup) MergeDynamo(TransactionGroup) (TransactionGroup, error)   { return nil, nil }
+func (g *mockTransGroup) TransactionType() evt.TransactionType                     { return "Mock" }
+func (g *mockTransGroup) StorageType() evt.StorageType                             { return StorageType }
+func (g *mockTransGroup) Len() int                                                 { return g.length }
+func (g *mockTransGroup) HandleError(_ error, _ int) error                         { return g.errToRet }
+func (g *mockTransGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) { return nil, nil }
+
+func Test_handleConditionalCheckFailure_NoConditionalCheck(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	// Regular error without conditional check failure
+	originalErr := errors.New("some error")
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 0, originalErr)
+	require.Equal(t, originalErr, result)
+}
+
+func Test_handleConditionalCheckFailure_RaceCondition(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	// Conditional check failure outside transaction items range
+	conditionalErr := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory feature-marker check
+			{Code: aws.String("ConditionalCheckFailed")},
+		},
+	}
+
+	// After the marker, empty transactItems means the failure is for events
+	// but we have no transaction groups, so it's a race condition
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 1, conditionalErr)
+	require.ErrorIs(t, result, ErrSnapshotRaceCondition)
+
+	var classified *policy.ClassifiedError
+	require.ErrorAs(t, result, &classified)
+	require.Equal(t, policy.ClassTransient, classified.Class)
+}
+
+func Test_handleConditionalCheckFailure_ClassifiesTransientTransactionConflict(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	transactionErr := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("TransactionConflict")},
+		},
+	}
+
+	result := repo.handleConditionalCheckFailure(ctx, nil, nil, 0, transactionErr)
+	require.ErrorIs(t, result, transactionErr)
+
+	var classified *policy.ClassifiedError
+	require.ErrorAs(t, result, &classified)
+	require.Equal(t, policy.ClassTransient, classified.Class)
+}
+
+func Test_handleConditionalCheckFailure_TransactionGroupHandlesError(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	expectedErr := errors.New("handled by group")
+	mockGroup := &mockTransGroup{length: 2, errToRet: expectedErr}
+
+	transaction := evt.Transaction{mockGroup}
+
+	// Two transaction items for the mock group
+	transactItems := []types.TransactWriteItem{
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+	}
+
+	conditionalErr := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory feature-marker check
+			{Code: aws.String("ConditionalCheckFailed")},
+		},
+	}
+
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 1, conditionalErr)
+	require.Equal(t, expectedErr, result)
+}
+
+func Test_handleConditionalCheckFailure_MultipleGroups(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	expectedErr := errors.New("second group error")
+	group1 := &mockTransGroup{length: 2, errToRet: errors.New("first group")}
+	group2 := &mockTransGroup{length: 3, errToRet: expectedErr}
+
+	transaction := evt.Transaction{group1, group2}
+
+	// 5 total transaction items
+	transactItems := []types.TransactWriteItem{
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+	}
+
+	// Failure at group-item index 3 (wire index 4 after the marker) is in group2.
+	conditionalErr := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory feature-marker check
+			{Code: aws.String("None")},
+			{Code: aws.String("None")},
+			{Code: aws.String("None")},
+			{Code: aws.String("ConditionalCheckFailed")},
+		},
+	}
+
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 1, conditionalErr)
+	require.Equal(t, expectedErr, result)
+}
+
+func Test_handleConditionalCheckFailure_FailureBeyondTransactionGroups(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	mockGroup := &mockTransGroup{length: 1, errToRet: errors.New("group error")}
+	transaction := evt.Transaction{mockGroup}
+
+	// More transact items than the group handles
+	transactItems := []types.TransactWriteItem{
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+	}
+
+	// Failure at group-item index 2 (wire index 3) is beyond the transaction group (length 1).
+	conditionalErr := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")}, // mandatory feature-marker check
+			{Code: aws.String("None")},
+			{Code: aws.String("None")},
+			{Code: aws.String("ConditionalCheckFailed")},
+		},
+	}
+
+	result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 1, conditionalErr)
+	require.ErrorIs(t, result, conditionalErr)
+
+	var classified *policy.ClassifiedError
+	require.ErrorAs(t, result, &classified)
+	require.Equal(t, policy.ClassTransient, classified.Class)
+}
+
+func Test_handleConditionalCheckFailure_IndexCalculation(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	// Test that the index is correctly calculated relative to the group
+	group1Err := errors.New("group 1 error")
+	group2Err := errors.New("group 2 error")
+
+	group1 := &mockTransGroup{length: 3, errToRet: group1Err}
+	group2 := &mockTransGroup{length: 2, errToRet: group2Err}
+
+	transaction := evt.Transaction{group1, group2}
+
+	transactItems := []types.TransactWriteItem{
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+		{Put: &types.Put{}},
+	}
+
+	testCases := []struct {
+		name         string
+		failureIndex int
+		expectedErr  error
+	}{
+		{"Index 0 in group1", 0, group1Err},
+		{"Index 1 in group1", 1, group1Err},
+		{"Index 2 in group1", 2, group1Err},
+		{"Index 3 in group2", 3, group2Err},
+		{"Index 4 in group2", 4, group2Err},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reasons := make([]types.CancellationReason, tc.failureIndex+2)
+			for i := range reasons {
+				reasons[i] = types.CancellationReason{Code: aws.String("None")}
+			}
+			reasons[tc.failureIndex+1] = types.CancellationReason{Code: aws.String("ConditionalCheckFailed")}
+
+			conditionalErr := &types.TransactionCanceledException{
+				CancellationReasons: reasons,
+			}
+
+			result := repo.handleConditionalCheckFailure(ctx, transaction, transactItems, 1, conditionalErr)
+			require.Equal(t, tc.expectedErr, result)
+		})
+	}
+}
+
+func Test_HasConditionalCheckFailure(t *testing.T) {
+	t.Run("non-transaction error", func(t *testing.T) {
+		found, idx := HasConditionalCheckFailure(errors.New("boom"))
+		require.False(t, found)
+		require.Equal(t, 0, idx)
+	})
+
+	t.Run("finds the failing item", func(t *testing.T) {
+		err := &types.TransactionCanceledException{
+			CancellationReasons: []types.CancellationReason{
+				{Code: aws.String("None")},
+				{Code: aws.String("ConditionalCheckFailed")},
+			},
+		}
+		found, idx := HasConditionalCheckFailure(err)
+		require.True(t, found)
+		require.Equal(t, 1, idx)
+	})
+
+	t.Run("tolerates nil reason codes", func(t *testing.T) {
+		// DynamoDB returns one CancellationReason per item; items that were not
+		// the cause have a nil Code. The scan must not panic on those.
+		err := &types.TransactionCanceledException{
+			CancellationReasons: []types.CancellationReason{
+				{Code: nil},
+				{Code: nil},
+				{Code: aws.String("ConditionalCheckFailed")},
+			},
+		}
+		found, idx := HasConditionalCheckFailure(err)
+		require.True(t, found)
+		require.Equal(t, 2, idx)
+	})
+
+	t.Run("all nil codes report no failure", func(t *testing.T) {
+		err := &types.TransactionCanceledException{
+			CancellationReasons: []types.CancellationReason{{Code: nil}, {Code: nil}},
+		}
+		found, idx := HasConditionalCheckFailure(err)
+		require.False(t, found)
+		require.Equal(t, 0, idx)
+	})
+}
+
+func Test_classifyCommitFailure_ATransactionConflictIsAnOptimisticConflict(t *testing.T) {
+	repo := &Repository{}
+
+	cancelled := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")},
+			{Code: aws.String("TransactionConflict")},
+		},
+	}
+
+	err := repo.classifyCommitFailure(context.Background(), nil, nil, commitLayout{}, cancelled)
+	require.ErrorIs(t, err, ErrTransactionConflict)
+	require.ErrorIs(t, err, evt.ErrOptimisticConflict, "fence-aware retry re-prepares on it, as in Rust")
+	require.ErrorIs(t, err, cancelled, "the SDK error stays matchable")
+	require.True(t, evt.IsOptimisticConflict(err))
+	require.True(t, policy.IsTransient(err))
+
+	// Throttling is transient but says nothing about another writer moving state.
+	throttled := &types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{{Code: aws.String("ThrottlingError")}},
+	}
+
+	err = repo.classifyCommitFailure(context.Background(), nil, nil, commitLayout{}, throttled)
+	require.False(t, evt.IsOptimisticConflict(err))
+	require.True(t, policy.IsTransient(err))
+}
+
+func Test_theSnapshotRaceConditionIsAnOptimisticConflict(t *testing.T) {
+	require.ErrorIs(t, ErrSnapshotRaceCondition, evt.ErrOptimisticConflict)
+	require.NotErrorIs(t, ErrSnapshotRaceCondition, ErrTransactionConflict, "each sentinel keeps its own identity")
+}
