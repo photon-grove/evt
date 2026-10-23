@@ -1,8 +1,8 @@
 //! The stream message envelope published for each committed event.
 //!
-//! The envelope is an EventBridge-style `CloudWatchEvent` around each event, as the Go SNS
-//! publisher (since removed) wrote it, and the JSON goes to SNS. Consumers (Go's `projectors` package, or Rust
-//! code using [`decode`]) unwrap the serialized event from `detail`.
+//! The envelope is an EventBridge-style `CloudWatchEvent` around each event, as the removed Go
+//! SNS publisher wrote it. Consumers (Go's `projectors` package, or Rust code using [`decode`])
+//! unwrap the serialized event from `detail`.
 //!
 //! ```json
 //! {"version":"","id":"<event id>","detail-type":"<event type>","source":"<source>",

@@ -330,7 +330,7 @@ error before any write and is never split.
   is refused with the typed reserved-ID error before the outcome row is read, so no outcome is read
   or recorded for a command aimed at engine-managed rows. An outcome read with an empty,
   non-UTF-8, or oversized command ID is the same typed error on every backend, never "absent"
-- Go's error-returning `Execute` keeps their contract on an outcomes store: when
+- Go's error-returning `Execute` keeps its contract on an outcomes store: when
   the outcome is replayed (a duplicate, or a lost race settled by the winner's row) the supplied
   entity is restored and loaded again, so it reflects durable state. Rust's outcome methods return
   a `CommandOutcome`, not an aggregate
@@ -1001,13 +1001,6 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   before writing data of that entity type
 - PostgreSQL holds the shared feature advisory lock through validation and all deletes in one
   transaction
-
-### Delete (build-tagged `//go:build !prod`)
-
-- Raw, snapshot-unsafe point-delete by `(pk, sk)`; for local/staging fixtures only. It also deletes
-  the head item of every stream it names, or the stream could not be created again
-- Excluded from production builds (`-tags prod`); released binaries set this tag
-- Use `CompactBelow` for principled, snapshot-verified truncation instead
 
 ## Backend Storage Contract
 

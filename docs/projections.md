@@ -320,3 +320,21 @@ res, err := evt.RebuildProjectionsFromStream(ctx, stream, evt.RebuildConfig{
 
 `Workers` sets how many entity partitions are reconstructed at once, and `Skip` lets you resume an
 interrupted run. Rebuilds are idempotent, so a full restart is always safe.
+
+## Reading views without buffering
+
+The view repository's `ListViewsByEntityType` and `ListViewsByPK` buffer their
+full result set. For large result sets prefer the cursor-based `*Paged` variants,
+or the streaming iterators on the optional `evt.ViewStreamer` interface
+(`ListViewsByEntityTypeEach` / `ListViewsByPKEach`), which invoke a callback per
+view and stop early when it returns an error. Type-assert a `ViewRepository` to
+`evt.ViewStreamer` to reach them (the DynamoDB repository implements it):
+
+```go
+if streamer, ok := repo.(evt.ViewStreamer); ok {
+    err := streamer.ListViewsByEntityTypeEach(ctx, entityType, func(v *evt.SerializedView) error {
+        // handle v without buffering the whole result set
+        return nil
+    })
+}
+```

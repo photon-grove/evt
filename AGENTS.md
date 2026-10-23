@@ -44,9 +44,6 @@
   stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedEntity` /
   `evt.SnapshotStreamer`), never full-replay-from-1. See
   `docs/adr/0001-event-compaction-and-snapshot-truncation.md`.
-- The raw `dynamo.Delete` is snapshot-unsafe and for local/staging fixtures only. It is guarded by
-  `//go:build !prod`; production builds must use `-tags prod` (released binaries already do). Prefer
-  `CompactBelow` for any principled truncation.
 - Do not persist mutable decisions, external signals, publish flags, accept/reject verdicts, or
   review state directly to a view table with no backing event.
 - DynamoDB event-log key patterns must stay stable. Preserve the documented `pk`/`sk`, inline

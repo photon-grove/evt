@@ -1,13 +1,13 @@
 # Streams and Projectors
 
 Once events land in the [DynamoDB event log](dynamodb.md), they fan out to
-asynchronous consumers — read-model projectors, change-detection
-[heads](projections.md), search indexers, feeds, webhooks — through a single hop:
+asynchronous consumers (read-model projectors, search indexers, feeds, webhooks) through a
+single hop:
 
 ```text
 event log ──DynamoDB Stream──▶ your handler ──▶ SNS topic ──┬──▶ SNS→SQS ──▶ projector
-              (NEW_IMAGE)      (one reader)                ├──▶ SNS→SQS ──▶ heads / search / …
-                                                          └──▶ SNS→Lambda ──▶ feeds / webhooks
+              (NEW_IMAGE)      (one reader)                 ├──▶ SNS→SQS ──▶ search / …
+                                                            └──▶ SNS→Lambda ──▶ feeds / webhooks
 ```
 
 One handler reads the DynamoDB Stream and republishes each **`INSERT`** of an event to SNS.

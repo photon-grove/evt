@@ -512,8 +512,7 @@ enforcement runs. Create markers from the repository so reads and transactional 
 client and events table; attaching a marker from another client or table is a typed configuration
 error.
 
-The raw `dynamo.Delete` is snapshot-unsafe, for local fixtures only, and excluded
-from production builds (`-tags prod`). See
+See
 [`BEHAVIORAL_INVARIANTS.md`](BEHAVIORAL_INVARIANTS.md) for the exact serialization
 and DynamoDB schema guarantees.
 
