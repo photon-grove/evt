@@ -68,7 +68,7 @@ transactional action is billed as two writes of the checked or written item's si
 1 KB; the head item stays well under 1 KB, so a head update or a fence is the cheapest action a commit
 can send, and it no longer scales with the size of a snapshot. (Whether a `ConditionCheck` bills by
 the size of the item it reads is documented only indirectly, and is still to be measured on real
-DynamoDB with the `dynamo/awsmeasure` script: [#159](https://github.com/photon-grove/evt/issues/159).)
+DynamoDB with the `go/backends/dynamo/awsmeasure` script: [#159](https://github.com/photon-grove/evt/issues/159).)
 
 There are no reads before a commit. A failed commit is told apart by reading the stream on the
 failure path only ([Classification](spec/storage-format.md#failure-classification)). A head item

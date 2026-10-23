@@ -37,7 +37,7 @@ implementations depend on, including the deliberate differences between them.
 
 ### 2. Go generates golden fixtures; both languages assert them
 
-`internal/compat` holds a Go implementation of a small shared domain (an account aggregate with
+`go/internal/compat` holds a Go implementation of a small shared domain (an account aggregate with
 upcasting, maps, optional fields, and multi-event commands). Its fixture generator writes
 `compat/fixtures/codec.json` (encode/decode vectors, DynamoDB items, SNS messages and attributes,
 and the snapshot policy table) and `compat/fixtures/scenarios.json` (the stored items, events,

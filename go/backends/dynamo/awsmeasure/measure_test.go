@@ -9,7 +9,7 @@
 // reaches AWS. A human runs it with credentials that may create and delete a table:
 //
 //	EVT_AWSMEASURE_CONFIRM=yes AWS_REGION=us-west-2 \
-//	  go test -tags=awsmeasure ./dynamo/awsmeasure -run TestMeasureConsumedCapacity -v -count=1
+//	  go test -tags=awsmeasure ./backends/dynamo/awsmeasure -run TestMeasureConsumedCapacity -v -count=1
 //
 // It creates an on-demand table named evt-awsmeasure-<unix time>, writes a handful of items,
 // prints one row per measured request, and deletes the table (also when a request fails). Cost is

@@ -201,7 +201,7 @@ outside the log cannot be rebuilt, and a rebuild would silently lose it.
 with `evt.GroupCommits`, fold each stream's state after its commit yourself, and run the projectors
 over the groups with `evt.ReplayViews`. For a **history-dependent** projector that is the contract
 — the rows it returns equal the live rows — and it is how to test one (see the end-to-end test in
-`snapshots/projectors_test.go`). For a **current-state** projector the same replay works because
+`go/snapshots/projectors_test.go`). For a **current-state** projector the same replay works because
 the state is yours to supply, but there is no engine entry point yet that rebuilds current-state
 rows from the current state of the streams alone (the state-based rebuild is specified in the
 [storage format](spec/storage-format.md#views) and lands with the rebuild ports); until then,

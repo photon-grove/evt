@@ -25,7 +25,7 @@
 
 ## Repository Identity
 
-- This repo is `evt`, a Go event-sourcing framework published as `github.com/photon-grove/evt`.
+- This repo is `evt`, a Go event-sourcing framework published as `github.com/photon-grove/evt/go`.
 - It contains Go framework packages, a native Rust crate (`photon-evt`, `crates/evt`) that shares the
   Go storage format, a Vite docs app, a React diagram package, local Terraform for
   DynamoDB-compatible integration tests, and public documentation.
@@ -52,7 +52,7 @@
 - When event JSON changes, add or update upcasters and fixture coverage so older stored events
   remain readable.
 - Go and Rust share one storage format (`docs/spec/storage-format.md`). Any change to it must
-  regenerate `compat/fixtures` (`go test ./internal/compat -run TestFixtures -update`), pass in both
+  regenerate `compat/fixtures` (`go -C go test ./internal/compat -run TestFixtures -update`), pass in both
   languages, and pass `scripts/compat-integration.sh dynamo|postgres`. Never hand-edit fixtures.
   The exception is a Rust-first extension's fixtures (ADR 0005): Rust generates them,
   `compat/fixtures/journal.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test
@@ -64,16 +64,17 @@
 ## Codebase Patterns
 
 - Structure:
-  - Root Go module: core `evt` package and support packages such as `dynamo`, `postgres`, `mem`,
-    `snapshots`, `projectors`, `viewstore`, and `test`.
+  - `go/`: the Go module (`github.com/photon-grove/evt/go`, package `evt`). Run Go commands from
+    there. The backends are `go/backends/dynamo`, `go/backends/postgres` and `go/backends/mem`, and
+    the other packages sit beside them: `snapshots`, `projectors`, `viewstore`, `test` and so on.
   - `website/`: Vite documentation site.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
   - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
-  - `examples/`: public examples; keep names and scenarios neutral.
+  - `go/examples/`: public examples; keep names and scenarios neutral.
   - `crates/evt` (`photon-evt`): the Rust crate. `crates/evt-lambda` (`photon-evt-lambda`): its
     DynamoDB Streams / Lambda helpers (ADR 0005, X3). `crates/evt-compat` (unpublished) and
-    `internal/compat` (Go) are the two halves of the compatibility harness. `compat/` holds the
+    `go/internal/compat` (Go) are the two halves of the compatibility harness. `compat/` holds the
     shared scenarios and generated fixtures.
 - Rust:
   - Keep the core dependency-light (serde, serde_json, thiserror); SDKs stay behind the `dynamodb`
@@ -101,12 +102,12 @@
 
 - Package manager: `pnpm` 10.x.
 - Node: 24.x, with Moon configured around Node `~24.5`.
-- Go toolchain: Go 1.26.4 via `go.mod`.
+- Go toolchain: Go 1.26.4 via `go/go.mod`.
 - Rust toolchain: 1.99.0 via `rust-toolchain.toml` (crate MSRV 1.88, `rust-version` in `Cargo.toml`,
   checked in CI without the `dynamodb` feature, which follows the AWS SDK's MSRV).
 - Common commands:
   - Install dependencies: `pnpm install`
-  - Go tests: `go test ./...`
+  - Go tests (from `go/`): `go test ./...`
   - Moon tests: `pnpm exec moon run evt:test`
   - Go vet/check: `pnpm exec moon run evt:check`
   - Go lint (golangci-lint, must report zero findings): `pnpm exec moon run evt:lint`
@@ -139,20 +140,19 @@
 - CI runs on ARM64 Ubuntu runners (`ubuntu-24.04-arm`).
 - Use upstream `actions/cache` (currently `@v6`); do not introduce archived cache forks.
 - CI quality checks include:
-  - `go mod tidy` with no `go.mod`/`go.sum` diff.
-  - `go vet ./...`
-  - `go test ./...`
+  - From `go/`: `go mod tidy` with no `go.mod`/`go.sum` diff, `go vet ./...` and `go test ./...`.
   - `pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build react-flow-diagrams:test`
   - `pnpm exec moon run evt-rust:check evt-rust:test` (Rust job)
 - CI integration checks start Moto or PostgreSQL, apply the local Terraform, and run
   `evt:integration` / `evt:integration-postgres`, plus `evt-rust:integration` /
   `evt-rust:integration-postgres` when the storage format may have changed.
 - A `changes` job classifies changed paths: Rust-only changes skip Go jobs and Go-only changes skip
-  the Rust job. Keep its path lists in `.github/workflows/ci.yml` in sync when adding directories.
+  the Rust job. Keep its path lists in `.github/workflows/ci.yml` in sync when adding directories. Go lives
+  under `go/`, and the release tags are `go/vX.Y.Z`.
 - Before staging, inspect dependency and workspace churn:
 
   ```sh
-  git diff -- go.mod go.sum '**/package.json' pnpm-lock.yaml Cargo.lock
+  git diff -- go/go.mod go/go.sum '**/package.json' pnpm-lock.yaml Cargo.lock
   ```
 
 - Revert unrelated churn introduced by tooling unless it is required by the change.
