@@ -1,6 +1,6 @@
 //go:build awsmeasure
 
-// Package awsmeasure measures what DynamoDB bills for the transaction actions the per-stream head
+// This file measures what DynamoDB bills for the transaction actions the per-stream head
 // item (ADR 0007) changes, using ReturnConsumedCapacity on a scratch table. It exists because the
 // ADR's WCU numbers assume a ConditionCheck bills by the size of the item it reads, and only real
 // DynamoDB can confirm that: the local emulator does not bill.
@@ -9,7 +9,7 @@
 // reaches AWS. A human runs it with credentials that may create and delete a table:
 //
 //	EVT_AWSMEASURE_CONFIRM=yes AWS_REGION=us-west-2 \
-//	  go test -tags=awsmeasure ./backends/dynamo/awsmeasure -run TestMeasureConsumedCapacity -v -count=1
+//	  go test -tags=awsmeasure ./backends/dynamo -run TestMeasureConsumedCapacity -v -count=1
 //
 // It creates an on-demand table named evt-awsmeasure-<unix time>, writes a handful of items,
 // prints one row per measured request, and deletes the table (also when a request fails). Cost is
@@ -17,7 +17,8 @@
 // PutItem, UpdateItem, GetItem, and DeleteTable on that table, plus the item-level actions that
 // TransactWriteItems requires. AWS_ENDPOINT_URL points it at an emulator instead, which prints
 // zeros and proves only that the script runs.
-package awsmeasure
+
+package dynamo_test
 
 import (
 	"context"
