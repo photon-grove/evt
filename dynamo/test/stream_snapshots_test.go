@@ -2,11 +2,13 @@ package test
 
 import (
 	"context"
+	"errors"
 	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
+	"github.com/photon-grove/evt/dynamo"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -159,5 +161,106 @@ func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_MultipleEntities() {
 	}
 
 	require.ElementsMatch(s.T(), []evt.EntityID{"acct-a", "acct-b"}, ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// noSnapshot answers a snapshot lookup with no row, so the entity replays from sequence 1.
+func (s *RepositorySuite) noSnapshot(ids ...string) {
+	for _, id := range ids {
+		s.client.On("GetItem", mock.Anything, getItemForPK(id), mock.Anything).Return(&dynamodb.GetItemOutput{Item: nil}, nil)
+		s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK(id)), mock.Anything).Return(eventsQueryOutput(id, 1), nil)
+	}
+}
+
+func applyAsMockEntity(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+	if entity == nil {
+		return &MockEntity{ID: event.EntityID}, nil
+	}
+
+	return entity, nil
+}
+
+func (s *RepositorySuite) collectIDs(opts dynamo.StreamFromSnapshotsOptions) ([]evt.EntityID, error) {
+	var (
+		ids    []evt.EntityID
+		gotErr error
+	)
+
+	for res := range s.repo.StreamEntitiesFromSnapshotsWithOptions(context.Background(), opts, seedMockEntity, applyAsMockEntity) {
+		entity, err := res.Unwrap()
+		if err != nil {
+			gotErr = err
+			continue
+		}
+
+		ids = append(ids, entity.GetID())
+	}
+
+	return ids, gotErr
+}
+
+// Test_StreamEntitiesFromSnapshots_Skip verifies the Skip predicate removes an entity before it is
+// reconstructed, so no snapshot or event read happens for it.
+func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_Skip() {
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(enumScanOutput("a", "b"), nil).Once()
+	s.noSnapshot("a")
+
+	ids, err := s.collectIDs(dynamo.StreamFromSnapshotsOptions{Workers: 1, Skip: func(id evt.EntityID) bool { return id == "b" }})
+
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), []evt.EntityID{"a"}, ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesFromSnapshots_EntityTypeFilter verifies enumeration filters the scan by type.
+func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_EntityTypeFilter() {
+	s.client.On("Scan", mock.Anything, mock.MatchedBy(func(in *dynamodb.ScanInput) bool {
+		v, ok := in.ExpressionAttributeValues[":et"].(*types.AttributeValueMemberS)
+		return in.FilterExpression != nil && ok && v.Value == "TestEntity"
+	}), mock.Anything).Return(enumScanOutput("a"), nil).Once()
+	s.noSnapshot("a")
+
+	ids, err := s.collectIDs(dynamo.StreamFromSnapshotsOptions{Workers: 1, EntityType: "TestEntity"})
+
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), []evt.EntityID{"a"}, ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesFromSnapshots_EnumerationError verifies that a failed enumeration is fatal:
+// it emits an error and no entities, so a rebuild never silently covers a subset.
+func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_EnumerationError() {
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).
+		Return((*dynamodb.ScanOutput)(nil), errors.New("scan boom")).Once()
+
+	ids, err := s.collectIDs(dynamo.StreamFromSnapshotsOptions{Workers: 2})
+
+	require.Error(s.T(), err)
+	require.Contains(s.T(), err.Error(), "scan boom")
+	require.Empty(s.T(), ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesFromSnapshots_SkipsHeadItemsAndReservedIDs verifies that an orphan head item
+// (sk = -1) and the reserved engine partitions never list as entities.
+func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_SkipsHeadItemsAndReservedIDs() {
+	headOnly := map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: "orphan"},
+		"sk": &types.AttributeValueMemberN{Value: "-1"},
+	}
+	reserved := pkItem(evt.SystemNamespacePrefix + "FEATURES")
+	live := map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: "a"},
+		"sk": &types.AttributeValueMemberN{Value: "1"},
+	}
+
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.ScanOutput{Items: []map[string]types.AttributeValue{headOnly, reserved, live}}, nil).Once()
+	s.noSnapshot("a")
+
+	ids, err := s.collectIDs(dynamo.StreamFromSnapshotsOptions{Workers: 1})
+
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), []evt.EntityID{"a"}, ids)
 	s.client.AssertExpectations(s.T())
 }

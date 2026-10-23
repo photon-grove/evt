@@ -14,7 +14,8 @@ import (
 // SNSMessage builds the stream envelope for an event-log item: the CloudWatchEvent-style message
 // body and the string message attributes that the SNS fan-out wrote. The Go library no longer
 // ships that publisher, but the envelope is the cross-language wire format that the Rust crate
-// encodes byte for byte, so the fixtures keep recording it.
+// encodes byte for byte, so the fixtures keep recording it. The item must be an event row, so the
+// callers skip the snapshot (sk 0) and head (sk -1) items first.
 func SNSMessage(item map[string]types.AttributeValue) (string, map[string]string, error) {
 	image := make(map[string]events.DynamoDBAttributeValue, len(item))
 	for name, value := range item {
