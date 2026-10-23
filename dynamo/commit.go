@@ -308,15 +308,6 @@ func (repo *Repository) buildEventPutTransactions(
 	return transactions, currentSequence, nil
 }
 
-// Commit the given TransactWriteItems to the DynamoDB table
-func (repo *Repository) commitEventsWithTransaction(
-	ctx context.Context,
-	writeItems []types.TransactWriteItem,
-	transaction evt.Transaction,
-) error {
-	return repo.commitTransactionItems(ctx, transaction, writeItems, commitLayout{})
-}
-
 // commitStreamItems sends one multi-stream commit: the feature-marker check, the projector
 // operations, then the stream and fence items, budgeted as a whole and never split.
 func (repo *Repository) commitStreamItems(
