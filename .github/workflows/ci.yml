@@ -58,7 +58,7 @@ jobs:
               compat/* | internal/compat/* | scripts/compat-integration.sh)
                 go=true rust=true compat=true ;;
               serialization.go | metadata.go | compaction.go | types.go | repository.go | transactions.go | \
-                dynamo/* | postgres/* | publishers/* | stream/* | projectors/* | snapshots/* | policy/* | \
+                dynamo/* | postgres/* | stream/* | projectors/* | snapshots/* | policy/* | \
                 go.mod | go.sum | infra/*)
                 go=true compat=true ;;
               *)
