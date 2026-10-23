@@ -10,7 +10,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 mkdir -p target/compat
-go build -o "target/compat/evt-compat-go-${backend}" ./internal/compat/cmd/evt-compat
+go -C go build -o "$root/target/compat/evt-compat-go-${backend}" ./internal/compat/cmd/evt-compat
 cargo build --quiet -p evt-compat --features drivers --bin evt-compat
 
 go_driver="target/compat/evt-compat-go-${backend}"

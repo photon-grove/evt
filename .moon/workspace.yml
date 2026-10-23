@@ -1,6 +1,6 @@
 $schema: https://moonrepo.dev/schemas/workspace.json
 projects:
-  - .
+  - go
   - crates
   - website
   - packages/*
