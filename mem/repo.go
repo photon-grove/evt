@@ -454,31 +454,6 @@ func cloneManifest(manifest evt.FeatureManifest) evt.FeatureManifest {
 	return manifest
 }
 
-// CommitStream streams Events to memory
-//
-// Deprecated: Cut in ADR-0006 (K1). Commit batched commands through the normal commit path
-// instead. It will be removed in the next minor release.
-func (repo Repository) CommitStream(
-	ctx context.Context,
-	channel <-chan result.Result[evt.SerializedResult],
-) []error {
-	var errors []error
-
-	for result := range channel {
-		serializedResult, err := result.Unwrap()
-		if err != nil {
-			errors = append(errors, err)
-			continue
-		}
-
-		if err := repo.Commit(ctx, serializedResult); err != nil {
-			errors = append(errors, err)
-		}
-	}
-
-	return errors
-}
-
 // CommitWithSnapshot commits Events with a Snapshot. It routes through the multi-stream commit
 // path, writing the snapshot in the same logical commit as its events.
 func (repo Repository) CommitWithSnapshot(

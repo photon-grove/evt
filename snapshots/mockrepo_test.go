@@ -77,10 +77,6 @@ func (m *MockRepository) PutSnapshot(
 	return nil
 }
 
-func (m *MockRepository) CommitStream(_ context.Context, _ <-chan result.Result[evt.SerializedResult]) []error {
-	return nil
-}
-
 func (m *MockRepository) StreamAllEvents(_ context.Context, _ evt.StreamFilter) <-chan result.Result[[]evt.SerializedEvent] {
 	ch := make(chan result.Result[[]evt.SerializedEvent])
 	close(ch)

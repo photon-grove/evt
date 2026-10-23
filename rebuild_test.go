@@ -78,9 +78,6 @@ type fakeRepo struct {
 }
 
 func (r *fakeRepo) Commit(_ context.Context, _ evt.SerializedResult) error { return nil }
-func (r *fakeRepo) CommitStream(_ context.Context, _ <-chan result.Result[evt.SerializedResult]) []error {
-	return nil
-}
 func (r *fakeRepo) CommitWithSnapshot(_ context.Context, _ evt.SerializedResult, _ evt.EntityType, _ evt.EntityID, _ []byte, _ evt.EventSequence) error {
 	return nil
 }

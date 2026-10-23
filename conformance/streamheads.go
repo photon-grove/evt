@@ -9,7 +9,6 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/policy"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/photon-grove/evt/test"
 )
 
@@ -66,10 +65,6 @@ func runStreamHeadCases(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 			t.Run("UnmigratedStoreRefusesWrites", func(t *testing.T) {
 				testUnmigratedStoreRefusesWrites(t, newRepo(), opts)
 			})
-		}
-
-		if opts.RefusesCommitStream {
-			t.Run("CommitStreamRefuses", func(t *testing.T) { testCommitStreamRefuses(t, newRepo()) })
 		}
 	})
 }
@@ -479,26 +474,4 @@ func testUnmigratedStoreRefusesWrites(t *testing.T, repo evt.Repository, opts Su
 		err = repo.Commit(ctx, evt.SerializedResult{Events: next})
 	}
 	require.NoError(t, err)
-}
-
-// The deprecated batch path writes events without maintaining heads, so it is refused outright.
-func testCommitStreamRefuses(t *testing.T, repo evt.Repository) {
-	t.Helper()
-	ctx := context.Background()
-	ns := newNamespace()
-
-	id := evt.EntityID(ns + "-batch")
-	channel := make(chan result.Result[evt.SerializedResult], 2)
-	channel <- result.Ok(evt.SerializedResult{Events: serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})})
-	channel <- result.Ok(evt.SerializedResult{Events: serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "two"})})
-	close(channel)
-
-	errs := repo.CommitStream(ctx, channel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	require.Len(t, errs, 1)
-	require.Error(t, errs[0])
-	require.False(t, errors.Is(errs[0], evt.ErrOptimisticConflict))
-
-	stored, err := repo.GetEvents(ctx, id)
-	require.NoError(t, err)
-	require.Empty(t, stored, "a refused batch writes nothing")
 }

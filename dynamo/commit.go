@@ -13,7 +13,6 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/internal/eventjson"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // Commit writes serialized events to the events table. A multi-stream commit (ADR 0004, C1)
@@ -217,44 +216,6 @@ func (repo *Repository) buildSnapshotPut(
 	}
 
 	return types.TransactWriteItem{Put: &put}, nil
-}
-
-// CommitStreamRefusedError is returned by the deprecated DynamoDB CommitStream. Its batches write
-// event items with no head update, which would leave every stream's head item stale (ADR 0007), so
-// it refuses; commit through Commit instead, which maintains the head. Nothing was written.
-type CommitStreamRefusedError struct{}
-
-// Error returns the error message string.
-func (e *CommitStreamRefusedError) Error() string {
-	return "dynamo: CommitStream writes events without maintaining stream head items and is refused; use Commit"
-}
-
-// ErrCommitStreamRefused matches a CommitStreamRefusedError with errors.Is.
-var ErrCommitStreamRefused = errors.New("dynamo: CommitStream is refused")
-
-// Is makes errors.Is(err, ErrCommitStreamRefused) match.
-func (e *CommitStreamRefusedError) Is(target error) bool { return target == ErrCommitStreamRefused }
-
-// CommitStream refuses. The batch path writes event items with no head update, so it would leave
-// every stream's head item stale (ADR 0007); the stores a head-aware build can write to all declare
-// the stream-heads feature, so there is no store left for it to serve. It drains the channel so
-// producers never block and returns one *CommitStreamRefusedError (or the marker-binding error of a
-// misconfigured repository). Commit batched commands through the normal commit path instead.
-//
-// Deprecated: Cut in ADR-0006 (K1). It will be removed in the next minor release.
-func (repo *Repository) CommitStream(
-	_ context.Context,
-	channel <-chan result.Result[evt.SerializedResult],
-) []error {
-	for range channel { //nolint:revive // Drain without reading so producers never block.
-		continue
-	}
-
-	if err := repo.checkFeatureMarkerTable(); err != nil {
-		return []error{err}
-	}
-
-	return []error{&CommitStreamRefusedError{}}
 }
 
 // CommitWithSnapshot commits events and a snapshot in a single transaction.

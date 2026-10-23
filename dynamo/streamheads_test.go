@@ -568,17 +568,6 @@ func TestProbe_AConcurrentCommitIsAConflictNotDrift(t *testing.T) {
 	require.NotErrorIs(t, err, evt.ErrSequenceGap)
 }
 
-// The deprecated batch path refuses outright.
-func TestCommitStream_NeverWritesAnEvent(t *testing.T) {
-	// Covered with the entry points in TestCommitStream_Refuses; this keeps the intent next to the
-	// head tests: no event item can ever be written without its head update.
-	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
-
-	require.NoError(t, repo.Commit(context.Background(), evt.SerializedResult{Events: headEvents("batch", 1, 1, "t")}))
-	require.Len(t, fake.Items("batch"), 2, "the stream's head item and its event")
-}
-
 // Delete removes a stream's head item with its events, so the stream can be created again.
 func TestDelete_RemovesTheHeadItemToo(t *testing.T) {
 	ctx := context.Background()

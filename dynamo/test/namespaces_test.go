@@ -11,7 +11,6 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	dynamo_mock "github.com/photon-grove/evt/dynamo/mock" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	"github.com/photon-grove/evt/result"                  //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -158,11 +157,6 @@ func (s *NamespacesSuite) Test_WritePaths_RefuseReservedEntityIds() {
 		require.Error(s.T(), repo.Commit(context.Background(), evt.SerializedResult{Events: events}))
 		require.Error(s.T(), repo.CommitWithSnapshot(
 			context.Background(), evt.SerializedResult{Events: events}, "test", evt.EntityID(id), []byte("{}"), 1))
-
-		streamed := make(chan result.Result[evt.SerializedResult], 1)
-		streamed <- result.Ok(evt.SerializedResult{Events: events})
-		close(streamed)
-		require.NotEmpty(s.T(), repo.CommitStream(context.Background(), streamed)) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 		require.Error(s.T(), repo.PutSnapshot(
 			context.Background(), "test", evt.EntityID(id), []byte("{}"), 1, 1))

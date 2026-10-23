@@ -89,10 +89,6 @@ type SuiteOptions struct {
 	// SupportsTransactions: every such backend keeps the rebuild fence, and the lease cases drive its
 	// clock instead of sleeping.
 	WithRebuildClock func(repo evt.Repository, now func() time.Time) evt.Repository
-
-	// RefusesCommitStream indicates the deprecated batch path is refused outright because it
-	// writes events without maintaining head items (the DynamoDB backend).
-	RefusesCommitStream bool
 }
 
 // RunRepositorySuite runs the full backend-neutral contract suite against the repository produced by
@@ -133,12 +129,6 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 	t.Run("StreamEntitiesHonorsFilter", func(t *testing.T) {
 		testStreamEntitiesHonorsFilter(t, newRepo())
 	})
-
-	if !opts.RefusesCommitStream {
-		t.Run("CommitStream", func(t *testing.T) {
-			testCommitStream(t, newRepo())
-		})
-	}
 
 	if opts.SupportsSnapshots {
 		t.Run("SnapshotRoundTrip", func(t *testing.T) {
@@ -505,26 +495,6 @@ func testStreamEntitiesHonorsFilter(t *testing.T, repo evt.Repository) {
 	require.Equal(t, []evt.EntityID{alphaID}, alpha)
 }
 
-func testCommitStream(t *testing.T, repo evt.Repository) {
-	t.Helper()
-	ctx := context.Background()
-	ns := newNamespace()
-
-	id := evt.EntityID(ns + "-1")
-	serialized := serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})
-
-	channel := make(chan result.Result[evt.SerializedResult], 1)
-	channel <- result.Ok(evt.SerializedResult{Events: serialized})
-	close(channel)
-
-	errs := repo.CommitStream(ctx, channel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	require.Empty(t, errs)
-
-	events, err := repo.GetEvents(ctx, id)
-	require.NoError(t, err)
-	require.Len(t, events, 1)
-}
-
 func testSnapshotRoundTrip(t *testing.T, repo evt.Repository) {
 	t.Helper()
 	ctx := context.Background()
@@ -591,11 +561,6 @@ func testCompactedFloor(t *testing.T, repo evt.Repository) {
 	// only the snapshot floor rejects it.
 	stale := serialize(t, id, "test", 1, &test.EntityUpdated{ID: id, Value: "stale"})
 	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: stale}), "a commit below the floor must be rejected")
-
-	streamed := make(chan result.Result[evt.SerializedResult], 1)
-	streamed <- result.Ok(evt.SerializedResult{Events: stale})
-	close(streamed)
-	require.NotEmpty(t, repo.CommitStream(ctx, streamed), "a streamed commit below the floor must be rejected") //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	events, err := repo.GetEvents(ctx, id)
 	require.NoError(t, err)

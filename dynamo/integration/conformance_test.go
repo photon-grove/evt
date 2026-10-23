@@ -89,7 +89,6 @@ func Test_RepositoryConformance(t *testing.T) {
 
 			return err
 		},
-		RefusesCommitStream: true,
 		WithRebuildClock: func(repo evt.Repository, now func() time.Time) evt.Repository {
 			return repo.(*dynamo.Repository).WithClock(now) //nolint:errcheck,forcetypeassert // newRepo returns a *dynamo.Repository
 		},

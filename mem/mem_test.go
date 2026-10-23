@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	evttest "github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
 )
@@ -171,21 +170,4 @@ func Test_Repository_StreamEntities_ApplyError(t *testing.T) {
 	}
 
 	require.True(t, sawErr)
-}
-
-func Test_CommitStream_CollectsErrors(t *testing.T) {
-	repo := &Repository{
-		events:    make(map[string][]evt.SerializedEvent),
-		snapshots: make(map[string]evt.SerializedSnapshot),
-	}
-
-	ch := make(chan result.Result[evt.SerializedResult])
-	go func() {
-		defer close(ch)
-		ch <- result.Err[evt.SerializedResult](errors.New("nope"))
-	}()
-
-	errs := repo.CommitStream(context.Background(), ch)
-	require.Len(t, errs, 1)
-	require.Contains(t, errs[0].Error(), "nope")
 }

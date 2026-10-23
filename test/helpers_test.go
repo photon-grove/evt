@@ -14,9 +14,6 @@ import (
 type stubRepo struct{}
 
 func (stubRepo) Commit(context.Context, evt.SerializedResult) error { return nil }
-func (stubRepo) CommitStream(context.Context, <-chan result.Result[evt.SerializedResult]) []error {
-	return nil
-}
 
 func (stubRepo) CommitWithSnapshot(context.Context, evt.SerializedResult, evt.EntityType, evt.EntityID, []byte, evt.EventSequence) error {
 	return nil
