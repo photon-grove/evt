@@ -22,4 +22,4 @@ type TransactionGroup interface {
 }
 
 // StorageType indicates the type of storage used to execute Dynamo transactions
-const StorageType evt.StorageType = "DynamoDB"
+const StorageType evt.StorageType = "dynamo"
