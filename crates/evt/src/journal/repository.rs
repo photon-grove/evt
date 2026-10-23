@@ -252,15 +252,14 @@ where
 {
     /// Declares the `journal` feature and the journaled entity types history-dependent, once per
     /// repository (clones share the flag). Nothing is written if the marker already declares them.
-    /// Returns whether this call wrote the `journal` declaration, so a commit that then fails
-    /// because the table is not migrated can take it back.
-    async fn ensure_declared(&self) -> Result<bool, Error> {
+    /// Returns what this call wrote, so a commit that then fails because the store is
+    /// uninitialized or not migrated can take it all back.
+    async fn ensure_declared(&self) -> Result<Declared, Error> {
         if self.declared.load(Ordering::Acquire) {
-            return Ok(false);
+            return Ok(Declared::default());
         }
 
         let manifest = self.inner.read_manifest().await?;
-        let mut wrote = false;
         match manifest
             .as_ref()
             .and_then(|manifest| manifest.features.get(JOURNAL_FEATURE))
@@ -272,33 +271,77 @@ where
                     version,
                 });
             }
-            None => {
-                self.inner
-                    .update_manifest(|manifest| manifest.declare_journal())
-                    .await?;
-                wrote = true;
-            }
+            None => {}
         }
+
+        // A writer that refuses uninitialized stores (DynamoDB's default) refuses the commit this
+        // declaration precedes without writing anything. Refuse here, on the manifest this read
+        // just fetched, so nothing below is declared on a store nothing can be journaled into: a
+        // `StoreNotInitialized` refusal writes nothing.
+        if self.inner.refuses_uninitialized()
+            && !manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.declares_stream_heads())
+        {
+            return Err(Error::StoreNotInitialized);
+        }
+
+        let mut declared = Declared::default();
+
+        if !manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.declares_journal())
+        {
+            self.inner
+                .update_manifest(|manifest| manifest.declare_journal())
+                .await?;
+            declared.journal = true;
+        }
+
+        declared.history = self
+            .journal
+            .entity_types()
+            .iter()
+            .filter(|entity_type| {
+                !manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.is_history_dependent(entity_type))
+            })
+            .cloned()
+            .collect();
 
         self.inner
             .declare_history_dependent(self.journal.entity_types())
             .await?;
         self.declared.store(true, Ordering::Release);
 
-        Ok(wrote)
+        Ok(declared)
     }
 
-    /// Takes back a `journal` declaration this repository just wrote, for a commit that then
-    /// failed because the table has not been migrated to stream heads (or initialized): the marker
-    /// must not be left declaring an extension on a table nothing journaled into. Best effort; the
-    /// history-dependent declaration stays, which only forbids compacting the types.
-    async fn retract(&self) {
+    /// Takes back the declarations this repository just wrote, for a commit that then failed
+    /// because the store is uninitialized or not migrated to stream heads: the marker must not be
+    /// left declaring `journal`, or forbidding compaction for entity types, on a store nothing
+    /// journaled into. Best effort.
+    async fn retract(&self, declared: &Declared) {
         self.declared.store(false, Ordering::Release);
+
+        if !declared.any() {
+            return;
+        }
+
+        let journal = declared.journal;
+        let history = declared.history.clone();
 
         let _ = self
             .inner
-            .update_manifest(|manifest| {
-                manifest.features.remove(JOURNAL_FEATURE);
+            .update_manifest(move |manifest| {
+                if journal {
+                    manifest.features.remove(JOURNAL_FEATURE);
+                }
+
+                for entity_type in &history {
+                    manifest.history_dependent.remove(entity_type.as_str());
+                }
             })
             .await;
     }
@@ -524,13 +567,13 @@ where
                 Err(error) => error,
             };
 
-            if declared_now
+            if declared_now.any()
                 && matches!(
                     error,
                     Error::StreamHeadsNotMigrated | Error::StoreNotInitialized
                 )
             {
-                self.retract().await;
+                self.retract(&declared_now).await;
 
                 return Err(error);
             }
@@ -576,6 +619,23 @@ where
 struct Counters {
     stored: BTreeMap<Scope, u64>,
     base: BTreeMap<Scope, u64>,
+}
+
+/// The declarations one `ensure_declared` call wrote, which a commit refused as uninitialized or
+/// unmigrated takes back.
+#[derive(Default)]
+struct Declared {
+    /// The `journal` feature, declared by this call.
+    journal: bool,
+    /// The journaled entity types this call added to the durable `historyDependent` set.
+    history: Vec<EntityType>,
+}
+
+impl Declared {
+    /// Reports whether this call wrote anything.
+    fn any(&self) -> bool {
+        self.journal || !self.history.is_empty()
+    }
 }
 
 /// Reports whether the error is a journal row that found its position taken, or a counter that

@@ -214,7 +214,8 @@ longer declares `stream-heads` on a fresh table itself, because that took a stro
 an uninitialized table with `*evt.StoreNotInitializedError` (Rust `Error::StoreNotInitialized`),
 writing nothing, and the table is initialized once at deploy time by a role that may Scan:
 `evt-doctor init -events-table <table>`, or `repo.Initialize(ctx)` (Rust `initialize()`). It is
-idempotent, so it can run on every deploy. Tables that already declare `stream-heads` need nothing,
+idempotent, so it can run on every deploy, concurrent deploys included: two jobs initializing the
+same empty table let exactly one of them write. Tables that already declare `stream-heads` need nothing,
 and writer roles can drop `dynamodb:Scan` (keep it only on roles that run rebuilds, enumeration, or
 `evt-doctor`). Tests and local emulators can keep the old behaviour with
 `WithLazyInitialization(true)` (Rust `with_lazy_initialization(true)`). PostgreSQL and in-memory

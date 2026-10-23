@@ -36,11 +36,12 @@ type InitializationOptions struct {
 // marker row. Both handles must implement evt.StoreInitializer, and the store must be fresh: a
 // durable backend needs its own empty table or schema.
 //
-// With RefusesUninitialized, every write path first refuses the store and writes nothing. Then, on
-// every backend: initialization declares stream-heads at version 1, a second initialization by
-// either handle declares nothing, both handles write, and initializing a store that holds data
-// but does not declare the feature is refused with *evt.StreamHeadsNotMigratedError and declares
-// nothing, as a lazily initializing writer's verification does.
+// With RefusesUninitialized, every write path first refuses the store and writes nothing. Then,
+// on every backend: two concurrent initializations let exactly one handle write, a second
+// initialization by either handle declares nothing, both handles write, and initializing a store
+// that holds data but does not declare the feature is refused with
+// *evt.StreamHeadsNotMigratedError and declares nothing, as a lazily initializing writer's
+// verification does.
 func RunInitializationSuite(t *testing.T, fresh, other evt.Repository, opts InitializationOptions) {
 	t.Helper()
 	ctx := context.Background()
@@ -65,16 +66,21 @@ func RunInitializationSuite(t *testing.T, fresh, other evt.Repository, opts Init
 		testUninitializedStoreRefusesWrites(t, fresh, id, opts)
 	}
 
-	declared, err := initializer.Initialize(ctx)
+	// Two deployment jobs initializing the same empty store at once: however their scans and
+	// reads interleave, exactly one of them writes, the manifest version bumps once, and the loser
+	// reports that it declared nothing. A second write by the loser would bump the version again,
+	// and every writer that cached the winner's would then fail its next commit's manifest check.
+	declaredOnce, err := initializeConcurrently(ctx, initializer, otherInitializer)
 	require.NoError(t, err)
-	require.True(t, declared, "the first initialization declares")
+	require.Equal(t, 1, declaredOnce, "exactly one of two concurrent initializations declares")
 
 	manifest, err = opts.Manifest(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, manifest)
-	require.EqualValues(t, 1, manifest.Version, "the initialization creates the row at version 1")
+	require.EqualValues(t, 1, manifest.Version, "the concurrent initializations bump the manifest version once")
 	require.Equal(t, map[string]evt.FeatureFormat{evt.FeatureStreamHeads: evt.StreamHeadsFormat}, manifest.Features)
 
+	var declared bool
 	for name, repo := range map[string]evt.StoreInitializer{"the same handle": initializer, "another handle": otherInitializer} {
 		declared, err = repo.Initialize(ctx)
 		require.NoError(t, err, name)
@@ -110,6 +116,39 @@ func RunInitializationSuite(t *testing.T, fresh, other evt.Repository, opts Init
 	}
 
 	require.NoError(t, err, "the writer writes once the feature is declared again")
+}
+
+// initializeConcurrently runs Initialize on two handles at once and returns how many of them
+// wrote the declaration. Both calls succeed, and whatever order their scans and reads interleave
+// in, the read-modify-write of the losing call observes the winner's declaration and writes
+// nothing.
+func initializeConcurrently(ctx context.Context, a, b evt.StoreInitializer) (int, error) {
+	type outcome struct {
+		declared bool
+		err      error
+	}
+
+	results := make(chan outcome, 2)
+	for _, initializer := range []evt.StoreInitializer{a, b} {
+		go func(initializer evt.StoreInitializer) {
+			declared, err := initializer.Initialize(ctx)
+			results <- outcome{declared: declared, err: err}
+		}(initializer)
+	}
+
+	declared := 0
+	outcomes := []outcome{<-results, <-results}
+	for _, result := range outcomes {
+		if result.err != nil {
+			return 0, result.err
+		}
+
+		if result.declared {
+			declared++
+		}
+	}
+
+	return declared, nil
 }
 
 // Every write path refuses an uninitialized store with *evt.StoreNotInitializedError, and none of

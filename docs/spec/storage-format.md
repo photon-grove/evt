@@ -2415,19 +2415,27 @@ The feature is `stream-heads`, format version 1, in the `features` map:
 A writer that implements this section **requires** `stream-heads: 1` in the manifest, the first time
 it validates the marker. The refusal covers every write path that validates the marker: commits
 (outcome-only and rejection commits included), `PutSnapshot`, `CompactBelow`, and the mutating
-`evt-doctor` commands other than `init` and `migrate-heads`. Read-only paths do not need it.
+`evt-doctor` commands other than `init` and `migrate-heads`. The paths that make their own marker
+declarations consult it before declaring, so a refused store is refused without any declaration of
+its own: the Rust journal's first journaled commit, and Go's `DeclareHistoryDependent`, which a
+history-dependent projector's first commit runs before the commit is sent. Read-only paths do not
+need it.
 
 **Initialization.** A store whose marker does not declare the feature (no marker row, or a row
 without it) is declared by **initializing** it: Go `StoreInitializer.Initialize` (every repository
-implements it), Rust `FeatureMarker::initialize`, or `evt-doctor init`. Initialization is idempotent:
-a store that already declares the feature is left alone after one manifest read, with nothing scanned
-or written, and the call reports that it declared nothing (Go `false`, Rust `Ok(false)`). A manifest
-that declares a pair the caller does not support is refused with `UnsupportedFeature` first.
-Otherwise it declares the feature only after it finds no non-reserved item in the store, and refuses
-a populated store with a typed `StreamHeadsNotMigrated` error (Go `*StreamHeadsNotMigratedError`,
-Rust `Error::StreamHeadsNotMigrated`), declaring nothing; such a store is migrated instead. It
-declares `stream-heads` and nothing else: the extensions (`journal`, `journal-compaction`) are
-declared by their first use, which reads and writes only the marker row.
+implements it), Rust `FeatureMarker::initialize`, or `evt-doctor init`. Initialization is idempotent,
+concurrent initializers included: a store that already declares the feature is left alone after one
+manifest read, with nothing scanned or written, and the call reports that it declared nothing (Go
+`false`, Rust `Ok(false)`); two jobs initializing the same empty store at once let exactly one of
+them write, because the loser's conditional write observes the row the winner guarded on and
+re-reads it before deciding, so the manifest version bumps once and no writer that cached the
+winner's version sees a spurious manifest change. A manifest that declares a pair the caller does
+not support is refused with `UnsupportedFeature` first. Otherwise it declares the feature only after
+it finds no non-reserved item in the store, and refuses a populated store with a typed
+`StreamHeadsNotMigrated` error (Go `*StreamHeadsNotMigratedError`, Rust
+`Error::StreamHeadsNotMigrated`), declaring nothing; such a store is migrated instead. It declares
+`stream-heads` and nothing else: the extensions (`journal`, `journal-compaction`) are declared by
+their first use, which reads and writes only the marker row.
 
 On DynamoDB the check is a **strongly consistent** scan that reads until it finds one item outside
 the `SYSTEM#` and `command-outcome#` namespaces or the table ends, so a populated table stops it at
@@ -2793,10 +2801,16 @@ The first journaled commit **declares** the journal on the marker row ([Feature 
 in a declaration transaction (one `version` bump), just before the commit is sent, and after the
 commit has been built: the counters are read and the rows allocated and size-guarded first, so a
 commit that cannot be built (no views table, an oversized row, a failing resolver) declares
-nothing. Nothing is written if the row already declares them. If the commit then fails because the
-table is not migrated to stream heads, the `journal` declaration is taken back (a further
-declaration; best effort) so the table is not left declaring an extension nothing was written
-for, which would block `evt-doctor migrate-heads`; the `historyDependent` entries stay. `historyDependent` makes `CompactBelow` refuse those types in every process:
+nothing. Nothing is written if the row already declares them. A store the inner writer refuses as
+uninitialized is refused before anything is declared: the wrapper reads the marker the declaration
+would consult anyway, and a writer that fails a store that does not declare `stream-heads` (Go
+`*StoreNotInitializedError`; Rust `Error::StoreNotInitialized`) has that refusal surface before the
+declarations, so the refusal writes nothing. If the commit then fails because the store is
+uninitialized or is not migrated to stream heads, everything the attempt declared is taken back
+(one declaration; best effort): the `journal` feature, and the `historyDependent` entries the
+attempt added, so the table is not left declaring an extension nothing was written for, which
+would block `evt-doctor migrate-heads`, nor forbidding compaction for types nothing ever
+journaled. `historyDependent` makes `CompactBelow` refuse those types in every process:
 the rows are rebuilt from the events, so the events are never compacted. A build without the
 `journal` cargo feature models only `stream-heads`, so it refuses the table on its first commit,
 snapshot write, or compaction (`UnsupportedFeature`), as does Go. A build that does model the

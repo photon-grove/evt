@@ -76,7 +76,8 @@ runs a strongly consistent `Scan` to prove the table holds no data, declares the
 once more to prove no stream without a head item slipped in before the declaration, so the
 initializing role needs `dynamodb:GetItem`, `dynamodb:Scan`, and `dynamodb:PutItem` on the event-log
 table. It is idempotent: on a table that already declares the feature it reads the marker and stops,
-so it is safe in every deploy. Tests, local emulators, and quickstarts can skip the step with
+and two jobs initializing the same empty table at once let exactly one of them write, so it is safe
+in every deploy, concurrent ones included. Tests, local emulators, and quickstarts can skip the step with
 `dynamo.NewRepository(client, table).WithLazyInitialization(true)` (Rust
 `.with_lazy_initialization(true)`): the first write then initializes the table itself, and that
 writer needs `dynamodb:Scan`. Writers older than the head item never read the marker, so they must

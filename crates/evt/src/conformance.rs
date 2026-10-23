@@ -3638,8 +3638,8 @@ where
 ///
 /// With `refuses_uninitialized` (the handles are writers that do not initialize a store
 /// themselves, the DynamoDB default), every write path first refuses the uninitialized store with
-/// [`Error::StoreNotInitialized`] and writes nothing. Then, on every backend: initialization
-/// declares `stream-heads` at version 1, a second initialization by either handle declares
+/// [`Error::StoreNotInitialized`] and writes nothing. Then, on every backend: two concurrent
+/// initializations let exactly one handle write, a second initialization by either handle declares
 /// nothing, both handles write, and initializing a store that holds data but does not declare
 /// the feature is refused with [`Error::StreamHeadsNotMigrated`] and declares nothing, as the
 /// first writer's verification always did. `fixtures`, when it has raw storage access, adds a
@@ -3667,10 +3667,29 @@ pub async fn initialization_cases<R, F>(
             uninitialized_store_refuses_writes(fresh, &stream).await?;
         }
 
+        // Two deployment jobs initializing the same empty store at once: however their scans and
+        // reads interleave, exactly one of them writes, the manifest version bumps once, and the
+        // loser reports that it declared nothing. A second write by the loser would bump the
+        // version again, and every writer that cached the winner's would then fail its next
+        // commit's manifest check.
+        let declared = join_all(vec![
+            Box::pin(fresh.initialize()),
+            Box::pin(other.initialize()),
+        ])
+        .await;
         ensure!(
-            fresh.initialize().await?,
-            "the first initialization declares"
+            declared.iter().all(Result::is_ok),
+            "both concurrent initializations succeed: {declared:?}"
         );
+        ensure_eq!(
+            declared
+                .iter()
+                .filter(|declared| matches!(declared, Ok(true)))
+                .count(),
+            1,
+            "exactly one of two concurrent initializations declares"
+        );
+
         let manifest = fresh
             .read_manifest()
             .await?
@@ -3678,7 +3697,7 @@ pub async fn initialization_cases<R, F>(
         ensure_eq!(
             (manifest.version, manifest.features_json()),
             (1, r#"{"stream-heads":1}"#.to_owned()),
-            "the initialization creates the row at version 1 declaring stream-heads"
+            "the concurrent initializations create the row at version 1 declaring stream-heads"
         );
 
         ensure!(

@@ -307,6 +307,16 @@ pub trait FeatureMarker: Send + Sync {
         self.update_manifest(FeatureManifest::declare_stream_heads)
     }
 
+    /// Reports whether a write to a store that does not declare `stream-heads` is refused with
+    /// [`Error::StoreNotInitialized`] (DynamoDB's default), rather than initialized by the writer
+    /// itself. A wrapper that declares extensions on the marker consults this before declaring,
+    /// so a store its writer would refuse is refused without any declaration of its own. The
+    /// default is `false`: backends keep their first-write initialization unless they say
+    /// otherwise.
+    fn refuses_uninitialized(&self) -> bool {
+        false
+    }
+
     /// Initializes the store: declares `stream-heads` on a store that holds no data, with the
     /// verification ADR 0007 requires, and returns whether this call declared it.
     ///

@@ -369,8 +369,13 @@ impl DynamoRepository {
     /// time, with a role that may Scan the event log; writers then never scan.
     ///
     /// A table that already declares the feature is left alone after one strongly consistent
-    /// read. Otherwise a strongly consistent scan must find no item outside the reserved
-    /// namespaces, or the table is refused with [`Error::StreamHeadsNotMigrated`].
+    /// read, and two jobs initializing the same empty table at once let exactly one of them
+    /// write: the loser's conditional write observes the row the winner guarded on, re-reads it,
+    /// sees the declaration, and reports that it wrote nothing — or refuses with
+    /// [`Error::StreamHeadsNotMigrated`] when the winner has already retracted it for a stream
+    /// with no head item. Otherwise a strongly consistent
+    /// scan must find no item outside the reserved namespaces, or the table is refused with
+    /// [`Error::StreamHeadsNotMigrated`].
     ///
     /// The scan and the declaration are two steps, and no transaction can exclude a writer that
     /// never reads the marker, so the order does the work: the declaration is committed first,
@@ -393,7 +398,41 @@ impl DynamoRepository {
             return Err(Error::StreamHeadsNotMigrated);
         }
 
-        self.declare_stream_heads().await?;
+        // The emptiness scan takes long enough for a concurrent initializer to commit its own
+        // declaration; the conditional write observes the row it guarded on, so the loser of that
+        // race leaves the row the winner wrote alone and reports that it wrote nothing.
+        let (_, wrote) = self
+            .revise_manifest(|manifest| {
+                if manifest.declares_stream_heads() {
+                    return false;
+                }
+
+                manifest.declare_stream_heads();
+
+                true
+            })
+            .await?;
+
+        if !wrote {
+            // The winner ran its own verification — which may have retracted its declaration
+            // after finding the table was not fresh after all. One more read tells this call
+            // which table it is reporting on.
+            let current = self.read_manifest().await?;
+            if !current
+                .as_ref()
+                .is_some_and(|manifest| manifest.declares_stream_heads())
+            {
+                return Err(Error::StreamHeadsNotMigrated);
+            }
+
+            // The winner's manifest may also declare a feature this build does not model.
+            current
+                .as_ref()
+                .expect("the manifest declares stream-heads")
+                .validate_supported()?;
+
+            return Ok(false);
+        }
 
         if self.holds_headless_stream().await? {
             self.update_manifest(|manifest| {
@@ -536,10 +575,34 @@ impl DynamoRepository {
         &self,
         change: impl Fn(&mut FeatureManifest),
     ) -> Result<(), Error> {
+        self.revise_manifest(move |manifest| {
+            change(manifest);
+
+            true
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// The read-modify-write of [`update_manifest`], with the change reporting whether the row
+    /// still needs writing: when it reports `false`, the freshly read manifest already says what
+    /// the change would write, and the row is left at the version it has instead of being written
+    /// again under a bumped one. Returns the manifest as it now stands and whether this call
+    /// wrote it.
+    async fn revise_manifest(
+        &self,
+        change: impl Fn(&mut FeatureManifest) -> bool,
+    ) -> Result<(FeatureManifest, bool), Error> {
         for _ in 0..=MAX_DECLARATION_RETRIES {
             let observed = self.read_manifest().await?;
             let mut next = observed.clone().unwrap_or_default();
-            change(&mut next);
+
+            if !change(&mut next) {
+                // A concurrent declaration already wrote this change; the row stands as it is.
+                return Ok((next, false));
+            }
+
             next.version = observed.as_ref().map_or(1, |manifest| manifest.version + 1);
 
             let item = wire::feature_marker_item(&next)?;
@@ -559,7 +622,7 @@ impl DynamoRepository {
             match put.send().await {
                 Ok(_) => {
                     self.invalidate_manifest();
-                    return Ok(());
+                    return Ok((next, true));
                 }
                 Err(SdkError::ServiceError(err))
                     if matches!(err.err(), PutItemError::ConditionalCheckFailedException(_)) => {}
@@ -2103,6 +2166,10 @@ impl FeatureMarker for DynamoRepository {
         change: impl Fn(&mut FeatureManifest) + Send,
     ) -> Result<(), Error> {
         DynamoRepository::update_manifest(self, change).await
+    }
+
+    fn refuses_uninitialized(&self) -> bool {
+        !self.lazy_initialization
     }
 
     async fn initialize(&self) -> Result<bool, Error> {

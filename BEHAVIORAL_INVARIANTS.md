@@ -227,8 +227,10 @@ Error() → err.Error()  // Returns underlying error message
   no non-reserved item, with the same verification as the migration's declaration (on DynamoDB a
   strongly consistent Scan, the declaration, then a second Scan that retracts it if a stream without
   a head item appeared), and refuses a populated store with `*StreamHeadsNotMigratedError`. It is
-  idempotent: a store that already declares the feature is neither scanned nor written, and the call
-  reports `false`. It declares nothing but `stream-heads`
+  idempotent, across concurrent handles included: a store that already declares the feature is
+  neither scanned nor written, two jobs initializing the same empty store let exactly one of them
+  write (the loser re-reads the manifest its conditional write guards on and reports `false`), and
+  the manifest version bumps once. It declares nothing but `stream-heads`
 - `*StoreNotInitializedError` (`evt.ErrStoreNotInitialized`; Rust `Error::StoreNotInitialized`)
   refuses every write path of a DynamoDB writer to a store that does not declare `stream-heads`,
   without scanning and without writing anything, so a DynamoDB writer never needs `dynamodb:Scan`.
@@ -583,7 +585,8 @@ transaction as the events. The byte-level rules are in the
   ID and the events and state of those types only (other streams by ID and type), and the
   store durably adds them to the manifest's `historyDependent` set before the first commit that runs
   it (`CompactBelow` then refuses them in every process). A repository that cannot declare
-  (`evt.HistoryDeclarer`) refuses the commit (`HistoryDeclarationUnsupportedError`).
+  (`evt.HistoryDeclarer`) refuses the commit (`HistoryDeclarationUnsupportedError`), and a store its
+  writer refuses as uninitialized is refused before anything is declared.
 - Every operation of every projector names an owner stream the commit wrote (of a declared type
   for a history-dependent projector). The owner is stored as the row's `entityID`, and every write
   to the row (put or delete) is conditioned on it: DynamoDB
@@ -672,8 +675,11 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   range; a reader never advances past a gap. `high_watermark` is the strongly consistent counter.
 - **The marker declares it.** The first journaled commit, once it is built (counters read, rows
   allocated and guarded), adds `journal: 1` and the journaled entity types to `historyDependent`
-  (so they are never compacted); a commit that cannot be built declares nothing, and one refused
-  for an unmigrated table retracts the `journal` declaration. A build without the cargo feature
+  (so they are never compacted); a commit that cannot be built declares nothing. A store a strict
+  writer refuses as uninitialized is refused before anything is declared, so a
+  `StoreNotInitialized` refusal writes nothing; a commit refused because the store is uninitialized
+  or unmigrated takes back everything the attempt declared — the `journal` declaration and the
+  `historyDependent` entries it added. A build without the cargo feature
   refuses the table; a build with it, wrapped or not, accepts it.
 - **Rebuilds run under the rebuild lock.** `rebuild` writes rows and counters unconditionally
   through the lease-guarded `write_rebuild_views` (owner and fencing token, at most 99 operations a

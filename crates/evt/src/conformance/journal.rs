@@ -575,6 +575,9 @@ pub(super) struct Lagging<R> {
     applies_expected_payload: bool,
     /// Every commit is refused as a DynamoDB writer refuses an uninitialized store.
     uninitialized: bool,
+    /// Every commit is refused as a lazily initializing writer refuses a store that holds data
+    /// nobody migrated to stream heads.
+    unmigrated: bool,
 }
 
 impl<R> Lagging<R> {
@@ -588,14 +591,27 @@ impl<R> Lagging<R> {
             writes_views: true,
             applies_expected_payload: true,
             uninitialized: false,
+            unmigrated: false,
         }
     }
 
     /// Refuses every commit with [`Error::StoreNotInitialized`], as a DynamoDB writer refuses a
-    /// store nobody initialized, without writing anything.
+    /// store nobody initialized, without writing anything. The wrapper also reports the store as
+    /// one its writer refuses uninitialized, so the journal declarations check it instead of
+    /// preceding the refusal.
     #[cfg(test)]
     fn uninitialized(mut self) -> Self {
         self.uninitialized = true;
+
+        self
+    }
+
+    /// Refuses every commit with [`Error::StreamHeadsNotMigrated`], as a lazily initializing
+    /// writer refuses a store that holds data without stream-heads. The journal declarations are
+    /// still made, and must be taken back afterwards.
+    #[cfg(test)]
+    fn unmigrated(mut self) -> Self {
+        self.unmigrated = true;
 
         self
     }
@@ -691,6 +707,10 @@ impl<R: FeatureMarker> FeatureMarker for Lagging<R> {
         self.inner.update_manifest(change)
     }
 
+    fn refuses_uninitialized(&self) -> bool {
+        self.uninitialized
+    }
+
     fn initialize(&self) -> impl Future<Output = Result<bool, Error>> + Send {
         self.inner.initialize()
     }
@@ -705,10 +725,15 @@ impl<R: Repository> Repository for Lagging<R> {
     ) -> impl Future<Output = Result<(), Error>> + Send {
         let fail = take(&self.transient_commits);
         let uninitialized = self.uninitialized;
+        let unmigrated = self.unmigrated;
 
         async move {
             if uninitialized {
                 return Err(Error::StoreNotInitialized);
+            }
+
+            if unmigrated {
+                return Err(Error::StreamHeadsNotMigrated);
             }
 
             if fail {
@@ -724,10 +749,15 @@ impl<R: Repository> Repository for Lagging<R> {
         commit: TransactionCommit<Self::Operation>,
     ) -> impl Future<Output = Result<(), Error>> + Send {
         let uninitialized = self.uninitialized;
+        let unmigrated = self.unmigrated;
 
         async move {
             if uninitialized {
                 return Err(Error::StoreNotInitialized);
+            }
+
+            if unmigrated {
+                return Err(Error::StreamHeadsNotMigrated);
             }
 
             self.inner.commit_transaction(commit).await
@@ -1778,11 +1808,12 @@ mod tests {
     use super::*;
     use crate::MemRepository;
 
-    /// A journaled commit to a store that is not initialized declares `journal` first (creating
-    /// the marker row) and is then refused: the declaration is taken back, so the marker does not
-    /// claim an extension on a store nothing journaled into.
+    /// A journaled commit to a store a strict writer refuses as uninitialized is refused before
+    /// any declaration: the marker is identical before and after, so a `StoreNotInitialized`
+    /// refusal writes nothing — no `journal` feature, no `historyDependent` entries forbidding
+    /// compaction, no bumped version.
     #[tokio::test]
-    async fn a_commit_to_an_uninitialized_store_leaves_no_journal_declaration() {
+    async fn a_commit_to_an_uninitialized_strict_store_declares_nothing() {
         let memory = MemRepository::new();
         let ns = namespace();
         let stream = Stream::new(&ns, "a", "ledger");
@@ -1791,9 +1822,42 @@ mod tests {
             journal(&ns),
         );
 
+        // A marker row that declares nothing: what a declaration made before the writer's refusal
+        // would have left behind.
+        memory.update_manifest(|_| {}).await.unwrap();
+        let before = memory.read_manifest().await.unwrap();
+
         let result = stream.commit(&journaled, stream.events(1..=1), None).await;
         assert!(
             matches!(result, Err(Error::StoreNotInitialized)),
+            "{result:?}"
+        );
+
+        assert_eq!(
+            memory.read_manifest().await.unwrap(),
+            before,
+            "the refusal writes nothing"
+        );
+        assert!(memory.events(&stream.id).await.unwrap().is_empty());
+    }
+
+    /// A journaled commit refused by a store that holds data without stream-heads (a lazily
+    /// initializing writer refuses it as unmigrated) takes back everything the attempt declared:
+    /// the `journal` feature, and the journaled entity types' `historyDependent` entries.
+    #[tokio::test]
+    async fn a_commit_to_an_unmigrated_store_retracts_every_declaration() {
+        let memory = MemRepository::new();
+        let ns = namespace();
+        let stream = Stream::new(&ns, "a", "ledger");
+        let journal = journal(&ns);
+        let journaled = JournalRepository::new(
+            Lagging::new(memory.clone(), 0).unmigrated(),
+            journal.clone(),
+        );
+
+        let result = stream.commit(&journaled, stream.events(1..=1), None).await;
+        assert!(
+            matches!(result, Err(Error::StreamHeadsNotMigrated)),
             "{result:?}"
         );
 
@@ -1803,6 +1867,13 @@ mod tests {
                 .as_ref()
                 .is_none_or(|manifest| !manifest.declares_journal()),
             "the journal declaration was retracted: {manifest:?}"
+        );
+        assert!(
+            manifest.as_ref().is_none_or(|manifest| journal
+                .entity_types()
+                .iter()
+                .all(|entity_type| !manifest.is_history_dependent(entity_type))),
+            "the history-dependent declarations were retracted: {manifest:?}"
         );
         assert!(memory.events(&stream.id).await.unwrap().is_empty());
     }

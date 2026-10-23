@@ -36,6 +36,7 @@ func (c *scanCountingClient) Scan(
 // with the default (non-lazy) writers: they refuse the uninitialized store, and only Initialize
 // scans it.
 func Test_StoreInitializationConformance(t *testing.T) {
+	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
 	writers := &scanCountingClient{FakeDynamo: fake}
 	marker := dynamo.NewRepository(fake, "events").FeatureMarker(nil)
@@ -60,7 +61,20 @@ func Test_StoreInitializationConformance(t *testing.T) {
 			},
 		})
 
-	require.Zero(t, writers.scans.Load(), "the second writer wrote and initialized nothing it had to scan for")
+	// Both handles initialize the empty store in the suite's concurrent case, and initialization
+	// is the one operation that scans. The writer's own paths — a commit to the initialized
+	// store, and an initialization of a store that already declares the feature — scan nothing.
+	writers.scans.Store(0)
+
+	writer := dynamo.NewRepository(writers, "events")
+	require.NoError(t, writer.Commit(ctx, evt.SerializedResult{Events: headEvents("scanless", 1, 1, "t")}))
+
+	var initializer evt.StoreInitializer = writer
+	declared, err := initializer.Initialize(ctx)
+	require.NoError(t, err)
+	require.False(t, declared, "an initialization of a store that declares the feature declares nothing")
+
+	require.Zero(t, writers.scans.Load(), "the writer's commits and idempotent initialization scan nothing")
 }
 
 // A writer never scans: on an uninitialized store every write path refuses it without one, and
