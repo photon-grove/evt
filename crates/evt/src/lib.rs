@@ -125,6 +125,11 @@ pub use views::{DEFAULT_VIEW_SK, ViewPage, ViewRepository};
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
+// The repository's front-page README, outside the published package, so only doctest builds read it.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct RootReadmeDoctests;
+
 #[doc(hidden)]
 pub mod __private {
     pub use serde_json;

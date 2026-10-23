@@ -44,7 +44,7 @@ that each driver creates itself — evt defines no PostgreSQL view schema, so th
 one, with the statements both drivers issue (a plain `INSERT` for an `absent` put, an upsert
 otherwise, and a `DELETE`).
 
-The live runs need the local stacks from the root [README](../README.md#local-development). Moon
+The live runs need the local stacks from [CONTRIBUTING.md](../CONTRIBUTING.md#integration-tests). Moon
 runs them, together with the Rust conformance suite, as `evt-rust:integration` and
 `evt-rust:integration-postgres`.
 
