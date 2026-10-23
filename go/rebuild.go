@@ -28,10 +28,10 @@ type RebuildConfig struct {
 	// Zero means no limit.
 	MaxErrors int
 
-	// SeedEntity enables snapshot-aware replay. It is required after CompactBelow because deleted
+	// SeedAggregate enables snapshot-aware replay. It is required after CompactBelow because deleted
 	// events cannot be fully replayed. The repository must implement SnapshotStreamer; nil uses
 	// StreamEntities for full replay.
-	SeedEntity SnapshotSeeder
+	SeedAggregate SnapshotSeeder
 
 	// OnProgress, if non-nil, is called after each entity is successfully processed
 	// by the projectors or when an error is encountered (stream, projector, or commit).
@@ -47,7 +47,7 @@ type RebuildConfig struct {
 // RebuildResult summarizes a projection rebuild run.
 //
 // Note: Processed counts only entities where all projectors succeeded.
-// Entities that produced errors are counted in Errors, not Processed or Skipped.
+// Aggregates that produced errors are counted in Errors, not Processed or Skipped.
 type RebuildResult struct {
 	// Processed is the number of entities successfully replayed through all projectors.
 	Processed int
@@ -61,7 +61,7 @@ type RebuildResult struct {
 }
 
 // RebuildProjections replays all entities from the repository through the configured projectors,
-// regenerating view data. Entities are streamed via StreamEntities, so this works with any
+// regenerating view data. Aggregates are streamed via StreamEntities, so this works with any
 // Repository implementation.
 //
 // The applyEvent callback is the same function used by StreamEntities to reconstitute entities
@@ -74,7 +74,7 @@ type RebuildResult struct {
 func RebuildProjections(
 	ctx context.Context,
 	repo Repository,
-	applyEvent func(context.Context, SerializedEvent, Entity) (Entity, error),
+	applyEvent func(context.Context, SerializedEvent, Aggregate) (Aggregate, error),
 	cfg RebuildConfig,
 ) (*RebuildResult, error) {
 	if applyEvent == nil {
@@ -109,18 +109,18 @@ func RebuildProjections(
 // per-entity type check below is a defensive backstop, not the primary filter.
 func RebuildProjectionsFromStream(
 	ctx context.Context,
-	stream <-chan result.Result[Entity],
+	stream <-chan result.Result[Aggregate],
 	cfg RebuildConfig,
 ) (*RebuildResult, error) {
 	// The stream may already be running (its producer started when the caller built it). On a
 	// config error, drain it in the background so that producer does not block forever on an
 	// abandoned consumer.
 	if len(cfg.Projectors) == 0 {
-		go drainEntityStream(stream)
+		go drainAggregateStream(stream)
 		return nil, fmt.Errorf("at least one projector is required")
 	}
 	if !cfg.DryRun && cfg.CommitGroup == nil {
-		go drainEntityStream(stream)
+		go drainAggregateStream(stream)
 		return nil, fmt.Errorf("CommitGroup is required when DryRun is false")
 	}
 
@@ -131,12 +131,12 @@ func RebuildProjectionsFromStream(
 
 	res := &RebuildResult{}
 
-	for entityResult := range stream {
+	for aggregateResult := range stream {
 		if ctx.Err() != nil {
 			return res, ctx.Err()
 		}
 
-		entity, err := entityResult.Unwrap()
+		aggregate, err := aggregateResult.Unwrap()
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Errorf("streaming entity: %w", err))
 			reportProgress(cfg.OnProgress, res.Processed, len(res.Errors))
@@ -146,25 +146,25 @@ func RebuildProjectionsFromStream(
 			continue
 		}
 
-		if entity == nil {
+		if aggregate == nil {
 			res.Skipped++
 			continue
 		}
 
 		// Double-check entity type in case the storage-level filter is approximate
 		// (e.g., in-memory repo ignores expressions).
-		if cfg.EntityType != "" && entity.Type() != cfg.EntityType {
+		if cfg.EntityType != "" && aggregate.Type() != cfg.EntityType {
 			res.Skipped++
 			continue
 		}
 
 		rebuildLogger := logger.With(
-			slog.String("entity_id", string(entity.GetID())),
-			slog.String("entity_type", string(entity.Type())),
+			slog.String("entity_id", string(aggregate.GetID())),
+			slog.String("entity_type", string(aggregate.Type())),
 		)
 
-		if err := projectEntity(ctx, entity, cfg, rebuildLogger); err != nil {
-			res.Errors = append(res.Errors, fmt.Errorf("entity %s: %w", entity.GetID(), err))
+		if err := projectAggregate(ctx, aggregate, cfg, rebuildLogger); err != nil {
+			res.Errors = append(res.Errors, fmt.Errorf("entity %s: %w", aggregate.GetID(), err))
 			reportProgress(cfg.OnProgress, res.Processed, len(res.Errors))
 			if cfg.MaxErrors > 0 && len(res.Errors) >= cfg.MaxErrors {
 				return res, fmt.Errorf("rebuild stopped: reached MaxErrors limit (%d)", cfg.MaxErrors)
@@ -191,25 +191,25 @@ func RebuildProjectionsFromStream(
 	return res, nil
 }
 
-// drainEntityStream consumes a stream to completion, discarding results. It is used to release a
+// drainAggregateStream consumes a stream to completion, discarding results. It is used to release a
 // prestarted stream's producer when the rebuild returns before consuming the stream itself.
-func drainEntityStream(stream <-chan result.Result[Entity]) {
+func drainAggregateStream(stream <-chan result.Result[Aggregate]) {
 	for range stream { //nolint:revive // intentional drain: empty body releases the producer
 	}
 }
 
-// selectRebuildStream chooses the entity stream for a rebuild. When cfg.SeedEntity is set it uses
+// selectRebuildStream chooses the entity stream for a rebuild. When cfg.SeedAggregate is set it uses
 // the snapshot-aware path (required for correctness after compaction); otherwise it uses the
 // default scan-based StreamEntities path. The returned stream is already running, so callers must
 // consume or drain it.
 func selectRebuildStream(
 	ctx context.Context,
 	repo Repository,
-	applyEvent func(context.Context, SerializedEvent, Entity) (Entity, error),
+	applyEvent func(context.Context, SerializedEvent, Aggregate) (Aggregate, error),
 	filter StreamFilter,
 	cfg RebuildConfig,
-) (<-chan result.Result[Entity], error) {
-	if cfg.SeedEntity == nil {
+) (<-chan result.Result[Aggregate], error) {
+	if cfg.SeedAggregate == nil {
 		return repo.StreamEntities(ctx, filter, applyEvent), nil
 	}
 
@@ -221,20 +221,20 @@ func selectRebuildStream(
 		)
 	}
 
-	return streamer.StreamEntitiesFromSnapshots(ctx, cfg.EntityType, cfg.SeedEntity, applyEvent), nil
+	return streamer.StreamEntitiesFromSnapshots(ctx, cfg.EntityType, cfg.SeedAggregate, applyEvent), nil
 }
 
-// projectEntity runs all projectors for a single entity and commits the resulting view writes.
-func projectEntity(
+// projectAggregate runs all projectors for a single entity and commits the resulting view writes.
+func projectAggregate(
 	ctx context.Context,
-	entity Entity,
+	aggregate Aggregate,
 	cfg RebuildConfig,
 	logger *slog.Logger,
 ) error {
 	for _, projector := range cfg.Projectors {
 		// Projectors receive nil events during rebuild — the entity already has its final state
 		// applied. Passing nil signals "full rebuild" rather than incremental projection.
-		txnGroup, err := projector.Project(ctx, entity, nil)
+		txnGroup, err := projector.Project(ctx, aggregate, nil)
 		if err != nil {
 			return fmt.Errorf("projector error: %w", err)
 		}

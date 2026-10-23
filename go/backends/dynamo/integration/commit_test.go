@@ -14,12 +14,12 @@ import (
 func (s *DynamoEventsIntegrationSuite) Test_Commit_Success() {
 	ctx := context.Background()
 
-	s.SetupEntity(evt.EntityID(newID()), 2)
+	s.SetupAggregate(evt.EntityID(newID()), 2)
 
 	metadata := s.getMetadata(ctx)
 	otherValue := "test-other-value"
 
-	result, err := s.entity.Handle(ctx, &test.CreateEntity{
+	result, err := s.aggregate.Handle(ctx, &test.CreateAggregate{
 		Value: "test-value",
 		Other: &otherValue,
 	})
@@ -66,7 +66,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Success() {
 func (s *DynamoEventsIntegrationSuite) Test_Commit_Empty() {
 	ctx := context.Background()
 
-	s.SetupEntity(evt.EntityID(newID()), 2)
+	s.SetupAggregate(evt.EntityID(newID()), 2)
 
 	metadata := s.getMetadata(ctx)
 	resultEvents := make([]evt.Event, 0)

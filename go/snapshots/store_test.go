@@ -1,7 +1,7 @@
 package snapshots_test
 
 // These tests exercise the public event store surface (Execute,
-// LoadEntity, Commit) with mocks to cover orchestration and error handling
+// LoadAggregate, Commit) with mocks to cover orchestration and error handling
 // paths that are hard to reach with the end-to-end snapshot fixtures alone.
 
 import (
@@ -36,15 +36,15 @@ func TestExecute_Success(t *testing.T) {
 	ctx := context.Background()
 	metadata := newTestMetadata()
 
-	entity := test.NewEntity(setup.entityID)
-	command := &test.CreateEntity{Value: "execute-value", Other: stringPtr("execute-other")}
+	aggregate := test.NewAggregate(setup.entityID)
+	command := &test.CreateAggregate{Value: "execute-value", Other: stringPtr("execute-other")}
 
-	err := setup.store.Execute(ctx, entity, setup.entityID, command, metadata)
+	err := setup.store.Execute(ctx, aggregate, setup.entityID, command, metadata)
 	require.NoError(t, err)
 
 	// Verify the entity was updated
-	require.Equal(t, "execute-value", entity.Value)
-	require.Equal(t, "execute-other", *entity.Other)
+	require.Equal(t, "execute-value", aggregate.Value)
+	require.Equal(t, "execute-other", *aggregate.Other)
 
 	// Verify events were committed
 	events := getEvents(t, setup.repo, setup.entityID)
@@ -53,8 +53,8 @@ func TestExecute_Success(t *testing.T) {
 	require.Equal(t, test.CreatedEvent, events[0].Type)
 }
 
-// Test Execute method with LoadEntity error
-func TestExecute_LoadEntityError(t *testing.T) {
+// Test Execute method with LoadAggregate error
+func TestExecute_LoadAggregateError(t *testing.T) {
 	// Create a mock repo that fails on GetSnapshot
 	mockRepo := &MockRepository{
 		getSnapshotError: errors.New("snapshot load failed"),
@@ -63,10 +63,10 @@ func TestExecute_LoadEntityError(t *testing.T) {
 	ctx := context.Background()
 	metadata := newTestMetadata()
 
-	entity := test.NewEntity("test-id")
-	command := &test.CreateEntity{Value: "test-value"}
+	aggregate := test.NewAggregate("test-id")
+	command := &test.CreateAggregate{Value: "test-value"}
 
-	err := store.Execute(ctx, entity, "test-id", command, metadata)
+	err := store.Execute(ctx, aggregate, "test-id", command, metadata)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "snapshot load failed")
 }
@@ -74,7 +74,7 @@ func TestExecute_LoadEntityError(t *testing.T) {
 // Test Execute method with Handle error
 func TestExecute_HandleError(t *testing.T) {
 	// Use a mock entity that will handle our MockCommand
-	mockEntity := &MockEntity{
+	mockAggregate := &MockAggregate{
 		ID:          "test-execute-handle-error",
 		handleError: errors.New("handle failed"),
 	}
@@ -87,7 +87,7 @@ func TestExecute_HandleError(t *testing.T) {
 	// Create a command that will cause the entity to fail
 	command := &MockCommand{handleError: errors.New("handle failed")}
 
-	err := store.Execute(ctx, mockEntity, "test-execute-handle-error", command, metadata)
+	err := store.Execute(ctx, mockAggregate, "test-execute-handle-error", command, metadata)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "handle failed")
 }
@@ -102,10 +102,10 @@ func TestExecute_CommitError(t *testing.T) {
 	ctx := context.Background()
 	metadata := newTestMetadata()
 
-	entity := test.NewEntity("test-id")
-	command := &test.CreateEntity{Value: "test-value"}
+	aggregate := test.NewAggregate("test-id")
+	command := &test.CreateAggregate{Value: "test-value"}
 
-	err := store.Execute(ctx, entity, "test-id", command, metadata)
+	err := store.Execute(ctx, aggregate, "test-id", command, metadata)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "commit failed")
 }
@@ -117,34 +117,34 @@ func TestExecute_ApplyError(t *testing.T) {
 	metadata := newTestMetadata()
 
 	// Create a mock entity that fails on Apply
-	entity := &MockEntity{
+	aggregate := &MockAggregate{
 		ID:         setup.entityID,
 		applyError: errors.New("apply failed"),
 	}
-	command := &test.CreateEntity{Value: "test-value"}
+	command := &test.CreateAggregate{Value: "test-value"}
 
-	err := setup.store.Execute(ctx, entity, setup.entityID, command, metadata)
+	err := setup.store.Execute(ctx, aggregate, setup.entityID, command, metadata)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "apply failed")
 }
 
-// Test LoadEntity with GetSnapshot error
-func TestLoadEntity_GetSnapshotError(t *testing.T) {
+// Test LoadAggregate with GetSnapshot error
+func TestLoadAggregate_GetSnapshotError(t *testing.T) {
 	mockRepo := &MockRepository{
 		getSnapshotError: errors.New("get snapshot failed"),
 	}
 	store := snapshots.NewStore(mockRepo, 5)
 	ctx := context.Background()
 
-	entity := test.NewEntity("test-id")
-	_, err := store.LoadEntity(ctx, entity, "test-id")
+	aggregate := test.NewAggregate("test-id")
+	_, err := store.LoadAggregate(ctx, aggregate, "test-id")
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "get snapshot failed")
 }
 
-// Test LoadEntity with snapshot unmarshal error
-func TestLoadEntity_UnmarshalError(t *testing.T) {
+// Test LoadAggregate with snapshot unmarshal error
+func TestLoadAggregate_UnmarshalError(t *testing.T) {
 	mockRepo := &MockRepository{
 		snapshot: &evt.SerializedSnapshot{
 			EntityType:    "TestEntity",
@@ -157,17 +157,17 @@ func TestLoadEntity_UnmarshalError(t *testing.T) {
 	store := snapshots.NewStore(mockRepo, 5)
 	ctx := context.Background()
 
-	entity := test.NewEntity("test-id")
-	_, err := store.LoadEntity(ctx, entity, "test-id")
+	aggregate := test.NewAggregate("test-id")
+	_, err := store.LoadAggregate(ctx, aggregate, "test-id")
 
 	require.Error(t, err)
 	// Error should be related to JSON unmarshaling
 	require.Contains(t, err.Error(), "invalid character")
 }
 
-// Test LoadEntity with GetLatestEvents error (with snapshot)
-func TestLoadEntity_GetLatestEventsError(t *testing.T) {
-	payload, mErr := json.Marshal(test.Entity{
+// Test LoadAggregate with GetLatestEvents error (with snapshot)
+func TestLoadAggregate_GetLatestEventsError(t *testing.T) {
+	payload, mErr := json.Marshal(test.Aggregate{
 		ID:    "test-id",
 		Value: "snapshot-value",
 	})
@@ -186,30 +186,30 @@ func TestLoadEntity_GetLatestEventsError(t *testing.T) {
 	store := snapshots.NewStore(mockRepo, 5)
 	ctx := context.Background()
 
-	entity := test.NewEntity("test-id")
-	_, err := store.LoadEntity(ctx, entity, "test-id")
+	aggregate := test.NewAggregate("test-id")
+	_, err := store.LoadAggregate(ctx, aggregate, "test-id")
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "get latest events failed")
 }
 
-// Test LoadEntity with GetEvents error (no snapshot)
-func TestLoadEntity_GetEventsError(t *testing.T) {
+// Test LoadAggregate with GetEvents error (no snapshot)
+func TestLoadAggregate_GetEventsError(t *testing.T) {
 	mockRepo := &MockRepository{
 		getEventsError: errors.New("get events failed"),
 	}
 	store := snapshots.NewStore(mockRepo, 5)
 	ctx := context.Background()
 
-	entity := test.NewEntity("test-id")
-	_, err := store.LoadEntity(ctx, entity, "test-id")
+	aggregate := test.NewAggregate("test-id")
+	_, err := store.LoadAggregate(ctx, aggregate, "test-id")
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "get events failed")
 }
 
-// Test LoadEntity with event apply error
-func TestLoadEntity_ApplyEventError(t *testing.T) {
+// Test LoadAggregate with event apply error
+func TestLoadAggregate_ApplyEventError(t *testing.T) {
 	// Create a serialized event that will fail to apply
 	metadata := newTestMetadata()
 	serializedEvent := createExpectedEvent(
@@ -228,12 +228,12 @@ func TestLoadEntity_ApplyEventError(t *testing.T) {
 	ctx := context.Background()
 
 	// Use mock entity that fails on Apply
-	entity := &MockEntity{
+	aggregate := &MockAggregate{
 		ID:         "test-id",
 		applyError: errors.New("apply event failed"),
 	}
 
-	_, err := store.LoadEntity(ctx, entity, "test-id")
+	_, err := store.LoadAggregate(ctx, aggregate, "test-id")
 
 	require.Error(t, err)
 	// The error will be from the DeserializeEvent method since that's called first
@@ -248,17 +248,17 @@ func TestCommit_UpdateSnapshotError(t *testing.T) {
 	metadata := newTestMetadata()
 
 	// Create events that will trigger snapshot
-	command := &test.CreateEntity{Value: "test-value"}
-	result := handleCommand(t, setup.entity, command)
+	command := &test.CreateAggregate{Value: "test-value"}
+	result := handleCommand(t, setup.aggregate, command)
 
 	// Use a mock entity that fails during snapshot generation
-	mockEntity := &MockEntity{
+	mockAggregate := &MockAggregate{
 		ID:            setup.entityID,
 		snapshotError: true,
 	}
 
 	eventContext := evt.Context{
-		Entity:          mockEntity,
+		Aggregate:       mockAggregate,
 		EntityID:        setup.entityID,
 		CurrentSequence: intPtr(0),
 		CurrentSnapshot: intPtr(0),
@@ -277,12 +277,12 @@ func TestUpdateSnapshotSequence_NilSnapshot(t *testing.T) {
 	ctx := context.Background()
 	metadata := newTestMetadata()
 
-	command := &test.CreateEntity{Value: "test-value"}
-	result := handleCommand(t, setup.entity, command)
+	command := &test.CreateAggregate{Value: "test-value"}
+	result := handleCommand(t, setup.aggregate, command)
 
 	// Manually create event context with nil CurrentSnapshot to test initialization behavior
 	eventContext := evt.Context{
-		Entity:          setup.entity,
+		Aggregate:       setup.aggregate,
 		EntityID:        setup.entityID,
 		CurrentSequence: intPtr(0),
 		CurrentSnapshot: nil,
@@ -302,8 +302,8 @@ func Test_EventStore_CommitSimpleEvents_Success(t *testing.T) {
 	metadata := newTestMetadata()
 	testOtherValue := "test-other-value"
 
-	command := createEntityCommand("test-value", &testOtherValue)
-	result := handleCommand(t, setup.entity, &command)
+	command := createAggregateCommand("test-value", &testOtherValue)
+	result := handleCommand(t, setup.aggregate, &command)
 
 	payload := marshalCreatedEvent(t, setup.entityID, command.Value, command.Other)
 	expected := []evt.SerializedEvent{
@@ -333,11 +333,11 @@ func Test_EventStore_LoadWithEvents_Success(t *testing.T) {
 	otherValue := "test-other-value"
 
 	// Add with an initial value
-	createCommand := createEntityCommand("test-value", &otherValue)
-	result := handleCommand(t, setup.entity, &createCommand)
+	createCommand := createAggregateCommand("test-value", &otherValue)
+	result := handleCommand(t, setup.aggregate, &createCommand)
 
-	updateCommand := replaceEntityCommand(updatedValue, &otherValue)
-	updateResult := handleCommand(t, setup.entity, &updateCommand)
+	updateCommand := replaceAggregateCommand(updatedValue, &otherValue)
+	updateResult := handleCommand(t, setup.aggregate, &updateCommand)
 
 	// Combine results
 	combinedResult := combineResults(result, updateResult)
@@ -348,7 +348,7 @@ func Test_EventStore_LoadWithEvents_Success(t *testing.T) {
 	setup.refresh(t)
 
 	// The hydrated entity should have the updated value (ignore exact timestamps)
-	assertEntityMatches(t, *setup.entity, setup.entityID, "updated-value", &otherValue)
+	assertAggregateMatches(t, *setup.aggregate, setup.entityID, "updated-value", &otherValue)
 }
 
 func Test_EventStore_SnapshotCommit_Success(t *testing.T) {
@@ -360,14 +360,14 @@ func Test_EventStore_SnapshotCommit_Success(t *testing.T) {
 	otherValue := "test-other-value"
 
 	// Create entity and handle multiple updates to trigger snapshot
-	createCommand := createEntityCommand("test-value", &otherValue)
-	result := handleCommand(t, setup.entity, &createCommand)
+	createCommand := createAggregateCommand("test-value", &otherValue)
+	result := handleCommand(t, setup.aggregate, &createCommand)
 
-	updateValueCommand := replaceEntityCommand(updatedValue, &otherValue)
-	updateValueResult := handleCommand(t, setup.entity, &updateValueCommand)
+	updateValueCommand := replaceAggregateCommand(updatedValue, &otherValue)
+	updateValueResult := handleCommand(t, setup.aggregate, &updateValueCommand)
 
-	updateOtherCommand := replaceEntityCommand(updatedValue, &intermediateOther)
-	updateOtherResult := handleCommand(t, setup.entity, &updateOtherCommand)
+	updateOtherCommand := replaceAggregateCommand(updatedValue, &intermediateOther)
+	updateOtherResult := handleCommand(t, setup.aggregate, &updateOtherCommand)
 
 	// Combine all results
 	firstBatchResult := combineResults(result, updateValueResult, updateOtherResult)
@@ -382,16 +382,16 @@ func Test_EventStore_SnapshotCommit_Success(t *testing.T) {
 	require.Equal(t, setup.entityID, snapshot.EntityID)
 	require.Equal(t, evt.EventSequence(1), snapshot.Sequence)
 	require.Equal(t, evt.EventSequence(3), snapshot.EventSequence)
-	var snapEntity test.Entity
-	require.NoError(t, json.Unmarshal(snapshot.Payload, &snapEntity))
-	assertEntityMatches(t, snapEntity, setup.entityID, updatedValue, &intermediateOther)
+	var snapAggregate test.Aggregate
+	require.NoError(t, json.Unmarshal(snapshot.Payload, &snapAggregate))
+	assertAggregateMatches(t, snapAggregate, setup.entityID, updatedValue, &intermediateOther)
 
 	// Add more events to trigger another snapshot
-	nextCommand1 := replaceEntityCommand(updatedValue, &intermediateOther)
-	nextResult1 := handleCommand(t, setup.entity, &nextCommand1)
+	nextCommand1 := replaceAggregateCommand(updatedValue, &intermediateOther)
+	nextResult1 := handleCommand(t, setup.aggregate, &nextCommand1)
 
-	nextCommand2 := replaceEntityCommand(updatedValue, &updatedOther)
-	nextResult2 := handleCommand(t, setup.entity, &nextCommand2)
+	nextCommand2 := replaceAggregateCommand(updatedValue, &updatedOther)
+	nextResult2 := handleCommand(t, setup.aggregate, &nextCommand2)
 
 	secondBatchResult := combineResults(nextResult1, nextResult2)
 	commitEvents(t, setup.store, secondBatchResult, setup.eventContext, metadata)
@@ -405,14 +405,14 @@ func Test_EventStore_SnapshotCommit_Success(t *testing.T) {
 	require.Equal(t, setup.entityID, snapshot.EntityID)
 	require.Equal(t, evt.EventSequence(2), snapshot.Sequence)
 	require.Equal(t, evt.EventSequence(5), snapshot.EventSequence)
-	var snapEntity2 test.Entity
-	require.NoError(t, json.Unmarshal(snapshot.Payload, &snapEntity2))
-	assertEntityMatches(t, snapEntity2, setup.entityID, updatedValue, &updatedOther)
+	var snapAggregate2 test.Aggregate
+	require.NoError(t, json.Unmarshal(snapshot.Payload, &snapAggregate2))
+	assertAggregateMatches(t, snapAggregate2, setup.entityID, updatedValue, &updatedOther)
 
 	// Verify all events were captured
 	committedSerializedEvents := getEvents(t, setup.repo, setup.entityID)
 	expectedCombinedResult := combineResults(firstBatchResult, secondBatchResult)
-	committedEvents := deserializeEvents(t, committedSerializedEvents, setup.eventContext.Entity)
+	committedEvents := deserializeEvents(t, committedSerializedEvents, setup.eventContext.Aggregate)
 	require.Equal(t, expectedCombinedResult.Events, committedEvents)
 }
 
@@ -425,29 +425,29 @@ func Test_EventStore_LoadWithSnapshot_Success(t *testing.T) {
 	otherValue := "test-other-value"
 
 	// Create entity and build up to snapshot
-	createCommand := createEntityCommand("test-value", &otherValue)
-	result := handleCommand(t, setup.entity, &createCommand)
+	createCommand := createAggregateCommand("test-value", &otherValue)
+	result := handleCommand(t, setup.aggregate, &createCommand)
 
-	updateValueCommand := replaceEntityCommand(updatedValue, &otherValue)
-	updateValueResult := handleCommand(t, setup.entity, &updateValueCommand)
+	updateValueCommand := replaceAggregateCommand(updatedValue, &otherValue)
+	updateValueResult := handleCommand(t, setup.aggregate, &updateValueCommand)
 
-	updateOtherCommand := replaceEntityCommand(updatedValue, &intermediateOther)
-	updateOtherResult := handleCommand(t, setup.entity, &updateOtherCommand)
+	updateOtherCommand := replaceAggregateCommand(updatedValue, &intermediateOther)
+	updateOtherResult := handleCommand(t, setup.aggregate, &updateOtherCommand)
 
 	// Combine and commit first batch (this will create a snapshot)
 	firstBatchResult := combineResults(result, updateValueResult, updateOtherResult)
 	commitEvents(t, setup.store, firstBatchResult, setup.eventContext, metadata)
 
 	// Add one more event (this will be after the snapshot)
-	finalCommand := replaceEntityCommand(updatedValue, &updatedOther)
-	finalResult := handleCommand(t, setup.entity, &finalCommand)
+	finalCommand := replaceAggregateCommand(updatedValue, &updatedOther)
+	finalResult := handleCommand(t, setup.aggregate, &finalCommand)
 	commitEvents(t, setup.store, finalResult, setup.eventContext, metadata)
 
 	// Refresh the setup to load from snapshot + events
 	setup.refresh(t)
 
 	// The hydrated entity should have the final values (ignore exact timestamps)
-	assertEntityMatches(t, *setup.entity, setup.entityID, updatedValue, &updatedOther)
+	assertAggregateMatches(t, *setup.aggregate, setup.entityID, updatedValue, &updatedOther)
 }
 
 // --- Command Dedupe Guard Tests ---
@@ -464,8 +464,8 @@ func TestCommit_DuplicateCommandID_ReturnsError(t *testing.T) {
 	}
 
 	// First commit succeeds
-	command := &test.CreateEntity{Value: "initial", Other: stringPtr("other")}
-	result := handleCommand(t, setup.entity, command)
+	command := &test.CreateAggregate{Value: "initial", Other: stringPtr("other")}
+	result := handleCommand(t, setup.aggregate, command)
 	_, err := setup.store.Commit(ctx, result, setup.eventContext, metadata)
 	require.NoError(t, err)
 
@@ -473,8 +473,8 @@ func TestCommit_DuplicateCommandID_ReturnsError(t *testing.T) {
 	setup.refresh(t)
 
 	// Second commit with the same commandId must be rejected
-	command2 := &test.CreateEntity{Value: "retry"}
-	result2 := handleCommand(t, setup.entity, command2)
+	command2 := &test.CreateAggregate{Value: "retry"}
+	result2 := handleCommand(t, setup.aggregate, command2)
 	_, err = setup.store.Commit(ctx, result2, setup.eventContext, metadata)
 	require.Error(t, err)
 	require.True(t, evt.IsDuplicateCommandErr(err), "expected DuplicateCommandError, got: %v", err)
@@ -488,8 +488,8 @@ func TestCommit_DifferentCommandIDs_Accepted(t *testing.T) {
 	cmdID1 := evt.CommandID("cmd-aaa")
 	meta1 := evt.Metadata{Region: "us-east-1", CommandID: &cmdID1}
 
-	command := &test.CreateEntity{Value: "v1", Other: stringPtr("o1")}
-	result := handleCommand(t, setup.entity, command)
+	command := &test.CreateAggregate{Value: "v1", Other: stringPtr("o1")}
+	result := handleCommand(t, setup.aggregate, command)
 	_, err := setup.store.Commit(ctx, result, setup.eventContext, meta1)
 	require.NoError(t, err)
 
@@ -499,8 +499,8 @@ func TestCommit_DifferentCommandIDs_Accepted(t *testing.T) {
 	cmdID2 := evt.CommandID("cmd-bbb")
 	meta2 := evt.Metadata{Region: "us-east-1", CommandID: &cmdID2}
 
-	command2 := &test.ReplaceEntity{Value: "v2", Other: stringPtr("o2")}
-	result2 := handleCommand(t, setup.entity, command2)
+	command2 := &test.ReplaceAggregate{Value: "v2", Other: stringPtr("o2")}
+	result2 := handleCommand(t, setup.aggregate, command2)
 	_, err = setup.store.Commit(ctx, result2, setup.eventContext, meta2)
 	require.NoError(t, err)
 }
@@ -513,16 +513,16 @@ func TestExecute_DuplicateCommandID_ReturnsError(t *testing.T) {
 	cmdID := evt.CommandID("cmd-exec-001")
 	metadata := evt.Metadata{Region: "us-east-1", CommandID: &cmdID}
 
-	entity := test.NewEntity(setup.entityID)
-	command := &test.CreateEntity{Value: "first"}
+	aggregate := test.NewAggregate(setup.entityID)
+	command := &test.CreateAggregate{Value: "first"}
 
 	// First execution succeeds
-	err := setup.store.Execute(ctx, entity, setup.entityID, command, metadata)
+	err := setup.store.Execute(ctx, aggregate, setup.entityID, command, metadata)
 	require.NoError(t, err)
 
 	// Second execution with same commandId is an idempotent duplicate
-	entity2 := test.NewEntity(setup.entityID)
-	err = setup.store.Execute(ctx, entity2, setup.entityID, command, metadata)
+	aggregate2 := test.NewAggregate(setup.entityID)
+	err = setup.store.Execute(ctx, aggregate2, setup.entityID, command, metadata)
 	require.Error(t, err)
 	require.True(t, evt.IsDuplicateCommandErr(err), "expected DuplicateCommandError, got: %v", err)
 }
@@ -535,15 +535,15 @@ func TestExecute_DifferentCommandIDs_Accepted(t *testing.T) {
 	cmdID1 := evt.CommandID("cmd-x1")
 	meta1 := evt.Metadata{Region: "us-east-1", CommandID: &cmdID1}
 
-	entity1 := test.NewEntity(setup.entityID)
-	err := setup.store.Execute(ctx, entity1, setup.entityID, &test.CreateEntity{Value: "first"}, meta1)
+	aggregate1 := test.NewAggregate(setup.entityID)
+	err := setup.store.Execute(ctx, aggregate1, setup.entityID, &test.CreateAggregate{Value: "first"}, meta1)
 	require.NoError(t, err)
 
 	cmdID2 := evt.CommandID("cmd-x2")
 	meta2 := evt.Metadata{Region: "us-east-1", CommandID: &cmdID2}
 
-	entity2 := test.NewEntity(setup.entityID)
-	err = setup.store.Execute(ctx, entity2, setup.entityID, &test.ReplaceEntity{Value: "second"}, meta2)
+	aggregate2 := test.NewAggregate(setup.entityID)
+	err = setup.store.Execute(ctx, aggregate2, setup.entityID, &test.ReplaceAggregate{Value: "second"}, meta2)
 	require.NoError(t, err)
 }
 
@@ -557,20 +557,20 @@ func TestExecute_SetID_OverridesEntityID(t *testing.T) {
 	abbreviatedID := evt.EntityID("abbreviated-id")
 	storeKey := evt.EntityID("scoped:abbreviated-id:2026-02-23")
 
-	entity := &SetIDMockEntity{
-		MockEntity: MockEntity{
+	aggregate := &SetIDMockAggregate{
+		MockAggregate: MockAggregate{
 			ID: abbreviatedID,
 		},
 	}
-	command := &test.CreateEntity{Value: "setid-value"}
+	command := &test.CreateAggregate{Value: "setid-value"}
 
-	err := setup.store.Execute(ctx, entity, storeKey, command, metadata)
+	err := setup.store.Execute(ctx, aggregate, storeKey, command, metadata)
 	require.NoError(t, err)
 
 	// Verify SetID was called with the store key
-	require.True(t, entity.setIDCalled, "SetID should have been called")
-	require.Equal(t, storeKey, entity.setIDValue, "SetID should receive the store's entity ID")
-	require.Equal(t, storeKey, entity.GetID(), "GetID should return the overridden ID")
+	require.True(t, aggregate.setIDCalled, "SetID should have been called")
+	require.Equal(t, storeKey, aggregate.setIDValue, "SetID should receive the store's entity ID")
+	require.Equal(t, storeKey, aggregate.GetID(), "GetID should return the overridden ID")
 }
 
 // Test Execute does not panic when entity does not implement SetID
@@ -579,13 +579,13 @@ func TestExecute_WithoutSetID_Succeeds(t *testing.T) {
 	ctx := context.Background()
 	metadata := newTestMetadata()
 
-	// MockEntity does not implement SetID — Execute should still work fine
-	entity := &MockEntity{
+	// MockAggregate does not implement SetID — Execute should still work fine
+	aggregate := &MockAggregate{
 		ID: "test-no-setid",
 	}
-	command := &test.CreateEntity{Value: "no-setid-value"}
+	command := &test.CreateAggregate{Value: "no-setid-value"}
 
-	err := setup.store.Execute(ctx, entity, "test-no-setid", command, metadata)
+	err := setup.store.Execute(ctx, aggregate, "test-no-setid", command, metadata)
 	require.NoError(t, err)
 }
 
@@ -596,15 +596,15 @@ func TestCommit_NilCommandID_Bypasses(t *testing.T) {
 
 	metadata := evt.Metadata{Region: "us-east-1"} // no CommandID
 
-	command := &test.CreateEntity{Value: "v1"}
-	result := handleCommand(t, setup.entity, command)
+	command := &test.CreateAggregate{Value: "v1"}
+	result := handleCommand(t, setup.aggregate, command)
 	_, err := setup.store.Commit(ctx, result, setup.eventContext, metadata)
 	require.NoError(t, err)
 
 	// Reload and commit again without commandId — should succeed
 	setup.refresh(t)
-	command2 := &test.ReplaceEntity{Value: "v2"}
-	result2 := handleCommand(t, setup.entity, command2)
+	command2 := &test.ReplaceAggregate{Value: "v2"}
+	result2 := handleCommand(t, setup.aggregate, command2)
 	_, err = setup.store.Commit(ctx, result2, setup.eventContext, metadata)
 	require.NoError(t, err)
 }
@@ -617,16 +617,16 @@ func TestDedupe_NoExtraEventsOnRetry(t *testing.T) {
 	cmdID := evt.CommandID("cmd-once")
 	metadata := evt.Metadata{Region: "us-east-1", CommandID: &cmdID}
 
-	entity := test.NewEntity(setup.entityID)
-	err := setup.store.Execute(ctx, entity, setup.entityID, &test.CreateEntity{Value: "once"}, metadata)
+	aggregate := test.NewAggregate(setup.entityID)
+	err := setup.store.Execute(ctx, aggregate, setup.entityID, &test.CreateAggregate{Value: "once"}, metadata)
 	require.NoError(t, err)
 
 	events := getEvents(t, setup.repo, setup.entityID)
 	require.Len(t, events, 1, "should have exactly 1 event after first execute")
 
 	// Retry — must not add events
-	entity2 := test.NewEntity(setup.entityID)
-	err = setup.store.Execute(ctx, entity2, setup.entityID, &test.CreateEntity{Value: "once"}, metadata)
+	aggregate2 := test.NewAggregate(setup.entityID)
+	err = setup.store.Execute(ctx, aggregate2, setup.entityID, &test.CreateAggregate{Value: "once"}, metadata)
 	require.True(t, evt.IsDuplicateCommandErr(err))
 
 	events = getEvents(t, setup.repo, setup.entityID)
@@ -655,12 +655,12 @@ func Test_EventStore_MultiBoundaryBatch_ReloadIsCurrent(t *testing.T) {
 
 	// Build a single 10-event batch: 1 create + 9 replaces. The last replace sets the final value.
 	results := []evt.CommandResult{
-		handleCommand(t, setup.entity, &test.CreateEntity{Value: "v0", Other: &otherValue}),
+		handleCommand(t, setup.aggregate, &test.CreateAggregate{Value: "v0", Other: &otherValue}),
 	}
 	var finalValue string
 	for i := 1; i <= 9; i++ {
 		finalValue = "v" + strconv.Itoa(i)
-		results = append(results, handleCommand(t, setup.entity, &test.ReplaceEntity{Value: finalValue, Other: &otherValue}))
+		results = append(results, handleCommand(t, setup.aggregate, &test.ReplaceAggregate{Value: finalValue, Other: &otherValue}))
 	}
 
 	commitEvents(t, setup.store, combineResults(results...), setup.eventContext, metadata)
@@ -672,22 +672,22 @@ func Test_EventStore_MultiBoundaryBatch_ReloadIsCurrent(t *testing.T) {
 
 	// Reloading from snapshot + tail must reflect the final event, not a stale prefix.
 	setup.refresh(t)
-	require.Equal(t, finalValue, setup.entity.Value)
+	require.Equal(t, finalValue, setup.aggregate.Value)
 }
 
 // --- Additive aggregate: proves snapshots are not double-applied via Execute ---
 
-type counterEntity struct {
+type counterAggregate struct {
 	ID    evt.EntityID `json:"id"`
 	Count int          `json:"count"`
 }
 
-func (c *counterEntity) Type() evt.EntityType                { return "counter" }
-func (c *counterEntity) GetID() evt.EntityID                 { return c.ID }
-func (c *counterEntity) EventUpcasters() []evt.EventUpcaster { return nil }
-func (c *counterEntity) Projectors() []evt.EventProjector    { return nil }
+func (c *counterAggregate) Type() evt.EntityType                { return "counter" }
+func (c *counterAggregate) GetID() evt.EntityID                 { return c.ID }
+func (c *counterAggregate) EventUpcasters() []evt.EventUpcaster { return nil }
+func (c *counterAggregate) Projectors() []evt.EventProjector    { return nil }
 
-func (c *counterEntity) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
+func (c *counterAggregate) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
 	add, ok := command.(*addCommand)
 	if !ok {
 		return evt.CommandResult{}, evt.NewBadCommandError(command)
@@ -701,7 +701,7 @@ func (c *counterEntity) Handle(_ context.Context, command evt.Command) (evt.Comm
 	return evt.CommandResult{Events: events}, nil
 }
 
-func (c *counterEntity) Apply(event evt.Event) error {
+func (c *counterAggregate) Apply(event evt.Event) error {
 	if _, ok := event.(incrementedEvent); !ok {
 		return evt.NewBadEventError(event)
 	}
@@ -711,7 +711,7 @@ func (c *counterEntity) Apply(event evt.Event) error {
 	return nil
 }
 
-func (c *counterEntity) DeserializeEvent(se evt.SerializedEvent) (evt.Event, error) {
+func (c *counterAggregate) DeserializeEvent(se evt.SerializedEvent) (evt.Event, error) {
 	if se.Type == "counter.incremented" {
 		return incrementedEvent{}, nil
 	}
@@ -741,13 +741,13 @@ func TestExecute_AdditiveSnapshot_NoDoubleApply(t *testing.T) {
 	store := snapshots.NewStore(repo, 2) // snapshot every 2 events; one command crosses boundaries
 
 	id := evt.EntityID("counter-1")
-	entity := &counterEntity{ID: id}
+	aggregate := &counterAggregate{ID: id}
 
-	require.NoError(t, store.Execute(ctx, entity, id, &addCommand{N: 6}, evt.Metadata{}))
-	require.Equal(t, 6, entity.Count)
+	require.NoError(t, store.Execute(ctx, aggregate, id, &addCommand{N: 6}, evt.Metadata{}))
+	require.Equal(t, 6, aggregate.Count)
 
-	reloaded := &counterEntity{ID: id}
-	_, err := store.LoadEntity(ctx, reloaded, id)
+	reloaded := &counterAggregate{ID: id}
+	_, err := store.LoadAggregate(ctx, reloaded, id)
 	require.NoError(t, err)
 	require.Equal(t, 6, reloaded.Count, "reloaded count must not be double-applied")
 }

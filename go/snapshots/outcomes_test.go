@@ -46,23 +46,23 @@ func newOutcomeStore(t *testing.T, opts ...snapshots.OutcomeOption) (*snapshots.
 	return snapshots.NewStore(repo, 0).WithOutcomes(opts...), repo
 }
 
-func createCommand() *etest.CreateEntity { return &etest.CreateEntity{Value: "created"} }
+func createCommand() *etest.CreateAggregate { return &etest.CreateAggregate{Value: "created"} }
 
 func TestOutcomes_DisabledStoreRefusesTheOutcomeEntryPoints(t *testing.T) {
 	store := snapshots.NewStore(mem.NewRepository(), 0)
 	ctx := context.Background()
-	entity := etest.NewEntity("e-1")
+	aggregate := etest.NewAggregate("e-1")
 
 	require.False(t, store.OutcomesEnabled())
 
-	_, err := store.ExecuteWithOutcome(ctx, entity, "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(ctx, aggregate, "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrInvalidArgument)
 
 	_, _, err = store.BeginCommand(ctx, evt.CommandIdentity{Type: "t"}, commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrInvalidArgument)
 
 	// A store without outcomes keeps today's behavior: no command ID is required.
-	require.NoError(t, store.Execute(ctx, entity, "e-1", createCommand(), evt.Metadata{}))
+	require.NoError(t, store.Execute(ctx, aggregate, "e-1", createCommand(), evt.Metadata{}))
 }
 
 // capabilityFreeRepository hides the outcome capability of the repository it wraps.
@@ -73,7 +73,7 @@ func (capabilityFreeRepository) AtomicTransactions() {}
 func TestOutcomes_RepositoryWithoutTheCapabilityIsRefusedBeforeAnyRead(t *testing.T) {
 	store := snapshots.NewStore(capabilityFreeRepository{mem.NewRepository()}, 0).WithOutcomes()
 
-	_, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrOutcomesUnsupported)
 
 	var unsupported *evt.OutcomesUnsupportedError
@@ -84,16 +84,16 @@ func TestOutcomes_RepositoryWithoutTheCapabilityIsRefusedBeforeAnyRead(t *testin
 func TestOutcomes_BareCommitIsRefusedOnAnOutcomeStore(t *testing.T) {
 	store, _ := newOutcomeStore(t)
 	ctx := context.Background()
-	entity := etest.NewEntity("e-1")
+	aggregate := etest.NewAggregate("e-1")
 
-	eventContext, err := store.LoadEntity(ctx, entity, "e-1")
+	eventContext, err := store.LoadAggregate(ctx, aggregate, "e-1")
 	require.NoError(t, err)
 
-	_, err = store.Commit(ctx, evt.CommandResult{Events: []evt.Event{&etest.EntityCreated{ID: "e-1", Value: "v"}}}, eventContext, commandMetadata("cmd-1"))
+	_, err = store.Commit(ctx, evt.CommandResult{Events: []evt.Event{&etest.AggregateCreated{ID: "e-1", Value: "v"}}}, eventContext, commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrInvalidArgument, "a bare commit has no command identity to digest")
 
 	tx := store.Transaction()
-	require.NoError(t, tx.Read(ctx, entity, "e-1"))
+	require.NoError(t, tx.Read(ctx, aggregate, "e-1"))
 
 	_, err = tx.Commit(ctx, commandMetadata("cmd-2"))
 	require.ErrorIs(t, err, evt.ErrInvalidArgument)
@@ -106,11 +106,11 @@ func TestOutcomes_CustomDigesterDefinesTheIdentity(t *testing.T) {
 	}))
 	ctx := context.Background()
 
-	first, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", &etest.CreateEntity{Value: "one"}, commandMetadata("cmd-1"))
+	first, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", &etest.CreateAggregate{Value: "one"}, commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.Equal(t, "type:test:create", first.Digest)
 
-	second, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", &etest.CreateEntity{Value: "two"}, commandMetadata("cmd-1"))
+	second, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", &etest.CreateAggregate{Value: "two"}, commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, second.Replayed, "the custom digest is equal, so this is a replay")
 
@@ -122,7 +122,7 @@ func TestOutcomes_CustomDigesterDefinesTheIdentity(t *testing.T) {
 	failing, _ := newOutcomeStore(t, snapshots.WithDigester(func(evt.DigestInput) (string, error) {
 		return "", errors.New("no digest")
 	}))
-	_, err = failing.ExecuteWithOutcome(ctx, etest.NewEntity("e-2"), "e-2", createCommand(), commandMetadata("cmd-1"))
+	_, err = failing.ExecuteWithOutcome(ctx, etest.NewAggregate("e-2"), "e-2", createCommand(), commandMetadata("cmd-1"))
 	require.ErrorContains(t, err, "no digest")
 }
 
@@ -132,10 +132,10 @@ func TestOutcomes_LegacyEventWindowStillCatchesPreOutcomeCommands(t *testing.T) 
 
 	// A pre-v0.9 command: its events carry the command ID but no outcome row exists.
 	legacy := snapshots.NewStore(repo, 0)
-	require.NoError(t, legacy.Execute(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("legacy")))
+	require.NoError(t, legacy.Execute(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("legacy")))
 
 	store := snapshots.NewStore(repo, 0).WithOutcomes()
-	err := store.Execute(ctx, etest.NewEntity("e-1"), "e-1", &etest.ReplaceEntity{Value: "again"}, commandMetadata("legacy"))
+	err := store.Execute(ctx, etest.NewAggregate("e-1"), "e-1", &etest.ReplaceAggregate{Value: "again"}, commandMetadata("legacy"))
 	require.True(t, evt.IsDuplicateCommandErr(err), "got %v", err)
 
 	events, err := repo.GetEvents(ctx, "e-1")
@@ -150,7 +150,7 @@ func TestOutcomes_HandlerErrorsMapToRejectionsOrFailures(t *testing.T) {
 
 	// NotFoundError is a persisted rejection; the error-returning Execute keeps the original
 	// error matchable on first execution.
-	notFound := &MockEntity{handleError: evt.NewNotFoundError("gone")}
+	notFound := &MockAggregate{handleError: evt.NewNotFoundError("gone")}
 	notFound.ID = "e-1"
 
 	err := store.Execute(ctx, notFound, "e-1", &MockCommand{}, commandMetadata("nf"))
@@ -167,7 +167,7 @@ func TestOutcomes_HandlerErrorsMapToRejectionsOrFailures(t *testing.T) {
 	require.False(t, evt.IsNotFoundErr(replayed))
 
 	// An arbitrary error is an internal failure: returned, and nothing recorded.
-	broken := &MockEntity{handleError: errors.New("disk on fire")}
+	broken := &MockAggregate{handleError: errors.New("disk on fire")}
 	broken.ID = "e-2"
 
 	err = store.Execute(ctx, broken, "e-2", &MockCommand{}, commandMetadata("broken"))
@@ -179,7 +179,7 @@ func TestOutcomes_HandlerErrorsMapToRejectionsOrFailures(t *testing.T) {
 	require.Nil(t, stored)
 
 	// A bad event while applying the handler's own events is an internal failure too.
-	badApply := &MockEntity{applyError: evt.NewBadEventError(&etest.EntityCreated{})}
+	badApply := &MockAggregate{applyError: evt.NewBadEventError(&etest.AggregateCreated{})}
 	badApply.ID = "e-3"
 
 	err = store.Execute(ctx, badApply, "e-3", &MockCommand{}, commandMetadata("bad-apply"))
@@ -190,7 +190,7 @@ func TestOutcomes_HandlerErrorsMapToRejectionsOrFailures(t *testing.T) {
 	require.Nil(t, stored)
 
 	// A NoOpError is an accepted outcome without events.
-	noop := &MockEntity{handleError: evt.NewNoOpError("nothing to do")}
+	noop := &MockAggregate{handleError: evt.NewNoOpError("nothing to do")}
 	noop.ID = "e-4"
 
 	outcome, err := store.ExecuteWithOutcome(ctx, noop, "e-4", &MockCommand{}, commandMetadata("noop"))
@@ -234,7 +234,7 @@ func TestOutcomes_RecoveryReadSurvivesTheCallersCancellation(t *testing.T) {
 	repo := &cancelAwareRepository{OutcomeRepository: memOutcomes(t), cancel: cancel}
 	store := snapshots.NewStore(repo, 0).WithOutcomes()
 
-	outcome, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Replayed)
 
@@ -252,14 +252,14 @@ func TestOutcomes_ResolveCommandReportsWhatHappened(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, absent)
 
-	_, err = store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err = store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 
 	found, err := store.ResolveCommand(ctx, identity, commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, found.Replayed)
 
-	identity.Payload = &etest.CreateEntity{Value: "other"}
+	identity.Payload = &etest.CreateAggregate{Value: "other"}
 	_, err = store.ResolveCommand(ctx, identity, commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse)
 }
@@ -270,10 +270,10 @@ func TestOutcomes_ABadCustomDigestIsAProgrammerErrorBeforeAnyReadOrHandler(t *te
 	for name, digest := range map[string]string{"empty": "", "not UTF-8": "bad\xff", "NUL": "bad\x00digest"} {
 		t.Run(name, func(t *testing.T) {
 			store, repo := newOutcomeStore(t, snapshots.WithDigester(func(evt.DigestInput) (string, error) { return digest, nil }))
-			entity := &MockEntity{}
-			entity.ID = "e-1"
+			aggregate := &MockAggregate{}
+			aggregate.ID = "e-1"
 
-			_, err := store.ExecuteWithOutcome(ctx, entity, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
+			_, err := store.ExecuteWithOutcome(ctx, aggregate, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
 			require.ErrorIs(t, err, evt.ErrInvalidArgument)
 
 			var invalid *evt.InvalidArgumentError
@@ -311,8 +311,8 @@ func TestOutcomes_MetadataIsSnapshottedAtBeginCommand(t *testing.T) {
 	tx, replayed, err := store.BeginCommand(ctx, evt.CommandIdentity{Type: "t", Targets: []evt.EntityID{"e-1"}}, metadata)
 	require.NoError(t, err)
 	require.Nil(t, replayed)
-	require.NoError(t, tx.Read(ctx, etest.NewEntity("e-1"), "e-1"))
-	require.NoError(t, tx.Append("e-1", &etest.EntityCreated{ID: "e-1", Value: "v"}))
+	require.NoError(t, tx.Read(ctx, etest.NewAggregate("e-1"), "e-1"))
+	require.NoError(t, tx.Append("e-1", &etest.AggregateCreated{ID: "e-1", Value: "v"}))
 
 	// The caller changes everything its metadata points to before completing.
 	id = "other-command"
@@ -380,16 +380,16 @@ func TestOutcomes_NonUTF8IdentityStringsAreRefusedBeforeAnyReadOrHandler(t *test
 	ctx := context.Background()
 	bad := "bad\xff"
 
-	entity := &MockEntity{}
-	entity.ID = "e-1"
+	aggregate := &MockAggregate{}
+	aggregate.ID = "e-1"
 
-	_, err := store.ExecuteWithOutcome(ctx, entity, "e-1", &MockCommand{}, commandMetadata(bad))
+	_, err := store.ExecuteWithOutcome(ctx, aggregate, "e-1", &MockCommand{}, commandMetadata(bad))
 	require.ErrorIs(t, err, evt.ErrInvalidArgument)
 
 	principal := evt.PrincipalID(bad)
 	metadata := commandMetadata("cmd-1")
 	metadata.PrincipalID = &principal
-	_, err = store.ExecuteWithOutcome(ctx, entity, "e-1", &MockCommand{}, metadata)
+	_, err = store.ExecuteWithOutcome(ctx, aggregate, "e-1", &MockCommand{}, metadata)
 	require.ErrorIs(t, err, evt.ErrInvalidArgument)
 
 	_, _, err = store.BeginCommand(ctx, evt.CommandIdentity{Type: evt.CommandType(bad)}, commandMetadata("cmd-2"))
@@ -433,11 +433,11 @@ func TestOutcomes_RecoveryNeverOutlivesItsWindowEvenWhenAReadHangs(t *testing.T)
 		WithOutcomes(snapshots.WithRecoveryWait(150 * time.Millisecond)).
 		WithRetry(snapshots.RetryPolicy{MaxAttempts: 1})
 
-	entity := &MockEntity{}
-	entity.ID = "e-1"
+	aggregate := &MockAggregate{}
+	aggregate.ID = "e-1"
 
 	started := time.Now()
-	_, err := store.ExecuteWithOutcome(context.Background(), entity, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(context.Background(), aggregate, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
 	elapsed := time.Since(started)
 
 	require.ErrorIs(t, err, evt.ErrAmbiguousWrite)
@@ -451,7 +451,7 @@ func TestOutcomes_EventsDoNotShareTheCallersMetadata(t *testing.T) {
 	metadata := commandMetadata("cmd-1")
 	metadata.Extensions = map[string]string{"tenant": "acme"}
 
-	outcome, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), metadata)
+	outcome, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), metadata)
 	require.NoError(t, err)
 	require.Len(t, outcome.Events, 1)
 

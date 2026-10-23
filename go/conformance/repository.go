@@ -234,8 +234,8 @@ func testCommitAndGetEvents(t *testing.T, repo evt.Repository) {
 
 	id := evt.EntityID(ns + "-1")
 	commitEvents(t, repo, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
 	)
 
 	events, err := repo.GetEvents(ctx, id)
@@ -252,8 +252,8 @@ func testMetadataRoundTrip(t *testing.T, repo evt.Repository) {
 	id := evt.EntityID(newNamespace() + "-1")
 
 	serialized := serialize(t, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
 	)
 	for i := range serialized {
 		commandID := evt.CommandID(fmt.Sprintf("command-%d", i+1))
@@ -289,8 +289,8 @@ func testGetEventsIsolatesEntities(t *testing.T, repo evt.Repository) {
 
 	idA := evt.EntityID(ns + "-a")
 	idB := evt.EntityID(ns + "-b")
-	commitEvents(t, repo, idA, "test", 0, &test.EntityCreated{ID: idA, Value: "a"})
-	commitEvents(t, repo, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "b"})
+	commitEvents(t, repo, idA, "test", 0, &test.AggregateCreated{ID: idA, Value: "a"})
+	commitEvents(t, repo, idB, "test", 0, &test.AggregateCreated{ID: idB, Value: "b"})
 
 	events, err := repo.GetEvents(ctx, idA)
 	require.NoError(t, err)
@@ -309,9 +309,9 @@ func testGetLatestEvents(t *testing.T, repo evt.Repository) {
 
 	id := evt.EntityID(ns + "-1")
 	commitEvents(t, repo, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
-		&test.EntityUpdated{ID: id, Value: "three"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
+		&test.AggregateUpdated{ID: id, Value: "three"},
 	)
 
 	latest, err := repo.GetLatestEvents(ctx, id, 1)
@@ -329,10 +329,10 @@ func testGetRecentEvents(t *testing.T, repo evt.Repository) {
 
 	id := evt.EntityID(ns + "-1")
 	commitEvents(t, repo, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
-		&test.EntityUpdated{ID: id, Value: "three"},
-		&test.EntityUpdated{ID: id, Value: "four"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
+		&test.AggregateUpdated{ID: id, Value: "three"},
+		&test.AggregateUpdated{ID: id, Value: "four"},
 	)
 
 	// A bounded newest-first window: the last two events, descending.
@@ -368,7 +368,7 @@ func testGetRecentEvents(t *testing.T, repo evt.Repository) {
 	require.Empty(t, missing)
 
 	// The newest-first window never includes the snapshot item.
-	serialized := serialize(t, id, "test", 4, &test.EntityUpdated{ID: id, Value: "five"})
+	serialized := serialize(t, id, "test", 4, &test.AggregateUpdated{ID: id, Value: "five"})
 	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"five"}`, id))
 	require.NoError(t, repo.CommitWithSnapshot(
 		ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1))
@@ -393,7 +393,7 @@ func testRejectsReservedEntityIds(t *testing.T, repo evt.Repository) {
 	}
 
 	for _, id := range reserved {
-		serialized := serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})
+		serialized := serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"})
 
 		err := repo.Commit(ctx, evt.SerializedResult{Events: serialized})
 		require.Error(t, err, "a commit into %q must be refused", id)
@@ -401,8 +401,8 @@ func testRejectsReservedEntityIds(t *testing.T, repo evt.Repository) {
 
 		// One reserved stream fails a multi-stream commit whole.
 		plain := evt.EntityID(ns + "-plain")
-		mixed := serialize(t, plain, "test", 0, &test.EntityCreated{ID: plain, Value: "ok"})
-		mixed = append(mixed, serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "reserved"})...)
+		mixed := serialize(t, plain, "test", 0, &test.AggregateCreated{ID: plain, Value: "ok"})
+		mixed = append(mixed, serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "reserved"})...)
 
 		err = repo.Commit(ctx, evt.SerializedResult{Events: mixed})
 		require.Error(t, err, "a multi-stream commit with one reserved stream must be refused")
@@ -415,7 +415,7 @@ func testRejectsReservedEntityIds(t *testing.T, repo evt.Repository) {
 
 		// Snapshot writes refuse all the same.
 		err = repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialize(t, id, "test", 0,
-			&test.EntityCreated{ID: id, Value: "one"})}, "test", id, []byte(`{"id":"x"}`), 1)
+			&test.AggregateCreated{ID: id, Value: "one"})}, "test", id, []byte(`{"id":"x"}`), 1)
 		require.Error(t, err)
 		require.True(t, evt.IsReservedEntityIdErr(err))
 
@@ -452,8 +452,8 @@ func testStreamAllEventsHonorsFilter(t *testing.T, repo evt.Repository) {
 	alphaID := evt.EntityID(ns + "-alpha-1")
 	betaID := evt.EntityID(ns + "-beta-1")
 
-	commitEvents(t, repo, alphaID, alphaType, 0, &test.EntityCreated{ID: alphaID, Value: "a"})
-	commitEvents(t, repo, betaID, betaType, 0, &test.EntityCreated{ID: betaID, Value: "b"})
+	commitEvents(t, repo, alphaID, alphaType, 0, &test.AggregateCreated{ID: alphaID, Value: "a"})
+	commitEvents(t, repo, betaID, betaType, 0, &test.AggregateCreated{ID: betaID, Value: "b"})
 
 	// Unfiltered stream returns every event in the store; assert membership rather than an absolute
 	// count so a shared table with residue from other cases stays valid.
@@ -478,13 +478,13 @@ func testStreamEntitiesHonorsFilter(t *testing.T, repo evt.Repository) {
 	alphaID := evt.EntityID(ns + "-alpha-1")
 	betaID := evt.EntityID(ns + "-beta-1")
 
-	commitEvents(t, repo, alphaID, alphaType, 0, &test.EntityCreated{ID: alphaID, Value: "a"})
-	commitEvents(t, repo, betaID, betaType, 0, &test.EntityCreated{ID: betaID, Value: "b"})
+	commitEvents(t, repo, alphaID, alphaType, 0, &test.AggregateCreated{ID: alphaID, Value: "a"})
+	commitEvents(t, repo, betaID, betaType, 0, &test.AggregateCreated{ID: betaID, Value: "b"})
 
 	apply := applyEvent()
 
 	// The unfiltered scan may sweep residue from other cases or backends sharing the store, whose
-	// events need not deserialize as a test.Entity. Tolerate those errors and assert only that our
+	// events need not deserialize as a test.Aggregate. Tolerate those errors and assert only that our
 	// two entities are present; the unique-type filtered scan below is the strict reconstitution
 	// check.
 	all := drainEntitiesLenient(repo.StreamEntities(ctx, evt.StreamFilter{}, apply))
@@ -506,7 +506,7 @@ func testSnapshotRoundTrip(t *testing.T, repo evt.Repository) {
 	require.NoError(t, err)
 	require.Nil(t, missing)
 
-	serialized := serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})
+	serialized := serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"})
 	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"one"}`, id))
 
 	err = repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1)
@@ -526,10 +526,10 @@ func testOptimisticConcurrency(t *testing.T, repo evt.Repository) {
 	ns := newNamespace()
 
 	id := evt.EntityID(ns + "-1")
-	commitEvents(t, repo, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})
+	commitEvents(t, repo, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"})
 
 	// Re-committing sequence 1 must be rejected: the (entityID, sequence) pair already exists.
-	duplicate := serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "conflict"})
+	duplicate := serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "conflict"})
 
 	err := repo.Commit(ctx, evt.SerializedResult{Events: duplicate})
 	require.Error(t, err, "expected a conflict committing a duplicate sequence")
@@ -547,8 +547,8 @@ func testCompactedFloor(t *testing.T, repo evt.Repository) {
 
 	id := evt.EntityID(ns + "-1")
 	serialized := serialize(t, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
 	)
 	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"two"}`, id))
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1))
@@ -559,14 +559,14 @@ func testCompactedFloor(t *testing.T, repo evt.Repository) {
 
 	// A writer that loaded before the snapshot would commit sequence 2 again. Its key is gone, so
 	// only the snapshot floor rejects it.
-	stale := serialize(t, id, "test", 1, &test.EntityUpdated{ID: id, Value: "stale"})
+	stale := serialize(t, id, "test", 1, &test.AggregateUpdated{ID: id, Value: "stale"})
 	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: stale}), "a commit below the floor must be rejected")
 
 	events, err := repo.GetEvents(ctx, id)
 	require.NoError(t, err)
 	require.Empty(t, events, "the rejected commit writes nothing")
 
-	next := serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "three"})
+	next := serialize(t, id, "test", 2, &test.AggregateUpdated{ID: id, Value: "three"})
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: next}))
 }
 
@@ -582,8 +582,8 @@ func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
 
 	id := evt.EntityID(ns + "-1")
 	serialized := serialize(t, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
 	)
 	payload := []byte(fmt.Sprintf(`{"id":%q,"value":"two"}`, id))
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: serialized}, "test", id, payload, 1))
@@ -593,8 +593,8 @@ func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
 
 	// The head condition checks the first event's sequence, so [3, 2] would recreate compacted sequence 2.
 	later := serialize(t, id, "test", 1,
-		&test.EntityUpdated{ID: id, Value: "a"},
-		&test.EntityUpdated{ID: id, Value: "b"},
+		&test.AggregateUpdated{ID: id, Value: "a"},
+		&test.AggregateUpdated{ID: id, Value: "b"},
 	)
 	reversed := evt.SerializedResult{Events: []evt.SerializedEvent{later[1], later[0]}}
 	require.Error(t, repo.CommitWithSnapshot(ctx, reversed, "test", id, payload, 2), "a snapshot commit out of order")
@@ -604,14 +604,14 @@ func testOutOfOrderEvents(t *testing.T, repo evt.Repository) {
 	// compacted floor out of the way.
 	fresh := evt.EntityID(ns + "-gap")
 	gapped := serialize(t, fresh, "test", 0,
-		&test.EntityCreated{ID: fresh, Value: "one"},
-		&test.EntityUpdated{ID: fresh, Value: "three"},
+		&test.AggregateCreated{ID: fresh, Value: "one"},
+		&test.AggregateUpdated{ID: fresh, Value: "three"},
 	)
 	gapped[1].Sequence = 3
 	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: gapped}), "a commit that skips a sequence")
 
 	// Sequences start at 1: DynamoDB keeps the snapshot at sk = 0.
-	zero := serialize(t, fresh, "test", 0, &test.EntityCreated{ID: fresh, Value: "zero"})
+	zero := serialize(t, fresh, "test", 0, &test.AggregateCreated{ID: fresh, Value: "zero"})
 	zero[0].Sequence = 0
 	require.Error(t, repo.Commit(ctx, evt.SerializedResult{Events: zero}), "a commit at sequence 0")
 
@@ -687,12 +687,12 @@ func commitEvents(
 	require.NoError(t, repo.Commit(context.Background(), evt.SerializedResult{Events: serialized}))
 }
 
-// applyEvent returns an applyEvent callback that reconstitutes a test.Entity from serialized events.
+// applyEvent returns an applyEvent callback that reconstitutes a test.Aggregate from serialized events.
 // It deserializes by event Type, so it works regardless of the (possibly overridden) EntityType.
-func applyEvent() func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error) {
-	return func(_ context.Context, se evt.SerializedEvent, current evt.Entity) (evt.Entity, error) {
+func applyEvent() func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error) {
+	return func(_ context.Context, se evt.SerializedEvent, current evt.Aggregate) (evt.Aggregate, error) {
 		if current == nil {
-			current = test.NewEntity(se.EntityID)
+			current = test.NewAggregate(se.EntityID)
 		}
 
 		event, err := current.DeserializeEvent(se)
@@ -721,17 +721,17 @@ func drainEvents(t *testing.T, channel <-chan result.Result[[]evt.SerializedEven
 	return events
 }
 
-func drainEntities(t *testing.T, channel <-chan result.Result[evt.Entity]) []evt.EntityID {
+func drainEntities(t *testing.T, channel <-chan result.Result[evt.Aggregate]) []evt.EntityID {
 	t.Helper()
 
 	var ids []evt.EntityID
 	for r := range channel {
-		entity, err := r.Unwrap()
+		aggregate, err := r.Unwrap()
 		require.NoError(t, err)
-		if entity == nil {
+		if aggregate == nil {
 			continue
 		}
-		ids = append(ids, entity.GetID())
+		ids = append(ids, aggregate.GetID())
 	}
 
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
@@ -742,14 +742,14 @@ func drainEntities(t *testing.T, channel <-chan result.Result[evt.Entity]) []evt
 // drainEntitiesLenient collects the IDs of successfully reconstituted entities, ignoring per-entity
 // errors. It is for whole-store scans that may encounter unrelated residue from other cases or
 // backends sharing a durable store.
-func drainEntitiesLenient(channel <-chan result.Result[evt.Entity]) []evt.EntityID {
+func drainEntitiesLenient(channel <-chan result.Result[evt.Aggregate]) []evt.EntityID {
 	var ids []evt.EntityID
 	for r := range channel {
-		entity, err := r.Unwrap()
-		if err != nil || entity == nil {
+		aggregate, err := r.Unwrap()
+		if err != nil || aggregate == nil {
 			continue
 		}
-		ids = append(ids, entity.GetID())
+		ids = append(ids, aggregate.GetID())
 	}
 
 	return ids
@@ -783,10 +783,10 @@ func testMultiStreamCommit(t *testing.T, repo evt.Repository) {
 
 	idA, idB := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-b")
 	eventsA := serialize(t, idA, "test", 0,
-		&test.EntityCreated{ID: idA, Value: "one"},
-		&test.EntityUpdated{ID: idA, Value: "two"},
+		&test.AggregateCreated{ID: idA, Value: "one"},
+		&test.AggregateUpdated{ID: idA, Value: "two"},
 	)
-	eventsB := serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "sibling"})
+	eventsB := serialize(t, idB, "test", 0, &test.AggregateCreated{ID: idB, Value: "sibling"})
 
 	// Deliberately declared out of bytewise stream order: the commit pins the order itself.
 	err := repo.Commit(ctx, evt.SerializedResult{Events: append(eventsB, eventsA...)})
@@ -810,12 +810,12 @@ func testMultiStreamAtomicity(t *testing.T, repo evt.Repository) {
 
 	idA, idB := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-b")
 	commitEvents(t, repo, idA, "test", 0,
-		&test.EntityCreated{ID: idA, Value: "one"},
-		&test.EntityUpdated{ID: idA, Value: "two"},
+		&test.AggregateCreated{ID: idA, Value: "one"},
+		&test.AggregateUpdated{ID: idA, Value: "two"},
 	)
 
-	eventsB := serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "sibling"})
-	colliding := serialize(t, idA, "test", 1, &test.EntityUpdated{ID: idA, Value: "reused"})
+	eventsB := serialize(t, idB, "test", 0, &test.AggregateCreated{ID: idB, Value: "sibling"})
+	colliding := serialize(t, idA, "test", 1, &test.AggregateUpdated{ID: idA, Value: "reused"})
 	err := repo.Commit(ctx, evt.SerializedResult{Events: append(eventsB, colliding...)})
 	require.Error(t, err, "a commit that collides on one stream must fail")
 
@@ -832,21 +832,21 @@ func testReadFence(t *testing.T, repo evt.Repository) {
 
 	idA, idC := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-c")
 	commitEvents(t, repo, idA, "test", 0,
-		&test.EntityCreated{ID: idA, Value: "one"},
-		&test.EntityUpdated{ID: idA, Value: "two"},
+		&test.AggregateCreated{ID: idA, Value: "one"},
+		&test.AggregateUpdated{ID: idA, Value: "two"},
 	)
 
 	// A fence at the observed head passes while the transaction writes another stream. A fence
 	// on an absent stream (head 0) passes too.
 	fenced := evt.ReadFence{EntityID: idA, EntityType: "test", Head: 2}
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, idC, "test", 0, &test.EntityCreated{ID: idC, Value: "writer"}),
+		Events: serialize(t, idC, "test", 0, &test.AggregateCreated{ID: idC, Value: "writer"}),
 		Fences: []evt.ReadFence{fenced, {EntityID: evt.EntityID(ns + "-absent"), EntityType: "test"}},
 	})
 	require.NoError(t, err)
 
 	// Another writer moves the fenced stream past the head.
-	commitEvents(t, repo, idA, "test", 2, &test.EntityUpdated{ID: idA, Value: "moved"})
+	commitEvents(t, repo, idA, "test", 2, &test.AggregateUpdated{ID: idA, Value: "moved"})
 
 	// A stale fence now fails the whole commit, and the failing item carries the fence.
 	events, err := repo.GetEvents(ctx, idC)
@@ -854,7 +854,7 @@ func testReadFence(t *testing.T, repo evt.Repository) {
 	before := len(events)
 	err = repo.Commit(ctx, evt.SerializedResult{
 		Events: serialize(t, idC, "test", evt.EventSequence(before),
-			&test.EntityUpdated{ID: idC, Value: "later"}),
+			&test.AggregateUpdated{ID: idC, Value: "later"}),
 		Fences: []evt.ReadFence{fenced},
 	})
 	require.Error(t, err)
@@ -874,7 +874,7 @@ func testReadFence(t *testing.T, repo evt.Repository) {
 	stamped.CallerStamped = true
 	err = repo.Commit(ctx, evt.SerializedResult{
 		Events: serialize(t, idC, "test", evt.EventSequence(before),
-			&test.EntityUpdated{ID: idC, Value: "later"}),
+			&test.AggregateUpdated{ID: idC, Value: "later"}),
 		Fences: []evt.ReadFence{stamped},
 	})
 	require.ErrorAs(t, err, &conflict)
@@ -898,7 +898,7 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 	idFits := evt.EntityID(ns + "-fits")
 	fitting := make([]evt.Event, 0, 97)
 	for i := range 97 {
-		fitting = append(fitting, &test.EntityUpdated{ID: idFits, Value: fmt.Sprintf("value-%d", i)})
+		fitting = append(fitting, &test.AggregateUpdated{ID: idFits, Value: fmt.Sprintf("value-%d", i)})
 	}
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idFits, "test", 0, fitting...)}))
 
@@ -906,13 +906,13 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 	// two control checks, the head update, and 97 event puts fill the 100 actions: 97 fit, 98 do not.
 	idGrows := evt.EntityID(ns + "-grows")
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, idGrows, "test", 0, &test.EntityCreated{ID: idGrows, Value: "first"}),
+		Events: serialize(t, idGrows, "test", 0, &test.AggregateCreated{ID: idGrows, Value: "first"}),
 	}))
 
 	growing := func(count int) []evt.Event {
 		out := make([]evt.Event, 0, count)
 		for i := range count {
-			out = append(out, &test.EntityUpdated{ID: idGrows, Value: fmt.Sprintf("value-%d", i)})
+			out = append(out, &test.AggregateUpdated{ID: idGrows, Value: fmt.Sprintf("value-%d", i)})
 		}
 
 		return out
@@ -929,7 +929,7 @@ func testCommitTooLarge(t *testing.T, repo evt.Repository) {
 	// 101 event puts plus the two control checks and the head update exceed the 100-item budget.
 	events := make([]evt.Event, 0, 101)
 	for i := range 101 {
-		events = append(events, &test.EntityUpdated{ID: idA, Value: fmt.Sprintf("value-%d", i)})
+		events = append(events, &test.AggregateUpdated{ID: idA, Value: fmt.Sprintf("value-%d", i)})
 	}
 	serialized := serialize(t, idA, "test", 0, events...)
 
@@ -954,11 +954,11 @@ func testFenceCompactionABA(t *testing.T, repo evt.Repository) {
 
 	idA, idC := evt.EntityID(ns+"-a"), evt.EntityID(ns+"-c")
 	events := serialize(t, idA, "test", 0,
-		&test.EntityCreated{ID: idA, Value: "one"},
-		&test.EntityUpdated{ID: idA, Value: "two"},
-		&test.EntityUpdated{ID: idA, Value: "three"},
+		&test.AggregateCreated{ID: idA, Value: "one"},
+		&test.AggregateUpdated{ID: idA, Value: "two"},
+		&test.AggregateUpdated{ID: idA, Value: "three"},
 	)
-	payload, err := json.Marshal(test.NewEntity(idA))
+	payload, err := json.Marshal(test.NewAggregate(idA))
 	require.NoError(t, err)
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "test", idA, payload, 1))
 
@@ -968,7 +968,7 @@ func testFenceCompactionABA(t *testing.T, repo evt.Repository) {
 	require.NoError(t, err)
 
 	err = repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, idC, "test", 0, &test.EntityCreated{ID: idC, Value: "writer"}),
+		Events: serialize(t, idC, "test", 0, &test.AggregateCreated{ID: idC, Value: "writer"}),
 		Fences: []evt.ReadFence{{EntityID: idA, EntityType: "test", Head: 1}},
 	})
 	var conflict *evt.FenceConflictError
@@ -1040,8 +1040,8 @@ func testRejectsFirstSnapshotAboveOne(t *testing.T, repo evt.Repository) {
 
 	idA := evt.EntityID(ns + "-a")
 	events := serialize(t, idA, "test", 0,
-		&test.EntityCreated{ID: idA, Value: "one"},
-		&test.EntityUpdated{ID: idA, Value: "two"},
+		&test.AggregateCreated{ID: idA, Value: "one"},
+		&test.AggregateUpdated{ID: idA, Value: "two"},
 	)
 
 	// A stream's first snapshot must have sequence 1: every backend refuses one that skips ahead.
@@ -1080,12 +1080,12 @@ func testProjectorBudget(t *testing.T, repo evt.Repository, group func(int) evt.
 	idFits, idOver := evt.EntityID(ns+"-fits"), evt.EntityID(ns+"-over")
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events:      serialize(t, idFits, "test", 0, &test.EntityCreated{ID: idFits, Value: "fits"}),
+		Events:      serialize(t, idFits, "test", 0, &test.AggregateCreated{ID: idFits, Value: "fits"}),
 		Transaction: evt.Transaction{group(96)},
 	}))
 
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events:      serialize(t, idOver, "test", 0, &test.EntityCreated{ID: idOver, Value: "over"}),
+		Events:      serialize(t, idOver, "test", 0, &test.AggregateCreated{ID: idOver, Value: "over"}),
 		Transaction: evt.Transaction{group(97)},
 	})
 	var tooLarge *evt.CommitTooLargeError
@@ -1102,8 +1102,8 @@ func testRejectsSequenceGaps(t *testing.T, repo evt.Repository, supportsSnapshot
 	ctx := context.Background()
 	ns := newNamespace()
 
-	created := func(id evt.EntityID) evt.Event { return &test.EntityCreated{ID: id, Value: "one"} }
-	updated := func(id evt.EntityID) evt.Event { return &test.EntityUpdated{ID: id, Value: "next"} }
+	created := func(id evt.EntityID) evt.Event { return &test.AggregateCreated{ID: id, Value: "one"} }
+	updated := func(id evt.EntityID) evt.Event { return &test.AggregateUpdated{ID: id, Value: "next"} }
 
 	// A first event above sequence 1 on a stream with no events is a gap.
 	idNew := evt.EntityID(ns + "-new")
@@ -1148,7 +1148,7 @@ func testRejectsSequenceGaps(t *testing.T, repo evt.Repository, supportsSnapshot
 	}
 
 	idC := evt.EntityID(ns + "-c")
-	payload, err := json.Marshal(test.NewEntity(idC))
+	payload, err := json.Marshal(test.NewAggregate(idC))
 	require.NoError(t, err)
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{
 		Events: serialize(t, idC, "test", 0, created(idC), updated(idC), updated(idC)),

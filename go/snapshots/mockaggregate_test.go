@@ -9,8 +9,8 @@ import (
 	"github.com/photon-grove/evt/go/test"
 )
 
-// MockEntity for testing error scenarios
-type MockEntity struct {
+// MockAggregate for testing error scenarios
+type MockAggregate struct {
 	ID                 evt.EntityID `json:"id"`
 	handleError        error
 	applyError         error
@@ -20,27 +20,27 @@ type MockEntity struct {
 	projectors         []evt.EventProjector
 }
 
-func (m *MockEntity) GetID() evt.EntityID {
+func (m *MockAggregate) GetID() evt.EntityID {
 	return m.ID
 }
 
-func (m *MockEntity) Type() evt.EntityType {
+func (m *MockAggregate) Type() evt.EntityType {
 	return "MockEntity"
 }
 
-func (m *MockEntity) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
+func (m *MockAggregate) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
 	return nil, errors.New("not implemented")
 }
 
-func (m *MockEntity) EventUpcasters() []evt.EventUpcaster {
+func (m *MockAggregate) EventUpcasters() []evt.EventUpcaster {
 	return nil
 }
 
-func (m *MockEntity) Projectors() []evt.EventProjector {
+func (m *MockAggregate) Projectors() []evt.EventProjector {
 	return m.projectors
 }
 
-func (m *MockEntity) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {
+func (m *MockAggregate) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {
 	if m.handleError != nil {
 		return evt.CommandResult{}, m.handleError
 	}
@@ -49,7 +49,7 @@ func (m *MockEntity) Handle(_ context.Context, _ evt.Command) (evt.CommandResult
 		// Return many events to trigger "too many events" error
 		manyEvents := make([]evt.Event, 5)
 		for i := range manyEvents {
-			manyEvents[i] = &test.EntityCreated{
+			manyEvents[i] = &test.AggregateCreated{
 				ID:    m.ID,
 				Value: "test",
 			}
@@ -66,7 +66,7 @@ func (m *MockEntity) Handle(_ context.Context, _ evt.Command) (evt.CommandResult
 
 	return evt.CommandResult{
 		Events: []evt.Event{
-			&test.EntityCreated{
+			&test.AggregateCreated{
 				ID:    m.ID,
 				Value: "test",
 			},
@@ -74,14 +74,14 @@ func (m *MockEntity) Handle(_ context.Context, _ evt.Command) (evt.CommandResult
 	}, nil
 }
 
-func (m *MockEntity) Apply(_ evt.Event) error {
+func (m *MockAggregate) Apply(_ evt.Event) error {
 	if m.applyError != nil {
 		return m.applyError
 	}
 	return nil
 }
 
-func (m *MockEntity) MarshalJSON() ([]byte, error) {
+func (m *MockAggregate) MarshalJSON() ([]byte, error) {
 	if m.snapshotError {
 		return nil, errors.New("snapshot generation failed")
 	}
@@ -91,19 +91,19 @@ func (m *MockEntity) MarshalJSON() ([]byte, error) {
 	})
 }
 
-func (m *MockEntity) UnmarshalJSON(_ []byte) error {
+func (m *MockAggregate) UnmarshalJSON(_ []byte) error {
 	return nil
 }
 
-// SetIDMockEntity is a MockEntity that implements SetID for testing the
+// SetIDMockAggregate is a MockAggregate that implements SetID for testing the
 // store's entity ID override behavior.
-type SetIDMockEntity struct {
-	MockEntity
+type SetIDMockAggregate struct {
+	MockAggregate
 	setIDCalled bool
 	setIDValue  evt.EntityID
 }
 
-func (m *SetIDMockEntity) SetID(id evt.EntityID) {
+func (m *SetIDMockAggregate) SetID(id evt.EntityID) {
 	m.setIDCalled = true
 	m.setIDValue = id
 	m.ID = id

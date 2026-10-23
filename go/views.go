@@ -88,8 +88,8 @@ type ViewStreamer interface {
 // For pointer-backed domain entities that need constructor-injected
 // dependencies, pass the app-specific constructor:
 //
-//	entity, found, err := evt.GetJSONView(ctx, repo, pk, func() *Entity {
-//		return NewEntity(projectors...)
+//	entity, found, err := evt.GetJSONView(ctx, repo, pk, func() *Aggregate {
+//		return NewAggregate(projectors...)
 //	})
 //
 // For plain value types, callers may pass nil and the zero value of T will be

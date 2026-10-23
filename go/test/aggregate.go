@@ -17,35 +17,35 @@ const EntityType evt.EntityType = "test"
 // Example error that might be returned by a command handler that fails a business rule
 var errBusiness = errors.New("business logic error")
 
-// The Entity handles commands and applies events for testing
-type Entity struct {
+// The Aggregate handles commands and applies events for testing
+type Aggregate struct {
 	ID    evt.EntityID `json:"id"`
 	Value string       `json:"value"`
 	Other *string      `json:"other"`
 }
 
-// NewEntity returns an Entity instance for the given id
-func NewEntity(id evt.EntityID) *Entity {
-	return &Entity{ID: id}
+// NewAggregate returns an Aggregate instance for the given id
+func NewAggregate(id evt.EntityID) *Aggregate {
+	return &Aggregate{ID: id}
 }
 
 // Type returns the Entity type constant
-func (entity *Entity) Type() evt.EntityType {
+func (aggregate *Aggregate) Type() evt.EntityType {
 	return EntityType
 }
 
-// GetID returns the ID for this Entity instance
-func (entity *Entity) GetID() evt.EntityID {
-	return entity.ID
+// GetID returns the ID for this Aggregate instance
+func (aggregate *Aggregate) GetID() evt.EntityID {
+	return aggregate.ID
 }
 
-// EventUpcasters returns the upcasters for events within this Entity
-func (entity *Entity) EventUpcasters() []evt.EventUpcaster {
+// EventUpcasters returns the upcasters for events within this Aggregate
+func (aggregate *Aggregate) EventUpcasters() []evt.EventUpcaster {
 	return nil
 }
 
-// Projectors returns the projectors for this Entity
-func (entity *Entity) Projectors() []evt.EventProjector {
+// Projectors returns the projectors for this Aggregate
+func (aggregate *Aggregate) Projectors() []evt.EventProjector {
 	return nil
 }
 
@@ -53,28 +53,28 @@ func (entity *Entity) Projectors() []evt.EventProjector {
 // ----------------
 
 // Handle handles a command, yielding Events or an error
-func (entity *Entity) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
+func (aggregate *Aggregate) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
 	switch c := command.(type) {
 
-	case *CreateEntity:
+	case *CreateAggregate:
 		if c.Value == "" {
 			return evt.CommandResult{}, errBusiness
 		}
 		return evt.CommandResult{
 			Events: []evt.Event{
-				&EntityCreated{
-					ID:    entity.GetID(),
+				&AggregateCreated{
+					ID:    aggregate.GetID(),
 					Value: c.Value,
 					Other: c.Other,
 				},
 			},
 		}, nil
 
-	case *ReplaceEntity:
+	case *ReplaceAggregate:
 		return evt.CommandResult{
 			Events: []evt.Event{
-				&EntityUpdated{
-					ID:    entity.GetID(),
+				&AggregateUpdated{
+					ID:    aggregate.GetID(),
 					Value: c.Value,
 					Other: c.Other,
 				},
@@ -91,17 +91,17 @@ func (entity *Entity) Handle(_ context.Context, command evt.Command) (evt.Comman
 
 // Apply takes an event and applies it to the current state of this entity instance.
 // Unknown events return a BadEventError (fail-closed).
-func (entity *Entity) Apply(event evt.Event) error {
+func (aggregate *Aggregate) Apply(event evt.Event) error {
 	switch e := event.(type) {
 
-	case *EntityCreated:
-		entity.ID = e.ID
-		entity.Value = e.Value
-		entity.Other = e.Other
+	case *AggregateCreated:
+		aggregate.ID = e.ID
+		aggregate.Value = e.Value
+		aggregate.Other = e.Other
 
-	case *EntityUpdated:
-		entity.Value = e.Value
-		entity.Other = e.Other
+	case *AggregateUpdated:
+		aggregate.Value = e.Value
+		aggregate.Other = e.Other
 
 	default:
 		return evt.NewBadEventError(event)
@@ -111,11 +111,11 @@ func (entity *Entity) Apply(event evt.Event) error {
 }
 
 // DeserializeEvent allows the event store to deserialize an event for this entity
-func (entity *Entity) DeserializeEvent(serializedEvent evt.SerializedEvent) (evt.Event, error) {
+func (aggregate *Aggregate) DeserializeEvent(serializedEvent evt.SerializedEvent) (evt.Event, error) {
 	switch serializedEvent.Type {
 
 	case CreatedEvent:
-		var event EntityCreated
+		var event AggregateCreated
 		err := json.Unmarshal(serializedEvent.Payload, &event)
 		if err != nil {
 			return nil, err
@@ -124,7 +124,7 @@ func (entity *Entity) DeserializeEvent(serializedEvent evt.SerializedEvent) (evt
 		return &event, nil
 
 	case UpdatedEvent:
-		var event EntityUpdated
+		var event AggregateUpdated
 		err := json.Unmarshal(serializedEvent.Payload, &event)
 		if err != nil {
 			return nil, err

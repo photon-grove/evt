@@ -30,7 +30,7 @@ func Test_CommitWaitsForEntityLock(t *testing.T) {
 	_, err = lock.Exec(ctx, "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))", string(id))
 	require.NoError(t, err)
 
-	events, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "one"}}, 0, id, evt.Metadata{})
+	events, err := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "one"}}, 0, id, evt.Metadata{})
 	require.NoError(t, err)
 
 	done := make(chan error, 1)

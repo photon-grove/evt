@@ -86,7 +86,7 @@ covers them (`snapshot.EventSequence >= throughSequence`). The snapshot lives in
 its own table and is never touched, so it remains the authoritative floor.
 Uncovered requests return `evt.ErrCompactionUncovered` and delete nothing.
 Rebuild compacted streams via the snapshot-aware path
-(`evt.SnapshotStreamer.StreamEntitiesFromSnapshots` / `RebuildConfig.SeedEntity`).
+(`evt.SnapshotStreamer.StreamEntitiesFromSnapshots` / `RebuildConfig.SeedAggregate`).
 See [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
 
 ### Incremental rebuilds

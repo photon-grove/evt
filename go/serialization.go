@@ -54,7 +54,7 @@ type SerializedResult struct {
 	Views []ProjectedView `json:"views,omitempty"`
 }
 
-// SerializedSnapshot represents a snapshot of current Entity state that is ready
+// SerializedSnapshot represents a snapshot of current Aggregate state that is ready
 // to be committed to a Repository.
 type SerializedSnapshot struct {
 	EntityType    EntityType    `json:"entityType"`
@@ -128,7 +128,7 @@ func SerializeEvents(
 	return serializedEvents, nil
 }
 
-// SerializeEventsWithContext serializes Events with the Entity within the given Context.
+// SerializeEventsWithContext serializes Events with the Aggregate within the given Context.
 func SerializeEventsWithContext(events []Event, eventContext *Context, metadata Metadata) ([]SerializedEvent, error) {
 	if eventContext == nil {
 		return nil, fmt.Errorf("context not found")
@@ -150,13 +150,13 @@ func SerializeEventsWithContext(events []Event, eventContext *Context, metadata 
 // This is a convenience function for testing and integration scenarios.
 func SerializeResult(
 	eventContext Context,
-	entity Entity,
+	aggregate Aggregate,
 	events []Event,
 	transaction Transaction,
 ) (SerializedResult, error) {
 	var entityID EntityID
-	if entity != nil {
-		entityID = entity.GetID()
+	if aggregate != nil {
+		entityID = aggregate.GetID()
 	}
 	if eventContext.EntityID != "" {
 		entityID = eventContext.EntityID
@@ -178,11 +178,11 @@ func SerializeResult(
 	}, nil
 }
 
-// DeserializeEvent decodes Events with the Entity within the given Context, applying upcasters.
-func DeserializeEvent(serializedEvent SerializedEvent, entity Entity) (Event, error) {
+// DeserializeEvent decodes Events with the Aggregate within the given Context, applying upcasters.
+func DeserializeEvent(serializedEvent SerializedEvent, aggregate Aggregate) (Event, error) {
 	event := serializedEvent
 
-	upcasters := entity.EventUpcasters()
+	upcasters := aggregate.EventUpcasters()
 
 	for _, upcaster := range upcasters {
 		if upcaster.CanUpcast(event.Type, event.Version) {
@@ -200,7 +200,7 @@ func DeserializeEvent(serializedEvent SerializedEvent, entity Entity) (Event, er
 		}
 	}
 
-	deserializedEvent, err := entity.DeserializeEvent(event)
+	deserializedEvent, err := aggregate.DeserializeEvent(event)
 	if err != nil {
 		return nil, &ReplayStrictnessError{
 			EventType: event.Type,

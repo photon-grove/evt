@@ -25,22 +25,22 @@ func eventItem(pk string, sk int) map[string]types.AttributeValue {
 	}
 }
 
-// Mock Entity for StreamEntities tests
-type MockEntity struct {
+// Mock Aggregate for StreamEntities tests
+type MockAggregate struct {
 	ID evt.EntityID `json:"id"`
 }
 
-func (m *MockEntity) Type() evt.EntityType { return "MockEntity" }
-func (m *MockEntity) GetID() evt.EntityID  { return m.ID }
-func (m *MockEntity) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {
+func (m *MockAggregate) Type() evt.EntityType { return "MockEntity" }
+func (m *MockAggregate) GetID() evt.EntityID  { return m.ID }
+func (m *MockAggregate) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {
 	return evt.CommandResult{}, nil
 }
-func (m *MockEntity) Apply(_ evt.Event) error { return nil }
-func (m *MockEntity) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
+func (m *MockAggregate) Apply(_ evt.Event) error { return nil }
+func (m *MockAggregate) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) {
 	return nil, errors.New("not implemented")
 }
-func (m *MockEntity) EventUpcasters() []evt.EventUpcaster { return nil }
-func (m *MockEntity) Projectors() []evt.EventProjector    { return nil }
+func (m *MockAggregate) EventUpcasters() []evt.EventUpcaster { return nil }
+func (m *MockAggregate) Projectors() []evt.EventProjector    { return nil }
 
 // Test StreamEntities Success
 func (s *RepositorySuite) Test_StreamEntities_Success() {
@@ -58,22 +58,22 @@ func (s *RepositorySuite) Test_StreamEntities_Success() {
 
 	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(output, nil)
 
-	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
-		return &MockEntity{ID: event.EntityID}, nil
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Aggregate) (evt.Aggregate, error) {
+		return &MockAggregate{ID: event.EntityID}, nil
 	}
 
-	entityStream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc)
-	allEntities := make([]evt.Entity, 0, 1)
-	for entityResult := range entityStream {
-		require.True(s.T(), entityResult.IsOk())
-		entity, err := entityResult.Unwrap()
+	aggregateStream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc)
+	allAggregates := make([]evt.Aggregate, 0, 1)
+	for aggregateResult := range aggregateStream {
+		require.True(s.T(), aggregateResult.IsOk())
+		aggregate, err := aggregateResult.Unwrap()
 		require.NoError(s.T(), err)
-		allEntities = append(allEntities, entity)
+		allAggregates = append(allAggregates, aggregate)
 	}
-	require.Len(s.T(), allEntities, 1)
-	mockEntity, ok := allEntities[0].(*MockEntity)
+	require.Len(s.T(), allAggregates, 1)
+	mockAggregate, ok := allAggregates[0].(*MockAggregate)
 	require.True(s.T(), ok)
-	require.Equal(s.T(), evt.EntityID("test-id-1"), mockEntity.ID)
+	require.Equal(s.T(), evt.EntityID("test-id-1"), mockAggregate.ID)
 	s.client.AssertExpectations(s.T())
 }
 
@@ -93,16 +93,16 @@ func (s *RepositorySuite) Test_StreamEntities_ApplyError() {
 
 	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(output, nil)
 
-	applyFunc := func(_ context.Context, _ evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
+	applyFunc := func(_ context.Context, _ evt.SerializedEvent, _ evt.Aggregate) (evt.Aggregate, error) {
 		return nil, errors.New("apply function failed")
 	}
 
-	entityStream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc)
-	entityResult := <-entityStream
-	require.True(s.T(), entityResult.IsErr())
-	_, err := entityResult.Unwrap()
+	aggregateStream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc)
+	aggregateResult := <-aggregateStream
+	require.True(s.T(), aggregateResult.IsErr())
+	_, err := aggregateResult.Unwrap()
 	require.Contains(s.T(), err.Error(), "apply function failed")
-	_, ok := <-entityStream
+	_, ok := <-aggregateStream
 	require.False(s.T(), ok)
 	s.client.AssertExpectations(s.T())
 }
@@ -127,20 +127,20 @@ func (s *RepositorySuite) Test_StreamEntities_GroupsAndOrdersInterleavedScan() {
 	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(output, nil)
 
 	applied := map[evt.EntityID][]int{}
-	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, aggregate evt.Aggregate) (evt.Aggregate, error) {
 		applied[event.EntityID] = append(applied[event.EntityID], int(event.Sequence))
-		if entity == nil {
-			return &MockEntity{ID: event.EntityID}, nil
+		if aggregate == nil {
+			return &MockAggregate{ID: event.EntityID}, nil
 		}
 
-		return entity, nil
+		return aggregate, nil
 	}
 
 	ids := make([]evt.EntityID, 0, 2)
-	for entityResult := range s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc) {
-		entity, err := entityResult.Unwrap()
+	for aggregateResult := range s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc) {
+		aggregate, err := aggregateResult.Unwrap()
 		require.NoError(s.T(), err)
-		ids = append(ids, entity.GetID())
+		ids = append(ids, aggregate.GetID())
 	}
 
 	require.ElementsMatch(s.T(), []evt.EntityID{"a", "b"}, ids)
@@ -170,21 +170,21 @@ func (s *RepositorySuite) Test_StreamEntities_ParallelSegments() {
 		return in.TotalSegments != nil && *in.TotalSegments == 2 && in.Segment != nil && *in.Segment == 1
 	}), mock.Anything).Return(seg1, nil)
 
-	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-		if entity == nil {
-			return &MockEntity{ID: event.EntityID}, nil
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, aggregate evt.Aggregate) (evt.Aggregate, error) {
+		if aggregate == nil {
+			return &MockAggregate{ID: event.EntityID}, nil
 		}
 
-		return entity, nil
+		return aggregate, nil
 	}
 
 	repo := s.repo.WithScanSegments(2)
 
 	ids := make([]evt.EntityID, 0, 2)
-	for entityResult := range repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc) {
-		entity, err := entityResult.Unwrap()
+	for aggregateResult := range repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc) {
+		aggregate, err := aggregateResult.Unwrap()
 		require.NoError(s.T(), err)
-		ids = append(ids, entity.GetID())
+		ids = append(ids, aggregate.GetID())
 	}
 
 	require.ElementsMatch(s.T(), []evt.EntityID{"a", "b"}, ids)
@@ -212,12 +212,12 @@ func (s *RepositorySuite) Test_StreamEntities_ScanErrorAborts() {
 	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).
 		Return((*dynamodb.ScanOutput)(nil), errors.New("scan failed")).Once()
 
-	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-		if entity == nil {
-			return &MockEntity{ID: event.EntityID}, nil
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, aggregate evt.Aggregate) (evt.Aggregate, error) {
+		if aggregate == nil {
+			return &MockAggregate{ID: event.EntityID}, nil
 		}
 
-		return entity, nil
+		return aggregate, nil
 	}
 
 	var errCount, okCount int

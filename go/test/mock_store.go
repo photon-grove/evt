@@ -18,9 +18,9 @@ func NewMockStore() *MockStore {
 	return new(MockStore)
 }
 
-// LoadEntity mocks the corresponding method on the Store
-func (store *MockStore) LoadEntity(ctx context.Context, entity evt.Entity, entityID evt.EntityID) (evt.Context, error) {
-	args := store.Called(ctx, entity, entityID)
+// LoadAggregate mocks the corresponding method on the Store
+func (store *MockStore) LoadAggregate(ctx context.Context, aggregate evt.Aggregate, entityID evt.EntityID) (evt.Context, error) {
+	args := store.Called(ctx, aggregate, entityID)
 
 	arg := args.Get(0)
 	if arg == nil {
@@ -57,8 +57,8 @@ func (store *MockStore) Commit(ctx context.Context, result evt.CommandResult, ev
 }
 
 // Execute mocks the corresponding method on the Store
-func (store *MockStore) Execute(ctx context.Context, entity evt.Entity, entityID evt.EntityID, command evt.Command, metadata evt.Metadata) error {
-	args := store.Called(ctx, entity, entityID, command, metadata)
+func (store *MockStore) Execute(ctx context.Context, aggregate evt.Aggregate, entityID evt.EntityID, command evt.Command, metadata evt.Metadata) error {
+	args := store.Called(ctx, aggregate, entityID, command, metadata)
 
 	return args.Error(0)
 }

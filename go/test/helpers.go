@@ -11,16 +11,16 @@ func NewTestStore() *MockStore {
 	return NewMockStore()
 }
 
-// NewTestEntity creates a new test Entity with the given ID
-func NewTestEntity(id string) *Entity {
-	return NewEntity(evt.EntityID(id))
+// NewTestAggregate creates a new test Aggregate with the given ID
+func NewTestAggregate(id string) *Aggregate {
+	return NewAggregate(evt.EntityID(id))
 }
 
 // NewTestEventContext creates a new test event context with default values
 func NewTestEventContext() evt.Context {
 	seq := evt.EventSequence(0)
 	return evt.Context{
-		Entity:          nil,
+		Aggregate:       nil,
 		EntityID:        "",
 		CurrentSequence: &seq,
 		CurrentSnapshot: nil,

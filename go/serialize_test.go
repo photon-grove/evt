@@ -56,7 +56,7 @@ func TestSerializeEventsWithContext(t *testing.T) {
 	snapshot := EventSequence(0)
 
 	ctx := &Context{
-		Entity:          nil,
+		Aggregate:       nil,
 		EntityID:        entityID,
 		CurrentSequence: &seq,
 		CurrentSnapshot: &snapshot,
@@ -109,11 +109,11 @@ func TestDeserializeEvent(t *testing.T) {
 		Payload:  mockPayload,
 	}
 
-	// Mock Entity that implements simple deserialization
-	entity := &MockTestEntity{}
+	// Mock Aggregate that implements simple deserialization
+	aggregate := &MockTestAggregate{}
 
 	// Execute
-	event, err := DeserializeEvent(serialized, entity)
+	event, err := DeserializeEvent(serialized, aggregate)
 
 	// Verify
 	require.NoError(t, err)
@@ -137,9 +137,9 @@ func TestDeserializeEvent_WithUpcaster(t *testing.T) {
 		Payload:  mockPayload,
 	}
 
-	// Mock Entity with Upcaster
+	// Mock Aggregate with Upcaster
 	// The upcaster should convert V1 to V2
-	entity := &MockTestEntity{
+	aggregate := &MockTestAggregate{
 		Upcasters: []EventUpcaster{
 			&MockUpcaster{
 				TargetType: "TestEventV1",
@@ -151,7 +151,7 @@ func TestDeserializeEvent_WithUpcaster(t *testing.T) {
 	}
 
 	// Execute
-	event, err := DeserializeEvent(serialized, entity)
+	event, err := DeserializeEvent(serialized, aggregate)
 
 	// Verify
 	require.NoError(t, err)
@@ -167,7 +167,7 @@ func TestDeserializeEvent_FailClosedWrapsDeserializeError(t *testing.T) {
 		Payload: []byte(`{}`),
 	}
 
-	_, err := DeserializeEvent(serialized, &failingDeserializeEntity{})
+	_, err := DeserializeEvent(serialized, &failingDeserializeAggregate{})
 	require.Error(t, err)
 	require.True(t, IsReplayStrictnessErr(err))
 
@@ -244,19 +244,19 @@ func TestCalculateAdditionalEvents(t *testing.T) {
 
 // Helpers for testing
 
-type MockTestEntity struct {
+type MockTestAggregate struct {
 	Upcasters []EventUpcaster
 }
 
-func (e *MockTestEntity) Type() EntityType { return "TestEntity" }
-func (e *MockTestEntity) GetID() EntityID  { return "id" }
-func (e *MockTestEntity) Handle(context.Context, Command) (CommandResult, error) {
+func (e *MockTestAggregate) Type() EntityType { return "TestEntity" }
+func (e *MockTestAggregate) GetID() EntityID  { return "id" }
+func (e *MockTestAggregate) Handle(context.Context, Command) (CommandResult, error) {
 	return CommandResult{}, nil
 }
-func (e *MockTestEntity) Apply(Event) error               { return nil }
-func (e *MockTestEntity) EventUpcasters() []EventUpcaster { return e.Upcasters }
-func (e *MockTestEntity) Projectors() []EventProjector    { return nil }
-func (e *MockTestEntity) DeserializeEvent(se SerializedEvent) (Event, error) {
+func (e *MockTestAggregate) Apply(Event) error               { return nil }
+func (e *MockTestAggregate) EventUpcasters() []EventUpcaster { return e.Upcasters }
+func (e *MockTestAggregate) Projectors() []EventProjector    { return nil }
+func (e *MockTestAggregate) DeserializeEvent(se SerializedEvent) (Event, error) {
 	// Simple mock implementation
 	mockEvent := MockEvent{
 		EventType:    se.Type,
@@ -267,11 +267,11 @@ func (e *MockTestEntity) DeserializeEvent(se SerializedEvent) (Event, error) {
 	return mockEvent, nil
 }
 
-type failingDeserializeEntity struct {
-	MockTestEntity
+type failingDeserializeAggregate struct {
+	MockTestAggregate
 }
 
-func (e *failingDeserializeEntity) DeserializeEvent(se SerializedEvent) (Event, error) {
+func (e *failingDeserializeAggregate) DeserializeEvent(se SerializedEvent) (Event, error) {
 	return nil, fmt.Errorf("unknown event type: %s", se.Type)
 }
 

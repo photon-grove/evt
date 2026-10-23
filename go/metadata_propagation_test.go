@@ -21,7 +21,7 @@ func Test_Metadata_V09Propagation(t *testing.T) {
 	ctx := context.Background()
 	repo := mem.NewRepository()
 	store := mem.NewStoreFromRepo(repo)
-	entity := evttest.NewEntity("e1")
+	aggregate := evttest.NewAggregate("e1")
 
 	metadata := evt.NewMetadata(ctx, regionPtr("us-east-1"),
 		evt.WithCommandID("cmd-0001"),
@@ -30,7 +30,7 @@ func Test_Metadata_V09Propagation(t *testing.T) {
 		evt.WithExtension("requestSource", "cli"),
 	)
 
-	require.NoError(t, store.Execute(ctx, entity, "e1", &evttest.ReplaceEntity{Value: "v1"}, metadata))
+	require.NoError(t, store.Execute(ctx, aggregate, "e1", &evttest.ReplaceAggregate{Value: "v1"}, metadata))
 
 	events, err := repo.GetEvents(ctx, "e1")
 	require.NoError(t, err)
@@ -44,9 +44,9 @@ func Test_Metadata_V09Propagation(t *testing.T) {
 	require.Equal(t, map[string]string{"requestSource": "cli"}, stored.Extensions)
 
 	// Without the options the stored bytes carry the defaults.
-	entity = evttest.NewEntity("e2")
-	require.NoError(t, store.Execute(ctx, entity, "e2", &evttest.ReplaceEntity{Value: "v1"}, evt.NewMetadata(ctx, nil)))
-	require.NoError(t, store.Execute(ctx, entity, "e2", &evttest.ReplaceEntity{Value: "v2"},
+	aggregate = evttest.NewAggregate("e2")
+	require.NoError(t, store.Execute(ctx, aggregate, "e2", &evttest.ReplaceAggregate{Value: "v1"}, evt.NewMetadata(ctx, nil)))
+	require.NoError(t, store.Execute(ctx, aggregate, "e2", &evttest.ReplaceAggregate{Value: "v2"},
 		evt.NewMetadata(ctx, nil, evt.WithCommandID("cmd-0002"))))
 
 	events, err = repo.GetEvents(ctx, "e2")

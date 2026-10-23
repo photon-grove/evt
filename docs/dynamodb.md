@@ -139,7 +139,7 @@ confirming the inline `sk = 0` snapshot already covers them**
 (`snapshot.EventSequence >= throughSequence`), and it never deletes the snapshot
 row itself. An uncovered request returns `evt.ErrCompactionUncovered` and deletes
 nothing. After a stream is compacted you **must** rebuild it through the
-snapshot-aware path (`RebuildConfig.SeedEntity` / `evt.SnapshotStreamer`), never a
+snapshot-aware path (`RebuildConfig.SeedAggregate` / `evt.SnapshotStreamer`), never a
 full replay from sequence 1 — the early events are gone.
 
 Feature-marker checks also refuse unsupported features and history-dependent entity types

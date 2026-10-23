@@ -16,14 +16,14 @@ import (
 // Commit directly).
 func (s *DynamoEventsIntegrationSuite) applyEvents(events []evt.Event) {
 	for _, event := range events {
-		require.NoError(s.T(), s.entity.Apply(event))
+		require.NoError(s.T(), s.aggregate.Apply(event))
 	}
 }
 
 func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	ctx := context.Background()
 
-	s.SetupEntity(evt.EntityID(newID()), 2)
+	s.SetupAggregate(evt.EntityID(newID()), 2)
 
 	metadata := s.getMetadata(ctx)
 
@@ -32,13 +32,13 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	updatedOther := "updated-other-value"
 	otherValue := "test-other-value"
 
-	result, err := s.entity.Handle(ctx, &test.CreateEntity{
+	result, err := s.aggregate.Handle(ctx, &test.CreateAggregate{
 		Value: "test-value",
 		Other: &otherValue,
 	})
 	require.NoError(s.T(), err)
 
-	updateValueResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
+	updateValueResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
 		Value: updatedValue,
 		Other: &otherValue,
 	})
@@ -47,7 +47,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	result.Events = append(result.Events, updateValueResult.Events...)
 
 	// Set "other" to an intermediate value
-	updateOtherResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
+	updateOtherResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
 		Value: updatedValue,
 		Other: &intermediateOther,
 	})
@@ -82,14 +82,14 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.Equal(s.T(), intermediateOther, *snap1.Other)
 
 	// Set "other" to the intermediate value again
-	newResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
+	newResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
 		Value: updatedValue,
 		Other: &intermediateOther,
 	})
 	require.NoError(s.T(), err)
 
 	// Set "other" to the final expected value
-	newOtherResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
+	newOtherResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
 		Value: updatedValue,
 		Other: &updatedOther,
 	})
@@ -132,7 +132,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	// Convert the serialized committed events to domain events
 	committedEvents := make([]evt.Event, 0, len(committedSerializedEvents))
 	for _, serializedEvent := range committedSerializedEvents {
-		event, err := evt.DeserializeEvent(serializedEvent, s.eventContext.Entity)
+		event, err := evt.DeserializeEvent(serializedEvent, s.eventContext.Aggregate)
 		require.NoError(s.T(), err)
 
 		committedEvents = append(committedEvents, event)
@@ -145,7 +145,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	ctx := context.Background()
 
-	s.SetupEntity(evt.EntityID(newID()), 2)
+	s.SetupAggregate(evt.EntityID(newID()), 2)
 
 	metadata := s.getMetadata(ctx)
 
@@ -154,13 +154,13 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	updatedOther := "updated-other-value"
 	otherValue := "test-other-value"
 
-	result, err := s.entity.Handle(ctx, &test.CreateEntity{
+	result, err := s.aggregate.Handle(ctx, &test.CreateAggregate{
 		Value: "test-value",
 		Other: &otherValue,
 	})
 	require.NoError(s.T(), err)
 
-	updateValueResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
+	updateValueResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
 		Value: updatedValue,
 		Other: &otherValue,
 	})
@@ -169,7 +169,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	result.Events = append(result.Events, updateValueResult.Events...)
 
 	// Set "other" to an intermediate value
-	updateOtherResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
+	updateOtherResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
 		Value: updatedValue,
 		Other: &intermediateOther,
 	})
@@ -182,7 +182,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	require.NoError(s.T(), err)
 
 	// Set "other" to the final expected value
-	newResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
+	newResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
 		Value: updatedValue,
 		Other: &updatedOther,
 	})
@@ -194,12 +194,12 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	require.NoError(s.T(), err)
 
 	// Load the entity again to retrieve events from memory
-	s.SetupEntity(s.entityID, 2)
+	s.SetupAggregate(s.entityID, 2)
 
 	// The hydrated entity should have the updated values
-	require.EqualValues(s.T(), test.Entity{
-		ID:    s.entity.ID,
+	require.EqualValues(s.T(), test.Aggregate{
+		ID:    s.aggregate.ID,
 		Value: "updated-value",
 		Other: &updatedOther,
-	}, *s.entity)
+	}, *s.aggregate)
 }

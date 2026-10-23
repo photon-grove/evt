@@ -489,7 +489,7 @@ error before any write and is never split.
 3. Record the last event sequence (`eventSeq`)
 4. Marshal entity state to JSON payload
 
-### Entity Loading Priority
+### Aggregate Loading Priority
 
 1. Check for snapshot first
 2. If found: unmarshal snapshot, then load events after `eventSeq`
@@ -528,11 +528,11 @@ its coordination with consumer wipe-and-replay guarantees.
 
 ### Snapshot-aware rebuild
 
-`SnapshotStreamer.StreamEntitiesFromSnapshots(ctx, expr, seedEntity, applyEvent)` (optional
+`SnapshotStreamer.StreamEntitiesFromSnapshots(ctx, expr, seedAggregate, applyEvent)` (optional
 capability) seeds each entity from its `sk = 0` snapshot, then applies only events with
 `sequence > snapshot.EventSequence`. Streams without a snapshot fall back to full replay from
-sequence 1. `RebuildProjections` uses this path when `RebuildConfig.SeedEntity` is set, and errors
-if `SeedEntity` is set on a repository that is not a `SnapshotStreamer`.
+sequence 1. `RebuildProjections` uses this path when `RebuildConfig.SeedAggregate` is set, and errors
+if `SeedAggregate` is set on a repository that is not a `SnapshotStreamer`.
 
 ## Commit-Wide Projectors (v0.9, C7)
 
@@ -714,7 +714,7 @@ The stored shapes are in the [storage format](docs/spec/storage-format.md#compac
 
 ```go
 type EventProjector interface {
-    Project(ctx context.Context, entity Entity, events []Event) (TransactionGroup, error)
+    Project(ctx context.Context, aggregate Aggregate, events []Event) (TransactionGroup, error)
 }
 ```
 
@@ -745,9 +745,9 @@ type EventUpcaster interface {
 
 ## Testing Patterns
 
-### Mock Entity Requirements
+### Mock Aggregate Requirements
 
-Implement all `Entity` interface methods:
+Implement all `Aggregate` interface methods:
 
 - `Type() EntityType`
 - `GetID() EntityID`
@@ -977,10 +977,10 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 
 ### StreamEntitiesFromSnapshots (optional: `evt.SnapshotStreamer`)
 
-- Like `StreamEntities`, but seeds each entity from its `sk = 0` snapshot via `seedEntity`
+- Like `StreamEntities`, but seeds each entity from its `sk = 0` snapshot via `seedAggregate`
 - Skips events with `sequence <= snapshot.EventSequence` (already captured by the seed)
 - Entities without a snapshot fall back to full replay from sequence 1 via `applyEvent`
-- A `seedEntity` error is yielded to the channel and that entity's remaining events are skipped
+- A `seedAggregate` error is yielded to the channel and that entity's remaining events are skipped
 
 ### CompactBelow (optional: `evt.Compactor`)
 

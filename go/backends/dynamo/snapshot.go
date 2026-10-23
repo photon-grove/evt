@@ -12,7 +12,7 @@ import (
 	"github.com/photon-grove/evt/go/policy"
 )
 
-// GetSnapshot gets the latest Snapshot for an Entity instance.
+// GetSnapshot gets the latest Snapshot for an Aggregate instance.
 // Snapshots are stored inline in the event-log table at sk=0.
 func (repo *Repository) GetSnapshot(
 	ctx context.Context,

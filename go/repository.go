@@ -27,17 +27,17 @@ func (f StreamFilter) Matches(entityType EntityType) bool {
 }
 
 // Store handles executing Commands, committing Events yielded by those Commands,
-// and loading Entity instances from a Repository.
+// and loading Aggregate instances from a Repository.
 type Store interface {
-	// LoadEntity loads the given Entity instance with the given id, retrieving Snapshots
+	// LoadAggregate loads the given Aggregate instance with the given id, retrieving Snapshots
 	// and Events from the Repository.
-	LoadEntity(
+	LoadAggregate(
 		ctx context.Context,
-		entity Entity,
+		aggregate Aggregate,
 		entityID EntityID,
 	) (Context, error)
 
-	// Commit new Events to the Entity within the given context, with optional Metadata.
+	// Commit new Events to the Aggregate within the given context, with optional Metadata.
 	Commit(
 		ctx context.Context,
 		result CommandResult,
@@ -45,12 +45,12 @@ type Store interface {
 		metadata Metadata,
 	) ([]SerializedEvent, error)
 
-	// Execute takes an empty Entity instance, loads it from the Repository, handles the given
+	// Execute takes an empty Aggregate instance, loads it from the Repository, handles the given
 	// Command, commits the resulting Events using the given Metadata, and applies those Events to the
-	// current Entity instance.
+	// current Aggregate instance.
 	Execute(
 		ctx context.Context,
-		entity Entity,
+		aggregate Aggregate,
 		entityID EntityID,
 		command Command,
 		metadata Metadata,
@@ -59,7 +59,7 @@ type Store interface {
 
 // Repository manages events for entities consistently and persists snapshots to improve load time.
 type Repository interface {
-	// Commit new Events for an Entity instance, or for several streams at once.
+	// Commit new Events for an Aggregate instance, or for several streams at once.
 	//
 	// Since v0.9 (ADR 0004, C1/C2/C7) a SerializedResult may also carry Snapshots (per-stream
 	// snapshot puts), Fences (read-only streams pinned to an observed head), and Views (the
@@ -75,7 +75,7 @@ type Repository interface {
 	// TransactionalRepository; transaction APIs refuse one that does not.
 	Commit(ctx context.Context, result SerializedResult) error
 
-	// Commit new Events for an Entity instance while also saving the given Snapshot.
+	// Commit new Events for an Aggregate instance while also saving the given Snapshot.
 	CommitWithSnapshot(
 		ctx context.Context,
 		result SerializedResult,
@@ -85,13 +85,13 @@ type Repository interface {
 		currentSnapshot EventSequence,
 	) error
 
-	// Get all Events for an Entity instance.
+	// Get all Events for an Aggregate instance.
 	GetEvents(
 		ctx context.Context,
 		entityID EntityID,
 	) ([]SerializedEvent, error)
 
-	// Get the latest Events beyond the given sequence number for an Entity, used for
+	// Get the latest Events beyond the given sequence number for an Aggregate, used for
 	// finding Events after a particular Snapshot.
 	GetLatestEvents(
 		ctx context.Context,
@@ -108,7 +108,7 @@ type Repository interface {
 		limit int,
 	) ([]SerializedEvent, error)
 
-	// Get the latest Snapshot for an Entity instance.
+	// Get the latest Snapshot for an Aggregate instance.
 	GetSnapshot(
 		ctx context.Context,
 		entityID EntityID,
@@ -121,14 +121,14 @@ type Repository interface {
 		filter StreamFilter,
 	) <-chan result.Result[[]SerializedEvent]
 
-	// StreamEntities returns a channel of all Entities in the Repository, optionally narrowed by the
-	// backend-neutral StreamFilter, with the given function applied to each Entity to fold the
+	// StreamEntities returns a channel of all Aggregates in the Repository, optionally narrowed by the
+	// backend-neutral StreamFilter, with the given function applied to each Aggregate to fold the
 	// application-specific Events into each instance. A zero filter streams every entity.
 	StreamEntities(
 		ctx context.Context,
 		filter StreamFilter,
-		applyEvent func(context.Context, SerializedEvent, Entity) (Entity, error),
-	) <-chan result.Result[Entity]
+		applyEvent func(context.Context, SerializedEvent, Aggregate) (Aggregate, error),
+	) <-chan result.Result[Aggregate]
 }
 
 // TransactionalRepository is the explicit capability a Repository declares when it commits a

@@ -41,7 +41,7 @@
 - Event logs are append-only and retained in full by default. Compaction
   (`evt.Compactor.CompactBelow`) may delete events only where a durable snapshot already covers them
   (`snapshot.EventSequence >= throughSequence`); it must never delete the `sk=0` snapshot. After a
-  stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedEntity` /
+  stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedAggregate` /
   `evt.SnapshotStreamer`), never full-replay-from-1. See
   `docs/adr/0001-event-compaction-and-snapshot-truncation.md`.
 - Do not persist mutable decisions, external signals, publish flags, accept/reject verdicts, or

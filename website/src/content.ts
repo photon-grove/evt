@@ -7,8 +7,8 @@ export const quickStartCode = `// Start with the in-memory repository.
 repo := mem.NewRepository()
 store := mem.NewStoreFromRepo(repo)
 
-entity := &account.Account{ID: "acct-1"}
-err := store.Execute(ctx, entity, "acct-1",
+aggregate := &account.Account{ID: "acct-1"}
+err := store.Execute(ctx, aggregate, "acct-1",
     &account.Open{InitialBalance: 100}, evt.Metadata{})
 
 // Use the same aggregate contract with DynamoDB.

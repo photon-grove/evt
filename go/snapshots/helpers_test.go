@@ -17,7 +17,7 @@ type testSetup struct {
 	store        evt.Store
 	repo         evt.Repository
 	entityID     evt.EntityID
-	entity       *test.Entity
+	aggregate    *test.Aggregate
 	eventContext evt.Context
 	entityType   evt.EntityType
 }
@@ -29,10 +29,10 @@ func newTestSetup(t *testing.T, entityID evt.EntityID, snapshotSize int) *testSe
 
 	repo := mem.NewRepository()
 	store := snapshots.NewStore(repo, snapshotSize)
-	entity := test.NewEntity(entityID)
-	entityType := entity.Type()
+	aggregate := test.NewAggregate(entityID)
+	entityType := aggregate.Type()
 
-	eventContext, err := store.LoadEntity(ctx, entity, entityID)
+	eventContext, err := store.LoadAggregate(ctx, aggregate, entityID)
 	if err != nil {
 		t.Fatalf("Error loading Entity: %v", err)
 	}
@@ -41,7 +41,7 @@ func newTestSetup(t *testing.T, entityID evt.EntityID, snapshotSize int) *testSe
 		store:        store,
 		repo:         repo,
 		entityID:     entityID,
-		entity:       entity,
+		aggregate:    aggregate,
 		eventContext: eventContext,
 		entityType:   entityType,
 	}
@@ -55,28 +55,28 @@ func newTestMetadata() evt.Metadata {
 	}
 }
 
-// createEntityCommand creates a CreateEntity command with the given value and other
-func createEntityCommand(value string, other *string) test.CreateEntity {
-	return test.CreateEntity{
+// createAggregateCommand creates a CreateAggregate command with the given value and other
+func createAggregateCommand(value string, other *string) test.CreateAggregate {
+	return test.CreateAggregate{
 		Value: value,
 		Other: other,
 	}
 }
 
-// replaceEntityCommand creates a ReplaceEntity command with the given value and other
-func replaceEntityCommand(value string, other *string) test.ReplaceEntity {
-	return test.ReplaceEntity{
+// replaceAggregateCommand creates a ReplaceAggregate command with the given value and other
+func replaceAggregateCommand(value string, other *string) test.ReplaceAggregate {
+	return test.ReplaceAggregate{
 		Value: value,
 		Other: other,
 	}
 }
 
 // handleCommand handles a command and returns the result, failing on error
-func handleCommand(t *testing.T, entity *test.Entity, command evt.Command) evt.CommandResult {
+func handleCommand(t *testing.T, aggregate *test.Aggregate, command evt.Command) evt.CommandResult {
 	t.Helper()
 	ctx := context.Background()
 
-	result, err := entity.Handle(ctx, command)
+	result, err := aggregate.Handle(ctx, command)
 	require.NoError(t, err, "Error handling command")
 	return result
 }
@@ -100,7 +100,7 @@ func commitEvents(t *testing.T, store evt.Store, result evt.CommandResult, event
 	ctx := context.Background()
 
 	for _, event := range result.Events {
-		require.NoError(t, eventContext.Entity.Apply(event), "Error applying event before commit")
+		require.NoError(t, eventContext.Aggregate.Apply(event), "Error applying event before commit")
 	}
 
 	serializedEvents, err := store.Commit(ctx, result, eventContext, metadata)
@@ -128,16 +128,16 @@ func getSnapshot(t *testing.T, repo evt.Repository, entityID evt.EntityID) *evt.
 	return snapshot
 }
 
-// marshalCreatedEvent marshals an EntityCreated event to JSON (matches SerializeEvents behavior)
+// marshalCreatedEvent marshals an AggregateCreated event to JSON (matches SerializeEvents behavior)
 func marshalCreatedEvent(t *testing.T, entityID evt.EntityID, value string, other *string) []byte {
 	t.Helper()
-	payload, err := json.Marshal(test.EntityCreated{ID: entityID, Value: value, Other: other})
+	payload, err := json.Marshal(test.AggregateCreated{ID: entityID, Value: value, Other: other})
 	require.NoError(t, err, "Error marshaling created event payload")
 	return payload
 }
 
-// assertEntityMatches checks the entity ID, value and other fields
-func assertEntityMatches(t *testing.T, e test.Entity, id evt.EntityID, value string, other *string) {
+// assertAggregateMatches checks the entity ID, value and other fields
+func assertAggregateMatches(t *testing.T, e test.Aggregate, id evt.EntityID, value string, other *string) {
 	t.Helper()
 	require.Equal(t, id, e.ID)
 	require.Equal(t, value, e.Value)
@@ -159,12 +159,12 @@ func createExpectedEvent(entityType evt.EntityType, entityID evt.EntityID, seque
 }
 
 // deserializeEvents converts serialized events to domain events using the entity
-func deserializeEvents(t *testing.T, serializedEvents []evt.SerializedEvent, entity evt.Entity) []evt.Event {
+func deserializeEvents(t *testing.T, serializedEvents []evt.SerializedEvent, aggregate evt.Aggregate) []evt.Event {
 	t.Helper()
 
 	domainEvents := make([]evt.Event, 0, len(serializedEvents))
 	for _, serializedEvent := range serializedEvents {
-		event, err := evt.DeserializeEvent(serializedEvent, entity)
+		event, err := evt.DeserializeEvent(serializedEvent, aggregate)
 		require.NoError(t, err, "Error deserializing events")
 		domainEvents = append(domainEvents, event)
 	}
@@ -176,10 +176,10 @@ func (s *testSetup) refresh(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 
-	entity := test.NewEntity(s.entityID)
-	eventContext, err := s.store.LoadEntity(ctx, entity, s.entityID)
+	aggregate := test.NewAggregate(s.entityID)
+	eventContext, err := s.store.LoadAggregate(ctx, aggregate, s.entityID)
 	require.NoError(t, err, "Error refreshing entity")
 
-	s.entity = entity
+	s.aggregate = aggregate
 	s.eventContext = eventContext
 }

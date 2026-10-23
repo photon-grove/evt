@@ -75,7 +75,7 @@ func TestRetry_ABackoffGrowsAndIsBounded(t *testing.T) {
 		Jitter: func(time.Duration) time.Duration { return 0 },
 	})
 
-	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected())
 	require.Equal(t, evt.RejectionStaleFence, outcome.Rejection.Code)
@@ -92,7 +92,7 @@ func TestRetry_AttemptsBelowOneMeanOne(t *testing.T) {
 	waits := &delays{}
 	store, repo := retryStore(t, conflicts(10), snapshots.RetryPolicy{MaxAttempts: 0, BaseDelay: time.Second, MaxDelay: time.Second, Sleep: waits.sleep})
 
-	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected(), "the first conflict is recorded without a retry")
 	require.EqualValues(t, 1, repo.commits.Load())
@@ -102,9 +102,9 @@ func TestRetry_AttemptsBelowOneMeanOne(t *testing.T) {
 func TestRetry_ARetriedCommandCommitsOnce(t *testing.T) {
 	waits := &delays{}
 	store, repo := retryStore(t, conflicts(2), snapshots.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: time.Second, Sleep: waits.sleep})
-	entity := etest.NewEntity("e-1")
+	aggregate := etest.NewAggregate("e-1")
 
-	outcome, err := store.ExecuteWithOutcome(context.Background(), entity, "e-1", createCommand(), commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(context.Background(), aggregate, "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
 	require.EqualValues(t, 3, repo.commits.Load())
@@ -113,7 +113,7 @@ func TestRetry_ARetriedCommandCommitsOnce(t *testing.T) {
 	events, err := repo.GetEvents(context.Background(), "e-1")
 	require.NoError(t, err)
 	require.Len(t, events, 1, "only the attempt that committed wrote anything")
-	require.Equal(t, "created", entity.Value)
+	require.Equal(t, "created", aggregate.Value)
 }
 
 func TestRetry_ATransientFailureIsReturnedWhenAttemptsRunOut(t *testing.T) {
@@ -123,7 +123,7 @@ func TestRetry_ATransientFailureIsReturnedWhenAttemptsRunOut(t *testing.T) {
 		MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: time.Second, Sleep: waits.sleep,
 	})
 
-	_, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, throttled)
 	require.True(t, policy.IsTransient(err))
 	require.EqualValues(t, 3, repo.commits.Load())
@@ -140,9 +140,9 @@ func TestRetry_AnInternalFailureIsNeverRetried(t *testing.T) {
 
 	// A handler that returns a domain ConflictError (a duplicate resource) is an internal failure,
 	// not an optimistic-concurrency conflict.
-	entity := &conflictingEntity{Entity: etest.NewEntity("e-1")}
+	aggregate := &conflictingAggregate{Aggregate: etest.NewAggregate("e-1")}
 
-	_, err := store.ExecuteWithOutcome(context.Background(), entity, "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(context.Background(), aggregate, "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.Error(t, err)
 	require.True(t, evt.IsConflictErr(err))
 	require.Empty(t, waits.waited, "the handler's own error is returned at once")
@@ -153,18 +153,18 @@ func TestRetry_AnInternalFailureIsNeverRetried(t *testing.T) {
 	require.Nil(t, stored)
 }
 
-// conflictingEntity is an entity whose handler fails with a domain ConflictError.
-type conflictingEntity struct{ *etest.Entity }
+// conflictingAggregate is an entity whose handler fails with a domain ConflictError.
+type conflictingAggregate struct{ *etest.Aggregate }
 
-func (*conflictingEntity) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
+func (*conflictingAggregate) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
 	return evt.CommandResult{}, evt.NewConflictError("handle is taken")
 }
 
-func TestRetry_AnEntityThatCannotBeResetIsAttemptedOnce(t *testing.T) {
+func TestRetry_AnAggregateThatCannotBeResetIsAttemptedOnce(t *testing.T) {
 	waits := &delays{}
 	store, repo := retryStore(t, conflicts(10), snapshots.RetryPolicy{MaxAttempts: 5, BaseDelay: time.Millisecond, MaxDelay: time.Second, Sleep: waits.sleep})
 
-	_, err := store.ExecuteWithOutcome(context.Background(), valueEntity{Entity: etest.NewEntity("e-1")}, "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(context.Background(), valueAggregate{Aggregate: etest.NewAggregate("e-1")}, "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.Error(t, err)
 	require.True(t, evt.IsConflictErr(err), "the conflict is returned as is")
 	require.EqualValues(t, 1, repo.commits.Load(), "applying events twice would double-count them")
@@ -175,18 +175,18 @@ func TestRetry_AnEntityThatCannotBeResetIsAttemptedOnce(t *testing.T) {
 	require.Nil(t, stored)
 }
 
-// valueEntity is an entity passed by value (its state lives behind the embedded pointer), which the
+// valueAggregate is an entity passed by value (its state lives behind the embedded pointer), which the
 // engine cannot reset between attempts.
-type valueEntity struct{ *etest.Entity }
+type valueAggregate struct{ *etest.Aggregate }
 
-func TestRetry_TheEntityReflectsDurableStateAfterTheAttemptsRanOut(t *testing.T) {
+func TestRetry_TheAggregateReflectsDurableStateAfterTheAttemptsRanOut(t *testing.T) {
 	store, _ := retryStore(t, conflicts(10), snapshots.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: time.Second, Sleep: (&delays{}).sleep})
-	entity := etest.NewEntity("e-1")
+	aggregate := etest.NewAggregate("e-1")
 
-	outcome, err := store.ExecuteWithOutcome(context.Background(), entity, "e-1", createCommand(), commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(context.Background(), aggregate, "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected())
-	require.Empty(t, entity.Value, "events applied by the failed attempts were discarded")
+	require.Empty(t, aggregate.Value, "events applied by the failed attempts were discarded")
 }
 
 func TestRetry_ACancelledContextEndsTheBackoff(t *testing.T) {
@@ -197,7 +197,7 @@ func TestRetry_ACancelledContextEndsTheBackoff(t *testing.T) {
 
 	cancel()
 
-	_, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, context.Canceled)
 	require.True(t, evt.IsConflictErr(err), "the conflict that was being retried is not lost: %v", err)
 	require.EqualValues(t, 1, repo.commits.Load())
@@ -215,12 +215,12 @@ func TestRetry_ATransactionIsPreparedAgainOnlyForRetryableFailures(t *testing.T)
 		func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
 			prepared++
 
-			entity := etest.NewEntity("e-1")
-			if err := tx.Read(ctx, entity, "e-1"); err != nil {
+			aggregate := etest.NewAggregate("e-1")
+			if err := tx.Read(ctx, aggregate, "e-1"); err != nil {
 				return nil, err
 			}
 
-			return nil, tx.Append("e-1", &etest.EntityCreated{ID: "e-1", Value: "v"})
+			return nil, tx.Append("e-1", &etest.AggregateCreated{ID: "e-1", Value: "v"})
 		})
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
@@ -247,7 +247,7 @@ func TestRetry_ATransactionIsPreparedAgainOnlyForRetryableFailures(t *testing.T)
 	// A rejection is recorded, fenced on what the prepare function read.
 	rejected, err := store.ExecuteTransaction(ctx, identity, commandMetadata("cmd-4"),
 		func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
-			if rerr := tx.Read(ctx, etest.NewEntity("e-1"), "e-1"); rerr != nil {
+			if rerr := tx.Read(ctx, etest.NewAggregate("e-1"), "e-1"); rerr != nil {
 				return nil, rerr
 			}
 
@@ -270,7 +270,7 @@ func TestRetry_UnsetDelaysTakeTheDefaultsAndImmediateOptsOut(t *testing.T) {
 	waits := &delays{}
 	store, repo := retryStore(t, conflicts(2), snapshots.RetryPolicy{MaxAttempts: 3, Sleep: waits.sleep})
 
-	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
 	require.EqualValues(t, 3, repo.commits.Load())
@@ -289,7 +289,7 @@ func TestRetry_UnsetDelaysTakeTheDefaultsAndImmediateOptsOut(t *testing.T) {
 
 	store, repo = retryStore(t, conflicts(2), immediate)
 
-	outcome, err = store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	outcome, err = store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
 	require.EqualValues(t, 3, repo.commits.Load())
@@ -301,7 +301,7 @@ func TestRetry_ADeadlineEndsTheRetries(t *testing.T) {
 		MaxAttempts: 5, Immediate: true, Deadline: time.Nanosecond,
 	})
 
-	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected(), "a conflict past the deadline is recorded like exhausted attempts")
 	require.EqualValues(t, 1, repo.commits.Load())
@@ -316,14 +316,14 @@ func TestRetry_ADeadlineEndsTheRetries(t *testing.T) {
 		MaxAttempts: 5, Immediate: true, Deadline: time.Nanosecond,
 	})
 
-	_, err = store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-2"))
+	_, err = store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-2"))
 	require.ErrorIs(t, err, throttled)
 	require.EqualValues(t, 1, repo.commits.Load())
 
 	// Without one, every attempt runs.
 	store, repo = retryStore(t, conflicts(2), snapshots.ImmediateRetryPolicy(5))
 
-	outcome, err = store.ExecuteWithOutcome(context.Background(), etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-3"))
+	outcome, err = store.ExecuteWithOutcome(context.Background(), etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-3"))
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
 	require.EqualValues(t, 3, repo.commits.Load())
@@ -353,7 +353,7 @@ func TestRetry_ALoadGapIsRetriedButNeverRecordedAsStale(t *testing.T) {
 	})
 
 	// The single-aggregate shortcut.
-	_, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrSequenceGap, "the gap is returned, not turned into a rejection")
 	require.Len(t, waits.waited, 2, "but it is retried like any transient failure")
 
@@ -367,7 +367,7 @@ func TestRetry_ALoadGapIsRetriedButNeverRecordedAsStale(t *testing.T) {
 
 	_, err = store.ExecuteTransaction(ctx, identity, commandMetadata("cmd-2"),
 		func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
-			return nil, tx.Read(ctx, etest.NewEntity("e-1"), "e-1")
+			return nil, tx.Read(ctx, etest.NewAggregate("e-1"), "e-1")
 		})
 	require.ErrorIs(t, err, evt.ErrSequenceGap)
 	require.Len(t, waits.waited, 2)
@@ -471,16 +471,16 @@ func (*refused) Rejection() evt.Rejection {
 func TestRetry_ARetriedCommandNeverAppliesItsEventsTwice(t *testing.T) {
 	ctx := context.Background()
 	store, repo := retryStore(t, conflicts(2), snapshots.ImmediateRetryPolicy(3))
-	entity := newTally("t-1")
+	aggregate := newTally("t-1")
 
-	outcome, err := store.ExecuteWithOutcome(ctx, entity, "t-1", &tallyAdd{N: 5}, commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(ctx, aggregate, "t-1", &tallyAdd{N: 5}, commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
 	require.EqualValues(t, 3, repo.commits.Load())
 
 	// Two failed attempts applied the event to the entity before their commits failed.
-	require.Equal(t, 5, entity.Total, "the failed attempts' events were reset, not accumulated")
-	require.Equal(t, map[string]int{"tallied": 1}, entity.Counts, "and so was the exported map")
+	require.Equal(t, 5, aggregate.Total, "the failed attempts' events were reset, not accumulated")
+	require.Equal(t, map[string]int{"tallied": 1}, aggregate.Counts, "and so was the exported map")
 
 	events, err := repo.GetEvents(ctx, "t-1")
 	require.NoError(t, err)
@@ -488,13 +488,13 @@ func TestRetry_ARetriedCommandNeverAppliesItsEventsTwice(t *testing.T) {
 
 	// When the attempts run out the caller's entity is what storage holds: nothing.
 	repo.failures, repo.commits = conflicts(10), atomic.Int32{}
-	entity = newTally("t-2")
+	aggregate = newTally("t-2")
 
-	outcome, err = store.ExecuteWithOutcome(ctx, entity, "t-2", &tallyAdd{N: 5}, commandMetadata("cmd-2"))
+	outcome, err = store.ExecuteWithOutcome(ctx, aggregate, "t-2", &tallyAdd{N: 5}, commandMetadata("cmd-2"))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected())
-	require.Zero(t, entity.Total)
-	require.Empty(t, entity.Counts)
+	require.Zero(t, aggregate.Total)
+	require.Empty(t, aggregate.Counts)
 }
 
 func TestRetry_TheDigestIsTakenOnceBeforeTheFirstAttempt(t *testing.T) {
@@ -545,12 +545,12 @@ func TestRetry_ATransientReadInsidePrepareIsRetriedButNeverRecorded(t *testing.T
 
 	// The function wraps the load error, as real code does.
 	prepare := func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
-		entity := etest.NewEntity("e-1")
-		if err := tx.Read(ctx, entity, "e-1"); err != nil {
+		aggregate := etest.NewAggregate("e-1")
+		if err := tx.Read(ctx, aggregate, "e-1"); err != nil {
 			return nil, fmt.Errorf("read the entity: %w", err)
 		}
 
-		return nil, tx.Append("e-1", &etest.EntityCreated{ID: "e-1", Value: "v"})
+		return nil, tx.Append("e-1", &etest.AggregateCreated{ID: "e-1", Value: "v"})
 	}
 
 	repo := &flakyReadRepository{OutcomeRepository: memOutcomes(t), failures: []error{throttled}}
@@ -597,7 +597,7 @@ func TestRetry_AnAmbiguousWriteOnTheLastAttemptIsAnErrorNotARejection(t *testing
 		WithOutcomes(snapshots.WithRecoveryWait(10 * time.Millisecond)).
 		WithRetry(snapshots.ImmediateRetryPolicy(2))
 
-	_, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrAmbiguousWrite)
 	require.True(t, policy.IsTransient(err))
 	require.EqualValues(t, 2, repo.commits.Load(), "both attempts ran")
@@ -642,7 +642,7 @@ func TestRetry_ACorruptOutcomeIsNeverRePreparedOrRecorded(t *testing.T) {
 	repo := &corruptingRepository{OutcomeRepository: memOutcomes(t)}
 	store := snapshots.NewStore(repo, 0).WithOutcomes().WithRetry(snapshots.ImmediateRetryPolicy(5))
 
-	_, err := store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	_, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
 	require.ErrorIs(t, err, evt.ErrCorruptOutcome)
 	require.EqualValues(t, 1, repo.reads.Load(), "not read again")
 	require.Zero(t, repo.commits.Load(), "and nothing ran")
@@ -653,7 +653,7 @@ func TestRetry_ACorruptOutcomeIsNeverRePreparedOrRecorded(t *testing.T) {
 		WithOutcomes(snapshots.WithRecoveryWait(10 * time.Millisecond)).
 		WithRetry(snapshots.ImmediateRetryPolicy(5))
 
-	_, err = store.ExecuteWithOutcome(ctx, etest.NewEntity("e-1"), "e-1", createCommand(), commandMetadata("cmd-2"))
+	_, err = store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-2"))
 	require.ErrorIs(t, err, evt.ErrCorruptOutcome)
 	require.EqualValues(t, 1, repo.commits.Load(), "the command was not prepared again")
 
@@ -672,11 +672,11 @@ func TestRetry_AReservedStreamIsStillRefusedWithoutAnIdentityCheck(t *testing.T)
 		// but the commit still refuses it, before any write.
 		_, err := store.ExecuteTransaction(ctx, identity, commandMetadata("cmd-"+string(reserved)),
 			func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
-				if err := tx.Read(ctx, etest.NewEntity(reserved), reserved); err != nil {
+				if err := tx.Read(ctx, etest.NewAggregate(reserved), reserved); err != nil {
 					return nil, err
 				}
 
-				return nil, tx.Append(reserved, &etest.EntityCreated{ID: reserved, Value: "v"})
+				return nil, tx.Append(reserved, &etest.AggregateCreated{ID: reserved, Value: "v"})
 			})
 		require.True(t, evt.IsReservedEntityIdErr(err), "%s: %v", reserved, err)
 
@@ -698,10 +698,10 @@ func (*tallyRefuse) EntityType() evt.EntityType { return tallyType }
 func TestRetry_ARejectionWithEventsIsPreparedAgainAndCommitsOnce(t *testing.T) {
 	ctx := context.Background()
 	store, repo := retryStore(t, conflicts(2), snapshots.ImmediateRetryPolicy(3))
-	entity := newTally("t-1")
+	aggregate := newTally("t-1")
 	command := &tallyRefuse{N: 5}
 
-	outcome, err := store.ExecuteWithOutcome(ctx, entity, "t-1", command, commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(ctx, aggregate, "t-1", command, commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected())
 	require.Equal(t, evt.RejectionCode("refused"), outcome.Rejection.Code)
@@ -710,8 +710,8 @@ func TestRetry_ARejectionWithEventsIsPreparedAgainAndCommitsOnce(t *testing.T) {
 	require.Equal(t, []evt.EventID{"t-1:1"}, outcome.EventIDs)
 
 	// The events of the failed attempts were reset, not accumulated.
-	require.Equal(t, 5, entity.Total)
-	require.Equal(t, map[string]int{"tallied": 1}, entity.Counts)
+	require.Equal(t, 5, aggregate.Total)
+	require.Equal(t, map[string]int{"tallied": 1}, aggregate.Counts)
 
 	events, err := repo.GetEvents(ctx, "t-1")
 	require.NoError(t, err)
@@ -734,10 +734,10 @@ func TestRetry_ARejectionWithEventsIsPreparedAgainAndCommitsOnce(t *testing.T) {
 func TestRetry_ExhaustedAttemptsRecordTheStaleFenceWithoutTheRejectionsEvents(t *testing.T) {
 	ctx := context.Background()
 	store, repo := retryStore(t, conflicts(10), snapshots.ImmediateRetryPolicy(3))
-	entity := newTally("t-1")
+	aggregate := newTally("t-1")
 	command := &tallyRefuse{N: 5}
 
-	outcome, err := store.ExecuteWithOutcome(ctx, entity, "t-1", command, commandMetadata("cmd-1"))
+	outcome, err := store.ExecuteWithOutcome(ctx, aggregate, "t-1", command, commandMetadata("cmd-1"))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected())
 	require.Equal(t, evt.RejectionStaleFence, outcome.Rejection.Code)
@@ -748,6 +748,6 @@ func TestRetry_ExhaustedAttemptsRecordTheStaleFenceWithoutTheRejectionsEvents(t 
 	events, err := repo.GetEvents(ctx, "t-1")
 	require.NoError(t, err)
 	require.Empty(t, events, "the caller's events are not written with the exhaustion rejection")
-	require.Zero(t, entity.Total, "the caller's entity reflects durable state")
-	require.Empty(t, entity.Counts)
+	require.Zero(t, aggregate.Total, "the caller's entity reflects durable state")
+	require.Empty(t, aggregate.Counts)
 }

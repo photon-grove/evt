@@ -91,16 +91,16 @@ func Test_Context_StructFields(t *testing.T) {
 	snapshotSeq := EventSequence(5)
 
 	// Create a mock entity (we'll use nil since we're just testing the struct)
-	var entity Entity
+	var aggregate Aggregate
 
 	ctx := Context{
-		Entity:          entity,
+		Aggregate:       aggregate,
 		EntityID:        entityID,
 		CurrentSequence: &currentSeq,
 		CurrentSnapshot: &snapshotSeq,
 	}
 
-	require.Equal(t, entity, ctx.Entity)
+	require.Equal(t, aggregate, ctx.Aggregate)
 	require.Equal(t, entityID, ctx.EntityID)
 	require.NotNil(t, ctx.CurrentSequence)
 	require.Equal(t, currentSeq, *ctx.CurrentSequence)
@@ -113,13 +113,13 @@ func Test_Context_NilPointers(t *testing.T) {
 	entityID := EntityID("test-entity")
 
 	ctx := Context{
-		Entity:          nil,
+		Aggregate:       nil,
 		EntityID:        entityID,
 		CurrentSequence: nil,
 		CurrentSnapshot: nil,
 	}
 
-	require.Nil(t, ctx.Entity)
+	require.Nil(t, ctx.Aggregate)
 	require.Equal(t, entityID, ctx.EntityID)
 	require.Nil(t, ctx.CurrentSequence)
 	require.Nil(t, ctx.CurrentSnapshot)
@@ -352,7 +352,7 @@ func Test_Context_ZeroValue(t *testing.T) {
 	// Test zero value of Context
 	var ctx Context
 
-	require.Nil(t, ctx.Entity)
+	require.Nil(t, ctx.Aggregate)
 	require.Equal(t, EntityID(""), ctx.EntityID)
 	require.Nil(t, ctx.CurrentSequence)
 	require.Nil(t, ctx.CurrentSnapshot)

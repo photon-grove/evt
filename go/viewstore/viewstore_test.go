@@ -194,7 +194,7 @@ func TestSingleStore(t *testing.T) {
 	}
 }
 
-type ptrEntity struct {
+type ptrAggregate struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	dep  string
@@ -202,11 +202,11 @@ type ptrEntity struct {
 
 func TestCodecFactory(t *testing.T) {
 	repo := newFakeRepo()
-	codec := NewWithFactory[*ptrEntity](repo, testEntityType, func() *ptrEntity {
-		return &ptrEntity{dep: "injected"}
+	codec := NewWithFactory[*ptrAggregate](repo, testEntityType, func() *ptrAggregate {
+		return &ptrAggregate{dep: "injected"}
 	})
 
-	if err := codec.PutAt(context.Background(), "PTR#1", "1", &ptrEntity{ID: "1", Name: "alpha"}); err != nil {
+	if err := codec.PutAt(context.Background(), "PTR#1", "1", &ptrAggregate{ID: "1", Name: "alpha"}); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 

@@ -48,9 +48,9 @@ type Transaction struct {
 
 // transactionStream is one read aggregate and the events appended to it since the read.
 type transactionStream struct {
-	entity  evt.Entity
-	context evt.Context
-	pending []evt.Event
+	aggregate evt.Aggregate
+	context   evt.Context
+	pending   []evt.Event
 }
 
 // Transaction begins a new multi-stream transaction on the store.
@@ -62,10 +62,10 @@ func (store *Store) Transaction() *Transaction {
 }
 
 // Read loads an aggregate into the transaction's read set. The entity instance is filled from
-// the snapshot and events like Store.LoadEntity, so appended events keep its snapshot payload
+// the snapshot and events like Store.LoadAggregate, so appended events keep its snapshot payload
 // consistent. A stream that receives no events before Commit is fenced at the head it was read
 // at; a stream that receives events is written.
-func (tx *Transaction) Read(ctx context.Context, entity evt.Entity, entityID evt.EntityID) error {
+func (tx *Transaction) Read(ctx context.Context, aggregate evt.Aggregate, entityID evt.EntityID) error {
 	if tx.used {
 		return fmt.Errorf("snapshots: transaction is already consumed")
 	}
@@ -74,14 +74,14 @@ func (tx *Transaction) Read(ctx context.Context, entity evt.Entity, entityID evt
 
 		return err
 	}
-	if entity == nil {
+	if aggregate == nil {
 		return fmt.Errorf("snapshots: transaction read of %s has a nil entity", entityID)
 	}
 	if _, exists := tx.streams[entityID]; exists {
 		return fmt.Errorf("snapshots: duplicate read of %s", entityID)
 	}
 
-	context, err := tx.store.LoadEntity(ctx, entity, entityID)
+	context, err := tx.store.LoadAggregate(ctx, aggregate, entityID)
 	if err != nil {
 		tx.used = true
 		tx.readErr = err
@@ -91,11 +91,11 @@ func (tx *Transaction) Read(ctx context.Context, entity evt.Entity, entityID evt
 
 	// Keep the entity's internal ID aligned with the store key, as Execute does, so projectors
 	// write views to the right partition.
-	if setter, ok := entity.(interface{ SetID(evt.EntityID) }); ok {
+	if setter, ok := aggregate.(interface{ SetID(evt.EntityID) }); ok {
 		setter.SetID(entityID)
 	}
 
-	tx.streams[entityID] = &transactionStream{entity: entity, context: context}
+	tx.streams[entityID] = &transactionStream{aggregate: aggregate, context: context}
 	tx.order = append(tx.order, entityID)
 
 	return nil
@@ -114,12 +114,12 @@ func (tx *Transaction) Append(entityID evt.EntityID, events ...evt.Event) error 
 	}
 
 	for _, event := range events {
-		if event.EntityType() != stream.entity.Type() {
+		if event.EntityType() != stream.aggregate.Type() {
 			tx.used = true
 
 			return fmt.Errorf("snapshots: event type %s does not belong to stream %s", event.EntityType(), entityID)
 		}
-		if err := stream.entity.Apply(event); err != nil {
+		if err := stream.aggregate.Apply(event); err != nil {
 			tx.used = true
 
 			return err
@@ -351,7 +351,7 @@ func (tx *Transaction) fencedReads() evt.SerializedResult {
 
 		result.Fences = append(result.Fences, evt.ReadFence{
 			EntityID:   entityID,
-			EntityType: stream.entity.Type(),
+			EntityType: stream.aggregate.Type(),
 			Head:       streamHead(stream.context),
 		})
 	}
@@ -385,24 +385,24 @@ func (tx *Transaction) prepare(ctx context.Context, metadata evt.Metadata) (evt.
 			// sequence and its snapshot's event sequence.
 			result.Fences = append(result.Fences, evt.ReadFence{
 				EntityID:   entityID,
-				EntityType: stream.entity.Type(),
+				EntityType: stream.aggregate.Type(),
 				Head:       streamHead(stream.context),
 			})
 
 			continue
 		}
 
-		serialized, snapshots, err := tx.store.stage(stream.entity, &stream.context, entityID, stream.pending, metadata)
+		serialized, snapshots, err := tx.store.stage(stream.aggregate, &stream.context, entityID, stream.pending, metadata)
 		if err != nil {
 			return evt.SerializedResult{}, err
 		}
 
-		projectorTransaction, err := buildProjectorTransaction(ctx, stream.entity, stream.pending)
+		projectorTransaction, err := buildProjectorTransaction(ctx, stream.aggregate, stream.pending)
 		if err != nil {
 			return evt.SerializedResult{}, err
 		}
 
-		state, serr := tx.store.stateAfterCommit(stream.entity, snapshots)
+		state, serr := tx.store.stateAfterCommit(stream.aggregate, snapshots)
 		if serr != nil {
 			return evt.SerializedResult{}, serr
 		}
@@ -427,7 +427,7 @@ func (tx *Transaction) prepare(ctx context.Context, metadata evt.Metadata) (evt.
 }
 
 // streamHead returns the head a fenced read observed: the loaded context's current event
-// sequence. LoadEntity seeds it from the snapshot's event sequence and advances it over later
+// sequence. LoadAggregate seeds it from the snapshot's event sequence and advances it over later
 // events, so it is already the larger of the stream's highest event sequence and its snapshot's
 // event sequence — including a compacted stream, whose events a snapshot covers.
 func streamHead(context evt.Context) evt.EventSequence {

@@ -47,7 +47,7 @@ func Test_CompactionFencesCompletedDeclaration(t *testing.T) {
 			defer cancel()
 			repo, marker := newIsolatedEventLog(ctx, t)
 			id := evt.EntityID("account-1")
-			events, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "one"}}, 0, id, evt.Metadata{})
+			events, err := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "one"}}, 0, id, evt.Metadata{})
 			require.NoError(t, err)
 			require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, test.EntityType, id, []byte(`{}`), 1))
 			if tc.existingMarker {
@@ -116,7 +116,7 @@ func Test_CommitAndDeclareShareMarker(t *testing.T) {
 		go func() {
 			<-start
 			id := evt.EntityID(fmt.Sprintf("account-%d", i))
-			events, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "one"}}, 0, id, evt.Metadata{})
+			events, err := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "one"}}, 0, id, evt.Metadata{})
 			if err != nil {
 				errs <- err
 				return
@@ -174,7 +174,7 @@ func Test_DefaultAndDeclaringWritersRefuseUnsupported(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, writer := range []*dynamo.Repository{repo, declaring} {
-		events, encodeErr := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: "after", Value: "v"}}, 0, "after", evt.Metadata{})
+		events, encodeErr := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: "after", Value: "v"}}, 0, "after", evt.Metadata{})
 		require.NoError(t, encodeErr)
 		res := evt.SerializedResult{Events: events}
 		require.True(t, evt.IsUnsupportedFeatureErr(writer.Commit(ctx, res)))

@@ -17,11 +17,11 @@ import (
 
 func (s *DynamoEventsIntegrationSuite) Test_Schema_EventItemStructure() {
 	ctx := context.Background()
-	s.SetupEntity(evt.EntityID(newID()), 2)
+	s.SetupAggregate(evt.EntityID(newID()), 2)
 	metadata := s.getMetadata(ctx)
 
 	// Create and commit an event
-	result, err := s.entity.Handle(ctx, &test.CreateEntity{Value: "test-value"})
+	result, err := s.aggregate.Handle(ctx, &test.CreateAggregate{Value: "test-value"})
 	require.NoError(s.T(), err)
 	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
 	require.NoError(s.T(), err)
@@ -87,16 +87,16 @@ func (s *DynamoEventsIntegrationSuite) Test_Schema_EventItemStructure() {
 func (s *DynamoEventsIntegrationSuite) Test_Schema_SnapshotItemStructure() {
 	ctx := context.Background()
 	// Snapshot size 2. We need 2 events to trigger snapshot.
-	s.SetupEntity(evt.EntityID(newID()), 2)
+	s.SetupAggregate(evt.EntityID(newID()), 2)
 	metadata := s.getMetadata(ctx)
 
 	// Use Execute to ensure proper state/sequence handling
 	// Event 1
-	err := s.store.Execute(ctx, s.entity, s.entityID, &test.CreateEntity{Value: "val1"}, metadata)
+	err := s.store.Execute(ctx, s.aggregate, s.entityID, &test.CreateAggregate{Value: "val1"}, metadata)
 	require.NoError(s.T(), err)
 
 	// Event 2 (triggers snapshot)
-	err = s.store.Execute(ctx, s.entity, s.entityID, &test.ReplaceEntity{Value: "val2"}, metadata)
+	err = s.store.Execute(ctx, s.aggregate, s.entityID, &test.ReplaceAggregate{Value: "val2"}, metadata)
 	require.NoError(s.T(), err)
 
 	// Fetch inline snapshot from the event-log table at sk=0
@@ -146,11 +146,11 @@ func (s *DynamoEventsIntegrationSuite) Test_Schema_SnapshotItemStructure() {
 
 func (s *DynamoEventsIntegrationSuite) Test_Schema_OptimisticLocking() {
 	ctx := context.Background()
-	s.SetupEntity(evt.EntityID(newID()), 2)
+	s.SetupAggregate(evt.EntityID(newID()), 2)
 	metadata := s.getMetadata(ctx)
 
 	// Commit event 1
-	res1, err := s.entity.Handle(ctx, &test.CreateEntity{Value: "val1"})
+	res1, err := s.aggregate.Handle(ctx, &test.CreateAggregate{Value: "val1"})
 	require.NoError(s.T(), err)
 	_, err = s.store.Commit(ctx, res1, s.eventContext, metadata)
 	require.NoError(s.T(), err)

@@ -9,7 +9,7 @@ import (
 )
 
 func TestDeserializeEvent_UnknownTypeFailsClosed(t *testing.T) {
-	entity := evttest.NewEntity("test-1")
+	aggregate := evttest.NewAggregate("test-1")
 
 	serialized := evt.SerializedEvent{
 		Type:    "test:never_existed",
@@ -17,7 +17,7 @@ func TestDeserializeEvent_UnknownTypeFailsClosed(t *testing.T) {
 		Payload: []byte(`{}`),
 	}
 
-	_, err := evt.DeserializeEvent(serialized, entity)
+	_, err := evt.DeserializeEvent(serialized, aggregate)
 	if err == nil {
 		t.Fatal("expected unknown event to fail closed")
 	}
@@ -39,7 +39,7 @@ func TestDeserializeEvent_UnknownTypeFailsClosed(t *testing.T) {
 }
 
 func TestDeserializeEvent_KnownTypeSucceeds(t *testing.T) {
-	entity := evttest.NewEntity("test-1")
+	aggregate := evttest.NewAggregate("test-1")
 
 	serialized := evt.SerializedEvent{
 		Type:    evttest.CreatedEvent,
@@ -47,7 +47,7 @@ func TestDeserializeEvent_KnownTypeSucceeds(t *testing.T) {
 		Payload: []byte(`{"id":"test-1","value":"hello"}`),
 	}
 
-	event, err := evt.DeserializeEvent(serialized, entity)
+	event, err := evt.DeserializeEvent(serialized, aggregate)
 	if err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
@@ -57,9 +57,9 @@ func TestDeserializeEvent_KnownTypeSucceeds(t *testing.T) {
 }
 
 func TestApply_UnknownEventReturnsBadEventError(t *testing.T) {
-	entity := evttest.NewEntity("test-1")
+	aggregate := evttest.NewAggregate("test-1")
 
-	err := entity.Apply(&evttest.FakeEvent{})
+	err := aggregate.Apply(&evttest.FakeEvent{})
 	if err == nil {
 		t.Fatal("expected Apply to fail closed on unknown event")
 	}

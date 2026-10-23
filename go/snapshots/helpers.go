@@ -8,9 +8,9 @@ import (
 )
 
 // createContext returns a new event context with the given entity and sequences.
-func createContext(entity evt.Entity, entityID evt.EntityID, currentSequence, currentSnapshot *evt.EventSequence) evt.Context {
+func createContext(aggregate evt.Aggregate, entityID evt.EntityID, currentSequence, currentSnapshot *evt.EventSequence) evt.Context {
 	return evt.Context{
-		Entity:          entity,
+		Aggregate:       aggregate,
 		EntityID:        entityID,
 		CurrentSequence: currentSequence,
 		CurrentSnapshot: currentSnapshot,
@@ -18,14 +18,14 @@ func createContext(entity evt.Entity, entityID evt.EntityID, currentSequence, cu
 }
 
 // createInitialContext returns an event context with zero sequences for new entities.
-func createInitialContext(entity evt.Entity, entityID evt.EntityID) evt.Context {
+func createInitialContext(aggregate evt.Aggregate, entityID evt.EntityID) evt.Context {
 	currentSequence := evt.EventSequence(0)
 	currentSnapshot := evt.EventSequence(0)
 
-	return createContext(entity, entityID, &currentSequence, &currentSnapshot)
+	return createContext(aggregate, entityID, &currentSequence, &currentSnapshot)
 }
 
-// applyEventsToEntity applies events to an entity and updates the current sequence.
+// applyEventsToAggregate applies events to an entity and updates the current sequence.
 // It also records any CommandIDs found in event metadata for dedupliation.
 //
 // Sequences must continue from the context's current sequence without a gap. A gap means another
@@ -33,7 +33,7 @@ func createInitialContext(entity evt.Entity, entityID evt.EntityID) evt.Context 
 // or events expired. Applying events across it would build the wrong state, so it returns a
 // conflict classified as transient: a caller that retries the command reloads a fresh entity, and
 // evt.IsConflictErr still matches it.
-func applyEventsToEntity(serializedEvents []evt.SerializedEvent, eventContext *evt.Context) error {
+func applyEventsToAggregate(serializedEvents []evt.SerializedEvent, eventContext *evt.Context) error {
 	for _, serializedEvent := range serializedEvents {
 		var current evt.EventSequence
 		if eventContext.CurrentSequence != nil {
@@ -47,7 +47,7 @@ func applyEventsToEntity(serializedEvents []evt.SerializedEvent, eventContext *e
 			}}
 		}
 
-		event, err := evt.DeserializeEvent(serializedEvent, eventContext.Entity)
+		event, err := evt.DeserializeEvent(serializedEvent, eventContext.Aggregate)
 		if err != nil {
 			return err
 		}
@@ -60,8 +60,8 @@ func applyEventsToEntity(serializedEvents []evt.SerializedEvent, eventContext *e
 			eventContext.RecordCommandID(*serializedEvent.Metadata.CommandID)
 		}
 
-		// Apply each Event to the Entity, to build up the current state
-		if err = eventContext.Entity.Apply(event); err != nil {
+		// Apply each Event to the Aggregate, to build up the current state
+		if err = eventContext.Aggregate.Apply(event); err != nil {
 			return err
 		}
 	}
@@ -80,8 +80,8 @@ func updateSnapshotSequence(eventContext *evt.Context) {
 }
 
 // generateSnapshotPayload marshals the current entity state to JSON.
-func generateSnapshotPayload(entity evt.Entity) ([]byte, error) {
-	snapshot, err := json.Marshal(entity)
+func generateSnapshotPayload(aggregate evt.Aggregate) ([]byte, error) {
+	snapshot, err := json.Marshal(aggregate)
 	if err != nil {
 		return nil, err
 	}

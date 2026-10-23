@@ -65,8 +65,8 @@ func TestStreamRecordFromEnvelope_RejectsMalformed(t *testing.T) {
 	require.Error(t, err)
 
 	// Envelope is valid JSON but its Detail has no entity id.
-	noEntity := envelopeFor(t, evt.SerializedEvent{ID: evt.EventID("x")})
-	_, err = projectors.StreamRecordFromEnvelope(noEntity)
+	noAggregate := envelopeFor(t, evt.SerializedEvent{ID: evt.EventID("x")})
+	_, err = projectors.StreamRecordFromEnvelope(noAggregate)
 	require.Error(t, err)
 
 	// ...or no event id, which would otherwise collide on an empty idempotency key.

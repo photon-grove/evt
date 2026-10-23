@@ -81,11 +81,11 @@ func driftedStream(
 
 	id := evt.EntityID(newNamespace() + "-" + name)
 	commitEvents(t, repo, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
 	)
 
-	raw := serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "bypass"})
+	raw := serialize(t, id, "test", 2, &test.AggregateUpdated{ID: id, Value: "bypass"})
 	require.NoError(t, bypass(context.Background(), repo, raw[0]))
 
 	stored, err := repo.GetEvents(context.Background(), id)
@@ -106,14 +106,14 @@ func testFenceOnAbsentStream(t *testing.T, repo evt.Repository) {
 	fence := evt.ReadFence{EntityID: idWatched, EntityType: "test", Head: 0}
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, idWriter, "test", 0, &test.EntityCreated{ID: idWriter, Value: "first"}),
+		Events: serialize(t, idWriter, "test", 0, &test.AggregateCreated{ID: idWriter, Value: "first"}),
 		Fences: []evt.ReadFence{fence},
 	}))
 
-	commitEvents(t, repo, idWatched, "test", 0, &test.EntityCreated{ID: idWatched, Value: "created"})
+	commitEvents(t, repo, idWatched, "test", 0, &test.AggregateCreated{ID: idWatched, Value: "created"})
 
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, idWriter, "test", 1, &test.EntityUpdated{ID: idWriter, Value: "second"}),
+		Events: serialize(t, idWriter, "test", 1, &test.AggregateUpdated{ID: idWriter, Value: "second"}),
 		Fences: []evt.ReadFence{fence},
 	})
 
@@ -131,9 +131,9 @@ func testHeadItemsAreNotEvents(t *testing.T, repo evt.Repository) {
 
 	id := evt.EntityID(ns + "-stream")
 	commitEvents(t, repo, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
-		&test.EntityUpdated{ID: id, Value: "three"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
+		&test.AggregateUpdated{ID: id, Value: "three"},
 	)
 
 	all, err := repo.GetEvents(ctx, id)
@@ -184,15 +184,15 @@ func testCompactionKeepsTheHead(t *testing.T, repo evt.Repository) {
 
 	id := evt.EntityID(ns + "-compacted")
 	events := serialize(t, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
-		&test.EntityUpdated{ID: id, Value: "three"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
+		&test.AggregateUpdated{ID: id, Value: "three"},
 	)
 	payload := []byte(`{"id":"x"}`)
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "test", id, payload, 1))
 
 	// A writer prepared an append at sequence 4 before the compaction.
-	prepared := serialize(t, id, "test", 3, &test.EntityUpdated{ID: id, Value: "four"})
+	prepared := serialize(t, id, "test", 3, &test.AggregateUpdated{ID: id, Value: "four"})
 
 	deleted, err := compactor.CompactBelow(ctx, id, 3)
 	require.NoError(t, err)
@@ -201,7 +201,7 @@ func testCompactionKeepsTheHead(t *testing.T, repo evt.Repository) {
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: prepared}),
 		"compaction does not move the head, so a current writer never conflicts with it")
 
-	stale := serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "stale"})
+	stale := serialize(t, id, "test", 2, &test.AggregateUpdated{ID: id, Value: "stale"})
 	err = repo.Commit(ctx, evt.SerializedResult{Events: stale})
 	require.True(t, evt.IsOptimisticConflict(err), "a compacted sequence cannot be recreated: %v", err)
 }
@@ -217,8 +217,8 @@ func testSnapshotGuard(t *testing.T, repo evt.Repository) {
 
 	id := evt.EntityID(ns + "-guarded")
 	commitEvents(t, repo, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
 	)
 
 	// Ahead of the head: refused as drift, and nothing is written.
@@ -262,7 +262,7 @@ func testSnapshotGuard(t *testing.T, repo evt.Repository) {
 	require.JSONEq(t, `{"id":"two"}`, string(snapshot.Payload))
 
 	// The refused writes left the stream writable.
-	commitEvents(t, repo, id, "test", 2, &test.EntityUpdated{ID: id, Value: "three"})
+	commitEvents(t, repo, id, "test", 2, &test.AggregateUpdated{ID: id, Value: "three"})
 }
 
 // A head that sits below the log is drift: it fails the stream's writes and its fences, is not a
@@ -278,7 +278,7 @@ func testDriftIsNotRetryable(
 	id := driftedStream(t, repo, bypass, "drifted")
 
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, id, "test", 3, &test.EntityUpdated{ID: id, Value: "four"}),
+		Events: serialize(t, id, "test", 3, &test.AggregateUpdated{ID: id, Value: "four"}),
 	})
 
 	var drift *evt.StreamHeadDriftError
@@ -293,7 +293,7 @@ func testDriftIsNotRetryable(
 	// The writer that believes the head is right appends exactly where the bypassing writer did: its
 	// head condition passes, and its event put finds an event above the head. That is drift too.
 	err = repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "third"}),
+		Events: serialize(t, id, "test", 2, &test.AggregateUpdated{ID: id, Value: "third"}),
 	})
 	require.ErrorAs(t, err, &drift)
 	require.Equal(t, id, drift.EntityID)
@@ -304,7 +304,7 @@ func testDriftIsNotRetryable(
 	// A fence on the drifted stream is drift too, not a quiet pass or a stale-fence conflict.
 	other := evt.EntityID(newNamespace() + "-other")
 	err = repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, other, "test", 0, &test.EntityCreated{ID: other, Value: "writer"}),
+		Events: serialize(t, other, "test", 0, &test.AggregateCreated{ID: other, Value: "writer"}),
 		Fences: []evt.ReadFence{{EntityID: id, EntityType: "test", Head: 3}},
 	})
 	require.ErrorAs(t, err, &drift)
@@ -363,12 +363,12 @@ func testPrecedenceOrder(
 	// A stream with one event, which a commit starting at 3 skips past, and one a commit collides
 	// with.
 	gapped, raced := evt.EntityID(ns+"-gapped"), evt.EntityID(ns+"-raced")
-	commitEvents(t, repo, gapped, "test", 0, &test.EntityCreated{ID: gapped, Value: "one"})
-	commitEvents(t, repo, raced, "test", 0, &test.EntityCreated{ID: raced, Value: "one"})
+	commitEvents(t, repo, gapped, "test", 0, &test.AggregateCreated{ID: gapped, Value: "one"})
+	commitEvents(t, repo, raced, "test", 0, &test.AggregateCreated{ID: raced, Value: "one"})
 
-	driftEvents := serialize(t, drifted, "test", 3, &test.EntityUpdated{ID: drifted, Value: "next"})
-	gapEvents := serialize(t, gapped, "test", 2, &test.EntityUpdated{ID: gapped, Value: "skips"})
-	raceEvents := serialize(t, raced, "test", 0, &test.EntityCreated{ID: raced, Value: "again"})
+	driftEvents := serialize(t, drifted, "test", 3, &test.AggregateUpdated{ID: drifted, Value: "next"})
+	gapEvents := serialize(t, gapped, "test", 2, &test.AggregateUpdated{ID: gapped, Value: "skips"})
+	raceEvents := serialize(t, raced, "test", 0, &test.AggregateCreated{ID: raced, Value: "again"})
 
 	// Drift outranks a gap and a conflict in the same commit.
 	err := repo.Commit(ctx, evt.SerializedResult{Events: append(append(append([]evt.SerializedEvent{}, raceEvents...), gapEvents...), driftEvents...)})
@@ -410,8 +410,8 @@ func testUnmigratedStoreRefusesWrites(t *testing.T, repo evt.Repository, opts Su
 
 	id := evt.EntityID(ns + "-legacy")
 	events := serialize(t, id, "test", 0,
-		&test.EntityCreated{ID: id, Value: "one"},
-		&test.EntityUpdated{ID: id, Value: "two"},
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
 	)
 	require.NoError(t, repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "test", id, []byte(`{"id":"x"}`), 1))
 
@@ -427,13 +427,13 @@ func testUnmigratedStoreRefusesWrites(t *testing.T, repo evt.Repository, opts Su
 		require.False(t, policy.IsTransient(err), "%s: refusal is not transient", what)
 	}
 
-	next := serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "three"})
+	next := serialize(t, id, "test", 2, &test.AggregateUpdated{ID: id, Value: "three"})
 	notMigrated(repo.Commit(ctx, evt.SerializedResult{Events: next}), "commit")
 	notMigrated(repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: next}, "test", id, []byte(`{"id":"x"}`), 2), "commit with snapshot")
 
 	other := evt.EntityID(ns + "-new")
 	notMigrated(repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, other, "test", 0, &test.EntityCreated{ID: other, Value: "new"}),
+		Events: serialize(t, other, "test", 0, &test.AggregateCreated{ID: other, Value: "new"}),
 	}), "a new stream")
 
 	if outcomes, ok := repo.(evt.OutcomeRepository); ok {

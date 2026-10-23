@@ -11,7 +11,7 @@ import (
 	evt "github.com/photon-grove/evt/go"
 )
 
-// ViewProjector simply projects an Entity to a DynamoDB view by ID.
+// ViewProjector simply projects an Aggregate to a DynamoDB view by ID.
 type ViewProjector struct {
 	tableName string
 	encoder   *attributevalue.Encoder
@@ -27,28 +27,28 @@ func NewViewProjector(tableName string) evt.EventProjector {
 }
 
 // Project creates a new view for the given entity.
-func (p *ViewProjector) Project(_ context.Context, entity evt.Entity, _ []evt.Event) (evt.TransactionGroup, error) {
-	if p == nil || p.encoder == nil || entity == nil {
+func (p *ViewProjector) Project(_ context.Context, aggregate evt.Aggregate, _ []evt.Event) (evt.TransactionGroup, error) {
+	if p == nil || p.encoder == nil || aggregate == nil {
 		return nil, nil
 	}
 	if p.tableName == "" {
 		return nil, fmt.Errorf("table name is required")
 	}
-	entityID := entity.GetID()
+	entityID := aggregate.GetID()
 	if entityID == "" {
 		return nil, nil
 	}
 
-	payload, err := json.Marshal(entity)
+	payload, err := json.Marshal(aggregate)
 	if err != nil {
 		return nil, err
 	}
 
 	view := &evt.SerializedView{
-		PK:         fmt.Sprintf("%s#%s", entity.Type(), entityID),
+		PK:         fmt.Sprintf("%s#%s", aggregate.Type(), entityID),
 		SK:         evt.DefaultViewSK,
 		EntityID:   entityID,
-		EntityType: entity.Type(),
+		EntityType: aggregate.Type(),
 		Payload:    payload,
 	}
 

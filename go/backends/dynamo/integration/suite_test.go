@@ -34,7 +34,7 @@ type DynamoEventsIntegrationSuite struct {
 	store        evt.Store
 	entityType   evt.EntityType
 	entityID     evt.EntityID
-	entity       *test.Entity
+	aggregate    *test.Aggregate
 	eventContext evt.Context
 }
 
@@ -74,15 +74,15 @@ func (s *DynamoEventsIntegrationSuite) SetupTest() {
 	s.client = isolatedClient
 }
 
-func (s *DynamoEventsIntegrationSuite) SetupEntity(entityID evt.EntityID, snapshotSize int) {
+func (s *DynamoEventsIntegrationSuite) SetupAggregate(entityID evt.EntityID, snapshotSize int) {
 	ctx := context.Background()
 
 	s.store = snapshots.NewStore(s.repo, snapshotSize)
 	s.entityID = entityID
-	s.entity = test.NewEntity(entityID)
-	s.entityType = s.entity.Type()
+	s.aggregate = test.NewAggregate(entityID)
+	s.entityType = s.aggregate.Type()
 
-	eventContext, err := s.store.LoadEntity(ctx, s.entity, entityID)
+	eventContext, err := s.store.LoadAggregate(ctx, s.aggregate, entityID)
 	require.NoError(s.T(), err)
 
 	s.eventContext = eventContext

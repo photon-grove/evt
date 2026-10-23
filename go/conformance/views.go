@@ -110,8 +110,8 @@ func testViewsWriteAtAnyKey(t *testing.T, repo evt.Repository, read ViewReader) 
 	// One commit writes two streams and rows in partitions that name no entity, from two projectors.
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 		Events: append(
-			serialize(t, idA, "test", 0, &test.EntityCreated{ID: idA, Value: "a"}),
-			serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "b"})...,
+			serialize(t, idA, "test", 0, &test.AggregateCreated{ID: idA, Value: "a"}),
+			serialize(t, idB, "test", 0, &test.AggregateCreated{ID: idB, Value: "b"})...,
 		),
 		Views: []evt.ProjectedView{
 			projected("directory", 0, 0, put(ns+"#directory", "a", `{"stream":"a"}`)),
@@ -140,7 +140,7 @@ func testViewsOverwriteAndDelete(t *testing.T, repo evt.Repository, read ViewRea
 	pk := ns + "#rows"
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"}),
+		Events: serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"}),
 		Views: []evt.ProjectedView{
 			projected("rows", 0, 0, put(pk, "keep", `{"v":1}`)),
 			projected("rows", 0, 1, put(pk, "drop", `{"v":1}`)),
@@ -150,7 +150,7 @@ func testViewsOverwriteAndDelete(t *testing.T, repo evt.Repository, read ViewRea
 	// A put overwrites, a conditioned delete of a present row removes it, and an unconditional
 	// delete of an absent row succeeds.
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, id, "test", 1, &test.EntityUpdated{ID: id, Value: "two"}),
+		Events: serialize(t, id, "test", 1, &test.AggregateUpdated{ID: id, Value: "two"}),
 		Views: []evt.ProjectedView{
 			projected("rows", 0, 0, put(pk, "keep", `{"v":2}`)),
 			projected("rows", 0, 1, evt.DeleteView(pk, "drop", "owner").IfPresent()),
@@ -172,7 +172,7 @@ func testViewsFailedAbsentCondition(t *testing.T, repo evt.Repository, read View
 	claims := ns + "#claims"
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, owner, "test", 0, &test.EntityCreated{ID: owner, Value: "owner"}),
+		Events: serialize(t, owner, "test", 0, &test.AggregateCreated{ID: owner, Value: "owner"}),
 		Views:  []evt.ProjectedView{projected("claims", 0, 0, put(claims, "ada", `{"owner":"first"}`).IfAbsent())},
 	}))
 
@@ -181,7 +181,7 @@ func testViewsFailedAbsentCondition(t *testing.T, repo evt.Repository, read View
 	// operation's mapped error, and nothing from the commit is written: not its events, and not
 	// the row its first projector put before the failed operation.
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, intruder, "test", 0, &test.EntityCreated{ID: intruder, Value: "intruder"}),
+		Events: serialize(t, intruder, "test", 0, &test.AggregateCreated{ID: intruder, Value: "intruder"}),
 		Views: []evt.ProjectedView{
 			projected("profile", 0, 0, put(ns+"#profiles", "intruder", `{"name":"ada"}`)),
 			projected("claims", 1, 0, put(claims, "ada-note", `{"note":true}`)),
@@ -216,7 +216,7 @@ func testViewsFailedPresentDelete(t *testing.T, repo evt.Repository, read ViewRe
 	id := evt.EntityID(ns + "-a")
 
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"}),
+		Events: serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"}),
 		Views: []evt.ProjectedView{
 			projected("release", 0, 0, put(ns+"#rows", "kept", `{}`)),
 			projected("release", 0, 1, evt.DeleteView(ns+"#rows", "absent", "owner").IfPresent()),
@@ -247,7 +247,7 @@ func testViewsOwnerIsEnforced(t *testing.T, repo evt.Repository, read ViewReader
 	first, second := evt.EntityID(ns+"-first"), evt.EntityID(ns+"-second")
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, first, "test", 0, &test.EntityCreated{ID: first, Value: "one"}),
+		Events: serialize(t, first, "test", 0, &test.AggregateCreated{ID: first, Value: "one"}),
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "row", `{"v":1}`))},
 	}))
 
@@ -259,7 +259,7 @@ func testViewsOwnerIsEnforced(t *testing.T, repo evt.Repository, read ViewReader
 
 	for name, op := range foreign {
 		err := repo.Commit(ctx, evt.SerializedResult{
-			Events: serialize(t, second, "test", 0, &test.EntityCreated{ID: second, Value: "two"}),
+			Events: serialize(t, second, "test", 0, &test.AggregateCreated{ID: second, Value: "two"}),
 			Views:  []evt.ProjectedView{projected("rows", 0, 0, op.OnConflict(errClaimTaken))},
 		})
 
@@ -275,13 +275,13 @@ func testViewsOwnerIsEnforced(t *testing.T, repo evt.Repository, read ViewReader
 
 	// The owner overwrites its row and deletes it; the delete of an absent row still succeeds.
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, first, "test", 1, &test.EntityUpdated{ID: first, Value: "two"}),
+		Events: serialize(t, first, "test", 1, &test.AggregateUpdated{ID: first, Value: "two"}),
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "row", `{"v":3}`))},
 	}))
 	requireRow(t, read, repo, pk, "row", `{"v":3}`)
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, first, "test", 2, &test.EntityUpdated{ID: first, Value: "three"}),
+		Events: serialize(t, first, "test", 2, &test.AggregateUpdated{ID: first, Value: "three"}),
 		Views: []evt.ProjectedView{
 			projected("rows", 0, 0, evt.DeleteView(pk, "row", "owner").IfPresent()),
 			projected("rows", 0, 1, evt.DeleteView(pk, "gone", "intruder")),
@@ -326,7 +326,7 @@ func testViewsRefusedBeforeAnyWrite(t *testing.T, repo evt.Repository, read View
 
 	id := evt.EntityID(ns + "-a")
 	events := func() []evt.SerializedEvent {
-		return serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})
+		return serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"})
 	}
 
 	// The exact limits pass: a 2,048-byte pk and a 1,024-byte sk.
@@ -338,7 +338,7 @@ func testViewsRefusedBeforeAnyWrite(t *testing.T, repo evt.Repository, read View
 
 	other := evt.EntityID(ns + "-other")
 	otherEvents := func() []evt.SerializedEvent {
-		return serialize(t, other, "test", 0, &test.EntityCreated{ID: other, Value: "one"})
+		return serialize(t, other, "test", 0, &test.AggregateCreated{ID: other, Value: "one"})
 	}
 
 	var tooLong *evt.ViewKeyTooLongError
@@ -407,13 +407,13 @@ func testViewsBudget(t *testing.T, repo evt.Repository, read ViewReader, bytes b
 	fits, over := evt.EntityID(ns+"-fits"), evt.EntityID(ns+"-over")
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, fits, "test", 0, &test.EntityCreated{ID: fits, Value: "fits"}),
+		Events: serialize(t, fits, "test", 0, &test.AggregateCreated{ID: fits, Value: "fits"}),
 		Views:  views(96),
 	}))
 	requireRow(t, read, repo, ns+"#bulk", "row-095", `{}`)
 
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, over, "test", 0, &test.EntityCreated{ID: over, Value: "over"}),
+		Events: serialize(t, over, "test", 0, &test.AggregateCreated{ID: over, Value: "over"}),
 		Views:  views(97),
 	})
 
@@ -433,7 +433,7 @@ func testViewsBudget(t *testing.T, repo evt.Repository, read ViewReader, bytes b
 	huge := func(size int) string { return strings.Repeat("x", size) }
 
 	err = repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, big, "test", 0, &test.EntityCreated{ID: big, Value: "big"}),
+		Events: serialize(t, big, "test", 0, &test.AggregateCreated{ID: big, Value: "big"}),
 		Views:  []evt.ProjectedView{projected("big", 0, 0, put(ns+"#big", "one", huge(381_000)))},
 	})
 	require.ErrorAs(t, err, &tooLarge)
@@ -444,7 +444,7 @@ func testViewsBudget(t *testing.T, repo evt.Repository, read ViewReader, bytes b
 	}
 
 	err = repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, big, "test", 0, &test.EntityCreated{ID: big, Value: "big"}),
+		Events: serialize(t, big, "test", 0, &test.AggregateCreated{ID: big, Value: "big"}),
 		Views:  many,
 	})
 	require.ErrorAs(t, err, &tooLarge)
@@ -461,7 +461,7 @@ func testViewsConflictOutranks(t *testing.T, repo evt.Repository, read ViewReade
 	pk := ns + "#rows"
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"}),
+		Events: serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"}),
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`))},
 	}))
 
@@ -469,7 +469,7 @@ func testViewsConflictOutranks(t *testing.T, repo evt.Repository, read ViewReade
 	// projector's condition. The stream's conflict outranks the projector operation, so the
 	// caller sees a conflict it can re-prepare, never a projector failure.
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "stale"}),
+		Events: serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "stale"}),
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`).IfAbsent())},
 	})
 	require.Error(t, err)
@@ -487,13 +487,13 @@ func testViewsGapOutranks(t *testing.T, repo evt.Repository, read ViewReader) {
 	pk := ns + "#rows"
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "b"}),
+		Events: serialize(t, idB, "test", 0, &test.AggregateCreated{ID: idB, Value: "b"}),
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`))},
 	}))
 
 	// Stream a starts above its head: a gap, which ranks above any projector operation.
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, idA, "test", 2, &test.EntityCreated{ID: idA, Value: "a"}),
+		Events: serialize(t, idA, "test", 2, &test.AggregateCreated{ID: idA, Value: "a"}),
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`).IfAbsent())},
 	})
 	require.ErrorIs(t, err, evt.ErrSequenceGap)
@@ -510,14 +510,14 @@ func testViewsFenceOutranks(t *testing.T, repo evt.Repository, read ViewReader) 
 	pk := ns + "#rows"
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, watched, "test", 0, &test.EntityCreated{ID: watched, Value: "w"}),
+		Events: serialize(t, watched, "test", 0, &test.AggregateCreated{ID: watched, Value: "w"}),
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`))},
 	}))
 
 	// The fence was taken before the first commit (head 0), so it has moved; the commit's claim
 	// fails too. The fence is reported, so the caller sees a conflict it can re-prepare.
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, writer, "test", 0, &test.EntityCreated{ID: writer, Value: "x"}),
+		Events: serialize(t, writer, "test", 0, &test.AggregateCreated{ID: writer, Value: "x"}),
 		Fences: []evt.ReadFence{{EntityID: watched, EntityType: "test", Head: 0}},
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`).IfAbsent())},
 	})
@@ -530,7 +530,7 @@ func testViewsFenceOutranks(t *testing.T, repo evt.Repository, read ViewReader) 
 
 	// The same fence at the current head passes, and then the claim is what fails.
 	err = repo.Commit(ctx, evt.SerializedResult{
-		Events: serialize(t, writer, "test", 0, &test.EntityCreated{ID: writer, Value: "x"}),
+		Events: serialize(t, writer, "test", 0, &test.AggregateCreated{ID: writer, Value: "x"}),
 		Fences: []evt.ReadFence{{EntityID: watched, EntityType: "test", Head: 1}},
 		Views:  []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`).IfAbsent())},
 	})
@@ -551,7 +551,7 @@ func testViewsOutcomeOutranks(t *testing.T, repo evt.Repository, read ViewReader
 	}
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
-		Events:  serialize(t, idA, "test", 0, &test.EntityCreated{ID: idA, Value: "a"}),
+		Events:  serialize(t, idA, "test", 0, &test.AggregateCreated{ID: idA, Value: "a"}),
 		Outcome: outcome(),
 		Views:   []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`))},
 	}))
@@ -559,7 +559,7 @@ func testViewsOutcomeOutranks(t *testing.T, repo evt.Repository, read ViewReader
 	// Another command ID already has its row, and this commit's claim fails as well: the row is
 	// where the answer lives, so the outcome conflict is what the caller sees.
 	err := repo.Commit(ctx, evt.SerializedResult{
-		Events:  serialize(t, idB, "test", 0, &test.EntityCreated{ID: idB, Value: "b"}),
+		Events:  serialize(t, idB, "test", 0, &test.AggregateCreated{ID: idB, Value: "b"}),
 		Outcome: outcome(),
 		Views:   []evt.ProjectedView{projected("rows", 0, 0, put(pk, "taken", `{}`).IfAbsent())},
 	})
