@@ -149,6 +149,17 @@ func (store *Store) Commit(
 	eventContext evt.Context,
 	metadata evt.Metadata,
 ) ([]evt.SerializedEvent, error) {
+	return store.commitWithTransaction(ctx, result, nil, eventContext, metadata)
+}
+
+// commitWithTransaction is Commit with the in-band projectors' transaction attached to the commit.
+func (store *Store) commitWithTransaction(
+	ctx context.Context,
+	result evt.CommandResult,
+	transaction evt.Transaction,
+	eventContext evt.Context,
+	metadata evt.Metadata,
+) ([]evt.SerializedEvent, error) {
 	// A store with outcomes records every command; a bare Commit has no command identity to digest.
 	if store.outcomes != nil {
 		return nil, errOutcomesNeedCommand
@@ -177,7 +188,7 @@ func (store *Store) Commit(
 		store.effectiveSnapshotSize(entityType),
 	)
 
-	serializedResult := evt.SerializedResult{Events: serializedEvents, Transaction: result.Transaction} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	serializedResult := evt.SerializedResult{Events: serializedEvents, Transaction: transaction}
 
 	if commitSnapshotToEvent == 0 {
 		// If not needed, execute a simple commit, with the commit-wide projectors' operations.
@@ -288,39 +299,11 @@ func (store *Store) Execute(
 		return err
 	}
 
-	result.Transaction = evt.MergeTransactions(result.Transaction, projectorTransaction) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-
-	if _, err = store.Commit(ctx, result, context, metadata); err != nil {
+	if _, err = store.commitWithTransaction(ctx, result, projectorTransaction, context, metadata); err != nil {
 		return err
 	}
 
 	return nil
-}
-
-// LoadEntityWithFactory creates a fresh entity instance and loads it from the repository.
-//
-// Deprecated: Cut in ADR-0006 (K7): use Store.LoadEntity directly. It will be removed in the
-// next minor release.
-func (store *Store) LoadEntityWithFactory(
-	ctx context.Context,
-	factory evt.EntityFactory,
-	entityID evt.EntityID,
-) (evt.Entity, evt.Context, error) {
-	return evt.LoadEntityWithFactory(ctx, store, factory, entityID) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-}
-
-// ExecuteWithFactory creates a fresh entity instance, executes the command, and returns it.
-//
-// Deprecated: Cut in ADR-0006 (K7): use Store.Execute directly. It will be removed in the next
-// minor release.
-func (store *Store) ExecuteWithFactory(
-	ctx context.Context,
-	factory evt.EntityFactory,
-	entityID evt.EntityID,
-	command evt.Command,
-	metadata evt.Metadata,
-) (evt.Entity, error) {
-	return evt.ExecuteWithFactory(ctx, store, factory, entityID, command, metadata) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 }
 
 // updateSnapshotWithEvents advances sequence counters and captures current entity state.

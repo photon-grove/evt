@@ -246,12 +246,10 @@ func TestCalculateAdditionalEvents(t *testing.T) {
 
 type MockTestEntity struct {
 	Upcasters []EventUpcaster
-	BaseEntity
 }
 
 func (e *MockTestEntity) Type() EntityType { return "TestEntity" }
 func (e *MockTestEntity) GetID() EntityID  { return "id" }
-func (e *MockTestEntity) Base() BaseEntity { return e.BaseEntity }
 func (e *MockTestEntity) Handle(context.Context, Command) (CommandResult, error) {
 	return CommandResult{}, nil
 }

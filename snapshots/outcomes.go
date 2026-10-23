@@ -410,11 +410,10 @@ func (store *Store) attemptOutcome(
 	}
 
 	if len(result.Events) == 0 {
-		// Projector operations without an event are never silently dropped: the commit keeps them
-		// so the shared validation refuses them (ProjectorOnlyCommitError) before any write.
+		// A command that produces no event commits only its outcome.
 		outcome, cerr := cmd.commit(
 			ctx,
-			evt.SerializedResult{Transaction: result.Transaction}, //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+			evt.SerializedResult{},
 			evt.OutcomeAccepted,
 			result.Response,
 			nil,
@@ -476,7 +475,7 @@ func (store *Store) prepareEvents(
 	return evt.SerializedResult{
 		Events:      serialized,
 		Snapshots:   snapshots,
-		Transaction: evt.MergeTransactions(result.Transaction, projectorTransaction), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		Transaction: projectorTransaction,
 		Views:       views,
 	}, nil
 }
@@ -509,18 +508,11 @@ func (store *Store) handlerFailed(
 
 	staged := evt.SerializedResult{}
 
-	if evt.RejectsWithEvents(handlerErr) {
-		if len(result.Events) == 0 {
-			// Projector operations without an event are never silently dropped: the commit keeps
-			// them so the shared validation refuses them (ProjectorOnlyCommitError) before any
-			// write, as it does for an accepted command.
-			staged.Transaction = result.Transaction //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-		} else {
-			var err error
+	if evt.RejectsWithEvents(handlerErr) && len(result.Events) > 0 {
+		var err error
 
-			if staged, err = store.prepareEvents(ctx, cmd, entity, eventContext, entityID, result); err != nil {
-				return executed{}, err
-			}
+		if staged, err = store.prepareEvents(ctx, cmd, entity, eventContext, entityID, result); err != nil {
+			return executed{}, err
 		}
 	}
 

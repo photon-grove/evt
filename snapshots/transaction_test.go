@@ -374,8 +374,8 @@ func TestTransaction_RefusesARepositoryWithoutTheTransactionCapability(t *testin
 
 // claimEntity is a second aggregate type for transactions that mix entity types.
 type claimEntity struct {
-	evt.BaseEntity
-	Holder string `json:"holder"`
+	ID     evt.EntityID `json:"id"`
+	Holder string       `json:"holder"`
 }
 
 const (
@@ -394,12 +394,11 @@ func (claimTakenEvent) Type() evt.EventType        { return claimTaken }
 func (claimTakenEvent) Version() evt.EventVersion  { return 1 }
 
 func newClaim(id evt.EntityID) *claimEntity {
-	return &claimEntity{BaseEntity: evt.NewEntity(id)} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	return &claimEntity{ID: id}
 }
 
 func (c *claimEntity) Type() evt.EntityType { return claimType }
 func (c *claimEntity) GetID() evt.EntityID  { return c.ID }
-func (c *claimEntity) Base() evt.BaseEntity { return c.BaseEntity } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 func (c *claimEntity) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
 	return evt.CommandResult{}, fmt.Errorf("claim handles no commands in this test")
 }

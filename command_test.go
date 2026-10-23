@@ -88,7 +88,6 @@ func Test_CommandResult_Creation(t *testing.T) {
 	// Test with empty events
 	result := CommandResult{}
 	require.Nil(t, result.Events)
-	require.Nil(t, result.Transaction)
 
 	// Test with events
 	mockEvent := MockEvent{
@@ -103,26 +102,6 @@ func Test_CommandResult_Creation(t *testing.T) {
 	}
 	require.Len(t, result.Events, 1)
 	require.Equal(t, EventType("TestEvent"), result.Events[0].Type())
-}
-
-func Test_CommandResult_WithTransaction(t *testing.T) {
-	mockEvent := MockEvent{
-		EventType: "TestEvent",
-	}
-
-	// Test with nil transaction
-	result := CommandResult{
-		Events:      []Event{mockEvent},
-		Transaction: nil,
-	}
-	require.Nil(t, result.Transaction)
-
-	// Test with empty transaction
-	result = CommandResult{
-		Events:      []Event{mockEvent},
-		Transaction: Transaction{},
-	}
-	require.Empty(t, result.Transaction)
 }
 
 func Test_CommandResult_MultipleEvents(t *testing.T) {
@@ -149,5 +128,4 @@ func Test_CommandTypes_ZeroValues(t *testing.T) {
 
 	var result CommandResult
 	require.Nil(t, result.Events)
-	require.Nil(t, result.Transaction)
 }

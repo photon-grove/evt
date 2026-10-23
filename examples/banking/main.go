@@ -14,20 +14,18 @@ import (
 const entityType evt.EntityType = "bank_account"
 
 type Account struct {
-	evt.BaseEntity
+	ID      evt.EntityID
 	Balance int
 	Opened  bool
 }
 
 func NewAccount(id evt.EntityID) *Account {
-	return &Account{BaseEntity: evt.NewEntity(id)} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	return &Account{ID: id}
 }
 
 func (a *Account) Type() evt.EntityType { return entityType }
 
 func (a *Account) GetID() evt.EntityID { return a.ID }
-
-func (a *Account) Base() evt.BaseEntity { return a.BaseEntity } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 func (a *Account) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
 	switch cmd := command.(type) {

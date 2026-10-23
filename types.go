@@ -3,7 +3,6 @@ package evt
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // CommandType is a unique identifier for the type of a Command.
@@ -25,11 +24,6 @@ type CommandResult struct {
 	// Response is stored with the command's outcome on a store with outcomes enabled (ADR 0004,
 	// C3), so a retried command returns the original answer. Nil means the command returned none.
 	Response []byte `json:"response,omitempty"`
-
-	// Deprecated: Cut in ADR-0006 (K7): handlers no longer attach a Transaction to a
-	// CommandResult; commits go through the repository commit path. It will be removed in the
-	// next minor release.
-	Transaction Transaction `json:"transaction"`
 }
 
 // EventType identifies an event kind.
@@ -98,104 +92,15 @@ type EntityType string
 // EntityID is a unique identifier for an aggregated Entity instance.
 type EntityID string
 
-// EntityFactory constructs a fresh zero-state aggregate instance for load/execute operations.
-type EntityFactory func() Entity
-
 // Entity is an object whose state is made up of aggregated immutable change Events.
 type Entity interface {
 	Type() EntityType
 	GetID() EntityID
-	Base() BaseEntity
 	Handle(context.Context, Command) (CommandResult, error)
 	Apply(Event) error
 	DeserializeEvent(serializedEvent SerializedEvent) (Event, error)
 	EventUpcasters() []EventUpcaster
 	Projectors() []EventProjector
-}
-
-// BaseEntity provides common fields for all entities.
-//
-// Planned for removal in the next minor release (ADR-0006, K7): entities define their own
-// identity and lifecycle fields instead of embedding BaseEntity. It carries no Deprecated
-// notice yet because Entity.Base still requires this type, so the notice would break builds
-// with no warning-free path; it lands once the core reshape (C1-C11) replaces the contract.
-type BaseEntity struct {
-	ID        EntityID  `json:"id"`        // A unique identifier
-	IsActive  bool      `json:"isActive"`  // Whether this record has been deleted
-	CreatedAt time.Time `json:"createdAt"` // The date this record was originally created
-	UpdatedAt time.Time `json:"updatedAt"` // The date this record was last updated
-}
-
-// NewEntity creates a new BaseEntity with the given ID, setting IsActive to true and timestamps to now.
-//
-// Planned for removal in the next minor release (ADR-0006, K7), together with BaseEntity.
-func NewEntity(id EntityID) BaseEntity {
-	return BaseEntity{
-		ID:        id,
-		IsActive:  true,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-}
-
-func entityFromFactory(factory EntityFactory) (Entity, error) {
-	if factory == nil {
-		return nil, fmt.Errorf("entity factory is nil")
-	}
-
-	entity := factory()
-	if entity == nil {
-		return nil, fmt.Errorf("entity factory returned nil")
-	}
-
-	return entity, nil
-}
-
-// LoadEntityWithFactory creates a fresh entity instance and loads it from the store.
-//
-// Deprecated: Cut in ADR-0006 (K7): use Store.LoadEntity directly. It will be removed in the
-// next minor release.
-func LoadEntityWithFactory(
-	ctx context.Context,
-	store Store,
-	factory EntityFactory,
-	entityID EntityID,
-) (Entity, Context, error) {
-	entity, err := entityFromFactory(factory)
-	if err != nil {
-		return nil, Context{}, err
-	}
-
-	eventContext, err := store.LoadEntity(ctx, entity, entityID)
-	if err != nil {
-		return entity, eventContext, err
-	}
-
-	return entity, eventContext, nil
-}
-
-// ExecuteWithFactory creates a fresh entity instance, executes the command, and returns it.
-//
-// Deprecated: Cut in ADR-0006 (K7): use Store.Execute directly. It will be removed in the next
-// minor release.
-func ExecuteWithFactory(
-	ctx context.Context,
-	store Store,
-	factory EntityFactory,
-	entityID EntityID,
-	command Command,
-	metadata Metadata,
-) (Entity, error) {
-	entity, err := entityFromFactory(factory)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := store.Execute(ctx, entity, entityID, command, metadata); err != nil {
-		return nil, err
-	}
-
-	return entity, nil
 }
 
 // EventProjector generates transactional view operations that should be committed alongside events.

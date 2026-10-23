@@ -13,7 +13,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/policy"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 )
 
 // This Repository lives in-memory for testing or local development

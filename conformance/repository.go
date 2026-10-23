@@ -17,7 +17,7 @@ import (
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/policy"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
 )

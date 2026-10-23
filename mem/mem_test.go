@@ -10,16 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func Test_DIProviders(t *testing.T) {
-	store, err := ProvideStore(nil)
-	require.NoError(t, err)
-	require.NotNil(t, store)
-
-	repo, err := ProvideRepository(nil)
-	require.NoError(t, err)
-	require.NotNil(t, repo)
-}
-
 func Test_NewStore(t *testing.T) {
 	store := NewStore()
 	require.NotNil(t, store)

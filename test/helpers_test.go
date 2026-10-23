@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -87,13 +87,6 @@ func Test_Commands_And_Events_Accessors(t *testing.T) {
 	require.Equal(t, EntityType, fe.EntityType())
 	require.Equal(t, evt.EventType("test:fake"), fe.Type())
 	require.Equal(t, evt.EventVersion(1), fe.Version())
-}
-
-func Test_Entity_Base(t *testing.T) {
-	e := NewEntity("e1")
-	require.Equal(t, evt.EntityID("e1"), e.GetID())
-	require.Equal(t, EntityType, e.Type())
-	require.Equal(t, e.ID, e.Base().ID)
 }
 
 func Test_Framework_WithEvents_Execute_Load(t *testing.T) {

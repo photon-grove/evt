@@ -264,65 +264,6 @@ func TestOutcomes_ResolveCommandReportsWhatHappened(t *testing.T) {
 	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse)
 }
 
-// opGroup is a projector transaction group of one operation.
-type opGroup struct{}
-
-func (opGroup) Len() int                             { return 1 }
-func (opGroup) StorageType() evt.StorageType         { return "test" }
-func (opGroup) TransactionType() evt.TransactionType { return "test" }
-func (opGroup) HandleError(err error, _ int) error   { return err }
-func (g opGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
-	return g, nil
-}
-
-// noopWithOperations decides no events but asks for a projector operation.
-type noopWithOperations struct{ MockEntity }
-
-func (noopWithOperations) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
-	return evt.CommandResult{Transaction: evt.Transaction{opGroup{}}}, nil
-}
-
-func TestOutcomes_ANoOpCarryingProjectorOperationsIsRefusedNotRecordedAsAccepted(t *testing.T) {
-	store, repo := newOutcomeStore(t)
-	entity := &noopWithOperations{}
-	entity.ID = "e-1"
-
-	_, err := store.ExecuteWithOutcome(context.Background(), entity, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
-
-	var projectorOnly *evt.ProjectorOnlyCommitError
-	require.ErrorAs(t, err, &projectorOnly)
-	require.Equal(t, 1, projectorOnly.Operations)
-
-	stored, err := repo.GetOutcome(context.Background(), "cmd-1")
-	require.NoError(t, err)
-	require.Nil(t, stored, "nothing is written, and no false accepted outcome is recorded")
-}
-
-// rejectsWithOperations rejects with events marked but decides none, carrying a projector
-// operation: with no event behind it the operation can never be rebuilt, so it is refused, not
-// dropped into a recorded rejection.
-type rejectsWithOperations struct{ MockEntity }
-
-func (rejectsWithOperations) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
-	return evt.CommandResult{Transaction: evt.Transaction{opGroup{}}}, evt.RejectWithEvents(evt.NewNotFoundError("gone"))
-}
-
-func TestOutcomes_AMarkedRejectionWithoutEventsStillRefusesProjectorOperations(t *testing.T) {
-	store, repo := newOutcomeStore(t)
-	entity := &rejectsWithOperations{}
-	entity.ID = "e-1"
-
-	_, err := store.ExecuteWithOutcome(context.Background(), entity, "e-1", &MockCommand{}, commandMetadata("cmd-1"))
-
-	var projectorOnly *evt.ProjectorOnlyCommitError
-	require.ErrorAs(t, err, &projectorOnly)
-	require.Equal(t, 1, projectorOnly.Operations)
-
-	stored, err := repo.GetOutcome(context.Background(), "cmd-1")
-	require.NoError(t, err)
-	require.Nil(t, stored, "no rejection is recorded around operations that were dropped")
-}
-
 func TestOutcomes_ABadCustomDigestIsAProgrammerErrorBeforeAnyReadOrHandler(t *testing.T) {
 	ctx := context.Background()
 

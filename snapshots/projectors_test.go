@@ -39,7 +39,6 @@ func (c *counter) GetID() evt.EntityID                 { return c.id }
 func (c *counter) SetID(id evt.EntityID)               { c.id = id }
 func (c *counter) EventUpcasters() []evt.EventUpcaster { return nil }
 func (c *counter) Projectors() []evt.EventProjector    { return nil }
-func (c *counter) Base() evt.BaseEntity                { return evt.BaseEntity{ID: c.id, IsActive: true} } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 type bumped struct {
 	By   int    `json:"by"`

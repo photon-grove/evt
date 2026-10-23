@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 )
 
 // StorageType identifies the backend storage system a Repository uses.

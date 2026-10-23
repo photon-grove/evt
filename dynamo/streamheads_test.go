@@ -568,21 +568,6 @@ func TestProbe_AConcurrentCommitIsAConflictNotDrift(t *testing.T) {
 	require.NotErrorIs(t, err, evt.ErrSequenceGap)
 }
 
-// Delete removes a stream's head item with its events, so the stream can be created again.
-func TestDelete_RemovesTheHeadItemToo(t *testing.T) {
-	ctx := context.Background()
-	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
-
-	events := headEvents("deleted", 1, 2, "t")
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events}))
-
-	require.NoError(t, repo.Delete(ctx, events)) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	require.Empty(t, fake.Items("deleted"))
-
-	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("deleted", 1, 1, "t")}))
-}
-
 // Scans ignore head items: an unfiltered scan decodes only events, and an orphan head item (no
 // events, no snapshot) is not an entity.
 func TestScans_IgnoreHeadItems(t *testing.T) {

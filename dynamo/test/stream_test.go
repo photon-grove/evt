@@ -26,7 +26,9 @@ func eventItem(pk string, sk int) map[string]types.AttributeValue {
 }
 
 // Mock Entity for StreamEntities tests
-type MockEntity struct{ evt.BaseEntity }
+type MockEntity struct {
+	ID evt.EntityID `json:"id"`
+}
 
 func (m *MockEntity) Type() evt.EntityType { return "MockEntity" }
 func (m *MockEntity) GetID() evt.EntityID  { return m.ID }
@@ -39,7 +41,6 @@ func (m *MockEntity) DeserializeEvent(_ evt.SerializedEvent) (evt.Event, error) 
 }
 func (m *MockEntity) EventUpcasters() []evt.EventUpcaster { return nil }
 func (m *MockEntity) Projectors() []evt.EventProjector    { return nil }
-func (m *MockEntity) Base() evt.BaseEntity                { return m.BaseEntity } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 // Test StreamEntities Success
 func (s *RepositorySuite) Test_StreamEntities_Success() {
@@ -58,7 +59,7 @@ func (s *RepositorySuite) Test_StreamEntities_Success() {
 	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(output, nil)
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
-		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		return &MockEntity{ID: event.EntityID}, nil
 	}
 
 	entityStream := s.repo.StreamEntities(ctx, evt.StreamFilter{}, applyFunc)
@@ -129,7 +130,7 @@ func (s *RepositorySuite) Test_StreamEntities_GroupsAndOrdersInterleavedScan() {
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		applied[event.EntityID] = append(applied[event.EntityID], int(event.Sequence))
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+			return &MockEntity{ID: event.EntityID}, nil
 		}
 
 		return entity, nil
@@ -171,7 +172,7 @@ func (s *RepositorySuite) Test_StreamEntities_ParallelSegments() {
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+			return &MockEntity{ID: event.EntityID}, nil
 		}
 
 		return entity, nil
@@ -213,7 +214,7 @@ func (s *RepositorySuite) Test_StreamEntities_ScanErrorAborts() {
 
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
 		if entity == nil {
-			return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+			return &MockEntity{ID: event.EntityID}, nil
 		}
 
 		return entity, nil
