@@ -23,8 +23,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Flow_ExecuteCycle() {
 	require.NoError(s.T(), err)
 
 	assert.Equal(s.T(), "v1", s.entity.Value)
-	assert.NotEmpty(s.T(), s.entity.CreatedAt)
-	assert.True(s.T(), s.entity.IsActive)
+	assert.Equal(s.T(), entityID, s.entity.ID)
 
 	// 2. Second command (Update)
 	// Create a FRESH entity to simulate loading from scratch

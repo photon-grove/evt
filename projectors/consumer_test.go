@@ -13,7 +13,7 @@ import (
 )
 
 // envelopeFor builds the CloudWatchEvent envelope JSON exactly as
-// stream.SNSPublisher does: the serialized domain event is the Detail. This is
+// the SNS fan-out does: the serialized domain event is the Detail. This is
 // the body a SNS->SQS (raw delivery) message or an SNS->Lambda record carries.
 func envelopeFor(t *testing.T, event evt.SerializedEvent) []byte {
 	t.Helper()

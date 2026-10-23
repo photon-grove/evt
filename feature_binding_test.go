@@ -7,7 +7,6 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/postgres"
-	"github.com/photon-grove/evt/result"
 	"github.com/stretchr/testify/require"
 )
 
@@ -129,12 +128,6 @@ func TestFeatureMarkerTableBinding(t *testing.T) {
 			require.ErrorAs(t, err, &mismatch)
 			_, err = repo.CompactBelow(ctx, "account", 1)
 			require.ErrorAs(t, err, &mismatch)
-			stream := make(chan result.Result[evt.SerializedResult], 1)
-			stream <- result.Ok(evt.SerializedResult{})
-			close(stream)
-			errs := repo.CommitStream(ctx, stream)
-			require.Len(t, errs, 1)
-			require.ErrorAs(t, errs[0], &mismatch)
 		})
 	}
 }

@@ -1,7 +1,5 @@
 // Package mock provides DynamoDB client mocks
 // nolint:errcheck
-//
-// Deprecated: Cut in ADR-0006 (K7). It will be removed in the next minor release.
 package mock
 
 import (

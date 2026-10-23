@@ -57,7 +57,7 @@ const DOC_CONFIG: Record<string, DocConfig> = {
     group: GUIDES,
     order: 4,
     summary:
-      'DynamoDB Streams projectors with idempotency and retry classification (SNS fan-out is deprecated in v0.9.0).',
+      'DynamoDB Streams projectors with idempotency and retry classification.',
   },
   dynamodb: {
     group: GUIDES,

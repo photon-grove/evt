@@ -13,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // exercises the deprecated batch write contract
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
 )
@@ -181,12 +180,6 @@ func Test_DefaultAndDeclaringWritersRefuseUnsupported(t *testing.T) {
 		require.True(t, evt.IsUnsupportedFeatureErr(writer.Commit(ctx, res)))
 		require.True(t, evt.IsUnsupportedFeatureErr(writer.CommitWithSnapshot(ctx, res, test.EntityType, "after", []byte(`{}`), 1)))
 		require.True(t, evt.IsUnsupportedFeatureErr(writer.PutSnapshot(ctx, test.EntityType, "after", []byte(`{}`), 1, 1)))
-		ch := make(chan result.Result[evt.SerializedResult], 1)
-		ch <- result.Ok(res)
-		close(ch)
-		errs := writer.CommitStream(ctx, ch) //nolint:staticcheck // the legacy batch path is refused outright (ADR 0007)
-		require.Len(t, errs, 1)
-		require.ErrorIs(t, errs[0], dynamo.ErrCommitStreamRefused)
 	}
 
 	// Changing only a durable set is still not writer validation.

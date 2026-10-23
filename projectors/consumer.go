@@ -37,7 +37,7 @@ func FromSerializedEvent(event evt.SerializedEvent) StreamRecord {
 }
 
 // StreamRecordFromEnvelope decodes one CloudWatchEvent envelope — the message
-// shape stream.SNSPublisher writes to the events topic — into a StreamRecord.
+// shape the SNS fan-out writes to the events topic — into a StreamRecord.
 // The envelope's Detail field carries the serialized domain event.
 //
 // Pass the raw message body: the SQS message body when the SNS->SQS

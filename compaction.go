@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 )
 
 // ErrCompactionUncovered is returned when no durable snapshot covers the requested range.

@@ -8,7 +8,7 @@ describe('slugifyHeading', () => {
   it('matches the in-page anchors the docs already use', () => {
     expect(slugifyHeading('Constant-memory enumeration')).toBe('constant-memory-enumeration')
     expect(slugifyHeading('Rebuilding compacted streams')).toBe('rebuilding-compacted-streams')
-    expect(slugifyHeading('StreamEntitiesByQuery (notes)')).toBe('streamentitiesbyquery-notes')
+    expect(slugifyHeading('StreamEntitiesFromSnapshots (notes)')).toBe('streamentitiesfromsnapshots-notes')
   })
 })
 
@@ -69,7 +69,7 @@ describe('resolveDocLink', () => {
   })
 
   it('drops a trailing fragment on a .md route link', () => {
-    expect(resolveDocLink('streams.md#publishers', 'projections')).toEqual({
+    expect(resolveDocLink('streams.md#projectors', 'projections')).toEqual({
       kind: 'route',
       slug: 'streams',
     })

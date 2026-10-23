@@ -10,7 +10,6 @@ import (
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/mem"
 	"github.com/photon-grove/evt/postgres"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // stubGroup is a backend-neutral projector group with one operation.
@@ -46,28 +45,12 @@ func TestEveryWriteEntryPointRefusesProjectorOnlyInput(t *testing.T) {
 		"CommitWithSnapshot": func(repo evt.Repository) []error {
 			return []error{repo.CommitWithSnapshot(ctx, projectorOnly, "t", "entry-point", []byte(`{}`), 1)}
 		},
-		"CommitStream": func(repo evt.Repository) []error {
-			channel := make(chan result.Result[evt.SerializedResult], 1)
-			channel <- result.Ok(projectorOnly)
-			close(channel)
-
-			return repo.CommitStream(ctx, channel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts); this test pins its fail-closed behavior
-		},
 	}
 
 	for backend, repo := range backends {
 		for entryPoint, run := range entryPoints {
 			t.Run(backend+"/"+entryPoint, func(t *testing.T) {
 				errs := run(repo)
-
-				// The DynamoDB batch path writes events with no head update, so it is refused outright
-				// (ADR 0007), whatever it is handed.
-				if backend == "dynamo" && entryPoint == "CommitStream" {
-					require.Len(t, errs, 1)
-					require.ErrorIs(t, errs[0], dynamo.ErrCommitStreamRefused)
-
-					return
-				}
 
 				require.Len(t, errs, 1)
 				var refused *evt.ProjectorOnlyCommitError

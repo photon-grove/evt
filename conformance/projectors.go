@@ -31,7 +31,6 @@ func (t *tally) GetID() evt.EntityID                 { return t.id }
 func (t *tally) SetID(id evt.EntityID)               { t.id = id }
 func (t *tally) EventUpcasters() []evt.EventUpcaster { return nil }
 func (t *tally) Projectors() []evt.EventProjector    { return nil }
-func (t *tally) Base() evt.BaseEntity                { return evt.BaseEntity{ID: t.id, IsActive: true} } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 type tallied struct {
 	By int `json:"by"`

@@ -24,8 +24,8 @@ your application needs.
 - **Long logs can be rebuilt efficiently.** Inline snapshots, versioned upcasters,
   and snapshot-verified compaction limit replay work without rewriting history.
 - **DynamoDB Streams support.** Projectors consume the stream directly
-  (`projectors.NewLambdaHandler`); idempotency and retry classification included. (The
-  SNS publisher runtime that used to sit in the middle is deprecated in v0.9.0 — K5.)
+  (`projectors.NewLambdaHandler`), with idempotency and retry classification included. The
+  library no longer ships an SNS publisher. If you fan events out, do it from your own handler.
 - **A Rust crate shares the log.** [`photon-evt`](crates/evt) reads and writes the
   same DynamoDB items, PostgreSQL rows, and stream envelopes, so Go and Rust
   services can append to the same streams. [`photon-evt-lambda`](crates/evt-lambda)
@@ -107,58 +107,39 @@ err := store.Execute(ctx, entity, "acct-1", command, metadata)
 | `evt/dynamo` | DynamoDB event log, snapshots, views, stream helpers, and transaction groups |
 | `evt/postgres` | PostgreSQL event log and snapshots — the same `evt.Repository` contract on a relational store |
 | `evt/snapshots` | Store with snapshot loading and write thresholds |
-| `evt/stream` | Stream handler and publisher helpers for event fanout |
-| `evt/projectors` | Projector runtime (SNS/SQS fan-out, or direct stream) with idempotency and retry classification |
-| `evt/publishers` | DynamoDB Streams publisher handler that fans events out to SNS, with ingress and retry budgets (deprecated) |
+| `evt/stream` | Stream envelope and DynamoDB Streams handler |
+| `evt/projectors` | Projector runtime (SNS/SQS envelope decode, or direct stream) with idempotency and retry classification |
 | `evt/policy` | Backend-neutral retry helpers for commit paths |
-| `evt/policy/dynamodb` | DynamoDB-specific retry classification |
 | `evt/viewstore` | Typed JSON helper around `evt.ViewRepository` |
 | `evt/test` | Test aggregate, commands, events, and helpers for adopters and framework tests |
 
 All packages live under `github.com/photon-grove/evt`.
 
-## Deprecations (v0.9.0)
+## Removals
 
-The v0.9.0 core reshape deprecates the features cut by plan decision D6
-([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md)); they keep compiling but are
-deleted in the next minor release. Each carries a `Deprecated:` godoc notice — pointing at its
-replacement where one exists, and saying plainly where the feature is removed without one:
+The features cut by plan decision D6 ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md))
+are deleted. The [parity matrix](docs/parity/feature-matrix.md) records each one (K1 to K7). In
+short:
 
-- `CommitStream` (K1) — commit batched commands through the normal commit path. The DynamoDB
-  `CommitStream` is already refused (`*dynamo.CommitStreamRefusedError`): its batches write events
-  without maintaining the stream head items
-- snapshot freshness observer / replay estimate / budget (K2) — removed without a Go
-  replacement; wrap `Load` with your own metrics (Rust gains structured load telemetry, P9)
-- `StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` (K3) —
-  removed without a bounded-memory in-library replacement: `StreamEntities` buffers every
-  matched event, so for large tables page your own DynamoDB Query/Scan with `LastEvaluatedKey`
-  (one partition query per entity keeps memory bounded)
-- `HeadStore` (heads table) and incremental/delta rebuild (K4) — scan-derived `StreamEntityHeads`
-- `evt/publishers`, `BudgetController`, and `stream.SNSPublisher`/FIFO (K5) — removed without an
-  in-library replacement: read the DynamoDB Stream directly (`projectors.NewLambdaHandler`) or
-  publish with your own handler; the envelope format stays (it is the cross-language wire format).
-  Command outcomes (C3/C4) ship in v0.9.0 (below) but are not a publisher replacement
-- the `WithFactory` helpers (including `snapshots.Store`'s), `ByCommandID`, `dynamo.Delete`,
-  `dynamo/mock`, the `do.go` DI providers, `dynamo.ExpressionStreamer` (and the concrete
-  `*dynamo.Repository` `...ByExpression` methods), and handler-attached
-  `CommandResult.Transaction` (K7) — direct store calls, `StreamFilter` (entity-type filtering
-  only: raw server-side expressions have no like-for-like replacement, so apply richer
-  predicates client-side), projector-produced transaction groups (superseded by commit-wide
-  projectors: `snapshots.Store.WithCommitProjectors`, below); for `dynamo.Delete`, delete fixture
-  items with the AWS SDK or recreate the test table
-
-Three more D6-cut surfaces have **no warning-free migration path yet**, so they carry no
-`Deprecated:` notice in v0.9.0. They are planned for removal once the core reshape (C1–C11)
-replaces the contracts that require them:
-
-- `evt.BaseEntity` / `evt.NewEntity` — `Entity.Base` still requires `BaseEntity`
-- `evt/result` — `Repository.StreamAllEvents`, `Repository.StreamEntities`,
-  `SnapshotStreamer`, and `RebuildProjectionsFromStream` still return `result.Result` channels
-- `policy.Hooks` / `policy.Attempt` / `policy.Config.Classify` / `policy.Classifier` (K6) —
-  `policy.Execute` still takes a `Hooks` argument, so these carry no `Deprecated:` notice yet
-  (the built-in `policy.Classify` only recognizes `ClassifiedError`, so a custom classifier
-  is the only supported way to mark raw backend errors transient). `policy.ExecuteWithRetry`
-  is deprecated: fence-aware retry (C5, below) replaces blind whole-command retry
+- `Repository.CommitStream` is gone. Commit batched commands through the normal commit path.
+- The snapshot freshness observer, replay estimate and replay budget are gone. Wrap `Load` with your
+  own metrics.
+- `dynamo.StreamEntitiesByQuery`, its `HeadSource` option and `RebuildProjectionsByQuery` are gone.
+  `StreamEntitiesFromSnapshots` stays. `StreamEntities` buffers every matched event, so for very
+  large tables page your own DynamoDB Query or Scan with `LastEvaluatedKey`.
+- `dynamo.HeadStore` and the entity-heads table are gone. `Repository.StreamEntityHeads` derives
+  heads from the log and stays.
+- The `evt/publishers` package and `stream.SNSPublisher` are gone. The stream envelope stays because
+  it is the cross-language wire format, so read the DynamoDB Stream with `stream.DynamoDBHandler` or
+  `projectors.NewLambdaHandler` and publish onward from your own handler.
+- `policy.ExecuteWithRetry`, its hooks and the pluggable classifier, plus `evt/policy/dynamodb`, are
+  gone. Fence-aware retry (below) replaces blind whole-command retry.
+- `evt.BaseEntity`, `evt.NewEntity`, `Entity.Base`, the `WithFactory` helpers, `evt.ByCommandID`,
+  `CommandResult.Transaction`, the `do.go` providers, `dynamo.Repository.Delete`,
+  `dynamo.ExpressionStreamer` and the public `...ByExpression` methods are gone, and `dynamo/mock`
+  is no longer importable. Entities define their own `ID` field and `GetID()`. Use `StreamFilter`
+  for entity-type filtering and `snapshots.Store.WithCommitProjectors` for commit-wide projectors.
+  The `result` package stays, because the repository stream channels still carry `result.Result`.
 
 Three v0.9.0 changes are source-breaking without a deprecation window:
 
@@ -443,7 +424,7 @@ default:
   PostgreSQL repositories do (PostgreSQL keeps the rows in `{events}__evt_command_outcomes`, created
   by `EnsureSchema`). On an upgraded log, command IDs recorded before outcomes were enabled keep
   only the old window check; see the [storage format](docs/spec/storage-format.md#command-outcomes).
-  `CommitStream` and the bare `Store.Commit` do not record outcomes and refuse them.
+  The bare `Store.Commit` does not record outcomes and refuses them.
 
 A custom `Repository` written before v0.9 compiles unchanged but now receives
 `SerializedResult.Snapshots` and `.Fences`. An implementation that cannot honor them atomically
@@ -531,8 +512,7 @@ enforcement runs. Create markers from the repository so reads and transactional 
 client and events table; attaching a marker from another client or table is a typed configuration
 error.
 
-The raw `dynamo.Delete` is snapshot-unsafe, for local fixtures only, and excluded
-from production builds (`-tags prod`). See
+See
 [`BEHAVIORAL_INVARIANTS.md`](BEHAVIORAL_INVARIANTS.md) for the exact serialization
 and DynamoDB schema guarantees.
 

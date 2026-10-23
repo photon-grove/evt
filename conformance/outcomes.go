@@ -102,9 +102,6 @@ func (l *ledger) GetID() evt.EntityID  { return l.id }
 func (l *ledger) SetID(id evt.EntityID) {
 	l.id = id
 }
-func (l *ledger) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	return evt.BaseEntity{ID: l.id} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-}
 func (l *ledger) EventUpcasters() []evt.EventUpcaster { return nil }
 func (l *ledger) Projectors() []evt.EventProjector    { return nil }
 

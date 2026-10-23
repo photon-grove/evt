@@ -11,7 +11,7 @@ import (
 
 // MockEntity for testing error scenarios
 type MockEntity struct {
-	evt.BaseEntity
+	ID                 evt.EntityID `json:"id"`
 	handleError        error
 	applyError         error
 	snapshotError      bool
@@ -38,10 +38,6 @@ func (m *MockEntity) EventUpcasters() []evt.EventUpcaster {
 
 func (m *MockEntity) Projectors() []evt.EventProjector {
 	return m.projectors
-}
-
-func (m *MockEntity) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	return m.BaseEntity
 }
 
 func (m *MockEntity) Handle(_ context.Context, _ evt.Command) (evt.CommandResult, error) {

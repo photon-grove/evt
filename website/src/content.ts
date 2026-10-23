@@ -7,7 +7,7 @@ export const quickStartCode = `// Start with the in-memory repository.
 repo := mem.NewRepository()
 store := mem.NewStoreFromRepo(repo)
 
-entity := account.NewEntity("acct-1")
+entity := &account.Account{ID: "acct-1"}
 err := store.Execute(ctx, entity, "acct-1",
     &account.Open{InitialBalance: 100}, evt.Metadata{})
 
@@ -65,10 +65,9 @@ export const packages = [
   {name: 'evt/mem', body: 'In-memory repository and store for fast unit tests.'},
   {name: 'evt/dynamo', body: 'DynamoDB event log, snapshots, views, stream helpers, and transaction groups.'},
   {name: 'evt/snapshots', body: 'Store with snapshot loading and configurable write thresholds.'},
-  {name: 'evt/stream', body: 'Stream handler and publisher helpers for event fanout.'},
-  {name: 'evt/projectors', body: 'Projector runtime for the SNS fan-out (or direct stream) with idempotency and retry classification.'},
-  {name: 'evt/publishers', body: 'DynamoDB Streams publisher that fans events out to SNS, with ingress and retry budgets (deprecated in v0.9.0).'},
-  {name: 'evt/policy', body: 'Backend-neutral retry helpers for commit paths (+ policy/dynamodb).'},
+  {name: 'evt/stream', body: 'Stream envelope and DynamoDB Streams handler.'},
+  {name: 'evt/projectors', body: 'Projector runtime for SNS/SQS envelopes (or the direct stream) with idempotency and retry classification.'},
+  {name: 'evt/policy', body: 'Backend-neutral retry helpers for commit paths.'},
   {name: 'evt/viewstore', body: 'Typed JSON helper around evt.ViewRepository.'},
   {name: 'evt/test', body: 'Shared test aggregate, commands, events, and helpers for adopters.'},
 ]

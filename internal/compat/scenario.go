@@ -415,7 +415,7 @@ func (r Runner) Execute(ctx context.Context, entityID evt.EntityID, step Step) (
 }
 
 func (r Runner) sequence(ctx context.Context, entityID evt.EntityID) (evt.EventSequence, error) {
-	_, eventContext, err := evt.LoadEntityWithFactory(ctx, r.Store, func() evt.Entity { return NewAccount(entityID) }, entityID) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	eventContext, err := r.Store.LoadEntity(ctx, NewAccount(entityID), entityID)
 	if err != nil {
 		return 0, err
 	}

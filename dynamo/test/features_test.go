@@ -11,7 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
-	dynamo_mock "github.com/photon-grove/evt/dynamo/mock" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	dynamo_mock "github.com/photon-grove/evt/dynamo/internal/mock"
 	"github.com/photon-grove/evt/policy"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -261,7 +261,7 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_RevalidatesAndRefuses() {
 
 // Test_Commit_CheckFailure_SupportedChangeIsTransient asserts a failed per-commit check against a
 // manifest the writer still supports re-validates, caches the new version, and classifies the
-// failure as transient so policy.ExecuteWithRetry retries.
+// failure as transient so a retry follows.
 func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient() {
 	client := dynamo_mock.NewClient()
 	repo := dynamo.NewRepository(client, "test-events").

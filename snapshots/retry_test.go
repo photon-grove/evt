@@ -389,12 +389,9 @@ func newTally(id evt.EntityID) *tally { return &tally{id: id, Counts: map[string
 
 const tallyType evt.EntityType = "retry-tally"
 
-func (t *tally) Type() evt.EntityType  { return tallyType }
-func (t *tally) GetID() evt.EntityID   { return t.id }
-func (t *tally) SetID(id evt.EntityID) { t.id = id }
-func (t *tally) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	return evt.BaseEntity{ID: t.id} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-}
+func (t *tally) Type() evt.EntityType                { return tallyType }
+func (t *tally) GetID() evt.EntityID                 { return t.id }
+func (t *tally) SetID(id evt.EntityID)               { t.id = id }
 func (t *tally) EventUpcasters() []evt.EventUpcaster { return nil }
 func (t *tally) Projectors() []evt.EventProjector    { return nil }
 

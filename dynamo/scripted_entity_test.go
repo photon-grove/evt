@@ -36,10 +36,6 @@ func (e *scriptedEntity) GetID() evt.EntityID                 { return e.id }
 func (e *scriptedEntity) SetID(id evt.EntityID)               { e.id = id }
 func (e *scriptedEntity) EventUpcasters() []evt.EventUpcaster { return nil }
 func (e *scriptedEntity) Projectors() []evt.EventProjector    { return nil }
-func (e *scriptedEntity) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	return evt.BaseEntity{ID: e.id} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-}
-
 func (e *scriptedEntity) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
 	*e.handled++
 

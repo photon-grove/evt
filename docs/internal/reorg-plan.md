@@ -39,7 +39,6 @@ The 45 root files group cleanly by concern:
   `namespaces_test.go`, `feature_binding_test.go`.
 - Compaction: `compaction.go`, `compaction_test.go`, and `snapshot_test.go` (documents the
   serialized snapshot shape; there is no root `snapshot.go`, the type lives in `serialization.go`).
-- Cut-list leftovers: `factory_test.go` exercises the K7 entity factories.
 
 The Go subpackages, in one line each: `dynamo` (the DynamoDB backend, with `integration`,
 `test`, `mock`, and a test-only `awsmeasure` alongside it), `postgres`, `mem` (backends),
@@ -103,13 +102,10 @@ Public API surface, meaning only the names a human actually stumbles on:
 - `StorageType` values differ in convention (`dynamo.StorageType` is `"DynamoDB"`,
   `postgres.StorageTypePostgres` is `"postgres"`). Before normalizing
   anyone should verify the string is never persisted; it appears in backend-capability checks.
-- History leaks from the cut list: `CommitStream` (K1), the freshness observers in `snapshots`
-  (K2), `StreamEntitiesByQuery`, `RebuildProjectionsByQuery` and `HeadSource` (K3),
-  `dynamo.HeadStore` and `incremental.go`'s delta rebuild (K4), `publishers` and the SNS
-  publisher (K5), `policy` hooks and `ExecuteWithRetry` (K6), and the K7 stragglers
-  (`BaseEntity`, factories, `ByCommandID`, `result`, `dynamo/mock`, the `do.go` providers,
-  `ExpressionStreamer`). These get deleted on the vNext schedule, not renamed, and the reorg
-  should not carry them into `go/` twice.
+- History leaks from the cut list (`CommitStream`, the freshness observers, the `ByQuery` rebuild
+  sources, `HeadStore`, `publishers` and the SNS publisher, the `policy` hooks, and the K7
+  stragglers) are deleted in the cut phase, not renamed, so the reorg doesn't carry them into
+  `go/` twice. See the decisions below for the two items that stay.
 
 The docs, with audience and currency:
 
@@ -223,12 +219,12 @@ commits.
 | `dynamo/` | `go/backends/dynamo/` | package `dynamo` |
 | `mem/` | `go/backends/mem/` | package `mem` |
 | `postgres/` | `go/backends/postgres/` | package `postgres` |
-| `snapshots/` | `go/snapshots/` | freshness (`K2`) and `do.go` (`K7`) die in the cut wave, not here |
+| `snapshots/` | `go/snapshots/` | freshness (`K2`) and `do.go` (`K7`) are already deleted |
 | `projectors/` | `go/projectors/` | |
-| `publishers/` | — | K5 cut, deleted in the cut wave; deprecated marker already on main |
-| `stream/` | `go/stream/` | minus the SNS publisher when K5 lands |
-| `policy/` | — | K6 cut in the cut wave |
-| `result/` | — | K7 cut; the internal channel helper inlines |
+| `publishers/` | — | K5 cut, already deleted |
+| `stream/` | `go/stream/` | the SNS publisher is already gone |
+| `policy/` | `go/policy/` | K6 already removed the hooks and `ExecuteWithRetry`, and what stays is the error classification and the backoff helpers |
+| `result/` | `go/result/` | stays for now, because the repository stream contracts still send `result.Result` over channels |
 | `viewstore/` | `go/viewcodec/` | rename rides the API-rename wave |
 | `test/` | `go/test/` | |
 | `conformance/` | `go/conformance/` | |
@@ -237,7 +233,7 @@ commits.
 | `examples/banking` | `go/examples/banking/` | |
 | `moon.yml` | `go/moon.yml` | project id stays `evt` so task names hold |
 | `CHANGELOG.md` | `go/CHANGELOG.md` | release-please changelog for the `go` package |
-| `dynamo/mock/`, `dynamo/awsmeasure/` | — | K7 cut / folded into dynamo tests in the tidy wave |
+| `dynamo/awsmeasure/` | — | folded into dynamo tests in the tidy wave (`dynamo/mock` already moved to `dynamo/internal/mock`) |
 | `docs/concepts.md` etc. | `docs/guide/…` | see the docs map |
 | `docs/spec/storage-format.md` | `docs/reference/storage-format.md` | |
 | `docs/parity/feature-matrix.md` | `docs/reference/feature-matrix.md` | links updated in the same PR |
@@ -372,24 +368,43 @@ Ordered PRs, each reviewable on its own, sizes S (under ~200 lines), M, L:
    across code, tests, conformance and examples.
 6. **Renames, small** (S, breaking) — `viewstore` → `viewcodec`, delete `dynamo.Transaction`,
    fold `awsmeasure`, the `StorageType` string check, the file consolidations.
-7. **Cut deletions** (2–3 PRs, M each, breaking) — K5 publishers and the SNS stream fan-out;
-   K6 policy; K1/K2/K3/K4 and the K7 stragglers. These overlap the vNext cut schedule, so each
-   PR should carry the plan ID it implements, and if a vNext issue already covers one, that PR
-   is that issue's, not a duplicate.
+7. **Cut deletions** (done, and moved ahead of the module move) — K1 through K7 landed in one
+   PR with one commit per group, so dead code isn't moved into `go/`. The decisions behind the
+   reorder are recorded below.
 8. **Final sweep** (S) — AGENTS.md trim, a links pass, and updating the feature matrix rows for
    anything a rename touched (renames don't change capabilities, so most rows won't move).
 
 Waves 2–4 are the reorg proper and can ship as one release. Waves 5–7 are breaking API work
 that lands in the following minor, aligned with the vNext cut schedule.
 
+## Decisions
+
+The owner settled the first three open questions after the plan was written.
+
+The cuts happen now. K1 through K7 are deleted in their own phase, before the module move,
+which answers question 2. The reorg then moves a smaller, living codebase into `go/`. Two items
+on the list stay, because non-cut code still needs them: the `result` package, since
+`Repository.StreamAllEvents`, `StreamEntities` and the rebuild streams send `result.Result` values
+over channels, and the `evt.EntityHeadStreamer` and `EntityHeadVisitor` interfaces, which the mem
+and postgres backends implement. Both can be reconsidered when the stream contracts are reshaped.
+
+Go `Entity` becomes `Aggregate`, which answers question 3. `EntityID` and `EntityType` keep their
+names, because they name the identity of a stream and not the domain object. Go `Context` becomes
+`CommandContext`, and it is passed explicitly beside `context.Context`. It is not embedded in or
+pulled out of `context.Context`. Both renames land in a later phase and not in the cut PR.
+
+The module move ships as `go/v0.9.0`, which answers question 1.
+
+Since the Go package sits at 0.8.0, the breaking commits of the cut PR would take release-please
+to 1.0.0, so the Go package now sets `bump-minor-pre-major`. A breaking change bumps the minor
+until the owner decides to cut 1.0.0 on purpose.
+
 ## Open questions
 
-1. Which minor carries the module move: `go/v0.9.0` (my recommendation, one breaking wave with
-   the reshape) or `go/v0.10.0` if the reshape work slips?
-2. Do the K-cut deletions ride this effort (my recommendation, so dead code isn't moved into
-   `go/`) or stay purely on the vNext schedule with the reorg merely sequencing around them?
-3. `Entity` → `Aggregate`: in or out? It's the highest-churn rename and the only one I'd
-   understand a veto on.
+1. ~~Which minor carries the module move?~~ Decided: `go/v0.9.0`.
+2. ~~Do the K-cut deletions ride this effort?~~ Decided: yes, deleted now, ahead of the move.
+3. ~~`Entity` → `Aggregate`: in or out?~~ Decided: in, with `Context` → `CommandContext` passed
+   explicitly.
 4. After K5, does what survives in `stream/` merge into `projectors/` (one fan-out story) or
    stay a separate package?
 5. Is `StorageType`'s string ever persisted? If not, normalize `"DynamoDB"`/`"postgres"` in the

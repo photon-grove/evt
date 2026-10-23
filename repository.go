@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 )
 
 // StorageType identifies the backend storage system a Repository uses.
@@ -74,13 +74,6 @@ type Repository interface {
 	// An implementation that honors all of this declares it by implementing
 	// TransactionalRepository; transaction APIs refuse one that does not.
 	Commit(ctx context.Context, result SerializedResult) error
-
-	// Commit a stream of Events using whatever batch size works best for the Repository.
-	//
-	// Deprecated: Cut in ADR-0006 (K1): CommitStream bypasses command outcomes, the journal, and
-	// projections. Commit batched commands through the normal commit path instead (see
-	// docs/adr/0006-parity-policy-and-feature-cuts.md). It will be removed in the next minor release.
-	CommitStream(ctx context.Context, channel <-chan result.Result[SerializedResult]) []error
 
 	// Commit new Events for an Entity instance while also saving the given Snapshot.
 	CommitWithSnapshot(

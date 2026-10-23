@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,16 +14,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/aws-sdk-go-v2/service/sns"
-	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/internal/eventjson"
-	"github.com/photon-grove/evt/stream"
 )
 
 // Fixture file names under compat/fixtures.
@@ -249,74 +242,6 @@ func DynamoItemJSON(item map[string]types.AttributeValue) map[string]any {
 	return out
 }
 
-// captureSNS records published messages in place of SNS.
-type captureSNS struct {
-	entries []snstypes.PublishBatchRequestEntry
-}
-
-func (c *captureSNS) PublishBatch(
-	_ context.Context,
-	params *sns.PublishBatchInput,
-	_ ...func(*sns.Options),
-) (*sns.PublishBatchOutput, error) {
-	c.entries = append(c.entries, params.PublishBatchRequestEntries...)
-
-	successful := make([]snstypes.PublishBatchResultEntry, 0, len(params.PublishBatchRequestEntries))
-	for _, entry := range params.PublishBatchRequestEntries {
-		successful = append(successful, snstypes.PublishBatchResultEntry{Id: entry.Id})
-	}
-
-	return &sns.PublishBatchOutput{Successful: successful}, nil
-}
-
-// SNSMessage publishes an event-log item through the real stream.SNSPublisher (as a DynamoDB
-// stream INSERT) and returns the message body and string attributes it sent.
-func SNSMessage(ctx context.Context, item map[string]types.AttributeValue) (string, map[string]string, error) {
-	image := make(map[string]events.DynamoDBAttributeValue, len(item))
-	for name, value := range item {
-		switch v := value.(type) {
-		case *types.AttributeValueMemberS:
-			image[name] = events.NewStringAttribute(v.Value)
-		case *types.AttributeValueMemberN:
-			image[name] = events.NewNumberAttribute(v.Value)
-		default:
-			return "", nil, fmt.Errorf("unsupported attribute %s (%T)", name, value)
-		}
-	}
-
-	capture := &captureSNS{}
-	publisher, err := stream.NewSNSPublisher( //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-		capture,
-		"arn:aws:sns:us-west-2:000000000000:evt-compat",
-		OriginSource,
-		stream.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	)
-	if err != nil {
-		return "", nil, err
-	}
-
-	record := events.DynamoDBEventRecord{
-		EventName: "INSERT",
-		Change:    events.DynamoDBStreamRecord{NewImage: image},
-	}
-
-	result, err := publisher.Publish(ctx, []events.DynamoDBEventRecord{record})
-	if err != nil {
-		return "", nil, err
-	}
-	if result.PublishedCount != 1 || len(capture.entries) != 1 {
-		return "", nil, fmt.Errorf("expected one published message, got %d", result.PublishedCount)
-	}
-
-	entry := capture.entries[0]
-	attributes := make(map[string]string, len(entry.MessageAttributes))
-	for name, value := range entry.MessageAttributes {
-		attributes[name] = aws.ToString(value.StringValue)
-	}
-
-	return aws.ToString(entry.Message), attributes, nil
-}
-
 // newFakeRunner returns a runner over the real DynamoDB repository backed by a FakeDynamo. A
 // scenario with outcomes gets a store that records command outcomes.
 func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) {
@@ -525,7 +450,7 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 				continue
 			}
 
-			message, _, err := SNSMessage(ctx, item)
+			message, _, err := SNSMessage(item)
 			if err != nil {
 				return fixtures, fmt.Errorf("%s: %w", scenario.Name, err)
 			}

@@ -298,7 +298,7 @@ func eventVector(ctx context.Context, c namedEvent) (EventVector, error) {
 		return EventVector{}, fmt.Errorf("expected one stored item, got %d", len(items))
 	}
 
-	message, attributes, err := SNSMessage(ctx, items[0])
+	message, attributes, err := SNSMessage(items[0])
 	if err != nil {
 		return EventVector{}, err
 	}
