@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"math"
 	"sync"
 
 	"github.com/photon-grove/evt"
@@ -17,10 +16,7 @@ type Store struct {
 	repo                     evt.Repository
 	snapshotSize             int
 	snapshotOverrides        map[evt.EntityType]int
-	replayEstimatePerEventMS float64
-	replayBudgetEvents       int
 	catchUpSnapshotThreshold int
-	freshnessObserver        FreshnessObserver
 
 	// outcomes is non-nil when command outcomes are enabled (ADR 0004, C3); see WithOutcomes.
 	outcomes *outcomeConfig
@@ -42,12 +38,42 @@ type Store struct {
 // (the target number of events between each Snapshot).
 func NewStore(repo evt.Repository, snapshotSize int) *Store {
 	return &Store{
-		repo:                     repo,
-		snapshotSize:             snapshotSize,
-		snapshotOverrides:        make(map[evt.EntityType]int),
-		replayEstimatePerEventMS: defaultReplayEstimatePerEventMS,
-		retry:                    DefaultRetryPolicy(),
+		repo:              repo,
+		snapshotSize:      snapshotSize,
+		snapshotOverrides: make(map[evt.EntityType]int),
+		retry:             DefaultRetryPolicy(),
 	}
+}
+
+// WithCatchUpSnapshotThreshold enables best-effort snapshot catch-up when replay debt exceeds threshold.
+func (store *Store) WithCatchUpSnapshotThreshold(threshold int) *Store {
+	store.catchUpSnapshotThreshold = threshold
+	return store
+}
+
+// WithSnapshotSize sets a per-entity-type snapshot interval override. The default
+// snapshotSize is used for any entity type without an explicit override.
+// Non-positive sizes remove the override so the default is used.
+// Must be called during Store initialization before concurrent use.
+func (store *Store) WithSnapshotSize(entityType evt.EntityType, size int) *Store {
+	if size <= 0 {
+		delete(store.snapshotOverrides, entityType)
+		return store
+	}
+	if store.snapshotOverrides == nil {
+		store.snapshotOverrides = make(map[evt.EntityType]int)
+	}
+	store.snapshotOverrides[entityType] = size
+	return store
+}
+
+// effectiveSnapshotSize returns the snapshot interval for the given entity type,
+// falling back to the store default when no override is configured.
+func (store *Store) effectiveSnapshotSize(entityType evt.EntityType) int {
+	if size, ok := store.snapshotOverrides[entityType]; ok {
+		return size
+	}
+	return store.snapshotSize
 }
 
 // LoadEntity loads the given Entity instance with the given id, retrieving Snapshots
@@ -107,27 +133,7 @@ func (store *Store) LoadEntity(
 		eventsSinceSnapshot = 0
 	}
 
-	estimatedReplayMS := int(math.Round(float64(eventsSinceSnapshot) * store.replayEstimatePerEventMS))
-	sample := FreshnessSample{
-		EntityType:          string(entity.Type()),
-		EntityID:            string(entityID),
-		EventsSinceSnapshot: eventsSinceSnapshot,
-		EstimatedReplayMS:   estimatedReplayMS,
-	}
-	if eventContext.CurrentSnapshot != nil {
-		sample.SnapshotSequence = int64(*eventContext.CurrentSnapshot)
-	}
-	if eventContext.CurrentSequence != nil {
-		sample.EventSequence = int64(*eventContext.CurrentSequence)
-	}
-	if store.replayBudgetEvents > 0 && eventsSinceSnapshot > store.replayBudgetEvents {
-		sample.ReplayBudgetExceeded = true
-	}
-
-	store.maybeCatchUpSnapshot(ctx, entity, entityID, &eventContext, eventsSinceSnapshot, &sample)
-	if store.freshnessObserver != nil {
-		store.freshnessObserver(ctx, sample)
-	}
+	store.maybeCatchUpSnapshot(ctx, entity, entityID, &eventContext, eventsSinceSnapshot)
 
 	return eventContext, nil
 }
@@ -387,7 +393,6 @@ func (store *Store) maybeCatchUpSnapshot(
 	entityID evt.EntityID,
 	eventContext *evt.Context,
 	eventsSinceSnapshot int,
-	sample *FreshnessSample,
 ) {
 	if store.catchUpSnapshotThreshold <= 0 || eventsSinceSnapshot < store.catchUpSnapshotThreshold {
 		return
@@ -403,30 +408,25 @@ func (store *Store) maybeCatchUpSnapshot(
 
 	payload, err := generateSnapshotPayload(entity)
 	if err != nil {
-		logCatchUpError(ctx, entity.Type(), entityID, "payload", err, sample)
+		logCatchUpError(ctx, entity.Type(), entityID, "payload", err)
 		return
 	}
 
 	nextSnapshot := *eventContext.CurrentSnapshot + 1
 	err = writer.PutSnapshot(ctx, entity.Type(), entityID, payload, nextSnapshot, *eventContext.CurrentSequence)
 	if err != nil {
-		logCatchUpError(ctx, entity.Type(), entityID, "write", err, sample)
+		logCatchUpError(ctx, entity.Type(), entityID, "write", err)
 		return
-	}
-	if sample != nil {
-		sample.CatchUpApplied = true
-		sample.SnapshotSequence = int64(nextSnapshot)
 	}
 }
 
-// logCatchUpError logs a snapshot catch-up failure and records it in the freshness sample.
+// logCatchUpError logs a snapshot catch-up failure.
 func logCatchUpError(
 	ctx context.Context,
 	entityType evt.EntityType,
 	entityID evt.EntityID,
 	phase string,
 	err error,
-	sample *FreshnessSample,
 ) {
 	slog.WarnContext(ctx, "snapshot catch-up failed",
 		"entityType", string(entityType),
@@ -434,7 +434,4 @@ func logCatchUpError(
 		"phase", phase,
 		"err", err,
 	)
-	if sample != nil {
-		sample.CatchUpError = err.Error()
-	}
 }
