@@ -10,13 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Compile the actual upgrade snippet, not a second copy that can drift from the README.
+// Compile the actual upgrade snippet, not a second copy that can drift from the upgrade guide.
 func TestReadmeGetRecentEvents(t *testing.T) {
-	readme, err := os.ReadFile("../../../README.md")
+	readme, err := os.ReadFile("../../../docs/guide/upgrading-to-v0.9.md")
 	require.NoError(t, err)
 
 	_, rest, ok := strings.Cut(string(readme), "```go\nfunc (r *Repository) GetRecentEvents(")
-	require.True(t, ok, "missing Repository migration example")
+	require.True(t, ok, "missing GetRecentEvents example in docs/guide/upgrading-to-v0.9.md")
 	body, _, ok := strings.Cut(rest, "\n```")
 	require.True(t, ok, "unterminated Repository migration example")
 

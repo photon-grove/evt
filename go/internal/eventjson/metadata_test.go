@@ -12,7 +12,7 @@ import (
 )
 
 func Test_Metadata_V09FieldsEncode(t *testing.T) {
-	// The storage format's metadata example (docs/spec/storage-format.md#metadata): causationId is
+	// The storage format's metadata example (docs/reference/storage-format.md#metadata): causationId is
 	// unset and defaults to the commandId, extensions is set, principalId is the caller's
 	// identity, and the engine-assigned commitId defaults to the commandId.
 	metadata := evt.NewMetadata(context.Background(), ptr("us-west-2"),
