@@ -3,7 +3,7 @@
 The repo holds three things that ship separately: the Go module in `go/`, the Rust crates in
 `crates/`, and the docs site in `website/` (with its diagram package in `packages/`). The Go and
 Rust sides share one storage format, so most changes touch one language, and the ones that touch
-the format touch both. The [docs map](docs/) splits the guide, the reference spec, the ADRs and
+the format touch both. The [`docs/`](docs/) directory splits the guide, the reference spec, the ADRs and
 internal process notes.
 
 ## Local checks
@@ -88,8 +88,8 @@ form Go's module proxy expects for a module in a subdirectory. When Release Plea
 release, the `goreleaser` job in `release.yml` builds `evt-doctor` and uploads the archives to
 that `go/vX.Y.Z` release. GoReleaser only parses plain semver tags, so it builds from a local
 `vX.Y.Z` tag that is never pushed. The Rust crates are tagged
-`photon-evt-vX.Y.Z` and `photon-evt-lambda-vX.Y.Z`. In 0.x, features bump the patch version and
-breaking changes bump the minor version. Merging a crate's release pull request runs its publish
+`photon-evt-vX.Y.Z` and `photon-evt-lambda-vX.Y.Z`. Before 1.0, a breaking change bumps the minor version
+of the Go module and of each crate, and for the crates a new feature bumps only the patch. Merging a crate's release pull request runs its publish
 job in `release.yml`, which pushes it to crates.io.
 
 crates.io only allows trusted publishing for a crate that already exists, so a crate's first

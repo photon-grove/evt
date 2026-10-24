@@ -17,8 +17,7 @@ item under `pk = <entity id>` and `sk = <sequence>`, and raises the stream's hea
 still holds the sequence the command loaded. On PostgreSQL it's one SQL transaction over the events
 table and its stream-heads table. If another writer got there first the commit fails as a
 conflict, and nothing is written. Projectors can add view rows to that same commit, so a read model
-is never out of step with the events behind it, and a rebuild can always reproduce it from the
-log.
+stays in step with the events behind it, and a rebuild can reproduce it from the log.
 
 ## Go
 

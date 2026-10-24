@@ -83,12 +83,12 @@ function Home() {
     <>
       <section className="hero" id="top">
         <div className="hero-copy">
-          <p className="eyebrow">A Go event-sourcing framework</p>
+          <p className="eyebrow">Event sourcing for Go and Rust</p>
           <h1>
             Immutable events as truth. <span className="accent">Views you can rebuild.</span>
           </h1>
           <p className="lede">
-            evt is a Go framework for event-sourced services. Aggregates handle commands, the events
+            evt is a Go library for event-sourced services. Aggregates handle commands, the events
             they decide on go into an append-only log in DynamoDB or PostgreSQL, and views are
             projections you can wipe and rebuild from that log. A Rust crate reads and writes the same
             log.
@@ -114,7 +114,7 @@ function Home() {
 
       <section className="band intro-band" id="features">
         <div className="section-heading">
-          <p className="eyebrow">Framework surface</p>
+          <p className="eyebrow">Packages</p>
           <h2>Components for event-sourced Go services.</h2>
           <p className="section-lead">
             Each piece is a small package with a stable contract, and each card links to its guide.{' '}

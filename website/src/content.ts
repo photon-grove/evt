@@ -58,7 +58,7 @@ export const gettingStarted = [
   'Test it on mem.NewStore, which is fast and deterministic.',
   'Move production writes to dynamo.NewRepository and snapshots.NewStore.',
   'Add view projectors once the event contract has settled.',
-  'Check real DynamoDB behavior against Moto with the integration task.',
+  'Check DynamoDB behavior against the Moto emulator with the integration task.',
 ]
 
 export const packages = [
@@ -71,7 +71,10 @@ export const packages = [
   {name: 'evt/go/projectors', body: 'Projector runtime for the DynamoDB Stream, SNS or SQS, with idempotency and retry classification.'},
   {name: 'evt/go/policy', body: 'Backend-neutral retry classification and backoff helpers.'},
   {name: 'evt/go/viewcodec', body: 'A typed JSON helper around evt.ViewRepository.'},
+  {name: 'evt/go/result', body: 'The result.Result value the repository stream channels carry.'},
+  {name: 'evt/go/conformance', body: 'The backend-neutral suite a custom evt.Repository should pass.'},
   {name: 'evt/go/test', body: 'A shared test aggregate, commands, events and helpers.'},
+  {name: 'evt/go/cmd/evt-doctor', body: 'A CLI that inspects an event log and runs the stream-heads migration.'},
 ]
 
 export const cookbook: ContentCard[] = [
