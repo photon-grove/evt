@@ -25,7 +25,7 @@ as the events. The [concepts guide](https://github.com/photon-grove/evt/blob/mai
 
 `Store::transaction` goes further. It loads several aggregates, appends decided events to any of
 them, and commits once, so all the streams land or none does. Streams it read but didn't write are
-fenced at the head it saw. Every event of the commit carries one `commitId` (the command ID when
+fenced at the head it saw. That check is a read fence: the commit fails if a stream it only read has moved since. Every event of the commit carries one `commitId` (the command ID when
 there is one, else a generated ULID). Every commit, in both languages and on every backend, fits a
 shared budget of 100 items, 3.8 MB and 380 KB, or it fails with `CommitTooLarge` before anything is
 written. Each commit also spends two items on control checks (the feature marker and the rebuild
@@ -166,68 +166,50 @@ rejection codes, messages and details. The command type implements `OutcomeComma
 `Aggregate::Error` implements `ToRejection`. The
 [commands guide](https://github.com/photon-grove/evt/blob/main/docs/guide/commands.md) explains the model in more depth.
 
-- A repeat of a command (same ID, same identity digest) returns the stored outcome and does not
-  run the handler or write. The dedupe is global, so it survives snapshots and compaction. The
-  digest is a SHA-256 over the command's type, the target streams the request names, canonical
-  payload JSON, and principal. That's the caller's intent, never the streams the command ends up
-  writing, and `OutcomeConfig::with_digester` replaces it. The same ID with another digest is
-  `Error::IdempotencyKeyReuse`, carrying the stored `prior_outcome`. That error is never stored.
-- An error from `handle` that `ToRejection` maps to `Some` is a domain rejection. It's persisted
-  as a `rejected` outcome (`Rejection { code, message, details }`) and a retried command replays it
-  verbatim. A `None` is an internal failure the handler couldn't decide. It's returned as
-  `Error::Handler` and records nothing, like every other internal failure, so a retry after the fix
-  starts clean.
-- A rejection can carry events. A proposal whose apply finds its base revision stale should answer
-  the client with a rejection and also leave an `apply-failed` event on the proposal. Implement
-  `Aggregate::rejection_events(&self, error)` to return those events for the errors that map to a
-  rejection (the default is none). They commit in the same atomic transaction as the rejected row,
-  which lists them, and a replay returns the stored rejection without writing them again. They are
-  applied, snapshotted, and projected like an accepted command's events. In a transaction, stage
-  the events with `append` and return `Decision::reject_with_events` (or call
-  `Transaction::reject_with_events`). `Decision::reject` and `Transaction::reject` still discard
-  what was staged. Every rule of an accepted commit applies (continuity, fences, reserved streams,
-  the commit budget). A conflict re-prepares the command, which may then decide differently. When
-  attempts run out, the `stale-fence` rejection is recorded without these events. A rejection
-  stores no response.
-- A command that decides no events is an accepted no-op, and a response (at most 65536 bytes) is
-  stored with the outcome. See `Store::execute_with_response`.
-- A commit whose result is unknown (`Error::Indeterminate`: a timeout, a dropped connection, a
-  server fault) is settled by polling the outcome row for the recovery window
-  (`OutcomeConfig::with_recovery_wait`, 10 s), never by running the handler again. The stored outcome
-  comes back with `replayed` set, or a row that never appears becomes the retryable
-  `Error::AmbiguousWrite`. It's never reported as "not applied", because a transaction can land
-  after any single read. A definitive refusal, such as a validation or authorization error, stays
-  `Error::Backend` and isn't recovered.
-- For backend authors: a commit that carries an outcome and whose result is truly unknown
-  (timeout, lost connection or response, server fault, a dropped `COMMIT`) must fail with
-  `Error::Indeterminate`. That's the only error the store recovers by re-reading the outcome row. A
-  definitive failure (validation, missing table, authorization, a constraint error) must stay
-  `Error::Backend`. `Repository::backoff` is the timer recovery polling sleeps on, and
-  `Repository::deadline` is the timer that bounds each recovery read. Override both if your runtime
-  has one. A backend with no timer must bound its own reads. Decoded outcome rows must pass
-  `Outcome::validate_stored`.
-- `Store::transaction` records multi-stream commands with `Transaction::begin_command`, which must
-  be the first call on the transaction (`Error::CommandOrder` after any read, append, or fence, and a
-  replayed result finishes the transaction), then
-  `commit_with_outcome` or `reject`, attempting once. A failed caller-stamped fence persists a
-  `stale-fence` rejection instead of retrying, and the remedy is a new command ID.
-- Fence-aware retry. `execute_with_outcome`, `execute_with_response`, and
-  `Store::execute_transaction` retry a command that conflicts with another writer, up to the
-  store's `RetryPolicy`, set with `OutcomeConfig::with_retry`. The default is 5 attempts, 25 ms
-  doubling to 1 s, jittered, waiting on `Repository::backoff`. `RetryPolicy::immediate` opts out of
-  waiting for tests, and `with_deadline` bounds the whole command. With the defaults the waits total
-  about 0.4 s, but an ambiguous write that never resolves costs a recovery window per attempt. A
-  conflict on anything the engine can re-derive (an event put, a snapshot or continuity check, an
-  engine-filled fence) re-prepares the command: the aggregate is loaded again, the handler (or your `prepare`
-  closure) runs again against fresh state, and only the attempt that commits writes anything. A
-  failed caller-stamped fence fails fast with the `stale-fence` rejection instead, because the
-  engine cannot know your decision still holds. When the last attempt also conflicts, the engine
-  persists `Rejection::retries_exhausted(attempts)` (code `stale-fence`) as the command's outcome,
-  so a replay of the ID gets the same answer. Submit a new command ID to try again. Handlers and
-  `prepare` closures may therefore run more than once and must be safe to repeat, and a command
-  passed to `execute_with_outcome` must be `Clone`. A transient failure that is not a conflict
-  (throttling, an ambiguous write that never resolved) is retried the same way but returned as an
-  error when attempts run out.
+A repeat of a command, meaning the same ID with the same identity digest, returns the stored
+outcome without running the handler or writing anything. The dedupe is global, so it survives
+snapshots and compaction. The digest is a SHA-256 over the command's type, the target streams the
+request names, canonical payload JSON and the principal, and `OutcomeConfig::with_digester`
+replaces it. The same ID with another digest is `Error::IdempotencyKeyReuse`, which carries the
+stored `prior_outcome` and is not itself stored.
+
+An error from `handle` that `ToRejection` maps to `Some` is a domain rejection. It's persisted as a
+`rejected` outcome (`Rejection { code, message, details }`), and a retry replays it verbatim. A
+`None` is an internal failure: it comes back as `Error::Handler` and records nothing, so a retry
+after the fix starts clean. A rejection can also carry events, for example an `apply-failed` event
+left on a proposal whose base revision went stale. Implement `Aggregate::rejection_events(&self,
+error)` to return them (the default is none), or in a transaction stage them with `append` and
+return `Decision::reject_with_events` (or call `Transaction::reject_with_events`). They commit
+atomically with the rejected row and are applied, snapshotted and projected like accepted events.
+`Decision::reject` and `Transaction::reject` still discard what was staged. A rejection stores no
+response. A command that decides no events is an accepted no-op, and a response of at most 65536
+bytes can be stored with any accepted outcome (see `Store::execute_with_response`).
+
+A commit whose result is unknown (`Error::Indeterminate`, from a timeout, a dropped connection or a
+server fault) is settled by polling the outcome row for the recovery window
+(`OutcomeConfig::with_recovery_wait`, 10 s), not by running the handler again. The stored outcome
+comes back with `replayed` set, or a row that never appears becomes the retryable
+`Error::AmbiguousWrite`. A definitive refusal, such as a validation or authorization error, stays
+`Error::Backend`. So a backend author has one rule to follow: fail a commit whose result is truly
+unknown with `Error::Indeterminate`, and every definitive failure with `Error::Backend`.
+`Repository::backoff` is the timer recovery polling sleeps on and `Repository::deadline` bounds each
+recovery read, so override both if your runtime has one, or bound your own reads if it has none.
+Decoded outcome rows must pass `Outcome::validate_stored`.
+
+`execute_with_outcome`, `execute_with_response` and `Store::execute_transaction` retry a command
+that conflicts with another writer, up to the store's `RetryPolicy` (`OutcomeConfig::with_retry`).
+The default is 5 attempts, 25 ms doubling to 1 s, jittered, waiting on `Repository::backoff`.
+`RetryPolicy::immediate` skips the waits in tests, and `with_deadline` bounds the whole command. A
+conflict the engine can re-derive re-prepares the command, meaning it reloads the aggregate and
+runs the handler or your `prepare` closure again against fresh state. So handlers and closures must
+be safe to repeat, and a command passed to `execute_with_outcome` must be `Clone`. When the last
+attempt also conflicts, the engine records `Rejection::retries_exhausted(attempts)` (code
+`stale-fence`), and a new command ID is the way to try again. For multi-stream commands,
+`Transaction::begin_command` must be the first call on the transaction (`Error::CommandOrder`
+otherwise), followed by `commit_with_outcome` or `reject`, attempting once. The
+[commands guide](https://github.com/photon-grove/evt/blob/main/docs/guide/commands.md) covers
+identity, ambiguous writes and fence-aware retry in full, and the rules are the same in both
+languages.
 
 ```rust
 use photon_evt::{
@@ -327,15 +309,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-A multi-stream command runs under the same retry with `Store::execute_transaction`: the closure is
-the command's decision step, run again from scratch whenever the engine re-prepares it, and the
-streams it reads and writes can depend on what it reads. The identity names only what the request
-names (`with_targets`), so the digest is the same on every attempt however the write set changes.
-The flip side is a contract: everything that distinguishes the request must be in the targets or
-the payload. A transfer whose destination is chosen only inside the closure has the same identity
-whichever destination it picks, so a second request with the same command ID and a different
-destination replays the first's outcome instead of running. Put the destination in the payload (or
-the targets):
+A multi-stream command runs under the same retry with `Store::execute_transaction`. The closure is
+the command's decision step and runs again from scratch whenever the engine re-prepares it. Its
+identity names only what the request names (`with_targets`), so the digest stays the same however
+the write set changes. That means everything that distinguishes the request has to be in the
+targets or the payload, as the
+[commands guide](https://github.com/photon-grove/evt/blob/main/docs/guide/commands.md#fence-aware-retry)
+explains:
 
 ```rust
 use photon_evt::{
@@ -420,7 +400,7 @@ against a repository that stores them. With outcomes enabled, the plain `Store::
 `Store::commit`, and `Transaction::commit` refuse to run, so no outcome is skipped silently. The
 older duplicate-command window is kept as a pre-check for IDs written before outcomes existed.
 
-## Events and versions
+## Events, runtimes and sharing
 
 Each `domain_events!` variant declares its stored type and version. Loading a stored event whose
 version, after upcasting, is not the declared one fails with `PayloadError::VersionMismatch`
@@ -436,8 +416,6 @@ domain_events! {
 }
 ```
 
-## Async runtime and sharing
-
 The core crate does not depend on an async runtime. The `dynamodb` and `postgres` features use
 Tokio through the AWS SDK and `tokio-postgres`. `execute_with_retry` takes the sleep function from
 the caller, such as `tokio::time::sleep`.
@@ -452,9 +430,9 @@ catches the repeat while the first run's events are after the latest snapshot: i
 wrote a snapshot, the reloaded entity no longer sees the ID, and running the command again applies
 it twice.
 
-## DynamoDB
+## Backends
 
-Enable the `dynamodb` feature and bring your own `aws_sdk_dynamodb::Client`. The crate disables the
+For DynamoDB, enable the `dynamodb` feature and bring your own `aws_sdk_dynamodb::Client`. The crate disables the
 SDK's default HTTP and runtime features, so enable them in your application (for example, by
 depending on `aws-config` with its defaults).
 
@@ -472,9 +450,7 @@ let store = Store::<Account, _>::new(repository, ())
 The table needs a string partition key `pk` and a number sort key `sk`, the same table Go's
 `dynamo.Repository` uses.
 
-## PostgreSQL
-
-Enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
+For PostgreSQL, enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
 `ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`. Engine relations use the
 reserved `__evt_` infix. Schema setup migrates the old `{events}_entity_type_idx` index to
 `{events}__evt_entity_type_idx`, and it creates the rebuild fence's `{events}__evt_rebuild_lock`
@@ -541,8 +517,6 @@ them refuses the commit with `Error::ViewsNotConfigured`. A failed condition is
 `source()`. It's never retried and records no outcome. Keys over 2,048 bytes (`pk`) or 1,024 bytes
 (`sk`), a repeated key, and operations with no event are refused before any write.
 
-### Row owners
-
 Every operation names an owner: the stream the row belongs to, which is stored as the row's
 `entityID` attribute. The owner must be a stream the commit wrote. Every write to a row is
 conditioned on its owner, so a stream never overwrites or deletes a row another stream owns: the
@@ -571,8 +545,6 @@ it returns must have these semantics (see `PostgresRepository::with_view_writer`
   `WITH gone AS (DELETE ... WHERE pk = $1 AND sk = $2 AND entity_id = $3) SELECT 1 FROM <table>
   WHERE pk = $1 AND sk = $2 AND entity_id <> $3`. An affected-row count above zero fails its
   condition (a plain `DELETE` would silently do nothing to another stream's row).
-
-### Current-state and history-dependent projectors
 
 A projector says which entity types it reads the *events* of with `history()`. The default, none,
 is a current-state projector. It's given an empty commit ID and streams without events, and
@@ -896,7 +868,7 @@ and field names match exactly, so mark fields `#[serde(default)]` that older or 
 omit. Views are projections, so replaying the events must be able to rebuild every row, so keep the
 mutable state behind these writes in events.
 
-## Testing your domain
+## Testing
 
 The `testing` feature adds `photon_evt::testing`: given/when/then tests over `MemRepository`, the
 counterpart of Go's `test` package. `Scenario` seeds a stream, runs a command through a real
@@ -919,13 +891,11 @@ stands in for a concurrent writer), `transaction()` starts a `Store::transaction
 over the same data, and `events::<A>(id)` / `assert_events` / `load::<A>(id)` inspect each
 stream. `Scenario::on(&fixture)` runs a single-stream scenario against it.
 
-[`examples/banking.rs`](examples/banking.rs) puts it together: `domain_events!` enums, two
+[`examples/banking.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/banking.rs) puts it together: `domain_events!` enums, two
 aggregates, a balance read model fed only from committed events, and a two-account transfer as a multi-stream transaction with a
 read-fenced `bank` stream. Run it with
 `cargo run -p photon-evt --example banking --features testing`, and its tests run with
 `cargo test -p photon-evt --features testing --example banking`.
-
-## Testing a backend
 
 The `conformance` feature adds the backend conformance suite that this crate runs against its own
 backends:
@@ -962,18 +932,16 @@ transactions, command outcomes and fences),
 [ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md) (Rust-first extensions) and
 [ADR 0006](https://github.com/photon-grove/evt/blob/main/docs/adr/0006-parity-policy-and-feature-cuts.md) (the parity policy).
 
-## Features
+## Features and Rust version
 
-None are on by default. `dynamodb` adds the DynamoDB event log through the AWS SDK, and you bring
+No feature is on by default. `dynamodb` adds the DynamoDB event log through the AWS SDK, and you bring
 your own `aws_sdk_dynamodb::Client`. `postgres` adds the PostgreSQL event log through
 `tokio-postgres` and a deadpool pool. Both run on Tokio. `journal` adds the sync journal and lets
 this build write to a table that declares it, while a build without it refuses such a table.
 `conformance` adds the backend conformance suite, and `testing` adds the given/when/then helpers
 (it turns on `conformance`, whose fixtures back its examples).
 
-## Minimum Rust version
-
-Rust 1.88 for the core crate and the `postgres`, `conformance`, and `journal` features. CI checks this.
+The minimum Rust version is 1.88 for the core crate and the `postgres`, `conformance`, and `journal` features. CI checks this.
 
 The `dynamodb` feature follows the AWS SDK's minimum Rust version, which rises over time. On Rust
 1.84 and later, Cargo's MSRV-aware resolver (the default for edition 2024, or `resolver = "3"`)
