@@ -1,4 +1,4 @@
-# Streams and Projectors
+# Streams and projectors
 
 Once events land in the [DynamoDB event log](dynamodb.md), they reach asynchronous consumers
 (read-model projectors, search indexers, feeds, webhooks) through the table's DynamoDB Stream. The

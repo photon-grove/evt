@@ -1,4 +1,4 @@
-# Projections and Rebuilds
+# Projections and rebuilds
 
 A projection is a read model derived from the event log. Its rows are deterministic: given the same
 events, a projector writes the same rows, so any view table can be wiped and rebuilt by replaying
@@ -60,7 +60,8 @@ default:
 The fence keeps a generation counter that's odd while a rebuild is in progress and even when the
 views are settled. `Begin` raises it by one (by two for a takeover or after a force-release), and
 `End` raises it by one more. A lease is both the owner token and the generation `Begin` returned,
-which makes it a fencing token. `Renew`, `End` and `WriteViews` take the whole `evt.RebuildLease`,
+which makes it a fencing token, meaning a value every later write must present so a stale holder
+can't act after it's been replaced. `Renew`, `End` and `WriteViews` take the whole `evt.RebuildLease`,
 so a worker whose lease lapsed can't renew, write for, or end the lease of a later incarnation
 that took over under the same owner token. It gets `*evt.RebuildLeaseLostError` instead.
 
@@ -75,10 +76,9 @@ into a `stale-fence` rejection, it records no outcome (a rejection decided durin
 recorded either), and the same command ID runs again once the rebuild ends. `policy.Classify`
 reports it as transient.
 
-Now the tradeoff. An expired lock still blocks commits until a rebuild that takes it over ends, so
-a crashed worker's lock blocks commits until it expires and a rebuild that takes it over (`Begin`
-does that) ends.
-Waiting out a crashed rebuild is the price of never writing beside one. `ForceRelease(ctx, owner)`
+Now the tradeoff. A crashed worker's lock keeps refusing commits after its lease expires, until
+another rebuild takes it over with `Begin` and runs to its end. That's the cost of never letting a
+commit write beside a rebuild. `ForceRelease(ctx, owner)`
 is the operator's escape hatch for a wedged worker. It ends that worker's lease at once, so a new
 rebuild can begin without waiting for it to lapse. But it leaves the generation odd and flagged,
 and readers stay fenced and commits stay refused until a later rebuild begins and ends. The
@@ -257,11 +257,10 @@ a different type, `*evt.ProjectorError`.
 A projector's rows must be a deterministic function of its `CommitView`. That rules out clocks,
 random sources, the environment, store reads, state kept between calls, and any dependence on map
 iteration order. Projectors run again on every fence-aware re-preparation of a command, so they
-have to be safe to repeat anyway. Mutable decisions, externally observed signals and verdicts get
-event-sourced first and projected second. A view row that exists only because something happened
-outside the log can't be rebuilt, and a rebuild would silently lose it.
+have to be safe to repeat anyway. Decisions and outside signals get recorded as events first, as
+[keeping the log](concepts.md#keeping-the-log) explains.
 
-Today the only rebuild is an in-memory replay. You regroup the stored events with
+For commit-wide projectors, today the only rebuild is an in-memory replay. You regroup the stored events with
 `evt.GroupCommits` (ordered consistently with each stream's sequence), fold each stream's state
 after its commit yourself, and run the projectors over the groups with `evt.ReplayViews`. For a
 history-dependent projector that is the contract: the rows it returns equal the live rows. It's

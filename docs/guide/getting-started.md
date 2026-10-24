@@ -1,4 +1,4 @@
-# Getting Started
+# Getting started
 
 This guide builds a replayable aggregate, tests it against in-memory storage, and then moves it to
 DynamoDB without changing the aggregate. The complete runnable example lives in
@@ -11,8 +11,8 @@ go get github.com/photon-grove/evt/go
 ```
 
 The core `evt` and `mem` packages have no cloud dependencies, so unit tests stay fast and offline.
-The AWS SDK comes in only through the `dynamo`, `stream` and `projectors` subpackages, where you
-actually need it.
+The AWS SDK comes in only through `backends/dynamo`, and the `stream` and `projectors` packages
+pull in the AWS Lambda event types.
 
 ## 1. Define an aggregate
 
@@ -154,7 +154,7 @@ strings: `evt.IsNotFoundErr(err)`, `evt.IsConflictErr(err)` and `evt.IsDuplicate
 command ID, trace context, origin, caller identity (`PrincipalID`), causation (`CausationID`) and
 application-specific `Extensions`. The command ID is what makes retries idempotent. Set it from a
 request ID, job ID or message ID, and a duplicate attempt fails as a
-[`DuplicateCommandError`](concepts.md#command) instead of recording the fact twice. For durable
+[`DuplicateCommandError`](concepts.md#command) and appends nothing. For durable
 idempotency that also stores the response, see [command outcomes](commands.md).
 
 ```go
@@ -197,11 +197,9 @@ The same swap works for PostgreSQL: `postgres.NewStore` (or `postgres.NewReposit
 
 ## 5. Project views deliberately
 
-Views are derived state. A projection table must always be safe to wipe and rebuild by replaying
-events (see [Projections and rebuilds](projections.md)). That leads to the framework's central
-rule. If a piece of state can't be rebuilt from the log, record it as an event first. Human
-decisions, external signals and publish flags belong in events, and never get written straight to a
-view.
+Views are derived from the log, so record anything that can't be rebuilt, like a human decision or
+a publish flag, as an event first ([keeping the log](concepts.md#keeping-the-log) says why).
+[Projections and rebuilds](projections.md) covers how.
 
 ## Where to go next
 

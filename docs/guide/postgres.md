@@ -1,4 +1,4 @@
-# PostgreSQL Integration
+# PostgreSQL
 
 The `evt/go/backends/postgres` package implements the same backend-neutral `evt.Repository` and
 `evt.Store` contracts as DynamoDB, on a relational store. The aggregate, projector and snapshot code
@@ -159,7 +159,7 @@ cause, is a `*evt.ProjectorError`. A commit that carries view operations but has
 with `*evt.ViewsNotConfiguredError` before any write. Each statement counts as one action in the
 commit budget, sized by its SQL text.
 
-## Local Development
+## Local development
 
 The `infra/local-postgres` Terraform stack provisions the local database, and the repository owns
 the tables inside it. Apply it before you run the integration tests:

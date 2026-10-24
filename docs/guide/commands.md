@@ -149,8 +149,11 @@ jittered. Unset delays take those defaults, `snapshots.ImmediateRetryPolicy` ski
 tests, and `Deadline` bounds the whole command. With the defaults the waits add up to about 0.4 s.
 But an ambiguous write that never resolves costs a recovery window per attempt.
 
-A conflict on anything the engine can derive again (an event put, a snapshot or continuity check, an
-engine-filled fence) re-prepares the command. The aggregate is reset and loaded again, the handler
+Fences come in two kinds. An engine-filled fence is one the engine adds for a stream the command read
+but didn't write, at the head it loaded. A caller-stamped fence is one your `Prepare` adds itself
+with `Fence`. A conflict on anything the engine can derive again (an event put, a snapshot or
+continuity check, an engine-filled fence) re-prepares the command, meaning it runs the decision
+again from fresh state. The aggregate is reset and loaded again, the handler
 or your `Prepare` runs again against fresh state, and only the attempt that commits writes anything.
 A failed caller-stamped fence fails fast with the `stale-fence` rejection instead, because the engine
 can't know whether your decision still holds.

@@ -1,4 +1,4 @@
-# DynamoDB Integration
+# DynamoDB
 
 The `dynamo` package is the DynamoDB storage backend. It implements the same
 [`evt.Repository`](concepts.md#repository) contract as `mem`, so aggregates move between the two
@@ -125,8 +125,7 @@ consistent reads of the generation.
 Because every commit checks the lock item, it's a hot item under heavy write traffic. A lifecycle
 transaction that writes it can lose a race against the commits' checks (or another `Begin`), so
 `Begin` retries from a fresh read up to eight times before returning the transient
-`*evt.RebuildConflictError`. Retry it. The commits that meet the lock are refused in the meantime,
-which is the point of the fence.
+`*evt.RebuildConflictError`. Retry it.
 
 ### Snapshots
 
@@ -157,7 +156,7 @@ plus one marker check) rather than the whole compaction, because there's no whol
 A declaration racing a multi-batch compaction can stop the later batches but can't roll back a
 prefix that already committed, which leaves the stream partially compacted. A history-dependent
 rebuild then reports `CompactionUncovered` instead of quietly replaying incomplete history. So
-declare history dependence before writing data of that entity type. PostgreSQL holds its shared
+declare it early, as [keeping the log](concepts.md#keeping-the-log) says. PostgreSQL holds its shared
 feature advisory lock through validation and all deletes in one transaction instead (see
 [Feature Marker](../reference/storage-format.md#feature-marker)).
 
@@ -189,9 +188,10 @@ prefix can disappear while newer events remain. So use retention only for stream
 replayed and never appended to after they become terminal. For streams that accumulate, keep a
 snapshot and use [compaction](#compaction).
 
-Read fences refuse retained types. Since TTL deletion is lazy, a fence on a retained stream isn't
-incarnation-proof (the stream can expire and be created again at the same head), so a fence on a
-retained entity type is refused with a retention conflict. The refusal combines two sources: this
+Read fences, meaning checks that a stream you read but didn't write is still at the head you saw,
+refuse retained types. TTL deletes items lazily, so a retained stream can expire and be recreated
+at the same head, and a fence can't tell the new stream from the old one. So a fence on a retained
+entity type is refused with a retention conflict. The refusal combines two sources: this
 repository's own `WithRetention` configuration, checked without any I/O, and the retention set in
 the durable feature marker. Local configuration alone protects only this process. So also declare
 each retained type in the marker (`FeatureMarker.Declare`, adding it to `Retention`) and every

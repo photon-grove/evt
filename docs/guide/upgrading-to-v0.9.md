@@ -50,7 +50,8 @@ None of these touch stored data. Item shapes, keys and marker names are unchange
 
 ## Source-breaking changes
 
-Three changes break source without a deprecation window.
+Three changes break source without a deprecation window. The second one also touches
+`evt.CommandResult`.
 
 `evt.Metadata` can no longer be compared with `==`. The new `Extensions` map makes the struct
 non-comparable. Use `evt.Metadata.Equal` instead, which treats nil and empty maps as equal.

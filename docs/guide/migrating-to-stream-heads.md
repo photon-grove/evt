@@ -244,7 +244,7 @@ migration as one-way.
 | `-region`, `-endpoint`      | DynamoDB region and an emulator endpoint.                                                |
 | `-dsn`                      | PostgreSQL connection string (also `DATABASE_URL`).                                      |
 | `-confirm-writers-stopped`  | Required to write: step 1 holds.                                                         |
-| `-dry-run`                  | Scan and count; write nothing.                                                           |
+| `-dry-run`                  | Scan and count, and write nothing.                                                       |
 | `-verify`                   | Read-only verification.                                                                  |
 | `-repair`, `-allow-lower`   | Repair, and also lower a high head.                                                      |
 | `-page-size`                | DynamoDB scan page size in items (0 lets DynamoDB fill a 1 MB page).                     |

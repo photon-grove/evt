@@ -1,8 +1,8 @@
 # Concepts
 
-evt is small on purpose. A handful of interfaces carry the whole model, and one rule ties them
-together: immutable events are the source of truth, and everything else is derived state you can
-rebuild. This page walks through the vocabulary and the contract behind each type. The
+evt models a system with a handful of interfaces. Events are the stored facts, and everything
+else, from snapshots to view rows, is derived from them and can be rebuilt. This page walks through
+each type and its contract. The
 [getting-started guide](getting-started.md) puts them together end to end.
 
 ## Aggregate
@@ -196,8 +196,7 @@ type EventProjector interface {
 ```
 
 Projectors have to be idempotent and safe to replay. The same events must always produce the same
-view rows, because a view is rebuilt by running its projector over the log again. That's what makes
-a projection table disposable. [Projections and rebuilds](projections.md) covers it in depth.
+view rows, because a view is rebuilt by running its projector over the log again. [Projections and rebuilds](projections.md) covers it in depth.
 
 ### Commit-wide projectors
 
@@ -268,8 +267,7 @@ assume every stored event already has the latest shape.
 
 ## Rebuild
 
-A rebuild replays the log to regenerate read models. It's the working form of "views are
-derived". `evt.RebuildProjections` streams entities, rebuilds each one, runs its projectors and
+A rebuild replays the log to regenerate read models. `evt.RebuildProjections` streams entities, rebuilds each one, runs its projectors and
 commits the resulting groups. In dry-run mode it reports what it would write instead. A stream that
 has been [compacted](dynamodb.md#compaction) has to rebuild from its snapshot through
 `RebuildConfig.SeedAggregate`, never by replaying from sequence 1. [Projections and
@@ -277,9 +275,10 @@ rebuilds](projections.md) has the details.
 
 ## Keeping the log
 
-Event rows are the source of truth and view rows are derived state. So any projection or view table
-must be safe to wipe and rebuild from the log. Human decisions, external signals, publish flags and
-review verdicts get recorded as events before a projector writes them to a view.
+Because view rows are derived, any projection or view table must be safe to wipe and rebuild from
+the log. That's the one rule the rest of the guide leans on, and it's why human decisions, external
+signals, publish flags and review verdicts get recorded as events before a projector writes them to
+a view.
 
 Event logs are append-only and kept in full by default. Two opt-in mechanisms trim them safely.
 
