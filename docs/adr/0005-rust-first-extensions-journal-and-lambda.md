@@ -59,7 +59,7 @@ Rust-first is justified because:
   journal rows, manifests, or lease rows. Run against an extension-using table, it can misreport
   or, worse, act on rows it does not model.
 - **Split fixture authority.** Today Go generates every golden fixture
-  ([`compat/README.md`](../../compat/README.md)). Under Rust-first, the **core** fixtures stay
+  ([`compat/README.md`](https://github.com/photon-grove/evt/blob/main/compat/README.md)). Under Rust-first, the **core** fixtures stay
   Go-generated while the **extension** fixtures are Rust-generated. Authority depends on which
   implementation shipped the feature — a rule to remember when regenerating.
 

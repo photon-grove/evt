@@ -602,7 +602,7 @@ and pins the bytes. What the decision left open:
 **Current state.** Each backend runs its own conformance suite (`conformance.RunRepositorySuite`
 in Go; `photon_evt::conformance::Suite` in Rust), and the cross-language fixtures cover
 serialization and the scenario set in `compat/scenarios.json` (see
-[`compat/README.md`](../../compat/README.md)). Bespoke in-app stores never shared a suite — the
+[`compat/README.md`](https://github.com/photon-grove/evt/blob/main/compat/README.md)). Bespoke in-app stores never shared a suite — the
 gap this aims to close permanently.
 
 **Decision.** The conformance suites (both languages) grow cases for every capability above:
