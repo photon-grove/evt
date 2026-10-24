@@ -51,6 +51,9 @@ tasks:
     inputs:
       - '@globs(sources)'
       - '@globs(tests)'
+      # internal/docexamples compiles snippets from these.
+      - '/README.md'
+      - '/docs/guide/upgrading-to-v0.9.md'
   tidy:
     command: go
     args:
