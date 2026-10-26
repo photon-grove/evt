@@ -15,40 +15,40 @@ func (f *FakeCommand) Type() evt.CommandType {
 	return CreateCommand
 }
 
-// CreateCommand is the type for Create Commands for the Test Entity
+// CreateCommand is the type for Create Commands for the Test Aggregate
 const CreateCommand evt.CommandType = evt.CommandType(string(EntityType) + ":create")
 
-// CreateEntity is the struct representing a Create Command
-type CreateEntity struct {
+// CreateAggregate is the struct representing a Create Command
+type CreateAggregate struct {
 	Value string
 	Other *string
 }
 
 // EntityType returns the EntityType constant
-func (c CreateEntity) EntityType() evt.EntityType {
+func (c CreateAggregate) EntityType() evt.EntityType {
 	return EntityType
 }
 
 // Type returns the CreateCommand type constant
-func (c CreateEntity) Type() evt.CommandType {
+func (c CreateAggregate) Type() evt.CommandType {
 	return CreateCommand
 }
 
-// ReplaceCommand is the type for Update Commands for the Test Entity
+// ReplaceCommand is the type for Update Commands for the Test Aggregate
 const ReplaceCommand evt.CommandType = evt.CommandType(string(EntityType) + ":update")
 
-// ReplaceEntity is the struct representing an Update Command
-type ReplaceEntity struct {
+// ReplaceAggregate is the struct representing an Update Command
+type ReplaceAggregate struct {
 	Value string
 	Other *string
 }
 
 // EntityType returns the EntityType constant
-func (c ReplaceEntity) EntityType() evt.EntityType {
+func (c ReplaceAggregate) EntityType() evt.EntityType {
 	return EntityType
 }
 
 // Type returns the ReplaceCommand type constant
-func (c ReplaceEntity) Type() evt.CommandType {
+func (c ReplaceAggregate) Type() evt.CommandType {
 	return ReplaceCommand
 }

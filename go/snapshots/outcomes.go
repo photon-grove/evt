@@ -180,12 +180,12 @@ func (state *attemptState) retriesExhausted(ctx context.Context, attempts int) (
 // conflict is returned as an error.
 func (store *Store) ExecuteWithOutcome(
 	ctx context.Context,
-	entity evt.Entity,
+	aggregate evt.Aggregate,
 	entityID evt.EntityID,
 	command evt.Command,
 	metadata evt.Metadata,
 ) (*evt.CommandOutcome, error) {
-	result, err := store.run(ctx, entity, entityID, command, metadata)
+	result, err := store.run(ctx, aggregate, entityID, command, metadata)
 
 	return result.outcome, err
 }
@@ -193,12 +193,12 @@ func (store *Store) ExecuteWithOutcome(
 // executeForError is Execute on a store with outcomes enabled.
 func (store *Store) executeForError(
 	ctx context.Context,
-	entity evt.Entity,
+	aggregate evt.Aggregate,
 	entityID evt.EntityID,
 	command evt.Command,
 	metadata evt.Metadata,
 ) error {
-	result, err := store.run(ctx, entity, entityID, command, metadata)
+	result, err := store.run(ctx, aggregate, entityID, command, metadata)
 	if err != nil {
 		return err
 	}
@@ -217,39 +217,39 @@ func (store *Store) executeForError(
 // caller handed in and loaded again from storage.
 func (store *Store) run(
 	ctx context.Context,
-	entity evt.Entity,
+	aggregate evt.Aggregate,
 	entityID evt.EntityID,
 	command evt.Command,
 	metadata evt.Metadata,
 ) (executed, error) {
-	reset, resettable := captureEntity(entity)
+	reset, resettable := captureAggregate(aggregate)
 
-	result, err := store.executeOutcome(ctx, entity, entityID, command, metadata, reset, resettable)
+	result, err := store.executeOutcome(ctx, aggregate, entityID, command, metadata, reset, resettable)
 	if err != nil || result.outcome == nil || (!result.outcome.Replayed && !result.discarded) {
 		return result, err
 	}
 
 	reset()
 
-	if _, err = store.LoadEntity(ctx, entity, entityID); err != nil {
+	if _, err = store.LoadAggregate(ctx, aggregate, entityID); err != nil {
 		return result, err
 	}
 
-	if setter, ok := entity.(interface{ SetID(evt.EntityID) }); ok {
+	if setter, ok := aggregate.(interface{ SetID(evt.EntityID) }); ok {
 		setter.SetID(entityID)
 	}
 
 	return result, nil
 }
 
-// captureEntity remembers a pointer-to-struct entity's value so a later reset puts back what the
+// captureAggregate remembers a pointer-to-struct entity's value so a later reset puts back what the
 // caller supplied, discarding events applied locally. The copy is deep over the entity's exported
 // fields — every map, slice, pointer, and nested struct — because those are exactly the state a
 // snapshot persists, so state a constructor initialized (a labels map, say) cannot be aliased and
 // kept dirty by Apply. Unexported fields are copied shallowly. Any other entity kind cannot be
 // reset: resettable is false and reset does nothing.
-func captureEntity(entity evt.Entity) (reset func(), resettable bool) {
-	value := reflect.ValueOf(entity)
+func captureAggregate(aggregate evt.Aggregate) (reset func(), resettable bool) {
+	value := reflect.ValueOf(aggregate)
 	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() || value.Elem().Kind() != reflect.Struct {
 		return func() {}, false
 	}
@@ -343,7 +343,7 @@ func deepCopy(v reflect.Value, seen map[uintptr]reflect.Value) reflect.Value {
 // last conflict is recorded as a stale-fence rejection.
 func (store *Store) executeOutcome(
 	ctx context.Context,
-	entity evt.Entity,
+	aggregate evt.Aggregate,
 	entityID evt.EntityID,
 	command evt.Command,
 	metadata evt.Metadata,
@@ -366,7 +366,7 @@ func (store *Store) executeOutcome(
 			reset()
 		}
 
-		return store.attemptOutcome(ctx, cmd, entity, entityID, command)
+		return store.attemptOutcome(ctx, cmd, aggregate, entityID, command)
 	}, state.retriesExhausted)
 }
 
@@ -375,7 +375,7 @@ func (store *Store) executeOutcome(
 func (store *Store) attemptOutcome(
 	ctx context.Context,
 	cmd *command,
-	entity evt.Entity,
+	aggregate evt.Aggregate,
 	entityID evt.EntityID,
 	command evt.Command,
 ) (executed, error) {
@@ -388,25 +388,25 @@ func (store *Store) attemptOutcome(
 		return executed{outcome: replayed}, nil
 	}
 
-	eventContext, err := store.LoadEntity(ctx, entity, entityID)
+	cc, err := store.LoadAggregate(ctx, aggregate, entityID)
 	if err != nil {
 		return executed{}, load(err)
 	}
 
 	// Keep the entity's internal ID aligned with the store key, as Execute does.
-	if setter, ok := entity.(interface{ SetID(evt.EntityID) }); ok {
+	if setter, ok := aggregate.(interface{ SetID(evt.EntityID) }); ok {
 		setter.SetID(entityID)
 	}
 
 	// The event window is superseded by the outcome row, but pre-v0.9 commands have no row: an
 	// event that carries this command ID without an outcome is one of those.
-	if eventContext.HasCommandID(cmd.id) {
+	if cc.HasCommandID(cmd.id) {
 		return executed{}, internal(evt.NewDuplicateCommandError(cmd.id))
 	}
 
-	result, err := entity.Handle(ctx, command)
+	result, err := aggregate.Handle(ctx, command)
 	if err != nil {
-		return store.handlerFailed(ctx, cmd, entity, &eventContext, entityID, result, err)
+		return store.handlerFailed(ctx, cmd, aggregate, &cc, entityID, result, err)
 	}
 
 	if len(result.Events) == 0 {
@@ -422,7 +422,7 @@ func (store *Store) attemptOutcome(
 		return executed{outcome: outcome}, cerr
 	}
 
-	staged, err := store.prepareEvents(ctx, cmd, entity, &eventContext, entityID, result)
+	staged, err := store.prepareEvents(ctx, cmd, aggregate, &cc, entityID, result)
 	if err != nil {
 		return executed{}, err
 	}
@@ -439,28 +439,28 @@ func (store *Store) attemptOutcome(
 func (store *Store) prepareEvents(
 	ctx context.Context,
 	cmd *command,
-	entity evt.Entity,
-	eventContext *evt.Context,
+	aggregate evt.Aggregate,
+	cc *evt.CommandContext,
 	entityID evt.EntityID,
 	result evt.CommandResult,
 ) (evt.SerializedResult, error) {
 	for _, event := range result.Events {
-		if err := entity.Apply(event); err != nil {
+		if err := aggregate.Apply(event); err != nil {
 			return evt.SerializedResult{}, internal(err)
 		}
 	}
 
-	projectorTransaction, err := buildProjectorTransaction(ctx, entity, result.Events)
+	projectorTransaction, err := buildProjectorTransaction(ctx, aggregate, result.Events)
 	if err != nil {
 		return evt.SerializedResult{}, internal(err)
 	}
 
-	serialized, snapshots, err := store.stage(entity, eventContext, entityID, result.Events, evt.CommitMetadata(cmd.metadata))
+	serialized, snapshots, err := store.stage(aggregate, cc, entityID, result.Events, evt.CommitMetadata(cmd.metadata))
 	if err != nil {
 		return evt.SerializedResult{}, internal(err)
 	}
 
-	state, err := store.stateAfterCommit(entity, snapshots)
+	state, err := store.stateAfterCommit(aggregate, snapshots)
 	if err != nil {
 		return evt.SerializedResult{}, internal(err)
 	}
@@ -487,8 +487,8 @@ func (store *Store) prepareEvents(
 func (store *Store) handlerFailed(
 	ctx context.Context,
 	cmd *command,
-	entity evt.Entity,
-	eventContext *evt.Context,
+	aggregate evt.Aggregate,
+	cc *evt.CommandContext,
 	entityID evt.EntityID,
 	result evt.CommandResult,
 	handlerErr error,
@@ -511,7 +511,7 @@ func (store *Store) handlerFailed(
 	if evt.RejectsWithEvents(handlerErr) && len(result.Events) > 0 {
 		var err error
 
-		if staged, err = store.prepareEvents(ctx, cmd, entity, eventContext, entityID, result); err != nil {
+		if staged, err = store.prepareEvents(ctx, cmd, aggregate, cc, entityID, result); err != nil {
 			return executed{}, err
 		}
 	}
@@ -531,32 +531,32 @@ func (store *Store) handlerFailed(
 // snapshot interval, captures the snapshot of the entity state they produced. The entity must
 // already include the events.
 func (store *Store) stage(
-	entity evt.Entity,
-	eventContext *evt.Context,
+	aggregate evt.Aggregate,
+	cc *evt.CommandContext,
 	entityID evt.EntityID,
 	events []evt.Event,
 	metadata evt.Metadata,
 ) ([]evt.SerializedEvent, []evt.SerializedSnapshot, error) {
-	serialized, err := evt.SerializeEventsWithContext(events, eventContext, metadata)
+	serialized, err := evt.SerializeEventsWithCommandContext(events, cc, metadata)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if evt.CalculateAdditionalEvents(
-		*eventContext.CurrentSequence, len(events), store.effectiveSnapshotSize(entity.Type()),
+		*cc.CurrentSequence, len(events), store.effectiveSnapshotSize(aggregate.Type()),
 	) == 0 {
 		return serialized, nil, nil
 	}
 
-	payload, err := store.updateSnapshotWithEvents(serialized, eventContext)
+	payload, err := store.updateSnapshotWithEvents(serialized, cc)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return serialized, []evt.SerializedSnapshot{{
-		EntityType:    entity.Type(),
+		EntityType:    aggregate.Type(),
 		EntityID:      entityID,
-		Sequence:      *eventContext.CurrentSnapshot,
+		Sequence:      *cc.CurrentSnapshot,
 		EventSequence: serialized[len(serialized)-1].Sequence,
 		Payload:       payload,
 	}}, nil

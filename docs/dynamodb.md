@@ -87,7 +87,7 @@ transactional action is billed as two writes of the checked or written item's si
 1 KB; the head item stays well under 1 KB, so a head update or a fence is the cheapest action a commit
 can send, and it no longer scales with the size of a snapshot. (Whether a `ConditionCheck` bills by
 the size of the item it reads is documented only indirectly, and is still to be measured on real
-DynamoDB with the `go/backends/dynamo/awsmeasure` script: [#159](https://github.com/photon-grove/evt/issues/159).)
+DynamoDB with the `go/backends/dynamo/awsmeasure_test.go` script: [#159](https://github.com/photon-grove/evt/issues/159).)
 
 There are no reads before a commit. A failed commit is told apart by reading the stream on the
 failure path only ([Classification](spec/storage-format.md#failure-classification)). A head item
@@ -158,7 +158,7 @@ confirming the inline `sk = 0` snapshot already covers them**
 (`snapshot.EventSequence >= throughSequence`), and it never deletes the snapshot
 row itself. An uncovered request returns `evt.ErrCompactionUncovered` and deletes
 nothing. After a stream is compacted you **must** rebuild it through the
-snapshot-aware path (`RebuildConfig.SeedEntity` / `evt.SnapshotStreamer`), never a
+snapshot-aware path (`RebuildConfig.SeedAggregate` / `evt.SnapshotStreamer`), never a
 full replay from sequence 1 — the early events are gone.
 
 Feature-marker checks also refuse unsupported features and history-dependent entity types
@@ -225,9 +225,9 @@ checks and before the written streams. A put carries all five attributes (`pk`, 
 `IfPresent` delete on `attribute_exists(pk)`. A failed condition is a
 `*evt.ProjectorOperationError`. See [commit-wide projectors](projections.md#commit-wide-projectors).
 
-Views are a **rebuildable cache, not a source of truth**. The `viewstore` package
+Views are a **rebuildable cache, not a source of truth**. The `viewcodec` package
 offers a typed JSON helper over `evt.ViewRepository` so projectors and readers
-share one codec — `viewstore.New[T]` for arbitrary pk/sk, or `viewstore.NewSingle`
+share one codec — `viewcodec.New[T]` for arbitrary pk/sk, or `viewcodec.NewSingle`
 for the common "one row per entity" pattern. See
 [Projections and rebuilds](projections.md).
 

@@ -41,7 +41,7 @@
 - Event logs are append-only and retained in full by default. Compaction
   (`evt.Compactor.CompactBelow`) may delete events only where a durable snapshot already covers them
   (`snapshot.EventSequence >= throughSequence`); it must never delete the `sk=0` snapshot. After a
-  stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedEntity` /
+  stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedAggregate` /
   `evt.SnapshotStreamer`), never full-replay-from-1. See
   `docs/adr/0001-event-compaction-and-snapshot-truncation.md`.
 - Do not persist mutable decisions, external signals, publish flags, accept/reject verdicts, or
@@ -66,7 +66,7 @@
 - Structure:
   - `go/`: the Go module (`github.com/photon-grove/evt/go`, package `evt`). Run Go commands from
     there. The backends are `go/backends/dynamo`, `go/backends/postgres` and `go/backends/mem`, and
-    the other packages sit beside them: `snapshots`, `projectors`, `viewstore`, `test` and so on.
+    the other packages sit beside them: `snapshots`, `projectors`, `viewcodec`, `test` and so on.
   - `website/`: Vite documentation site.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.

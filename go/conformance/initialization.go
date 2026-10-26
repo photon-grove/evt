@@ -87,8 +87,8 @@ func RunInitializationSuite(t *testing.T, fresh, other evt.Repository, opts Init
 		require.False(t, declared, "a second initialization by %s declares nothing", name)
 	}
 
-	commitEvents(t, fresh, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})
-	commitEvents(t, other, id, "test", 1, &test.EntityUpdated{ID: id, Value: "two"})
+	commitEvents(t, fresh, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"})
+	commitEvents(t, other, id, "test", 1, &test.AggregateUpdated{ID: id, Value: "two"})
 
 	stored, err := fresh.GetEvents(ctx, id)
 	require.NoError(t, err)
@@ -108,7 +108,7 @@ func RunInitializationSuite(t *testing.T, fresh, other evt.Repository, opts Init
 	// declaration may fail its marker check and revalidate, which is transient and retryable.
 	restore()
 
-	next := serialize(t, id, "test", 2, &test.EntityUpdated{ID: id, Value: "three"})
+	next := serialize(t, id, "test", 2, &test.AggregateUpdated{ID: id, Value: "three"})
 
 	err = fresh.Commit(ctx, evt.SerializedResult{Events: next})
 	if errors.Is(err, evt.ErrFeatureManifestChanged) {
@@ -166,7 +166,7 @@ func testUninitializedStoreRefusesWrites(t *testing.T, repo evt.Repository, id e
 		require.False(t, policy.IsTransient(err), "%s: refusal is not transient", what)
 	}
 
-	events := serialize(t, id, "test", 0, &test.EntityCreated{ID: id, Value: "one"})
+	events := serialize(t, id, "test", 0, &test.AggregateCreated{ID: id, Value: "one"})
 	notInitialized(repo.Commit(ctx, evt.SerializedResult{Events: events}), "commit")
 	notInitialized(repo.CommitWithSnapshot(ctx, evt.SerializedResult{Events: events}, "test", id, []byte(`{"id":"x"}`), 1), "commit with snapshot")
 
@@ -231,7 +231,7 @@ func testInitializingAPopulatedStoreIsRefused(
 
 	if opts.BypassHead != nil {
 		headless := evt.EntityID(ns + "-headless")
-		events := serialize(t, headless, "test", 0, &test.EntityCreated{ID: headless, Value: "one"})
+		events := serialize(t, headless, "test", 0, &test.AggregateCreated{ID: headless, Value: "one"})
 		require.NoError(t, opts.BypassHead(ctx, repo, events[0]))
 	}
 

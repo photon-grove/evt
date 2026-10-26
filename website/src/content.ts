@@ -7,8 +7,8 @@ export const quickStartCode = `// Start with the in-memory repository.
 repo := mem.NewRepository()
 store := mem.NewStoreFromRepo(repo)
 
-entity := &account.Account{ID: "acct-1"}
-err := store.Execute(ctx, entity, "acct-1",
+aggregate := &account.Account{ID: "acct-1"}
+err := store.Execute(ctx, aggregate, "acct-1",
     &account.Open{InitialBalance: 100}, evt.Metadata{})
 
 // Use the same aggregate contract with DynamoDB.
@@ -68,7 +68,7 @@ export const packages = [
   {name: 'evt/go/stream', body: 'Stream envelope and DynamoDB Streams handler.'},
   {name: 'evt/go/projectors', body: 'Projector runtime for SNS/SQS envelopes (or the direct stream) with idempotency and retry classification.'},
   {name: 'evt/go/policy', body: 'Backend-neutral retry helpers for commit paths.'},
-  {name: 'evt/go/viewstore', body: 'Typed JSON helper around evt.ViewRepository.'},
+  {name: 'evt/go/viewcodec', body: 'Typed JSON helper around evt.ViewRepository.'},
   {name: 'evt/go/test', body: 'Shared test aggregate, commands, events, and helpers for adopters.'},
 ]
 

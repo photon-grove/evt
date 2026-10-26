@@ -49,7 +49,7 @@ func logHandle(pool *pgxpool.Pool, events string) *postgres.Repository {
 func commitCreated(ctx context.Context, t *testing.T, repo evt.Repository, id evt.EntityID) error {
 	t.Helper()
 
-	events, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 0, id, evt.Metadata{})
+	events, err := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}}, 0, id, evt.Metadata{})
 	require.NoError(t, err)
 
 	for i := range events {
@@ -138,7 +138,7 @@ func Test_Rebuild_BeginWaitsForACommitInFlight(t *testing.T) {
 	log := base.WithViewWriter(slow)
 
 	id := evt.EntityID(name + "-slow")
-	events, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 0, id, evt.Metadata{})
+	events, err := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}}, 0, id, evt.Metadata{})
 	require.NoError(t, err)
 
 	for i := range events {

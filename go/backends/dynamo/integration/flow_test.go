@@ -14,47 +14,47 @@ import (
 func (s *DynamoEventsIntegrationSuite) Test_Flow_ExecuteCycle() {
 	ctx := context.Background()
 	entityID := evt.EntityID(newID())
-	s.SetupEntity(entityID, 100)
+	s.SetupAggregate(entityID, 100)
 	metadata := s.getMetadata(ctx)
 
 	// 1. First command (Create)
-	cmd1 := &test.CreateEntity{Value: "v1"}
-	err := s.store.Execute(ctx, s.entity, entityID, cmd1, metadata)
+	cmd1 := &test.CreateAggregate{Value: "v1"}
+	err := s.store.Execute(ctx, s.aggregate, entityID, cmd1, metadata)
 	require.NoError(s.T(), err)
 
-	assert.Equal(s.T(), "v1", s.entity.Value)
-	assert.Equal(s.T(), entityID, s.entity.ID)
+	assert.Equal(s.T(), "v1", s.aggregate.Value)
+	assert.Equal(s.T(), entityID, s.aggregate.ID)
 
 	// 2. Second command (Update)
 	// Create a FRESH entity to simulate loading from scratch
-	entity2 := test.NewEntity(entityID)
-	cmd2 := &test.ReplaceEntity{Value: "v2"}
+	aggregate2 := test.NewAggregate(entityID)
+	cmd2 := &test.ReplaceAggregate{Value: "v2"}
 
-	err = s.store.Execute(ctx, entity2, entityID, cmd2, metadata)
+	err = s.store.Execute(ctx, aggregate2, entityID, cmd2, metadata)
 	require.NoError(s.T(), err)
 
-	assert.Equal(s.T(), "v2", entity2.Value)
-	assert.Equal(s.T(), entityID, entity2.ID)
+	assert.Equal(s.T(), "v2", aggregate2.Value)
+	assert.Equal(s.T(), entityID, aggregate2.ID)
 
 	// Verify state persistence by loading a third instance
-	entity3 := test.NewEntity(entityID)
-	_, err = s.store.LoadEntity(ctx, entity3, entityID)
+	aggregate3 := test.NewAggregate(entityID)
+	_, err = s.store.LoadAggregate(ctx, aggregate3, entityID)
 	require.NoError(s.T(), err)
-	assert.Equal(s.T(), "v2", entity3.Value)
+	assert.Equal(s.T(), "v2", aggregate3.Value)
 }
 
 func (s *DynamoEventsIntegrationSuite) Test_Flow_Snapshotting() {
 	ctx := context.Background()
 	entityID := evt.EntityID(newID())
-	s.SetupEntity(entityID, 2) // Snapshot every 2 events
+	s.SetupAggregate(entityID, 2) // Snapshot every 2 events
 	metadata := s.getMetadata(ctx)
 
 	// 1. Create (Seq 1)
-	err := s.store.Execute(ctx, s.entity, entityID, &test.CreateEntity{Value: "init"}, metadata)
+	err := s.store.Execute(ctx, s.aggregate, entityID, &test.CreateAggregate{Value: "init"}, metadata)
 	require.NoError(s.T(), err)
 
 	// 2. Update (Seq 2) -> Snapshot 1
-	err = s.store.Execute(ctx, s.entity, entityID, &test.ReplaceEntity{Value: "snap1"}, metadata)
+	err = s.store.Execute(ctx, s.aggregate, entityID, &test.ReplaceAggregate{Value: "snap1"}, metadata)
 	require.NoError(s.T(), err)
 
 	// Verify snapshot exists
@@ -64,57 +64,57 @@ func (s *DynamoEventsIntegrationSuite) Test_Flow_Snapshotting() {
 	assert.Equal(s.T(), evt.EventSequence(2), snap.EventSequence)
 
 	// 3. Update (Seq 3)
-	err = s.store.Execute(ctx, s.entity, entityID, &test.ReplaceEntity{Value: "after1"}, metadata)
+	err = s.store.Execute(ctx, s.aggregate, entityID, &test.ReplaceAggregate{Value: "after1"}, metadata)
 	require.NoError(s.T(), err)
 
 	// Load from scratch - should use snapshot + 1 event
-	loaded := test.NewEntity(entityID)
-	context, err := s.store.LoadEntity(ctx, loaded, entityID)
+	loaded := test.NewAggregate(entityID)
+	cc, err := s.store.LoadAggregate(ctx, loaded, entityID)
 	require.NoError(s.T(), err)
 
 	assert.Equal(s.T(), "after1", loaded.Value)
-	assert.Equal(s.T(), evt.EventSequence(3), *context.CurrentSequence)
-	assert.Equal(s.T(), evt.EventSequence(1), *context.CurrentSnapshot)
+	assert.Equal(s.T(), evt.EventSequence(3), *cc.CurrentSequence)
+	assert.Equal(s.T(), evt.EventSequence(1), *cc.CurrentSnapshot)
 	// Note: CurrentSnapshot tracks snapshot SEQUENCE (1st snapshot), not event sequence.
 }
 
 func (s *DynamoEventsIntegrationSuite) Test_Flow_ConcurrentConflict() {
 	ctx := context.Background()
 	entityID := evt.EntityID(newID())
-	s.SetupEntity(entityID, 100)
+	s.SetupAggregate(entityID, 100)
 	metadata := s.getMetadata(ctx)
 
 	// Create initial state
-	err := s.store.Execute(ctx, s.entity, entityID, &test.CreateEntity{Value: "init"}, metadata)
+	err := s.store.Execute(ctx, s.aggregate, entityID, &test.CreateAggregate{Value: "init"}, metadata)
 	require.NoError(s.T(), err)
 
 	// Load two separate instances (simulating two threads/processes)
-	entityA := test.NewEntity(entityID)
-	ctxA, err := s.store.LoadEntity(ctx, entityA, entityID)
+	aggregateA := test.NewAggregate(entityID)
+	ccA, err := s.store.LoadAggregate(ctx, aggregateA, entityID)
 	require.NoError(s.T(), err)
 
-	entityB := test.NewEntity(entityID)
-	ctxB, err := s.store.LoadEntity(ctx, entityB, entityID)
+	aggregateB := test.NewAggregate(entityID)
+	ccB, err := s.store.LoadAggregate(ctx, aggregateB, entityID)
 	require.NoError(s.T(), err)
 
 	// A modifies
-	resA, err := entityA.Handle(ctx, &test.ReplaceEntity{Value: "A"})
+	resA, err := aggregateA.Handle(ctx, &test.ReplaceAggregate{Value: "A"})
 	require.NoError(s.T(), err)
-	_, err = s.store.Commit(ctx, resA, ctxA, metadata)
+	_, err = s.store.Commit(ctx, resA, ccA, metadata)
 	require.NoError(s.T(), err)
 
 	// B modifies (using STALE context)
-	resB, err := entityB.Handle(ctx, &test.ReplaceEntity{Value: "B"})
+	resB, err := aggregateB.Handle(ctx, &test.ReplaceAggregate{Value: "B"})
 	require.NoError(s.T(), err)
-	_, err = s.store.Commit(ctx, resB, ctxB, metadata)
+	_, err = s.store.Commit(ctx, resB, ccB, metadata)
 
 	// Should fail
 	require.Error(s.T(), err)
 	assert.Contains(s.T(), err.Error(), "race condition")
 
 	// Verify state is A
-	final := test.NewEntity(entityID)
-	_, err = s.store.LoadEntity(ctx, final, entityID)
+	final := test.NewAggregate(entityID)
+	_, err = s.store.LoadAggregate(ctx, final, entityID)
 	require.NoError(s.T(), err)
 	assert.Equal(s.T(), "A", final.Value)
 }
@@ -126,14 +126,14 @@ func (s *DynamoEventsIntegrationSuite) Test_Flow_TimeTravel() {
 
 	ctx := context.Background()
 	entityID := evt.EntityID(newID())
-	s.SetupEntity(entityID, 10)
+	s.SetupAggregate(entityID, 10)
 	metadata := s.getMetadata(ctx)
 
-	err := s.store.Execute(ctx, s.entity, entityID, &test.CreateEntity{Value: "1"}, metadata)
+	err := s.store.Execute(ctx, s.aggregate, entityID, &test.CreateAggregate{Value: "1"}, metadata)
 	require.NoError(s.T(), err)
-	err = s.store.Execute(ctx, s.entity, entityID, &test.ReplaceEntity{Value: "2"}, metadata)
+	err = s.store.Execute(ctx, s.aggregate, entityID, &test.ReplaceAggregate{Value: "2"}, metadata)
 	require.NoError(s.T(), err)
-	err = s.store.Execute(ctx, s.entity, entityID, &test.ReplaceEntity{Value: "3"}, metadata)
+	err = s.store.Execute(ctx, s.aggregate, entityID, &test.ReplaceAggregate{Value: "3"}, metadata)
 	require.NoError(s.T(), err)
 
 	// Get events manually

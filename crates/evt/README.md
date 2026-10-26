@@ -864,7 +864,7 @@ partition listings out when a stale page is acceptable. Entity-type listings rea
 `entityType-index` global secondary index, which DynamoDB only reads eventually consistently, so
 they can briefly miss a row a commit just wrote.
 
-`ViewCodec<T, R>` (Go's `viewstore.Codec`, `viewstore.Single`, and the `GetJSONView` family) binds a
+`ViewCodec<T, R>` (Go's `viewcodec.Codec`, `viewcodec.Single`, and the `GetJSONView` family) binds a
 repository, an entity type and a serde type. It writes `T` as the payload with `json::to_vec`, so
 the bytes are Go's `json.Marshal` of the same shape, and reads it back; `with_decoder` stands in
 for Go's factory when a value needs constructor-injected dependencies.

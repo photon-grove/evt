@@ -30,7 +30,7 @@ func TestOpenThenDepositAndReplay(t *testing.T) {
 
 	// Replay from the event log into a fresh instance and confirm the state matches.
 	reloaded := NewAccount("acct-1")
-	if _, err := store.LoadEntity(ctx, reloaded, "acct-1"); err != nil {
+	if _, err := store.LoadAggregate(ctx, reloaded, "acct-1"); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if !reloaded.Opened {

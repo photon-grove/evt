@@ -7,7 +7,7 @@ Accepted (2026-10-18). Tracking: matrix row C12 in
 [#159](https://github.com/photon-grove/evt/issues/159). The core commit path is implemented in Go
 and Rust, and the migration tool (`evt-doctor migrate-heads`, Go only; see the
 [runbook](../migrating-to-stream-heads.md)) is implemented; the real-DynamoDB billing measurement
-(`go/backends/dynamo/awsmeasure`, run by a human) is still to be run. The normative text is the
+(`go/backends/dynamo/awsmeasure_test.go`, run by a human) is still to be run. The normative text is the
 [Stream Heads](../spec/storage-format.md#stream-heads) section of the storage spec, and the
 sections of the spec that describe commits, fences, and failures follow it.
 
@@ -188,7 +188,7 @@ the item's size rounded up to 1 KB, and that an `Update` is billed on the larger
 and after. The documentation does not say in so many words that a `ConditionCheck` bills by the size
 of the item it reads, and the numbers below assume it does. **The implementation spike must confirm it
 with `ReturnConsumedCapacity` against real DynamoDB** (the local emulator does not bill; run
-`go/backends/dynamo/awsmeasure`). The action
+`go/backends/dynamo/awsmeasure_test.go`). The action
 counts above do not depend on it.
 
 Worked example, the ten-writes-and-five-reads command, with 12 KB reference snapshots, 4 KB written
@@ -725,7 +725,7 @@ them:
 2. **Condition-check billing: unconfirmed.** The WCU numbers assume a `ConditionCheck` bills by the
    size of the item it reads. They stay marked as unconfirmed until measured on real DynamoDB with
    `ReturnConsumedCapacity`; that measurement is on the
-   [#159](https://github.com/photon-grove/evt/issues/159) checklist. `go/backends/dynamo/awsmeasure` is the
+   [#159](https://github.com/photon-grove/evt/issues/159) checklist. `go/backends/dynamo/awsmeasure_test.go` is the
    script for it (behind the `awsmeasure` build tag; a human runs it with AWS credentials that can
    create a scratch table, and pastes its table here). The action-count result stands either way.
 3. **Retention: decided.** The head item carries `ttl` for retained types and fences stay refused

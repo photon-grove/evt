@@ -38,7 +38,7 @@ type StreamFromSnapshotsOptions struct {
 // StreamEntitiesFromSnapshots reconstitutes entities with bounded memory by enumerating the
 // distinct entity IDs in the event log and, for each, loading it from its latest durable snapshot
 // (sk=0) plus only the events recorded after that snapshot — the same snapshot-aware path as
-// snapshots.Store.LoadEntity, applied per partition during a rebuild. Entities without a snapshot
+// snapshots.Store.LoadAggregate, applied per partition during a rebuild. Aggregates without a snapshot
 // fall back to full replay from sequence 1. This is the rebuild path that stays correct after
 // CompactBelow has removed events below a snapshot.
 //
@@ -47,13 +47,13 @@ type StreamFromSnapshotsOptions struct {
 func (repo *Repository) StreamEntitiesFromSnapshots(
 	ctx context.Context,
 	entityType evt.EntityType,
-	seedEntity evt.SnapshotSeeder,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
+	seedAggregate evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
 	return repo.StreamEntitiesFromSnapshotsWithOptions(
 		ctx,
 		StreamFromSnapshotsOptions{EntityType: entityType},
-		seedEntity,
+		seedAggregate,
 		applyEvent,
 	)
 }
@@ -69,12 +69,12 @@ func (repo *Repository) StreamEntitiesFromSnapshots(
 func (repo *Repository) StreamEntitiesFromSnapshotsWithOptions(
 	ctx context.Context,
 	opts StreamFromSnapshotsOptions,
-	seedEntity evt.SnapshotSeeder,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
+	seedAggregate evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
 	logger := repo.loggerOrDefault()
 
-	results := make(chan result.Result[evt.Entity])
+	results := make(chan result.Result[evt.Aggregate])
 
 	workers := opts.Workers
 	if workers < 1 {
@@ -106,7 +106,7 @@ func (repo *Repository) StreamEntitiesFromSnapshotsWithOptions(
 				defer wg.Done()
 
 				for id := range ids {
-					entity, ok := repo.loadEntityFromSnapshot(ctx, id, seedEntity, applyEvent, results, logger)
+					aggregate, ok := repo.loadAggregateFromSnapshot(ctx, id, seedAggregate, applyEvent, results, logger)
 					if !ok {
 						if ctx.Err() != nil {
 							return
@@ -115,7 +115,7 @@ func (repo *Repository) StreamEntitiesFromSnapshotsWithOptions(
 						continue
 					}
 
-					if !repo.sendEntity(ctx, results, result.Ok(entity)) {
+					if !repo.sendAggregate(ctx, results, result.Ok(aggregate)) {
 						return
 					}
 				}
@@ -132,20 +132,20 @@ func (repo *Repository) StreamEntitiesFromSnapshotsWithOptions(
 		// Surface an enumeration failure as a stream error. Enumeration collects all IDs before any
 		// worker runs, so this preserves its emit-nothing-then-error behavior.
 		if enumErr != nil {
-			repo.sendEntity(ctx, results, result.Err[evt.Entity](enumErr))
+			repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](enumErr))
 		}
 	}()
 
 	return results
 }
 
-// sendEntity delivers an entity result unless the context is cancelled first, returning false when
+// sendAggregate delivers an aggregate result unless the context is cancelled first, returning false when
 // the caller should stop producing. It keeps concurrent workers from blocking on an abandoned
 // consumer.
-func (repo *Repository) sendEntity(
+func (repo *Repository) sendAggregate(
 	ctx context.Context,
-	channel chan<- result.Result[evt.Entity],
-	value result.Result[evt.Entity],
+	channel chan<- result.Result[evt.Aggregate],
+	value result.Result[evt.Aggregate],
 ) bool {
 	select {
 	case channel <- value:
@@ -276,21 +276,21 @@ func (repo *Repository) enumerateEntityIDs(
 	return nil
 }
 
-// loadEntityFromSnapshot reconstructs a single entity from its durable snapshot (when present) plus
-// the events recorded after it, mirroring snapshots.Store.LoadEntity for one partition. It returns
+// loadAggregateFromSnapshot reconstructs a single entity from its durable snapshot (when present) plus
+// the events recorded after it, mirroring snapshots.Store.LoadAggregate for one partition. It returns
 // ok=false (after forwarding any error to results) when seeding, querying, or applying fails, or
 // when the partition produced no entity.
-func (repo *Repository) loadEntityFromSnapshot(
+func (repo *Repository) loadAggregateFromSnapshot(
 	ctx context.Context,
 	id evt.EntityID,
-	seedEntity evt.SnapshotSeeder,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-	results chan<- result.Result[evt.Entity],
+	seedAggregate evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+	results chan<- result.Result[evt.Aggregate],
 	logger *slog.Logger,
-) (evt.Entity, bool) {
+) (evt.Aggregate, bool) {
 	snapshot, err := repo.GetSnapshot(ctx, id)
 	if err != nil {
-		repo.sendEntity(ctx, results, result.Err[evt.Entity](fmt.Errorf("reading snapshot for %s: %w", id, err)))
+		repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](fmt.Errorf("reading snapshot for %s: %w", id, err)))
 		return nil, false
 	}
 
@@ -298,33 +298,33 @@ func (repo *Repository) loadEntityFromSnapshot(
 	if snapshot == nil {
 		events, eerr := repo.GetEvents(ctx, id)
 		if eerr != nil {
-			repo.sendEntity(ctx, results, result.Err[evt.Entity](fmt.Errorf("reading events for %s: %w", id, eerr)))
+			repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](fmt.Errorf("reading events for %s: %w", id, eerr)))
 			return nil, false
 		}
 
-		return repo.buildEntity(ctx, id, events, applyEvent, results, logger)
+		return repo.buildAggregate(ctx, id, events, applyEvent, results, logger)
 	}
 
 	// Seed from the snapshot, then apply only the events recorded after it.
-	entity, err := seedEntity(ctx, *snapshot)
+	aggregate, err := seedAggregate(ctx, *snapshot)
 	if err != nil {
-		repo.sendEntity(ctx, results, result.Err[evt.Entity](fmt.Errorf("seeding %s from snapshot: %w", id, err)))
+		repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](fmt.Errorf("seeding %s from snapshot: %w", id, err)))
 		return nil, false
 	}
 
 	events, err := repo.GetLatestEvents(ctx, id, snapshot.EventSequence)
 	if err != nil {
-		repo.sendEntity(ctx, results, result.Err[evt.Entity](fmt.Errorf("reading events for %s: %w", id, err)))
+		repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](fmt.Errorf("reading events for %s: %w", id, err)))
 		return nil, false
 	}
 
-	// GetLatestEvents returns events in sort-key order; sort defensively to match buildEntity.
+	// GetLatestEvents returns events in sort-key order; sort defensively to match buildAggregate.
 	sort.SliceStable(events, func(i, j int) bool {
 		return events[i].Sequence < events[j].Sequence
 	})
 
 	for _, event := range events {
-		applied, aerr := applyEvent(ctx, event, entity)
+		applied, aerr := applyEvent(ctx, event, aggregate)
 		if aerr != nil {
 			logger.
 				With("id", event.ID).
@@ -333,15 +333,15 @@ func (repo *Repository) loadEntityFromSnapshot(
 				With("event_type", event.Type).
 				Error("Error during applyEvent", "error", aerr.Error())
 
-			repo.sendEntity(ctx, results, result.Err[evt.Entity](aerr))
+			repo.sendAggregate(ctx, results, result.Err[evt.Aggregate](aerr))
 
 			return nil, false
 		}
 
-		entity = applied
+		aggregate = applied
 	}
 
-	if entity == nil {
+	if aggregate == nil {
 		return nil, false
 	}
 
@@ -351,5 +351,5 @@ func (repo *Repository) loadEntityFromSnapshot(
 		With("seeded_from_snapshot", true).
 		Debug("Entity Processed")
 
-	return entity, true
+	return aggregate, true
 }

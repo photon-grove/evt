@@ -12,36 +12,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type badJSONEntity struct {
+type badJSONAggregate struct {
 	ID evt.EntityID `json:"id"`
 	F  func()       `json:"f"`
 }
 
-func (e *badJSONEntity) Type() evt.EntityType { return "bad" }
-func (e *badJSONEntity) GetID() evt.EntityID  { return e.ID }
-func (e *badJSONEntity) EventUpcasters() []evt.EventUpcaster {
+func (e *badJSONAggregate) Type() evt.EntityType { return "bad" }
+func (e *badJSONAggregate) GetID() evt.EntityID  { return e.ID }
+func (e *badJSONAggregate) EventUpcasters() []evt.EventUpcaster {
 	return nil
 }
-func (e *badJSONEntity) Projectors() []evt.EventProjector { return nil }
-func (e *badJSONEntity) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
+func (e *badJSONAggregate) Projectors() []evt.EventProjector { return nil }
+func (e *badJSONAggregate) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
 	return evt.CommandResult{}, nil
 }
-func (e *badJSONEntity) Apply(evt.Event) error { return nil }
-func (e *badJSONEntity) DeserializeEvent(evt.SerializedEvent) (evt.Event, error) {
+func (e *badJSONAggregate) Apply(evt.Event) error { return nil }
+func (e *badJSONAggregate) DeserializeEvent(evt.SerializedEvent) (evt.Event, error) {
 	return nil, nil
 }
 
-type emptyIDEntity struct{}
+type emptyIDAggregate struct{}
 
-func (e emptyIDEntity) Type() evt.EntityType                { return "x" }
-func (e emptyIDEntity) GetID() evt.EntityID                 { return "" }
-func (e emptyIDEntity) EventUpcasters() []evt.EventUpcaster { return nil }
-func (e emptyIDEntity) Projectors() []evt.EventProjector    { return nil }
-func (e emptyIDEntity) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
+func (e emptyIDAggregate) Type() evt.EntityType                { return "x" }
+func (e emptyIDAggregate) GetID() evt.EntityID                 { return "" }
+func (e emptyIDAggregate) EventUpcasters() []evt.EventUpcaster { return nil }
+func (e emptyIDAggregate) Projectors() []evt.EventProjector    { return nil }
+func (e emptyIDAggregate) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
 	return evt.CommandResult{}, nil
 }
-func (e emptyIDEntity) Apply(evt.Event) error                                   { return nil }
-func (e emptyIDEntity) DeserializeEvent(evt.SerializedEvent) (evt.Event, error) { return nil, nil }
+func (e emptyIDAggregate) Apply(evt.Event) error                                   { return nil }
+func (e emptyIDAggregate) DeserializeEvent(evt.SerializedEvent) (evt.Event, error) { return nil, nil }
 
 type otherTG struct{}
 
@@ -63,18 +63,18 @@ func Test_ViewProjector_Project_GuardsAndSuccess(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, group)
 
-	group, err = p.Project(context.Background(), emptyIDEntity{}, nil)
+	group, err = p.Project(context.Background(), emptyIDAggregate{}, nil)
 	require.NoError(t, err)
 	require.Nil(t, group)
 
 	// JSON marshal error
-	group, err = p.Project(context.Background(), &badJSONEntity{ID: "e1"}, nil)
+	group, err = p.Project(context.Background(), &badJSONAggregate{ID: "e1"}, nil)
 	require.Error(t, err)
 	require.Nil(t, group)
 
 	// success
-	entity := evttest.NewEntity("e2")
-	group, err = p.Project(context.Background(), entity, nil)
+	aggregate := evttest.NewAggregate("e2")
+	group, err = p.Project(context.Background(), aggregate, nil)
 	require.NoError(t, err)
 	require.NotNil(t, group)
 	require.Equal(t, viewPutTransactionType, group.TransactionType())

@@ -93,7 +93,7 @@ type Rejection struct {
 //
 // Which events are committed depends on where the error is returned:
 //
-//   - Entity.Handle: the Events of the CommandResult returned beside the error, on the entity's
+//   - Aggregate.Handle: the Events of the CommandResult returned beside the error, on the entity's
 //     own stream. The Response is not stored with a rejection.
 //   - snapshots.Prepare: the events staged with Transaction.Append, on any stream the Prepare
 //     function read.
@@ -131,7 +131,7 @@ func (e *rejectWithEventsError) Error() string { return e.err.Error() }
 func (e *rejectWithEventsError) Unwrap() error { return e.err }
 
 // Rejectioner is implemented by domain errors that map onto a Rejection. An error returned by
-// Entity.Handle that implements it (anywhere in its Unwrap chain) is persisted as a rejected
+// Aggregate.Handle that implements it (anywhere in its Unwrap chain) is persisted as a rejected
 // outcome; any other error is an internal failure that writes no outcome.
 type Rejectioner interface {
 	error

@@ -270,14 +270,14 @@ func TestTransactionInProgressIsPolledForByTheStoreNotCalledNotApplied(t *testin
 	ctx := context.Background()
 
 	id := evt.CommandID("cmd-1")
-	entity := newScriptedEntity("e-1")
+	aggregate := newScriptedAggregate("e-1")
 
 	// The transaction commits while the store is polling for its row: the command returns the
 	// stored outcome and the handler ran exactly once.
-	outcome, err := store.ExecuteWithOutcome(ctx, entity, "e-1", deposit(5), evt.Metadata{CommandID: &id})
+	outcome, err := store.ExecuteWithOutcome(ctx, aggregate, "e-1", deposit(5), evt.Metadata{CommandID: &id})
 	require.NoError(t, err)
 	require.True(t, outcome.Replayed, "the delayed commit is found, not re-run")
-	require.Equal(t, 1, *entity.handled)
+	require.Equal(t, 1, *aggregate.handled)
 	require.GreaterOrEqual(t, client.polls, 3)
 
 	events, err := repo.GetEvents(ctx, "e-1")
@@ -293,14 +293,14 @@ func TestTransactionInProgressThatNeverLandsIsARetryableAmbiguousWrite(t *testin
 
 	id := evt.CommandID("cmd-1")
 
-	_, err := store.ExecuteWithOutcome(ctx, newScriptedEntity("e-1"), "e-1", deposit(5), evt.Metadata{CommandID: &id})
+	_, err := store.ExecuteWithOutcome(ctx, newScriptedAggregate("e-1"), "e-1", deposit(5), evt.Metadata{CommandID: &id})
 	require.ErrorIs(t, err, evt.ErrAmbiguousWrite, "an absent row never proves the commit did not apply")
 	require.True(t, policy.IsTransient(err), "the retry is safe: every attempt reads the outcome row first")
 
 	// The retry, once DynamoDB stops reporting the transaction as running, commits.
 	client.inProgress = false
 
-	outcome, err := store.ExecuteWithOutcome(ctx, newScriptedEntity("e-1"), "e-1", deposit(5), evt.Metadata{CommandID: &id})
+	outcome, err := store.ExecuteWithOutcome(ctx, newScriptedAggregate("e-1"), "e-1", deposit(5), evt.Metadata{CommandID: &id})
 	require.NoError(t, err)
 	require.False(t, outcome.Replayed)
 }
@@ -316,13 +316,13 @@ func TestACancelledCallerStillGetsAPolledRecovery(t *testing.T) {
 	cancel()
 
 	id := evt.CommandID("cmd-1")
-	entity := newScriptedEntity("e-1")
+	aggregate := newScriptedAggregate("e-1")
 
 	// The pre-check and load run on the live path of the fake client, which ignores the context.
-	outcome, err := store.ExecuteWithOutcome(ctx, entity, "e-1", deposit(5), evt.Metadata{CommandID: &id})
+	outcome, err := store.ExecuteWithOutcome(ctx, aggregate, "e-1", deposit(5), evt.Metadata{CommandID: &id})
 	require.NoError(t, err)
 	require.True(t, outcome.Replayed)
-	require.Equal(t, 1, *entity.handled)
+	require.Equal(t, 1, *aggregate.handled)
 }
 
 func TestWrongAttributeTypesAreACorruptRowNotAnEmptyValue(t *testing.T) {

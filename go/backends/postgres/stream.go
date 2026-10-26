@@ -98,55 +98,55 @@ func (repo *Repository) StreamAllEvents(
 func (repo *Repository) StreamEntities(
 	ctx context.Context,
 	filter evt.StreamFilter,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
-	channel := make(chan result.Result[evt.Entity])
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
+	channel := make(chan result.Result[evt.Aggregate])
 
 	go func() {
 		defer close(channel)
 
 		err := repo.streamEventsByEntity(ctx, filter, func(batch []evt.SerializedEvent) error {
-			entity, foldErr := foldEntity(ctx, batch, nil, 0, applyEvent)
+			aggregate, foldErr := foldAggregate(ctx, batch, nil, 0, applyEvent)
 			if foldErr != nil {
-				channel <- result.Err[evt.Entity](foldErr)
+				channel <- result.Err[evt.Aggregate](foldErr)
 				return nil
 			}
 
-			if entity != nil {
-				channel <- result.Ok(entity)
+			if aggregate != nil {
+				channel <- result.Ok(aggregate)
 			}
 
 			return ctx.Err()
 		})
 		if err != nil {
-			channel <- result.Err[evt.Entity](err)
+			channel <- result.Err[evt.Aggregate](err)
 		}
 	}()
 
 	return channel
 }
 
-// foldEntity applies the events whose sequence is strictly greater than through to the (possibly
+// foldAggregate applies the events whose sequence is strictly greater than through to the (possibly
 // nil) entity, using applyEvent. It is shared by the full-replay and snapshot-seeded stream paths.
-func foldEntity(
+func foldAggregate(
 	ctx context.Context,
 	events []evt.SerializedEvent,
-	entity evt.Entity,
+	aggregate evt.Aggregate,
 	through evt.EventSequence,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) (evt.Entity, error) {
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) (evt.Aggregate, error) {
 	for _, event := range events {
 		if event.Sequence <= through {
 			continue
 		}
 
-		next, err := applyEvent(ctx, event, entity)
+		next, err := applyEvent(ctx, event, aggregate)
 		if err != nil {
 			return nil, err
 		}
 
-		entity = next
+		aggregate = next
 	}
 
-	return entity, nil
+	return aggregate, nil
 }

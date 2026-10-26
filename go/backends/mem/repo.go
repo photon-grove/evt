@@ -680,7 +680,7 @@ func (repo Repository) StreamEntityHeadsFunc(
 		}
 	}
 
-	// Entities present only as a snapshot (events compacted away with no event key) still have a
+	// Aggregates present only as a snapshot (events compacted away with no event key) still have a
 	// head. Skip any id that already has an events entry — it was visited above.
 	for id, snapshot := range repo.snapshots {
 		if _, hasEvents := repo.events[id]; hasEvents {
@@ -759,16 +759,16 @@ func (repo Repository) CompactBelow(
 	return deleted, nil
 }
 
-// StreamEntitiesFromSnapshots streams collected Entities, seeding each from its snapshot (when
+// StreamEntitiesFromSnapshots streams collected Aggregates, seeding each from its snapshot (when
 // present) before applying post-snapshot events. entityType, when non-empty, restricts the stream
 // to entities of that type. It implements evt.SnapshotStreamer.
 func (repo Repository) StreamEntitiesFromSnapshots(
 	ctx context.Context,
 	entityType evt.EntityType,
-	seedEntity evt.SnapshotSeeder,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
-	channel := make(chan result.Result[evt.Entity])
+	seedAggregate evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
+	channel := make(chan result.Result[evt.Aggregate])
 
 	go func() {
 		defer close(channel)
@@ -783,18 +783,18 @@ func (repo Repository) StreamEntitiesFromSnapshots(
 				continue
 			}
 
-			entity, through, ok := repo.seedFromSnapshot(ctx, id, seedEntity, channel)
+			aggregate, through, ok := repo.seedFromSnapshot(ctx, id, seedAggregate, channel)
 			if !ok {
 				continue
 			}
 
-			entity, ok = applyMemEvents(ctx, serialized, entity, through, applyEvent, channel)
+			aggregate, ok = applyMemEvents(ctx, serialized, aggregate, through, applyEvent, channel)
 			if !ok {
 				continue
 			}
 
-			if entity != nil {
-				channel <- result.Ok(entity)
+			if aggregate != nil {
+				channel <- result.Ok(aggregate)
 			}
 		}
 	}()
@@ -808,21 +808,21 @@ func (repo Repository) StreamEntitiesFromSnapshots(
 func (repo Repository) seedFromSnapshot(
 	ctx context.Context,
 	id string,
-	seedEntity evt.SnapshotSeeder,
-	channel chan<- result.Result[evt.Entity],
-) (evt.Entity, evt.EventSequence, bool) {
+	seedAggregate evt.SnapshotSeeder,
+	channel chan<- result.Result[evt.Aggregate],
+) (evt.Aggregate, evt.EventSequence, bool) {
 	snapshot, ok := repo.snapshots[id]
 	if !ok {
 		return nil, 0, true
 	}
 
-	entity, err := seedEntity(ctx, snapshot)
+	aggregate, err := seedAggregate(ctx, snapshot)
 	if err != nil {
-		channel <- result.Err[evt.Entity](err)
+		channel <- result.Err[evt.Aggregate](err)
 		return nil, 0, false
 	}
 
-	return entity, snapshot.EventSequence, true
+	return aggregate, snapshot.EventSequence, true
 }
 
 // memPartitionType reports a partition's entity type, reading the first non-snapshot event and
@@ -848,41 +848,41 @@ func memEventsMatchType(serialized []evt.SerializedEvent, snapshot evt.Serialize
 func applyMemEvents(
 	ctx context.Context,
 	serialized []evt.SerializedEvent,
-	entity evt.Entity,
+	aggregate evt.Aggregate,
 	through evt.EventSequence,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-	channel chan<- result.Result[evt.Entity],
-) (evt.Entity, bool) {
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+	channel chan<- result.Result[evt.Aggregate],
+) (evt.Aggregate, bool) {
 	for _, event := range serialized {
 		if event.Sequence == 0 || event.Sequence <= through {
 			continue
 		}
 
-		next, err := applyEvent(ctx, event, entity)
+		next, err := applyEvent(ctx, event, aggregate)
 		if err != nil {
-			channel <- result.Err[evt.Entity](err)
-			return entity, false
+			channel <- result.Err[evt.Aggregate](err)
+			return aggregate, false
 		}
 
-		entity = next
+		aggregate = next
 	}
 
-	return entity, true
+	return aggregate, true
 }
 
-// StreamEntities streams all collected Entities, honoring the StreamFilter's entity-type narrowing
+// StreamEntities streams all collected Aggregates, honoring the StreamFilter's entity-type narrowing
 // client-side (the in-memory repository has no server-side filter to push down to).
 func (repo Repository) StreamEntities(
 	ctx context.Context,
 	filter evt.StreamFilter,
-	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-) <-chan result.Result[evt.Entity] {
-	channel := make(chan result.Result[evt.Entity])
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
+	channel := make(chan result.Result[evt.Aggregate])
 
 	go func() {
 		defer close(channel)
 
-		var entity evt.Entity
+		var aggregate evt.Aggregate
 		var err error
 		entityEvents := 0
 
@@ -902,20 +902,20 @@ func (repo Repository) StreamEntities(
 					continue
 				}
 
-				if entity != nil && event.EntityID != entity.GetID() {
-					// We've moved on to a new Entity. Process this one and reset the Entity
+				if aggregate != nil && event.EntityID != aggregate.GetID() {
+					// We've moved on to a new Aggregate. Process this one and reset the Aggregate
 					// pointer back to nil.
 
-					// Yield this finished Entity to the channel
-					channel <- result.Ok(entity)
+					// Yield this finished Aggregate to the channel
+					channel <- result.Ok(aggregate)
 
-					entity = nil
+					aggregate = nil
 					entityEvents = 0
 				}
 
-				entity, err = applyEvent(ctx, event, entity)
+				aggregate, err = applyEvent(ctx, event, aggregate)
 				if err != nil {
-					channel <- result.Err[evt.Entity](err)
+					channel <- result.Err[evt.Aggregate](err)
 
 					continue
 				}
@@ -924,10 +924,10 @@ func (repo Repository) StreamEntities(
 			}
 		}
 
-		// Yield the final Entity to the channel. Guard against nil so a stream whose partitions were
+		// Yield the final Aggregate to the channel. Guard against nil so a stream whose partitions were
 		// all filtered out (or an empty repository) does not emit a spurious nil result.
-		if entity != nil {
-			channel <- result.Ok(entity)
+		if aggregate != nil {
+			channel <- result.Ok(aggregate)
 		}
 	}()
 

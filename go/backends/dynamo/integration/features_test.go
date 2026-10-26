@@ -126,7 +126,7 @@ func commitOne(ctx context.Context, t *testing.T, repo *dynamo.Repository, id ev
 
 	metadata := evt.NewMetadata(ctx, aws.String("us-west-2"))
 	serialized, err := evt.SerializeEvents(
-		[]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, sequence, id, metadata)
+		[]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}}, sequence, id, metadata)
 	require.NoError(t, err)
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialized}))
 }
@@ -200,7 +200,7 @@ func Test_FeatureMarker_CommitRefusesUnsupportedFeature(t *testing.T) {
 	require.NoError(t, err)
 
 	other := evt.EntityID("acct-2")
-	serialized, serr := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: other, Value: "v"}},
+	serialized, serr := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: other, Value: "v"}},
 		0, other, evt.NewMetadata(ctx, aws.String("us-west-2")))
 	require.NoError(t, serr)
 
@@ -233,7 +233,7 @@ func Test_FeatureMarker_ChangedManifestRetries(t *testing.T) {
 
 	// The next commit's cached condition fails; the re-validation still succeeds, so the error is
 	// the transient changed-manifest error.
-	serialized, serr := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}},
+	serialized, serr := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}},
 		1, id, evt.NewMetadata(ctx, aws.String("us-west-2")))
 	require.NoError(t, serr)
 
@@ -259,7 +259,7 @@ func Test_FeatureMarker_CompactBelowRefusesHistoryDependent(t *testing.T) {
 
 	id := evt.EntityID("acct-1")
 	metadata := evt.NewMetadata(ctx, aws.String("us-west-2"))
-	serialized, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 0, id, metadata)
+	serialized, err := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}}, 0, id, metadata)
 	require.NoError(t, err)
 
 	payload := []byte(`{"id":"acct-1","value":"v"}`)
@@ -325,7 +325,7 @@ func Test_Namespaces_EnumerationSkipsEngineRows(t *testing.T) {
 	require.Contains(t, heads, id)
 
 	rebuilt := 0
-	for res := range repo.StreamEntitiesFromSnapshots(ctx, test.EntityType, seedIntegrationEntity, applyIntegrationEvent) {
+	for res := range repo.StreamEntitiesFromSnapshots(ctx, test.EntityType, seedIntegrationAggregate, applyIntegrationEvent) {
 		_, uerr := res.Unwrap()
 		require.NoError(t, uerr)
 		rebuilt++
@@ -347,7 +347,7 @@ func Test_Namespaces_ReservedWritePathsRefused(t *testing.T) {
 	for _, id := range reserved {
 		metadata := evt.NewMetadata(ctx, aws.String("us-west-2"))
 		serialized, serr := evt.SerializeEvents(
-			[]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, 0, id, metadata)
+			[]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}}, 0, id, metadata)
 		require.NoError(t, serr)
 
 		err := repo.Commit(ctx, evt.SerializedResult{Events: serialized})
@@ -385,7 +385,7 @@ func Test_GetRecentEvents_NewestFirst(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		metadata := evt.NewMetadata(ctx, aws.String("us-west-2"))
 		serialized, err := evt.SerializeEvents(
-			[]evt.Event{&test.EntityCreated{ID: id, Value: "v" + strconv.Itoa(i)}},
+			[]evt.Event{&test.AggregateCreated{ID: id, Value: "v" + strconv.Itoa(i)}},
 			evt.EventSequence(i-1), id, metadata)
 		require.NoError(t, err)
 		require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialized}))

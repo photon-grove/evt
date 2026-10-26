@@ -83,8 +83,8 @@ func (m *MockRepository) StreamAllEvents(_ context.Context, _ evt.StreamFilter) 
 	return ch
 }
 
-func (m *MockRepository) StreamEntities(_ context.Context, _ evt.StreamFilter, _ func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error)) <-chan result.Result[evt.Entity] {
-	ch := make(chan result.Result[evt.Entity])
+func (m *MockRepository) StreamEntities(_ context.Context, _ evt.StreamFilter, _ func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error)) <-chan result.Result[evt.Aggregate] {
+	ch := make(chan result.Result[evt.Aggregate])
 	close(ch)
 	return ch
 }

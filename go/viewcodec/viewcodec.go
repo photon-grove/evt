@@ -1,9 +1,9 @@
-// Package viewstore binds evt.ViewRepository to JSON values, an entity type, and optional decode
+// Package viewcodec binds evt.ViewRepository to JSON values, an entity type, and optional decode
 // factories. Codec accepts keys per call; Single binds a primary-key function.
 //
 // List methods skip invalid payloads and report them to an optional DecodeErrorHandler. Use
 // evt.ListJSONViewsByPK or evt.ListJSONViewsByEntityType for strict decoding.
-package viewstore
+package viewcodec
 
 import (
 	"context"

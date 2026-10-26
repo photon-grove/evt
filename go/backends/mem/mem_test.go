@@ -108,14 +108,14 @@ func Test_Repository_StreamEntities(t *testing.T) {
 		{EntityID: "b", Sequence: 2, Type: "t2", Payload: []byte("b2")},
 	}
 
-	applyEvent := func(_ context.Context, e evt.SerializedEvent, current evt.Entity) (evt.Entity, error) {
+	applyEvent := func(_ context.Context, e evt.SerializedEvent, current evt.Aggregate) (evt.Aggregate, error) {
 		if e.Type == "boom" {
 			return nil, errors.New("boom")
 		}
 		if current == nil {
-			current = evttest.NewEntity(e.EntityID)
+			current = evttest.NewAggregate(e.EntityID)
 		}
-		ent, ok := current.(*evttest.Entity)
+		ent, ok := current.(*evttest.Aggregate)
 		if !ok {
 			return nil, errors.New("unexpected entity type")
 		}
@@ -145,7 +145,7 @@ func Test_Repository_StreamEntities_ApplyError(t *testing.T) {
 		{EntityID: "a", Sequence: 1, Type: "boom"},
 	}
 
-	applyEvent := func(_ context.Context, _ evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
+	applyEvent := func(_ context.Context, _ evt.SerializedEvent, _ evt.Aggregate) (evt.Aggregate, error) {
 		return nil, errors.New("apply failed")
 	}
 

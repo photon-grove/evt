@@ -19,13 +19,13 @@ func TestExecute_ProjectorCalled(t *testing.T) {
 	metadata := newTestMetadata()
 
 	projector := &MockProjector{}
-	entity := &MockEntity{
+	aggregate := &MockAggregate{
 		ID:         setup.entityID,
 		projectors: []evt.EventProjector{projector},
 	}
-	command := &test.CreateEntity{Value: "test-value"}
+	command := &test.CreateAggregate{Value: "test-value"}
 
-	err := setup.store.Execute(ctx, entity, setup.entityID, command, metadata)
+	err := setup.store.Execute(ctx, aggregate, setup.entityID, command, metadata)
 	require.NoError(t, err)
 
 	require.True(t, projector.called)
@@ -39,13 +39,13 @@ func TestExecute_ProjectorError(t *testing.T) {
 	metadata := newTestMetadata()
 
 	projector := &MockProjector{projectError: errors.New("projector failed")}
-	entity := &MockEntity{
+	aggregate := &MockAggregate{
 		ID:         setup.entityID,
 		projectors: []evt.EventProjector{projector},
 	}
-	command := &test.CreateEntity{Value: "test-value"}
+	command := &test.CreateAggregate{Value: "test-value"}
 
-	err := setup.store.Execute(ctx, entity, setup.entityID, command, metadata)
+	err := setup.store.Execute(ctx, aggregate, setup.entityID, command, metadata)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "projector failed")
 
@@ -68,7 +68,7 @@ func (g txGroup) Merge(evt.TransactionGroup) (evt.TransactionGroup, error) {
 // groupProjector returns a real transaction group for every event it sees.
 type groupProjector struct{}
 
-func (groupProjector) Project(context.Context, evt.Entity, []evt.Event) (evt.TransactionGroup, error) {
+func (groupProjector) Project(context.Context, evt.Aggregate, []evt.Event) (evt.TransactionGroup, error) {
 	return txGroup{}, nil
 }
 
@@ -99,9 +99,9 @@ func TestExecute_ProjectorGroupIsCommittedWithTheEvents(t *testing.T) {
 			repo := &recordingRepo{Repository: mem.NewRepository()}
 			store := snapshots.NewStore(repo, snapshotSize)
 			id := evt.EntityID("group-1")
-			entity := &MockEntity{ID: id, projectors: []evt.EventProjector{groupProjector{}}}
+			aggregate := &MockAggregate{ID: id, projectors: []evt.EventProjector{groupProjector{}}}
 
-			require.NoError(t, store.Execute(context.Background(), entity, id, &test.CreateEntity{Value: "v"}, newTestMetadata()))
+			require.NoError(t, store.Execute(context.Background(), aggregate, id, &test.CreateAggregate{Value: "v"}, newTestMetadata()))
 
 			require.Len(t, repo.committed, 1)
 			require.Len(t, repo.committed[0].Events, 1)

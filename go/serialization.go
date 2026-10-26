@@ -3,6 +3,8 @@ package evt
 import (
 	"encoding/json"
 	"fmt"
+
+	"github.com/photon-grove/evt/go/internal/jsondefaults"
 )
 
 // SerializedEvent is a common event format that is ready to be committed to an Event Store and
@@ -54,7 +56,7 @@ type SerializedResult struct {
 	Views []ProjectedView `json:"views,omitempty"`
 }
 
-// SerializedSnapshot represents a snapshot of current Entity state that is ready
+// SerializedSnapshot represents a snapshot of current Aggregate state that is ready
 // to be committed to a Repository.
 type SerializedSnapshot struct {
 	EntityType    EntityType    `json:"entityType"`
@@ -128,20 +130,20 @@ func SerializeEvents(
 	return serializedEvents, nil
 }
 
-// SerializeEventsWithContext serializes Events with the Entity within the given Context.
-func SerializeEventsWithContext(events []Event, eventContext *Context, metadata Metadata) ([]SerializedEvent, error) {
-	if eventContext == nil {
+// SerializeEventsWithCommandContext serializes Events with the Aggregate within the given CommandContext.
+func SerializeEventsWithCommandContext(events []Event, cc *CommandContext, metadata Metadata) ([]SerializedEvent, error) {
+	if cc == nil {
 		return nil, fmt.Errorf("context not found")
 	}
 
 	// Initialize the sequence with the last one from the context, but dereference
 	// it so that the sequence in the context is not iterated, just this inner value.
-	sequence := *eventContext.CurrentSequence
+	sequence := *cc.CurrentSequence
 
 	return SerializeEvents(
 		events,
 		sequence,
-		eventContext.EntityID,
+		cc.EntityID,
 		metadata,
 	)
 }
@@ -149,22 +151,22 @@ func SerializeEventsWithContext(events []Event, eventContext *Context, metadata 
 // SerializeResult creates a SerializedResult from events using the given context and entity.
 // This is a convenience function for testing and integration scenarios.
 func SerializeResult(
-	eventContext Context,
-	entity Entity,
+	cc CommandContext,
+	aggregate Aggregate,
 	events []Event,
 	transaction Transaction,
 ) (SerializedResult, error) {
 	var entityID EntityID
-	if entity != nil {
-		entityID = entity.GetID()
+	if aggregate != nil {
+		entityID = aggregate.GetID()
 	}
-	if eventContext.EntityID != "" {
-		entityID = eventContext.EntityID
+	if cc.EntityID != "" {
+		entityID = cc.EntityID
 	}
 
 	sequence := EventSequence(0)
-	if eventContext.CurrentSequence != nil {
-		sequence = *eventContext.CurrentSequence
+	if cc.CurrentSequence != nil {
+		sequence = *cc.CurrentSequence
 	}
 
 	serializedEvents, err := SerializeEvents(events, sequence, entityID, Metadata{})
@@ -178,11 +180,11 @@ func SerializeResult(
 	}, nil
 }
 
-// DeserializeEvent decodes Events with the Entity within the given Context, applying upcasters.
-func DeserializeEvent(serializedEvent SerializedEvent, entity Entity) (Event, error) {
+// DeserializeEvent decodes Events with the Aggregate within the given CommandContext, applying upcasters.
+func DeserializeEvent(serializedEvent SerializedEvent, aggregate Aggregate) (Event, error) {
 	event := serializedEvent
 
-	upcasters := entity.EventUpcasters()
+	upcasters := aggregate.EventUpcasters()
 
 	for _, upcaster := range upcasters {
 		if upcaster.CanUpcast(event.Type, event.Version) {
@@ -200,7 +202,7 @@ func DeserializeEvent(serializedEvent SerializedEvent, entity Entity) (Event, er
 		}
 	}
 
-	deserializedEvent, err := entity.DeserializeEvent(event)
+	deserializedEvent, err := aggregate.DeserializeEvent(event)
 	if err != nil {
 		return nil, &ReplayStrictnessError{
 			EventType: event.Type,
@@ -236,4 +238,35 @@ func CalculateAdditionalEvents(currentSequence EventSequence, numEvents int, max
 	}
 
 	return numEvents
+}
+
+// eventWire retains the envelope's fields without its JSON methods to avoid recursion.
+type eventWire SerializedEvent
+
+// MarshalEvent encodes a serialized event in the shared storage and stream format. It writes
+// effective causation and an extensions object without mutating the caller's metadata.
+func MarshalEvent(event SerializedEvent) ([]byte, error) {
+	wire := eventWire(event)
+	wire.Metadata.CausationID, wire.Metadata.Extensions = jsondefaults.Metadata(
+		wire.Metadata.CommandID, wire.Metadata.CausationID, wire.Metadata.Extensions,
+	)
+
+	return json.Marshal(wire)
+}
+
+// UnmarshalEvent decodes a serialized event without applying encode-time metadata defaults.
+// Missing fields retain the destination's values, matching encoding/json.
+func UnmarshalEvent(data []byte, event *SerializedEvent) error {
+	if event == nil {
+		return json.Unmarshal(data, event)
+	}
+
+	wire := eventWire(*event)
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+
+	*event = SerializedEvent(wire)
+
+	return nil
 }

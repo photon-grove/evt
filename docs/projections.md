@@ -277,29 +277,29 @@ been **compacted** (`evt.Compactor.CompactBelow` truncates events that a durable
 snapshot already captures), those low events no longer exist, so a from-event-1
 replay would reconstruct incorrect state.
 
-For compacted streams, set `RebuildConfig.SeedEntity`. The rebuild then seeds each
+For compacted streams, set `RebuildConfig.SeedAggregate`. The rebuild then seeds each
 entity from its snapshot before applying only the post-snapshot events (via
 `evt.SnapshotStreamer`), and falls back to full replay for streams that have no
 snapshot. This is safe on uncompacted data too, so adopters that plan to compact
-should switch rebuilds to `SeedEntity` first:
+should switch rebuilds to `SeedAggregate` first:
 
 ```go
 res, err := evt.RebuildProjections(ctx, repo, applyEvent, evt.RebuildConfig{
     Projectors: projectors,
     CommitGroup: commitGroup,
-    SeedEntity: func(ctx context.Context, snap evt.SerializedSnapshot) (evt.Entity, error) {
-        entity, err := newEntityForType(snap.EntityType) // your factory
+    SeedAggregate: func(ctx context.Context, snap evt.SerializedSnapshot) (evt.Aggregate, error) {
+        aggregate, err := newAggregateForType(snap.EntityType) // your factory
         if err != nil {
             return nil, err
         }
-        return entity, json.Unmarshal(snap.Payload, entity)
+        return aggregate, json.Unmarshal(snap.Payload, aggregate)
     },
 })
 ```
 
 The snapshot-aware path enumerates entity IDs with a key-only event-log scan and a dedup set, then
 queries each partition (seeding from the `sk=0` snapshot and applying events after it). It is
-bounded by the entity count, and it does not depend on scan ordering. If `SeedEntity` is set but
+bounded by the entity count, and it does not depend on scan ordering. If `SeedAggregate` is set but
 the repository does not implement `evt.SnapshotStreamer`, `RebuildProjections` returns an error
 rather than silently producing partial state. See
 [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
@@ -310,7 +310,7 @@ To drive it yourself, the DynamoDB repository exposes `StreamEntitiesFromSnapsho
 stream := repo.StreamEntitiesFromSnapshotsWithOptions(ctx, dynamo.StreamFromSnapshotsOptions{
     EntityType: entityType,
     Workers:    8,
-}, seedEntity, applyEvent)
+}, seedAggregate, applyEvent)
 
 res, err := evt.RebuildProjectionsFromStream(ctx, stream, evt.RebuildConfig{
     Projectors:  projectors,

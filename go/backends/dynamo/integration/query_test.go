@@ -24,7 +24,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_GetEvents_NoEvents() {
 func (s *DynamoEventsIntegrationSuite) Test_Query_GetLatestEvents_Pagination() {
 	ctx := context.Background()
 	entityID := evt.EntityID(newID())
-	s.SetupEntity(entityID, 100) // Large snapshot size so we get many events
+	s.SetupAggregate(entityID, 100) // Large snapshot size so we get many events
 	metadata := s.getMetadata(ctx)
 
 	// Generate enough events to trigger pagination if page size is small.
@@ -35,7 +35,7 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_GetLatestEvents_Pagination() {
 
 	numEvents := 10
 	for i := 0; i < numEvents; i++ {
-		err := s.store.Execute(ctx, s.entity, entityID, &test.CreateEntity{Value: "v"}, metadata)
+		err := s.store.Execute(ctx, s.aggregate, entityID, &test.CreateAggregate{Value: "v"}, metadata)
 		require.NoError(s.T(), err)
 	}
 
@@ -62,16 +62,16 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_GetSnapshot_NoneExists() {
 
 func (s *DynamoEventsIntegrationSuite) Test_Query_StreamEntities() {
 	ctx := context.Background()
-	s.SetupEntity(evt.EntityID(newID()), 100)
+	s.SetupAggregate(evt.EntityID(newID()), 100)
 	metadata := s.getMetadata(ctx)
 
 	// Create two distinct entities
 	id1 := evt.EntityID(newID())
-	err := s.store.Execute(ctx, test.NewEntity(id1), id1, &test.CreateEntity{Value: "s1"}, metadata)
+	err := s.store.Execute(ctx, test.NewAggregate(id1), id1, &test.CreateAggregate{Value: "s1"}, metadata)
 	require.NoError(s.T(), err)
 
 	id2 := evt.EntityID(newID())
-	err = s.store.Execute(ctx, test.NewEntity(id2), id2, &test.CreateEntity{Value: "s2"}, metadata)
+	err = s.store.Execute(ctx, test.NewAggregate(id2), id2, &test.CreateAggregate{Value: "s2"}, metadata)
 	require.NoError(s.T(), err)
 
 	// Stream all entities
@@ -79,10 +79,10 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_StreamEntities() {
 	// Since we are running in a shared local environment, there might be other entities from other tests.
 	// We should just check that OUR entities are present in the stream.
 
-	applier := func(_ context.Context, se evt.SerializedEvent, e evt.Entity) (evt.Entity, error) {
+	applier := func(_ context.Context, se evt.SerializedEvent, e evt.Aggregate) (evt.Aggregate, error) {
 		if e == nil {
 			// Create new instance of correct type
-			e = test.NewEntity(se.EntityID)
+			e = test.NewAggregate(se.EntityID)
 		}
 		event, err := e.DeserializeEvent(se)
 		if err != nil {
@@ -101,22 +101,22 @@ func (s *DynamoEventsIntegrationSuite) Test_Query_StreamEntities() {
 
 	// Consume stream
 	for result := range stream {
-		entity, err := result.Unwrap()
+		aggregate, err := result.Unwrap()
 		if err != nil {
 			// Ignore errors from other random data if any
 			continue
 		}
-		if entity.GetID() == id1 {
+		if aggregate.GetID() == id1 {
 			found1 = true
-			testEntity, ok := entity.(*test.Entity)
+			testAggregate, ok := aggregate.(*test.Aggregate)
 			require.True(s.T(), ok)
-			assert.Equal(s.T(), "s1", testEntity.Value)
+			assert.Equal(s.T(), "s1", testAggregate.Value)
 		}
-		if entity.GetID() == id2 {
+		if aggregate.GetID() == id2 {
 			found2 = true
-			testEntity, ok := entity.(*test.Entity)
+			testAggregate, ok := aggregate.(*test.Aggregate)
 			require.True(s.T(), ok)
-			assert.Equal(s.T(), "s2", testEntity.Value)
+			assert.Equal(s.T(), "s2", testAggregate.Value)
 		}
 	}
 

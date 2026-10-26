@@ -45,7 +45,7 @@ func (e *NotFoundError) Error() string {
 	return e.msg
 }
 
-// BadCommandError means an invalid Command was sent to an Entity
+// BadCommandError means an invalid Command was sent to an Aggregate
 type BadCommandError struct {
 	Command Command
 }

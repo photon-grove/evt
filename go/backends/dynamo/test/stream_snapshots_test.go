@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// seedMockEntity reconstructs a MockEntity from a snapshot payload.
-func seedMockEntity(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Entity, error) {
-	return &MockEntity{ID: snapshot.EntityID}, nil
+// seedMockAggregate reconstructs a MockAggregate from a snapshot payload.
+func seedMockAggregate(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Aggregate, error) {
+	return &MockAggregate{ID: snapshot.EntityID}, nil
 }
 
 // enumScanOutput builds a key-only Scan page (the entity-ID enumeration) for the given pks. It
@@ -87,26 +87,26 @@ func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_SeedsAndQueriesAfterS
 	s.client.On("Query", mock.Anything, queryForPKSince("acct-1", 5), mock.Anything).Return(eventsQueryOutput("acct-1", 6, 7), nil)
 
 	applied := make([]evt.EventSequence, 0)
-	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, aggregate evt.Aggregate) (evt.Aggregate, error) {
 		applied = append(applied, event.Sequence)
-		return entity, nil
+		return aggregate, nil
 	}
 
-	var entities []evt.Entity
-	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, "", seedMockEntity, applyFunc) {
-		entity, err := res.Unwrap()
+	var aggregates []evt.Aggregate
+	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, "", seedMockAggregate, applyFunc) {
+		aggregate, err := res.Unwrap()
 		require.NoError(s.T(), err)
-		entities = append(entities, entity)
+		aggregates = append(aggregates, aggregate)
 	}
 
-	require.Len(s.T(), entities, 1)
-	require.Equal(s.T(), evt.EntityID("acct-1"), entities[0].GetID())
+	require.Len(s.T(), aggregates, 1)
+	require.Equal(s.T(), evt.EntityID("acct-1"), aggregates[0].GetID())
 	require.Equal(s.T(), []evt.EventSequence{6, 7}, applied)
 	s.client.AssertExpectations(s.T())
 }
 
 // Test_StreamEntitiesFromSnapshots_NoSnapshotFullReplay verifies that an entity without a snapshot
-// is replayed from sequence 1 (GetEvents) and seedEntity is never called.
+// is replayed from sequence 1 (GetEvents) and seedAggregate is never called.
 func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_NoSnapshotFullReplay() {
 	ctx := context.Background()
 
@@ -116,25 +116,25 @@ func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_NoSnapshotFullReplay(
 
 	applied := make([]evt.EventSequence, 0)
 	seeded := false
-	seedFunc := func(ctx context.Context, snapshot evt.SerializedSnapshot) (evt.Entity, error) {
+	seedFunc := func(ctx context.Context, snapshot evt.SerializedSnapshot) (evt.Aggregate, error) {
 		seeded = true
-		return seedMockEntity(ctx, snapshot)
+		return seedMockAggregate(ctx, snapshot)
 	}
-	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
+	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Aggregate) (evt.Aggregate, error) {
 		applied = append(applied, event.Sequence)
-		return &MockEntity{ID: event.EntityID}, nil
+		return &MockAggregate{ID: event.EntityID}, nil
 	}
 
-	var entities []evt.Entity
+	var aggregates []evt.Aggregate
 	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, "", seedFunc, applyFunc) {
-		entity, err := res.Unwrap()
+		aggregate, err := res.Unwrap()
 		require.NoError(s.T(), err)
-		entities = append(entities, entity)
+		aggregates = append(aggregates, aggregate)
 	}
 
-	require.False(s.T(), seeded, "no snapshot row means seedEntity is never called")
+	require.False(s.T(), seeded, "no snapshot row means seedAggregate is never called")
 	require.Equal(s.T(), []evt.EventSequence{1, 2}, applied)
-	require.Len(s.T(), entities, 1)
+	require.Len(s.T(), aggregates, 1)
 	s.client.AssertExpectations(s.T())
 }
 
@@ -149,15 +149,15 @@ func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_MultipleEntities() {
 	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("acct-a")), mock.Anything).Return(eventsQueryOutput("acct-a", 6), nil)
 	s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK("acct-b")), mock.Anything).Return(eventsQueryOutput("acct-b", 6), nil)
 
-	applyFunc := func(_ context.Context, _ evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-		return entity, nil
+	applyFunc := func(_ context.Context, _ evt.SerializedEvent, aggregate evt.Aggregate) (evt.Aggregate, error) {
+		return aggregate, nil
 	}
 
 	ids := make([]evt.EntityID, 0, 2)
-	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, "", seedMockEntity, applyFunc) {
-		entity, err := res.Unwrap()
+	for res := range s.repo.StreamEntitiesFromSnapshots(ctx, "", seedMockAggregate, applyFunc) {
+		aggregate, err := res.Unwrap()
 		require.NoError(s.T(), err)
-		ids = append(ids, entity.GetID())
+		ids = append(ids, aggregate.GetID())
 	}
 
 	require.ElementsMatch(s.T(), []evt.EntityID{"acct-a", "acct-b"}, ids)
@@ -172,12 +172,12 @@ func (s *RepositorySuite) noSnapshot(ids ...string) {
 	}
 }
 
-func applyAsMockEntity(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-	if entity == nil {
-		return &MockEntity{ID: event.EntityID}, nil
+func applyAsMockAggregate(_ context.Context, event evt.SerializedEvent, aggregate evt.Aggregate) (evt.Aggregate, error) {
+	if aggregate == nil {
+		return &MockAggregate{ID: event.EntityID}, nil
 	}
 
-	return entity, nil
+	return aggregate, nil
 }
 
 func (s *RepositorySuite) collectIDs(opts dynamo.StreamFromSnapshotsOptions) ([]evt.EntityID, error) {
@@ -186,14 +186,14 @@ func (s *RepositorySuite) collectIDs(opts dynamo.StreamFromSnapshotsOptions) ([]
 		gotErr error
 	)
 
-	for res := range s.repo.StreamEntitiesFromSnapshotsWithOptions(context.Background(), opts, seedMockEntity, applyAsMockEntity) {
-		entity, err := res.Unwrap()
+	for res := range s.repo.StreamEntitiesFromSnapshotsWithOptions(context.Background(), opts, seedMockAggregate, applyAsMockAggregate) {
+		aggregate, err := res.Unwrap()
 		if err != nil {
 			gotErr = err
 			continue
 		}
 
-		ids = append(ids, entity.GetID())
+		ids = append(ids, aggregate.GetID())
 	}
 
 	return ids, gotErr

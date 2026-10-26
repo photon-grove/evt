@@ -18,7 +18,7 @@ func (s *DynamoEventsIntegrationSuite) Test_CommitWithSnapshot_FirstSnapshotMust
 	id := evt.EntityID(newID())
 
 	events := func(from evt.EventSequence) evt.SerializedResult {
-		serialized, err := evt.SerializeEvents([]evt.Event{&test.EntityCreated{ID: id, Value: "v"}}, from, id, evt.Metadata{})
+		serialized, err := evt.SerializeEvents([]evt.Event{&test.AggregateCreated{ID: id, Value: "v"}}, from, id, evt.Metadata{})
 		require.NoError(s.T(), err)
 
 		return evt.SerializedResult{Events: serialized}

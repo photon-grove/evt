@@ -1480,9 +1480,9 @@ func testRejectionWithEvents(t *testing.T, repo evt.OutcomeRepository) {
 
 	id := env.commandID("flagged")
 	command := &ledgerCommand{Kind: "withdraw-flagged", Amount: 5, ran: ran}
-	entity := newLedger(env.id)
+	aggregate := newLedger(env.id)
 
-	outcome, err := env.store.ExecuteWithOutcome(ctx, entity, env.id, command, withCommand(id))
+	outcome, err := env.store.ExecuteWithOutcome(ctx, aggregate, env.id, command, withCommand(id))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected())
 	require.False(t, outcome.Replayed)
@@ -1494,8 +1494,8 @@ func testRejectionWithEvents(t *testing.T, repo evt.OutcomeRepository) {
 
 	stored := env.events(t, env.id)
 	require.Equal(t, []string{"deposited", "flagged"}, kinds(t, stored))
-	require.Equal(t, 2, entity.Total, "the flagged event changed no balance")
-	require.Equal(t, 1, entity.Seen["flagged"], "the entity reflects the committed events")
+	require.Equal(t, 2, aggregate.Total, "the flagged event changed no balance")
+	require.Equal(t, 1, aggregate.Seen["flagged"], "the entity reflects the committed events")
 
 	row, err := env.repo.GetOutcome(ctx, id)
 	require.NoError(t, err)
@@ -1715,9 +1715,9 @@ func testRejectionWithEventsRetry(t *testing.T, repo evt.OutcomeRepository) {
 	env.interfere(true, hasEvents, func() { env.deposit(t, env.id, 1) })
 
 	id := env.commandID("reprepare")
-	entity := newLedger(env.id)
+	aggregate := newLedger(env.id)
 
-	outcome, err := env.store.ExecuteWithOutcome(ctx, entity, env.id,
+	outcome, err := env.store.ExecuteWithOutcome(ctx, aggregate, env.id,
 		&ledgerCommand{Kind: "withdraw-flagged", Amount: 50, ran: ran}, withCommand(id))
 	require.NoError(t, err)
 	require.True(t, outcome.Rejected())
@@ -1725,8 +1725,8 @@ func testRejectionWithEventsRetry(t *testing.T, repo evt.OutcomeRepository) {
 	require.Equal(t, []string{"deposited", "deposited", "flagged"}, kinds(t, env.events(t, env.id)),
 		"only the committing attempt's event was written")
 	require.Equal(t, []evt.EventID{evt.GetEventID(env.id, 3)}, outcome.EventIDs)
-	require.Equal(t, 2, entity.Total)
-	require.Equal(t, 1, entity.Seen["flagged"], "the failed attempt's event was not counted")
+	require.Equal(t, 2, aggregate.Total)
+	require.Equal(t, 1, aggregate.Seen["flagged"], "the failed attempt's event was not counted")
 
 	// The rival's move can change the decision: now the command is accepted and records no failure.
 	env.interfere(true, hasEvents, func() { env.deposit(t, env.id, 100) })
@@ -1744,9 +1744,9 @@ func testRejectionWithEventsRetry(t *testing.T, repo evt.OutcomeRepository) {
 	ran.Store(0)
 
 	exhausted := env.commandID("exhausted")
-	entity = newLedger(env.id)
+	aggregate = newLedger(env.id)
 
-	lost, err := env.store.ExecuteWithOutcome(ctx, entity, env.id,
+	lost, err := env.store.ExecuteWithOutcome(ctx, aggregate, env.id,
 		&ledgerCommand{Kind: "withdraw-flagged", Amount: 5000, ran: ran}, withCommand(exhausted))
 	require.NoError(t, err)
 	require.True(t, lost.Rejected())
@@ -1759,7 +1759,7 @@ func testRejectionWithEventsRetry(t *testing.T, repo evt.OutcomeRepository) {
 	after := env.events(t, env.id)
 	require.Len(t, after, before+3, "three rival events and no flagged event from the command")
 	require.NotContains(t, kinds(t, after[before:]), "flagged")
-	require.Equal(t, 1, entity.Seen["flagged"], "the caller's entity reflects durable state: only the earlier refusal")
+	require.Equal(t, 1, aggregate.Seen["flagged"], "the caller's entity reflects durable state: only the earlier refusal")
 
 	// The exhausted ID replays the stale-fence rejection.
 	env.faulty.Intercept = nil

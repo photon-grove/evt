@@ -81,7 +81,7 @@ that should be an event is hiding in a view.
 Wrap the repository in [`snapshots.NewStore(repo, size)`](dynamodb.md#snapshots)
 so hot entities don't replay from sequence 1. Only after a durable snapshot covers
 a range should you [`CompactBelow`](dynamodb.md#compaction) to truncate it — and
-then rebuild that stream through `RebuildConfig.SeedEntity`, never a full replay.
+then rebuild that stream through `RebuildConfig.SeedAggregate`, never a full replay.
 For genuinely transient, never-replayed streams, prefer a
 [retention TTL](dynamodb.md#retention) over compaction.
 

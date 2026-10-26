@@ -484,7 +484,7 @@ key `entityType` (no range key).
   string attribute as its text; a `ttl` that is not an integer is a corrupt row.
 
 `compat/fixtures/views.json` pins the items, request keys and expressions, cursors, and the
-payload bytes of the typed codec (`viewstore.Codec` in Go, `ViewCodec` in Rust: the payload is the
+payload bytes of the typed codec (`viewcodec.Codec` in Go, `ViewCodec` in Rust: the payload is the
 `json.Marshal` of the value).
 
 **Commit-wide projectors (v0.9, C7).** A commit-wide projector is a pure function over the whole
@@ -3363,7 +3363,7 @@ Loaded events must continue the sequence without a gap: the first event after a 
 `eventSequence` plus one, and a stream without a snapshot starts at 1. A gap means another writer
 snapshotted and compacted the stream between the snapshot read and the event read, or events
 expired. Applying events across the gap would build the wrong state. Rust's `Store::load` reads the
-stream again, up to three times, then returns `Error::Conflict`. Go's `snapshots.Store.LoadEntity`
+stream again, up to three times, then returns `Error::Conflict`. Go's `snapshots.Store.LoadAggregate`
 returns a conflict error at once, because it has already modified the entity the caller passed in.
 The error is a `policy.ClassifiedError` with class `transient`, so the fence-aware retry
 loop retries it with a fresh entity, and `evt.IsConflictErr` still matches it. A gap that does not heal,

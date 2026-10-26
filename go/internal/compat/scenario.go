@@ -415,12 +415,12 @@ func (r Runner) Execute(ctx context.Context, entityID evt.EntityID, step Step) (
 }
 
 func (r Runner) sequence(ctx context.Context, entityID evt.EntityID) (evt.EventSequence, error) {
-	eventContext, err := r.Store.LoadEntity(ctx, NewAccount(entityID), entityID)
+	cc, err := r.Store.LoadAggregate(ctx, NewAccount(entityID), entityID)
 	if err != nil {
 		return 0, err
 	}
 
-	return *eventContext.CurrentSequence, nil
+	return *cc.CurrentSequence, nil
 }
 
 func (r Runner) execute(ctx context.Context, entityID evt.EntityID, step Step) (Outcome, error) {

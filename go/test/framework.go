@@ -10,13 +10,13 @@ import (
 type Framework struct {
 	repo     evt.Repository
 	store    evt.Store
-	factory  func() evt.Entity
+	factory  func() evt.Aggregate
 	id       evt.EntityID
 	sequence evt.EventSequence
 }
 
 // NewFramework creates a new testing framework for event-sourced entities.
-func NewFramework(repo evt.Repository, store evt.Store, factory func() evt.Entity, id evt.EntityID) *Framework {
+func NewFramework(repo evt.Repository, store evt.Store, factory func() evt.Aggregate, id evt.EntityID) *Framework {
 	return NewFrameworkWithFactory(repo, store, factory, id)
 }
 
@@ -24,14 +24,14 @@ func NewFramework(repo evt.Repository, store evt.Store, factory func() evt.Entit
 func NewFrameworkWithFactory(
 	repo evt.Repository,
 	store evt.Store,
-	factory func() evt.Entity,
+	factory func() evt.Aggregate,
 	id evt.EntityID,
 ) *Framework {
 	return &Framework{repo: repo, store: store, factory: factory, id: id, sequence: 0}
 }
 
 // WithEvents applies the given events to the entity and persists them to the repository
-func (f *Framework) WithEvents(ctx context.Context, events []evt.Event) (evt.Entity, error) {
+func (f *Framework) WithEvents(ctx context.Context, events []evt.Event) (evt.Aggregate, error) {
 	serializedEvents, err := evt.SerializeEvents(events, f.sequence, f.id, evt.Metadata{})
 	if err != nil {
 		return nil, err
@@ -48,7 +48,7 @@ func (f *Framework) WithEvents(ctx context.Context, events []evt.Event) (evt.Ent
 }
 
 // Execute runs the given command against the entity and persists any resulting events to the repository
-func (f *Framework) Execute(ctx context.Context, cmd evt.Command, metadata evt.Metadata) (evt.Entity, error) {
+func (f *Framework) Execute(ctx context.Context, cmd evt.Command, metadata evt.Metadata) (evt.Aggregate, error) {
 	if err := f.store.Execute(ctx, f.factory(), f.id, cmd, metadata); err != nil {
 		return nil, err
 	}
@@ -57,12 +57,12 @@ func (f *Framework) Execute(ctx context.Context, cmd evt.Command, metadata evt.M
 }
 
 // Load retrieves the current state of the entity from the store
-func (f *Framework) Load(ctx context.Context) (evt.Entity, error) {
-	entity := f.factory()
+func (f *Framework) Load(ctx context.Context) (evt.Aggregate, error) {
+	aggregate := f.factory()
 
-	if _, err := f.store.LoadEntity(ctx, entity, f.id); err != nil {
+	if _, err := f.store.LoadAggregate(ctx, aggregate, f.id); err != nil {
 		return nil, err
 	}
 
-	return entity, nil
+	return aggregate, nil
 }

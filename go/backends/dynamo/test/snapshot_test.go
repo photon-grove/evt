@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Test retrieving a Snapshot for an Entity
+// Test retrieving a Snapshot for an Aggregate
 func (s *RepositorySuite) Test_GetSnapshot_Success() {
 	ctx := context.Background()
 

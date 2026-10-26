@@ -114,19 +114,19 @@ func (store *Store) declareHistory(ctx context.Context) error {
 
 // commitState returns an entity's state as the commit-wide projectors see it, only when any are
 // registered.
-func (store *Store) commitState(entity evt.Entity) ([]byte, error) {
+func (store *Store) commitState(aggregate evt.Aggregate) ([]byte, error) {
 	if len(store.commitProjectors) == 0 {
 		return nil, nil
 	}
 
-	return generateSnapshotPayload(entity)
+	return generateSnapshotPayload(aggregate)
 }
 
 // stateAfterCommit returns the state of an entity that already reflects a commit's events: the
 // payload of the snapshot the commit writes for it, else its current JSON encoding. The snapshot
 // is the same bytes, so a stream's state is encoded once. It returns nothing when no commit-wide
 // projector is registered.
-func (store *Store) stateAfterCommit(entity evt.Entity, snapshots []evt.SerializedSnapshot) ([]byte, error) {
+func (store *Store) stateAfterCommit(aggregate evt.Aggregate, snapshots []evt.SerializedSnapshot) ([]byte, error) {
 	if len(store.commitProjectors) == 0 {
 		return nil, nil
 	}
@@ -135,5 +135,5 @@ func (store *Store) stateAfterCommit(entity evt.Entity, snapshots []evt.Serializ
 		return snapshots[0].Payload, nil
 	}
 
-	return generateSnapshotPayload(entity)
+	return generateSnapshotPayload(aggregate)
 }

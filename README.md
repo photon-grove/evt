@@ -96,9 +96,9 @@ refuse an uninitialized table rather than scan it.
 When aggregates carry injected dependencies, construct them and pass the instance to `Execute`:
 
 ```go
-entity := NewAccount("acct-1", projectors...)
-err := store.Execute(ctx, entity, "acct-1", command, metadata)
-// entity now holds the post-command state
+aggregate := NewAccount("acct-1", projectors...)
+err := store.Execute(ctx, aggregate, "acct-1", command, metadata)
+// aggregate now holds the post-command state
 ```
 
 ## Packages
@@ -113,7 +113,7 @@ err := store.Execute(ctx, entity, "acct-1", command, metadata)
 | `evt/go/stream` | Stream envelope and DynamoDB Streams handler |
 | `evt/go/projectors` | Projector runtime (SNS/SQS envelope decode, or direct stream) with idempotency and retry classification |
 | `evt/go/policy` | Backend-neutral retry helpers for commit paths |
-| `evt/go/viewstore` | Typed JSON helper around `evt.ViewRepository` |
+| `evt/go/viewcodec` | Typed JSON helper around `evt.ViewRepository` |
 | `evt/go/test` | Test aggregate, commands, events, and helpers for adopters and framework tests |
 
 All packages live under `github.com/photon-grove/evt/go`.
@@ -394,7 +394,7 @@ default:
   jittered; unset delays take those defaults, `snapshots.ImmediateRetryPolicy` opts out of waiting
   for tests, and `Deadline` bounds the whole command; with the defaults the waits total about
   0.4 s, but an ambiguous write that never resolves costs a recovery window per attempt). A conflict on anything the engine can re-derive — an event put, a snapshot or
-  continuity check, an engine-filled fence — **re-prepares** the command: the entity is reset and
+  continuity check, an engine-filled fence — **re-prepares** the command: the aggregate is reset and
   loaded again, the handler (or your `Prepare`) runs again against fresh state, and only the
   attempt that commits writes anything. A failed **caller-stamped** fence fails fast with the
   `stale-fence` rejection instead, because the engine cannot know your decision still holds. When
@@ -406,12 +406,12 @@ default:
   error when attempts run out.
 
   A command whose write set depends on state — a rename that releases whichever handle the
-  entity currently holds — keeps one identity across attempts, because only the targets in its
+  aggregate currently holds — keeps one identity across attempts, because only the targets in its
   `evt.CommandIdentity` are digested. The flip side is a contract: **everything that distinguishes
   the request must be in `Targets` or the payload.** A transfer whose destination is chosen only
   inside `Prepare` has the same identity whichever destination it picks, so a second request with
   the same command ID and a different destination replays the first's outcome instead of running;
-  put the destination in the payload (or the targets). The handler resets the entity between
+  put the destination in the payload (or the targets). The handler resets the aggregate between
   attempts from a deep copy of its exported fields, so keep the state `Apply` changes in exported
   fields, and do not mutate the command in a handler.
 

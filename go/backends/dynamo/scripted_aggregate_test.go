@@ -7,7 +7,7 @@ import (
 	evt "github.com/photon-grove/evt/go"
 )
 
-// scriptedCommand deposits an amount on a scriptedEntity.
+// scriptedCommand deposits an amount on a scriptedAggregate.
 type scriptedCommand struct{ Amount int }
 
 func (*scriptedCommand) Type() evt.CommandType      { return "scripted:deposit" }
@@ -20,23 +20,23 @@ func (*scriptedEvent) Version() evt.EventVersion  { return 1 }
 func (*scriptedEvent) EntityType() evt.EntityType { return "scripted" }
 func (*scriptedEvent) EntityID() evt.EntityID     { return "" }
 
-// scriptedEntity counts how many times its handler ran.
-type scriptedEntity struct {
+// scriptedAggregate counts how many times its handler ran.
+type scriptedAggregate struct {
 	id      evt.EntityID
 	Total   int  `json:"total"`
 	handled *int // shared, so a restore of the entity cannot reset the count
 }
 
-func newScriptedEntity(id evt.EntityID) *scriptedEntity {
-	return &scriptedEntity{id: id, handled: new(int)}
+func newScriptedAggregate(id evt.EntityID) *scriptedAggregate {
+	return &scriptedAggregate{id: id, handled: new(int)}
 }
 
-func (e *scriptedEntity) Type() evt.EntityType                { return "scripted" }
-func (e *scriptedEntity) GetID() evt.EntityID                 { return e.id }
-func (e *scriptedEntity) SetID(id evt.EntityID)               { e.id = id }
-func (e *scriptedEntity) EventUpcasters() []evt.EventUpcaster { return nil }
-func (e *scriptedEntity) Projectors() []evt.EventProjector    { return nil }
-func (e *scriptedEntity) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
+func (e *scriptedAggregate) Type() evt.EntityType                { return "scripted" }
+func (e *scriptedAggregate) GetID() evt.EntityID                 { return e.id }
+func (e *scriptedAggregate) SetID(id evt.EntityID)               { e.id = id }
+func (e *scriptedAggregate) EventUpcasters() []evt.EventUpcaster { return nil }
+func (e *scriptedAggregate) Projectors() []evt.EventProjector    { return nil }
+func (e *scriptedAggregate) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
 	*e.handled++
 
 	c, ok := command.(*scriptedCommand)
@@ -47,7 +47,7 @@ func (e *scriptedEntity) Handle(_ context.Context, command evt.Command) (evt.Com
 	return evt.CommandResult{Events: []evt.Event{&scriptedEvent{Amount: c.Amount}}}, nil
 }
 
-func (e *scriptedEntity) Apply(event evt.Event) error {
+func (e *scriptedAggregate) Apply(event evt.Event) error {
 	deposited, ok := event.(*scriptedEvent)
 	if !ok {
 		return evt.NewBadEventError(event)
@@ -58,7 +58,7 @@ func (e *scriptedEntity) Apply(event evt.Event) error {
 	return nil
 }
 
-func (e *scriptedEntity) DeserializeEvent(serialized evt.SerializedEvent) (evt.Event, error) {
+func (e *scriptedAggregate) DeserializeEvent(serialized evt.SerializedEvent) (evt.Event, error) {
 	var event scriptedEvent
 	if err := json.Unmarshal(serialized.Payload, &event); err != nil {
 		return nil, err

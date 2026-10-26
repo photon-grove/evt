@@ -13,7 +13,7 @@ import (
 func (s *DynamoEventsIntegrationSuite) Test_Load_WithEvents() {
 	ctx := context.Background()
 
-	s.SetupEntity(evt.EntityID(newID()), 5)
+	s.SetupAggregate(evt.EntityID(newID()), 5)
 
 	metadata := s.getMetadata(ctx)
 
@@ -21,14 +21,14 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithEvents() {
 	otherValue := "test-other-value"
 
 	// Add with an initial value
-	result, err := s.entity.Handle(ctx, &test.CreateEntity{
+	result, err := s.aggregate.Handle(ctx, &test.CreateAggregate{
 		Value: "test-value",
 		Other: &otherValue,
 	})
 	require.NoError(s.T(), err)
 
 	// Then update the value
-	updateResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
+	updateResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
 		Value: updatedValue,
 		Other: &otherValue,
 	})
@@ -36,16 +36,16 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithEvents() {
 
 	result.Events = append(result.Events, updateResult.Events...)
 
-	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
+	_, err = s.store.Commit(ctx, result, s.cc, metadata)
 	require.NoError(s.T(), err)
 
 	// Load the entity again to retrieve events from memory
-	s.SetupEntity(s.entityID, 5)
+	s.SetupAggregate(s.entityID, 5)
 
 	// The hydrated entity should have the updated value
-	require.EqualValues(s.T(), test.Entity{
-		ID:    s.entity.ID,
+	require.EqualValues(s.T(), test.Aggregate{
+		ID:    s.aggregate.ID,
 		Value: "updated-value",
 		Other: &otherValue,
-	}, *s.entity)
+	}, *s.aggregate)
 }

@@ -16,7 +16,7 @@ import (
 func rebuildCommit(t *testing.T, repo evt.Repository, id evt.EntityID, sequence evt.EventSequence) error {
 	t.Helper()
 
-	events, err := evt.SerializeEvents([]evt.Event{&test.EntityUpdated{ID: id, Value: "v"}}, sequence-1, id, evt.Metadata{})
+	events, err := evt.SerializeEvents([]evt.Event{&test.AggregateUpdated{ID: id, Value: "v"}}, sequence-1, id, evt.Metadata{})
 	require.NoError(t, err)
 
 	for i := range events {

@@ -52,11 +52,11 @@ func (s transactionSetup) seed(t *testing.T, id evt.EntityID, updates int, metad
 	t.Helper()
 	ctx := context.Background()
 
-	entity := test.NewEntity(id)
-	require.NoError(t, s.store.Execute(ctx, entity, id, &test.CreateEntity{Value: "created"}, metadata))
+	aggregate := test.NewAggregate(id)
+	require.NoError(t, s.store.Execute(ctx, aggregate, id, &test.CreateAggregate{Value: "created"}, metadata))
 
 	for range updates {
-		require.NoError(t, s.store.Execute(ctx, entity, id, &test.ReplaceEntity{Value: "updated"}, metadata))
+		require.NoError(t, s.store.Execute(ctx, aggregate, id, &test.ReplaceAggregate{Value: "updated"}, metadata))
 	}
 
 	s.repo.committed = nil
@@ -65,15 +65,15 @@ func (s transactionSetup) seed(t *testing.T, id evt.EntityID, updates int, metad
 func (s transactionSetup) read(t *testing.T, tx *snapshots.Transaction, id evt.EntityID) {
 	t.Helper()
 
-	require.NoError(t, tx.Read(context.Background(), test.NewEntity(id), id))
+	require.NoError(t, tx.Read(context.Background(), test.NewAggregate(id), id))
 }
 
 func updated(id evt.EntityID) evt.Event {
-	return &test.EntityUpdated{ID: id, Value: "transaction"}
+	return &test.AggregateUpdated{ID: id, Value: "transaction"}
 }
 
 func created(id evt.EntityID) evt.Event {
-	return &test.EntityCreated{ID: id, Value: "transaction"}
+	return &test.AggregateCreated{ID: id, Value: "transaction"}
 }
 
 func TestTransaction_EngineFillsFenceHeadsForUnwrittenReads(t *testing.T) {
@@ -149,8 +149,8 @@ func TestTransaction_StaleEngineFenceIsRetryableAndWritesNothing(t *testing.T) {
 	require.NoError(t, tx.Append("tx-target", created("tx-target")))
 
 	// Another writer moves the fenced stream past the head the transaction read.
-	other := test.NewEntity("tx-fenced")
-	require.NoError(t, setup.store.Execute(ctx, other, "tx-fenced", &test.ReplaceEntity{Value: "moved"}, metadata))
+	other := test.NewAggregate("tx-fenced")
+	require.NoError(t, setup.store.Execute(ctx, other, "tx-fenced", &test.ReplaceAggregate{Value: "moved"}, metadata))
 
 	_, err := tx.Commit(ctx, metadata)
 	require.Error(t, err)
@@ -257,7 +257,7 @@ func TestTransaction_IsSingleUse(t *testing.T) {
 
 	_, err = tx.Commit(ctx, metadata)
 	require.ErrorContains(t, err, "already consumed")
-	require.ErrorContains(t, tx.Read(ctx, test.NewEntity("tx-other"), "tx-other"), "already consumed")
+	require.ErrorContains(t, tx.Read(ctx, test.NewAggregate("tx-other"), "tx-other"), "already consumed")
 	require.ErrorContains(t, tx.Append("tx-once", updated("tx-once")), "already consumed")
 	require.ErrorContains(t, tx.Fence(evt.ReadFence{EntityID: "tx-other"}), "already consumed")
 	require.Len(t, getEvents(t, setup.repo, "tx-once"), 1)
@@ -283,7 +283,7 @@ func TestTransaction_ValidationErrorsAreRecoverableAndStateErrorsConsume(t *test
 	tx := setup.store.Transaction()
 	setup.read(t, tx, "tx-known")
 	require.Error(t, tx.Read(ctx, nil, "tx-nil"))
-	require.Error(t, tx.Read(ctx, test.NewEntity("tx-known"), "tx-known"))
+	require.Error(t, tx.Read(ctx, test.NewAggregate("tx-known"), "tx-known"))
 	require.Error(t, tx.Append("tx-unread", created("tx-unread")))
 	require.NoError(t, tx.Append("tx-known", created("tx-known")))
 	_, err := tx.Commit(ctx, newTestMetadata())
@@ -355,7 +355,7 @@ func TestTransaction_RefusesARepositoryWithoutTheTransactionCapability(t *testin
 	store := snapshots.NewStore(plainRepository{Repository: recording}, 0)
 
 	tx := store.Transaction()
-	err := tx.Read(ctx, test.NewEntity("tx-plain"), "tx-plain")
+	err := tx.Read(ctx, test.NewAggregate("tx-plain"), "tx-plain")
 
 	var unsupported *evt.TransactionsUnsupportedError
 	require.ErrorAs(t, err, &unsupported)
@@ -372,8 +372,8 @@ func TestTransaction_RefusesARepositoryWithoutTheTransactionCapability(t *testin
 	require.NoError(t, evt.RequireTransactions(mem.NewRepository()))
 }
 
-// claimEntity is a second aggregate type for transactions that mix entity types.
-type claimEntity struct {
+// claimAggregate is a second aggregate type for transactions that mix entity types.
+type claimAggregate struct {
 	ID     evt.EntityID `json:"id"`
 	Holder string       `json:"holder"`
 }
@@ -393,17 +393,17 @@ func (e claimTakenEvent) EntityID() evt.EntityID   { return e.ID }
 func (claimTakenEvent) Type() evt.EventType        { return claimTaken }
 func (claimTakenEvent) Version() evt.EventVersion  { return 1 }
 
-func newClaim(id evt.EntityID) *claimEntity {
-	return &claimEntity{ID: id}
+func newClaim(id evt.EntityID) *claimAggregate {
+	return &claimAggregate{ID: id}
 }
 
-func (c *claimEntity) Type() evt.EntityType { return claimType }
-func (c *claimEntity) GetID() evt.EntityID  { return c.ID }
-func (c *claimEntity) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
+func (c *claimAggregate) Type() evt.EntityType { return claimType }
+func (c *claimAggregate) GetID() evt.EntityID  { return c.ID }
+func (c *claimAggregate) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
 	return evt.CommandResult{}, fmt.Errorf("claim handles no commands in this test")
 }
 
-func (c *claimEntity) Apply(event evt.Event) error {
+func (c *claimAggregate) Apply(event evt.Event) error {
 	taken, ok := event.(*claimTakenEvent)
 	if !ok {
 		return evt.NewBadEventError(event)
@@ -413,7 +413,7 @@ func (c *claimEntity) Apply(event evt.Event) error {
 	return nil
 }
 
-func (c *claimEntity) DeserializeEvent(serialized evt.SerializedEvent) (evt.Event, error) {
+func (c *claimAggregate) DeserializeEvent(serialized evt.SerializedEvent) (evt.Event, error) {
 	var event claimTakenEvent
 	if err := json.Unmarshal(serialized.Payload, &event); err != nil {
 		return nil, err
@@ -421,8 +421,8 @@ func (c *claimEntity) DeserializeEvent(serialized evt.SerializedEvent) (evt.Even
 
 	return &event, nil
 }
-func (c *claimEntity) EventUpcasters() []evt.EventUpcaster { return nil }
-func (c *claimEntity) Projectors() []evt.EventProjector    { return nil }
+func (c *claimAggregate) EventUpcasters() []evt.EventUpcaster { return nil }
+func (c *claimAggregate) Projectors() []evt.EventProjector    { return nil }
 
 func TestTransaction_MixesEntityTypesAndFencesReadOnlyStreamsOfAnyType(t *testing.T) {
 	setup := newTransactionSetup(0)
@@ -502,7 +502,7 @@ func TestTransaction_AnEmptyCommandIDIsNeverADuplicate(t *testing.T) {
 	require.NoError(t, err, "an empty command ID is absent, not a duplicate")
 
 	// The single-stream path agrees: the same empty ID twice is not a duplicate.
-	entity := test.NewEntity("tx-empty-single")
-	require.NoError(t, setup.store.Execute(ctx, entity, "tx-empty-single", &test.CreateEntity{Value: "one"}, metadata))
-	require.NoError(t, setup.store.Execute(ctx, entity, "tx-empty-single", &test.ReplaceEntity{Value: "two"}, metadata))
+	aggregate := test.NewAggregate("tx-empty-single")
+	require.NoError(t, setup.store.Execute(ctx, aggregate, "tx-empty-single", &test.CreateAggregate{Value: "one"}, metadata))
+	require.NoError(t, setup.store.Execute(ctx, aggregate, "tx-empty-single", &test.ReplaceAggregate{Value: "two"}, metadata))
 }

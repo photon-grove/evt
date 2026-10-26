@@ -49,14 +49,14 @@ func TestSerializeEvents(t *testing.T) {
 	assert.Equal(t, mockEvent, unmarshaled)
 }
 
-func TestSerializeEventsWithContext(t *testing.T) {
+func TestSerializeEventsWithCommandContext(t *testing.T) {
 	// Setup
 	entityID := EntityID("test-entity-1")
 	seq := EventSequence(5)
 	snapshot := EventSequence(0)
 
-	ctx := &Context{
-		Entity:          nil,
+	cc := &CommandContext{
+		Aggregate:       nil,
 		EntityID:        entityID,
 		CurrentSequence: &seq,
 		CurrentSnapshot: &snapshot,
@@ -73,7 +73,7 @@ func TestSerializeEventsWithContext(t *testing.T) {
 	events := []Event{mockEvent}
 
 	// Execute
-	serialized, err := SerializeEventsWithContext(events, ctx, metadata)
+	serialized, err := SerializeEventsWithCommandContext(events, cc, metadata)
 
 	// Verify
 	require.NoError(t, err)
@@ -85,11 +85,11 @@ func TestSerializeEventsWithContext(t *testing.T) {
 	assert.Equal(t, entityID, sEvent.EntityID)
 }
 
-func TestSerializeEventsWithContext_NilContext(t *testing.T) {
+func TestSerializeEventsWithCommandContext_NilContext(t *testing.T) {
 	events := []Event{MockEvent{}}
 	metadata := NewMetadata(context.Background(), nil)
 
-	_, err := SerializeEventsWithContext(events, nil, metadata)
+	_, err := SerializeEventsWithCommandContext(events, nil, metadata)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "context not found")
 }
@@ -109,11 +109,11 @@ func TestDeserializeEvent(t *testing.T) {
 		Payload:  mockPayload,
 	}
 
-	// Mock Entity that implements simple deserialization
-	entity := &MockTestEntity{}
+	// Mock Aggregate that implements simple deserialization
+	aggregate := &MockTestAggregate{}
 
 	// Execute
-	event, err := DeserializeEvent(serialized, entity)
+	event, err := DeserializeEvent(serialized, aggregate)
 
 	// Verify
 	require.NoError(t, err)
@@ -137,9 +137,9 @@ func TestDeserializeEvent_WithUpcaster(t *testing.T) {
 		Payload:  mockPayload,
 	}
 
-	// Mock Entity with Upcaster
+	// Mock Aggregate with Upcaster
 	// The upcaster should convert V1 to V2
-	entity := &MockTestEntity{
+	aggregate := &MockTestAggregate{
 		Upcasters: []EventUpcaster{
 			&MockUpcaster{
 				TargetType: "TestEventV1",
@@ -151,7 +151,7 @@ func TestDeserializeEvent_WithUpcaster(t *testing.T) {
 	}
 
 	// Execute
-	event, err := DeserializeEvent(serialized, entity)
+	event, err := DeserializeEvent(serialized, aggregate)
 
 	// Verify
 	require.NoError(t, err)
@@ -167,7 +167,7 @@ func TestDeserializeEvent_FailClosedWrapsDeserializeError(t *testing.T) {
 		Payload: []byte(`{}`),
 	}
 
-	_, err := DeserializeEvent(serialized, &failingDeserializeEntity{})
+	_, err := DeserializeEvent(serialized, &failingDeserializeAggregate{})
 	require.Error(t, err)
 	require.True(t, IsReplayStrictnessErr(err))
 
@@ -244,19 +244,19 @@ func TestCalculateAdditionalEvents(t *testing.T) {
 
 // Helpers for testing
 
-type MockTestEntity struct {
+type MockTestAggregate struct {
 	Upcasters []EventUpcaster
 }
 
-func (e *MockTestEntity) Type() EntityType { return "TestEntity" }
-func (e *MockTestEntity) GetID() EntityID  { return "id" }
-func (e *MockTestEntity) Handle(context.Context, Command) (CommandResult, error) {
+func (e *MockTestAggregate) Type() EntityType { return "TestEntity" }
+func (e *MockTestAggregate) GetID() EntityID  { return "id" }
+func (e *MockTestAggregate) Handle(context.Context, Command) (CommandResult, error) {
 	return CommandResult{}, nil
 }
-func (e *MockTestEntity) Apply(Event) error               { return nil }
-func (e *MockTestEntity) EventUpcasters() []EventUpcaster { return e.Upcasters }
-func (e *MockTestEntity) Projectors() []EventProjector    { return nil }
-func (e *MockTestEntity) DeserializeEvent(se SerializedEvent) (Event, error) {
+func (e *MockTestAggregate) Apply(Event) error               { return nil }
+func (e *MockTestAggregate) EventUpcasters() []EventUpcaster { return e.Upcasters }
+func (e *MockTestAggregate) Projectors() []EventProjector    { return nil }
+func (e *MockTestAggregate) DeserializeEvent(se SerializedEvent) (Event, error) {
 	// Simple mock implementation
 	mockEvent := MockEvent{
 		EventType:    se.Type,
@@ -267,11 +267,11 @@ func (e *MockTestEntity) DeserializeEvent(se SerializedEvent) (Event, error) {
 	return mockEvent, nil
 }
 
-type failingDeserializeEntity struct {
-	MockTestEntity
+type failingDeserializeAggregate struct {
+	MockTestAggregate
 }
 
-func (e *failingDeserializeEntity) DeserializeEvent(se SerializedEvent) (Event, error) {
+func (e *failingDeserializeAggregate) DeserializeEvent(se SerializedEvent) (Event, error) {
 	return nil, fmt.Errorf("unknown event type: %s", se.Type)
 }
 
@@ -290,4 +290,158 @@ func (u *MockUpcaster) Upcast(se SerializedEvent) (SerializedEvent, error) {
 	se.Type = u.NewType
 	se.Version = u.NewVer
 	return se, nil
+}
+
+func TestSerializedEventDecodePreservesValues(t *testing.T) {
+	for _, unmarshal := range []func([]byte, *SerializedEvent) error{
+		func(data []byte, event *SerializedEvent) error { return json.Unmarshal(data, event) },
+		UnmarshalEvent,
+	} {
+		event := SerializedEvent{ID: "account-1:1", Payload: []byte(`{}`)}
+		require.NoError(t, unmarshal([]byte(`{"metadata":{"commandId":"cmd-1"}}`), &event))
+		require.Equal(t, EventID("account-1:1"), event.ID)
+		require.Equal(t, []byte(`{}`), event.Payload)
+		require.Equal(t, CommandID("cmd-1"), *event.Metadata.CommandID)
+		require.Nil(t, event.Metadata.CausationID)
+		require.Nil(t, event.Metadata.Extensions)
+
+		encoded, err := json.Marshal(event)
+		require.NoError(t, err)
+		require.Contains(t, string(encoded), `"causationId":"cmd-1","extensions":{}`)
+		require.Nil(t, event.Metadata.CausationID)
+		require.Nil(t, event.Metadata.Extensions)
+
+		require.NoError(t, unmarshal([]byte(`null`), &event))
+		require.Equal(t, EventID("account-1:1"), event.ID)
+		require.Error(t, unmarshal([]byte(`{"payload":"not-base64!"}`), &event))
+		require.Equal(t, []byte(`{}`), event.Payload)
+		require.Error(t, unmarshal([]byte(`{}`), nil))
+	}
+}
+
+// These tests document the SerializedSnapshot structure and its serialization behavior.
+
+func Test_SerializedSnapshot_Creation(t *testing.T) {
+	snapshot := SerializedSnapshot{
+		EntityType:    EntityType("User"),
+		EntityID:      EntityID("user-123"),
+		Sequence:      EventSequence(5),
+		EventSequence: EventSequence(25),
+		Payload:       []byte(`{"id":"user-123","name":"John","isActive":true}`),
+	}
+
+	require.Equal(t, EntityType("User"), snapshot.EntityType)
+	require.Equal(t, EntityID("user-123"), snapshot.EntityID)
+	require.Equal(t, EventSequence(5), snapshot.Sequence)
+	require.Equal(t, EventSequence(25), snapshot.EventSequence)
+	require.Contains(t, string(snapshot.Payload), "John")
+}
+
+func Test_SerializedSnapshot_ZeroValue(t *testing.T) {
+	var snapshot SerializedSnapshot
+
+	require.Equal(t, EntityType(""), snapshot.EntityType)
+	require.Equal(t, EntityID(""), snapshot.EntityID)
+	require.Equal(t, EventSequence(0), snapshot.Sequence)
+	require.Equal(t, EventSequence(0), snapshot.EventSequence)
+	require.Nil(t, snapshot.Payload)
+}
+
+func Test_SerializedSnapshot_JSONSerialization(t *testing.T) {
+	snapshot := SerializedSnapshot{
+		EntityType:    "Order",
+		EntityID:      "order-456",
+		Sequence:      10,
+		EventSequence: 100,
+		Payload:       []byte(`{"status":"completed"}`),
+	}
+
+	// Test JSON marshaling
+	data, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	// Verify JSON field names
+	var fields map[string]interface{}
+	err = json.Unmarshal(data, &fields)
+	require.NoError(t, err)
+
+	require.Contains(t, fields, "entityType")
+	require.Contains(t, fields, "entityID")
+	require.Contains(t, fields, "sequence")
+	require.Contains(t, fields, "eventSequence")
+	require.Contains(t, fields, "payload")
+}
+
+func Test_SerializedSnapshot_JSONDeserialization(t *testing.T) {
+	jsonData := `{
+		"entityType": "Product",
+		"entityID": "prod-789",
+		"sequence": 3,
+		"eventSequence": 15,
+		"payload": "eyJza3UiOiJQUk9ELTEyMyJ9"
+	}`
+
+	var snapshot SerializedSnapshot
+	err := json.Unmarshal([]byte(jsonData), &snapshot)
+	require.NoError(t, err)
+
+	require.Equal(t, EntityType("Product"), snapshot.EntityType)
+	require.Equal(t, EntityID("prod-789"), snapshot.EntityID)
+	require.Equal(t, EventSequence(3), snapshot.Sequence)
+	require.Equal(t, EventSequence(15), snapshot.EventSequence)
+}
+
+func Test_SerializedSnapshot_Roundtrip(t *testing.T) {
+	original := SerializedSnapshot{
+		EntityType:    "Customer",
+		EntityID:      "cust-abc",
+		Sequence:      7,
+		EventSequence: 35,
+		Payload:       []byte(`{"email":"test@example.com","tier":"premium"}`),
+	}
+
+	// Marshal
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+
+	// Unmarshal
+	var roundtripped SerializedSnapshot
+	err = json.Unmarshal(data, &roundtripped)
+	require.NoError(t, err)
+
+	require.Equal(t, original.EntityType, roundtripped.EntityType)
+	require.Equal(t, original.EntityID, roundtripped.EntityID)
+	require.Equal(t, original.Sequence, roundtripped.Sequence)
+	require.Equal(t, original.EventSequence, roundtripped.EventSequence)
+	// Payload comparison needs care due to base64 encoding
+	require.NotNil(t, roundtripped.Payload)
+}
+
+func Test_SerializedSnapshot_SequenceRelationship(t *testing.T) {
+	// Document the relationship between Sequence (snapshot count) and EventSequence (event count)
+	// Sequence starts at 1 for the first snapshot
+	// EventSequence represents the last event included in the snapshot
+
+	testCases := []struct {
+		name          string
+		sequence      EventSequence
+		eventSequence EventSequence
+		description   string
+	}{
+		{"First snapshot", 1, 5, "First snapshot taken after 5 events"},
+		{"Second snapshot", 2, 10, "Second snapshot at event 10"},
+		{"Many snapshots", 10, 50, "Tenth snapshot at event 50"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := SerializedSnapshot{
+				Sequence:      tc.sequence,
+				EventSequence: tc.eventSequence,
+			}
+
+			// EventSequence should always be >= Sequence (since multiple events per snapshot)
+			require.GreaterOrEqual(t, int(snapshot.EventSequence), int(snapshot.Sequence))
+		})
+	}
 }

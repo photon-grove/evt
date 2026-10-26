@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Test retrieving Events for an Entity
+// Test retrieving Events for an Aggregate
 func (s *RepositorySuite) Test_GetEvents_Success() {
 	ctx := context.Background()
 
@@ -66,7 +66,7 @@ func (s *RepositorySuite) Test_GetEvents_Success() {
 	require.Equal(s.T(), expected, eventsList)
 }
 
-// Test retrieving Events after a particular sequence for an Entity with a Snapshot
+// Test retrieving Events after a particular sequence for an Aggregate with a Snapshot
 func (s *RepositorySuite) Test_GetLatestEvents_Success() {
 	ctx := context.Background()
 
