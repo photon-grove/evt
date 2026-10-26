@@ -1,6 +1,6 @@
 export const repoUrl = 'https://github.com/photon-grove/evt'
 
-export const installCommand = 'go get github.com/photon-grove/evt'
+export const installCommand = 'go get github.com/photon-grove/evt/go'
 
 // The aggregate contract is the same for the memory and DynamoDB stores.
 export const quickStartCode = `// Start with the in-memory repository.
@@ -61,15 +61,15 @@ export const gettingStarted = [
 ]
 
 export const packages = [
-  {name: 'evt', body: 'Aggregate, command, event, metadata, transaction, repository, and rebuild contracts.'},
-  {name: 'evt/mem', body: 'In-memory repository and store for fast unit tests.'},
-  {name: 'evt/dynamo', body: 'DynamoDB event log, snapshots, views, stream helpers, and transaction groups.'},
-  {name: 'evt/snapshots', body: 'Store with snapshot loading and configurable write thresholds.'},
-  {name: 'evt/stream', body: 'Stream envelope and DynamoDB Streams handler.'},
-  {name: 'evt/projectors', body: 'Projector runtime for SNS/SQS envelopes (or the direct stream) with idempotency and retry classification.'},
-  {name: 'evt/policy', body: 'Backend-neutral retry helpers for commit paths.'},
-  {name: 'evt/viewstore', body: 'Typed JSON helper around evt.ViewRepository.'},
-  {name: 'evt/test', body: 'Shared test aggregate, commands, events, and helpers for adopters.'},
+  {name: 'evt/go', body: 'Aggregate, command, event, metadata, transaction, repository, and rebuild contracts.'},
+  {name: 'evt/go/backends/mem', body: 'In-memory repository and store for fast unit tests.'},
+  {name: 'evt/go/backends/dynamo', body: 'DynamoDB event log, snapshots, views, stream helpers, and transaction groups.'},
+  {name: 'evt/go/snapshots', body: 'Store with snapshot loading and configurable write thresholds.'},
+  {name: 'evt/go/stream', body: 'Stream envelope and DynamoDB Streams handler.'},
+  {name: 'evt/go/projectors', body: 'Projector runtime for SNS/SQS envelopes (or the direct stream) with idempotency and retry classification.'},
+  {name: 'evt/go/policy', body: 'Backend-neutral retry helpers for commit paths.'},
+  {name: 'evt/go/viewstore', body: 'Typed JSON helper around evt.ViewRepository.'},
+  {name: 'evt/go/test', body: 'Shared test aggregate, commands, events, and helpers for adopters.'},
 ]
 
 export const cookbook: ContentCard[] = [
@@ -108,7 +108,7 @@ export const cookbook: ContentCard[] = [
 export const examples = [
   {
     title: 'In-memory aggregate test',
-    command: 'go test ./examples/banking',
+    command: 'go -C go test ./examples/banking',
     body: 'A compact aggregate that opens and deposits to an account using mem.NewRepository.',
   },
   {

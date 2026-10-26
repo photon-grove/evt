@@ -1,6 +1,6 @@
 # PostgreSQL Integration
 
-The `evt/postgres` package implements the same backend-neutral `evt.Repository`
+The `evt/go/backends/postgres` package implements the same backend-neutral `evt.Repository`
 and `evt.Store` contracts as DynamoDB, on a relational store. The aggregate,
 projector, and snapshot code you write does not change between backends — only
 the wiring does. The backend passes `conformance.RunRepositorySuite` with

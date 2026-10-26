@@ -16,14 +16,14 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 | `fixtures/lambda.json`    | Rust generator | X3 `photon-evt-lambda` vectors (ADR 0005, Rust-first): the event source mapping filter patterns, DynamoDB Streams records (events, engine items, journal rows and counters, in each view type) with what the decoders make of them (an event, a wake-up, a skip, or an error) and which filters match them, and the partial batch failure responses. Regenerate with `EVT_UPDATE_FIXTURES=1 cargo test -p photon-evt-lambda --all-features --test fixtures`. |
 | `fixtures/scenarios.json` | Go generator | For each scenario: stored events and snapshot, DynamoDB items (including the stream head item at `sk = -1`), the stream's `head` (the PostgreSQL heads row), SNS messages, sequences, and loaded state; the view rows commit-wide projectors left in the scenario's partitions (`views`); and the `TransactWriteItems` action order of each transaction step, where an action on the views table carries `table: "views"` and its string sort key in `skText`. |
 
-Both sides implement the same account domain: `internal/compat/account.go` and
+Both sides implement the same account domain: `go/internal/compat/account.go` and
 `crates/evt-compat/src/account.rs`. Keep them identical, field for field and rule for rule.
 
 ## Tests
 
 | Command                                  | Checks                                                                                                         |
 | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `go test ./internal/compat`              | The Go output still matches the fixtures.                                                                      |
+| `go -C go test ./internal/compat`              | The Go output still matches the fixtures.                                                                      |
 | `cargo test -p evt-compat`               | The Rust output matches the fixtures byte for byte, running every step in Rust against `MemRepository`.        |
 | `scripts/compat-integration.sh dynamo`   | Go and Rust take turns writing the same streams in the local DynamoDB emulator, then both verify every stream. |
 | `scripts/compat-integration.sh postgres` | The same against local PostgreSQL.                                                                             |
@@ -54,7 +54,7 @@ runs them, together with the Rust conformance suite, as `evt-rust:integration` a
 Fixtures change only when the storage format changes on purpose:
 
 ```sh
-go test ./internal/compat -run TestFixtures -update
+go -C go test ./internal/compat -run TestFixtures -update
 cargo test --workspace
 ```
 

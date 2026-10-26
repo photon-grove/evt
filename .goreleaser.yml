@@ -2,12 +2,20 @@ version: 2
 
 project_name: evt
 
+# The Go module is released under go/vX.Y.Z tags, and goreleaser only parses plain semver tags.
+# The release workflow gives it a local, never pushed vX.Y.Z tag to build from, and uploads the
+# artifacts to the go/vX.Y.Z release that release-please already created. So goreleaser neither
+# creates the release nor writes its notes.
+release:
+  disable: true
+
 before:
   hooks:
-    - go mod tidy
+    - sh -c 'cd go && go mod tidy'
 
 builds:
   - id: evt-doctor
+    dir: go
     main: ./cmd/evt-doctor
     binary: evt-doctor
     env:
@@ -35,4 +43,4 @@ snapshot:
   version_template: "{{ incpatch .Version }}-next"
 
 changelog:
-  use: github
+  disable: true

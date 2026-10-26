@@ -1,5 +1,5 @@
 //! Asserts the Rust implementation against the golden fixtures the Go implementation generated.
-//! Regenerate them with `go test ./internal/compat -run TestFixtures -update`.
+//! Regenerate them with `go -C go test ./internal/compat -run TestFixtures -update`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, UNIX_EPOCH};

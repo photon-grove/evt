@@ -4,7 +4,7 @@
 
 ```sh
 pnpm install
-go test ./...
+(cd go && go test ./...)
 moon run evt:lint
 moon run website:build
 ```
@@ -39,8 +39,8 @@ The Go and Rust implementations share one storage format
 ([spec](docs/spec/storage-format.md)). A change to DynamoDB items, PostgreSQL rows,
 serialized JSON, envelopes, or the snapshot policy must:
 
-1. regenerate the fixtures with `go test ./internal/compat -run TestFixtures -update`;
-2. pass `go test ./...` and `cargo test --workspace`;
+1. regenerate the fixtures with `go -C go test ./internal/compat -run TestFixtures -update`;
+2. pass `go test ./...` from `go/` and `cargo test --workspace`;
 3. pass both live cross-language runs;
 4. keep older stored data readable (upcasters plus fixture coverage);
 5. update the spec. See [`compat/README.md`](compat/README.md).

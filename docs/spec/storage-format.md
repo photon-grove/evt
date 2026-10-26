@@ -2582,7 +2582,7 @@ stored items gain the head item, and each PostgreSQL stream a heads row recorded
 `streamHeads`, with the commit budget's item sizes, and the fresh-table declaration under
 `commits`) and edited `compat/scenarios.json` (new `stream-heads-snapshot-guard` and
 `stream-heads-drift`, with the `putSnapshot` and `appendRawBypassingHead` ops). It also touched
-`internal/compat/fakedynamo.go` (an `Update` action and the new condition strings), the in-memory
+`go/internal/compat/fakedynamo.go` (an `Update` action and the new condition strings), the in-memory
 backends, both conformance suites, `BEHAVIORAL_INVARIANTS.md`, `docs/dynamodb.md`, and
 `docs/streams.md`. The migration scenarios (`stream-heads-migration`, `stream-heads-compaction`)
 are not in the shared scenarios yet. The migration is Go only, and a shared fixture table cannot be
@@ -3506,7 +3506,7 @@ tool is Go only and covered by the Go live suites. See
 
 The v0.9 core reshape (C1–C10) extends `compat/scenarios.json` with the interleaved Go/Rust
 scenarios below. Go generates the core golden fixtures for them
-(`go test ./internal/compat -run TestFixtures -update`), Rust must reproduce them byte for byte,
+(`go -C go test ./internal/compat -run TestFixtures -update`), Rust must reproduce them byte for byte,
 and the live interleaved runs (`scripts/compat-integration.sh dynamo|postgres`) execute the same
 steps on real backends. **E2.8** (Go conformance suite + fixtures) and **E3.8** (Rust conformance
 suite + the live runs) must implement every scenario in this list; the names are the shared keys
@@ -3573,7 +3573,7 @@ with the table settled.
 The format changes only on purpose. A change must:
 
 1. Update the Go implementation and regenerate the fixtures:
-   `go test ./internal/compat -run TestFixtures -update`.
+   `go -C go test ./internal/compat -run TestFixtures -update`.
 2. Update the Rust implementation until `cargo test --workspace` passes against the new fixtures.
 3. Pass the live cross-language suite on both backends (`scripts/compat-integration.sh`).
 4. Keep older stored data readable: add upcasters for changed event payloads and fixture coverage

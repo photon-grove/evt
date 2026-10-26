@@ -1,6 +1,6 @@
 //! Asserts the Rust view repository encoding and the typed view codec against the golden fixtures
 //! the Go implementation generated (`compat/fixtures/views.json`). Regenerate them with
-//! `go test ./internal/compat -run TestFixtures -update`.
+//! `go -C go test ./internal/compat -run TestFixtures -update`.
 
 use std::collections::BTreeMap;
 

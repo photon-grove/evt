@@ -35,13 +35,13 @@ your application needs.
 ## Install
 
 ```sh
-go get github.com/photon-grove/evt
+go get github.com/photon-grove/evt/go
 ```
 
 ## Quick Start
 
 An aggregate handles commands, emits events, and folds those events into state.
-Here is the shape of one — see [`examples/banking`](examples/banking) for the full
+Here is the shape of one — see [`go/examples/banking`](go/examples/banking) for the full
 runnable version:
 
 ```go
@@ -105,18 +105,18 @@ err := store.Execute(ctx, entity, "acct-1", command, metadata)
 
 | Package | Purpose |
 | --- | --- |
-| `evt` | Core aggregate, command, event, metadata, transaction, repository, and rebuild contracts |
-| `evt/mem` | In-memory repository and store for unit tests |
-| `evt/dynamo` | DynamoDB event log, snapshots, views, stream helpers, and transaction groups |
-| `evt/postgres` | PostgreSQL event log and snapshots — the same `evt.Repository` contract on a relational store |
-| `evt/snapshots` | Store with snapshot loading and write thresholds |
-| `evt/stream` | Stream envelope and DynamoDB Streams handler |
-| `evt/projectors` | Projector runtime (SNS/SQS envelope decode, or direct stream) with idempotency and retry classification |
-| `evt/policy` | Backend-neutral retry helpers for commit paths |
-| `evt/viewstore` | Typed JSON helper around `evt.ViewRepository` |
-| `evt/test` | Test aggregate, commands, events, and helpers for adopters and framework tests |
+| `evt/go` | Core aggregate, command, event, metadata, transaction, repository, and rebuild contracts |
+| `evt/go/backends/mem` | In-memory repository and store for unit tests |
+| `evt/go/backends/dynamo` | DynamoDB event log, snapshots, views, stream helpers, and transaction groups |
+| `evt/go/backends/postgres` | PostgreSQL event log and snapshots — the same `evt.Repository` contract on a relational store |
+| `evt/go/snapshots` | Store with snapshot loading and write thresholds |
+| `evt/go/stream` | Stream envelope and DynamoDB Streams handler |
+| `evt/go/projectors` | Projector runtime (SNS/SQS envelope decode, or direct stream) with idempotency and retry classification |
+| `evt/go/policy` | Backend-neutral retry helpers for commit paths |
+| `evt/go/viewstore` | Typed JSON helper around `evt.ViewRepository` |
+| `evt/go/test` | Test aggregate, commands, events, and helpers for adopters and framework tests |
 
-All packages live under `github.com/photon-grove/evt`.
+All packages live under `github.com/photon-grove/evt/go`.
 
 ## Removals
 
@@ -537,7 +537,7 @@ and DynamoDB schema guarantees.
 
 ```sh
 pnpm install
-go test ./...
+(cd go && go test ./...)
 moon run evt:test
 moon run evt:lint
 ```

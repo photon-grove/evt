@@ -17,8 +17,8 @@ jobs:
   release-please:
     runs-on: ubuntu-24.04-arm
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      go_release_created: ${{ steps.release.outputs['go--release_created'] }}
+      go_tag_name: ${{ steps.release.outputs['go--tag_name'] }}
       crate_release_created: ${{ steps.release.outputs['crates/evt--release_created'] }}
       crate_tag_name: ${{ steps.release.outputs['crates/evt--tag_name'] }}
       lambda_release_created: ${{ steps.release.outputs['crates/evt-lambda--release_created'] }}
@@ -30,27 +30,43 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+  # Builds evt-doctor for the Go module's go/vX.Y.Z release. goreleaser only parses plain semver
+  # tags, so it builds from a local vX.Y.Z tag that is never pushed, and the archives are uploaded
+  # to the go/vX.Y.Z release that release-please already created.
   goreleaser:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    if: ${{ needs.release-please.outputs.go_release_created == 'true' }}
     runs-on: ubuntu-24.04-arm
+    env:
+      GO_TAG: ${{ needs.release-please.outputs.go_tag_name }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release-please.outputs.go_tag_name }}
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Tag the build with plain semver
+        run: |
+          semver_tag="v${GO_TAG#go/v}"
+          git tag "$semver_tag"
+          echo "GORELEASER_CURRENT_TAG=$semver_tag" >> "$GITHUB_ENV"
 
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: latest
           args: release --clean
+
+      - name: Upload the archives to the go release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$GO_TAG" dist/*.tar.gz dist/checksums.txt --clobber
 
   # Publishes photon-evt when release-please tags a crate release (photon-evt-vX.Y.Z).
   # crates.io only allows trusted publishing (OIDC) for crates that already exist, so the first
