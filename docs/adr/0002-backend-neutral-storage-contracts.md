@@ -86,7 +86,7 @@ against any `evt.Repository`. Backends wire it from their own test packages:
 `SuiteOptions` gates guarantees that not every backend provides (e.g. the in-memory test double does
 not enforce optimistic concurrency). The suite namespaces its data per run so it is safe against a
 shared durable table. The required storage invariants it checks are documented in
-`BEHAVIORAL_INVARIANTS.md` ("Backend Storage Contract").
+`docs/internal/behavioral-invariants.md` ("Backend Storage Contract").
 
 ## Consequences
 

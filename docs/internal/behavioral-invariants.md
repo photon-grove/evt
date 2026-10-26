@@ -2,7 +2,7 @@
 
 This document captures the behavioral guarantees, serialization formats, error conditions, and key
 invariants of the `evt` library. The byte-level storage contract shared with the Rust `photon-evt`
-crate is specified in [`docs/spec/storage-format.md`](docs/spec/storage-format.md).
+crate is specified in [`docs/reference/storage-format.md`](../reference/storage-format.md).
 
 ## Core Types
 
@@ -106,7 +106,7 @@ In v0.9 (C7), commit-wide projectors may put or delete rows at any `pk`/`sk` —
 derived `{entityType}#{entityId}` / `VIEW` — with per-operation error mapping and shared
 key-length validation (`pk` ≤ 2,048 and `sk` ≤ 1,024 UTF-8 bytes, enforced before any write on
 both backends). The row shape and rules are specified in the
-[storage format](docs/spec/storage-format.md#views); the invariants are under
+[storage format](../reference/storage-format.md#views); the invariants are under
 [Commit-Wide Projectors](#commit-wide-projectors-v09-c7).
 
 ## Serialization Formats
@@ -153,13 +153,13 @@ has no JSON methods; embedding it in application DTOs must preserve sibling fiel
 - `region`: AWS region
 - `timestamp`: RFC3339 format, UTC timezone
 
-In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C6),
+In v0.9 ([ADR 0004](../adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C6),
 metadata gains `principalId` (string or null), `causationId` (string or null; defaults to
 `commandId` when unset), `extensions` (string-keyed map, `{}` when empty), and `commitId`
 (string; engine-written, identical across every event of a commit, defaulting to the command ID
 when outcomes are enabled, else a generated ULID) — appended after the
 existing keys. The byte-level shape — including defaults for old readers — is specified in the
-[storage format](docs/spec/storage-format.md#metadata).
+[storage format](../reference/storage-format.md#metadata).
 
 ## Error Types and Messages
 
@@ -272,7 +272,7 @@ type TransactionGroup interface {
 
 The v0.9 core reshape adds further transaction items — read-fence checks, the command-outcome row,
 and the feature-marker and rebuild-lock checks — with a pinned item ordering and budget formula in
-the [storage format](docs/spec/storage-format.md#writes). An over-budget commit fails with a typed
+the [storage format](../reference/storage-format.md#writes). An over-budget commit fails with a typed
 error before any write and is never split.
 
 ### Multi-Stream Commits (v0.9, C1)
@@ -515,7 +515,7 @@ error before any write and is never split.
 ## Compaction
 
 Compaction is the opt-in mechanism for bounding event-log growth. See
-[ADR 0001](docs/adr/0001-event-compaction-and-snapshot-truncation.md) for the full rationale and
+[ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md) for the full rationale and
 its coordination with consumer wipe-and-replay guarantees.
 
 ### Compactor capability
@@ -527,12 +527,12 @@ its coordination with consumer wipe-and-replay guarantees.
 - **Refuses unless covered:** reads the inline snapshot and requires
   `snapshot.EventSequence >= throughSequence`. With no snapshot, or an uncovered range, it deletes
   nothing and returns `evt.ErrCompactionUncovered` (wrapped; matchable with `errors.Is`).
-- In v0.9 ([ADR 0004](docs/adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7,
+- In v0.9 ([ADR 0004](../adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7,
   C9) it also validates all declared feature/version pairs against the writer's supported set,
   refusing unsupported features before deletion. It reads the durable `historyDependent` set and
   refuses with a typed error when the entity's type is declared history-dependent — in every
   process that opens the log, not only those that registered the projector. The byte-level rules
-  are specified in the [storage format](docs/spec/storage-format.md#feature-marker).
+  are specified in the [storage format](../reference/storage-format.md#feature-marker).
 - Never deletes the `sk = 0` snapshot row. `throughSequence < 1` is a no-op. Idempotent.
 
 ### Compaction invariants
@@ -554,7 +554,7 @@ if `SeedAggregate` is set on a repository that is not a `SnapshotStreamer`.
 
 A `CommitProjector` is a pure function over one commit; its view operations commit in the same
 transaction as the events. The byte-level rules are in the
-[storage format](docs/spec/storage-format.md#views).
+[storage format](../reference/storage-format.md#views).
 
 **Contract**
 
@@ -639,7 +639,7 @@ transaction as the events. The byte-level rules are in the
 Rust only (`photon-evt` with the `journal` cargo feature). Go does not implement the journal and
 refuses a table that declares it (`UnsupportedFeatureError` on the first commit after the
 declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes are in the
-[storage format](docs/spec/storage-format.md#journal).
+[storage format](../reference/storage-format.md#journal).
 
 - **Allocations live on the event.** An event's `(scope, position)` pairs are stored in its
   metadata extension `evt.journal`, ascending by scope with no repeat. Every journal row and every
@@ -693,7 +693,7 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 
 ## Journal compaction (X2, Rust-first)
 
-The stored shapes are in the [storage format](docs/spec/storage-format.md#compaction-x2).
+The stored shapes are in the [storage format](../reference/storage-format.md#journal-compaction).
 
 - **A snapshot before any delete.** A run stores the canonical chunks of rows `1..=checkpoint`,
   swaps the scope's manifest (the checkpoint becomes the floor) in one atomic write with the one
@@ -850,7 +850,7 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   the configured events and snapshots tables — and the upgrade note requires renaming (migrating)
   such streams before enabling the v0.9 features.
 - `evt-doctor migrate-heads` (Go only) migrates a v0.8 store to per-stream head items and is the
-  only code that writes head items outside a commit ([runbook](docs/migrating-to-stream-heads.md)):
+  only code that writes head items outside a commit ([runbook](../guide/migrating-to-stream-heads.md)):
   - It refuses without `-confirm-writers-stopped` (nothing is written, `-dry-run` aside), and
     refuses a store whose marker declares `journal` or any feature it does not model
     (`*UnsupportedFeatureError`), or that holds a non-engine stream in a reserved namespace
@@ -1076,7 +1076,7 @@ See `docs/adr/0002-backend-neutral-storage-contracts.md` for the rationale and t
 
 The Rust crate `photon-evt` (`crates/evt`) implements the same storage format natively. Go and Rust
 services can append to and load the same streams in DynamoDB or PostgreSQL. See
-[ADR 0003](docs/adr/0003-rust-implementation-and-cross-language-compatibility.md).
+[ADR 0003](../adr/0003-rust-implementation-and-cross-language-compatibility.md).
 
 - **One format, two implementations.** DynamoDB items, PostgreSQL rows, serialized event, snapshot,
   and metadata JSON, SNS envelopes and message attributes, conditional-write expressions, and the

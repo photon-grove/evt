@@ -51,6 +51,8 @@ jobs:
             case "$file" in
               .github/* | crates/moon.yml)
                 go=true rust=true compat=true ;;
+              README.md)
+                go=true rust=true ;;
               crates/* | Cargo.toml | Cargo.lock | rust-toolchain.toml)
                 rust=true compat=true ;;
               .moon/* | package.json | pnpm-lock.yaml | pnpm-workspace.yaml)

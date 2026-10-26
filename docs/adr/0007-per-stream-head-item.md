@@ -3,12 +3,12 @@
 ## Status
 
 Accepted (2026-10-18). Tracking: matrix row C12 in
-[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md) and
+[`docs/reference/feature-matrix.md`](../reference/feature-matrix.md) and
 [#159](https://github.com/photon-grove/evt/issues/159). The core commit path is implemented in Go
 and Rust, and the migration tool (`evt-doctor migrate-heads`, Go only; see the
-[runbook](../migrating-to-stream-heads.md)) is implemented; the real-DynamoDB billing measurement
+[runbook](../guide/migrating-to-stream-heads.md)) is implemented; the real-DynamoDB billing measurement
 (`go/backends/dynamo/awsmeasure_test.go`, run by a human) is still to be run. The normative text is the
-[Stream Heads](../spec/storage-format.md#stream-heads) section of the storage spec, and the
+[Stream Heads](../reference/storage-format.md#stream-heads) section of the storage spec, and the
 sections of the spec that describe commits, fences, and failures follow it.
 
 **Decided:** the migration from v0.8 storage is a stop-the-world procedure (stop writers, backfill,
@@ -646,7 +646,7 @@ standing permission of every writer role. It refuses a store without the feature
 `StoreNotInitialized`, without scanning, and the store is initialized once by an explicit,
 idempotent operator step (`Initialize` / `initialize()`, `evt-doctor init`) that runs the same
 verification. First-write declaration stays as an opt-in (lazy initialization), and PostgreSQL and
-in-memory writers keep it. See the spec's [Required feature](../spec/storage-format.md#required-feature).
+in-memory writers keep it. See the spec's [Required feature](../reference/storage-format.md#required-feature).
 
 **Writers that predate the feature.** A v0.9 build without `stream-heads` refuses a table that
 declares it (the existing rule), so a mixed fleet of old and new v0.9 builds cannot corrupt heads
@@ -693,7 +693,7 @@ them:
 - The in-memory backends (Go `go/backends/mem/repo.go`, Rust `crates/evt/src/mem.rs`) keep a head per stream in
   the commit.
 - Both conformance suites (`go/conformance/repository.go`, `crates/evt/src/conformance.rs`).
-- Docs: `BEHAVIORAL_INVARIANTS.md`, `docs/dynamodb.md`, `docs/streams.md`, the READMEs, and the
+- Docs: `docs/internal/behavioral-invariants.md`, `docs/guide/dynamodb.md`, `docs/guide/streams.md`, the READMEs, and the
   spec.
 
 ## Consequences

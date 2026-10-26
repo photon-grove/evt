@@ -28,7 +28,7 @@
 //!   commit is refused with [`Error::RebuildInProgress`], and readers check a [`RebuildEpoch`].
 //!
 //! The storage contract is documented in the
-//! [storage format spec](https://github.com/photon-grove/evt/blob/main/docs/spec/storage-format.md).
+//! [storage format spec](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md).
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
@@ -124,6 +124,11 @@ pub use views::{DEFAULT_VIEW_SK, ViewPage, ViewRepository};
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+// The repository's front-page README, outside the published package, so only doctest builds read it.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct RootReadmeDoctests;
 
 #[doc(hidden)]
 pub mod __private {

@@ -26,9 +26,9 @@
 ## Repository Identity
 
 - This repo is `evt`, a Go event-sourcing framework published as `github.com/photon-grove/evt/go`.
-- It contains Go framework packages, a native Rust crate (`photon-evt`, `crates/evt`) that shares the
-  Go storage format, a Vite docs app, a React diagram package, local Terraform for
-  DynamoDB-compatible integration tests, and public documentation.
+- It contains the Go module (`go/`), native Rust crates (`crates/`) that share the Go storage
+  format, a Vite docs site (`website/`), a React diagram package (`packages/`), local Terraform
+  for integration tests (`infra/`), and the docs (`docs/`).
 - The project is intentionally public-safe: examples should use neutral names, local emulator
   credentials, and no private application environment details.
 - Verify the remote if uncertain: `git remote get-url origin`.
@@ -51,15 +51,16 @@
 - Avoid table scans except for explicit migration, rebuild, or diagnostic flows.
 - When event JSON changes, add or update upcasters and fixture coverage so older stored events
   remain readable.
-- Go and Rust share one storage format (`docs/spec/storage-format.md`). Any change to it must
+- Go and Rust share one storage format (`docs/reference/storage-format.md`). Any change to it must
   regenerate `compat/fixtures` (`go -C go test ./internal/compat -run TestFixtures -update`), pass in both
   languages, and pass `scripts/compat-integration.sh dynamo|postgres`. Never hand-edit fixtures.
   The exception is a Rust-first extension's fixtures (ADR 0005): Rust generates them,
   `compat/fixtures/journal.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test
   journal_fixtures` and `compat/fixtures/lambda.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p
   photon-evt-lambda --all-features --test fixtures`.
-- Update documentation when behavior changes, especially `README.md`, `BEHAVIORAL_INVARIANTS.md`,
-  and relevant files under `docs/`.
+- Update documentation when behavior changes: the README of the unit you changed (`README.md`,
+  `go/README.md`, `crates/*/README.md`), `docs/guide/`, `docs/reference/storage-format.md` (normative),
+  and `docs/internal/behavioral-invariants.md`.
 
 ## Codebase Patterns
 
@@ -67,7 +68,11 @@
   - `go/`: the Go module (`github.com/photon-grove/evt/go`, package `evt`). Run Go commands from
     there. The backends are `go/backends/dynamo`, `go/backends/postgres` and `go/backends/mem`, and
     the other packages sit beside them: `snapshots`, `projectors`, `viewcodec`, `test` and so on.
-  - `website/`: Vite documentation site.
+  - `website/`: Vite documentation site. It renders `docs/**/*.md` except `docs/internal/`, and
+    `website/src/docs.ts` (`DOC_CONFIG`) orders and groups the pages.
+  - `docs/`: `guide/` (how-tos), `reference/` (storage format, feature matrix), `adr/` (decisions,
+    kept as history), `internal/` (process notes, behavioral invariants). Plan and epic IDs
+    (K1, C3, X2 and so on) belong only in `adr/` and `internal/`, never in user-facing prose.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
   - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
@@ -203,9 +208,9 @@ changed file). Severities: **P0** = must fix before merge; **P1** = should fix; 
 - **P0** — flag storage-format changes (DynamoDB items, PostgreSQL rows, serialized JSON, stream
   envelopes, snapshot policy) that do not regenerate `compat/fixtures` and update both the Go and
   Rust implementations, or that change the documented Go/Rust differences without updating
-  `docs/spec/storage-format.md`.
+  `docs/reference/storage-format.md`.
 - **P1** — flag new behavior without test coverage, and documentation a change makes stale
-  (especially `README.md`, `BEHAVIORAL_INVARIANTS.md`, and `docs/`).
+  (the READMEs, `docs/guide/`, `docs/reference/`, and `docs/internal/behavioral-invariants.md`).
 - **P1** — flag accidental breaks to existing exported package contracts.
 - Do not report issues in generated code or lockfiles, and do not re-flag anything CI already
   enforces (`go vet`, formatting/lint, `go mod tidy`). This is a public repo: also flag any private
