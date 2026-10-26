@@ -15,7 +15,6 @@ business invariants and applies facts. It implements:
 type Entity interface {
     Type() EntityType
     GetID() EntityID
-    Base() BaseEntity
     Handle(context.Context, Command) (CommandResult, error)
     Apply(Event) error
     DeserializeEvent(SerializedEvent) (Event, error)
@@ -24,16 +23,8 @@ type Entity interface {
 }
 ```
 
-*Planned for removal in the next minor release* ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):
-`evt.BaseEntity` and `evt.NewEntity` go away then — define your own identity and lifecycle
-fields instead, so the switch is a one-line change. The `Base() BaseEntity` interface method
-goes with them. No `Deprecated:` notice is carried in v0.9.0 because `Entity.Base` still
-requires the type, so a notice would break builds with no warning-free path; the notice lands
-once the core reshape (C1–C11) replaces the contract.
-
-Embed `evt.BaseEntity` (and construct it with `evt.NewEntity(id)`) to get the
-`ID`, `IsActive`, `CreatedAt`, and `UpdatedAt` bookkeeping for free. The critical
-discipline is the split between `Handle` and `Apply`: **`Handle` validates and
+An entity defines its own identity and lifecycle fields, such as an `ID` that `GetID()` returns.
+The critical discipline is the split between `Handle` and `Apply`: **`Handle` validates and
 decides; `Apply` mutates and trusts.** `Handle` produces events without changing
 state; `Apply` folds an already-recorded event into state without re-validating
 it. Replay only ever calls `Apply`, so any check left in `Apply` would re-run
@@ -54,9 +45,8 @@ type Command interface {
 
 ```go
 type CommandResult struct {
-    Events      []Event     // the immutable facts to commit
-    Response    []byte      // stored with the command's outcome when outcomes are enabled
-    Transaction Transaction // deprecated in v0.9.0 (K7); see [Transaction](#transaction)
+    Events   []Event // the immutable facts to commit
+    Response []byte  // stored with the command's outcome when outcomes are enabled
 }
 ```
 
@@ -179,9 +169,7 @@ type Store interface {
 `Execute` is the everyday entry point: it loads the entity from the log, handles
 the command, and commits the result in one call. When an aggregate needs injected
 dependencies, construct a fresh instance yourself and pass it to `store.Execute(ctx, entity,
-entityID, command, metadata)` — `evt.ExecuteWithFactory` is deprecated in v0.9.0
-([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7) and will be removed in the next
-minor release.
+entityID, command, metadata)`.
 
 ## Snapshot
 
@@ -248,13 +236,10 @@ the framework merges compatible groups before committing.
 The supported way to produce those groups is a projector: an `EventProjector` runs inside the
 commit and its `TransactionGroup` is merged into the same atomic write as the command's events.
 
-*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7):*
-handler-attached `CommandResult.Transaction` — the pattern of a handler returning related writes
-on the command's result. Return zero transactions and let projectors produce the view writes
-instead. [Commit-wide projectors](#commit-wide-projectors) ([ADR
-0004](adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7) are the replacement:
-backend-neutral operations, for every event in a commit, not just one entity's. The groups of
-`EventProjector` and the deprecated field stay until the next minor release; their operations come
+A command handler can't attach related writes to its `CommandResult`. Return zero transactions and let
+projectors produce the view writes. [Commit-wide projectors](#commit-wide-projectors) ([ADR
+0004](adr/0004-core-reshape-multi-stream-transactions-and-outcomes.md), C7) emit backend-neutral
+operations for every event in a commit, not just one entity's. The groups of `EventProjector` come
 first in a commit, then the commit-wide projectors'.
 
 ## Upcaster

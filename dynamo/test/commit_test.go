@@ -11,7 +11,6 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/internal/eventjson"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -198,24 +197,6 @@ func (s *RepositorySuite) Test_Commit_WithNextSnapshot() {
 		":last": &types.AttributeValueMemberN{Value: "7"},
 		":prev": &types.AttributeValueMemberN{Value: "6"},
 	}, update.ExpressionAttributeValues)
-}
-
-// Test CommitStream refuses: its batches would write events without maintaining head items
-func (s *RepositorySuite) Test_CommitStream_Refuses() {
-	ctx := context.Background()
-
-	resultChannel := make(chan result.Result[evt.SerializedResult], 2)
-	resultChannel <- result.Ok(evt.SerializedResult{Events: []evt.SerializedEvent{{
-		EntityType: "test", EntityID: "entity-1", Sequence: 1, Type: "test-event", Version: 1,
-		Payload: []byte(`{"test": "data1"}`), Metadata: evt.Metadata{Region: "us-east-1"},
-	}}})
-	resultChannel <- result.Err[evt.SerializedResult](errors.New("processing error"))
-	close(resultChannel)
-
-	errs := s.repo.CommitStream(ctx, resultChannel) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	require.Len(s.T(), errs, 1)
-	require.ErrorIs(s.T(), errs[0], dynamo.ErrCommitStreamRefused)
-	s.client.AssertNotCalled(s.T(), "TransactWriteItems")
 }
 
 // Test commit with large batch respects batching behavior

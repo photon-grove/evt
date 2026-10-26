@@ -240,11 +240,6 @@ func (a *Account) GetID() evt.EntityID { return a.id }
 // SetID sets the entity ID. The store calls it after loading.
 func (a *Account) SetID(id evt.EntityID) { a.id = id }
 
-// Base returns the base entity fields.
-func (a *Account) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	return evt.BaseEntity{ID: a.id, IsActive: a.Status == "open"} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-}
-
 // Projectors returns no in-band projectors.
 func (a *Account) Projectors() []evt.EventProjector { return nil }
 

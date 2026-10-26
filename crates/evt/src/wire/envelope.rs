@@ -1,8 +1,8 @@
 //! The stream message envelope published for each committed event.
 //!
-//! The Go framework's `stream.SNSPublisher` wraps each event in an EventBridge-style
-//! `CloudWatchEvent` and publishes the JSON to SNS. Consumers (Go's `projectors` package, or Rust
-//! code using [`decode`]) unwrap the serialized event from `detail`.
+//! The envelope is an EventBridge-style `CloudWatchEvent` around each event, as the removed Go
+//! SNS publisher wrote it. Consumers (Go's `projectors` package, or Rust code using [`decode`])
+//! unwrap the serialized event from `detail`.
 //!
 //! ```json
 //! {"version":"","id":"<event id>","detail-type":"<event type>","source":"<source>",
@@ -42,7 +42,7 @@ struct EnvelopeIn {
     detail: Option<SerializedEvent>,
 }
 
-/// Encodes the envelope for an event, byte-identical to Go's `stream.SNSPublisher` message body.
+/// Encodes the envelope for an event, byte-identical to the message body the removed Go SNS publisher wrote.
 pub fn encode(event: &SerializedEvent, source: &str) -> Result<Vec<u8>, Error> {
     let detail = String::from_utf8(event.to_json()?).expect("serde_json writes UTF-8");
     let detail = RawValue::from_string(detail)?;

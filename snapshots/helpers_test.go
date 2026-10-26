@@ -86,7 +86,6 @@ func combineResults(results ...evt.CommandResult) evt.CommandResult {
 	combined := evt.CommandResult{}
 	for _, result := range results {
 		combined.Events = append(combined.Events, result.Events...)
-		combined.Transaction = append(combined.Transaction, result.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 	}
 	return combined
 }
@@ -137,15 +136,12 @@ func marshalCreatedEvent(t *testing.T, entityID evt.EntityID, value string, othe
 	return payload
 }
 
-// assertEntityMatches checks core fields and that timestamps are non-zero without requiring exact equality
+// assertEntityMatches checks the entity ID, value and other fields
 func assertEntityMatches(t *testing.T, e test.Entity, id evt.EntityID, value string, other *string) {
 	t.Helper()
 	require.Equal(t, id, e.ID)
-	require.True(t, e.IsActive)
 	require.Equal(t, value, e.Value)
 	require.Equal(t, other, e.Other)
-	require.False(t, e.CreatedAt.IsZero())
-	require.False(t, e.UpdatedAt.IsZero())
 }
 
 // createExpectedEvent creates an expected serialized event for assertions

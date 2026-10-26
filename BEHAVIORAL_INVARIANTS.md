@@ -269,8 +269,6 @@ type TransactionGroup interface {
 - Every written stream adds one `Update` of its head item (`sk = -1`) to the commit, whether it
   creates the stream or appends to it, and whether or not it writes a snapshot. It counts toward
   the 100 items and is billed as a write
-- The DynamoDB `CommitStream` (deprecated in v0.9.0, K1) is refused with
-  `*dynamo.CommitStreamRefusedError`: its batches would write events with no head update
 
 The v0.9 core reshape adds further transaction items — read-fence checks, the command-outcome row,
 and the feature-marker and rebuild-lock checks — with a pinned item ordering and budget formula in
@@ -348,7 +346,7 @@ error before any write and is never split.
   is refused with the typed reserved-ID error before the outcome row is read, so no outcome is read
   or recorded for a command aimed at engine-managed rows. An outcome read with an empty,
   non-UTF-8, or oversized command ID is the same typed error on every backend, never "absent"
-- Go's error-returning `Execute`/`ExecuteWithFactory` keep their contract on an outcomes store: when
+- Go's error-returning `Execute` keeps its contract on an outcomes store: when
   the outcome is replayed (a duplicate, or a lost race settled by the winner's row) the supplied
   entity is restored and loaded again, so it reflects durable state. Rust's outcome methods return
   a `CommandOutcome`, not an aggregate
@@ -394,7 +392,7 @@ error before any write and is never split.
   65,536 bytes (`OutcomeTooLarge`, before any write); an empty response is stored as no response
 - The outcome item counts in the commit budget (one action and its encoded size); an outcome-only
   commit is the feature-marker check, the rebuild-lock check, and the outcome put
-- Stores without outcomes keep today's behavior, and `CommitStream` / bare `Store.Commit` refuse
+- Stores without outcomes keep today's behavior, and a bare `Store.Commit` refuses
   to carry or skip an outcome
 
 ### Rejections and the Accepted No-Op (v0.9, C4)
@@ -413,8 +411,7 @@ error before any write and is never split.
   that write no outcome, so a retry after the fix starts clean. An oversized rejection fails with
   `OutcomeTooLarge` and writes nothing
 - A command that produces zero events is an accepted outcome with no events (still storing any
-  response), not an error; if it carries projector operations (the deprecated
-  `CommandResult.Transaction`) it is refused with `ProjectorOnlyCommitError` and nothing is
+  response), not an error; if projectors produce operations for it, it is refused with `ProjectorOnlyCommitError` and nothing is
   written. Outcome-only commits carry the feature-marker and rebuild-lock checks and, for a
   multi-stream transaction, the fence checks of its reads; the single-aggregate shortcut has no
   fences to check
@@ -487,8 +484,8 @@ error before any write and is never split.
   attempt and must not be mutated by a handler. After a replayed or exhausted result the entity is
   reloaded so it reflects durable state. Rust loads a fresh aggregate and clones the command per
   attempt
-- `policy.ExecuteWithRetry` (deprecated, K6) and Rust's `execute_with_retry` (a store without
-  outcomes) remain blind whole-command retry for code that does not use outcomes
+- Rust's `execute_with_retry` (a store without outcomes) remains blind whole-command retry for
+  code that does not use outcomes. Go has no equivalent: its retry is the fence-aware loop above
 
 ## Snapshot Logic
 
@@ -766,19 +763,6 @@ type EventUpcaster interface {
 3. Multiple upcasters can chain transformations
 4. Final event is passed to `entity.DeserializeEvent`
 
-## Sorting
-
-### ByCommandID Sort
-
-_Deprecated in v0.9.0 ([ADR 0006](docs/adr/0006-parity-policy-and-feature-cuts.md), K7):_
-`evt.ByCommandID` is cut and removed in the next minor release. It has no in-library
-replacement — write your own comparator when you need deterministic batch ordering. The
-pre-v0.9 behavior:
-
-- Sorts `[]SerializedEvent` by `Metadata.CommandID` if both events have one
-- Falls back to sorting by `ID` (EventID) if either is missing CommandID
-- Used for deterministic event ordering in batch operations
-
 ## Testing Patterns
 
 ### Mock Entity Requirements
@@ -787,7 +771,6 @@ Implement all `Entity` interface methods:
 
 - `Type() EntityType`
 - `GetID() EntityID`
-- `Base() BaseEntity`
 - `Handle(context.Context, Command) (CommandResult, error)`
 - `Apply(Event) error`
 - `DeserializeEvent(SerializedEvent) (Event, error)`
@@ -854,11 +837,10 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   (matching is a case-sensitive byte prefix on the entity ID).
 - Every entity-addressed write path refuses a reserved entity ID before any request, with a typed
   `evt.ReservedEntityIdError`: `Commit` (one reserved stream fails a multi-stream commit whole),
-  `CommitWithSnapshot`, `CommitStream`, out-of-band snapshot writes (`dynamo.PutSnapshot`), and
+  `CommitWithSnapshot`, out-of-band snapshot writes (`dynamo.PutSnapshot`), and
   `CompactBelow` (which writes no new rows but is refused all the same).
 - Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
-  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition, including the deprecated
-  `HeadStore` map and visitor APIs. `ReservedNamespacePrefixes()` returns a copy; callers cannot
+  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition. `ReservedNamespacePrefixes()` returns a copy; callers cannot
   change the authoritative namespace checks.
 - Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
   disappear from enumeration after upgrading. Explicit event and snapshot reads by ID still
@@ -1003,11 +985,8 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   `EntityType` narrows to that type. The core contract carries no DynamoDB types.
 - DynamoDB compiles the filter into a Scan `FilterExpression`; the in-memory repository applies it
   client-side. Skips items with the inline-snapshot marker (`sk = 0`). Uses scan pagination.
-- Callers needing a raw DynamoDB filter beyond entity type historically type-asserted the
-  repository to `dynamo.ExpressionStreamer` and called `StreamAllEventsByExpression`. That
-  extension is deprecated in v0.9.0 (K7) and removed in the next minor — new code narrows with
-  `evt.StreamFilter` (entity type) and filters the rest client-side, or scans directly with the
-  AWS SDK.
+- There is no raw-expression variant. Callers narrow with `evt.StreamFilter` (entity type) and
+  filter the rest client-side, or scan directly with the AWS SDK.
 
 ### StreamEntities
 
@@ -1015,8 +994,6 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 - Yields complete entities after all their events are processed
 - Skips `sequence = 0` events (snapshot markers)
 - Errors during `applyEvent` are yielded to channel, then continues
-- DynamoDB raw-expression variant: `dynamo.ExpressionStreamer.StreamEntitiesByExpression`
-  (deprecated in v0.9.0, K7 — use `evt.StreamFilter`)
 
 ### StreamEntitiesFromSnapshots (optional: `evt.SnapshotStreamer`)
 
@@ -1044,13 +1021,6 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   before writing data of that entity type
 - PostgreSQL holds the shared feature advisory lock through validation and all deletes in one
   transaction
-
-### Delete (build-tagged `//go:build !prod`)
-
-- Raw, snapshot-unsafe point-delete by `(pk, sk)`; for local/staging fixtures only. It also deletes
-  the head item of every stream it names, or the stream could not be created again
-- Excluded from production builds (`-tags prod`); released binaries set this tag
-- Use `CompactBelow` for principled, snapshot-verified truncation instead
 
 ## Backend Storage Contract
 
@@ -1088,10 +1058,9 @@ EventSequence)` is rejected, not silently overwritten. DynamoDB enforces this wi
   `SerializedResult` are committed atomically. On DynamoDB this is a `TransactWriteItems` call; on
   PostgreSQL it is a single SQL transaction; partial commits must not be observable.
 - **Backend-neutral filtering** — `StreamAllEvents`/`StreamEntities` honor `evt.StreamFilter`
-  (entity-type narrowing today). The legacy backend extension interface
-  (`dynamo.ExpressionStreamer`) offered richer vendor-specific server-side filtering but is
-  deprecated in v0.9.0 (K7) and removed in the next minor; richer filtering must not enter the
-  core contract.
+  (entity-type narrowing today). Richer vendor-specific
+  server-side filtering must not enter the core contract, so the former DynamoDB expression
+  extension is gone.
 
 The PostgreSQL backend stores the log as an append-only `evt_events` table keyed by `(entity_id,
 sequence)` and durable snapshots in a sibling `evt_snapshots` table keyed by `entity_id`. That

@@ -25,7 +25,7 @@ func TestClassifyWriteError(t *testing.T) {
 
 		require.Error(t, err)
 		require.True(t, evt.IsConflictErr(err), "a 23505 violation should map to evt.ConflictError")
-		require.True(t, policy.IsTransient(err), "the conflict is transient so ExecuteWithRetry retries it")
+		require.True(t, policy.IsTransient(err), "the conflict is transient so a retry follows")
 	})
 
 	t.Run("other errors pass through unchanged", func(t *testing.T) {

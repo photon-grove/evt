@@ -35,7 +35,6 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithEvents() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateResult.Events...)
-	result.Transaction = append(result.Transaction, updateResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
 	require.NoError(s.T(), err)
@@ -45,8 +44,8 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithEvents() {
 
 	// The hydrated entity should have the updated value
 	require.EqualValues(s.T(), test.Entity{
-		BaseEntity: s.entity.BaseEntity,
-		Value:      "updated-value",
-		Other:      &otherValue,
+		ID:    s.entity.ID,
+		Value: "updated-value",
+		Other: &otherValue,
 	}, *s.entity)
 }

@@ -221,8 +221,8 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
 2. The rebuild-lock check (`SYSTEM#REBUILD`), present in every v0.9 commit
    ([Rebuild Fence](#rebuild-fence)).
 3. Projector operations, in projector declaration order; within one projector, in emission order
-   ([Views](#views)). In Go, the operations of the deprecated handler-attached and per-entity
-   transaction groups (K7) come first, then those of the commit-wide projectors. A commit that
+   ([Views](#views)). In Go, the operations of the per-entity
+   transaction groups come first, then those of the commit-wide projectors. A commit that
    carries projector operations must also write at least one event: views are projections of
    committed events, so operations with no backing event are refused with a typed error
    (`ProjectorOnlyCommit` in Go, `ProjectorWithoutEvents` in Rust) before any write, on every
@@ -1303,9 +1303,8 @@ vector (`rejected with events`) is a valid one now.
 A command on a store with outcomes runs under **fence-aware retry** (v0.9, C5): a bounded number
 of attempts, each of which decides the command from scratch against freshly loaded state, and a
 persisted answer when the attempts run out. It replaces blind whole-command retry
-(`policy.ExecuteWithRetry`, `Store::execute_with_retry`) as the default path for commands with
-outcomes; the policy packages remain for backend-level transient classification and for stores
-without outcomes.
+(Rust's `Store::execute_with_retry`) as the default path for commands with
+outcomes. In Go, the `policy` package remains for backend-level transient classification.
 
 ### Classification
 
@@ -2355,11 +2354,9 @@ Every path that adds, removes, or snapshots events either maintains the head or 
 | Path                                                                                          | Effect                                                                                                                         |
 | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | Go `Commit`, `CommitWithSnapshot`, and Rust `commit`, `commit_transaction` (every backend)    | The head update is part of the commit (outcome-only and rejection commits included).                                           |
-| Go PostgreSQL and in-memory `CommitStream`                                                    | Loops over `Commit`; nothing to change.                                                                                        |
-| Go DynamoDB `CommitStream` (deprecated, K1)                                                   | Writes events with no head update, so it is refused outright with a typed error (`*dynamo.CommitStreamRefusedError`) until it is deleted (#134). |
 | `PutSnapshot`, `put_snapshot`, and rebuild seeding that writes a snapshot                     | Conditions on `head >= :new` and refreshes a retained head's `ttl` ([above](#snapshot-writes-outside-a-commit)).        |
 | `CompactBelow`, `compact_below`                                                               | Unchanged; never touches the head.                                                                                             |
-| `dynamo.Delete` (K7) and fixture or reset tooling                                             | Deletes events only; must delete the head item too.                                                                            |
+| Fixture or reset tooling                                                                      | Deletes events only; must delete the head item too.                                                                            |
 | `evt-doctor migrate-heads`                                                                    | The only tool writing head items outside a commit.                                                                             |
 
 - Event, snapshot, `latest(n)`, and compaction queries are unchanged. `CompactBelow` never deletes
@@ -2384,8 +2381,7 @@ Every path that adds, removes, or snapshots events either maintains the head or 
   ```
 
   (`"0"` also drops the snapshot, which consumers already skip.) The `NEW_IMAGE` decoder skips
-  `sk < 1`; in Go, `stream.DynamoDBHandler` drops such `INSERT` records and `stream.SNSPublisher`
-  counts them as skipped, not as malformed events. `KEYS_ONLY` wake-ups fire on every head update unless filtered.
+  `sk < 1`; in Go, `stream.DynamoDBHandler` drops such `INSERT` records. `KEYS_ONLY` wake-ups fire on every head update unless filtered.
 - `evt-doctor` reports: head below the derived head, head above it, a head item with no events or
   snapshot, and a stream with events and no head item. A plain `evt-doctor` run reports them once the
   store declares `stream-heads` and exits 1 on drift; `migrate-heads --verify` is the same check
@@ -3137,7 +3133,7 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   names no operation: Go `*evt.ProjectorError`, Rust `Error::Projector`).
 - A failed head statement is an optimistic-concurrency conflict (or drift or a gap, by the
   [failure-path probe](#failure-classification)). In Go, conflicts are `evt.ConflictError`s wrapped in a
-  transient `policy.ClassifiedError`, so `policy.ExecuteWithRetry` retries them as it does on
+  transient `policy.ClassifiedError`, so the fence-aware retry loop retries them as it does on
   DynamoDB. An event insert that finds its sequence already stored, after the stream's head
   statement passed, is an event above the head: `StreamHeadDrift`. In Rust, a serialization failure
   (`40001`) or deadlock (`40P01`), raised by any statement in the commit (head statement,
@@ -3319,9 +3315,8 @@ name.)
 
 ## Stream Envelope
 
-The stream envelope is the cross-language wire format. Go's `stream.SNSPublisher` (deprecated in
-v0.9.0, K5) wraps each committed event in an EventBridge-style envelope and publishes it to SNS;
-a post-removal publisher emits the same envelope itself. Go decodes the envelope with
+The stream envelope is the cross-language wire format. Go ships no publisher for it, so a
+consumer that publishes onward wraps each committed event in the EventBridge-style envelope itself. Go decodes the envelope with
 `projectors.StreamRecordFromEnvelope`; Rust encodes the same bytes
 (`photon_evt::wire::envelope::encode`) and decodes both SNS messages and raw-delivery SQS bodies
 (`decode`).
@@ -3370,8 +3365,8 @@ snapshotted and compacted the stream between the snapshot read and the event rea
 expired. Applying events across the gap would build the wrong state. Rust's `Store::load` reads the
 stream again, up to three times, then returns `Error::Conflict`. Go's `snapshots.Store.LoadEntity`
 returns a conflict error at once, because it has already modified the entity the caller passed in.
-The error is a `policy.ClassifiedError` with class `transient`, so `policy.ExecuteWithRetry`
-retries it with a fresh entity, and `evt.IsConflictErr` still matches it. A gap that does not heal,
+The error is a `policy.ClassifiedError` with class `transient`, so the fence-aware retry
+loop retries it with a fresh entity, and `evt.IsConflictErr` still matches it. A gap that does not heal,
 such as a prefix that DynamoDB TTL expired under `WithRetention`, fails every load. Before this
 check, such a stream loaded with the wrong state.
 

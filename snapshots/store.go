@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"math"
 	"sync"
 
 	"github.com/photon-grove/evt"
@@ -17,10 +16,7 @@ type Store struct {
 	repo                     evt.Repository
 	snapshotSize             int
 	snapshotOverrides        map[evt.EntityType]int
-	replayEstimatePerEventMS float64
-	replayBudgetEvents       int
 	catchUpSnapshotThreshold int
-	freshnessObserver        FreshnessObserver
 
 	// outcomes is non-nil when command outcomes are enabled (ADR 0004, C3); see WithOutcomes.
 	outcomes *outcomeConfig
@@ -42,12 +38,42 @@ type Store struct {
 // (the target number of events between each Snapshot).
 func NewStore(repo evt.Repository, snapshotSize int) *Store {
 	return &Store{
-		repo:                     repo,
-		snapshotSize:             snapshotSize,
-		snapshotOverrides:        make(map[evt.EntityType]int),
-		replayEstimatePerEventMS: defaultReplayEstimatePerEventMS,
-		retry:                    DefaultRetryPolicy(),
+		repo:              repo,
+		snapshotSize:      snapshotSize,
+		snapshotOverrides: make(map[evt.EntityType]int),
+		retry:             DefaultRetryPolicy(),
 	}
+}
+
+// WithCatchUpSnapshotThreshold enables best-effort snapshot catch-up when replay debt exceeds threshold.
+func (store *Store) WithCatchUpSnapshotThreshold(threshold int) *Store {
+	store.catchUpSnapshotThreshold = threshold
+	return store
+}
+
+// WithSnapshotSize sets a per-entity-type snapshot interval override. The default
+// snapshotSize is used for any entity type without an explicit override.
+// Non-positive sizes remove the override so the default is used.
+// Must be called during Store initialization before concurrent use.
+func (store *Store) WithSnapshotSize(entityType evt.EntityType, size int) *Store {
+	if size <= 0 {
+		delete(store.snapshotOverrides, entityType)
+		return store
+	}
+	if store.snapshotOverrides == nil {
+		store.snapshotOverrides = make(map[evt.EntityType]int)
+	}
+	store.snapshotOverrides[entityType] = size
+	return store
+}
+
+// effectiveSnapshotSize returns the snapshot interval for the given entity type,
+// falling back to the store default when no override is configured.
+func (store *Store) effectiveSnapshotSize(entityType evt.EntityType) int {
+	if size, ok := store.snapshotOverrides[entityType]; ok {
+		return size
+	}
+	return store.snapshotSize
 }
 
 // LoadEntity loads the given Entity instance with the given id, retrieving Snapshots
@@ -107,27 +133,7 @@ func (store *Store) LoadEntity(
 		eventsSinceSnapshot = 0
 	}
 
-	estimatedReplayMS := int(math.Round(float64(eventsSinceSnapshot) * store.replayEstimatePerEventMS))
-	sample := FreshnessSample{
-		EntityType:          string(entity.Type()),
-		EntityID:            string(entityID),
-		EventsSinceSnapshot: eventsSinceSnapshot,
-		EstimatedReplayMS:   estimatedReplayMS,
-	}
-	if eventContext.CurrentSnapshot != nil {
-		sample.SnapshotSequence = int64(*eventContext.CurrentSnapshot)
-	}
-	if eventContext.CurrentSequence != nil {
-		sample.EventSequence = int64(*eventContext.CurrentSequence)
-	}
-	if store.replayBudgetEvents > 0 && eventsSinceSnapshot > store.replayBudgetEvents {
-		sample.ReplayBudgetExceeded = true
-	}
-
-	store.maybeCatchUpSnapshot(ctx, entity, entityID, &eventContext, eventsSinceSnapshot, &sample)
-	if store.freshnessObserver != nil {
-		store.freshnessObserver(ctx, sample)
-	}
+	store.maybeCatchUpSnapshot(ctx, entity, entityID, &eventContext, eventsSinceSnapshot)
 
 	return eventContext, nil
 }
@@ -140,6 +146,17 @@ func (store *Store) LoadEntity(
 func (store *Store) Commit(
 	ctx context.Context,
 	result evt.CommandResult,
+	eventContext evt.Context,
+	metadata evt.Metadata,
+) ([]evt.SerializedEvent, error) {
+	return store.commitWithTransaction(ctx, result, nil, eventContext, metadata)
+}
+
+// commitWithTransaction is Commit with the in-band projectors' transaction attached to the commit.
+func (store *Store) commitWithTransaction(
+	ctx context.Context,
+	result evt.CommandResult,
+	transaction evt.Transaction,
 	eventContext evt.Context,
 	metadata evt.Metadata,
 ) ([]evt.SerializedEvent, error) {
@@ -171,7 +188,7 @@ func (store *Store) Commit(
 		store.effectiveSnapshotSize(entityType),
 	)
 
-	serializedResult := evt.SerializedResult{Events: serializedEvents, Transaction: result.Transaction} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	serializedResult := evt.SerializedResult{Events: serializedEvents, Transaction: transaction}
 
 	if commitSnapshotToEvent == 0 {
 		// If not needed, execute a simple commit, with the commit-wide projectors' operations.
@@ -282,39 +299,11 @@ func (store *Store) Execute(
 		return err
 	}
 
-	result.Transaction = evt.MergeTransactions(result.Transaction, projectorTransaction) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-
-	if _, err = store.Commit(ctx, result, context, metadata); err != nil {
+	if _, err = store.commitWithTransaction(ctx, result, projectorTransaction, context, metadata); err != nil {
 		return err
 	}
 
 	return nil
-}
-
-// LoadEntityWithFactory creates a fresh entity instance and loads it from the repository.
-//
-// Deprecated: Cut in ADR-0006 (K7): use Store.LoadEntity directly. It will be removed in the
-// next minor release.
-func (store *Store) LoadEntityWithFactory(
-	ctx context.Context,
-	factory evt.EntityFactory,
-	entityID evt.EntityID,
-) (evt.Entity, evt.Context, error) {
-	return evt.LoadEntityWithFactory(ctx, store, factory, entityID) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-}
-
-// ExecuteWithFactory creates a fresh entity instance, executes the command, and returns it.
-//
-// Deprecated: Cut in ADR-0006 (K7): use Store.Execute directly. It will be removed in the next
-// minor release.
-func (store *Store) ExecuteWithFactory(
-	ctx context.Context,
-	factory evt.EntityFactory,
-	entityID evt.EntityID,
-	command evt.Command,
-	metadata evt.Metadata,
-) (evt.Entity, error) {
-	return evt.ExecuteWithFactory(ctx, store, factory, entityID, command, metadata) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 }
 
 // updateSnapshotWithEvents advances sequence counters and captures current entity state.
@@ -387,7 +376,6 @@ func (store *Store) maybeCatchUpSnapshot(
 	entityID evt.EntityID,
 	eventContext *evt.Context,
 	eventsSinceSnapshot int,
-	sample *FreshnessSample,
 ) {
 	if store.catchUpSnapshotThreshold <= 0 || eventsSinceSnapshot < store.catchUpSnapshotThreshold {
 		return
@@ -403,30 +391,25 @@ func (store *Store) maybeCatchUpSnapshot(
 
 	payload, err := generateSnapshotPayload(entity)
 	if err != nil {
-		logCatchUpError(ctx, entity.Type(), entityID, "payload", err, sample)
+		logCatchUpError(ctx, entity.Type(), entityID, "payload", err)
 		return
 	}
 
 	nextSnapshot := *eventContext.CurrentSnapshot + 1
 	err = writer.PutSnapshot(ctx, entity.Type(), entityID, payload, nextSnapshot, *eventContext.CurrentSequence)
 	if err != nil {
-		logCatchUpError(ctx, entity.Type(), entityID, "write", err, sample)
+		logCatchUpError(ctx, entity.Type(), entityID, "write", err)
 		return
-	}
-	if sample != nil {
-		sample.CatchUpApplied = true
-		sample.SnapshotSequence = int64(nextSnapshot)
 	}
 }
 
-// logCatchUpError logs a snapshot catch-up failure and records it in the freshness sample.
+// logCatchUpError logs a snapshot catch-up failure.
 func logCatchUpError(
 	ctx context.Context,
 	entityType evt.EntityType,
 	entityID evt.EntityID,
 	phase string,
 	err error,
-	sample *FreshnessSample,
 ) {
 	slog.WarnContext(ctx, "snapshot catch-up failed",
 		"entityType", string(entityType),
@@ -434,7 +417,4 @@ func logCatchUpError(
 		"phase", phase,
 		"err", err,
 	)
-	if sample != nil {
-		sample.CatchUpError = err.Error()
-	}
 }

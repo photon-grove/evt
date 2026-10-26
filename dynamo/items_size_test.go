@@ -13,7 +13,6 @@ import (
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/dynamo"
 	"github.com/photon-grove/evt/internal/compat"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 )
 
 // projectorGroup is a DynamoDB projector group carrying arbitrary write items.
@@ -136,32 +135,6 @@ func TestCommit_NamesTheStreamWhoseItemFailed(t *testing.T) {
 	require.ErrorContains(t, err, "stream name-d")
 	require.NotContains(t, err.Error(), "name-c")
 	require.NotContains(t, err.Error(), "name-e")
-}
-
-func TestCommitStream_Refuses(t *testing.T) {
-	ctx := context.Background()
-	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
-
-	entry := evt.SerializedResult{Events: []evt.SerializedEvent{{
-		ID: evt.GetEventID("batch-plain", 1), Sequence: 1, Type: "t:created", Version: 1,
-		EntityID: "batch-plain", EntityType: "t", Payload: []byte(`{}`),
-	}}}
-
-	channel := make(chan result.Result[evt.SerializedResult], 2)
-	channel <- result.Ok(entry)
-	channel <- result.Ok(entry)
-	close(channel)
-
-	errs := repo.CommitStream(ctx, channel)
-
-	require.Len(t, errs, 1, "the whole stream is refused once, and the channel is drained")
-	require.ErrorIs(t, errs[0], dynamo.ErrCommitStreamRefused)
-
-	var refused *dynamo.CommitStreamRefusedError
-	require.ErrorAs(t, errs[0], &refused)
-	require.Empty(t, fake.Transactions(), "the refusal is before any request")
-	require.Empty(t, fake.Items("batch-plain"))
 }
 
 func TestCommit_RefusesFencesForLocallyRetainedTypesWithoutAManifest(t *testing.T) {

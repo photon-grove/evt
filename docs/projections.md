@@ -242,216 +242,33 @@ res, err := evt.RebuildProjections(ctx, repo, applyEvent, cfg)
 read throughput (and consumed capacity) for a faster rebuild. Leave it at the
 default (a single sequential scan) for small tables.
 
-### Bounded-memory rebuilds for large tables
+### Large tables and entity heads
 
-*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K3):*
-`StreamEntitiesByQuery`, its workers/`HeadSource` options, and `RebuildProjectionsByQuery` are
-cut — **removed without a bounded-memory in-library replacement**. `StreamEntities` (the source
-behind `evt.RebuildProjections` and `evt.RebuildProjectionsFromStream`) buffers every matched
-event, so for large tables page your own DynamoDB Query/Scan with `LastEvaluatedKey` (one
+`StreamEntities` (the source behind `evt.RebuildProjections` and `evt.RebuildProjectionsFromStream`)
+buffers every matched event, and the library has no bounded-memory counterpart for a from-events
+rebuild. For a very large table, page your own DynamoDB Query or Scan with `LastEvaluatedKey` (one
 partition query per entity keeps memory bounded) and feed `evt.RebuildProjectionsFromStream`
-yourself. The section below documents the deprecated path for pre-v0.9 readers.
+yourself. For a snapshot-seeded rebuild, `StreamEntitiesFromSnapshots` is bounded by the entity
+count rather than the event count (see below).
 
-Because `StreamEntities` must regroup an unordered scan, it holds the matched
-events in memory until the scan finishes. For large event logs, use the dynamo
-repository's `StreamEntitiesByQuery`, which first enumerates the distinct entity
-IDs with a key-only scan (`ProjectionExpression` on `pk`) and then queries each
-entity's partition — returning its events already in order — folding and emitting
-one entity at a time. Memory is bounded to the set of entity IDs plus a worker
-pool of in-flight aggregates, and entities stream out as they are rebuilt. Pass
-the resulting stream to `RebuildProjectionsFromStream`:
-
-```go
-repo := dynamo.NewRepository(client, eventsTable)
-stream := repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{
-    EntityType: cfg.EntityType, // optional filter
-    Workers:    8,              // partitions queried concurrently
-    // Skip lets you resume an interrupted run; rebuilds are idempotent, so a
-    // full restart is also always safe.
-    Skip: func(id evt.EntityID) bool { return false },
-}, applyEvent)
-
-res, err := evt.RebuildProjectionsFromStream(ctx, stream, cfg)
-```
-
-`RebuildProjections` is the convenience wrapper that builds the scan-based stream
-for you; `RebuildProjectionsFromStream` accepts any entity stream so you can pick
-the strategy that fits your table size.
-
-Note on cost: enumeration is still a table `Scan`. A `ProjectionExpression`
-reduces the data returned over the wire but **not** the read capacity consumed —
-DynamoDB charges scan RCUs by the size of the items read, not the attributes
-projected. So enumeration consumes read capacity comparable to scanning the full
-log; the win here is bounded memory, incremental output, and parallel per-entity
-queries, not lower read cost. For genuinely cheaper, constant-memory enumeration,
-back it with a heads registry — see [Constant-memory enumeration](#constant-memory-enumeration)
-below.
-
-### Incremental rebuilds with an entity-heads table
-
-*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K4):* the heads
-table and `dynamo.HeadStore` are cut — derive heads from the log with `StreamEntityHeads`
-instead, and rebuild changed entities against a per-entity checkpoint you maintain yourself.
-This section documents the pre-v0.9 setup for readers still on it.
-
-A full rebuild reprocesses every entity even when only a handful changed since the
-last run, and (per the note above) enumeration reads capacity comparable to the
-whole log. To rebuild only what changed, keep a small **heads table**: one row per
-entity (`pk` = entity ID) holding that entity's highest event sequence. Reading it
-is a scan of a few small rows, not the event log, so change detection is cheap.
-
-The heads table is maintained like any other read model — by a projector on the
-[events topic](streams.md) — so it adds nothing to the commit path, and its per-entity-keyed
-writes stay distributed (no hot partition, no global counter, no secondary index).
-
-```mermaid
-flowchart TB
-  cmd[Command] --> commit[Repository.Commit]
-  commit --> log[("event-log<br/>append-only")]
-  log -- "DynamoDB Stream" --> pub[publisher]
-  pub -- "SNS / SQS" --> topic(["events topic"])
-  topic --> heads["HeadStore<br/>(heads projector)"]
-  topic --> other["your view projectors"]
-  heads -- "monotonic upsert" --> ht[("heads table<br/>pk = entity, headSeq")]
-  other --> views[("views")]
-
-  subgraph rebuild ["incremental rebuild tool"]
-    direction TB
-    read["StreamEntityHeads()"] --> detect{"head > checkpoint?"}
-    ckpt[("per-entity<br/>projection checkpoint")] --> detect
-    detect -- "changed only" --> reproject["reproject entity"]
-    reproject --> views2[("views")]
-    reproject --> ckpt
-  end
-
-  ht -.->|"read, not the log"| read
-```
-
-`dynamo.HeadStore` plays both projector and reader roles. Putting the pieces
-together:
-
-**1. Provision the heads table** — one attribute, the partition key (`pk`); no sort
-key, no index. `entityType` is a plain attribute the reader filters on, not a key.
-
-**2. Maintain it with a projector Lambda**, subscribed to the same events topic your
-other projectors use. The upsert is monotonic, so re-deliveries and out-of-order
-events fail the condition and are no-ops — durable idempotency is optional:
+A full rebuild reprocesses every entity even when only a few changed. To find the ones that moved,
+`Repository.StreamEntityHeads` returns a `map[EntityID]EventSequence` of each entity's highest
+event sequence, derived by scanning and folding the event log. The head accounts for a compacted
+stream's snapshot floor, so it stays correct after `CompactBelow`. Compare each head against a
+per-entity checkpoint you store beside your views, and reproject only the entities whose head
+moved:
 
 ```go
-heads := dynamo.NewHeadStore(client, "my-entity-heads")
-runtime := projectors.NewRuntime(heads, projectors.NewInMemoryIdempotencyGuard(), logger)
-// runtime.Process(ctx, records) from your SNS/SQS handler — see streams.md.
-```
-
-**3. Seed it once** from the existing log before the first incremental run, so
-entities that predate the projector are present. `Backfill` takes any
-`EntityHeadStreamer` source — typically a `Repository`, whose `StreamEntityHeads`
-folds the log (the one place a full scan remains). Call once per entity type to
-record the type on each row:
-
-```go
-for _, t := range myEntityTypes {
-    if _, err := heads.Backfill(ctx, repo, t); err != nil { /* ... */ }
-}
-```
-
-**4. Detect and reproject** in the rebuild tool: read every head, compare against a
-per-entity projection checkpoint you store alongside your views (the sequence each
-view was last built from), and reproject only the entities whose head moved.
-
-```go
-current, err := heads.StreamEntityHeads(ctx, "") // all types; few-MB scan
+current, err := repo.StreamEntityHeads(ctx, "") // all entity types; scans the event log
 // for id, head := range current:
 //   if head > checkpoint[id] { reproject(id); checkpoint[id] = head }
 ```
 
-Compare with `>`, not `!=`: heads only advance, so a strictly-greater test reprojects
-exactly the entities that moved. It also keeps detection correct under the eventually
-consistent read above — a stale head that briefly reads *behind* the checkpoint is
-simply skipped, never regressing the checkpoint or forcing a redundant reprojection.
-
-The reader is eventually consistent by default (half the RCU cost); a head that lags
-a beat only defers an entity to the next rebuild, never skips it. Derive a strongly
-consistent variant with `heads.WithConsistentRead(true)` if a read must reflect the
-latest projector write.
-
-**Recovering a lagged head.** The heads table is a projection, so it is only as
-current as its projector. If a delivery is permanently dropped (for example, a record
-exhausted its retries and went to a dead-letter queue), that entity's head can lag the
-log, and change detection would treat it as unchanged and skip its reprojection. The
-fix is the same operation that seeds the table: re-run `Backfill` from the log, whose
-heads are authoritative. Because the upsert is monotonic, backfill only ever advances a
-lagging head and is safe to run anytime — concurrently with the live projector and as
-often as you like — so a periodic backfill (or one after draining a DLQ) keeps the
-table from drifting.
-
-`EntityHeadStreamer` is backend-neutral, so a non-DynamoDB backend can satisfy it
-its own way (for example, a SQL backend with `SELECT entity_id, MAX(sequence) …`).
-The in-memory repository implements it directly over its event map for tests. The
-head accounts for a compacted stream's snapshot floor, so it stays correct after
-`CompactBelow`.
-
-#### Constant-memory enumeration
-
-*Deprecated in v0.9.0 (K3/K4):* the `HeadSource` option, `StreamEntitiesByQuery`, and
-`RebuildProjectionsByQuery` below are cut — the scan-and-dedup enumeration through
-`StreamEntities`/`StreamEntitiesFromSnapshotsWithOptions` is the supported path.
-
-`StreamEntityHeads` returns a `map[EntityID]EventSequence` — convenient, but the
-map grows with the number of entities, so a rebuild's memory ceiling scales with
-the table. For a genuinely constant-memory pass, `HeadStore` also implements the
-streaming `evt.EntityHeadVisitor`:
-
-```go
-err := heads.StreamEntityHeadsFunc(ctx, "", func(id evt.EntityID, head evt.EventSequence) error {
-    if head > checkpoint(id) { // your per-entity projection checkpoint
-        reproject(id)
-    }
-    return nil // return an error to stop enumeration early
-})
-```
-
-This pages the heads table and invokes the callback once per row. One row per
-entity means no dedup set is needed, unlike an event-log scan. `EntityHeadVisitor`
-is backend-neutral, so a SQL backend can stream a cursor over
-`SELECT entity_id, MAX(sequence) …`.
-
-To drive a bounded-memory **rebuild** from the registry instead of a scan, set
-`StreamByQueryOptions.HeadSource` (any `EntityHeadVisitor`, e.g. a `HeadStore`):
-
-```go
-stream := repo.StreamEntitiesByQuery(ctx, dynamo.StreamByQueryOptions{
-    Workers:    8,
-    HeadSource: heads, // enumerate IDs from the registry, not a key-only event-log scan
-}, applyEvent)
-```
-
-With `HeadSource`, IDs stream from the registry to workers without a dedup set;
-each entity's events still come from its event-log partition. This opt-in path
-requires a projector-maintained, `Backfill`-seeded heads table. Leave it nil for
-scan-and-dedup enumeration. The scan path reports enumeration errors before output,
-while the registry can report an error after emitting entities. Rerun or resume with
-`Skip`.
-
-To skip the hand-wiring entirely, the dynamo repository's
-`RebuildProjectionsByQuery` builds the `StreamEntitiesByQuery` stream — registry or
-scan — and feeds it to `RebuildProjectionsFromStream` for you. It is the
-bounded-memory counterpart to `evt.RebuildProjections`:
-
-```go
-res, err := repo.RebuildProjectionsByQuery(ctx, dynamo.StreamByQueryOptions{
-    Workers:    8,
-    HeadSource: heads, // omit to use the scan-and-dedup enumeration instead
-}, applyEvent, cfg)
-```
-
-Set `cfg.EntityType` to scope the rebuild: when `StreamByQueryOptions.EntityType`
-is empty it inherits `cfg.EntityType`, so the type is declared once and scopes
-enumeration too. (Setting both to different types is rejected, since the stream
-would enumerate one type while the rebuild's per-entity check skips it as another.)
-This wrapper covers the scan-vs-registry choice; for streams truncated by
-`CompactBelow`, stay on `evt.RebuildProjections` with `RebuildConfig.SeedEntity` —
-see [Rebuilding compacted streams](#rebuilding-compacted-streams).
+Compare with `>`, not `!=`, because heads only advance. `StreamEntityHeads` is a scan, so it costs
+read capacity comparable to the log, and the library keeps no separate heads table. The
+`evt.EntityHeadStreamer` interface is backend-neutral, so the in-memory and PostgreSQL repositories
+implement it too (PostgreSQL with `SELECT entity_id, MAX(sequence) ...`). A caller that wants a
+visitor instead of a map can use `evt.EntityHeadVisitor`, which those backends also implement.
 
 ## Rebuilding compacted streams
 
@@ -480,30 +297,19 @@ res, err := evt.RebuildProjections(ctx, repo, applyEvent, evt.RebuildConfig{
 })
 ```
 
-Like `StreamEntitiesByQuery`, the snapshot-aware path enumerates entity IDs and
-queries each partition (seeding from the `sk=0` snapshot, then applying events
-after it), so it is bounded-memory and does not depend on scan ordering. If
-`SeedEntity` is set but the repository does not implement `evt.SnapshotStreamer`,
-`RebuildProjections` returns an error rather than silently producing partial state.
-See [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
+The snapshot-aware path enumerates entity IDs with a key-only event-log scan and a dedup set, then
+queries each partition (seeding from the `sk=0` snapshot and applying events after it). It is
+bounded by the entity count, and it does not depend on scan ordering. If `SeedEntity` is set but
+the repository does not implement `evt.SnapshotStreamer`, `RebuildProjections` returns an error
+rather than silently producing partial state. See
+[ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
 
-By default this path still enumerates entity IDs with a key-only event-log scan and
-a dedup set, so its memory ceiling grows with the entity count. For the same
-**constant-memory** enumeration the from-events path gets from
-`StreamByQueryOptions.HeadSource`, the DynamoDB repository exposes
-`StreamEntitiesFromSnapshotsWithOptions` with a matching
-`StreamFromSnapshotsOptions.HeadSource` (any `EntityHeadVisitor`, e.g. a
-`HeadStore`).
-
-*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K3):*
-`HeadSource` is cut along with the heads registry — the scan-and-dedup enumeration above is the
-supported path. The rest of this section describes the pre-v0.9 setup.
+To drive it yourself, the DynamoDB repository exposes `StreamEntitiesFromSnapshotsWithOptions`:
 
 ```go
 stream := repo.StreamEntitiesFromSnapshotsWithOptions(ctx, dynamo.StreamFromSnapshotsOptions{
     EntityType: entityType,
     Workers:    8,
-    HeadSource: heads, // enumerate IDs from the registry, not a key-only event-log scan
 }, seedEntity, applyEvent)
 
 res, err := evt.RebuildProjectionsFromStream(ctx, stream, evt.RebuildConfig{
@@ -512,12 +318,8 @@ res, err := evt.RebuildProjectionsFromStream(ctx, stream, evt.RebuildConfig{
 })
 ```
 
-The heads registry includes `MAX(highest event sk, snapshot EventSequence)`, so it
-remains a valid ID source after compaction. `StreamEntitiesFromSnapshotsWithOptions`
-uses the same `HeadSource` trade-offs: it seeds each entity from `sk=0`, reads its
-partition, and avoids a dedup set. Without `HeadSource`, it uses scan-and-dedup
-enumeration. The registry requires projector-maintained, `Backfill`-seeded heads
-and can report an error after emitting entities; rerun or resume with `Skip`.
+`Workers` sets how many entity partitions are reconstructed at once, and `Skip` lets you resume an
+interrupted run. Rebuilds are idempotent, so a full restart is always safe.
 
 ## Reading views without buffering
 

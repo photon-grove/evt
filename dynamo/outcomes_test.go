@@ -259,14 +259,6 @@ func TestIndeterminateCommitFailuresAreAmbiguousWrites(t *testing.T) {
 	}
 }
 
-func TestCommitStreamRefusesOutcomes(t *testing.T) {
-	err := evt.CheckBatchEntry(evt.SerializedResult{Outcome: accepted("cmd-1")})
-
-	var unsupported *evt.UnsupportedBatchEntryError
-	require.ErrorAs(t, err, &unsupported)
-	require.Equal(t, 1, unsupported.Outcomes)
-}
-
 func strPtr(value string) *string { return &value }
 
 func deposit(amount int) *scriptedCommand { return &scriptedCommand{Amount: amount} }

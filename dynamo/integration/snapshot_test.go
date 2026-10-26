@@ -5,7 +5,6 @@ package integration
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/test"
@@ -46,7 +45,6 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateValueResult.Events...)
-	result.Transaction = append(result.Transaction, updateValueResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	// Set "other" to an intermediate value
 	updateOtherResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
@@ -56,7 +54,6 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateOtherResult.Events...)
-	result.Transaction = append(result.Transaction, updateOtherResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	s.applyEvents(result.Events)
 	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
@@ -73,20 +70,14 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.Equal(s.T(), evt.EventSequence(1), snapshot.Sequence)
 	require.Equal(s.T(), evt.EventSequence(3), snapshot.EventSequence)
 
-	// Unmarshal snapshot payload and assert semantics, not exact timestamps
+	// Unmarshal snapshot payload and assert semantics
 	var snap1 struct {
-		ID        string    `json:"id"`
-		IsActive  bool      `json:"isActive"`
-		CreatedAt time.Time `json:"createdAt"`
-		UpdatedAt time.Time `json:"updatedAt"`
-		Value     string    `json:"value"`
-		Other     *string   `json:"other"`
+		ID    string  `json:"id"`
+		Value string  `json:"value"`
+		Other *string `json:"other"`
 	}
 	require.NoError(s.T(), json.Unmarshal(snapshot.Payload, &snap1))
 	require.Equal(s.T(), string(s.entityID), snap1.ID)
-	require.True(s.T(), snap1.IsActive)
-	require.False(s.T(), snap1.CreatedAt.IsZero())
-	require.False(s.T(), snap1.UpdatedAt.IsZero())
 	require.Equal(s.T(), updatedValue, snap1.Value)
 	require.Equal(s.T(), intermediateOther, *snap1.Other)
 
@@ -105,7 +96,6 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.NoError(s.T(), err)
 
 	newResult.Events = append(newResult.Events, newOtherResult.Events...)
-	newResult.Transaction = append(newResult.Transaction, newOtherResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	s.applyEvents(newResult.Events)
 	_, err = s.store.Commit(ctx, newResult, s.eventContext, metadata)
@@ -122,20 +112,14 @@ func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
 	require.Equal(s.T(), evt.EventSequence(2), snapshot.Sequence)
 	require.Equal(s.T(), evt.EventSequence(5), snapshot.EventSequence)
 
-	// Unmarshal snapshot payload and assert semantics, not exact timestamps
+	// Unmarshal snapshot payload and assert semantics
 	var snap2 struct {
-		ID        string    `json:"id"`
-		IsActive  bool      `json:"isActive"`
-		CreatedAt time.Time `json:"createdAt"`
-		UpdatedAt time.Time `json:"updatedAt"`
-		Value     string    `json:"value"`
-		Other     *string   `json:"other"`
+		ID    string  `json:"id"`
+		Value string  `json:"value"`
+		Other *string `json:"other"`
 	}
 	require.NoError(s.T(), json.Unmarshal(snapshot.Payload, &snap2))
 	require.Equal(s.T(), string(s.entityID), snap2.ID)
-	require.True(s.T(), snap2.IsActive)
-	require.False(s.T(), snap2.CreatedAt.IsZero())
-	require.False(s.T(), snap2.UpdatedAt.IsZero())
 	require.Equal(s.T(), updatedValue, snap2.Value)
 	require.Equal(s.T(), updatedOther, *snap2.Other)
 
@@ -183,7 +167,6 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateValueResult.Events...)
-	result.Transaction = append(result.Transaction, updateValueResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	// Set "other" to an intermediate value
 	updateOtherResult, err := s.entity.Handle(ctx, &test.ReplaceEntity{
@@ -193,7 +176,6 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 	require.NoError(s.T(), err)
 
 	result.Events = append(result.Events, updateOtherResult.Events...)
-	result.Transaction = append(result.Transaction, updateOtherResult.Transaction...) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 
 	s.applyEvents(result.Events)
 	_, err = s.store.Commit(ctx, result, s.eventContext, metadata)
@@ -216,8 +198,8 @@ func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
 
 	// The hydrated entity should have the updated values
 	require.EqualValues(s.T(), test.Entity{
-		BaseEntity: s.entity.BaseEntity,
-		Value:      "updated-value",
-		Other:      &updatedOther,
+		ID:    s.entity.ID,
+		Value: "updated-value",
+		Other: &updatedOther,
 	}, *s.entity)
 }

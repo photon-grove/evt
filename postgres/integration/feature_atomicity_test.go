@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/postgres"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // exercises the deprecated batch write contract
 	"github.com/photon-grove/evt/test"
 	"github.com/stretchr/testify/require"
 )
@@ -144,12 +143,6 @@ func Test_DefaultAndDeclaringWritersRefuseUnsupported(t *testing.T) {
 		require.True(t, evt.IsUnsupportedFeatureErr(writer.Commit(ctx, res)))
 		require.True(t, evt.IsUnsupportedFeatureErr(writer.CommitWithSnapshot(ctx, res, "account", id, []byte(`{}`), 1)))
 		require.True(t, evt.IsUnsupportedFeatureErr(writer.PutSnapshot(ctx, "account", id, []byte(`{}`), 1, 1)))
-		ch := make(chan result.Result[evt.SerializedResult], 1)
-		ch <- result.Ok(res)
-		close(ch)
-		errs := writer.CommitStream(ctx, ch) //nolint:staticcheck // the marker binds legacy batches too
-		require.Len(t, errs, 1)
-		require.True(t, evt.IsUnsupportedFeatureErr(errs[0]))
 	}
 	_, err = marker.Declare(ctx, func(m *evt.FeatureManifest) { m.Retention = []evt.EntityType{"session"} })
 	require.NoError(t, err)

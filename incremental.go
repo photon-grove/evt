@@ -35,10 +35,9 @@ type EntityHeadStreamer interface {
 // at a time to a visitor callback and never accumulates them — so a rebuild's enumeration memory
 // ceiling stays constant no matter how many entities exist.
 //
-// This is only constant-memory when the underlying store holds one row per entity (a registry such
-// as a heads table): such a source is naturally unique, needs no dedup set, and is resumable from
-// the last key it paged. It is deliberately backend-neutral — no DynamoDB types appear here — so a
-// future SQL backend can satisfy it with a streamed cursor over SELECT entity_id, MAX(sequence) ….
+// This is only constant-memory when the underlying store holds one row per entity, as PostgreSQL's
+// stream-heads table does: such a source is naturally unique, needs no dedup set, and is resumable
+// from the last key it paged. It is deliberately backend-neutral, with no DynamoDB types.
 // Like EntityHeadStreamer, it is kept off the core Repository interface and detected via a type
 // assertion (source.(EntityHeadVisitor)).
 type EntityHeadVisitor interface {

@@ -7,16 +7,19 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 )
 
 // snapshotStreamWorkers is the default number of entity partitions reconstructed concurrently by
 // the snapshot-aware rebuild path. Each in-flight worker holds one entity's post-snapshot events.
 const snapshotStreamWorkers = 4
 
-// StreamFromSnapshotsOptions configures StreamEntitiesFromSnapshotsWithOptions. It mirrors
-// StreamByQueryOptions for the snapshot-aware rebuild path.
+// StreamFromSnapshotsOptions configures StreamEntitiesFromSnapshotsWithOptions.
 type StreamFromSnapshotsOptions struct {
 	// EntityType, if set, restricts the rebuild to entities of this type.
 	EntityType evt.EntityType
@@ -30,21 +33,6 @@ type StreamFromSnapshotsOptions struct {
 	// (rebuilds are idempotent, so re-running from scratch is always safe; Skip just avoids redoing
 	// finished work).
 	Skip func(evt.EntityID) bool
-
-	// HeadSource, if set, enumerates entity IDs from a heads registry (one row per entity) instead
-	// of the default key-only event-log scan. It streams unique IDs directly to workers without a
-	// deduplication set. Heads include a compacted stream's snapshot floor, so the registry is a valid
-	// ID source for snapshot-seeded rebuilds. Populate the heads table with its projector and
-	// HeadStore.Backfill. The event log still supplies each entity's events.
-	//
-	// The default path collects every ID before emitting an entity. HeadSource emits while enumerating,
-	// so an enumeration error can follow emitted entities. Rebuilds are idempotent, so resume with Skip
-	// or rerun the rebuild.
-	//
-	// Deprecated: Cut in ADR-0006 (K3): the heads-registry enumeration path goes away with
-	// HeadStore. Use the default key-only scan enumeration. It will be removed in the next minor
-	// release.
-	HeadSource evt.EntityHeadVisitor
 }
 
 // StreamEntitiesFromSnapshots reconstitutes entities with bounded memory by enumerating the
@@ -55,8 +43,7 @@ type StreamFromSnapshotsOptions struct {
 // CompactBelow has removed events below a snapshot.
 //
 // It implements evt.SnapshotStreamer using the default scan-and-dedup enumeration (no schema
-// change). For constant-memory enumeration from a heads registry, call
-// StreamEntitiesFromSnapshotsWithOptions with StreamFromSnapshotsOptions.HeadSource set.
+// change).
 func (repo *Repository) StreamEntitiesFromSnapshots(
 	ctx context.Context,
 	entityType evt.EntityType,
@@ -75,12 +62,10 @@ func (repo *Repository) StreamEntitiesFromSnapshots(
 // reconstitutes each entity from its latest durable snapshot plus only the post-snapshot events,
 // falling back to full replay for entities with no snapshot.
 //
-// Like StreamEntitiesByQuery, per-entity ordering comes from partition Queries (sk-ascending), not
-// from scan order, and the two paths share enumeration (produceEntityIDs): with opts.HeadSource set,
-// entity IDs stream from the heads registry with no dedup set (constant memory regardless of entity
-// count); otherwise they are collected from a key-only event-log scan first, where a failed (partial)
-// enumeration is fatal and emits no entities so a rebuild never silently covers a subset. Memory is
-// otherwise bounded to a small worker pool of in-flight aggregates.
+// Per-entity ordering comes from partition Queries (sk-ascending), not from scan order. Entity IDs
+// are collected from a key-only event-log scan first, where a failed (partial) enumeration is fatal
+// and emits no entities so a rebuild never silently covers a subset. Memory is otherwise bounded to
+// a small worker pool of in-flight aggregates.
 func (repo *Repository) StreamEntitiesFromSnapshotsWithOptions(
 	ctx context.Context,
 	opts StreamFromSnapshotsOptions,
@@ -110,7 +95,7 @@ func (repo *Repository) StreamEntitiesFromSnapshotsWithOptions(
 		go func() {
 			defer close(producerDone)
 			defer close(ids)
-			enumErr = repo.produceEntityIDs(ctx, opts.EntityType, opts.Skip, opts.HeadSource, ids)
+			enumErr = repo.produceEntityIDs(ctx, opts.EntityType, opts.Skip, ids)
 		}()
 
 		var wg sync.WaitGroup
@@ -144,15 +129,151 @@ func (repo *Repository) StreamEntitiesFromSnapshotsWithOptions(
 		// ctx.Done select, so this never deadlocks.
 		<-producerDone
 
-		// Surface an enumeration failure as a stream error. The default scan path collects all IDs
-		// before any worker runs, so this preserves its emit-nothing-then-error behavior; the
-		// HeadSource path may have emitted entities first.
+		// Surface an enumeration failure as a stream error. Enumeration collects all IDs before any
+		// worker runs, so this preserves its emit-nothing-then-error behavior.
 		if enumErr != nil {
 			repo.sendEntity(ctx, results, result.Err[evt.Entity](enumErr))
 		}
 	}()
 
 	return results
+}
+
+// sendEntity delivers an entity result unless the context is cancelled first, returning false when
+// the caller should stop producing. It keeps concurrent workers from blocking on an abandoned
+// consumer.
+func (repo *Repository) sendEntity(
+	ctx context.Context,
+	channel chan<- result.Result[evt.Entity],
+	value result.Result[evt.Entity],
+) bool {
+	select {
+	case channel <- value:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// produceEntityIDs enumerates the entity IDs to rebuild and feeds them to ids, applying the optional
+// skip predicate. It collects the distinct IDs from a key-only event-log scan before emitting any —
+// all-or-nothing semantics, where an enumeration failure emits no IDs at all, so a rebuild never
+// silently covers a subset.
+func (repo *Repository) produceEntityIDs(
+	ctx context.Context,
+	entityType evt.EntityType,
+	skip func(evt.EntityID) bool,
+	ids chan<- evt.EntityID,
+) error {
+	idList, err := repo.collectEntityIDs(ctx, entityType, skip)
+	if err != nil {
+		return err
+	}
+
+	for _, id := range idList {
+		select {
+		case ids <- id:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return nil
+}
+
+// collectEntityIDs enumerates the distinct entity IDs in the event log, applying the optional Skip
+// predicate, and returns them as a slice. It returns an error if the underlying scan fails, so the
+// caller can treat enumeration as all-or-nothing.
+func (repo *Repository) collectEntityIDs(
+	ctx context.Context,
+	entityType evt.EntityType,
+	skip func(evt.EntityID) bool,
+) ([]evt.EntityID, error) {
+	var ids []evt.EntityID
+
+	err := repo.enumerateEntityIDs(ctx, entityType, func(id evt.EntityID) bool {
+		if skip != nil && skip(id) {
+			return true
+		}
+
+		ids = append(ids, id)
+
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return ids, nil
+}
+
+// enumerateEntityIDs paginates a key-only Scan of the event log and invokes visit once per distinct
+// entity ID (partition key). visit returns false to stop enumeration early (e.g. on context
+// cancellation). Snapshot rows share their entity's partition key, so de-duplication folds them in.
+// Head items (sk = -1, ADR 0007) are skipped: an orphan head, a partition with neither events nor a
+// snapshot, would otherwise list a ghost entity ID.
+func (repo *Repository) enumerateEntityIDs(
+	ctx context.Context,
+	entityType evt.EntityType,
+	visit func(evt.EntityID) bool,
+) error {
+	input := dynamodb.ScanInput{
+		TableName:            &repo.EventsTable,
+		ConsistentRead:       aws.Bool(repo.consistentRead),
+		ProjectionExpression: aws.String("pk, sk"),
+	}
+
+	if entityType != "" {
+		input.FilterExpression = aws.String("entityType = :et")
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":et": &types.AttributeValueMemberS{Value: string(entityType)},
+		}
+	}
+
+	seen := make(map[evt.EntityID]struct{})
+	p := dynamodb.NewScanPaginator(repo.client, &input)
+
+	for p.HasMorePages() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		if page == nil {
+			continue
+		}
+
+		for _, item := range page.Items {
+			pkAttr, ok := item["pk"].(*types.AttributeValueMemberS)
+			if !ok {
+				continue
+			}
+
+			if sk, ok := numAttr(item, "sk"); ok && sk < 0 {
+				// A head item says nothing about its entity's existence.
+				continue
+			}
+
+			id := evt.EntityID(pkAttr.Value)
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			if evt.IsReservedEntityID(id) {
+				// Reserved namespaces hold engine-managed rows, never ordinary aggregates.
+				continue
+			}
+			seen[id] = struct{}{}
+
+			if !visit(id) {
+				return ctx.Err()
+			}
+		}
+	}
+
+	return nil
 }
 
 // loadEntityFromSnapshot reconstructs a single entity from its durable snapshot (when present) plus
@@ -173,7 +294,7 @@ func (repo *Repository) loadEntityFromSnapshot(
 		return nil, false
 	}
 
-	// No snapshot: full replay from sequence 1 (identical to StreamEntitiesByQuery).
+	// No snapshot: full replay from sequence 1.
 	if snapshot == nil {
 		events, eerr := repo.GetEvents(ctx, id)
 		if eerr != nil {

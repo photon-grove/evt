@@ -75,7 +75,7 @@ func TestExecute_LoadEntityError(t *testing.T) {
 func TestExecute_HandleError(t *testing.T) {
 	// Use a mock entity that will handle our MockCommand
 	mockEntity := &MockEntity{
-		BaseEntity:  evt.NewEntity("test-execute-handle-error"), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		ID:          "test-execute-handle-error",
 		handleError: errors.New("handle failed"),
 	}
 
@@ -118,7 +118,7 @@ func TestExecute_ApplyError(t *testing.T) {
 
 	// Create a mock entity that fails on Apply
 	entity := &MockEntity{
-		BaseEntity: evt.NewEntity(setup.entityID), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		ID:         setup.entityID,
 		applyError: errors.New("apply failed"),
 	}
 	command := &test.CreateEntity{Value: "test-value"}
@@ -168,8 +168,8 @@ func TestLoadEntity_UnmarshalError(t *testing.T) {
 // Test LoadEntity with GetLatestEvents error (with snapshot)
 func TestLoadEntity_GetLatestEventsError(t *testing.T) {
 	payload, mErr := json.Marshal(test.Entity{
-		BaseEntity: evt.NewEntity("test-id"), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-		Value:      "snapshot-value",
+		ID:    "test-id",
+		Value: "snapshot-value",
 	})
 	require.NoError(t, mErr)
 
@@ -229,7 +229,7 @@ func TestLoadEntity_ApplyEventError(t *testing.T) {
 
 	// Use mock entity that fails on Apply
 	entity := &MockEntity{
-		BaseEntity: evt.NewEntity("test-id"), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		ID:         "test-id",
 		applyError: errors.New("apply event failed"),
 	}
 
@@ -253,7 +253,7 @@ func TestCommit_UpdateSnapshotError(t *testing.T) {
 
 	// Use a mock entity that fails during snapshot generation
 	mockEntity := &MockEntity{
-		BaseEntity:    evt.NewEntity(setup.entityID), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		ID:            setup.entityID,
 		snapshotError: true,
 	}
 
@@ -559,7 +559,7 @@ func TestExecute_SetID_OverridesEntityID(t *testing.T) {
 
 	entity := &SetIDMockEntity{
 		MockEntity: MockEntity{
-			BaseEntity: evt.NewEntity(abbreviatedID), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+			ID: abbreviatedID,
 		},
 	}
 	command := &test.CreateEntity{Value: "setid-value"}
@@ -581,7 +581,7 @@ func TestExecute_WithoutSetID_Succeeds(t *testing.T) {
 
 	// MockEntity does not implement SetID — Execute should still work fine
 	entity := &MockEntity{
-		BaseEntity: evt.NewEntity("test-no-setid"), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		ID: "test-no-setid",
 	}
 	command := &test.CreateEntity{Value: "no-setid-value"}
 
@@ -678,13 +678,12 @@ func Test_EventStore_MultiBoundaryBatch_ReloadIsCurrent(t *testing.T) {
 // --- Additive aggregate: proves snapshots are not double-applied via Execute ---
 
 type counterEntity struct {
-	evt.BaseEntity
-	Count int `json:"count"`
+	ID    evt.EntityID `json:"id"`
+	Count int          `json:"count"`
 }
 
 func (c *counterEntity) Type() evt.EntityType                { return "counter" }
 func (c *counterEntity) GetID() evt.EntityID                 { return c.ID }
-func (c *counterEntity) Base() evt.BaseEntity                { return c.BaseEntity } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 func (c *counterEntity) EventUpcasters() []evt.EventUpcaster { return nil }
 func (c *counterEntity) Projectors() []evt.EventProjector    { return nil }
 
@@ -742,12 +741,12 @@ func TestExecute_AdditiveSnapshot_NoDoubleApply(t *testing.T) {
 	store := snapshots.NewStore(repo, 2) // snapshot every 2 events; one command crosses boundaries
 
 	id := evt.EntityID("counter-1")
-	entity := &counterEntity{BaseEntity: evt.NewEntity(id)} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	entity := &counterEntity{ID: id}
 
 	require.NoError(t, store.Execute(ctx, entity, id, &addCommand{N: 6}, evt.Metadata{}))
 	require.Equal(t, 6, entity.Count)
 
-	reloaded := &counterEntity{BaseEntity: evt.NewEntity(id)} //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	reloaded := &counterEntity{ID: id}
 	_, err := store.LoadEntity(ctx, reloaded, id)
 	require.NoError(t, err)
 	require.Equal(t, 6, reloaded.Count, "reloaded count must not be double-applied")

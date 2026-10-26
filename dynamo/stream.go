@@ -10,55 +10,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 )
 
-// The Repository satisfies the backend-neutral streaming contract and the DynamoDB-specific
-// raw-expression extension.
+// The Repository satisfies the backend-neutral streaming contract.
 var (
 	_ evt.Repository              = (*Repository)(nil)
 	_ evt.TransactionalRepository = (*Repository)(nil)
-	_ ExpressionStreamer          = (*Repository)(nil)
 )
-
-// ExpressionStreamer is the DynamoDB-specific streaming capability for callers that need richer
-// server-side filtering than the backend-neutral evt.StreamFilter exposes. The core
-// evt.Repository contract intentionally carries no DynamoDB types, so callers that want to push a
-// raw DynamoDB filter expression into the table scan type-assert a repository to ExpressionStreamer.
-//
-// Like evt's other optional capabilities (Compactor, SnapshotStreamer), it is detected via a type
-// assertion (repo.(dynamo.ExpressionStreamer)) and is not part of the backend-neutral contract a
-// future SQL backend must satisfy.
-//
-// Deprecated: Cut in ADR-0006 (K7): raw server-side expressions leak backend types past the
-// backend-neutral contract. There is no like-for-like in-library replacement:
-// StreamAllEvents / StreamEntities with evt.StreamFilter filter by entity type only, so move
-// richer predicates client-side or page your own Scan with a FilterExpression. It will be
-// removed in the next minor release.
-type ExpressionStreamer interface {
-	// StreamAllEventsByExpression scans all Events in the table, optionally filtered by a raw
-	// DynamoDB expression. A nil expression streams every event.
-	//
-	// Deprecated: Cut in ADR-0006 (K7). No like-for-like replacement: StreamAllEvents with
-	// evt.StreamFilter filters by entity type only — apply richer predicates client-side. It
-	// will be removed in the next minor release.
-	StreamAllEventsByExpression(
-		ctx context.Context,
-		expr *expression.Expression,
-	) <-chan result.Result[[]evt.SerializedEvent]
-
-	// StreamEntitiesByExpression streams reconstituted Entities, optionally filtered by a raw
-	// DynamoDB expression. A nil expression streams every entity.
-	//
-	// Deprecated: Cut in ADR-0006 (K7). No like-for-like replacement: StreamEntities with
-	// evt.StreamFilter filters by entity type only — apply richer predicates client-side. It
-	// will be removed in the next minor release.
-	StreamEntitiesByExpression(
-		ctx context.Context,
-		expr *expression.Expression,
-		applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
-	) <-chan result.Result[evt.Entity]
-}
 
 // filterExpression compiles a backend-neutral evt.StreamFilter into an optional DynamoDB filter
 // expression. A zero filter yields a nil expression (no server-side filtering).
@@ -78,7 +37,7 @@ func filterExpression(filter evt.StreamFilter) (*expression.Expression, error) {
 }
 
 // StreamAllEvents implements the backend-neutral evt.Repository contract by translating the
-// StreamFilter into a DynamoDB filter expression and delegating to StreamAllEventsByExpression.
+// StreamFilter into a DynamoDB filter expression and delegating to streamAllEventsFiltered.
 func (repo *Repository) StreamAllEvents(
 	ctx context.Context,
 	filter evt.StreamFilter,
@@ -91,21 +50,17 @@ func (repo *Repository) StreamAllEvents(
 		return channel
 	}
 
-	return repo.StreamAllEventsByExpression(ctx, expr)
+	return repo.streamAllEventsFiltered(ctx, expr)
 }
 
-// StreamAllEventsByExpression scans all Events in the table, returning a channel for results and
+// streamAllEventsFiltered scans all Events in the table, returning a channel for results and
 // errors.
 //
 // Events are emitted page by page as they are read; the channel is a true stream and does not buffer
 // the whole table. When the repository is configured with WithScanSegments, the scan runs in
 // parallel across segments and pages from different segments interleave on the channel in no
 // particular order.
-//
-// Deprecated: Cut in ADR-0006 (K7). No like-for-like replacement: StreamAllEvents with
-// evt.StreamFilter filters by entity type only — apply richer predicates client-side. It
-// will be removed in the next minor release.
-func (repo *Repository) StreamAllEventsByExpression(
+func (repo *Repository) streamAllEventsFiltered(
 	ctx context.Context,
 	expr *expression.Expression,
 ) <-chan result.Result[[]evt.SerializedEvent] {
@@ -125,7 +80,7 @@ func (repo *Repository) StreamAllEventsByExpression(
 }
 
 // StreamEntities implements the backend-neutral evt.Repository contract by translating the
-// StreamFilter into a DynamoDB filter expression and delegating to StreamEntitiesByExpression.
+// StreamFilter into a DynamoDB filter expression and delegating to streamEntitiesFiltered.
 func (repo *Repository) StreamEntities(
 	ctx context.Context,
 	filter evt.StreamFilter,
@@ -139,10 +94,10 @@ func (repo *Repository) StreamEntities(
 		return channel
 	}
 
-	return repo.StreamEntitiesByExpression(ctx, expr, applyEvent) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	return repo.streamEntitiesFiltered(ctx, expr, applyEvent)
 }
 
-// StreamEntitiesByExpression streams Events from the table, optionally filtered by a raw DynamoDB
+// streamEntitiesFiltered streams Events from the table, optionally filtered by a raw DynamoDB
 // expression, and yields each completed Entity after all of its Events have been applied in
 // sequence order.
 //
@@ -155,11 +110,7 @@ func (repo *Repository) StreamEntities(
 // As a result it buffers all matched Events in memory for the duration of the scan. It is intended
 // for rebuild/diagnostic flows (see evt.RebuildProjections), not hot read paths. For large tables,
 // pair it with WithScanSegments to parallelize the read.
-//
-// Deprecated: Cut in ADR-0006 (K7). No like-for-like replacement: StreamEntities with
-// evt.StreamFilter filters by entity type only — apply richer predicates client-side. It
-// will be removed in the next minor release.
-func (repo *Repository) StreamEntitiesByExpression(
+func (repo *Repository) streamEntitiesFiltered(
 	ctx context.Context,
 	expr *expression.Expression,
 	applyEvent func(context.Context, evt.SerializedEvent, evt.Entity) (evt.Entity, error),
@@ -182,7 +133,7 @@ func (repo *Repository) StreamEntitiesByExpression(
 		order := make([]evt.EntityID, 0)
 		scanFailed := false
 
-		for eventResults := range repo.StreamAllEventsByExpression(scanCtx, expr) {
+		for eventResults := range repo.streamAllEventsFiltered(scanCtx, expr) {
 			serialized, err := eventResults.Unwrap()
 			if err != nil {
 				if !scanFailed {

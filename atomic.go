@@ -170,39 +170,6 @@ func CheckLegacyProjectorOperationsSupported(backend string, result SerializedRe
 	return nil
 }
 
-// UnsupportedBatchEntryError refuses a SerializedResult sent through the deprecated CommitStream
-// batch path that carries Snapshots, Fences, or an Outcome. The batch path writes events (and
-// projector operations) only, so it would drop them silently; commit such a result with
-// Repository.Commit instead. Nothing from the entry was written.
-type UnsupportedBatchEntryError struct {
-	Snapshots int
-	Fences    int
-	Outcomes  int
-}
-
-func (e *UnsupportedBatchEntryError) Error() string {
-	return fmt.Sprintf(
-		"CommitStream entry carries %d snapshots, %d read fences, and %d outcomes, which the batch path cannot honor; use Repository.Commit",
-		e.Snapshots, e.Fences, e.Outcomes,
-	)
-}
-
-// CheckBatchEntry returns *UnsupportedBatchEntryError for a result with Snapshots, Fences, or an
-// Outcome. A legacy batch path that does not route each entry through Repository.Commit calls it
-// before batching, so it fails closed instead of dropping the new fields.
-func CheckBatchEntry(result SerializedResult) error {
-	outcomes := 0
-	if result.Outcome != nil {
-		outcomes = 1
-	}
-
-	if len(result.Snapshots) == 0 && len(result.Fences) == 0 && outcomes == 0 {
-		return nil
-	}
-
-	return &UnsupportedBatchEntryError{Snapshots: len(result.Snapshots), Fences: len(result.Fences), Outcomes: outcomes}
-}
-
 // InvalidCommitError reports a commit built wrong — for example an event whose ID is not the
 // canonical {entityId}:{sequence} for its stream and sequence. Nothing was written.
 type InvalidCommitError struct {

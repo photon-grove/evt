@@ -15,7 +15,7 @@ import (
 
 // seedMockEntity reconstructs a MockEntity from a snapshot payload.
 func seedMockEntity(_ context.Context, snapshot evt.SerializedSnapshot) (evt.Entity, error) {
-	return &MockEntity{BaseEntity: evt.NewEntity(snapshot.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	return &MockEntity{ID: snapshot.EntityID}, nil
 }
 
 // enumScanOutput builds a key-only Scan page (the entity-ID enumeration) for the given pks. It
@@ -122,7 +122,7 @@ func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_NoSnapshotFullReplay(
 	}
 	applyFunc := func(_ context.Context, event evt.SerializedEvent, _ evt.Entity) (evt.Entity, error) {
 		applied = append(applied, event.Sequence)
-		return &MockEntity{BaseEntity: evt.NewEntity(event.EntityID)}, nil //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+		return &MockEntity{ID: event.EntityID}, nil
 	}
 
 	var entities []evt.Entity
@@ -164,106 +164,103 @@ func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_MultipleEntities() {
 	s.client.AssertExpectations(s.T())
 }
 
-// Test_StreamEntitiesFromSnapshotsWithOptions_HeadSourceEnumeration verifies the opt-in registry
-// path for the snapshot-aware rebuild: with a HeadSource set, entity IDs stream from the heads
-// registry (no key-only event-log scan), and each entity is still seeded from its sk=0 snapshot and
-// has only its post-snapshot events applied. No Scan is registered on the mock, so any fallback to
-// the scan-and-dedup path would surface as an unexpected call.
-func (s *RepositorySuite) Test_StreamEntitiesFromSnapshotsWithOptions_HeadSourceEnumeration() {
-	ctx := context.Background()
-
-	heads := &fakeHeadVisitor{heads: []headEntry{
-		{id: "acct-a", seq: 6, typ: "MockEntity"},
-		{id: "acct-b", seq: 6, typ: "MockEntity"},
-	}}
-
-	s.client.On("GetItem", mock.Anything, getItemForPK("acct-a"), mock.Anything).Return(snapshotGetItem("acct-a", 5), nil)
-	s.client.On("GetItem", mock.Anything, getItemForPK("acct-b"), mock.Anything).Return(snapshotGetItem("acct-b", 5), nil)
-	s.client.On("Query", mock.Anything, queryForPKSince("acct-a", 5), mock.Anything).Return(eventsQueryOutput("acct-a", 6), nil)
-	s.client.On("Query", mock.Anything, queryForPKSince("acct-b", 5), mock.Anything).Return(eventsQueryOutput("acct-b", 6), nil)
-
-	applied := map[evt.EntityID][]evt.EventSequence{}
-	applyFunc := func(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-		applied[event.EntityID] = append(applied[event.EntityID], event.Sequence)
-		return entity, nil
+// noSnapshot answers a snapshot lookup with no row, so the entity replays from sequence 1.
+func (s *RepositorySuite) noSnapshot(ids ...string) {
+	for _, id := range ids {
+		s.client.On("GetItem", mock.Anything, getItemForPK(id), mock.Anything).Return(&dynamodb.GetItemOutput{Item: nil}, nil)
+		s.client.On("Query", mock.Anything, mock.MatchedBy(queryForPK(id)), mock.Anything).Return(eventsQueryOutput(id, 1), nil)
 	}
-
-	opts := dynamo.StreamFromSnapshotsOptions{Workers: 1, HeadSource: heads}
-
-	ids := make([]evt.EntityID, 0, 2)
-	for res := range s.repo.StreamEntitiesFromSnapshotsWithOptions(ctx, opts, seedMockEntity, applyFunc) {
-		entity, err := res.Unwrap()
-		require.NoError(s.T(), err)
-		ids = append(ids, entity.GetID())
-	}
-
-	require.ElementsMatch(s.T(), []evt.EntityID{"acct-a", "acct-b"}, ids)
-	require.Equal(s.T(), []evt.EventSequence{6}, applied["acct-a"])
-	require.Equal(s.T(), []evt.EventSequence{6}, applied["acct-b"])
-	require.Equal(s.T(), []evt.EntityID{"acct-a", "acct-b"}, heads.streamed, "IDs came from the registry, streamed in order")
-	s.client.AssertExpectations(s.T())
 }
 
-// Test_StreamEntitiesFromSnapshotsWithOptions_HeadSourceSkipAndType verifies the snapshot-aware
-// registry path honors the Skip predicate (a skipped ID is never reconstructed) and forwards
-// EntityType to the head source so enumeration is scoped to one type.
-func (s *RepositorySuite) Test_StreamEntitiesFromSnapshotsWithOptions_HeadSourceSkipAndType() {
-	ctx := context.Background()
-
-	heads := &fakeHeadVisitor{heads: []headEntry{
-		{id: "acct-a", seq: 6, typ: "MockEntity"},
-		{id: "acct-b", seq: 6, typ: "MockEntity"},
-		{id: "acct-z", seq: 6, typ: "OtherEntity"},
-	}}
-
-	// Only "acct-a" should be reconstructed: "acct-b" is skipped, "acct-z" is filtered out by type.
-	s.client.On("GetItem", mock.Anything, getItemForPK("acct-a"), mock.Anything).Return(snapshotGetItem("acct-a", 5), nil)
-	s.client.On("Query", mock.Anything, queryForPKSince("acct-a", 5), mock.Anything).Return(eventsQueryOutput("acct-a", 6), nil)
-
-	applyFunc := func(_ context.Context, _ evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-		return entity, nil
+func applyAsMockEntity(_ context.Context, event evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
+	if entity == nil {
+		return &MockEntity{ID: event.EntityID}, nil
 	}
 
-	opts := dynamo.StreamFromSnapshotsOptions{
-		Workers:    1,
-		EntityType: evt.EntityType("MockEntity"),
-		HeadSource: heads,
-		Skip:       func(id evt.EntityID) bool { return id == "acct-b" },
-	}
-
-	ids := make([]evt.EntityID, 0, 1)
-	for res := range s.repo.StreamEntitiesFromSnapshotsWithOptions(ctx, opts, seedMockEntity, applyFunc) {
-		entity, err := res.Unwrap()
-		require.NoError(s.T(), err)
-		ids = append(ids, entity.GetID())
-	}
-
-	require.Equal(s.T(), []evt.EntityID{"acct-a"}, ids)
-	require.Equal(s.T(), evt.EntityType("MockEntity"), heads.gotType, "EntityType is forwarded to the head source")
-	require.Equal(s.T(), []evt.EntityID{"acct-a", "acct-b"}, heads.streamed, "only matching-type heads are streamed")
-	s.client.AssertExpectations(s.T())
+	return entity, nil
 }
 
-// Test_StreamEntitiesFromSnapshotsWithOptions_HeadSourceEnumerationError surfaces a head-source
-// failure as an error result on the stream.
-func (s *RepositorySuite) Test_StreamEntitiesFromSnapshotsWithOptions_HeadSourceEnumerationError() {
-	ctx := context.Background()
+func (s *RepositorySuite) collectIDs(opts dynamo.StreamFromSnapshotsOptions) ([]evt.EntityID, error) {
+	var (
+		ids    []evt.EntityID
+		gotErr error
+	)
 
-	heads := &fakeHeadVisitor{err: errors.New("registry boom")}
-
-	applyFunc := func(_ context.Context, _ evt.SerializedEvent, entity evt.Entity) (evt.Entity, error) {
-		return entity, nil
-	}
-
-	opts := dynamo.StreamFromSnapshotsOptions{Workers: 2, HeadSource: heads}
-
-	var gotErr error
-	for res := range s.repo.StreamEntitiesFromSnapshotsWithOptions(ctx, opts, seedMockEntity, applyFunc) {
-		if _, err := res.Unwrap(); err != nil {
+	for res := range s.repo.StreamEntitiesFromSnapshotsWithOptions(context.Background(), opts, seedMockEntity, applyAsMockEntity) {
+		entity, err := res.Unwrap()
+		if err != nil {
 			gotErr = err
+			continue
 		}
+
+		ids = append(ids, entity.GetID())
 	}
 
-	require.ErrorContains(s.T(), gotErr, "registry boom")
+	return ids, gotErr
+}
+
+// Test_StreamEntitiesFromSnapshots_Skip verifies the Skip predicate removes an entity before it is
+// reconstructed, so no snapshot or event read happens for it.
+func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_Skip() {
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).Return(enumScanOutput("a", "b"), nil).Once()
+	s.noSnapshot("a")
+
+	ids, err := s.collectIDs(dynamo.StreamFromSnapshotsOptions{Workers: 1, Skip: func(id evt.EntityID) bool { return id == "b" }})
+
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), []evt.EntityID{"a"}, ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesFromSnapshots_EntityTypeFilter verifies enumeration filters the scan by type.
+func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_EntityTypeFilter() {
+	s.client.On("Scan", mock.Anything, mock.MatchedBy(func(in *dynamodb.ScanInput) bool {
+		v, ok := in.ExpressionAttributeValues[":et"].(*types.AttributeValueMemberS)
+		return in.FilterExpression != nil && ok && v.Value == "TestEntity"
+	}), mock.Anything).Return(enumScanOutput("a"), nil).Once()
+	s.noSnapshot("a")
+
+	ids, err := s.collectIDs(dynamo.StreamFromSnapshotsOptions{Workers: 1, EntityType: "TestEntity"})
+
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), []evt.EntityID{"a"}, ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesFromSnapshots_EnumerationError verifies that a failed enumeration is fatal:
+// it emits an error and no entities, so a rebuild never silently covers a subset.
+func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_EnumerationError() {
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).
+		Return((*dynamodb.ScanOutput)(nil), errors.New("scan boom")).Once()
+
+	ids, err := s.collectIDs(dynamo.StreamFromSnapshotsOptions{Workers: 2})
+
+	require.Error(s.T(), err)
+	require.Contains(s.T(), err.Error(), "scan boom")
+	require.Empty(s.T(), ids)
+	s.client.AssertExpectations(s.T())
+}
+
+// Test_StreamEntitiesFromSnapshots_SkipsHeadItemsAndReservedIDs verifies that an orphan head item
+// (sk = -1) and the reserved engine partitions never list as entities.
+func (s *RepositorySuite) Test_StreamEntitiesFromSnapshots_SkipsHeadItemsAndReservedIDs() {
+	headOnly := map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: "orphan"},
+		"sk": &types.AttributeValueMemberN{Value: "-1"},
+	}
+	reserved := pkItem(evt.SystemNamespacePrefix + "FEATURES")
+	live := map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: "a"},
+		"sk": &types.AttributeValueMemberN{Value: "1"},
+	}
+
+	s.client.On("Scan", mock.Anything, mock.Anything, mock.Anything).
+		Return(&dynamodb.ScanOutput{Items: []map[string]types.AttributeValue{headOnly, reserved, live}}, nil).Once()
+	s.noSnapshot("a")
+
+	ids, err := s.collectIDs(dynamo.StreamFromSnapshotsOptions{Workers: 1})
+
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), []evt.EntityID{"a"}, ids)
 	s.client.AssertExpectations(s.T())
 }

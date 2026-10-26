@@ -3,7 +3,6 @@ package snapshots_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/photon-grove/evt"
 	"github.com/photon-grove/evt/mem"
@@ -78,8 +77,8 @@ func (r *gapOnce) GetLatestEvents(ctx context.Context, id evt.EntityID, after ev
 	return events[1:], nil
 }
 
-// policy.ExecuteWithRetry retries a load gap, because the conflict is classified as transient.
-func TestExecuteWithRetryRetriesALoadGap(t *testing.T) {
+// A load gap is a transient conflict, so a caller that retries the command gets a clean load.
+func TestLoadGapIsTransientAndTheRetrySucceeds(t *testing.T) {
 	ctx := context.Background()
 	repo := mem.NewRepository()
 	id := evt.EntityID("gap-retry-1")
@@ -90,21 +89,16 @@ func TestExecuteWithRetryRetriesALoadGap(t *testing.T) {
 		require.NoError(t, store.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: value}, newTestMetadata()))
 	}
 
-	retries := 0
-	entity, err := policy.ExecuteWithRetry(ctx, //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-		snapshots.NewStore(&gapOnce{Repository: repo}, 3),
-		func() evt.Entity { return test.NewEntity(id) },
-		id,
-		&test.ReplaceEntity{Value: "six"},
-		newTestMetadata(),
-		policy.Config{MaxAttempts: 3, Sleep: func(context.Context, time.Duration) error { return nil }},
-		policy.Hooks{OnRetry: func(policy.Attempt) { retries++ }}, //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	)
+	gapped := snapshots.NewStore(&gapOnce{Repository: repo}, 3)
+	err := gapped.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: "six"}, newTestMetadata())
+	require.Error(t, err)
+	require.True(t, policy.IsTransient(err), "the gap is classified as transient")
 
+	require.NoError(t, gapped.Execute(ctx, test.NewEntity(id), id, &test.ReplaceEntity{Value: "six"}, newTestMetadata()))
+
+	loaded := test.NewEntity(id)
+	_, err = gapped.LoadEntity(ctx, loaded, id)
 	require.NoError(t, err)
-	require.Equal(t, 1, retries, "the gap is retried once")
-	loaded, ok := entity.(*test.Entity)
-	require.True(t, ok)
 	require.Equal(t, "six", loaded.Value)
 }
 

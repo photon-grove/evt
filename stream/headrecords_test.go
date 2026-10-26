@@ -33,20 +33,3 @@ func TestDynamoDBHandler_SkipsHeadItems(t *testing.T) {
 		t.Fatalf("expected only the event record, got %+v", got)
 	}
 }
-
-// The SNS publisher counts a head item as skipped, not as a malformed event to drop.
-func TestSNSPublisher_SkipsHeadItems(t *testing.T) {
-	publisher, err := NewSNSPublisher(&mockSNSPublishClient{}, "arn:aws:sns:us-west-2:000000000000:test", "test") //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result, err := publisher.Publish(context.Background(), []events.DynamoDBEventRecord{record("head", "-1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if result.SkippedCount != 1 || result.DroppedMalformedCount != 0 || result.PublishedCount != 0 || len(result.FailedIndices) != 0 {
-		t.Fatalf("expected one skipped record, got %+v", result)
-	}
-}

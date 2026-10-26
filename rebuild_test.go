@@ -11,19 +11,18 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/photon-grove/evt"
-	"github.com/photon-grove/evt/result" //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	"github.com/photon-grove/evt/result"
 )
 
 // --- Test doubles ---
 
 type stubEntity struct {
-	evt.BaseEntity
-	Value string `json:"value"`
+	ID    evt.EntityID `json:"id"`
+	Value string       `json:"value"`
 }
 
 func (e *stubEntity) Type() evt.EntityType                { return "stub" }
 func (e *stubEntity) GetID() evt.EntityID                 { return e.ID }
-func (e *stubEntity) Base() evt.BaseEntity                { return e.BaseEntity }
 func (e *stubEntity) Reset() evt.Entity                   { return &stubEntity{} }
 func (e *stubEntity) EventUpcasters() []evt.EventUpcaster { return nil }
 func (e *stubEntity) Projectors() []evt.EventProjector    { return nil }
@@ -78,9 +77,6 @@ type fakeRepo struct {
 }
 
 func (r *fakeRepo) Commit(_ context.Context, _ evt.SerializedResult) error { return nil }
-func (r *fakeRepo) CommitStream(_ context.Context, _ <-chan result.Result[evt.SerializedResult]) []error {
-	return nil
-}
 func (r *fakeRepo) CommitWithSnapshot(_ context.Context, _ evt.SerializedResult, _ evt.EntityType, _ evt.EntityID, _ []byte, _ evt.EventSequence) error {
 	return nil
 }
@@ -173,8 +169,8 @@ func TestRebuildProjections_EmptyRepo(t *testing.T) {
 }
 
 func TestRebuildProjections_ProcessesEntities(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "hello"}
-	e2 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e2"}, Value: "world"}
+	e1 := &stubEntity{ID: "e1", Value: "hello"}
+	e2 := &stubEntity{ID: "e2", Value: "world"}
 	repo := &fakeRepo{entities: []evt.Entity{e1, e2}}
 
 	txnGroup := &stubTransactionGroup{size: 1}
@@ -204,7 +200,7 @@ func TestRebuildProjections_ProcessesEntities(t *testing.T) {
 }
 
 func TestRebuildProjections_DryRunSkipsCommit(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "hello"}
+	e1 := &stubEntity{ID: "e1", Value: "hello"}
 	repo := &fakeRepo{entities: []evt.Entity{e1}}
 
 	txnGroup := &stubTransactionGroup{size: 1}
@@ -221,10 +217,10 @@ func TestRebuildProjections_DryRunSkipsCommit(t *testing.T) {
 }
 
 func TestRebuildProjections_FiltersEntityType(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "match"}
+	e1 := &stubEntity{ID: "e1", Value: "match"}
 
 	// otherEntity has a different type
-	other := &otherTypeEntity{BaseEntity: evt.BaseEntity{ID: "e2"}, Value: "skip"}
+	other := &otherTypeEntity{ID: "e2", Value: "skip"}
 
 	repo := &fakeRepo{entities: []evt.Entity{e1, other}}
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
@@ -247,7 +243,7 @@ func TestRebuildProjections_FiltersEntityType(t *testing.T) {
 }
 
 func TestRebuildProjections_ProjectorError(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "hello"}
+	e1 := &stubEntity{ID: "e1", Value: "hello"}
 	repo := &fakeRepo{entities: []evt.Entity{e1}}
 
 	proj := &stubProjector{err: errors.New("projection failed")}
@@ -264,7 +260,7 @@ func TestRebuildProjections_ProjectorError(t *testing.T) {
 }
 
 func TestRebuildProjections_CommitError(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "hello"}
+	e1 := &stubEntity{ID: "e1", Value: "hello"}
 	repo := &fakeRepo{entities: []evt.Entity{e1}}
 
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
@@ -299,7 +295,7 @@ func TestRebuildProjections_StreamError(t *testing.T) {
 }
 
 func TestRebuildProjections_NilProjectorResult(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "hello"}
+	e1 := &stubEntity{ID: "e1", Value: "hello"}
 	repo := &fakeRepo{entities: []evt.Entity{e1}}
 
 	// Projector returns nil group (no-op)
@@ -316,8 +312,8 @@ func TestRebuildProjections_NilProjectorResult(t *testing.T) {
 }
 
 func TestRebuildProjections_OnProgress(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "a"}
-	e2 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e2"}, Value: "b"}
+	e1 := &stubEntity{ID: "e1", Value: "a"}
+	e2 := &stubEntity{ID: "e2", Value: "b"}
 	repo := &fakeRepo{entities: []evt.Entity{e1, e2}}
 
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
@@ -341,7 +337,7 @@ func TestRebuildProjections_OnProgress(t *testing.T) {
 }
 
 func TestRebuildProjections_MultipleProjectors(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "hello"}
+	e1 := &stubEntity{ID: "e1", Value: "hello"}
 	repo := &fakeRepo{entities: []evt.Entity{e1}}
 
 	proj1 := &stubProjector{group: &stubTransactionGroup{size: 1}}
@@ -381,7 +377,7 @@ func TestRebuildProjections_ContextCancellation(t *testing.T) {
 	// Create a slow repo that yields many entities
 	entities := make([]evt.Entity, 100)
 	for i := range entities {
-		entities[i] = &stubEntity{BaseEntity: evt.BaseEntity{ID: evt.EntityID(fmt.Sprintf("e%d", i))}}
+		entities[i] = &stubEntity{ID: evt.EntityID(fmt.Sprintf("e%d", i))}
 	}
 	repo := &fakeRepo{entities: entities}
 
@@ -411,9 +407,9 @@ func TestRebuildProjections_ContextCancellation(t *testing.T) {
 }
 
 func TestRebuildProjections_MaxErrors(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "a"}
-	e2 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e2"}, Value: "b"}
-	e3 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e3"}, Value: "c"}
+	e1 := &stubEntity{ID: "e1", Value: "a"}
+	e2 := &stubEntity{ID: "e2", Value: "b"}
+	e3 := &stubEntity{ID: "e3", Value: "c"}
 	repo := &fakeRepo{entities: []evt.Entity{e1, e2, e3}}
 
 	proj := &stubProjector{err: errors.New("always fails")}
@@ -434,13 +430,12 @@ func TestRebuildProjections_MaxErrors(t *testing.T) {
 
 // otherTypeEntity returns a different entity type for filtering tests.
 type otherTypeEntity struct {
-	evt.BaseEntity
-	Value string `json:"value"`
+	ID    evt.EntityID `json:"id"`
+	Value string       `json:"value"`
 }
 
 func (e *otherTypeEntity) Type() evt.EntityType                { return "other" }
 func (e *otherTypeEntity) GetID() evt.EntityID                 { return e.ID }
-func (e *otherTypeEntity) Base() evt.BaseEntity                { return e.BaseEntity }
 func (e *otherTypeEntity) Reset() evt.Entity                   { return &otherTypeEntity{} }
 func (e *otherTypeEntity) EventUpcasters() []evt.EventUpcaster { return nil }
 func (e *otherTypeEntity) Projectors() []evt.EventProjector    { return nil }
@@ -465,8 +460,8 @@ func streamOf(entities ...evt.Entity) <-chan result.Result[evt.Entity] {
 }
 
 func TestRebuildProjectionsFromStream_ProcessesEntities(t *testing.T) {
-	e1 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e1"}, Value: "hello"}
-	e2 := &stubEntity{BaseEntity: evt.BaseEntity{ID: "e2"}, Value: "world"}
+	e1 := &stubEntity{ID: "e1", Value: "hello"}
+	e2 := &stubEntity{ID: "e2", Value: "world"}
 
 	proj := &stubProjector{group: &stubTransactionGroup{size: 1}}
 	var committed int

@@ -19,16 +19,14 @@ var errBusiness = errors.New("business logic error")
 
 // The Entity handles commands and applies events for testing
 type Entity struct {
-	evt.BaseEntity
-	Value string  `json:"value"`
-	Other *string `json:"other"`
+	ID    evt.EntityID `json:"id"`
+	Value string       `json:"value"`
+	Other *string      `json:"other"`
 }
 
 // NewEntity returns an Entity instance for the given id
 func NewEntity(id evt.EntityID) *Entity {
-	return &Entity{
-		BaseEntity: evt.NewEntity(id), //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	}
+	return &Entity{ID: id}
 }
 
 // Type returns the Entity type constant
@@ -39,11 +37,6 @@ func (entity *Entity) Type() evt.EntityType {
 // GetID returns the ID for this Entity instance
 func (entity *Entity) GetID() evt.EntityID {
 	return entity.ID
-}
-
-// Base returns the base entity fields
-func (entity *Entity) Base() evt.BaseEntity { //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
-	return entity.BaseEntity
 }
 
 // EventUpcasters returns the upcasters for events within this Entity

@@ -363,7 +363,7 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 				if sk, ok := item["sk"].(*types.AttributeValueMemberN); ok && (sk.Value == "0" || sk.Value == "-1") {
 					continue
 				}
-				message, _, err := compat.SNSMessage(ctx, item)
+				message, _, err := compat.SNSMessage(item)
 				if err != nil {
 					return nil, err
 				}

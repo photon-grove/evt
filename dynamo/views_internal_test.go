@@ -13,13 +13,12 @@ import (
 )
 
 type badJSONEntity struct {
-	evt.BaseEntity
-	F func() `json:"f"`
+	ID evt.EntityID `json:"id"`
+	F  func()       `json:"f"`
 }
 
 func (e *badJSONEntity) Type() evt.EntityType { return "bad" }
 func (e *badJSONEntity) GetID() evt.EntityID  { return e.ID }
-func (e *badJSONEntity) Base() evt.BaseEntity { return e.BaseEntity } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 func (e *badJSONEntity) EventUpcasters() []evt.EventUpcaster {
 	return nil
 }
@@ -36,7 +35,6 @@ type emptyIDEntity struct{}
 
 func (e emptyIDEntity) Type() evt.EntityType                { return "x" }
 func (e emptyIDEntity) GetID() evt.EntityID                 { return "" }
-func (e emptyIDEntity) Base() evt.BaseEntity                { return evt.BaseEntity{} } //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
 func (e emptyIDEntity) EventUpcasters() []evt.EventUpcaster { return nil }
 func (e emptyIDEntity) Projectors() []evt.EventProjector    { return nil }
 func (e emptyIDEntity) Handle(context.Context, evt.Command) (evt.CommandResult, error) {
@@ -70,7 +68,7 @@ func Test_ViewProjector_Project_GuardsAndSuccess(t *testing.T) {
 	require.Nil(t, group)
 
 	// JSON marshal error
-	group, err = p.Project(context.Background(), &badJSONEntity{BaseEntity: evt.NewEntity("e1")}, nil) //nolint:staticcheck // deprecated in ADR-0006 (K cuts), kept until the next-minor deletion
+	group, err = p.Project(context.Background(), &badJSONEntity{ID: "e1"}, nil)
 	require.Error(t, err)
 	require.Nil(t, group)
 

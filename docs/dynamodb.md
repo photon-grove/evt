@@ -171,13 +171,9 @@ history dependence **before writing data of that entity type**. PostgreSQL inste
 shared feature advisory lock through validation and all deletes in one transaction. See
 [Feature Marker](spec/storage-format.md#feature-marker).
 
-The raw `dynamo.Delete` helper is snapshot-unsafe, intended for local/staging
-fixtures only, and excluded from production builds behind a `//go:build !prod`
-tag. It is deprecated in v0.9.0
-([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K7) and will be removed in the next
-minor release with no in-library replacement: for fixture teardown or reset, delete the items
-with the AWS SDK or recreate the table. (`CompactBelow` is for snapshot-verified truncation, not
-fixture cleanup — it only deletes a snapshot-covered prefix and never deletes the snapshot row.)
+There is no raw delete helper. For fixture teardown or reset, delete the items with the AWS SDK or
+recreate the table. `CompactBelow` is for snapshot-verified truncation, not fixture cleanup: it only
+deletes a snapshot-covered prefix and never deletes the snapshot row.
 Prefer `CompactBelow` for principled truncation in any environment. Background and rationale
 live in [ADR 0001](adr/0001-event-compaction-and-snapshot-truncation.md).
 
@@ -247,22 +243,10 @@ the `entityType-index` global secondary index, which DynamoDB can only read even
 consistently, so a row a commit just wrote can be missing from them for a moment. Rust's
 `DynamoViewRepository` behaves the same (`with_consistent_read`).
 
-## Entity-heads table
-
-*Deprecated in v0.9.0 ([ADR 0006](adr/0006-parity-policy-and-feature-cuts.md), K4):* the heads
-table and `dynamo.HeadStore` are cut — derive entity heads from the log with
-`Repository.StreamEntityHeads` (a scan-and-fold over the event log) instead. The paragraph below
-describes the pre-v0.9 table for readers still on it.
-
-To support [incremental rebuilds](projections.md), the repository can track one
-small row per entity (`pk` = entity ID) recording its current head sequence. This
-lets a rebuild enumerate entity heads with a key-only scan and re-project only the
-streams that changed, instead of re-reading the whole log.
-
 ## Local tables
 
 The [`infra/local`](https://github.com/photon-grove/evt/tree/main/infra/local)
 Terraform stack creates emulator tables that match the integration suite —
-`evt-local-event-log`, `evt-local-entity-views`, and `evt-local-entity-heads`.
+`evt-local-event-log` and `evt-local-entity-views`.
 Apply it against a local DynamoDB-compatible emulator (Moto) before running
 integration tests; keep real account IDs, ARNs, and hostnames out of this repo.
