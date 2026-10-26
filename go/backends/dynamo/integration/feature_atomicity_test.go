@@ -56,7 +56,7 @@ func Test_CompactionFencesCompletedDeclaration(t *testing.T) {
 			}
 
 			client := &pausedWriteClient{Client: repoClient(), paused: make(chan struct{}), resume: make(chan struct{})}
-			compactor := dynamo.NewRepository(client, repo.EventsTable)
+			compactor := dynamo.NewRepository(client, repo.EventsTable).WithLazyInitialization(true)
 			done := make(chan error, 1)
 			go func() {
 				_, compactErr := compactor.CompactBelow(ctx, id, 1)
@@ -147,7 +147,7 @@ func Test_SnapshotFencesCompletedDeclaration(t *testing.T) {
 	defer cancel()
 	repo, marker := newIsolatedEventLog(ctx, t)
 	client := &pausedWriteClient{Client: repoClient(), paused: make(chan struct{}), resume: make(chan struct{})}
-	writer := dynamo.NewRepository(client, repo.EventsTable)
+	writer := dynamo.NewRepository(client, repo.EventsTable).WithLazyInitialization(true)
 	done := make(chan error, 1)
 	go func() { done <- writer.PutSnapshot(ctx, "account", "account-1", []byte(`{}`), 1, 1) }()
 

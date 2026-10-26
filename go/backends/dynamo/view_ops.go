@@ -134,9 +134,16 @@ func (repo *Repository) WritesViews() bool { return true }
 
 // DeclareHistoryDependent durably adds the entity types to the feature manifest's historyDependent
 // set, so CompactBelow refuses them in every process (evt.HistoryDeclarer). Types already declared
-// are left alone and nothing is written.
+// are left alone and nothing is written. A store the writer refuses as uninitialized is refused
+// here first, on the cheap validation the marker caches: the commit this declaration precedes
+// would be refused without writing anything, and the declaration must not be the one thing that
+// stays behind, forbidding compaction for types nothing ever committed.
 func (repo *Repository) DeclareHistoryDependent(ctx context.Context, types ...evt.EntityType) error {
 	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
+	if err := repo.features.Validate(ctx); err != nil {
 		return err
 	}
 

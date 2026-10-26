@@ -7,7 +7,7 @@ import (
 )
 
 func Test_marshalMap_RejectsNonMapAttributeValue(t *testing.T) {
-	repo := NewRepository(nil, "events")
+	repo := NewRepository(nil, "events").WithLazyInitialization(true)
 
 	// A scalar encodes to a non-M AttributeValue. It must be rejected with an error
 	// rather than returning a nil map with a nil error.
@@ -17,7 +17,7 @@ func Test_marshalMap_RejectsNonMapAttributeValue(t *testing.T) {
 }
 
 func Test_marshalMap_EncodesStruct(t *testing.T) {
-	repo := NewRepository(nil, "events")
+	repo := NewRepository(nil, "events").WithLazyInitialization(true)
 
 	item, err := repo.marshalMap(struct {
 		A string `json:"a"`

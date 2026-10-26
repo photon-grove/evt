@@ -5,7 +5,8 @@
 //! cargo test -p evt-compat --features drivers --test conformance
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
@@ -15,7 +16,7 @@ use futures_core::Stream as _;
 use photon_evt::conformance::{
     Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, RebuildSuite, Suite, TestClock,
     ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, feature_marker_cases,
-    fresh_store_cases, outcome_cases, view_repository_cases,
+    fresh_store_cases, initialization_cases, outcome_cases, view_repository_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
@@ -206,7 +207,9 @@ async fn dynamo_conforms() {
 const CONFORMANCE_BUDGET_SECS: u64 = 300;
 
 async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
-    let repository = DynamoRepository::new(client, table);
+    // The table starts empty, and the first writer initializes it, as a lazily initializing
+    // writer does (explicit initialization has its own case below).
+    let repository = DynamoRepository::new(client, table).with_lazy_initialization(true);
     let views = DynamoViews {
         client: repository.client().clone(),
         table: drivers::views_table(),
@@ -221,7 +224,8 @@ async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
         .await;
 
     // A second handle over the same table is a second writer with its own marker cache.
-    let second = DynamoRepository::new(repository.client().clone(), repository.table());
+    let second = DynamoRepository::new(repository.client().clone(), repository.table())
+        .with_lazy_initialization(true);
     feature_marker_cases(&repository, &second).await;
     outcome_cases(&repository, &second).await;
     Box::pin(dynamo_commit_wide_views(&repository)).await;
@@ -234,6 +238,7 @@ async fn run_dynamo_conformance(client: aws_sdk_dynamodb::Client, table: &str) {
     dynamo_legacy_reserved_reads(&repository).await;
     dynamo_enumeration(&repository).await;
     Box::pin(dynamo_fresh_and_unmigrated_tables(&repository)).await;
+    Box::pin(dynamo_store_initialization(repository.client())).await;
     Box::pin(dynamo_rebuild_rows_leave_a_table_fresh(repository.client())).await;
     Box::pin(dynamo_retained_stream_heads(&repository)).await;
 }
@@ -634,10 +639,11 @@ impl aws_sdk_dynamodb::config::Intercept for HeadlessAfterDeclare {
     }
 }
 
-/// The empty-table check and the declaration are two steps, and a writer that never reads the
-/// marker can commit a stream between them. The declaration is committed first and the table is
-/// looked at again afterward: a stream with no head item retracts the declaration and the table
-/// is refused, rather than being left declared over a stream the heads cannot guard.
+/// The empty-table check and the declaration are two steps of an initialization, and a writer that
+/// never reads the marker can commit a stream between them. The declaration is committed first and
+/// the table is looked at again afterward: a stream with no head item retracts the declaration and
+/// the table is refused, rather than being left declared over a stream the heads cannot guard. A
+/// lazily initializing writer's first write runs the same initialization.
 #[tokio::test(flavor = "multi_thread")]
 async fn dynamo_retracts_a_declaration_over_a_headless_stream() {
     let client = drivers::dynamo_client().await;
@@ -671,20 +677,10 @@ async fn dynamo_retracts_a_declaration_over_a_headless_stream() {
             event,
         })
         .build();
-    let writer = DynamoRepository::new(aws_sdk_dynamodb::Client::from_conf(config), &table);
+    let operator = DynamoRepository::new(aws_sdk_dynamodb::Client::from_conf(config), &table);
 
-    let late = SerializedEvent {
-        id: EventId::for_event(&EntityId::new("late-stream"), EventSequence(1)),
-        sequence: EventSequence(1),
-        event_type: EventType::new("ledger:added"),
-        version: EventVersion(1),
-        entity_id: EntityId::new("late-stream"),
-        entity_type: Ledger::TYPE.into(),
-        payload: br#"{"amount":2}"#.to_vec(),
-        metadata: Metadata::new("local"),
-    };
-    let error = writer
-        .commit(Commit::new("late-stream", vec![late]))
+    let error = operator
+        .initialize()
         .await
         .expect_err("the table held a headless stream");
     assert!(
@@ -700,6 +696,98 @@ async fn dynamo_retracts_a_declaration_over_a_headless_stream() {
     assert!(
         !manifest.declares_stream_heads(),
         "the declaration is retracted"
+    );
+
+    client
+        .delete_table()
+        .table_name(&table)
+        .send()
+        .await
+        .unwrap();
+}
+
+/// Counts the Scan requests a client sends.
+#[derive(Debug, Default)]
+struct ScanCounter(Arc<AtomicUsize>);
+
+impl aws_sdk_dynamodb::config::Intercept for ScanCounter {
+    fn name(&self) -> &'static str {
+        "ScanCounter"
+    }
+
+    fn read_before_transmit(
+        &self,
+        context: &aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+        _runtime_components: &aws_sdk_dynamodb::config::RuntimeComponents,
+        _cfg: &mut aws_sdk_dynamodb::config::ConfigBag,
+    ) -> Result<(), BoxError> {
+        let is_scan = context
+            .request()
+            .headers()
+            .get("x-amz-target")
+            .is_some_and(|target| target.ends_with(".Scan"));
+        if is_scan {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        Ok(())
+    }
+}
+
+/// Explicit store initialization (issue #188) on a fresh table: a writer that does not initialize
+/// stores (the default) refuses the table without a single Scan, the operator's initialization
+/// declares `stream-heads`, and writers then commit, still without scanning.
+async fn dynamo_store_initialization(client: &aws_sdk_dynamodb::Client) {
+    let table = format!(
+        "evt-init-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    create_dynamo_table(client, &table).await;
+
+    let scans = Arc::new(AtomicUsize::new(0));
+    let counted = |scans: &Arc<AtomicUsize>| {
+        let config = client
+            .config()
+            .to_builder()
+            .interceptor(ScanCounter(scans.clone()))
+            .build();
+        DynamoRepository::new(aws_sdk_dynamodb::Client::from_conf(config), &table)
+    };
+
+    let writer = counted(&scans);
+    let refused = Store::<Ledger, _>::new(&writer, ())
+        .execute("uninitialized-ledger", Add(1), Metadata::new("local"))
+        .await
+        .expect_err("an uninitialized table is refused");
+    assert!(
+        matches!(refused.as_store_error(), Some(Error::StoreNotInitialized)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        scans.load(Ordering::SeqCst),
+        0,
+        "a writer never scans the table"
+    );
+
+    // The suite initializes through `writer`, which scans; the other handle is a second writer.
+    let other = DynamoRepository::new(client.clone(), &table);
+    let heads = DynamoHeads::new(client.clone(), table.clone());
+    initialization_cases(&writer, &other, &heads, true).await;
+
+    let runtime_scans = Arc::new(AtomicUsize::new(0));
+    let runtime = counted(&runtime_scans);
+    Store::<Ledger, _>::new(&runtime, ())
+        .execute("initialized-ledger", Add(1), Metadata::new("local"))
+        .await
+        .expect("a writer commits to an initialized table");
+    assert_eq!(
+        runtime_scans.load(Ordering::SeqCst),
+        0,
+        "a writer never scans an initialized table"
     );
 
     client
@@ -767,6 +855,7 @@ async fn dynamo_retained_stream_heads(repository: &DynamoRepository) {
     };
     let handle = |retention: u64, clock: fn() -> SystemTime| {
         DynamoRepository::new(client.clone(), table)
+            .with_lazy_initialization(true)
             .with_clock(clock)
             .with_retention(entity_type.as_str(), Duration::from_secs(retention))
     };
@@ -956,8 +1045,8 @@ async fn dynamo_fresh_and_unmigrated_tables(repository: &DynamoRepository) {
     // An empty table.
     let table = format!("evt-fresh-{nanos}");
     create_dynamo_table(client, &table).await;
-    let fresh = DynamoRepository::new(client.clone(), &table);
-    let other = DynamoRepository::new(client.clone(), &table);
+    let fresh = DynamoRepository::new(client.clone(), &table).with_lazy_initialization(true);
+    let other = DynamoRepository::new(client.clone(), &table).with_lazy_initialization(true);
     fresh_store_cases(&fresh, &other).await;
     client
         .delete_table()
@@ -969,7 +1058,7 @@ async fn dynamo_fresh_and_unmigrated_tables(repository: &DynamoRepository) {
     // A table holding only a reserved row is empty: the Scan skips `command-outcome#` rows.
     let table = format!("evt-reserved-{nanos}");
     create_dynamo_table(client, &table).await;
-    let reserved = DynamoRepository::new(client.clone(), &table);
+    let reserved = DynamoRepository::new(client.clone(), &table).with_lazy_initialization(true);
     reserved
         .commit(Commit::new("reserved-only", Vec::new()).with_outcome(
             photon_evt::Outcome::accepted(format!("reserved-{nanos}"), "digest"),
@@ -995,7 +1084,7 @@ async fn dynamo_fresh_and_unmigrated_tables(repository: &DynamoRepository) {
     // A populated table with no marker row, as a v0.8 writer left it.
     let table = format!("evt-legacy-{nanos}");
     create_dynamo_table(client, &table).await;
-    let legacy = DynamoRepository::new(client.clone(), &table);
+    let legacy = DynamoRepository::new(client.clone(), &table).with_lazy_initialization(true);
     let heads = DynamoHeads::new(client.clone(), table.clone());
     let id = EntityId::new("legacy-stream");
     let event = SerializedEvent {
@@ -1056,6 +1145,26 @@ async fn dynamo_fresh_and_unmigrated_tables(repository: &DynamoRepository) {
             "an unmigrated table refuses writes: {result:?}"
         );
     }
+    // Explicit initialization verifies the table the same way, and a writer that does not
+    // initialize stores refuses it as uninitialized, without scanning it.
+    assert!(
+        matches!(
+            legacy.initialize().await,
+            Err(Error::StreamHeadsNotMigrated)
+        ),
+        "initializing a populated table is refused"
+    );
+    let strict = DynamoRepository::new(client.clone(), &table);
+    assert!(
+        matches!(
+            strict
+                .compact_below(&id, EventSequence(1))
+                .await
+                .map(|_| ()),
+            Err(Error::StoreNotInitialized)
+        ),
+        "a writer that does not initialize refuses the table as uninitialized"
+    );
     assert!(
         legacy.read_manifest().await.unwrap().is_none(),
         "a refused writer declares nothing on a populated table"
@@ -2128,6 +2237,14 @@ async fn postgres_fresh_and_unmigrated_databases() {
     fresh_store_cases(&fresh, &handle(&events)).await;
     drop_tables(events).await;
 
+    // Empty tables, initialized explicitly.
+    let events = format!("in_{nanos:x}");
+    let initialized = handle(&events);
+    initialized.ensure_schema().await.unwrap();
+    let heads = PostgresHeads::new(pool.clone(), events.clone());
+    initialization_cases(&initialized, &handle(&events), &heads, false).await;
+    drop_tables(events).await;
+
     // Tables with an event row and no marker.
     let events = format!("um_{nanos:x}");
     let legacy = handle(&events);
@@ -2185,6 +2302,13 @@ async fn postgres_fresh_and_unmigrated_databases() {
             "an unmigrated database refuses writes: {result:?}"
         );
     }
+    assert!(
+        matches!(
+            legacy.initialize().await,
+            Err(Error::StreamHeadsNotMigrated)
+        ),
+        "initializing a populated database is refused"
+    );
     assert!(legacy.read_manifest().await.unwrap().is_none());
     assert_eq!(
         legacy.entity_heads(None).await.unwrap().get(&id),
@@ -2836,6 +2960,7 @@ impl RecordingEndpoint {
             .build();
 
         DynamoRepository::new(aws_sdk_dynamodb::Client::from_conf(config), table)
+            .with_lazy_initialization(true)
             .with_views_table(views)
             .with_clock(clock.reader())
     }
@@ -3110,7 +3235,7 @@ async fn dynamo_rebuild_begin_reads_again_after_a_torn_read() {
 // ---------------------------------------------------------------------------------------------
 
 /// The rebuild rows live in the reserved namespace, so a table that holds nothing but them is
-/// still fresh: its first writer declares `stream-heads` itself and commits.
+/// still fresh: its first (lazily initializing) writer declares `stream-heads` itself and commits.
 async fn dynamo_rebuild_rows_leave_a_table_fresh(client: &aws_sdk_dynamodb::Client) {
     use photon_evt::RebuildFence;
 
@@ -3124,7 +3249,7 @@ async fn dynamo_rebuild_rows_leave_a_table_fresh(client: &aws_sdk_dynamodb::Clie
     );
     create_dynamo_table(client, &table).await;
 
-    let repository = DynamoRepository::new(client.clone(), &table);
+    let repository = DynamoRepository::new(client.clone(), &table).with_lazy_initialization(true);
     let lease = repository
         .begin_rebuild("fresh", Duration::from_secs(60))
         .await

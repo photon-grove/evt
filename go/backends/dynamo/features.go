@@ -42,6 +42,11 @@ type FeatureMarker struct {
 	eventsTable string
 	supported   evt.SupportedFeatures
 
+	// lazy makes a write to a store that does not declare stream-heads initialize it (scanning
+	// the table) instead of refusing with *evt.StoreNotInitializedError. It is the repository's
+	// setting when the marker was created (Repository.WithLazyInitialization).
+	lazy bool
+
 	// mu guards the cached validation below; commits and declarations run concurrently.
 	mu            sync.Mutex
 	validated     bool
@@ -51,17 +56,19 @@ type FeatureMarker struct {
 
 // FeatureMarker constructs a marker using this repository's client and events table.
 // The supported set declares the (feature, formatVersion) pairs this writer models;
-// a nil or empty set supports no extensions.
+// a nil or empty set supports no extensions. The marker initializes a store lazily when the
+// repository does (WithLazyInitialization).
 func (repo *Repository) FeatureMarker(supported evt.SupportedFeatures) *FeatureMarker {
-	return newFeatureMarker(repo.client, repo.EventsTable, supported)
+	return newFeatureMarker(repo.client, repo.EventsTable, supported, repo.lazyInit)
 }
 
-func newFeatureMarker(client Client, eventsTable string, supported evt.SupportedFeatures) *FeatureMarker {
+func newFeatureMarker(client Client, eventsTable string, supported evt.SupportedFeatures, lazy bool) *FeatureMarker {
 	return &FeatureMarker{
 		client:      client,
 		eventsTable: eventsTable,
 		// Every writer of this format models stream-heads, whatever else the caller configured.
 		supported: supported.WithStreamHeads(),
+		lazy:      lazy,
 	}
 }
 
@@ -149,7 +156,11 @@ func (m *FeatureMarker) Declare(
 	ctx context.Context,
 	update func(*evt.FeatureManifest),
 ) (evt.FeatureManifest, error) {
-	declared, err := m.declare(ctx, update)
+	declared, _, err := m.declare(ctx, func(manifest *evt.FeatureManifest) bool {
+		update(manifest)
+
+		return true
+	})
 	if err != nil {
 		return evt.FeatureManifest{}, err
 	}
@@ -163,8 +174,8 @@ func (m *FeatureMarker) Declare(
 // build writes) in the ordinary declaration transaction, without checking that the store holds
 // no data. It is the migration's declaring step (storage spec, Stream Heads, Migration): the
 // caller has backfilled and verified a head item for every stream with every older writer
-// stopped, and declaring is what lets this build's writers start. A writer that finds a fresh
-// store declares the feature itself; it never calls this.
+// stopped, and declaring is what lets this build's writers start. A fresh store is declared with
+// Initialize instead, which verifies it first.
 func (m *FeatureMarker) DeclareStreamHeads(ctx context.Context) (evt.FeatureManifest, error) {
 	return m.Declare(ctx, declareStreamHeads)
 }
@@ -177,15 +188,33 @@ func declareStreamHeads(manifest *evt.FeatureManifest) {
 	manifest.Features[evt.FeatureStreamHeads] = evt.StreamHeadsFormat
 }
 
+// declareStreamHeadsUnlessDeclared is the initialization's change: it reports a manifest that
+// already declares stream-heads as needing no write, so a second initializer — one that passed
+// the emptiness scan before another job's declaration committed — leaves the row the winner
+// wrote alone instead of writing it again under a bumped version.
+func declareStreamHeadsUnlessDeclared(manifest *evt.FeatureManifest) bool {
+	if manifest.DeclaresStreamHeads() {
+		return false
+	}
+
+	declareStreamHeads(manifest)
+
+	return true
+}
+
 // declare is Declare without touching the validation cache, for callers that hold the cache lock.
+// The change is applied to a copy of the freshly read manifest and reports whether the row still
+// needs writing: when it reports false, the manifest already says what this declaration would, and
+// the row is left at the version it has instead of being written again under a bumped one. The
+// reported manifest is then the one as it stands.
 func (m *FeatureMarker) declare(
 	ctx context.Context,
-	update func(*evt.FeatureManifest),
-) (evt.FeatureManifest, error) {
+	change func(*evt.FeatureManifest) bool,
+) (evt.FeatureManifest, bool, error) {
 	for attempt := 0; ; attempt++ {
 		manifest, err := m.Manifest(ctx)
 		if err != nil {
-			return evt.FeatureManifest{}, err
+			return evt.FeatureManifest{}, false, err
 		}
 
 		current := evt.FeatureManifest{Version: 1, Features: map[string]evt.FeatureFormat{}}
@@ -196,7 +225,10 @@ func (m *FeatureMarker) declare(
 			current = *manifest
 		}
 
-		update(&current)
+		if !change(&current) {
+			// A concurrent declaration already wrote this change; the row stands as it is.
+			return current, false, nil
+		}
 
 		// Each declaration transaction adds exactly one to the version, no matter how many features
 		// it adds or bumps.
@@ -204,7 +236,7 @@ func (m *FeatureMarker) declare(
 
 		item, err := m.manifestItem(current)
 		if err != nil {
-			return evt.FeatureManifest{}, err
+			return evt.FeatureManifest{}, false, err
 		}
 
 		input := &dynamodb.PutItemInput{
@@ -222,7 +254,7 @@ func (m *FeatureMarker) declare(
 
 		_, err = m.client.PutItem(ctx, input)
 		if err == nil {
-			return current, nil
+			return current, true, nil
 		}
 
 		var condFailed *types.ConditionalCheckFailedException
@@ -231,7 +263,7 @@ func (m *FeatureMarker) declare(
 			continue
 		}
 
-		return evt.FeatureManifest{}, fmt.Errorf("features: declaring manifest: %w", err)
+		return evt.FeatureManifest{}, false, fmt.Errorf("features: declaring manifest: %w", err)
 	}
 }
 
@@ -308,9 +340,10 @@ func (m *FeatureMarker) manifestItem(manifest evt.FeatureManifest) (map[string]t
 // this writer validated. Later commits only condition on the cached version; a failed condition
 // invalidates the cache (see invalidate) and the next commit re-validates.
 //
-// A store that does not declare stream-heads is refused with *evt.StreamHeadsNotMigratedError
-// unless it holds no data. Validate only checks: a writer's first commit is what declares the
-// feature on an empty store.
+// A store that does not declare stream-heads is refused with *evt.StoreNotInitializedError,
+// without scanning it. A lazily initializing marker instead refuses it with
+// *evt.StreamHeadsNotMigratedError unless it holds no data; Validate only checks, and a writer's
+// first commit is what declares the feature on an empty store.
 func (m *FeatureMarker) Validate(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -318,12 +351,78 @@ func (m *FeatureMarker) Validate(ctx context.Context) error {
 	return m.validateLocked(ctx, false)
 }
 
+// Initialize declares stream-heads on a store that holds no data and reports whether this call
+// declared it (evt.StoreInitializer). A store that already declares the feature is left alone
+// after one strongly consistent read, and two jobs initializing the same empty store at once let
+// exactly one of them write: the loser re-reads the manifest its conditional write must guard on,
+// sees the declaration, and reports that it declared nothing — or refuses as unmigrated when the
+// winner has already retracted it for a stream with no head item. Otherwise a strongly consistent
+// Scan must find no item outside the reserved namespaces, or the store is refused with
+// *evt.StreamHeadsNotMigratedError; the declaration is then committed and the table scanned once
+// more for a stream with no head item, which retracts it (see declareOnEmptyStore). Run it once,
+// at deploy time, with a role that may Scan the event log. It holds the marker's lock throughout,
+// so commits through this marker wait for it.
+func (m *FeatureMarker) Initialize(ctx context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	declared, err := m.initializeLocked(ctx)
+
+	// A declaration (or its retraction) moved the version: the next commit re-reads it.
+	m.validated = false
+	m.hasMarker = false
+	m.cachedVersion = 0
+
+	return declared, err
+}
+
+// initializeLocked is Initialize while mu is held.
+func (m *FeatureMarker) initializeLocked(ctx context.Context) (bool, error) {
+	manifest, err := m.Manifest(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if manifest != nil {
+		if verr := manifest.Validate(m.supported); verr != nil {
+			return false, verr
+		}
+
+		if manifest.DeclaresStreamHeads() {
+			return false, nil
+		}
+	}
+
+	empty, err := m.StoreIsEmpty(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if !empty {
+		return false, &evt.StreamHeadsNotMigratedError{}
+	}
+
+	declared, wrote, err := m.declareOnEmptyStore(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	// A concurrent declaration may have added a feature this writer does not model; when another
+	// initializer declared stream-heads first, its manifest is the one validated.
+	if verr := declared.Validate(m.supported); verr != nil {
+		return wrote, verr
+	}
+
+	return wrote, nil
+}
+
 // validateLocked reads and caches validation while mu is held. Besides refusing a declared pair
-// this writer does not model, it requires the stream-heads feature (ADR 0007): a store that does not
-// declare it holds streams with no head items, which a head-aware writer would fail on every
-// stream, so it refuses with *evt.StreamHeadsNotMigratedError. A store that holds no data yet is
-// declared by the writer itself when declare is set (a commit), so a fresh table needs no step;
-// otherwise it passes without being written or cached.
+// this writer does not model, it requires the stream-heads feature (ADR 0007). A store that does
+// not declare it is refused with *evt.StoreNotInitializedError, without a scan, unless the marker
+// initializes lazily: then a store that holds data (streams with no head items, which a head-aware
+// writer would fail on every stream) is refused with *evt.StreamHeadsNotMigratedError, and one that
+// holds no data yet is declared by the writer itself when declare is set (a commit); otherwise it
+// passes without being written or cached.
 func (m *FeatureMarker) validateLocked(ctx context.Context, declare bool) error {
 	if m.validated {
 		return nil
@@ -341,6 +440,10 @@ func (m *FeatureMarker) validateLocked(ctx context.Context, declare bool) error 
 	}
 
 	if manifest == nil || !manifest.DeclaresStreamHeads() {
+		if !m.lazy {
+			return &evt.StoreNotInitializedError{}
+		}
+
 		empty, serr := m.StoreIsEmpty(ctx)
 		if serr != nil {
 			return serr
@@ -354,12 +457,13 @@ func (m *FeatureMarker) validateLocked(ctx context.Context, declare bool) error 
 			return nil
 		}
 
-		declared, derr := m.declareOnEmptyStore(ctx)
+		declared, _, derr := m.declareOnEmptyStore(ctx)
 		if derr != nil {
 			return derr
 		}
 
-		// A concurrent declaration may have added a feature this writer does not model.
+		// A concurrent declaration may have added a feature this writer does not model; when
+		// another writer declared stream-heads first, its manifest is the one cached.
 		if verr := declared.Validate(m.supported); verr != nil {
 			return verr
 		}
@@ -375,7 +479,10 @@ func (m *FeatureMarker) validateLocked(ctx context.Context, declare bool) error 
 }
 
 // declareOnEmptyStore declares stream-heads on a store that held no data when it was looked at,
-// and closes the window between that look and the declaration.
+// and closes the window between that look and the declaration. It reports whether this call wrote
+// the declaration: the emptiness scan takes long enough for a concurrent initializer to commit
+// its own, and the loser of that race reports the winner's manifest as it stands instead of
+// writing it again under a bumped version.
 //
 // No transaction can exclude a writer that never reads the marker, so the order does the work:
 // the declaration is committed first, which makes every writer that reads the marker fail its
@@ -385,26 +492,46 @@ func (m *FeatureMarker) validateLocked(ctx context.Context, declare bool) error 
 // the declaration is retracted (a new version, so every cached validation is dropped) and the
 // store is refused as unmigrated. Streams other head-aware writers created in the meantime have a
 // head item and are no reason to retract.
-func (m *FeatureMarker) declareOnEmptyStore(ctx context.Context) (evt.FeatureManifest, error) {
-	declared, err := m.declare(ctx, declareStreamHeads)
+func (m *FeatureMarker) declareOnEmptyStore(ctx context.Context) (evt.FeatureManifest, bool, error) {
+	declared, wrote, err := m.declare(ctx, declareStreamHeadsUnlessDeclared)
 	if err != nil {
-		return evt.FeatureManifest{}, err
+		return evt.FeatureManifest{}, false, err
+	}
+
+	if !wrote {
+		// The winner ran its own verification — which may have retracted its declaration after
+		// finding the store was not fresh after all. One more read tells this call which store it
+		// is reporting on.
+		current, merr := m.Manifest(ctx)
+		if merr != nil {
+			return evt.FeatureManifest{}, false, merr
+		}
+
+		if current == nil || !current.DeclaresStreamHeads() {
+			return evt.FeatureManifest{}, false, &evt.StreamHeadsNotMigratedError{}
+		}
+
+		return *current, false, nil
 	}
 
 	headless, err := m.hasHeadlessStream(ctx)
 	if err != nil {
-		return evt.FeatureManifest{}, err
+		return evt.FeatureManifest{}, wrote, err
 	}
 
 	if !headless {
-		return declared, nil
+		return declared, wrote, nil
 	}
 
-	if _, err := m.declare(ctx, retractStreamHeads); err != nil {
-		return evt.FeatureManifest{}, err
+	if _, _, err := m.declare(ctx, func(manifest *evt.FeatureManifest) bool {
+		retractStreamHeads(manifest)
+
+		return true
+	}); err != nil {
+		return evt.FeatureManifest{}, wrote, err
 	}
 
-	return evt.FeatureManifest{}, &evt.StreamHeadsNotMigratedError{}
+	return evt.FeatureManifest{}, wrote, &evt.StreamHeadsNotMigratedError{}
 }
 
 func retractStreamHeads(manifest *evt.FeatureManifest) {
@@ -468,6 +595,19 @@ func (m *FeatureMarker) hasHeadlessStream(ctx context.Context) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// requireStreamHeads is evt.RequireStreamHeads for this marker's writers, which never declare the
+// feature on the way: a writer that does not initialize lazily refuses a store without it as
+// uninitialized (*evt.StoreNotInitializedError), since telling a fresh store from an unmigrated
+// one takes a scan.
+func (m *FeatureMarker) requireStreamHeads(manifest *evt.FeatureManifest) error {
+	err := evt.RequireStreamHeads(manifest)
+	if err != nil && !m.lazy {
+		return &evt.StoreNotInitializedError{}
+	}
+
+	return err
 }
 
 // invalidate drops the cached validation so the next commit re-reads the manifest.

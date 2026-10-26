@@ -4,6 +4,11 @@
 // stream-heads, drift between each stream's head item and its log. It runs against DynamoDB by
 // default, or against PostgreSQL with -backend postgres.
 //
+// The init subcommand initializes a fresh store at deploy time: it declares the required
+// stream-heads feature on a store that holds no data, so writers, which refuse an uninitialized
+// DynamoDB table instead of scanning it, need no dynamodb:Scan. Run "evt-doctor init -h" for its
+// flags.
+//
 // The migrate-heads subcommand migrates a store written by v0.8 to per-stream head items (storage
 // spec, Stream Heads, Migration): backfill, verify, repair, and declare. Run
 // "evt-doctor migrate-heads -h" for its procedure and flags.
@@ -45,6 +50,10 @@ func main() {
 		os.Exit(runMigrateHeads(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == initCommand {
+		os.Exit(runInit(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	var (
 		region      = flag.String("region", envOr("AWS_REGION", "us-west-2"), "AWS region (DynamoDB backend)")
 		endpoint    = flag.String("endpoint", resolveLocalEndpoint(), "AWS emulator endpoint (DynamoDB backend)")
@@ -58,7 +67,8 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() > 0 {
-		exitf("unexpected argument %q; the %s subcommand must come first, before any flag", flag.Arg(0), migrateHeadsCommand)
+		exitf("unexpected argument %q; the %s and %s subcommands must come first, before any flag",
+			flag.Arg(0), initCommand, migrateHeadsCommand)
 	}
 
 	if *printSchema {

@@ -57,7 +57,7 @@ func newIsolatedEventLog(ctx context.Context, t *testing.T) (*dynamo.Repository,
 		return err == nil && out.Table != nil && out.Table.TableStatus == types.TableStatusActive
 	}, 10*time.Second, 100*time.Millisecond)
 
-	repo := dynamo.NewRepository(client, name)
+	repo := dynamo.NewRepository(client, name).WithLazyInitialization(true)
 	isolatedClient = client
 
 	return repo, repo.FeatureMarker(nil)
@@ -276,7 +276,7 @@ func Test_FeatureMarker_CompactBelowRefusesHistoryDependent(t *testing.T) {
 
 	// A repository that does not enforce the manifest refuses all the same: the refusal reads the
 	// row, not local configuration.
-	plain := dynamo.NewRepository(repoClient(), repo.EventsTable)
+	plain := dynamo.NewRepository(repoClient(), repo.EventsTable).WithLazyInitialization(true)
 	_, err = plain.CompactBelow(ctx, id, 1)
 	require.Error(t, err)
 	require.True(t, evt.IsHistoryDependentProjectionErr(err), "expected HistoryDependentProjectionError, got %v", err)
