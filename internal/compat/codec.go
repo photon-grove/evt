@@ -273,7 +273,7 @@ func eventVector(ctx context.Context, c namedEvent) (EventVector, error) {
 	}
 
 	fake := NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, fakeTable)
+	repo := dynamo.NewRepository(fake, fakeTable).WithLazyInitialization(true)
 
 	// A commit must continue from the stored head (ADR 0007), so a vector above sequence 1 is
 	// committed onto a stream whose head item already says the previous event is stored.
@@ -331,7 +331,7 @@ func snapshotVector(ctx context.Context, c namedSnapshot) (SnapshotVector, error
 	// A snapshot never covers more than the stream's head (H3), so the stream's head item is
 	// stored first.
 	fake := NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, fakeTable)
+	repo := dynamo.NewRepository(fake, fakeTable).WithLazyInitialization(true)
 	if err = seedHead(ctx, fake, repo, c.snapshot.EntityID, c.snapshot.EventSequence); err != nil {
 		return SnapshotVector{}, err
 	}
@@ -413,7 +413,7 @@ func ttlVector(ctx context.Context) (TTLVector, error) {
 	retention := 24*time.Hour + 500*time.Millisecond
 
 	fake := NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, fakeTable).
+	repo := dynamo.NewRepository(fake, fakeTable).WithLazyInitialization(true).
 		WithClock(func() time.Time { return clock }).
 		WithRetention(dynamo.Retention{"scratch": retention, "disabled": 0})
 

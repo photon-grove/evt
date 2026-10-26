@@ -26,10 +26,17 @@ documented, and shared fixtures plus a live cross-language test run enforce it.
   action instead of two. A stream whose head disagrees with its events or snapshot fails with
   `Error::StreamHeadDrift`, which is never retried and never recorded as a rejection. Every writer
   requires the `stream-heads` feature in the marker: a table written before stream heads is
-  refused with `Error::StreamHeadsNotMigrated` until `evt-doctor migrate-heads` has backfilled it
-  and declared the feature (`FeatureMarker::declare_stream_heads` is the hook for that call), and
-  a fresh table is declared by its first writer. DynamoDB scanners skip the head item (`sk < 1`),
-  and a Streams consumer must skip its records (see the storage format spec).
+  refused until `evt-doctor migrate-heads` has backfilled it and declared the feature
+  (`FeatureMarker::declare_stream_heads` is the hook for that call). A fresh store is initialized
+  once, before writers start, with `FeatureMarker::initialize` (or `evt-doctor init`), which
+  verifies it holds no data and is idempotent (`initialize` is a new required trait method, so a
+  custom `FeatureMarker` implementation must add it). A DynamoDB writer never scans: it refuses a table
+  that does not declare the feature with `Error::StoreNotInitialized`, so its role needs no
+  `dynamodb:Scan` (`with_lazy_initialization(true)` restores first-write initialization for tests
+  and local use). PostgreSQL and in-memory writers initialize a fresh store on their first write,
+  and refuse a populated undeclared one with `Error::StreamHeadsNotMigrated`. DynamoDB scanners
+  skip the head item (`sk < 1`), and a Streams consumer must skip its records (see the storage
+  format spec).
 - `latest(n)` reads a stream's last `n` events newest-first. The `SYSTEM#` and `command-outcome#`
   namespaces are reserved for engine rows: writes to them are refused, entity heads skip them,
   and a `SYSTEM#FEATURES` marker row declares the extensions a table uses — a writer that does
@@ -443,6 +450,9 @@ use photon_evt::dynamodb::{DynamoRepository, ViewProjector};
 
 let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 let repository = DynamoRepository::new(aws_sdk_dynamodb::Client::new(&config), "event-log");
+
+// Once, at deploy time, with a role that may Scan the table (writers never scan):
+repository.initialize().await?;
 
 let store = Store::<Account, _>::new(repository, ())
     .with_snapshot_interval(25)

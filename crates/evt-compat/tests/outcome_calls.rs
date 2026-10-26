@@ -200,8 +200,9 @@ async fn outcome_scenarios_send_the_requests_go_recorded() {
 
     let mut checked = 0;
     for scenario in scenarios.scenarios.iter().filter(|s| s.outcomes) {
-        let repository =
-            DynamoRepository::new(client.clone(), &table).with_views_table(&views_table);
+        let repository = DynamoRepository::new(client.clone(), &table)
+            .with_views_table(&views_table)
+            .with_lazy_initialization(true);
         // Every step runs through the Rust store, whichever language the scenario assigns it to:
         // the requests are the same.
         let runner = Runner::for_scenario(repository, scenario, &run)

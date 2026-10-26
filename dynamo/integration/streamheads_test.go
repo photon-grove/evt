@@ -89,7 +89,7 @@ func Test_StreamHeads_RetainedTTLNeverLowers(t *testing.T) {
 	require.Equal(t, longTTL, ttl)
 
 	// A separate repository has seen nothing of the stream (the ttl memory is per repository).
-	stranger := dynamo.NewRepository(repoClient(), repo.EventsTable).
+	stranger := dynamo.NewRepository(repoClient(), repo.EventsTable).WithLazyInitialization(true).
 		WithRetention(dynamo.Retention{"scratch": time.Minute}).WithClock(clock)
 	err = stranger.Commit(ctx, evt.SerializedResult{Events: scratchEvents("ttl-1", 3, 1)})
 	require.True(t, evt.IsOptimisticConflict(err), "%v", err)

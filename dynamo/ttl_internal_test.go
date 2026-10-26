@@ -60,7 +60,7 @@ func Test_Snapshot_TTL_OmittedWhenZero(t *testing.T) {
 
 func Test_buildEventPutTransactions_StampsTTLForPolicyTypeOnly(t *testing.T) {
 	fixed := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
-	repo := NewRepository(nil, "events").
+	repo := NewRepository(nil, "events").WithLazyInitialization(true).
 		WithRetention(Retention{"transient": 30 * 24 * time.Hour}).
 		WithClock(func() time.Time { return fixed })
 
@@ -80,7 +80,7 @@ func Test_buildEventPutTransactions_StampsTTLForPolicyTypeOnly(t *testing.T) {
 }
 
 func Test_buildEventPutTransactions_NoRetentionNeverStampsTTL(t *testing.T) {
-	repo := NewRepository(nil, "events")
+	repo := NewRepository(nil, "events").WithLazyInitialization(true)
 
 	transactions, _, err := repo.buildEventPutTransactions([]evt.SerializedEvent{
 		{EntityID: "a", EntityType: "transient", Sequence: 1},
@@ -93,7 +93,7 @@ func Test_buildEventPutTransactions_NoRetentionNeverStampsTTL(t *testing.T) {
 
 func Test_buildSnapshotPut_StampsTTLForPolicyType(t *testing.T) {
 	fixed := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
-	repo := NewRepository(nil, "events").
+	repo := NewRepository(nil, "events").WithLazyInitialization(true).
 		WithRetention(Retention{"transient": 7 * 24 * time.Hour}).
 		WithClock(func() time.Time { return fixed })
 
@@ -126,7 +126,7 @@ func Test_PutSnapshot_StampsTTLForPolicyType(t *testing.T) {
 			captured = input.TransactItems[2].Put
 		})
 
-	repo := NewRepository(client, "events").
+	repo := NewRepository(client, "events").WithLazyInitialization(true).
 		WithRetention(Retention{"transient": 30 * 24 * time.Hour}).
 		WithClock(func() time.Time { return fixed })
 
@@ -155,7 +155,7 @@ func Test_PutSnapshot_NoTTLForUnpolicedType(t *testing.T) {
 			captured = input.TransactItems[2].Put
 		})
 
-	repo := NewRepository(client, "events").
+	repo := NewRepository(client, "events").WithLazyInitialization(true).
 		WithRetention(Retention{"transient": 30 * 24 * time.Hour})
 
 	require.NoError(t, repo.PutSnapshot(context.Background(), "durable", "a", []byte(`{}`), 1, 3))

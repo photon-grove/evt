@@ -340,7 +340,7 @@ impl PostgresRepository {
         &self,
         change: impl Fn(&mut FeatureManifest),
     ) -> Result<(), Error> {
-        self.declare(change, false).await
+        self.declare(change, false).await.map(|_| ())
     }
 
     /// Declares `stream-heads: 1` in the feature manifest through the ordinary declaration
@@ -349,24 +349,38 @@ impl PostgresRepository {
     ///
     /// This is the hook for a migration tool: after it has backfilled and verified a head row
     /// for every stream, with every writer that predates stream heads stopped, it declares the
-    /// feature with this call. A fresh database needs no call: the first writer declares the
-    /// feature itself after confirming the events and snapshots tables are empty. Declaring on a
-    /// populated database whose streams have no head rows makes every later commit to those
-    /// streams fail with [`Error::StreamHeadDrift`].
+    /// feature with this call. A fresh database is declared with [`initialize`](Self::initialize)
+    /// (or by its first writer) instead, which verifies it first. Declaring on a populated
+    /// database whose streams have no head rows makes every later commit to those streams fail
+    /// with [`Error::StreamHeadDrift`].
     pub async fn declare_stream_heads(&self) -> Result<(), Error> {
         self.update_manifest(FeatureManifest::declare_stream_heads)
             .await
     }
 
-    /// One declaration transaction. With `only_if_empty`, it is the writer's own declaration of
-    /// `stream-heads` on a fresh database: under the exclusive lock it declares the feature
+    /// Initializes the database: declares `stream-heads` when the events and snapshots tables are
+    /// empty, in one transaction under the exclusive feature lock, and returns whether this call
+    /// declared it (see [`FeatureMarker::initialize`]). A database that already declares the
+    /// feature is left alone; a populated one that does not is refused with
+    /// [`Error::StreamHeadsNotMigrated`]. Run [`ensure_schema`](Self::ensure_schema) first.
+    ///
+    /// Unlike DynamoDB, a PostgreSQL writer still initializes a fresh database itself on its first
+    /// write: the check is two `EXISTS` probes under the lock it already takes, and needs no
+    /// privilege a writer lacks. This call is for a deploy step that treats both backends alike.
+    pub async fn initialize(&self) -> Result<bool, Error> {
+        self.declare(FeatureManifest::declare_stream_heads, true)
+            .await
+    }
+
+    /// One declaration transaction, returning whether it wrote. With `only_if_empty`, it is the
+    /// initialization of a fresh database: under the exclusive lock it declares `stream-heads`
     /// unless it is already declared, and refuses with [`Error::StreamHeadsNotMigrated`] when the
     /// events or snapshots table holds a row.
     async fn declare(
         &self,
         change: impl Fn(&mut FeatureManifest),
         only_if_empty: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = client.transaction().await.map_err(Error::backend)?;
         let lock_key = features_lock_key(&self.events_table);
@@ -379,8 +393,8 @@ impl PostgresRepository {
             if let Some(manifest) = &observed {
                 manifest.validate_supported()?;
                 if manifest.declares_stream_heads() {
-                    // Another writer declared it first.
-                    return Ok(());
+                    // Already initialized (or another writer declared it first).
+                    return Ok(false);
                 }
             }
 
@@ -460,12 +474,12 @@ impl PostgresRepository {
         tx.commit().await.map_err(Error::backend)?;
         *self.validated_marker() = None;
 
-        Ok(())
+        Ok(true)
     }
 
     /// Makes sure the database is ready for this writer's first write: the feature manifest
-    /// declares `stream-heads` (ADR 0007). A database whose manifest lacks it is declared by the
-    /// writer itself when the events and snapshots tables are empty, and otherwise refused with
+    /// declares `stream-heads` (ADR 0007). A database whose manifest lacks it is initialized by
+    /// the writer itself when the events and snapshots tables are empty, and otherwise refused with
     /// [`Error::StreamHeadsNotMigrated`]. It runs before the commit transaction, only while the
     /// handle has not validated a manifest yet: a declaration needs the exclusive lock, which a
     /// commit holding the shared lock must not wait for. The commit then re-validates inside its
@@ -479,10 +493,7 @@ impl PostgresRepository {
 
         match features::validate_marker_for_write(observed.as_ref()) {
             Ok(_) => Ok(()),
-            Err(Error::StreamHeadsNotMigrated) => {
-                self.declare(FeatureManifest::declare_stream_heads, true)
-                    .await
-            }
+            Err(Error::StreamHeadsNotMigrated) => self.initialize().await.map(|_| ()),
             Err(error) => Err(error),
         }
     }
@@ -1436,6 +1447,10 @@ impl FeatureMarker for PostgresRepository {
         change: impl Fn(&mut FeatureManifest) + Send,
     ) -> Result<(), Error> {
         PostgresRepository::update_manifest(self, change).await
+    }
+
+    async fn initialize(&self) -> Result<bool, Error> {
+        PostgresRepository::initialize(self).await
     }
 }
 

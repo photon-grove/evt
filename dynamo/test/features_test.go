@@ -125,8 +125,8 @@ func (s *FeatureMarkerSuite) commit(repo *dynamo.Repository, entityID string) er
 // store with no marker and no data is declared by the writer itself.
 func (s *FeatureMarkerSuite) Test_Commit_IncludesMarkerCheck() {
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(nil))
 
 	// First commit: no marker row exists and the scan finds only engine rows, so the writer
 	// declares stream-heads (version 1) and validates against that version.
@@ -182,8 +182,8 @@ func (s *FeatureMarkerSuite) Test_Commit_RefusesAnUnmigratedStore() {
 	} {
 		s.Run(name, func() {
 			client := dynamo_mock.NewClient()
-			repo := dynamo.NewRepository(client, "test-events").
-				WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(evt.SupportedFeatures{"journal": 1}))
+			repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+				WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(evt.SupportedFeatures{"journal": 1}))
 
 			expectManifest(client, manifest)
 			expectScan(client, "SYSTEM#REBUILD", "acct-0")
@@ -202,8 +202,8 @@ func (s *FeatureMarkerSuite) Test_Commit_RefusesAnUnmigratedStore() {
 // the version it validated.
 func (s *FeatureMarkerSuite) Test_Commit_ConditionsOnCachedVersion() {
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(nil))
 
 	expectManifest(client, markerItem(3, `{"stream-heads":1}`, "", ""))
 
@@ -224,8 +224,8 @@ func (s *FeatureMarkerSuite) Test_Commit_ConditionsOnCachedVersion() {
 // pair this writer does not model refuses before anything is written.
 func (s *FeatureMarkerSuite) Test_Commit_RefusesUnsupportedFeature() {
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(nil))
 
 	expectManifest(client, markerItem(1, `{"journal":1}`, "", ""))
 
@@ -239,8 +239,8 @@ func (s *FeatureMarkerSuite) Test_Commit_RefusesUnsupportedFeature() {
 // an unsupported pair surfaces as UnsupportedFeatureError.
 func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_RevalidatesAndRefuses() {
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(nil))
 
 	// First commit validates a migrated store and succeeds.
 	expectManifest(client, markerItem(1, `{"stream-heads":1}`, "", ""))
@@ -264,8 +264,8 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_RevalidatesAndRefuses() {
 // failure as transient so a retry follows.
 func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient() {
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(evt.SupportedFeatures{"journal": 1}))
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(evt.SupportedFeatures{"journal": 1}))
 
 	expectManifest(client, markerItem(1, `{"journal":1,"stream-heads":1}`, "", ""))
 
@@ -296,7 +296,7 @@ func (s *FeatureMarkerSuite) Test_Commit_CheckFailure_SupportedChangeIsTransient
 // against attribute_not_exists(pk); an update bumps by exactly one against version = :observed.
 func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 	client := dynamo_mock.NewClient()
-	marker := dynamo.NewRepository(client, "test-events").FeatureMarker(evt.SupportedFeatures{"journal": 1})
+	marker := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(evt.SupportedFeatures{"journal": 1})
 
 	// Create.
 	expectManifest(client, nil)
@@ -354,8 +354,8 @@ func (s *FeatureMarkerSuite) Test_Declare_CreatesAndBumpsVersion() {
 func (s *FeatureMarkerSuite) Test_Declare_SameInstanceRevalidatesUnsupportedFeature() {
 	ctx := context.Background()
 	client := dynamo_mock.NewClient()
-	marker := dynamo.NewRepository(client, "test-events").FeatureMarker(nil)
-	repo := dynamo.NewRepository(client, "test-events").WithFeatureMarker(marker)
+	marker := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(nil)
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).WithFeatureMarker(marker)
 
 	expectManifest(client, markerItem(1, `{"stream-heads":1}`, "", ""))
 	var first dynamodb.TransactWriteItemsInput
@@ -398,8 +398,8 @@ func (s *FeatureMarkerSuite) Test_Declare_SameInstanceRevalidatesUnsupportedFeat
 // history-dependent in the durable manifest, before deleting anything.
 func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(nil))
 
 	// The snapshot read learns the entity's type.
 	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
@@ -428,8 +428,8 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesHistoryDependentType() {
 // declare stream-heads before it reads or deletes anything.
 func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesAnUnmigratedStore() {
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(nil))
 
 	expectManifest(client, nil)
 
@@ -444,8 +444,8 @@ func (s *FeatureMarkerSuite) Test_CompactBelow_RefusesAnUnmigratedStore() {
 // stream-heads and does not declare the entity's type history-dependent.
 func (s *FeatureMarkerSuite) Test_CompactBelow_ProceedsOnAMigratedStore() {
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events").
-		WithFeatureMarker(dynamo.NewRepository(client, "test-events").FeatureMarker(nil))
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).
+		WithFeatureMarker(dynamo.NewRepository(client, "test-events").WithLazyInitialization(true).FeatureMarker(nil))
 
 	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
 		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)

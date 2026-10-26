@@ -20,8 +20,10 @@ func Test_RebuildFenceConformance(t *testing.T) {
 	fake := compat.NewFakeDynamo()
 	views := "views"
 
-	newRepo := func() evt.Repository { return dynamo.NewRepository(fake, "events").WithViewsTable(views) }
-	marker := dynamo.NewRepository(fake, "events").FeatureMarker(nil)
+	newRepo := func() evt.Repository {
+		return dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithViewsTable(views)
+	}
+	marker := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).FeatureMarker(nil)
 
 	conformance.RunRebuildFenceSuite(t, newRepo, conformance.SuiteOptions{
 		SupportsOutcomes: true,

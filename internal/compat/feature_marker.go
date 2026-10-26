@@ -231,7 +231,7 @@ func GenerateFeatureMarkerFixtures(ctx context.Context) (FeatureMarkerFixtures, 
 	var fixtures FeatureMarkerFixtures
 	fake := NewFakeDynamo()
 	pg := &featurePG{}
-	dm := dynamo.NewRepository(fake, fakeTable).FeatureMarker(nil)
+	dm := dynamo.NewRepository(fake, fakeTable).WithLazyInitialization(true).FeatureMarker(nil)
 	pm := postgres.NewRepository(pg).FeatureMarker(nil)
 	inputs := []FeatureDeclarationVector{
 		{Name: "empty", Input: FeatureDeclarationInput{Features: map[string]evt.FeatureFormat{}, HistoryDependent: []evt.EntityType{}, Retention: []evt.EntityType{}}},
@@ -351,7 +351,7 @@ func featureCommitVector(ctx context.Context, name string, declarations []Featur
 	vector := FeatureCommitVector{Name: name}
 	capture := &featureCaptureDynamo{FakeDynamo: NewFakeDynamo()}
 	supported := evt.SupportedFeatures{evt.FeatureJournal: 1, evt.FeatureJournalCompaction: 2}
-	marker := dynamo.NewRepository(capture, fakeTable).FeatureMarker(supported)
+	marker := dynamo.NewRepository(capture, fakeTable).WithLazyInitialization(true).FeatureMarker(supported)
 	if !strings.HasPrefix(name, "absent") {
 		// Reproduce the named declaration's version as well as its contents.
 		for _, declaration := range declarations[:2] {
@@ -383,7 +383,7 @@ func featureCommitVector(ctx context.Context, name string, declarations []Featur
 	vector.Input.ViewState = string(state)
 	vector.Input.Event = EventInput{ID: event.ID, Sequence: event.Sequence, Type: event.Type, Version: event.Version, EntityID: event.EntityID, EntityType: event.EntityType, Payload: string(event.Payload), MetadataJSON: string(metadata)}
 	res := evt.SerializedResult{Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{group}}
-	repo := dynamo.NewRepository(capture, fakeTable).WithFeatureMarker(marker)
+	repo := dynamo.NewRepository(capture, fakeTable).WithLazyInitialization(true).WithFeatureMarker(marker)
 	if strings.HasSuffix(name, "snapshot") {
 		vector.Input.Snapshot = &SnapshotInput{EntityType: AccountType, EntityID: account.GetID(), Sequence: 1, EventSequence: 1, Payload: string(state)}
 		err = repo.CommitWithSnapshot(ctx, res, AccountType, account.GetID(), state, 1)

@@ -191,6 +191,11 @@ repo := dynamo.NewRepository(dynamoClient, "evt-local-event-log")
 store := snapshots.NewStore(repo, 25) // write a snapshot every ~25 events
 ```
 
+Initialize a new event-log table once, before its writers start, with `evt-doctor init` (or
+`repo.Initialize(ctx)` in a deploy step). Writers refuse an uninitialized table instead of scanning
+it, so their roles need no `dynamodb:Scan`. For a local emulator you can skip the step with
+`.WithLazyInitialization(true)`, and the first write initializes the table itself.
+
 `snapshots.NewStore` keeps replay fast by checkpointing entity state inline in the
 event log, so loading a long-lived stream reads the latest snapshot plus the tail
 rather than every event from sequence 1. You provision two tables — an event log

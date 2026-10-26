@@ -166,7 +166,7 @@ func TestCommit_ActionCountsFollowTheWorkedExamples(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fake := compat.NewFakeDynamo()
-			repo := dynamo.NewRepository(fake, "events")
+			repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 			name := fmt.Sprintf("count-%d", time.Now().UnixNano())
 
 			commit := test.prepare(t, repo, name)
@@ -198,7 +198,7 @@ func TestCommit_SingleStreamCapacity(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			fake := compat.NewFakeDynamo()
-			repo := dynamo.NewRepository(fake, "events")
+			repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 			first := 1
 			if test.appends {
@@ -236,7 +236,7 @@ func TestCommit_BudgetMatchesTheActionsSent(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			capture := &capturingClient{FakeDynamo: compat.NewFakeDynamo()}
 			clock := time.Unix(1_791_763_200, 0)
-			repo := dynamo.NewRepository(capture, "events").WithClock(func() time.Time { return clock })
+			repo := dynamo.NewRepository(capture, "events").WithLazyInitialization(true).WithClock(func() time.Time { return clock })
 			if retention != nil {
 				repo = repo.WithRetention(retention)
 			}
@@ -311,7 +311,7 @@ func (c *capturingClient) TransactWriteItems(
 func TestCommit_MaintainsTheHeadItem(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	_, _, present := headOf(fake, "maintained")
 	require.False(t, present)
@@ -345,9 +345,9 @@ func TestCommit_NeverLowersTheHeadTTL(t *testing.T) {
 	now := time.Unix(1_791_763_200, 0)
 	clock := func() time.Time { return now }
 
-	long := dynamo.NewRepository(fake, "events").
+	long := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).
 		WithRetention(dynamo.Retention{"scratch": 2 * time.Hour}).WithClock(clock)
-	short := dynamo.NewRepository(fake, "events").
+	short := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).
 		WithRetention(dynamo.Retention{"scratch": time.Minute}).WithClock(clock)
 
 	require.NoError(t, long.Commit(ctx, evt.SerializedResult{Events: headEvents("ttl-1", 1, 1, "scratch")}))
@@ -365,7 +365,7 @@ func TestCommit_NeverLowersTheHeadTTL(t *testing.T) {
 
 	// An unseen writer: a writer that did not load the stream conflicts on the ttl condition (its
 	// ttl is below the stored one) instead of lowering it, and the retry, which loads, passes.
-	stranger := dynamo.NewRepository(fake, "events").
+	stranger := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).
 		WithRetention(dynamo.Retention{"scratch": time.Minute}).WithClock(clock)
 
 	err = stranger.Commit(ctx, evt.SerializedResult{Events: headEvents("ttl-1", 3, 1, "scratch")})
@@ -395,14 +395,14 @@ func TestPutSnapshot_RefreshesARetainedHeadTTL(t *testing.T) {
 	fake := compat.NewFakeDynamo()
 	now := time.Unix(1_791_763_200, 0)
 
-	writer := dynamo.NewRepository(fake, "events").
+	writer := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).
 		WithRetention(dynamo.Retention{"scratch": time.Hour}).WithClock(func() time.Time { return now })
 	require.NoError(t, writer.Commit(ctx, evt.SerializedResult{Events: headEvents("refresh", 1, 3, "scratch")}))
 	_, firstTTL, _ := headOf(fake, "refresh")
 
 	// Later, a snapshot is written: its ttl is later than the head's, so the head follows it.
 	later := now.Add(30 * time.Minute)
-	snapshotter := dynamo.NewRepository(fake, "events").
+	snapshotter := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).
 		WithRetention(dynamo.Retention{"scratch": time.Hour}).WithClock(func() time.Time { return later })
 	require.NoError(t, snapshotter.PutSnapshot(ctx, "scratch", "refresh", []byte(`{}`), 1, 3))
 
@@ -412,7 +412,7 @@ func TestPutSnapshot_RefreshesARetainedHeadTTL(t *testing.T) {
 
 	// A snapshot whose ttl is below the head's: only the ttl condition fails, so the write retries
 	// as a plain check and succeeds, leaving the head ttl alone.
-	earlier := dynamo.NewRepository(fake, "events").
+	earlier := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).
 		WithRetention(dynamo.Retention{"scratch": time.Minute}).WithClock(func() time.Time { return now })
 	require.NoError(t, earlier.PutSnapshot(ctx, "scratch", "refresh", []byte(`{"v":2}`), 2, 3))
 
@@ -443,13 +443,13 @@ func TestPutSnapshot_RetriesTheTTLRefreshWhenTheHeadAdvancesUnderIt(t *testing.T
 	now := time.Unix(1_791_763_200, 0)
 	retention := dynamo.Retention{"scratch": time.Hour}
 
-	writer := dynamo.NewRepository(fake, "events").WithRetention(retention).WithClock(func() time.Time { return now })
+	writer := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithRetention(retention).WithClock(func() time.Time { return now })
 	require.NoError(t, writer.Commit(ctx, evt.SerializedResult{Events: headEvents("lagging", 1, 2, "scratch")}))
 
 	// The snapshot covers event 3 and is stamped half an hour later than the stream's items.
 	later := now.Add(30 * time.Minute)
 	client := &interleavingClient{FakeDynamo: fake}
-	snapshotter := dynamo.NewRepository(client, "events").WithRetention(retention).WithClock(func() time.Time { return later })
+	snapshotter := dynamo.NewRepository(client, "events").WithLazyInitialization(true).WithRetention(retention).WithClock(func() time.Time { return later })
 
 	// The head (2) is behind the snapshot (3), so the guard fails; a rival then appends event 3,
 	// stamped with the earlier ttl, before the guard's failure is read back.
@@ -477,7 +477,7 @@ func TestCommit_ExpiredResidualOfARetainedStreamHeals(t *testing.T) {
 	now := time.Unix(1_791_763_200, 0)
 	retention := dynamo.Retention{"scratch": time.Hour}
 
-	repo := dynamo.NewRepository(fake, "events").WithRetention(retention).WithClock(func() time.Time { return now })
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithRetention(retention).WithClock(func() time.Time { return now })
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("residual", 1, 2, "scratch")}))
 
 	deleteHead := func() {
@@ -507,7 +507,7 @@ func TestCommit_ExpiredResidualOfARetainedStreamHeals(t *testing.T) {
 
 	// Once every remaining item has expired, the same failure is a conflict that heals when TTL
 	// deletes them.
-	expired := dynamo.NewRepository(fake, "events").WithRetention(retention).
+	expired := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithRetention(retention).
 		WithClock(func() time.Time { return now.Add(3 * time.Hour) })
 
 	err = expired.Commit(ctx, evt.SerializedResult{Events: headEvents("residual", 1, 1, "scratch")})
@@ -550,8 +550,8 @@ func TestProbe_AConcurrentCommitIsAConflictNotDrift(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
 	client := &interleavingClient{FakeDynamo: fake}
-	repo := dynamo.NewRepository(client, "events")
-	rival := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
+	rival := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("race", 1, 2, "t")}))
 
@@ -573,7 +573,7 @@ func TestProbe_AConcurrentCommitIsAConflictNotDrift(t *testing.T) {
 func TestScans_IgnoreHeadItems(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("scanned", 1, 2, "t")}))
 
@@ -607,7 +607,7 @@ func TestScans_IgnoreHeadItems(t *testing.T) {
 func TestCommit_AFreshStoreDeclaresStreamHeads(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	manifest, err := repo.FeatureMarker(nil).Manifest(ctx)
 	require.NoError(t, err)
@@ -622,7 +622,7 @@ func TestCommit_AFreshStoreDeclaresStreamHeads(t *testing.T) {
 	require.Equal(t, map[string]evt.FeatureFormat{evt.FeatureStreamHeads: evt.StreamHeadsFormat}, manifest.Features)
 
 	// Another process finds it declared and writes without declaring again.
-	other := dynamo.NewRepository(fake, "events")
+	other := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 	require.NoError(t, other.Commit(ctx, evt.SerializedResult{Events: headEvents("fresh", 2, 1, "t")}))
 
 	manifest, err = other.FeatureMarker(nil).Manifest(ctx)
@@ -675,7 +675,7 @@ func TestCommit_ARetractedDeclarationWhenAHeadlessStreamAppearsInTheWindow(t *te
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
 	client := &declaringClient{FakeDynamo: fake}
-	repo := dynamo.NewRepository(client, "events")
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
 
 	client.afterDeclare = func() {
 		putRaw(t, fake, "early", 1, map[string]types.AttributeValue{
@@ -696,7 +696,7 @@ func TestCommit_ARetractedDeclarationWhenAHeadlessStreamAppearsInTheWindow(t *te
 	require.NotContains(t, manifest.Features, evt.FeatureStreamHeads)
 
 	// It stays refused: the store is populated and undeclared.
-	err = dynamo.NewRepository(fake, "events").Commit(ctx, evt.SerializedResult{Events: headEvents("later", 1, 1, "t")})
+	err = dynamo.NewRepository(fake, "events").WithLazyInitialization(true).Commit(ctx, evt.SerializedResult{Events: headEvents("later", 1, 1, "t")})
 	require.ErrorIs(t, err, evt.ErrStreamHeadsNotMigrated)
 }
 
@@ -705,7 +705,7 @@ func TestCommit_AHeadedStreamInTheWindowKeepsTheDeclaration(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
 	client := &declaringClient{FakeDynamo: fake}
-	repo := dynamo.NewRepository(client, "events")
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
 
 	client.afterDeclare = func() {
 		putRaw(t, fake, "peer", -1, map[string]types.AttributeValue{"head": &types.AttributeValueMemberN{Value: "1"}})
@@ -736,7 +736,7 @@ func TestCommit_EngineRowsAloneLeaveAStoreFresh(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("engine", 1, 1, "t")}))
 }
 
@@ -764,7 +764,7 @@ func TestWrites_AnUnmigratedStoreIsRefused(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 	sent := len(fake.Transactions())
 
 	requireRefused := func(err error, what string) {
@@ -815,7 +815,7 @@ func TestWrites_AnUnmigratedStoreIsRefused(t *testing.T) {
 func TestGetLatestEvents_ClampsANegativeSequence(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("clamped", 1, 2, "t")}))
 
@@ -849,10 +849,10 @@ func TestProbe_AFailedReadIsReturnedAsItself(t *testing.T) {
 	ctx := context.Background()
 	fake := compat.NewFakeDynamo()
 	client := &failingHeadReadClient{FakeDynamo: fake}
-	repo := dynamo.NewRepository(client, "events")
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("read-fails", 1, 2, "t")}))
-	require.NoError(t, dynamo.NewRepository(fake, "events").Commit(ctx,
+	require.NoError(t, dynamo.NewRepository(fake, "events").WithLazyInitialization(true).Commit(ctx,
 		evt.SerializedResult{Events: headEvents("read-fails", 3, 1, "t")}))
 
 	client.err = errors.New("head read failed")
@@ -877,7 +877,7 @@ func TestProbe_AHeadAboveTheLog(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			fake := compat.NewFakeDynamo()
-			repo := dynamo.NewRepository(fake, "events")
+			repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 			if test.retention != nil {
 				repo = repo.WithRetention(test.retention)
 			}

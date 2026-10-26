@@ -257,7 +257,7 @@ func GenerateRebuildFenceVectors(ctx context.Context) ([]RebuildFenceVector, err
 			LeaseGeneration: s.token,
 		}
 
-		repo := dynamo.NewRepository(capture, fakeTable).WithViewsTable("views").WithClock(clock)
+		repo := dynamo.NewRepository(capture, fakeTable).WithLazyInitialization(true).WithViewsTable("views").WithClock(clock)
 
 		result, err := runRebuildFenceOperation(ctx, repo.RebuildFence(), s.operation, evt.RebuildLease{Owner: s.owner, Generation: s.token}, s.lease)
 		if err != nil {

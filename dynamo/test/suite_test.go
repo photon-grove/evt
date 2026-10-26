@@ -71,7 +71,7 @@ func controlChecks(table string) []types.TransactWriteItem {
 // Use the mocked TestDynamoClient to initialize the Dynamo EventRepository
 func (s *RepositorySuite) SetupTest() {
 	s.client = mock.NewClient()
-	s.repo = dynamo.NewRepository(s.client, "test-events")
+	s.repo = dynamo.NewRepository(s.client, "test-events").WithLazyInitialization(true)
 	// Ordinary repository tests use a store that declares stream-heads and nothing else. Keep this
 	// default scoped to the marker key so entity reads and the explicit FeatureMarkerSuite stay strict.
 	s.client.On("GetItem", mocktest.Anything, mocktest.MatchedBy(func(in *dynamodb.GetItemInput) bool {

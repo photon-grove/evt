@@ -14,8 +14,9 @@ import (
 // compactionCheck validates the durable feature manifest strongly and pins that exact marker
 // version. Every delete batch carries this check, fencing declarations that complete after
 // validation but before deletion. A store that does not declare stream-heads is refused with
-// *evt.StreamHeadsNotMigratedError: compaction never touches the head item, but it is a write
-// path of a store whose streams have no head items yet.
+// *evt.StoreNotInitializedError (*evt.StreamHeadsNotMigratedError when the repository initializes
+// lazily): compaction never touches the head item, but it is a write path of a store whose
+// streams have no head items yet. It never declares the feature itself.
 func (repo *Repository) compactionCheck(ctx context.Context, entityType evt.EntityType) (types.TransactWriteItem, error) {
 	manifest, err := repo.features.Manifest(ctx)
 	if err != nil {
@@ -36,7 +37,7 @@ func (repo *Repository) compactionCheckFor(
 		}
 	}
 
-	if err := evt.RequireStreamHeads(manifest); err != nil {
+	if err := repo.features.requireStreamHeads(manifest); err != nil {
 		return types.TransactWriteItem{}, err
 	}
 
@@ -104,7 +105,7 @@ func (repo *Repository) CompactBelow(
 		}
 	}
 
-	if err = evt.RequireStreamHeads(manifest); err != nil {
+	if err = repo.features.requireStreamHeads(manifest); err != nil {
 		return 0, err
 	}
 
