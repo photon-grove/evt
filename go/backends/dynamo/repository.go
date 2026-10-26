@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"context"
 	"log/slog"
 	"reflect"
 	"time"
@@ -25,6 +26,7 @@ type Repository struct {
 	now            func() time.Time // clock for TTL expiry; nil means time.Now
 	logger         *slog.Logger
 	features       *FeatureMarker // mandatory feature validation (C9)
+	lazyInit       bool           // a write initializes an uninitialized store instead of refusing it
 	ttlFloors      *ttlFloors     // largest loaded ttl per stream, for the head item's never-lower ttl
 }
 
@@ -48,8 +50,41 @@ func NewRepository(client Client, eventsTable string) *Repository {
 	})
 
 	return &Repository{EventsTable: eventsTable, client: client, encoder: encoder, decoder: decoder, consistentRead: true,
-		features: newFeatureMarker(client, eventsTable, nil), ttlFloors: newTTLFloors()}
+		features: newFeatureMarker(client, eventsTable, nil, false), ttlFloors: newTTLFloors()}
 }
+
+// WithLazyInitialization returns a shallow copy of the repository that, when lazy is true,
+// initializes a store that does not declare stream-heads on its first write, as Initialize does,
+// instead of refusing it with *evt.StoreNotInitializedError. That costs a strongly consistent Scan
+// of the table at first write (two when the store is fresh) and needs dynamodb:Scan on the event
+// log, so it is for tests, local emulators, and quickstarts; production writers keep the default
+// (false) and the store is initialized by an operator step (Initialize, or "evt-doctor init").
+//
+// The setting travels with the feature marker: the copy gets its own marker (with the same
+// supported features, and an empty validation cache), a marker created afterwards with
+// FeatureMarker inherits the setting, and a marker passed to WithFeatureMarker brings the setting
+// of the repository that created it.
+func (repo *Repository) WithLazyInitialization(lazy bool) *Repository {
+	r := *repo
+	r.lazyInit = lazy
+	r.features = newFeatureMarker(r.client, r.EventsTable, repo.features.supported, lazy)
+
+	return &r
+}
+
+// Initialize initializes the store: it declares stream-heads on a table that holds no data and
+// reports whether this call declared it (evt.StoreInitializer). It is idempotent, and a table
+// that already declares the feature costs one strongly consistent GetItem. Otherwise it scans the
+// table (strongly consistent) to verify it holds no data, so run it once, at deploy time, with a
+// role that may Scan the event log: writers then need no dynamodb:Scan. A populated table that
+// does not declare the feature is refused with *evt.StreamHeadsNotMigratedError (run "evt-doctor
+// migrate-heads" instead).
+func (repo *Repository) Initialize(ctx context.Context) (bool, error) {
+	return repo.features.Initialize(ctx)
+}
+
+// The DynamoDB repository initializes stores explicitly.
+var _ evt.StoreInitializer = (*Repository)(nil)
 
 // WithLogger returns a shallow copy of the repository with the logger updated.
 func (repo *Repository) WithLogger(logger *slog.Logger) *Repository {

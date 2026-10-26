@@ -47,8 +47,10 @@ lockstep with the Go types that read and write it:
   inserts the row (a new stream) or advances it with `UPDATE … WHERE head = first − 1`, and a fence
   is one read of it, all under the per-entity advisory locks. A head row that disagrees with the log
   is `*evt.StreamHeadDriftError`. A store that holds data must declare the `stream-heads` feature
-  before a writer writes (`*evt.StreamHeadsNotMigratedError`), and an empty one is declared by its
-  first writer; entity heads read this table once it is declared, and the aggregate over events and
+  before a writer writes (`*evt.StreamHeadsNotMigratedError`), and an empty one is initialized by
+  its first writer (the check is two `EXISTS` probes under the feature lock, so writers keep doing
+  it, unlike DynamoDB's) or explicitly with `repo.Initialize(ctx)` / `evt-doctor init -backend
+  postgres`; entity heads read this table once it is declared, and the aggregate over events and
   snapshots until then. Run `EnsureSchema` to create it. A database written by v0.8 is migrated with
   `evt-doctor migrate-heads -backend postgres`, which backfills, verifies, and declares in one
   transaction: see the [migration runbook](migrating-to-stream-heads.md).

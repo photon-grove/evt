@@ -202,7 +202,7 @@ func budgetSizes(request StreamHeadRequest) ([]int, error) {
 
 func runStreamHeadRequest(ctx context.Context, request StreamHeadRequest) ([]FeatureWriteItem, error) {
 	capture := &featureCaptureDynamo{FakeDynamo: NewFakeDynamo()}
-	repo := dynamo.NewRepository(capture, fakeTable)
+	repo := dynamo.NewRepository(capture, fakeTable).WithLazyInitialization(true)
 
 	if len(request.RetentionNanos) > 0 {
 		retention := dynamo.Retention{}

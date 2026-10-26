@@ -70,6 +70,7 @@ var (
 	_ evt.EntityHeadVisitor  = (*Repository)(nil)
 
 	_ evt.TransactionalRepository = (*Repository)(nil)
+	_ evt.StoreInitializer        = (*Repository)(nil)
 	_ evt.OutcomeRepository       = (*Repository)(nil)
 	_ evt.RebuildFenceProvider    = (*Repository)(nil)
 )
@@ -273,6 +274,33 @@ func (repo Repository) validateLocked() error {
 	repo.features.manifest = &next
 
 	return nil
+}
+
+// Initialize declares stream-heads on a repository that holds no events and no snapshots, and
+// reports whether this call declared it (evt.StoreInitializer). The in-memory repository also
+// initializes a fresh store on its first write, so this is only needed by code that treats every
+// backend alike. A store that already declares the feature is left alone; one that holds data
+// without it is refused with *evt.StreamHeadsNotMigratedError.
+func (repo Repository) Initialize(context.Context) (bool, error) {
+	repo.features.mu.Lock()
+	defer repo.features.mu.Unlock()
+
+	supported := evt.SupportedFeatures(nil).WithStreamHeads()
+	if manifest := repo.features.manifest; manifest != nil {
+		if err := manifest.Validate(supported); err != nil {
+			return false, err
+		}
+
+		if manifest.DeclaresStreamHeads() {
+			return false, nil
+		}
+	}
+
+	if err := repo.validateLocked(); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // requireStreamHeadsLocked refuses a store that does not declare stream-heads, without declaring

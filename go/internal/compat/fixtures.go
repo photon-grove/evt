@@ -249,7 +249,7 @@ func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) 
 
 	// Rebuild leases expire against a manual clock that the rebuild op's wait advances.
 	now := RebuildFenceNow
-	repo := dynamo.NewRepository(fake, fakeTable).WithViewsTable(ViewsTable).
+	repo := dynamo.NewRepository(fake, fakeTable).WithLazyInitialization(true).WithViewsTable(ViewsTable).
 		WithClock(func() time.Time { return time.Unix(now, 0) })
 
 	var runner Runner

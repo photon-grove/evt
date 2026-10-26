@@ -23,7 +23,7 @@ import (
 var rebuildNow = time.Unix(1_790_000_000, 0)
 
 func newFenceRepo(client dynamo.Client) *dynamo.Repository {
-	return dynamo.NewRepository(client, "events").WithViewsTable("views").WithClock(func() time.Time { return rebuildNow })
+	return dynamo.NewRepository(client, "events").WithLazyInitialization(true).WithViewsTable("views").WithClock(func() time.Time { return rebuildNow })
 }
 
 // countingClient counts the reads and transactions that reach the table.
@@ -106,7 +106,7 @@ func TestCommit_MarkerFailureOutranksTheRebuildLock(t *testing.T) {
 
 	// Another writer declares a feature this writer models, bumping the manifest version, and a
 	// rebuild takes the lock.
-	_, err := dynamo.NewRepository(fake, "events").FeatureMarker(nil).Declare(ctx, func(manifest *evt.FeatureManifest) {
+	_, err := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).FeatureMarker(nil).Declare(ctx, func(manifest *evt.FeatureManifest) {
 		manifest.Retention = append(manifest.Retention, "other")
 	})
 	require.NoError(t, err)
@@ -346,7 +346,7 @@ func TestRebuildFence_GuardedViewWritesFailInOrder(t *testing.T) {
 	}
 
 	// No views table: refused before any request.
-	bare := dynamo.NewRepository(client, "events").WithClock(func() time.Time { return rebuildNow })
+	bare := dynamo.NewRepository(client, "events").WithLazyInitialization(true).WithClock(func() time.Time { return rebuildNow })
 
 	lease, err := bare.RebuildFence().Begin(ctx, "job", time.Minute)
 	require.NoError(t, err)

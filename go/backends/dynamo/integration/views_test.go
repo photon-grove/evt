@@ -102,7 +102,7 @@ func Test_Views_CommitThenListPage(t *testing.T) {
 	client := isolatedClient
 	viewsTable := newIsolatedViewsTable(ctx, t, client)
 
-	writer := dynamo.NewRepository(client, events.EventsTable).WithViewsTable(viewsTable)
+	writer := dynamo.NewRepository(client, events.EventsTable).WithLazyInitialization(true).WithViewsTable(viewsTable)
 	views := dynamo.NewViewRepository(client, viewsTable)
 
 	id := evt.EntityID("ryw-" + newID())

@@ -32,7 +32,7 @@ func TestEveryWriteEntryPointRefusesProjectorOnlyInput(t *testing.T) {
 
 	backends := map[string]evt.Repository{
 		"mem":      mem.NewRepository(),
-		"dynamo":   dynamo.NewRepository(fake, "events"),
+		"dynamo":   dynamo.NewRepository(fake, "events").WithLazyInitialization(true),
 		"postgres": postgres.NewRepository(nil), // no pool: the refusal must precede any use of it
 	}
 

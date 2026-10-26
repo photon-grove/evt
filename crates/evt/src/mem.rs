@@ -696,6 +696,34 @@ impl FeatureMarker for MemRepository {
 
         Ok(())
     }
+
+    /// Declares `stream-heads` when the repository holds no events and no snapshots, as its first
+    /// writer would. The in-memory repository always initializes a fresh store on the first write,
+    /// so this is only needed by code that treats every backend alike.
+    async fn initialize(&self) -> Result<bool, Error> {
+        // The manifest lock first, then the streams, as every write path takes them.
+        let mut stored = self.manifest_lock();
+        let streams = self.lock();
+
+        if let Some(manifest) = stored.as_ref() {
+            manifest.validate_supported()?;
+            if manifest.declares_stream_heads() {
+                return Ok(false);
+            }
+        }
+
+        if streams.values().any(Stream::holds_data) {
+            return Err(Error::StreamHeadsNotMigrated);
+        }
+
+        let mut next = stored.clone().unwrap_or_default();
+        next.declare_stream_heads();
+        next.version = stored.as_ref().map_or(1, |manifest| manifest.version + 1);
+        *stored = Some(next);
+        *self.validated() = None;
+
+        Ok(true)
+    }
 }
 
 /// The rebuild fence over the shared lock and generation. Every operation runs under the fence's
@@ -835,7 +863,8 @@ mod views;
 mod tests {
     use super::*;
     use crate::conformance::{
-        Suite, commit_view_cases, feature_marker_cases, fresh_store_cases, outcome_cases,
+        Suite, commit_view_cases, feature_marker_cases, fresh_store_cases, initialization_cases,
+        outcome_cases,
     };
 
     #[tokio::test]
@@ -868,6 +897,15 @@ mod tests {
         let first = MemRepository::new();
 
         fresh_store_cases(&first, &first.clone()).await;
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_initialized_store_takes_writes() {
+        let store = MemRepository::new();
+
+        // The in-memory repository initializes a fresh store on its first write, so it does not
+        // refuse an uninitialized one.
+        initialization_cases(&store, &store.clone(), &store.clone(), false).await;
     }
 
     #[tokio::test]

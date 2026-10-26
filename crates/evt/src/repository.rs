@@ -658,8 +658,11 @@ pub(crate) fn item_size(item: &crate::wire::dynamo::Item) -> usize {
 /// - refuse an out-of-band snapshot that the stream's head does not cover with
 ///   [`Error::StreamHeadDrift`] (a snapshot of event sequence 0 needs no head);
 /// - refuse every write path that validates the feature marker (commits, `put_snapshot`,
-///   `compact_below`) with [`Error::StreamHeadsNotMigrated`] when the table does not declare
-///   `stream-heads`, after declaring it themselves on a table that holds no data;
+///   `compact_below`) when the table does not declare `stream-heads`: with
+///   [`Error::StoreNotInitialized`], without scanning, unless the writer initializes stores
+///   lazily (the DynamoDB default refuses), or with [`Error::StreamHeadsNotMigrated`] after a lazy
+///   writer found the table populated (a lazy writer's commit declares the feature itself on a
+///   table that holds no data; compaction never declares it);
 /// - return events in ascending sequence order, and `latest` in descending order;
 /// - refuse an entity ID in a reserved namespace (`SYSTEM#`, `command-outcome#`) on every
 ///   entity-addressed write path (commit, `put_snapshot`, `compact_below`) with
