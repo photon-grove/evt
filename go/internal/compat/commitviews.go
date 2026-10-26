@@ -89,7 +89,7 @@ func GenerateCommitViewVectors(ctx context.Context) ([]CommitViewVector, error) 
 		result := commitViewResult(vectors[i].Request)
 
 		capture := &featureCaptureDynamo{FakeDynamo: NewFakeDynamo()}
-		repo := dynamo.NewRepository(capture, fakeTable).WithViewsTable(ViewsTable)
+		repo := dynamo.NewRepository(capture, fakeTable).WithLazyInitialization(true).WithViewsTable(ViewsTable)
 
 		if _, err := repo.FeatureMarker(nil).DeclareStreamHeads(ctx); err != nil {
 			return nil, fmt.Errorf("commit view vector %s: %w", vectors[i].Name, err)

@@ -30,7 +30,8 @@ Both sides implement the same account domain: `go/internal/compat/account.go` an
 
 The marker vectors include duplicate-input set canonicalization, the complete transaction order
 (marker check, rebuild-lock check, projector operations, then per written stream its head update,
-event puts, and snapshot put), the marker row a writer stores when it declares `stream-heads` on a fresh table, and, under
+event puts, and snapshot put), the marker row a writer stores when it declares `stream-heads` on a fresh table (an explicit
+initialization or a lazily initializing writer: the request is the same), and, under
 `streamHeads`, the exact actions, expressions, name placeholders, and values of every head request
 shape (create, append, later snapshot, fences, retained streams, and the out-of-band snapshot guard)
 with the commit budget's item sizes. Rust consumes these

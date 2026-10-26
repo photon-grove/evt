@@ -640,7 +640,13 @@ paths do not need the feature. On a table with no marker row, a writer may decla
 itself, but only after confirming, with a **strongly consistent** scan, that the table holds no
 non-reserved items (it reads until it finds one or exhausts the table; a populated table stops it
 immediately). A fresh table therefore needs no step, and a populated unmigrated table can never be
-declared by accident.
+declared by accident. _Errata ([#188](https://github.com/photon-grove/evt/issues/188)):_ a DynamoDB
+writer no longer declares the feature itself by default, because the scan made `dynamodb:Scan` a
+standing permission of every writer role. It refuses a store without the feature with
+`StoreNotInitialized`, without scanning, and the store is initialized once by an explicit,
+idempotent operator step (`Initialize` / `initialize()`, `evt-doctor init`) that runs the same
+verification. First-write declaration stays as an opt-in (lazy initialization), and PostgreSQL and
+in-memory writers keep it. See the spec's [Required feature](../reference/storage-format.md#required-feature).
 
 **Writers that predate the feature.** A v0.9 build without `stream-heads` refuses a table that
 declares it (the existing rule), so a mixed fleet of old and new v0.9 builds cannot corrupt heads

@@ -28,10 +28,14 @@ func (repo *Repository) headsTable() string {
 }
 
 // ensureStreamHeads makes sure the store declares stream-heads before a write. A store that
-// holds no data declares it itself, in a transaction under the exclusive feature lock that first
-// checks both tables are empty; one that holds data without the declaration is refused with
-// *evt.StreamHeadsNotMigratedError, because its streams have no head rows. The declaring step for
-// a populated store is the migration's (FeatureMarker.DeclareStreamHeads).
+// holds no data is initialized by the writer itself (Initialize); one that holds data without the
+// declaration is refused with *evt.StreamHeadsNotMigratedError, because its streams have no head
+// rows. The declaring step for a populated store is the migration's
+// (FeatureMarker.DeclareStreamHeads).
+//
+// Unlike DynamoDB, a PostgreSQL writer initializes a fresh store itself by default: the check is
+// two EXISTS probes under the feature lock it takes anyway, and it needs no privilege a writer
+// lacks.
 func (repo *Repository) ensureStreamHeads(ctx context.Context) error {
 	marker := repo.features
 
@@ -72,7 +76,7 @@ func (repo *Repository) ensureStreamHeads(ctx context.Context) error {
 	}
 
 	if !declares {
-		if _, err = marker.declare(ctx, declareStreamHeads, repo.requireEmptyStore); err != nil {
+		if _, err = repo.Initialize(ctx); err != nil {
 			return err
 		}
 	}
@@ -84,13 +88,47 @@ func (repo *Repository) ensureStreamHeads(ctx context.Context) error {
 	return nil
 }
 
-// requireEmptyStore is the guard of a writer's own stream-heads declaration: inside the
-// declaration transaction, under the exclusive feature lock, the event and snapshot tables must
-// hold no row at all (the engine rows live in their own tables, so any row is a stream). A manifest that already declares the feature (a racing declaration won)
-// needs nothing.
+// Initialize initializes the store: it declares stream-heads when the events and snapshots tables
+// hold no row, in one transaction under the exclusive feature lock, and reports whether this call
+// declared it (evt.StoreInitializer). A store that already declares the feature is left alone; a
+// populated one that does not is refused with *evt.StreamHeadsNotMigratedError, and a manifest
+// that declares a feature this writer does not model with *evt.UnsupportedFeatureError. Run
+// EnsureSchema first.
+func (repo *Repository) Initialize(ctx context.Context) (bool, error) {
+	_, err := repo.features.declare(ctx, declareStreamHeads, repo.requireEmptyStore)
+	if errors.Is(err, errAlreadyInitialized) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// The PostgreSQL repository initializes stores explicitly.
+var _ evt.StoreInitializer = (*Repository)(nil)
+
+// errAlreadyInitialized stops a stream-heads declaration whose store already declares the feature:
+// there is nothing to write.
+var errAlreadyInitialized = errors.New("postgres: the store already declares stream-heads")
+
+// requireEmptyStore is the guard of a stream-heads initialization: inside the declaration
+// transaction, under the exclusive feature lock, the event and snapshot tables must hold no row at
+// all (the engine rows live in their own tables, so any row is a stream). A manifest that already
+// declares the feature (initialized before, or a racing declaration won) stops the declaration
+// with errAlreadyInitialized, and one that declares a feature this writer does not model refuses
+// it.
 func (repo *Repository) requireEmptyStore(ctx context.Context, tx pgx.Tx, manifest *evt.FeatureManifest) error {
-	if manifest != nil && manifest.DeclaresStreamHeads() {
-		return nil
+	if manifest != nil {
+		if err := manifest.Validate(repo.features.supported); err != nil {
+			return err
+		}
+
+		if manifest.DeclaresStreamHeads() {
+			return errAlreadyInitialized
+		}
 	}
 
 	var occupied bool

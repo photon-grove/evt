@@ -18,7 +18,7 @@ func projected(name string, index, operation int, op evt.ViewOperation) evt.Proj
 }
 
 func Test_buildViewItems_ShapesEveryOperationAsTheSpecPins(t *testing.T) {
-	repo := NewRepository(nil, "events").WithViewsTable("views")
+	repo := NewRepository(nil, "events").WithLazyInitialization(true).WithViewsTable("views")
 
 	items, err := repo.buildViewItems([]evt.ProjectedView{
 		projected("p", 0, 0, evt.PutView("pk", "sk", "owner", "account", []byte(`{"v":1}`))),
@@ -67,7 +67,7 @@ func owned(owner string) map[string]types.AttributeValue {
 }
 
 func Test_buildViewItems_AnEmptyEntityTypeIsStillWritten(t *testing.T) {
-	repo := NewRepository(nil, "events").WithViewsTable("views")
+	repo := NewRepository(nil, "events").WithLazyInitialization(true).WithViewsTable("views")
 
 	items, err := repo.buildViewItems([]evt.ProjectedView{projected("p", 0, 0, evt.PutView("pk", "sk", "owner", "", nil))})
 	require.NoError(t, err)
@@ -79,7 +79,7 @@ func Test_buildViewItems_AnEmptyEntityTypeIsStillWritten(t *testing.T) {
 }
 
 func Test_buildViewItems_RefusesOperationsWithoutAViewsTable(t *testing.T) {
-	_, err := NewRepository(nil, "events").buildViewItems([]evt.ProjectedView{
+	_, err := NewRepository(nil, "events").WithLazyInitialization(true).buildViewItems([]evt.ProjectedView{
 		projected("p", 0, 0, evt.PutView("pk", "sk", "owner", "", nil)),
 		projected("p", 0, 1, evt.DeleteView("pk", "other", "owner")),
 	})
@@ -90,13 +90,13 @@ func Test_buildViewItems_RefusesOperationsWithoutAViewsTable(t *testing.T) {
 	require.Equal(t, "dynamodb", refused.Backend)
 	require.Equal(t, 2, refused.Operations)
 
-	items, err := NewRepository(nil, "events").buildViewItems(nil)
+	items, err := NewRepository(nil, "events").WithLazyInitialization(true).buildViewItems(nil)
 	require.NoError(t, err)
 	require.Empty(t, items, "a commit with no view operations needs no views table")
 }
 
 func Test_theBudgetedSizeOfAViewOperationIsTheSizeOfItsItem(t *testing.T) {
-	repo := NewRepository(nil, "events").WithViewsTable("views")
+	repo := NewRepository(nil, "events").WithLazyInitialization(true).WithViewsTable("views")
 
 	for name, op := range map[string]evt.ViewOperation{
 		"put":                  evt.PutView("pk", "sk", "owner", "account", []byte(`{"balance":10}`)),
@@ -202,7 +202,7 @@ func Test_aDeleteIsBudgetedByTheConditionAndOwnerValueTheRepositorySends(t *test
 }
 
 func Test_DeclareHistoryDependent_ChecksTheFeatureMarkerBeforeAnyRead(t *testing.T) {
-	repo := NewRepository(nil, "events").WithViewsTable("views")
+	repo := NewRepository(nil, "events").WithLazyInitialization(true).WithViewsTable("views")
 
 	// A repository whose events table no longer matches its marker's is refused before the manifest
 	// is read, like every other write path.

@@ -207,7 +207,7 @@ func (s *RepositorySuite) Test_CompactBelow_RetriesMarkerChange() {
 
 	// Script each marker read on a fresh client rather than using the suite default.
 	client := dynamo_mock.NewClient()
-	repo := dynamo.NewRepository(client, "test-events")
+	repo := dynamo.NewRepository(client, "test-events").WithLazyInitialization(true)
 	client.On("GetItem", mock.Anything, mock.MatchedBy(func(in *dynamodb.GetItemInput) bool {
 		pk, ok := in.Key["pk"].(*types.AttributeValueMemberS)
 		return ok && pk.Value == entityID

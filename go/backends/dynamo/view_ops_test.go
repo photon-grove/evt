@@ -33,7 +33,7 @@ func projected(name string, index, operation int, op evt.ViewOperation) evt.Proj
 func newViewsRepo() (*compat.FakeDynamo, *dynamo.Repository) {
 	fake := compat.NewFakeDynamo()
 
-	return fake, dynamo.NewRepository(fake, "events").WithViewsTable("views")
+	return fake, dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithViewsTable("views")
 }
 
 func TestViewOperationsSitBetweenTheControlChecksAndTheWrittenStreams(t *testing.T) {
@@ -82,7 +82,7 @@ func TestViewOperationsSitBetweenTheControlChecksAndTheWrittenStreams(t *testing
 
 func TestViewOperationsWithoutAViewsTableAreRefusedBeforeAnyRequest(t *testing.T) {
 	fake := compat.NewFakeDynamo()
-	repo := dynamo.NewRepository(fake, "events")
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
 
 	err := repo.Commit(context.Background(), evt.SerializedResult{
 		Events: []evt.SerializedEvent{viewEvent("a", 1)},

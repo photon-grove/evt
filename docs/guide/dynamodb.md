@@ -20,13 +20,17 @@ store := snapshots.NewStore(repo, 25)
 ```
 
 `NewRepository(client, eventsTable)` takes an AWS SDK v2 DynamoDB client and the event-log table
-name. You tune it with chainable options:
+name. The table must be initialized once before writers start, with `evt-doctor init` or
+`repo.Initialize(ctx)` in a deploy step. Until then every write is refused with
+`*evt.StoreNotInitializedError`, and [Permissions and billing](#permissions-and-billing) below says
+why. You tune the repository with chainable options:
 
 | Option | Effect |
 | --- | --- |
 | `WithScanSegments(n)` | Parallel-scan the table with `n` segments during rebuilds (faster, more capacity). |
 | `WithConsistentRead(true)` | Strongly consistent reads on loads. |
 | `WithRetention(retention)` | Stamp a DynamoDB `ttl` on policed entity types (see [Retention](#retention)). |
+| `WithLazyInitialization(true)` | Initialize an uninitialized table on the first write instead of refusing it (tests and local use, and it needs `dynamodb:Scan`). |
 | `WithViewsTable(name)` | Where commit-wide projectors write their rows (see [Entity-views table](#entity-views-table)). |
 | `WithLogger(logger)` | Inject a `*slog.Logger` for structured logs. |
 
@@ -79,9 +83,9 @@ plus that put.
 There are no reads before a commit. A failed commit is told apart by reading the stream on the
 failure path only ([Classification](../reference/storage-format.md#failure-classification)). A head
 item that disagrees with its log is `*evt.StreamHeadDriftError`. A store that holds data without
-declaring the `stream-heads` feature is refused with `*evt.StreamHeadsNotMigratedError` until it's
-migrated. An empty table is declared by its first writer, so a fresh table needs no step. A table
-written by v0.8 is migrated with `evt-doctor migrate-heads`, which is stop-the-world and one-way
+declaring the `stream-heads` feature is refused until it's migrated (initialization refuses it with
+`*evt.StreamHeadsNotMigratedError`). An empty table is initialized once with `evt-doctor init`. A
+table written by v0.8 is migrated with `evt-doctor migrate-heads`, which is stop-the-world and one-way
 (see the [migration runbook](migrating-to-stream-heads.md)).
 
 The `sk = 0` snapshot row records the entity's serialized state plus the `eventSequence` it
@@ -92,12 +96,28 @@ no-op, so a slow background writer can never regress the floor.
 
 The head update is an `Update` action inside `TransactWriteItems`, so a writer's role needs
 `dynamodb:UpdateItem` on the event-log table as well as `PutItem`, `ConditionCheckItem` and
-`TransactWriteItems`. The first write to a table that doesn't declare `stream-heads` runs a
-strongly consistent `Scan` to prove the table holds no data, declares the feature, then scans once
-more to prove no stream without a head item slipped in before the declaration. That needs
-`dynamodb:Scan`. A writer to a table that already declares the feature never scans. Writers older
-than the head item never read the marker, so they have to be stopped before the first head-aware
-writer runs against a table ([the obligation](../reference/storage-format.md#required-feature)).
+`TransactWriteItems`. A writer never scans the event log, so its role needs no `dynamodb:Scan`. It
+refuses a table that doesn't declare `stream-heads` with `*evt.StoreNotInitializedError` (Rust
+`Error::StoreNotInitialized`) and writes nothing. You initialize the table once instead, at deploy
+time, before any writer starts:
+
+```sh
+evt-doctor init -events-table event-log
+```
+
+You can also call `repo.Initialize(ctx)` (Rust `repository.initialize().await`) from a deploy step.
+Initialization runs a strongly consistent `Scan` to prove the table holds no data, declares the
+feature, then scans once more to prove no stream without a head item slipped in before the
+declaration. So the initializing role needs `dynamodb:GetItem`, `dynamodb:Scan` and
+`dynamodb:PutItem` on the event-log table. It's idempotent. On a table that already declares the
+feature it reads the marker and stops, and two jobs initializing the same empty table at once let
+exactly one of them write, so it's safe in every deploy, concurrent ones included. Tests, local
+emulators and quickstarts can skip the step with
+`dynamo.NewRepository(client, table).WithLazyInitialization(true)` (Rust
+`.with_lazy_initialization(true)`). The first write then initializes the table itself, and that
+writer needs `dynamodb:Scan`. Writers older than the head item never read the marker, so they have
+to be stopped before the first head-aware writer runs against a table ([the
+obligation](../reference/storage-format.md#required-feature)).
 
 Every transactional action is billed as two writes of the checked or written item's size, rounded
 up to 1 KB. The head item stays well under 1 KB, so a head update or a fence is the cheapest action

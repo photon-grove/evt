@@ -1,6 +1,7 @@
 package evt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -50,9 +51,9 @@ var ErrStreamHeadsNotMigrated = errors.New("store has not been migrated to strea
 // stream-heads while the store holds data: the streams have no head items, so a head-aware writer
 // would fail every stream. The refusal covers every write path that validates the marker —
 // commits (outcome-only and rejection commits included), PutSnapshot, and CompactBelow. Run the
-// migration (evt-doctor migrate-heads) with every older writer stopped. A store with no data
-// declares the feature itself on the first write, so a fresh table needs no step. Nothing was
-// written.
+// migration (evt-doctor migrate-heads) with every older writer stopped. A store with no data is
+// initialized instead (StoreInitializer), or by a lazily initializing writer's first write.
+// Nothing was written.
 type StreamHeadsNotMigratedError struct{}
 
 // Error returns the error message string.
@@ -64,6 +65,52 @@ func (e *StreamHeadsNotMigratedError) Error() string {
 // Is makes errors.Is(err, ErrStreamHeadsNotMigrated) match.
 func (e *StreamHeadsNotMigratedError) Is(target error) bool {
 	return target == ErrStreamHeadsNotMigrated
+}
+
+// ErrStoreNotInitialized matches a StoreNotInitializedError with errors.Is.
+var ErrStoreNotInitialized = errors.New("store is not initialized")
+
+// StoreNotInitializedError refuses a write to a store whose feature marker does not declare
+// stream-heads, by a writer that does not initialize stores itself (the DynamoDB default): telling
+// a fresh store from one written before stream heads takes a table scan, which a writer never
+// runs. Initialize a fresh store once, at deploy time, with StoreInitializer.Initialize (or
+// "evt-doctor init"), and migrate a store written before stream heads with "evt-doctor
+// migrate-heads". The refusal covers every write path that validates the marker — commits
+// (outcome-only and rejection commits included), PutSnapshot, and CompactBelow. Reads need no
+// feature. Nothing was written.
+type StoreNotInitializedError struct{}
+
+// Error returns the error message string.
+func (e *StoreNotInitializedError) Error() string {
+	return "store is not initialized: the feature manifest does not declare " + FeatureStreamHeads +
+		"; initialize a fresh store, or migrate one written before stream heads, before writing"
+}
+
+// Is makes errors.Is(err, ErrStoreNotInitialized) match.
+func (e *StoreNotInitializedError) Is(target error) bool {
+	return target == ErrStoreNotInitialized
+}
+
+// IsStoreNotInitializedErr returns true when err is (or wraps) a StoreNotInitializedError.
+func IsStoreNotInitializedErr(err error) bool {
+	var notInitialized *StoreNotInitializedError
+
+	return errors.As(err, &notInitialized)
+}
+
+// StoreInitializer is implemented by every repository in this module: it initializes a store
+// explicitly (storage spec, Stream Heads, Required feature).
+type StoreInitializer interface {
+	// Initialize declares stream-heads on a store that holds no data, with the verification a
+	// lazily initializing writer runs on its first write, and reports whether this call declared
+	// it. It is an operator step, run once at deploy time before any writer starts, and it is
+	// idempotent: a store that already declares the feature is left alone after one manifest read,
+	// with nothing scanned or written. A store that holds data without declaring the feature is
+	// refused with *StreamHeadsNotMigratedError (migrate it instead), and a manifest that declares
+	// a feature the writer does not model with *UnsupportedFeatureError. Only stream-heads is
+	// declared. On DynamoDB the verification is a strongly consistent Scan, so the caller needs
+	// dynamodb:Scan on the event log; writers then never scan.
+	Initialize(ctx context.Context) (bool, error)
 }
 
 // ErrStreamHeadDrift matches a StreamHeadDriftError with errors.Is.

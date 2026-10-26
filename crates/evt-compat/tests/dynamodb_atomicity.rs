@@ -232,6 +232,7 @@ impl TransactionGate {
             aws_sdk_dynamodb::Client::from_conf(config),
             repository.table(),
         )
+        .with_lazy_initialization(true)
     }
 }
 

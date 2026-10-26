@@ -2,16 +2,21 @@
 
 This is the operator runbook for `evt-doctor migrate-heads`. A table or database written by v0.8
 has streams with no [head items](../reference/storage-format.md#stream-heads), the small per-stream
-row a commit conditions on. A head-aware writer refuses such a store
-(`*evt.StreamHeadsNotMigratedError`, or `Error::StreamHeadsNotMigrated` in Rust) until the heads
-are backfilled and verified and the required `stream-heads` feature is declared. The rules this
+row a commit conditions on. A head-aware writer refuses such a store until the heads are backfilled
+and verified and the required `stream-heads` feature is declared. A DynamoDB writer refuses it with
+`*evt.StoreNotInitializedError` (Rust `Error::StoreNotInitialized`), because it doesn't scan the
+table to find out why the feature is missing. A PostgreSQL writer, or a DynamoDB writer with lazy
+initialization, refuses it with `*evt.StreamHeadsNotMigratedError` (Rust
+`Error::StreamHeadsNotMigrated`). The rules this
 procedure implements are in the storage format's
 [Migration](../reference/storage-format.md#migration) section and
 [ADR 0007](../adr/0007-per-stream-head-item.md#migration-and-compatibility).
 
 You only need this for a store that already holds streams written by v0.8. A fresh table or
-database needs no step, because its first head-aware writer declares the feature. A store that
-already declares `stream-heads` is migrated, and `-verify` checks it.
+database is initialized instead, once, before its writers start. `evt-doctor init` (or `Initialize`
+and `initialize()` from a deploy step) declares the feature after verifying the store is empty, and
+it refuses a v0.8 store, which needs this runbook. A store that already declares `stream-heads` is
+migrated, and `-verify` checks it.
 
 The migration is stop-the-world and one-way. No v0.8 writer may run against the store once its
 first head-aware writer has run, and there's no rollback in place. The way back is the backup you

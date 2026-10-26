@@ -29,6 +29,8 @@ An aggregate handles commands and applies events. This counter emits an `Increme
 each `Increment` command, and `mem.NewStore()` runs it against an in-memory log, which is what
 you'd use in tests. Swapping in `dynamo.NewRepository` or `postgres.NewRepository` behind
 `snapshots.NewStore` changes nothing in the aggregate.
+A DynamoDB table is initialized once at deploy time with `evt-doctor init` (or `repo.Initialize(ctx)`),
+and writers refuse an uninitialized table rather than scan it.
 
 ```go
 package main

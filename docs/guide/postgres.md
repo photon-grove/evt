@@ -49,8 +49,10 @@ though compaction deleted those keys. An `entity_type` index backs `StreamFilter
 stream or advances it with `UPDATE … WHERE head = first − 1`, and a fence is one read of it, all
 under the per-entity advisory locks. A head row that disagrees with the log is
 `*evt.StreamHeadDriftError`. A store that holds data must declare the `stream-heads` feature before
-a writer writes (`*evt.StreamHeadsNotMigratedError` until then), and an empty one is declared by its
-first writer. Entity heads read this table once the feature is declared, and the aggregate over
+a writer writes (`*evt.StreamHeadsNotMigratedError` until then). An empty one is initialized by its
+first writer, which costs two `EXISTS` probes under the feature lock, so writers keep doing it
+unlike DynamoDB's. You can also initialize explicitly with `repo.Initialize(ctx)` or
+`evt-doctor init -backend postgres`. Entity heads read this table once the feature is declared, and the aggregate over
 events and snapshots until then. A database written by v0.8 is migrated with
 `evt-doctor migrate-heads -backend postgres`, which backfills, verifies and declares in one
 transaction (see the [migration runbook](migrating-to-stream-heads.md)).

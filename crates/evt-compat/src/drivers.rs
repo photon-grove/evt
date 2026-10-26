@@ -61,7 +61,10 @@ pub async fn dynamo_client() -> aws_sdk_dynamodb::Client {
 /// A repository over the local event-log table, writing commit-wide view operations to the local
 /// views table.
 pub async fn dynamo() -> DynamoRepository {
-    DynamoRepository::new(dynamo_client().await, dynamo_table()).with_views_table(views_table())
+    // The shared scenario table starts empty, and its first writer initializes it.
+    DynamoRepository::new(dynamo_client().await, dynamo_table())
+        .with_views_table(views_table())
+        .with_lazy_initialization(true)
 }
 
 /// A connection pool for `DATABASE_URL` (default: the `infra/local-postgres` database).
