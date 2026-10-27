@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.9.0](https://github.com/photon-grove/evt/compare/go/v0.8.0...go/v0.9.0) (2026-10-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* Repository no longer has CommitStream. Commit batched commands through Repository.Commit.
+* **go:** Repository no longer has CommitStream. Commit batched commands through Repository.Commit.
+* **go:** Repository no longer has CommitStream. Commit batched commands through Repository.Commit.
+
+### Documentation
+
+* reorganize and rewrite the docs for humans ([#198](https://github.com/photon-grove/evt/issues/198)) ([f413eb1](https://github.com/photon-grove/evt/commit/f413eb14a6e692d05b4ae34dbf1f41d4aaa43e58))
+
+
+### Code Refactoring
+
+* **go:** move the Go module into go/ ([#196](https://github.com/photon-grove/evt/issues/196)) ([035293c](https://github.com/photon-grove/evt/commit/035293c74c85f3402954d854e889be0c1c97d14f))
+* **go:** rename Entity to Aggregate and Context to CommandContext ([#197](https://github.com/photon-grove/evt/issues/197)) ([d11b22e](https://github.com/photon-grove/evt/commit/d11b22ed5b306c15d642144eb15d01bdb591d2b4))
+
 ## [0.8.0](https://github.com/photon-grove/evt/compare/v0.7.0...v0.8.0) (2026-10-13)
 
 
