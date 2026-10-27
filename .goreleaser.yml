@@ -2,18 +2,22 @@ version: 2
 
 project_name: evt
 
+# The Go module is released under go/vX.Y.Z tags, and goreleaser only parses plain semver tags.
+# The release workflow gives it a local, never pushed vX.Y.Z tag to build from, and uploads the
+# artifacts to the go/vX.Y.Z release that release-please already created. So goreleaser neither
+# creates the release nor writes its notes.
+release:
+  disable: true
+
 before:
   hooks:
-    - go mod tidy
+    - sh -c 'cd go && go mod tidy'
 
 builds:
   - id: evt-doctor
+    dir: go
     main: ./cmd/evt-doctor
     binary: evt-doctor
-    # Build with the `prod` tag so dangerous, non-snapshot-safe helpers (e.g. dynamo.Delete,
-    # guarded by `//go:build !prod`) are physically excluded from released binaries.
-    flags:
-      - -tags=prod
     env:
       - CGO_ENABLED=0
     goos:
@@ -39,4 +43,4 @@ snapshot:
   version_template: "{{ incpatch .Version }}-next"
 
 changelog:
-  use: github
+  disable: true

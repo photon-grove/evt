@@ -23,7 +23,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "6.69.1"
+      version = "6.70.0"
     }
   }
 }
@@ -50,19 +50,6 @@ resource "aws_dynamodb_table" "event_log" {
   ttl {
     attribute_name = "ttl"
     enabled        = true
-  }
-}
-
-# Heads table: one row per entity (pk) stores its highest sequence for incremental rebuilds.
-# The heads projector maintains it; entityType is a scanned, non-key attribute.
-resource "aws_dynamodb_table" "entity_heads" {
-  name         = "evt-local-entity-heads"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pk"
-
-  attribute {
-    name = "pk"
-    type = "S"
   }
 }
 

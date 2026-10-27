@@ -1,8 +1,8 @@
-# Security Policy
+# Security policy
 
-Report vulnerabilities privately through GitHub Security Advisories for this
-repository. Do not open public issues for suspected vulnerabilities.
+Please report vulnerabilities privately through GitHub Security Advisories on this repository,
+not as public issues.
 
-This project should never contain production secrets, private account IDs,
-private hostnames, or adopter-specific environment names. Public examples should
-use local emulator endpoints and placeholder values only.
+The repo is public, so it should never contain production secrets, private account IDs, private
+hostnames or environment names from any project that uses evt. Examples and tests use local
+emulator endpoints and placeholder values only.

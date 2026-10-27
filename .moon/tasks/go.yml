@@ -51,6 +51,9 @@ tasks:
     inputs:
       - '@globs(sources)'
       - '@globs(tests)'
+      # internal/docexamples compiles snippets from these.
+      - '/README.md'
+      - '/docs/guide/upgrading-to-v0.9.md'
   tidy:
     command: go
     args:
@@ -62,7 +65,7 @@ tasks:
   check-integration-readiness:
     command: bash
     args:
-      - scripts/check-integration-readiness.sh
+      - $workspaceRoot/scripts/check-integration-readiness.sh
       - --endpoint
       - '${AWS_ENDPOINT_URL:-http://localhost:4566}'
   integration:
@@ -71,7 +74,7 @@ tasks:
       - test
       - -race
       - -tags=integration
-      - ./dynamo/integration
+      - ./backends/dynamo/integration
     deps:
       - check-integration-readiness
     env:
@@ -85,7 +88,7 @@ tasks:
   check-postgres-readiness:
     command: bash
     args:
-      - scripts/check-postgres-readiness.sh
+      - $workspaceRoot/scripts/check-postgres-readiness.sh
       - --host
       - '${POSTGRES_HOST:-localhost}'
       - --port
@@ -96,7 +99,7 @@ tasks:
       - test
       - -race
       - -tags=integration
-      - ./postgres/integration
+      - ./backends/postgres/integration
     deps:
       - check-postgres-readiness
     env:

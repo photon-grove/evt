@@ -1,0 +1,205 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+
+	evt "github.com/photon-grove/evt/go"
+	"github.com/photon-grove/evt/go/test"
+	"github.com/stretchr/testify/require"
+)
+
+// applyEvents applies events to the suite entity to satisfy the Store.Commit contract (the entity
+// must reflect the events before Commit; Execute does this in production, but these tests drive
+// Commit directly).
+func (s *DynamoEventsIntegrationSuite) applyEvents(events []evt.Event) {
+	for _, event := range events {
+		require.NoError(s.T(), s.aggregate.Apply(event))
+	}
+}
+
+func (s *DynamoEventsIntegrationSuite) Test_Commit_Snapshot() {
+	ctx := context.Background()
+
+	s.SetupAggregate(evt.EntityID(newID()), 2)
+
+	metadata := s.getMetadata(ctx)
+
+	updatedValue := "updated-value"
+	intermediateOther := "intermediate-other-value"
+	updatedOther := "updated-other-value"
+	otherValue := "test-other-value"
+
+	result, err := s.aggregate.Handle(ctx, &test.CreateAggregate{
+		Value: "test-value",
+		Other: &otherValue,
+	})
+	require.NoError(s.T(), err)
+
+	updateValueResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
+		Value: updatedValue,
+		Other: &otherValue,
+	})
+	require.NoError(s.T(), err)
+
+	result.Events = append(result.Events, updateValueResult.Events...)
+
+	// Set "other" to an intermediate value
+	updateOtherResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
+		Value: updatedValue,
+		Other: &intermediateOther,
+	})
+	require.NoError(s.T(), err)
+
+	result.Events = append(result.Events, updateOtherResult.Events...)
+
+	s.applyEvents(result.Events)
+	_, err = s.store.Commit(ctx, result, s.cc, metadata)
+	require.NoError(s.T(), err)
+
+	// Retrieve the initial snapshot
+	snapshot, err := s.repo.GetSnapshot(ctx, s.entityID)
+	require.NoError(s.T(), err)
+
+	// The sequence should match the last event captured in the snapshot, and the snapshot
+	// number itself should be 1, because it was the first taken.
+	require.Equal(s.T(), s.entityType, snapshot.EntityType)
+	require.Equal(s.T(), s.entityID, snapshot.EntityID)
+	require.Equal(s.T(), evt.EventSequence(1), snapshot.Sequence)
+	require.Equal(s.T(), evt.EventSequence(3), snapshot.EventSequence)
+
+	// Unmarshal snapshot payload and assert semantics
+	var snap1 struct {
+		ID    string  `json:"id"`
+		Value string  `json:"value"`
+		Other *string `json:"other"`
+	}
+	require.NoError(s.T(), json.Unmarshal(snapshot.Payload, &snap1))
+	require.Equal(s.T(), string(s.entityID), snap1.ID)
+	require.Equal(s.T(), updatedValue, snap1.Value)
+	require.Equal(s.T(), intermediateOther, *snap1.Other)
+
+	// Set "other" to the intermediate value again
+	newResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
+		Value: updatedValue,
+		Other: &intermediateOther,
+	})
+	require.NoError(s.T(), err)
+
+	// Set "other" to the final expected value
+	newOtherResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
+		Value: updatedValue,
+		Other: &updatedOther,
+	})
+	require.NoError(s.T(), err)
+
+	newResult.Events = append(newResult.Events, newOtherResult.Events...)
+
+	s.applyEvents(newResult.Events)
+	_, err = s.store.Commit(ctx, newResult, s.cc, metadata)
+	require.NoError(s.T(), err)
+
+	// Retrieve the updated snapshot
+	snapshot, err = s.repo.GetSnapshot(ctx, s.entityID)
+	require.NoError(s.T(), err)
+
+	// The sequence should increase to 5, which is the event with the final expected value
+	// for the "other" field. The snapshot itself should be 2, because it was the second taken.
+	require.Equal(s.T(), s.entityType, snapshot.EntityType)
+	require.Equal(s.T(), s.entityID, snapshot.EntityID)
+	require.Equal(s.T(), evt.EventSequence(2), snapshot.Sequence)
+	require.Equal(s.T(), evt.EventSequence(5), snapshot.EventSequence)
+
+	// Unmarshal snapshot payload and assert semantics
+	var snap2 struct {
+		ID    string  `json:"id"`
+		Value string  `json:"value"`
+		Other *string `json:"other"`
+	}
+	require.NoError(s.T(), json.Unmarshal(snapshot.Payload, &snap2))
+	require.Equal(s.T(), string(s.entityID), snap2.ID)
+	require.Equal(s.T(), updatedValue, snap2.Value)
+	require.Equal(s.T(), updatedOther, *snap2.Other)
+
+	committedSerializedEvents, err := s.repo.GetEvents(ctx, s.entityID)
+	require.NoError(s.T(), err)
+
+	// Both the initial and the subsequent events should be captured in the repository
+	expected := append(result.Events, newResult.Events...)
+
+	// Convert the serialized committed events to domain events
+	committedEvents := make([]evt.Event, 0, len(committedSerializedEvents))
+	for _, serializedEvent := range committedSerializedEvents {
+		event, err := evt.DeserializeEvent(serializedEvent, s.cc.Aggregate)
+		require.NoError(s.T(), err)
+
+		committedEvents = append(committedEvents, event)
+	}
+
+	// Check to make sure they were all captured
+	require.Equal(s.T(), expected, committedEvents)
+}
+
+func (s *DynamoEventsIntegrationSuite) Test_Load_WithSnapshot() {
+	ctx := context.Background()
+
+	s.SetupAggregate(evt.EntityID(newID()), 2)
+
+	metadata := s.getMetadata(ctx)
+
+	updatedValue := "updated-value"
+	intermediateOther := "intermediate-other-value"
+	updatedOther := "updated-other-value"
+	otherValue := "test-other-value"
+
+	result, err := s.aggregate.Handle(ctx, &test.CreateAggregate{
+		Value: "test-value",
+		Other: &otherValue,
+	})
+	require.NoError(s.T(), err)
+
+	updateValueResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
+		Value: updatedValue,
+		Other: &otherValue,
+	})
+	require.NoError(s.T(), err)
+
+	result.Events = append(result.Events, updateValueResult.Events...)
+
+	// Set "other" to an intermediate value
+	updateOtherResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
+		Value: updatedValue,
+		Other: &intermediateOther,
+	})
+	require.NoError(s.T(), err)
+
+	result.Events = append(result.Events, updateOtherResult.Events...)
+
+	s.applyEvents(result.Events)
+	_, err = s.store.Commit(ctx, result, s.cc, metadata)
+	require.NoError(s.T(), err)
+
+	// Set "other" to the final expected value
+	newResult, err := s.aggregate.Handle(ctx, &test.ReplaceAggregate{
+		Value: updatedValue,
+		Other: &updatedOther,
+	})
+	require.NoError(s.T(), err)
+
+	// This sequence of events should leave 1 trailing event after the last snapshot
+	s.applyEvents(newResult.Events)
+	_, err = s.store.Commit(ctx, newResult, s.cc, metadata)
+	require.NoError(s.T(), err)
+
+	// Load the entity again to retrieve events from memory
+	s.SetupAggregate(s.entityID, 2)
+
+	// The hydrated entity should have the updated values
+	require.EqualValues(s.T(), test.Aggregate{
+		ID:    s.aggregate.ID,
+		Value: "updated-value",
+		Other: &updatedOther,
+	}, *s.aggregate)
+}

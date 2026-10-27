@@ -12,7 +12,7 @@
 //! same conditional write that updates the feature set, so every writer cached at the old version
 //! fails its condition, re-validates, and refuses when the feature is not one it models.
 //!
-//! See `docs/spec/storage-format.md` ("Reserved Namespaces", "Feature Marker") for the stored
+//! See `docs/reference/storage-format.md` ("Reserved Namespaces", "Feature Marker") for the stored
 //! shapes; the manifest's JSON encoding is byte-identical across languages.
 
 use std::collections::{BTreeMap, BTreeSet};

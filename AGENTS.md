@@ -25,10 +25,10 @@
 
 ## Repository Identity
 
-- This repo is `evt`, a Go event-sourcing framework published as `github.com/photon-grove/evt`.
-- It contains Go framework packages, a native Rust crate (`photon-evt`, `crates/evt`) that shares the
-  Go storage format, a Vite docs app, a React diagram package, local Terraform for
-  DynamoDB-compatible integration tests, and public documentation.
+- This repo is `evt`, a Go event-sourcing framework published as `github.com/photon-grove/evt/go`.
+- It contains the Go module (`go/`), native Rust crates (`crates/`) that share the Go storage
+  format, a Vite docs site (`website/`), a React diagram package (`packages/`), local Terraform
+  for integration tests (`infra/`), and the docs (`docs/`).
 - The project is intentionally public-safe: examples should use neutral names, local emulator
   credentials, and no private application environment details.
 - Verify the remote if uncertain: `git remote get-url origin`.
@@ -41,12 +41,9 @@
 - Event logs are append-only and retained in full by default. Compaction
   (`evt.Compactor.CompactBelow`) may delete events only where a durable snapshot already covers them
   (`snapshot.EventSequence >= throughSequence`); it must never delete the `sk=0` snapshot. After a
-  stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedEntity` /
+  stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedAggregate` /
   `evt.SnapshotStreamer`), never full-replay-from-1. See
   `docs/adr/0001-event-compaction-and-snapshot-truncation.md`.
-- The raw `dynamo.Delete` is snapshot-unsafe and for local/staging fixtures only. It is guarded by
-  `//go:build !prod`; production builds must use `-tags prod` (released binaries already do). Prefer
-  `CompactBelow` for any principled truncation.
 - Do not persist mutable decisions, external signals, publish flags, accept/reject verdicts, or
   review state directly to a view table with no backing event.
 - DynamoDB event-log key patterns must stay stable. Preserve the documented `pk`/`sk`, inline
@@ -54,29 +51,35 @@
 - Avoid table scans except for explicit migration, rebuild, or diagnostic flows.
 - When event JSON changes, add or update upcasters and fixture coverage so older stored events
   remain readable.
-- Go and Rust share one storage format (`docs/spec/storage-format.md`). Any change to it must
-  regenerate `compat/fixtures` (`go test ./internal/compat -run TestFixtures -update`), pass in both
+- Go and Rust share one storage format (`docs/reference/storage-format.md`). Any change to it must
+  regenerate `compat/fixtures` (`go -C go test ./internal/compat -run TestFixtures -update`), pass in both
   languages, and pass `scripts/compat-integration.sh dynamo|postgres`. Never hand-edit fixtures.
   The exception is a Rust-first extension's fixtures (ADR 0005): Rust generates them,
   `compat/fixtures/journal.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test
   journal_fixtures` and `compat/fixtures/lambda.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p
   photon-evt-lambda --all-features --test fixtures`.
-- Update documentation when behavior changes, especially `README.md`, `BEHAVIORAL_INVARIANTS.md`,
-  and relevant files under `docs/`.
+- Update documentation when behavior changes: the README of the unit you changed (`README.md`,
+  `go/README.md`, `crates/*/README.md`), `docs/guide/`, `docs/reference/storage-format.md` (normative),
+  and `docs/internal/behavioral-invariants.md`.
 
 ## Codebase Patterns
 
 - Structure:
-  - Root Go module: core `evt` package and support packages such as `dynamo`, `postgres`, `mem`,
-    `snapshots`, `projectors`, `publishers`, `viewstore`, and `test`.
-  - `website/`: Vite documentation site.
+  - `go/`: the Go module (`github.com/photon-grove/evt/go`, package `evt`). Run Go commands from
+    there. The backends are `go/backends/dynamo`, `go/backends/postgres` and `go/backends/mem`, and
+    the other packages sit beside them: `snapshots`, `projectors`, `viewcodec`, `test` and so on.
+  - `website/`: Vite documentation site. It renders `docs/**/*.md` except `docs/internal/`, and
+    `website/src/docs.ts` (`DOC_CONFIG`) orders and groups the pages.
+  - `docs/`: `guide/` (how-tos), `reference/` (storage format, feature matrix), `adr/` (decisions,
+    kept as history), `internal/` (process notes, behavioral invariants). Plan and epic IDs
+    (K1, C3, X2 and so on) belong only in `adr/` and `internal/`, never in user-facing prose.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
   - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
-  - `examples/`: public examples; keep names and scenarios neutral.
+  - `go/examples/`: public examples; keep names and scenarios neutral.
   - `crates/evt` (`photon-evt`): the Rust crate. `crates/evt-lambda` (`photon-evt-lambda`): its
     DynamoDB Streams / Lambda helpers (ADR 0005, X3). `crates/evt-compat` (unpublished) and
-    `internal/compat` (Go) are the two halves of the compatibility harness. `compat/` holds the
+    `go/internal/compat` (Go) are the two halves of the compatibility harness. `compat/` holds the
     shared scenarios and generated fixtures.
 - Rust:
   - Keep the core dependency-light (serde, serde_json, thiserror); SDKs stay behind the `dynamodb`
@@ -104,12 +107,12 @@
 
 - Package manager: `pnpm` 10.x.
 - Node: 24.x, with Moon configured around Node `~24.5`.
-- Go toolchain: Go 1.26.4 via `go.mod`.
+- Go toolchain: Go 1.26.4 via `go/go.mod`.
 - Rust toolchain: 1.99.0 via `rust-toolchain.toml` (crate MSRV 1.88, `rust-version` in `Cargo.toml`,
   checked in CI without the `dynamodb` feature, which follows the AWS SDK's MSRV).
 - Common commands:
   - Install dependencies: `pnpm install`
-  - Go tests: `go test ./...`
+  - Go tests (from `go/`): `go test ./...`
   - Moon tests: `pnpm exec moon run evt:test`
   - Go vet/check: `pnpm exec moon run evt:check`
   - Go lint (golangci-lint, must report zero findings): `pnpm exec moon run evt:lint`
@@ -142,20 +145,19 @@
 - CI runs on ARM64 Ubuntu runners (`ubuntu-24.04-arm`).
 - Use upstream `actions/cache` (currently `@v6`); do not introduce archived cache forks.
 - CI quality checks include:
-  - `go mod tidy` with no `go.mod`/`go.sum` diff.
-  - `go vet ./...`
-  - `go test ./...`
+  - From `go/`: `go mod tidy` with no `go.mod`/`go.sum` diff, `go vet ./...` and `go test ./...`.
   - `pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build react-flow-diagrams:test`
   - `pnpm exec moon run evt-rust:check evt-rust:test` (Rust job)
 - CI integration checks start Moto or PostgreSQL, apply the local Terraform, and run
   `evt:integration` / `evt:integration-postgres`, plus `evt-rust:integration` /
   `evt-rust:integration-postgres` when the storage format may have changed.
 - A `changes` job classifies changed paths: Rust-only changes skip Go jobs and Go-only changes skip
-  the Rust job. Keep its path lists in `.github/workflows/ci.yml` in sync when adding directories.
+  the Rust job. Keep its path lists in `.github/workflows/ci.yml` in sync when adding directories. Go lives
+  under `go/`, and the release tags are `go/vX.Y.Z`.
 - Before staging, inspect dependency and workspace churn:
 
   ```sh
-  git diff -- go.mod go.sum '**/package.json' pnpm-lock.yaml Cargo.lock
+  git diff -- go/go.mod go/go.sum '**/package.json' pnpm-lock.yaml Cargo.lock
   ```
 
 - Revert unrelated churn introduced by tooling unless it is required by the change.
@@ -206,9 +208,9 @@ changed file). Severities: **P0** = must fix before merge; **P1** = should fix; 
 - **P0** — flag storage-format changes (DynamoDB items, PostgreSQL rows, serialized JSON, stream
   envelopes, snapshot policy) that do not regenerate `compat/fixtures` and update both the Go and
   Rust implementations, or that change the documented Go/Rust differences without updating
-  `docs/spec/storage-format.md`.
+  `docs/reference/storage-format.md`.
 - **P1** — flag new behavior without test coverage, and documentation a change makes stale
-  (especially `README.md`, `BEHAVIORAL_INVARIANTS.md`, and `docs/`).
+  (the READMEs, `docs/guide/`, `docs/reference/`, and `docs/internal/behavioral-invariants.md`).
 - **P1** — flag accidental breaks to existing exported package contracts.
 - Do not report issues in generated code or lockfiles, and do not re-flag anything CI already
   enforces (`go vet`, formatting/lint, `go mod tidy`). This is a public repo: also flag any private

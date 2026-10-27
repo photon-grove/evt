@@ -41,7 +41,7 @@
 //! # });
 //! ```
 //!
-//! See `docs/spec/storage-format.md` ("Rebuild Fence", "Rebuild lifecycle API", "Rebuild view
+//! See `docs/reference/storage-format.md` ("Rebuild Fence", "Rebuild lifecycle API", "Rebuild view
 //! writes", "Rebuild epochs") for the stored shapes and the exact requests.
 
 use std::fmt;

@@ -1,11 +1,11 @@
 import {humanizeSlug, titleFromMarkdown} from './markdown'
 
-// Every Markdown guide under the repo-root docs/ directory, bundled as a raw string at build time.
+// Every Markdown guide under the repo-root docs/ directory (except docs/internal/), bundled as a raw string at build time.
 // Vite's import.meta.glob keeps these in sync automatically — adding a docs/*.md file surfaces it on
 // the site with no code change (its title comes from the first H1, its place from DOC_CONFIG below).
 const DOCS_PREFIX = '../../docs/'
 
-const rawDocs = import.meta.glob('../../docs/**/*.md', {
+const rawDocs = import.meta.glob(['../../docs/**/*.md', '!../../docs/internal/**'], {
   query: '?raw',
   import: 'default',
   eager: true,
@@ -32,53 +32,71 @@ interface DocConfig {
 }
 
 const GUIDES = 'Guides'
+const REFERENCE = 'Reference'
 const ADRS = 'Architecture decisions'
 
 // Ordering, grouping, and index blurbs for the known docs. Unknown docs still appear (sorted last);
 // ADRs are grouped automatically by their adr/ path prefix.
 const DOC_CONFIG: Record<string, DocConfig> = {
-  'getting-started': {
+  'guide/getting-started': {
     group: GUIDES,
     order: 1,
-    summary: 'Model an aggregate, commit events, and read it back — in memory first, then DynamoDB.',
+    summary: 'Model an aggregate, commit events and read it back, in memory first and then on DynamoDB.',
   },
-  concepts: {
+  'guide/concepts': {
     group: GUIDES,
     order: 2,
-    summary: 'Events, entities, snapshots, projections, and framework invariants.',
+    summary: 'Aggregates, commands, events, snapshots, projections and the rules that tie them together.',
   },
-  projections: {
+  'guide/projections': {
     group: GUIDES,
     order: 3,
-    summary:
-      'Rebuild views from the log with scan-based streaming and snapshot-aware seeds.',
+    summary: 'Rebuild views from the log, fence rebuilds against live writers, and write cross-entity views in the commit\'s own transaction.',
   },
-  streams: {
+  'guide/streams': {
     group: GUIDES,
     order: 4,
-    summary:
-      'DynamoDB Streams projectors with idempotency and retry classification (SNS fan-out is deprecated in v0.9.0).',
+    summary: 'Read the DynamoDB Stream with idempotent projectors, skip head items, and publish onward from your own handler.',
   },
-  dynamodb: {
+  'guide/dynamodb': {
     group: GUIDES,
     order: 5,
-    summary: 'The single-table event-log layout, key patterns, and conditional-write ordering.',
+    summary: 'The single-table event log, what a commit sends, and the snapshot, compaction and retention options.',
   },
-  postgres: {
+  'guide/postgres': {
     group: GUIDES,
     order: 6,
-    summary: 'The relational event-log schema, optimistic concurrency, and snapshot-aware compaction.',
+    summary: 'The relational schema, the engine tables EnsureSchema creates, and view writers that enforce row owners.',
   },
-  'integration-cookbook': {
+  'guide/commands': {
+    group: GUIDES,
+    order: 9,
+    summary: 'Durable command outcomes, rejections that carry events, and fence-aware retry.',
+  },
+  'guide/upgrading-to-v0.9': {
+    group: GUIDES,
+    order: 10,
+    summary: 'What v0.9 removed, what breaks at compile time, and what a custom repository must honor.',
+  },
+  'guide/integration': {
     group: GUIDES,
     order: 7,
-    summary: 'Copy-ready patterns for adopters: rebuilds, dedup, schema evolution, and local testing.',
+    summary: 'Integration rules and the reasons behind them: rebuilds, retry keys, schema evolution and local testing.',
   },
-  'migrating-to-stream-heads': {
+  'guide/migrating-to-stream-heads': {
     group: GUIDES,
     order: 8,
-    summary:
-      'Runbook for moving a v0.8 store to per-stream head items: stop, back up, backfill, verify, declare.',
+    summary: 'The runbook for moving a v0.8 store to per-stream head items: stop writers, back up, backfill, verify, declare.',
+  },
+  'reference/storage-format': {
+    group: REFERENCE,
+    order: 20,
+    summary: 'The normative byte-level format that Go and Rust both read and write.',
+  },
+  'reference/feature-matrix': {
+    group: REFERENCE,
+    order: 21,
+    summary: 'Which features each language implements today.',
   },
 }
 

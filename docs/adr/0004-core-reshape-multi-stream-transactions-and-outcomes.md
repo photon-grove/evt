@@ -6,7 +6,7 @@ Accepted (2026-10-13). Capabilities C1–C11 of the vNext plan: the core reshape
 transactions, read fences, command outcomes, rejections, fence-aware retry, metadata additions,
 commit-wide projectors, `latest(n)` and reserved namespaces, the feature marker, the rebuild
 fence, and shared conformance. Tracking:
-[`docs/parity/feature-matrix.md`](../parity/feature-matrix.md).
+[`docs/reference/feature-matrix.md`](../reference/feature-matrix.md).
 
 _Amended by [ADR 0007](0007-per-stream-head-item.md): a per-stream head item replaces the
 continuation check, the floor check, and the fence's snapshot companion in C1 and C2._
@@ -26,17 +26,17 @@ hand:
 Meanwhile the framework itself only executes one aggregate per commit:
 
 - Go: `evt.Repository.Commit` takes a single entity's `SerializedResult`
-  ([`repository.go`](../../repository.go)); `CommitStream` batches many single-entity commits, but
-  each is its own transaction ([`dynamo/commit.go`](../../dynamo/commit.go)).
+  ([`repository.go`](../../go/repository.go)); `CommitStream` batches many single-entity commits, but
+  each is its own transaction ([`go/backends/dynamo/commit.go`](../../go/backends/dynamo/commit.go)).
 - Rust: `photon_evt::repository::Commit::new(entity_id, events)` is likewise single-entity
   ([`crates/evt/src/repository.rs`](../../crates/evt/src/repository.rs)).
 
 At the same time the duplicate-command check only covers events replayed since the latest snapshot
 (`Loaded::has_seen`, `crates/evt/src/store.rs`; the dedupe window is documented in
-[`docs/spec/storage-format.md`](../spec/storage-format.md)), so a command whose first attempt also
+[`docs/reference/storage-format.md`](../reference/storage-format.md)), so a command whose first attempt also
 wrote a snapshot can run twice. Rebuilds have no fence: a rebuild and a live writer can interleave
 unchecked. And retry is blind: `policy.ExecuteWithRetry` (Go,
-[`policy/commit.go`](../../policy/commit.go)) and `execute_with_retry` (Rust,
+`policy/commit.go`) and `execute_with_retry` (Rust,
 `crates/evt/src/store.rs`) re-run the whole command on every conflict, even though a conflict on a
 fence the engine filled — rather than a fence the command read — means the command's decision is
 still valid.
@@ -56,11 +56,11 @@ v0.9.0) and Rust (`photon-evt` 0.2), in the same release window, behind the same
 Per plan decision D1 (the commit path and the storage contract are dual-language obligations),
 anything in the commit path or storage contract lands in **both** languages:
 
-- Go generates the core golden fixtures (`go test ./internal/compat -run TestFixtures -update`),
+- Go generates the core golden fixtures (`go -C go test ./internal/compat -run TestFixtures -update`),
   as it does today.
 - Both implementations run the shared conformance suite, extended to cover C1–C10, and both pass
   the live interleaved cross-language run (`scripts/compat-integration.sh dynamo|postgres`).
-- The spec ([`docs/spec/storage-format.md`](../spec/storage-format.md)) gains byte-level examples
+- The spec ([`docs/reference/storage-format.md`](../reference/storage-format.md)) gains byte-level examples
   for every new item shape before either implementation ships.
 
 Single-aggregate execution stays: Go's `Store`/`Execute` and Rust's `Store::execute` remain the
@@ -69,7 +69,7 @@ shortcut over the general transaction, not a second code path.
 ### C1 — Multi-stream transactions
 
 **Current state.** Go commits one entity per `Commit` call; `CommitStream` flushes batches of
-independent single-entity transactions (`dynamo/commit.go`). Rust's `Commit` builder carries one
+independent single-entity transactions (`go/backends/dynamo/commit.go`). Rust's `Commit` builder carries one
 entity's events (`crates/evt/src/repository.rs`). A command that must append to two aggregates —
 claiming a unique handle while updating the owning profile, where `user#<subject>` and
 `username#<handle>` change together — cannot commit atomically today.
@@ -131,7 +131,7 @@ included: any store instance can snapshot the stream and `CompactBelow` compacts
 durable snapshot covers, so no interval configuration durably disables compaction (E1.1 pins the
 exact rule). Each bills as a write and
 counts toward the 100-item limit, like the existing floor check
-([`dynamo/commit.go`](../../dynamo/commit.go), `buildFloorChecks`). A `ConditionalCheckFailed` on a
+([`go/backends/dynamo/commit.go`](../../go/backends/dynamo/commit.go), `buildFloorChecks`). A `ConditionalCheckFailed` on a
 fence is a conflict (another writer moved the stream), classified and retried like an event-put
 conflict. PostgreSQL fences cannot rely on row locks: the slot at `head + 1` does not exist at fence time,
 and `SELECT … FOR KEY SHARE` locks only rows that were actually returned, so it cannot protect an
@@ -247,7 +247,7 @@ read). See the storage spec's Command Outcomes section.
 ### C4 — Rejections
 
 **Current state.** Go's command errors are ad-hoc sentinel types (`NotFoundError`,
-`BadCommandError`, `BadEventError` in [`errors.go`](../../errors.go)); Rust commands return their
+`BadCommandError`, `BadEventError` in [`errors.go`](../../go/errors.go)); Rust commands return their
 own `Aggregate::Error`. Neither is durable, and neither survives a retry — the caller of a retried
 command cannot know why the first attempt failed.
 
@@ -333,7 +333,7 @@ change; the storage spec's "Identity digest" and "Fence-aware retry" sections pi
 ### C6 — Metadata: `principalId`, `causationId`, `extensions`
 
 **Current state.** `Metadata` is `commandId`, `trace`, `origin`, `address`, `region`, `timestamp`
-([`metadata.go`](../../metadata.go); Rust `crates/evt/src/metadata.rs`; spec "Metadata").
+([`metadata.go`](../../go/metadata.go); Rust `crates/evt/src/metadata.rs`; spec "Metadata").
 
 **Decision.** Three additions:
 
@@ -359,9 +359,9 @@ options. Rust: `Metadata::with_principal_id`, `with_causation_id`, `with_extensi
 ### C7 — Commit-wide projectors
 
 **Current state.** Projectors are per-entity and puts-only: Go's `EventProjector.Project(ctx,
-entity, events)` runs per entity ([`types.go`](../../types.go)) and its `TransactionGroup` merges
-view puts into the commit ([`dynamo/view_projector.go`](../../dynamo/view_projector.go)); errors go
-through `TransactionGroup.HandleError` ([`transactions.go`](../../transactions.go)), which sees
+entity, events)` runs per entity ([`types.go`](../../go/types.go)) and its `TransactionGroup` merges
+view puts into the commit ([`go/backends/dynamo/view_projector.go`](../../go/backends/dynamo/view_projector.go)); errors go
+through `TransactionGroup.HandleError` ([`transactions.go`](../../go/transactions.go)), which sees
 only its own group. Rust's `Projector` trait is likewise per-aggregate
 (`crates/evt/src/aggregate.rs`), and the DynamoDB `ViewProjector` writes exactly one `VIEW` row
 per entity at `pk = {entityType}#{entityId}` (spec "Views"). Cross-entity views — a projection
@@ -391,7 +391,7 @@ stands ([ADR 0006](0006-parity-policy-and-feature-cuts.md)). C7 on PostgreSQL th
 backend executes the projector's operations inside the commit transaction, as the Rust backend
 already does with `PgStatement` ([`crates/evt/src/postgres.rs`](../../crates/evt/src/postgres.rs));
 the Go PostgreSQL backend today ignores `res.Transaction`
-([`postgres/repository.go`](../../postgres/repository.go)), so this is new backend work — a
+([`go/backends/postgres/repository.go`](../../go/backends/postgres/repository.go)), so this is new backend work — a
 view-row execution path, not a port of an existing one. _Errata (E1.1):_ the spec pins the
 **current-state contract**: a commit-wide projector's rows are a deterministic function of the
 commit's events plus the post-commit aggregate states, and every commit-wide projector implements
@@ -439,7 +439,7 @@ history-dependent registration check are part of the rebuild ports (P4).
 **Current state.** Go has `GetEvents`/`GetLatestEvents(lastSequence)` — unbounded, and
 "latest" is a floor, not a count (`repository.go`). Rust has `events`/`events_after`
 (`crates/evt/src/repository.rs`). Enumeration (`StreamAllEvents`, `StreamEntities`) and the heads
-scan (`dynamo/heads.go`, `entity_heads` in Rust) read **every** partition, so today a global
+scan (`go/backends/dynamo/heads.go`, `entity_heads` in Rust) read **every** partition, so today a global
 outcome stream would pollute enumerations, heads, and rebuilds.
 
 **Decision.**
@@ -508,7 +508,7 @@ refusals hold across independently configured instances; in-memory-only declarat
 ### C10 — Rebuild fence
 
 **Current state.** Rebuilds are unconstrained: `RebuildProjections`
-([`rebuild.go`](../../rebuild.go)) runs whenever a job feels like it, and a live writer can commit
+([`rebuild.go`](../../go/rebuild.go)) runs whenever a job feels like it, and a live writer can commit
 while the rebuild replays, interleaving projector output. A downstream service fences rebuilds by
 hand with a writers-quiesced flag passed through its call graph — a promise, not a fence.
 
@@ -578,7 +578,7 @@ The rows live in the reserved `SYSTEM#` namespace (C8), skipped by enumeration a
 PostgreSQL the same rows are table rows checked in the commit transaction.
 
 **Implementation (E2.7/E3.7).** The decision above is implemented in both languages on every
-backend; the storage spec's [Rebuild Fence](../spec/storage-format.md#rebuild-fence) is normative
+backend; the storage spec's [Rebuild Fence](../reference/storage-format.md#rebuild-fence) is normative
 and pins the bytes. What the decision left open:
 
 - The commit-time check sits at action 2 of every commit, after the marker check, and costs one
@@ -602,7 +602,7 @@ and pins the bytes. What the decision left open:
 **Current state.** Each backend runs its own conformance suite (`conformance.RunRepositorySuite`
 in Go; `photon_evt::conformance::Suite` in Rust), and the cross-language fixtures cover
 serialization and the scenario set in `compat/scenarios.json` (see
-[`compat/README.md`](../../compat/README.md)). Bespoke in-app stores never shared a suite — the
+[`compat/README.md`](https://github.com/photon-grove/evt/blob/main/compat/README.md)). Bespoke in-app stores never shared a suite — the
 gap this aims to close permanently.
 
 **Decision.** The conformance suites (both languages) grow cases for every capability above:
@@ -649,7 +649,7 @@ core golden fixtures as today. The suite, not the ADR, is the executable contrac
   collide with entity IDs. Entity IDs beginning with these prefixes are rejected at commit, and
   pre-existing streams in a reserved namespace must be renamed (migrated) before enabling the
   v0.9 features — `evt-doctor` reports them (C8), so no stored data is silently skipped.
-- **Spec and fixtures first.** No code lands before `docs/spec/storage-format.md` carries the
+- **Spec and fixtures first.** No code lands before `docs/reference/storage-format.md` carries the
   byte-level shapes (plan E1.1); both implementations then pass the regenerated fixtures and the
   shared conformance suite.
 

@@ -1,29 +1,35 @@
 # photon-evt-lambda
 
-AWS Lambda helpers for [`photon-evt`](../evt) on DynamoDB: the consumer side of an event log
-([ADR 0005](../../docs/adr/0005-rust-first-extensions-journal-and-lambda.md), X3).
-
-- **Event decode.** `decode_event` reads the committed events from an event-log table's stream
-  (`NEW_IMAGE`). The engine's own items are skipped: stream heads (`sk = -1`), snapshots (`sk = 0`),
-  the feature marker and rebuild fence (`SYSTEM#…`), and command outcomes (`command-outcome#…`).
-- **Filter patterns.** `EventFilter` and `JournalFilter` write event source mapping filter patterns
-  by event type, entity type, or journal scope. `matches` applies the same test in the handler.
-- **Journal wake-ups** (feature `journal`). `decode_wakeup` reads a views-table stream record
-  (`KEYS_ONLY` is enough) and returns the journal scope to read.
-- **Partial batch failures.** `process_events`, `process_wakeups` and `process_records` process a
-  batch in order, stop at the first failure, and return the `batchItemFailures` response that
-  Lambda resumes from.
-
-The crate has no Lambda runtime or AWS SDK dependency. `StreamEvent` deserializes from the payload
-Lambda delivers, and `BatchResponse` serializes to the response Lambda expects. You can wire both
-into `lambda_runtime` or any other runtime. Item images are DynamoDB JSON, decoded with the same
-`photon_evt::wire::dynamo` codecs the repositories use.
+This crate is the consumer side of a [`photon-evt`](https://crates.io/crates/photon-evt) event log on
+AWS Lambda. It reads the DynamoDB Streams records an event-log table (or its views table) produces,
+writes the event source mapping filter patterns that keep unrelated records from invoking your
+function, and builds the partial batch failure response Lambda resumes from. The design is in
+[ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md).
 
 ```toml
 [dependencies]
 # Add features = ["journal"] for journal wake-ups.
 photon-evt-lambda = "0.1"
 ```
+
+There is no Lambda runtime or AWS SDK dependency. `StreamEvent` deserializes from the payload Lambda
+delivers and `BatchResponse` serializes to the response it expects, so you can wire both into
+`lambda_runtime` or anything else. Item images are DynamoDB JSON, decoded with the same
+`photon_evt::wire::dynamo` codecs the repositories use.
+
+The pieces are small. `decode_event` reads the committed events from an event-log table's stream
+(`NEW_IMAGE`) and skips the engine's own items: stream heads (`sk = -1`), snapshots (`sk = 0`), the
+feature marker and rebuild fence (`SYSTEM#…`), and command outcomes (`command-outcome#…`).
+`EventFilter` and `JournalFilter` write filter patterns by event type, entity type or journal scope,
+and `matches` applies the same test in the handler. With the `journal` feature, `decode_wakeup`
+reads a views-table stream record (`KEYS_ONLY` is enough) and returns the journal scope to read.
+And `process_events`, `process_wakeups` and `process_records` run a batch in order, stop at the
+first failure, and return the `batchItemFailures` response.
+
+The guide's [streams page](https://github.com/photon-grove/evt/blob/main/docs/guide/streams.md) covers the event-log stream from the Go side
+too, and the [storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md) pins every item these decoders
+read. Releases are tagged `photon-evt-lambda-vX.Y.Z` and published to crates.io, separately from
+`photon-evt`.
 
 ## Projectors and fan-out
 
@@ -65,32 +71,33 @@ on `streamed.event` before you decode its payload.
 
 These rules assume `FunctionResponseTypes: ["ReportBatchItemFailures"]` on the mapping.
 
-- Records go to the handler in stream order, one at a time. The first record that fails stops the
-  batch, whether it failed to decode or the handler returned an error. The response reports that
-  record's `SequenceNumber`.
-- Lambda checkpoints before the lowest reported sequence number. It treats the earlier records as
-  done and delivers the failed record, and every record after it, again. The helpers do not attempt
-  the later records: they come back behind the failed one, so per-item order holds.
-- **Handlers must be idempotent.** The failed record, and any record after it, can be delivered
-  more than once. A handler that failed halfway can also have run some of its side effects already.
-  Key event handlers on the event ID (`StreamedEvent::idempotency_key`). Key projectors on the last
-  sequence they applied per stream.
-- A record that does not decode is never skipped. It fails the batch like a handler error. Set
-  `MaximumRetryAttempts` (or `MaximumRecordAgeInSeconds`) and an on-failure destination on the
-  mapping. Otherwise a poison record stops its shard until it ages out of the stream. For a stream
-  source, the on-failure destination receives the batch's shard and sequence-number range, not the
-  records, so replaying from it means reading the stream or the table again.
-- An empty `itemIdentifier` makes Lambda fail the whole batch. That is the response for a record
-  with no sequence number. Without `ReportBatchItemFailures`, Lambda ignores the response, and only
-  a returned error fails (and retries) the batch.
-- `ParallelizationFactor` above 1 keeps order per partition key, which is per stream for event
-  items.
+Records go to the handler in stream order, one at a time, and the first record that fails stops
+the batch, whether it failed to decode or the handler returned an error. The response reports that
+record's `SequenceNumber`. Lambda checkpoints before the lowest reported sequence number, treats
+the earlier records as done, and delivers the failed record and every record after it again. The
+helpers don't attempt the later records, so they come back behind the failed one and per-item
+order holds.
+
+So handlers must be idempotent. The failed record and anything after it can arrive more than once,
+and a handler that failed halfway may already have run some of its side effects. Key event
+handlers on the event ID (`StreamedEvent::idempotency_key`), and key projectors on the last
+sequence they applied per stream.
+
+A record that doesn't decode is not skipped. It fails the batch like a handler error, so set
+`MaximumRetryAttempts` (or `MaximumRecordAgeInSeconds`) and an on-failure destination on the
+mapping, or a poison record stops its shard until it ages out of the stream. For a stream source
+the on-failure destination receives the batch's shard and sequence-number range, not the records,
+so replaying from it means reading the stream or the table again. An empty `itemIdentifier` makes
+Lambda fail the whole batch, and that's the response for a record with no sequence number. Without
+`ReportBatchItemFailures` Lambda ignores the response, and only a returned error fails (and
+retries) the batch. A `ParallelizationFactor` above 1 keeps order per partition key, which is per
+stream for event items.
 
 ## Journal wake-ups
 
-The [sync journal](../evt/README.md#the-sync-journal) (X1) writes its rows (`journal#<scope>`,
+The [sync journal](https://docs.rs/photon-evt/latest/photon_evt/#the-sync-journal) writes its rows (`journal#<scope>`,
 20-digit position) and counters (`journal-counter#<scope>`, `COUNTER`) as view rows. They go in
-the repository's **views table**, in the same transaction as the events. A consumer that wakes on
+the repository's views table, in the same transaction as the events. A consumer that wakes on
 journal writes does three things:
 
 1. Turns on the views table's stream. `KEYS_ONLY` is enough: wake-ups decode from the keys, so any
@@ -119,7 +126,7 @@ assert!(rows.pattern().is_ok());
 # }
 ```
 
-A stream record is a **wake-up, not a delivery**. DynamoDB Streams orders records per item, not
+A stream record is a wake-up, not a delivery. DynamoDB Streams orders records per item, not
 per scope, and a batch can hold several records of one scope. `process_wakeups` merges them into
 one call per scope, with the highest position seen. The handler reads the page, and the page is
 ordered and reports gaps. A redelivered or merged wake-up only costs a read that finds nothing new,
@@ -129,46 +136,36 @@ retries. Removals (a compaction deleting rows) are not wake-ups, and neither are
 journal's partitions: `decode_wakeup` never fails, so no views-table record can stop a shard, and a
 corrupt journal shows up where it is read, in the page.
 
-**A wake-up can be lost.** A failed scope blocks the scopes behind it in its shard until it
+A wake-up can be lost. A failed scope blocks the scopes behind it in its shard until it
 succeeds, and when the mapping's retries run out (`MaximumRetryAttempts`,
 `MaximumRecordAgeInSeconds`), Lambda moves past the batch. The scopes it named are then read only
 on their next write. Two things keep that from mattering:
 
-- **Retry for longer than a rebuild.** Rebuild errors are transient, and the only other failures
-  are the consumer's own. Size the retry budget (or leave it unbounded, `-1`) for the longest
-  rebuild you run, rather than a handful of attempts. The cost is that a scope that keeps failing
-  holds back its shard for as long: the sample below allows a day.
-- **Sweep.** A consumer that must not fall behind a quiet scope also reads its scopes from their
-  cursors on a schedule, the same read a wake-up triggers. Wake-ups make the consumer prompt; the
-  sweep makes it complete.
+So size the mapping's retry budget for your longest rebuild, or leave it unbounded (`-1`), since
+rebuild errors are transient and the only other failures are the consumer's own. The cost is that
+a scope that keeps failing holds back its shard that long, and the sample below allows a day. A
+consumer that can't fall behind a quiet scope should also sweep its scopes from their cursors on a
+schedule, which is the same read a wake-up triggers. The sweep catches any wake-up that was lost.
 
-### Why the views-table stream, not a separate journal table
+### Why the views-table stream
 
-This crate supports **one stream on the views table, filtered to the journal's keys**. Two reasons:
+This crate supports one stream on the views table, filtered to the journal's keys. The journal
+already stores its rows and counters there, through the repository's view operations, in the
+commit, under the same owner rules as every other view row. A separate journal table would change
+the commit path and the storage format (a second table in every journaled transaction and in the
+rebuild lock's guarded writes), and it would give consumers nothing the filter doesn't. The event
+source mapping drops non-journal records before invoking the function, and
+`JournalFilter::matches` repeats the test in the handler.
 
-- **X1 already stores the rows there.** The journal writes rows and counters through the
-  repository's view operations, in the commit, under the same owner rules as every other view row.
-  A separate journal table would change the commit path and the storage format (a second table in
-  every journaled transaction and in the rebuild lock's guarded writes). It would gain nothing for
-  consumers that the filter does not already give them.
-- **The filter does the separation.** The event source mapping drops non-journal records before
-  invoking the function. Only journal writes run the consumer, and `JournalFilter::matches` repeats
-  the test in the handler.
+There are costs. The views table has one stream, and its view type is set per table. A wake-up
+consumer works with any view type, so if another consumer of the same table needs images, choose
+`NEW_IMAGE` and both work. Every view write appears in that stream, and every mapping on it reads
+every shard. AWS recommends at most two readers per shard, so keep to two mappings on the views
+table and fan out from a function when more consumers need the wake-ups. Filtered-out records cost
+no invocations. The decoders don't look at the table name (`eventSourceARN`), so the same filters
+and decoders would work unchanged on a dedicated journal table's stream.
 
-The costs, and how to live with them:
-
-- The views table has one stream, and its view type is set per table. A wake-up consumer works
-  with any view type. If another consumer of the same table needs images, choose `NEW_IMAGE` and
-  both work.
-- Every view write appears in that stream, and every mapping on it reads every shard. AWS
-  recommends at most two readers per shard, so keep to two mappings on the views table and fan out
-  from a function when more consumers need the wake-ups. Filtered-out records cost no
-  invocations.
-- The decoders do not look at the table name (`eventSourceARN`). If a dedicated journal table holds
-  the rows later, the same filters and decoders work on its stream unchanged. That is the hook for
-  the alternative.
-
-### Feature `journal` is build-wide
+### The `journal` feature is build-wide
 
 Enabling `journal` here enables `photon-evt`'s `journal` feature. That feature is build-wide (ADR
 0005): every repository in the build then accepts a table that declares the journal. A function
@@ -205,19 +202,17 @@ resource "aws_lambda_event_source_mapping" "journal_wakeups" {
 }
 ```
 
-## Compatibility fixture
+## Compatibility fixture and Rust version
 
 `compat/fixtures/lambda.json` pins the filter patterns, the records the decoders accept, skip, or
 refuse (the event decoder only), the wake-ups they produce, and the batch responses. It is generated by this crate
-(Rust-first, ADR 0005):
+(Rust-first, per ADR 0005):
 
 ```sh
 EVT_UPDATE_FIXTURES=1 cargo test -p photon-evt-lambda --all-features --test fixtures
 ```
 
-## Minimum Rust version
-
-1.88, like `photon-evt`. The batch helpers take async closures (`AsyncFnMut`).
+The minimum Rust version is 1.88, like `photon-evt`. The batch helpers take async closures (`AsyncFnMut`).
 
 ## License
 

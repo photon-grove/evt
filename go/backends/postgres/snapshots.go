@@ -1,0 +1,176 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	evt "github.com/photon-grove/evt/go"
+	"github.com/photon-grove/evt/go/result"
+)
+
+// PutSnapshot advances a durable snapshot without regressing its floor. The shared feature lock
+// is held in the write transaction so an unsupported declaration cannot race the maintenance write.
+//
+// The write also keeps invariant H3 (a snapshot never covers more than the stream's head): under
+// the entity lock the stream's head row must be at least eventSequence, or absent when that is 0.
+// A snapshot ahead of the stream is refused with *evt.StreamHeadDriftError instead of being written
+// (ADR 0007).
+func (repo *Repository) PutSnapshot(
+	ctx context.Context,
+	entityType evt.EntityType,
+	entityID evt.EntityID,
+	payload []byte,
+	snapshotSequence evt.EventSequence,
+	eventSequence evt.EventSequence,
+) error {
+	if err := repo.checkFeatureMarkerTable(); err != nil {
+		return err
+	}
+
+	if err := evt.CheckReservedEntityID(entityID); err != nil {
+		return err
+	}
+
+	if err := repo.ensureStreamHeads(ctx); err != nil {
+		return err
+	}
+
+	return repo.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, entityLockQuery, string(entityID)); err != nil {
+			return classifyWriteError(fmt.Errorf("postgres: lock snapshot: %w", err))
+		}
+
+		if err := repo.checkFeatures(ctx, tx); err != nil {
+			return err
+		}
+
+		if err := repo.guardSnapshotHead(ctx, tx, entityID, eventSequence); err != nil {
+			return err
+		}
+
+		return repo.upsertSnapshot(ctx, tx, evt.SerializedSnapshot{
+			EntityType:    entityType,
+			EntityID:      entityID,
+			Payload:       payload,
+			Sequence:      snapshotSequence,
+			EventSequence: eventSequence,
+		})
+	})
+}
+
+// StreamEntitiesFromSnapshots streams completed entities, seeding each from its durable snapshot and
+// applying only the events recorded after that snapshot. Streams with no snapshot fall back to full
+// replay from sequence 1. entityType, when non-empty, restricts the rebuild to that type. It
+// implements evt.SnapshotStreamer.
+//
+// Each entity is reconstructed from its own partition (per-entity queries), so the result stays
+// correct after compaction has removed events below a snapshot — the snapshot, not event 1, is the
+// authoritative floor.
+func (repo *Repository) StreamEntitiesFromSnapshots(
+	ctx context.Context,
+	entityType evt.EntityType,
+	seedAggregate evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) <-chan result.Result[evt.Aggregate] {
+	channel := make(chan result.Result[evt.Aggregate])
+
+	go func() {
+		defer close(channel)
+
+		ids, err := repo.distinctEntityIDs(ctx, entityType)
+		if err != nil {
+			channel <- result.Err[evt.Aggregate](err)
+			return
+		}
+
+		for _, id := range ids {
+			if ctx.Err() != nil {
+				return
+			}
+
+			aggregate, err := repo.rebuildFromSnapshot(ctx, id, seedAggregate, applyEvent)
+			if err != nil {
+				channel <- result.Err[evt.Aggregate](err)
+				continue
+			}
+
+			if aggregate != nil {
+				channel <- result.Ok(aggregate)
+			}
+		}
+	}()
+
+	return channel
+}
+
+// rebuildFromSnapshot reconstructs a single entity: seed from its snapshot when present and apply
+// only post-snapshot events, otherwise replay every event from sequence 1.
+func (repo *Repository) rebuildFromSnapshot(
+	ctx context.Context,
+	id evt.EntityID,
+	seedAggregate evt.SnapshotSeeder,
+	applyEvent func(context.Context, evt.SerializedEvent, evt.Aggregate) (evt.Aggregate, error),
+) (evt.Aggregate, error) {
+	snapshot, err := repo.GetSnapshot(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		aggregate evt.Aggregate
+		through   evt.EventSequence
+	)
+
+	if snapshot != nil {
+		aggregate, err = seedAggregate(ctx, *snapshot)
+		if err != nil {
+			return nil, err
+		}
+
+		through = snapshot.EventSequence
+	}
+
+	events, err := repo.GetLatestEvents(ctx, id, through)
+	if err != nil {
+		return nil, err
+	}
+
+	return foldAggregate(ctx, events, aggregate, through, applyEvent)
+}
+
+// distinctEntityIDs returns the entity IDs present in the event log or as a snapshot-only entity
+// (events compacted away), narrowed by entityType. Only the IDs are materialized; each entity is
+// rebuilt from its own partition afterward.
+func (repo *Repository) distinctEntityIDs(ctx context.Context, entityType evt.EntityType) ([]evt.EntityID, error) {
+	query := fmt.Sprintf(`
+SELECT DISTINCT entity_id FROM (
+    SELECT entity_id, entity_type FROM %s
+    UNION
+    SELECT entity_id, entity_type FROM %s
+) sources
+WHERE ($1 = '' OR entity_type = $1) AND `+reservedExclusion+`
+ORDER BY entity_id ASC`, repo.eventsTable, repo.snapshotsTable)
+
+	rows, err := repo.db.Query(ctx, query, string(entityType))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list entities: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []evt.EntityID
+	for rows.Next() {
+		var id evt.EntityID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("postgres: scan entity id: %w", err)
+		}
+
+		ids = append(ids, id)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list entities: %w", err)
+	}
+
+	return ids, nil
+}
