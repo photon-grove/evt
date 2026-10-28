@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in evt behaves differently from its docs or spec.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. This repo is public, so please leave out
+        credentials, account IDs, private hostnames and real customer data. Use placeholder
+        values and local emulator endpoints in any reproduction. Report a vulnerability through
+        a [private security advisory](https://github.com/photon-grove/evt/security/advisories/new) instead.
+  - type: dropdown
+    id: implementation
+    attributes:
+      label: Implementation
+      options:
+        - Go (github.com/photon-grove/evt/go)
+        - Rust (photon-evt)
+        - Rust (photon-evt-lambda)
+        - Both Go and Rust (cross-language)
+        - Docs or docs site
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - In-memory
+        - DynamoDB
+        - PostgreSQL
+        - Not backend-specific
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The Go module tag or crate version, e.g. go/v0.9.0 or photon-evt 0.2.0.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The smallest aggregate, command sequence or test that shows the problem. A failing test against the in-memory store is ideal.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors or logs
+      render: text

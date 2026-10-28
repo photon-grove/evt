@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 280" role="img" aria-label="evt: event sourcing for Go and Rust">
+  <title>evt: event sourcing for Go and Rust</title>
+  <rect x="1" y="1" width="958" height="278" rx="22" fill="#0d1424" stroke="rgba(226,232,240,0.12)" stroke-width="1.5"/>
+  <g transform="translate(56 76) scale(1.5)">
+    <rect width="64" height="64" rx="15" fill="#eef2f8"/>
+    <rect x="13" y="15" width="22" height="8" rx="4" fill="#172033" opacity="0.55"/>
+    <rect x="13" y="28" width="30" height="8" rx="4" fill="#172033" opacity="0.8"/>
+    <rect x="13" y="41" width="38" height="8" rx="4" fill="#0f766e"/>
+    <circle cx="51" cy="19" r="5" fill="#f6c453"/>
+  </g>
+  <text x="176" y="150" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="88" font-weight="800" letter-spacing="-3" fill="#eef2f8">evt</text>
+  <text x="180" y="190" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="21" font-weight="600" fill="#a3afc2">Event sourcing for Go and Rust</text>
+  <text x="180" y="218" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="13" fill="#2dd4bf">DynamoDB · PostgreSQL · in-memory</text>
+  <text x="560" y="42" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#eef2f8">event-log</text>
+  <text x="904" y="42" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" fill="rgba(226,232,240,0.5)">append-only</text>
+  <g>
+    <rect x="560" y="56" width="58" height="52" rx="10" fill="#2dd4bf" stroke="#2dd4bf" stroke-width="1.75"/>
+    <text x="589" y="80" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="13" font-weight="700" fill="#0d1424">sk 0</text>
+    <text x="589" y="97" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="9.5" fill="#0d1424" opacity="0.8">snapshot</text></g>
+<g><path d="M622 82h6" stroke="#2dd4bf" stroke-width="2.5" stroke-linecap="round" opacity="0.6"/>
+    <rect x="632" y="56" width="58" height="52" rx="10" fill="#18233a" stroke="rgba(226,232,240,0.4)" stroke-width="1.75"/>
+    <text x="661" y="80" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="13" font-weight="700" fill="#eef2f8">sk 1</text>
+    <text x="661" y="97" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="9.5" fill="rgba(226,232,240,0.5)" opacity="1">event</text></g>
+<g><path d="M694 82h6" stroke="#2dd4bf" stroke-width="2.5" stroke-linecap="round" opacity="0.6"/>
+    <rect x="704" y="56" width="58" height="52" rx="10" fill="#18233a" stroke="rgba(226,232,240,0.4)" stroke-width="1.75"/>
+    <text x="733" y="80" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="13" font-weight="700" fill="#eef2f8">sk 2</text>
+    <text x="733" y="97" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="9.5" fill="rgba(226,232,240,0.5)" opacity="1">event</text></g>
+<g><path d="M766 82h6" stroke="#2dd4bf" stroke-width="2.5" stroke-linecap="round" opacity="0.6"/>
+    <rect x="776" y="56" width="58" height="52" rx="10" fill="#18233a" stroke="rgba(226,232,240,0.4)" stroke-width="1.75"/>
+    <text x="805" y="80" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="13" font-weight="700" fill="#eef2f8">sk 3</text>
+    <text x="805" y="97" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="9.5" fill="rgba(226,232,240,0.5)" opacity="1">event</text></g>
+<g><path d="M838 82h6" stroke="#2dd4bf" stroke-width="2.5" stroke-linecap="round" opacity="0.6"/>
+    <rect x="848" y="56" width="58" height="52" rx="10" fill="#18233a" stroke="rgba(226,232,240,0.4)" stroke-width="1.75"/>
+    <text x="877" y="80" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="13" font-weight="700" fill="#eef2f8">sk 4</text>
+    <text x="877" y="97" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="9.5" fill="rgba(226,232,240,0.5)" opacity="1">event</text></g>
+  <path d="M740 116v30" stroke="#2dd4bf" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="2 6"/>
+  <path d="M734 142l6 8 6-8" fill="none" stroke="#2dd4bf" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="754" y="138" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" fill="rgba(226,232,240,0.5)">project · replay</text>
+  <rect x="604" y="158" width="272" height="88" rx="12" fill="#131c30" stroke="rgba(226,232,240,0.12)" stroke-width="1.5"/>
+  <text x="852" y="173" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10" fill="#2dd4bf">rebuildable</text>
+  <rect x="626" y="178" width="11" height="11" rx="3" fill="#2dd4bf"/>
+    <rect x="647" y="181" width="150" height="5" rx="2.5" fill="rgba(226,232,240,0.18)"/>
+<rect x="626" y="198" width="11" height="11" rx="3" fill="#1d4d49"/>
+    <rect x="647" y="201" width="118" height="5" rx="2.5" fill="rgba(226,232,240,0.18)"/>
+<rect x="626" y="218" width="11" height="11" rx="3" fill="#1d4d49"/>
+    <rect x="647" y="221" width="136" height="5" rx="2.5" fill="rgba(226,232,240,0.18)"/>
+</svg>
