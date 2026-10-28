@@ -2,17 +2,17 @@
   <a href="https://photon-grove.github.io/evt/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/assets/evt-banner-dark.svg">
-      <img alt="evt: event sourcing for Go and Rust" src="docs/assets/evt-banner-light.svg" width="820">
+      <img alt="evt: event sourcing for Rust and Go" src="docs/assets/evt-banner-light.svg" width="820">
     </picture>
   </a>
 </p>
 
 <p align="center">
   <a href="https://github.com/photon-grove/evt/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/photon-grove/evt/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://pkg.go.dev/github.com/photon-grove/evt/go"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/photon-grove/evt/go.svg"></a>
   <a href="https://crates.io/crates/photon-evt"><img alt="photon-evt on crates.io" src="https://img.shields.io/crates/v/photon-evt?label=photon-evt&amp;logo=rust&amp;color=0f766e"></a>
   <a href="https://docs.rs/photon-evt"><img alt="docs.rs" src="https://img.shields.io/docsrs/photon-evt?label=docs.rs"></a>
   <a href="https://crates.io/crates/photon-evt-lambda"><img alt="photon-evt-lambda on crates.io" src="https://img.shields.io/crates/v/photon-evt-lambda?label=photon-evt-lambda&amp;logo=awslambda&amp;color=0f766e"></a>
+  <a href="https://pkg.go.dev/github.com/photon-grove/evt/go"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/photon-grove/evt/go.svg"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-172033"></a>
 </p>
 
@@ -24,15 +24,15 @@
   <a href="docs/reference/feature-matrix.md">Feature matrix</a>
 </p>
 
-evt is an event-sourcing library for Go, with a native Rust implementation that reads and writes
-the same log. The record of truth is an append-only log of events, and an aggregate's state (an
-account, an order, a document) is whatever you get by folding its events in order. You don't adopt
-a runtime or inherit from a base type. You implement a handful of interfaces and use the packages
+evt is an event-sourcing library for Rust, with a Go module that reads and writes the same log.
+The record of truth is an append-only log of events, and an aggregate's state (an account, an
+order, a document) is whatever you get by folding its events in order. You don't adopt a runtime
+or inherit from a base type. You implement a handful of traits or interfaces and use the pieces
 you need.
 
 Reach for it when the history matters as much as the current state: an audit trail you can trust,
 read models you can delete and rebuild, and retries that never record the same fact twice. Because
-the Go and Rust code share one storage format byte for byte, a Go service and a Rust service can
+the Rust and Go code share one storage format byte for byte, a Rust service and a Go service can
 append to the same streams.
 
 ## Highlights
@@ -45,7 +45,7 @@ append to the same streams.
 | **Durable command outcomes**          | A retried command gets its stored answer, accepted or rejected, instead of running twice. Rejections can carry events of their own.     |
 | **Views derived from events**         | Projectors write read-model rows in the same commit as the events. In Go, `RebuildProjections` replays the log into per-entity views behind a rebuild fence; the Rust port is in progress. |
 | **Snapshots and upcasters**           | Inline snapshots keep loads short, snapshot-verified compaction trims old history, and versioned upcasters let payloads change shape.    |
-| **Go and Rust, wire-compatible**      | Golden fixtures and live interleaved runs keep both languages writing the same bytes. See the [feature matrix](docs/reference/feature-matrix.md). |
+| **Rust and Go, wire-compatible**      | Golden fixtures and live interleaved runs keep both languages writing the same bytes. See the [feature matrix](docs/reference/feature-matrix.md). |
 | **Realtime sync and Lambda (Rust)**   | A per-scope sync journal with gap detection and compaction, and `photon-evt-lambda` for DynamoDB Streams handlers.                       |
 
 ## How a command flows
@@ -72,16 +72,84 @@ behind it, and every row stays a deterministic function of the log.
 [Projections and rebuilds](docs/guide/projections.md) covers what can rebuild views today, and
 [Concepts](docs/guide/concepts.md) walks through each piece.
 
+## Quick start: Rust
+
+```sh
+cargo add photon-evt                      # add --features dynamodb or postgres for a durable backend
+```
+
+An aggregate handles commands and applies events. `domain_events!` declares the event enum with
+its stored type names and versions, and the `Aggregate` trait carries the command, event and error
+types. This counter emits an `Incremented` event for each command, and `MemRepository` runs it
+against an in-memory log, which is what you'd use in tests. Swapping in `DynamoRepository` or
+`PostgresRepository` (behind the `dynamodb` and `postgres` features) changes nothing in the
+aggregate.
+
+```rust
+use photon_evt::{Aggregate, MemRepository, Metadata, Store, domain_events};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Incremented {
+    pub by: i64,
+}
+
+domain_events! {
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum CounterEvent {
+        Incremented(Incremented) => ("counter:incremented", 1),
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Counter {
+    pub total: i64,
+}
+
+impl Aggregate for Counter {
+    const TYPE: &'static str = "counter";
+
+    type Command = i64;
+    type Event = CounterEvent;
+    type Error = std::convert::Infallible;
+    type Services = ();
+
+    async fn handle(&self, by: i64, _: &()) -> Result<Vec<CounterEvent>, Self::Error> {
+        Ok(vec![Incremented { by }.into()])
+    }
+
+    fn apply(&mut self, event: CounterEvent) {
+        match event {
+            CounterEvent::Incremented(e) => self.total += e.by,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Store::<Counter, _>::new(MemRepository::new(), ());
+    let executed = store.execute("counter-1", 2, Metadata::new("us-west-2")).await?;
+    assert_eq!(executed.state.aggregate().total, 2);
+    Ok(())
+}
+```
+
+`Store::execute` loads the stream, runs `handle`, and commits the events in one conditional
+write. If another writer got there first, the commit fails as a conflict. The
+[`photon-evt` README](crates/evt/README.md) covers transactions, command outcomes, the journal and
+testing, and [`photon-evt-lambda`](crates/evt-lambda/README.md) is its AWS Lambda side.
+
 ## Quick start: Go
 
 ```sh
 go get github.com/photon-grove/evt/go
 ```
 
-An aggregate handles commands and applies events. This counter emits an `Incremented` event for
-each `Increment` command, and `mem.NewStore()` runs it against an in-memory log, which is what
-you'd use in tests. Swapping in `dynamo.NewRepository` or `postgres.NewRepository` behind
-`snapshots.NewStore` changes nothing in the aggregate. A DynamoDB table is initialized once at
+The Go module has the same shape. This counter emits an `Incremented` event for each `Increment`
+command, and `mem.NewStore()` runs it against an in-memory log. Swapping in
+`dynamo.NewRepository` or `postgres.NewRepository` behind `snapshots.NewStore` changes nothing in
+the aggregate. A DynamoDB table is initialized once at
 deploy time with `evt-doctor init` (or `repo.Initialize(ctx)`), and writers refuse an
 uninitialized table rather than scan it.
 
@@ -166,82 +234,18 @@ it's what a commit checks against. [`go/examples/banking`](go/examples/banking) 
 version with conflicts and not-found errors, and [`go/README.md`](go/README.md) lists the
 packages. This program runs in CI exactly as written.
 
-## Quick start: Rust
-
-```sh
-cargo add photon-evt                      # add --features dynamodb or postgres for a durable backend
-```
-
-The Rust side has the same shape. `domain_events!` declares the event enum with its stored type
-names and versions, and the `Aggregate` trait carries the command, event and error types.
-
-```rust
-use photon_evt::{Aggregate, MemRepository, Metadata, Store, domain_events};
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Incremented {
-    pub by: i64,
-}
-
-domain_events! {
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum CounterEvent {
-        Incremented(Incremented) => ("counter:incremented", 1),
-    }
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Counter {
-    pub total: i64,
-}
-
-impl Aggregate for Counter {
-    const TYPE: &'static str = "counter";
-
-    type Command = i64;
-    type Event = CounterEvent;
-    type Error = std::convert::Infallible;
-    type Services = ();
-
-    async fn handle(&self, by: i64, _: &()) -> Result<Vec<CounterEvent>, Self::Error> {
-        Ok(vec![Incremented { by }.into()])
-    }
-
-    fn apply(&mut self, event: CounterEvent) {
-        match event {
-            CounterEvent::Incremented(e) => self.total += e.by,
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Store::<Counter, _>::new(MemRepository::new(), ());
-    let executed = store.execute("counter-1", 2, Metadata::new("us-west-2")).await?;
-    assert_eq!(executed.state.aggregate().total, 2);
-    Ok(())
-}
-```
-
-`Store::execute` loads the stream, runs `handle`, and commits the events with the same optimistic
-check the Go store makes. The [`photon-evt` README](crates/evt/README.md) covers transactions,
-command outcomes, the journal and testing, and
-[`photon-evt-lambda`](crates/evt-lambda/README.md) is its AWS Lambda side.
-
 ## Examples
 
 Every example compiles and runs in CI. [The examples page](docs/guide/examples.md) lists them all
 with their run commands.
 
-| Example | Go | Rust |
+| Example | Rust | Go |
 | --- | --- | --- |
-| Banking: commands, conflicts, not-found errors | [`go/examples/banking`](go/examples/banking) | [`banking.rs`](crates/evt/examples/banking.rs) |
-| Todo: a commit-wide projector, its rows replayed from the log | [`go/examples/todo`](go/examples/todo) | [`todo.rs`](crates/evt/examples/todo.rs) |
-| Transfer: two accounts in one commit (Go also replays retries from stored outcomes) | [`go/examples/transfer`](go/examples/transfer) | in [`banking.rs`](crates/evt/examples/banking.rs) |
-| Sync journal: scopes, high watermark, gap-checked paging | — | [`journal.rs`](crates/evt/examples/journal.rs) |
-| Lambda: a DynamoDB Streams batch with partial batch failures | — | [`stream_handler.rs`](crates/evt-lambda/examples/stream_handler.rs) |
+| Banking: commands, conflicts, not-found errors | [`banking.rs`](crates/evt/examples/banking.rs) | [`go/examples/banking`](go/examples/banking) |
+| Todo: a commit-wide projector, its rows replayed from the log | [`todo.rs`](crates/evt/examples/todo.rs) | [`go/examples/todo`](go/examples/todo) |
+| Transfer: two accounts in one commit (the Go version also replays retries from stored outcomes) | in [`banking.rs`](crates/evt/examples/banking.rs) | [`go/examples/transfer`](go/examples/transfer) |
+| Sync journal: scopes, high watermark, gap-checked paging | [`journal.rs`](crates/evt/examples/journal.rs) | — |
+| Lambda: a DynamoDB Streams batch with partial batch failures | [`stream_handler.rs`](crates/evt-lambda/examples/stream_handler.rs) | — |
 
 ## Documentation
 
@@ -260,8 +264,8 @@ The same pages, with interactive architecture diagrams, are on the
 
 | Path | What it is |
 | --- | --- |
-| [`go/`](go/) | The Go module `github.com/photon-grove/evt/go`, tagged `go/vX.Y.Z` because Go requires that prefix for a module in a subdirectory |
 | [`crates/`](crates/) | `photon-evt`, `photon-evt-lambda`, and `evt-compat`, the cross-language test harness |
+| [`go/`](go/) | The Go module `github.com/photon-grove/evt/go`, tagged `go/vX.Y.Z` because Go requires that prefix for a module in a subdirectory |
 | [`compat/`](compat/) | Shared scenarios and golden fixtures that keep the two languages writing the same bytes |
 | [`docs/`](docs/) | The guide, the reference, and the architecture decision records |
 | [`website/`](website/), [`packages/`](packages/) | The docs site and the diagram package it uses |

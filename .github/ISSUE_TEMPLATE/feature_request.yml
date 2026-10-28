@@ -30,5 +30,5 @@ body:
     attributes:
       label: Languages
       options:
-        - label: Go
         - label: Rust
+        - label: Go
