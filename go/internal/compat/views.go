@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	evt "github.com/photon-grove/evt/go"
@@ -48,6 +49,11 @@ type StepView struct {
 
 	// Conflict maps the operation's failed condition to an error with this message.
 	Conflict string `json:"conflict,omitempty"`
+
+	// Repeat emits the operation that many times (once when 0), with {n} in its keys and payload
+	// replaced by the copy's index, zero-padded to three digits, so the budget cases need not
+	// list a hundred operations.
+	Repeat int `json:"repeat,omitempty"`
 }
 
 // viewsOf builds the step's commit-wide view operations, in declaration then emission order.
@@ -64,23 +70,33 @@ func viewsOf(base evt.EntityID, step Step) []evt.ProjectedView {
 	}
 
 	for index, projector := range step.Projectors {
-		for operation, item := range projector.Operations {
-			op := evt.ViewOperation{
-				Kind:       evt.ViewOperationKind(item.Op),
-				PK:         pad(scope(item.PK), item.PKPad),
-				SK:         pad(scope(item.SK), item.SKPad),
-				Owner:      evt.EntityID(scope(item.Owner)),
-				EntityType: evt.EntityType(item.EntityType),
-				Payload:    []byte(scope(item.Payload)),
-				Condition:  evt.ViewCondition(item.Condition),
-			}
-			if item.Conflict != "" {
-				op.Conflict = errors.New(item.Conflict)
-			}
+		operation := 0
 
-			views = append(views, evt.ProjectedView{
-				Projector: projector.Name, ProjectorIndex: index, Operation: operation, Op: op,
-			})
+		for _, item := range projector.Operations {
+			for copyIndex := range max(item.Repeat, 1) {
+				number := func(text string) string {
+					return strings.ReplaceAll(text, "{n}", fmt.Sprintf("%03d", copyIndex))
+				}
+
+				op := evt.ViewOperation{
+					Kind:       evt.ViewOperationKind(item.Op),
+					PK:         pad(number(scope(item.PK)), item.PKPad),
+					SK:         pad(number(scope(item.SK)), item.SKPad),
+					Owner:      evt.EntityID(scope(item.Owner)),
+					EntityType: evt.EntityType(item.EntityType),
+					Payload:    []byte(number(scope(item.Payload))),
+					Condition:  evt.ViewCondition(item.Condition),
+				}
+				if item.Conflict != "" {
+					op.Conflict = errors.New(item.Conflict)
+				}
+
+				views = append(views, evt.ProjectedView{
+					Projector: projector.Name, ProjectorIndex: index, Operation: operation, Op: op,
+				})
+
+				operation++
+			}
 		}
 	}
 

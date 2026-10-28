@@ -108,10 +108,10 @@ async fn step<R, H, V, F>(
     only: &str,
 ) -> Result<Failures, BoxError>
 where
-    R: Repository,
+    R: Repository + EventLog,
     H: HeadAccess + Clone + 'static,
     V: ViewAccess + Clone + 'static,
-    F: photon_evt::RebuildFence + Clone + 'static,
+    F: photon_evt::RebuildFence + photon_evt::FeatureMarker + Clone + 'static,
 {
     let (heads, views, fence) = access;
     let scenarios = Scenarios::load()?;
@@ -126,7 +126,8 @@ where
         let runner = Runner::for_scenario(&repository, scenario, run)
             .with_head_access(heads.clone())
             .with_view_access(views.clone())
-            .with_rebuild_access(RebuildDriver::sleeping(fence.clone()));
+            .with_rebuild_access(RebuildDriver::sleeping(fence.clone()))
+            .with_marker_access(fence.clone());
         let outcome = runner.execute(&scenario.entity_id(run), step).await?;
 
         if outcome == step.expect {
@@ -156,7 +157,7 @@ fn check<T: PartialEq + std::fmt::Debug>(
     }
 }
 
-async fn verify_common<R: Repository>(
+async fn verify_common<R: Repository + EventLog>(
     repository: &R,
     heads: impl HeadAccess + 'static,
     expected: &Expectation,

@@ -26,7 +26,8 @@ done
 
 # An exclusive scenario holds store-wide state across its steps (a rebuild lock refuses every other
 # scenario's commits), so it runs alone, after the interleaved scenarios, one step at a time.
-# A failed exclusive step must not leave its rebuild lock behind for the next run: settle the fence.
+# A failed exclusive step must not leave its rebuild lock or a declared feature behind for the next
+# run: settle the fence and the feature marker.
 trap '"$go_driver" settle -backend "$backend" || true' ERR
 exclusive_scenarios="$("$go_driver" exclusive)"
 while IFS= read -r scenario; do
