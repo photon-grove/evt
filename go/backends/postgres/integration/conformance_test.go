@@ -115,3 +115,24 @@ func Test_StoreInitializationConformance(t *testing.T) {
 		},
 	})
 }
+
+// Test_FeatureMarkerConformance runs the feature-marker cases on an event log of their own: they
+// declare features no writer supports, which would refuse every other test's commits on the shared
+// log. The two writers are separate repositories over the same tables, each with its own cached
+// validation.
+func Test_FeatureMarkerConformance(t *testing.T) {
+	ctx := context.Background()
+
+	first, _, name := newIsolatedEventLog(ctx, t)
+	second := postgres.NewRepository(newPool(ctx, t),
+		postgres.WithEventsTable(name), postgres.WithSnapshotsTable(name+"_snapshots"))
+
+	conformance.RunFeatureMarkerSuite(t, first, second, conformance.FeatureMarkerOptions{
+		Declare: func(ctx context.Context, repo evt.Repository, change func(*evt.FeatureManifest)) (evt.FeatureManifest, error) {
+			return repo.(*postgres.Repository).FeatureMarker(nil).Declare(ctx, change) //nolint:errcheck,forcetypeassert // the suite is handed *postgres.Repository writers
+		},
+		Manifest: func(ctx context.Context, repo evt.Repository) (*evt.FeatureManifest, error) {
+			return repo.(*postgres.Repository).FeatureMarker(nil).Manifest(ctx) //nolint:errcheck,forcetypeassert // the suite is handed *postgres.Repository writers
+		},
+	})
+}

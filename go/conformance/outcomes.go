@@ -1446,6 +1446,18 @@ func testOutcomeStreamsAreReserved(t *testing.T, repo evt.OutcomeRepository) {
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{
 		Outcome: &evt.Outcome{CommandID: evt.CommandID(ns), Status: evt.OutcomeAccepted, Digest: "d"},
 	}))
+
+	// The engine row is not a stream: enumeration and entity heads skip it.
+	row := evt.EntityID(evt.OutcomeKey(evt.CommandID(ns)))
+	for _, event := range drainEvents(t, repo.StreamAllEvents(ctx, evt.StreamFilter{})) {
+		require.NotEqual(t, row, event.EntityID, "enumeration yielded the outcome row")
+	}
+
+	if heads, ok := repo.(evt.EntityHeadStreamer); ok {
+		all, err := heads.StreamEntityHeads(ctx, "")
+		require.NoError(t, err)
+		require.NotContains(t, all, row, "entity heads yielded the outcome row")
+	}
 }
 
 // --- rejections that carry events ---
