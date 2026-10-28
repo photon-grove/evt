@@ -133,6 +133,9 @@ function decorateStatus(cell: HTMLTableCellElement) {
   }
 }
 
+// pendingMermaid is the latest mermaid render; each render waits for the one before it.
+let pendingMermaid: Promise<void> = Promise.resolve()
+
 // enhanceDoc applies in-place enhancements to the rendered Markdown: stable heading ids, link
 // rewriting (external/route/in-page), syntax colors, table decoration, and mermaid rendering for
 // fenced ```mermaid blocks. Returns a cleanup that cancels any in-flight async mermaid work when
@@ -193,9 +196,13 @@ function enhanceDoc(container: HTMLElement, doc: DocMeta, theme: Theme): () => v
     return () => {}
   }
 
+  // mermaid.run is not cancellable, so a newer render (a theme toggle) waits for an older one to
+  // finish rather than racing it over the same nodes.
   let cancelled = false
-  void (async () => {
+  const previous = pendingMermaid
+  pendingMermaid = (async () => {
     const {default: mermaid} = await import('mermaid')
+    await previous
     if (cancelled) {
       return
     }
@@ -208,7 +215,11 @@ function enhanceDoc(container: HTMLElement, doc: DocMeta, theme: Theme): () => v
     }
 
     await mermaid.run({nodes: mermaidBlocks})
-  })()
+  })().catch((error: unknown) => {
+    if (!cancelled) {
+      console.error('mermaid render failed', error)
+    }
+  })
 
   return () => {
     cancelled = true

@@ -174,6 +174,19 @@ function ConceptTour({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void})
   const [active, setActive] = useState(0)
   const stop = tour[active]
 
+  // Arrow keys move between stops, as in any tab list.
+  const onRailKey = (event: React.KeyboardEvent) => {
+    const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
+    if (step === 0) {
+      return
+    }
+
+    event.preventDefault()
+    const next = (active + step + tour.length) % tour.length
+    setActive(next)
+    document.getElementById(`tour-tab-${tour[next].id}`)?.focus()
+  }
+
   return (
     <section className="band tour-band" id="concepts">
       <div className="section-heading">
@@ -185,15 +198,16 @@ function ConceptTour({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void})
         </p>
       </div>
 
-      <ol className="tour-rail" role="tablist" aria-label="Concepts">
+      <ol className="tour-rail" role="tablist" aria-label="Concepts" onKeyDown={onRailKey}>
         {tour.map((item, index) => (
-          <li key={item.id}>
+          <li key={item.id} role="presentation">
             <button
               type="button"
               role="tab"
               id={`tour-tab-${item.id}`}
               aria-selected={index === active}
               aria-controls="tour-panel"
+              tabIndex={index === active ? 0 : -1}
               className={index === active ? 'is-active' : index < active ? 'is-past' : undefined}
               onClick={() => setActive(index)}
             >
@@ -249,8 +263,8 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
           <p className="lede">
             evt is a library for event-sourced services. Aggregates handle commands, the events they
             decide on go into an append-only log in <strong>DynamoDB</strong> or{' '}
-            <strong>PostgreSQL</strong>, and views are projections you can wipe and rebuild from that
-            log. Go and Rust read and write the same bytes.
+            <strong>PostgreSQL</strong>, and views are projections derived from that log, so it can
+            reproduce them. Go and Rust read and write the same bytes.
           </p>
           <div className="install">
             <LangSwitch lang={lang} onChange={onLang} label="Install language" />

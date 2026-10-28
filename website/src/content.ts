@@ -164,7 +164,8 @@ export const tour: TourStop[] = [
 store := snapshots.NewStore(repo, 25) // snapshot every 25 events
 
 metadata := evt.NewMetadata(ctx, nil, evt.WithCommandID("cmd-7f3a"))
-err := store.Execute(ctx, NewAccount("acct-1"), "acct-1", &Deposit{Amount: 50}, metadata)
+err := store.Execute(ctx, NewAccount("acct-1"), "acct-1",
+	&Deposit{AccountID: "acct-1", Amount: 50}, metadata)
 // a racing writer gets a conflict, never a silent overwrite,
 // and a retry with the same command ID is caught as a duplicate`,
       rust: `let repository = DynamoRepository::new(client, "event-log");
@@ -183,13 +184,18 @@ let executed = store
     body: 'A commit-wide projector is a pure function over everything one commit wrote. Its view rows go into the same transaction as the events, so a read model never drifts from the log behind it.',
     doc: 'guide/projections',
     code: {
-      go: `func (directory) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
+      go: `type directory struct{}
+
+func (directory) Name() string              { return "directory" }
+func (directory) History() []evt.EntityType { return nil } // current state, no events
+
+func (directory) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
 	var operations []evt.ViewOperation
 
 	for _, stream := range commit.Streams {
-		latest := stream.Events[len(stream.Events)-1]
+		// stream.State is the aggregate's JSON after the commit; the stream owns its row.
 		operations = append(operations, evt.PutView("directory",
-			string(stream.EntityID), stream.EntityID, stream.EntityType, summaryOf(latest)))
+			string(stream.EntityID), stream.EntityID, stream.EntityType, stream.State))
 	}
 
 	return operations, nil
@@ -216,10 +222,10 @@ let store = Store::<Account, _>::new(repository, ()).with_commit_projector(Arc::
     id: 'derived',
     title: 'Rebuild and sync',
     tagline: 'Derived state you can throw away',
-    body: 'Views are disposable: wipe the table and replay the log behind a rebuild fence. In Rust, the sync journal hands each scope an ordered, gap-checked feed for realtime clients.',
+    body: 'Views are derived, so the log can reproduce them. In Go, RebuildProjections replays the log into per-entity views behind a rebuild fence; the Rust port is in progress. In Rust, the sync journal hands each scope an ordered, gap-checked feed for realtime clients.',
     doc: 'guide/projections',
     code: {
-      go: `lease, err := fence.Begin(ctx, owner, 10*time.Minute) // fence out writers
+      go: `lease, err := fence.Begin(ctx, owner, 10*time.Minute) // fence out writers and readers
 
 result, err := evt.RebuildProjections(ctx, repo, applyEvent, cfg)
 if err == nil && len(result.Errors) == 0 {
@@ -287,7 +293,8 @@ export const capabilities: ContentCard[] = [
   {
     icon: 'fence',
     title: 'Fenced rebuilds',
-    body: 'Wipe a view table and replay the log. A rebuild fence keeps writers out and tells readers when the views are settled again.',
+    tag: 'Go',
+    body: 'RebuildProjections replays the log into per-entity views while a rebuild fence keeps writers out and tells readers when the views are settled. The Rust port is in progress.',
     doc: 'guide/projections',
   },
   {
@@ -402,7 +409,7 @@ export const examples: ExampleEntry[] = [
   {
     title: 'Todo with a rebuildable view',
     lang: 'Go',
-    body: 'A commit-wide projector keeps each list\'s open and done counts in the commit, then rebuilds every row from the log and checks it matches.',
+    body: 'A commit-wide projector keeps each list\'s open and done counts in the commit, then replays the commits in memory and checks the rows match.',
     command: 'go -C go run ./examples/todo',
     href: `${repoUrl}/tree/main/go/examples/todo`,
   },
@@ -416,7 +423,7 @@ export const examples: ExampleEntry[] = [
   {
     title: 'Todo with a rebuildable view',
     lang: 'Rust',
-    body: 'The Rust port of the todo example: a CommitProjector writes the summary row, and group_commits plus replay_views rebuild it.',
+    body: 'The Rust port of the todo example: a CommitProjector writes the summary row, and group_commits plus replay_views reproduce it from the log.',
     command: 'cargo run -p photon-evt --example todo',
     href: `${repoUrl}/blob/main/crates/evt/examples/todo.rs`,
   },
