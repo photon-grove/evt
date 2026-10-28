@@ -951,6 +951,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
 /// Loads any aggregate type from a repository, retrying when a sequence gap shows a compaction
 /// raced the read, with no catch-up snapshot.
+#[cfg_attr(not(feature = "testing"), allow(dead_code))]
 pub(crate) async fn load_aggregate<A: Aggregate, R: Repository>(
     repository: &R,
     entity_id: EntityId,
