@@ -32,13 +32,15 @@ export type DocLink =
   | {kind: 'external'; href: string}
   | {kind: 'route'; slug: string}
   | {kind: 'anchor'; id: string}
+  | {kind: 'repo'; path: string}
   | {kind: 'asis'; href: string}
 
 // resolveDocLink decides how an href inside the doc identified by fromSlug should behave:
 //   - absolute/protocol URLs open externally,
 //   - pure "#fragment" links scroll within the current doc,
-//   - relative links to another ".md" become an in-site doc route (resolved against fromSlug's dir),
-//   - everything else is left untouched.
+//   - relative links to another ".md" under docs/ become an in-site doc route,
+//   - other relative links (source files, directories, Markdown outside docs/) open on GitHub,
+//   - anything that climbs above the repo root is left untouched.
 export function resolveDocLink(href: string, fromSlug: string): DocLink {
   if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) {
     return {kind: 'external', href}
@@ -48,19 +50,25 @@ export function resolveDocLink(href: string, fromSlug: string): DocLink {
     return {kind: 'anchor', id: href.slice(1)}
   }
 
-  const [pathPart] = href.split('#')
-  if (pathPart.endsWith('.md')) {
-    return {kind: 'route', slug: resolveRelativePath(fromSlug, pathPart).replace(/\.md$/, '')}
+  const [pathPart, fragment] = href.split('#')
+  const repoPath = resolveRepoPath(fromSlug, pathPart)
+  if (repoPath === undefined) {
+    return {kind: 'asis', href}
   }
 
-  return {kind: 'asis', href}
+  if (repoPath.startsWith('docs/') && repoPath.endsWith('.md')) {
+    return {kind: 'route', slug: repoPath.slice('docs/'.length).replace(/\.md$/, '')}
+  }
+
+  return {kind: 'repo', path: fragment ? `${repoPath}#${fragment}` : repoPath}
 }
 
-// resolveRelativePath resolves target (a relative path like "adr/x.md" or "../concepts.md") against
-// the directory of fromSlug, returning a docs-root-relative path.
-function resolveRelativePath(fromSlug: string, target: string): string {
+// resolveRepoPath resolves target (a relative path like "adr/x.md" or "../../go/errors.go")
+// against the docs/ directory of fromSlug, returning a repo-root-relative path, or undefined when
+// the target climbs above the repo root.
+function resolveRepoPath(fromSlug: string, target: string): string | undefined {
   const baseDir = fromSlug.includes('/') ? fromSlug.slice(0, fromSlug.lastIndexOf('/')) : ''
-  const parts = baseDir ? baseDir.split('/') : []
+  const parts = ['docs', ...(baseDir ? baseDir.split('/') : [])]
 
   for (const segment of target.split('/')) {
     if (segment === '' || segment === '.') {
@@ -68,6 +76,9 @@ function resolveRelativePath(fromSlug: string, target: string): string {
     }
 
     if (segment === '..') {
+      if (parts.length === 0) {
+        return undefined
+      }
       parts.pop()
     } else {
       parts.push(segment)
@@ -75,4 +86,28 @@ function resolveRelativePath(fromSlug: string, target: string): string {
   }
 
   return parts.join('/')
+}
+
+// Status is one feature-matrix cell marker, as the matrix legend defines them.
+export interface Status {
+  symbol: string
+  kind: 'shipped' | 'progress' | 'planned' | 'deferred' | 'cut' | 'na'
+  label: string
+}
+
+const STATUSES: Status[] = [
+  {symbol: '✅', kind: 'shipped', label: 'Shipped'},
+  {symbol: '🚧', kind: 'progress', label: 'In progress'},
+  {symbol: '⏳', kind: 'planned', label: 'Planned'},
+  {symbol: '⏸', kind: 'deferred', label: 'Deferred'},
+  {symbol: '🗑️', kind: 'cut', label: 'Cut'},
+  {symbol: '🗑', kind: 'cut', label: 'Cut'},
+  {symbol: '—', kind: 'na', label: 'Not applicable'},
+]
+
+// statusOf returns the status a matrix cell starts with, if any.
+export function statusOf(cell: string): Status | undefined {
+  const text = cell.trimStart()
+
+  return STATUSES.find((status) => text.startsWith(status.symbol))
 }

@@ -3,11 +3,32 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>evt · Event sourcing for Go</title>
+    <title>evt · Event sourcing for Rust and Go</title>
     <meta
       name="description"
-      content="evt is an event-sourcing framework for Go, with a wire-compatible Rust crate. It stores events in DynamoDB or PostgreSQL, with snapshots, projections, stream projectors and rebuild tooling."
+      content="evt is an event-sourcing library for Rust and Go. It stores events in DynamoDB or PostgreSQL, with atomic multi-stream commits, durable command outcomes, projections you can rebuild, and a shared storage format."
     />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="theme-color" content="#fdf8f0" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="evt · Event sourcing for Rust and Go" />
+    <meta
+      property="og:description"
+      content="Immutable events as truth, views you can rebuild. DynamoDB, PostgreSQL and in-memory backends, one storage format for Rust and Go."
+    />
+    <meta property="og:url" content="https://photon-grove.github.io/evt/" />
+    <meta property="og:image" content="https://photon-grove.github.io/evt/og.png" />
+    <meta property="og:image:width" content="1280" />
+    <meta property="og:image:height" content="640" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      // Apply a saved theme before first paint so a dark-mode pick doesn't flash light.
+      try {
+        const theme = localStorage.getItem('evt-theme')
+        if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme
+      } catch {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

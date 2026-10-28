@@ -48,6 +48,11 @@ const DOC_CONFIG: Record<string, DocConfig> = {
     order: 2,
     summary: 'Aggregates, commands, events, snapshots, projections and the rules that tie them together.',
   },
+  'guide/examples': {
+    group: GUIDES,
+    order: 2.5,
+    summary: 'Every runnable example in both languages, what it shows, and the command that runs it.',
+  },
   'guide/projections': {
     group: GUIDES,
     order: 3,
@@ -91,7 +96,7 @@ const DOC_CONFIG: Record<string, DocConfig> = {
   'reference/storage-format': {
     group: REFERENCE,
     order: 20,
-    summary: 'The normative byte-level format that Go and Rust both read and write.',
+    summary: 'The normative byte-level format that Rust and Go both read and write.',
   },
   'reference/feature-matrix': {
     group: REFERENCE,
