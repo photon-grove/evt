@@ -7,10 +7,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tracing::Instrument;
+
 use crate::aggregate::{Aggregate, Projector};
 use crate::commit_id::{self, CommitIdGenerator};
 use crate::error::{BoxError, Error, ExecuteError, ReplayPhase};
-use crate::event::{DomainEvent, SerializedEvent};
+use crate::event::{DomainEvent, SerializedEvent, SerializedSnapshot};
 use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
@@ -31,7 +33,7 @@ const LOAD_ATTEMPTS: usize = 3;
 pub const DEFAULT_SNAPSHOT_INTERVAL: usize = 5;
 
 /// Loads aggregates of type `A` from a repository, handles commands, and commits the resulting
-/// events, writing a snapshot every [`snapshot interval`](Store::with_snapshot_interval) events.
+/// events, writing a snapshot every [`snapshot interval`](Store::snapshot_interval) events.
 ///
 /// A store is `Send + Sync` when its repository and services are, so it can be shared across
 /// tasks behind an `Arc`. It is `Clone` when the repository and services are `Clone`; projectors
@@ -40,6 +42,7 @@ pub struct Store<A: Aggregate, R: Repository> {
     pub(crate) repository: R,
     services: A::Services,
     pub(crate) snapshot_interval: usize,
+    pub(crate) catch_up_threshold: usize,
     pub(crate) projectors: Vec<Arc<dyn Projector<A, R::Operation>>>,
     pub(crate) commit_projectors: Vec<Arc<dyn CommitProjector>>,
     pub(crate) history_declared: HistoryLedger,
@@ -58,6 +61,7 @@ where
             repository: self.repository.clone(),
             services: self.services.clone(),
             snapshot_interval: self.snapshot_interval,
+            catch_up_threshold: self.catch_up_threshold,
             projectors: self.projectors.clone(),
             commit_projectors: self.commit_projectors.clone(),
             history_declared: self.history_declared.clone(),
@@ -72,7 +76,8 @@ impl<A: Aggregate, R: Repository + fmt::Debug> fmt::Debug for Store<A, R> {
         f.debug_struct("Store")
             .field("aggregate", &A::TYPE)
             .field("repository", &self.repository)
-            .field("snapshot_interval", &self.snapshot_interval)
+            .field("snapshot_interval", &self.snapshot_interval())
+            .field("catch_up_threshold", &self.catch_up_threshold)
             .field("projectors", &self.projectors.len())
             .field("commit_projectors", &self.commit_projectors.len())
             .finish_non_exhaustive()
@@ -86,6 +91,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             repository,
             services,
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
+            catch_up_threshold: 0,
             projectors: Vec::new(),
             commit_projectors: Vec::new(),
             history_declared: HistoryLedger::default(),
@@ -127,10 +133,33 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         self
     }
 
-    /// Sets the number of events between snapshots. 0 disables snapshots.
+    /// Sets the store's number of events between snapshots (default
+    /// [`DEFAULT_SNAPSHOT_INTERVAL`]). 0 disables snapshots. It is the default for the
+    /// [transactions](Store::transaction) the store begins too. An aggregate type that declares
+    /// its own [`Aggregate::SNAPSHOT_INTERVAL`] uses that instead, here and in every transaction.
     #[must_use]
     pub fn with_snapshot_interval(mut self, interval: usize) -> Self {
         self.snapshot_interval = interval;
+        self
+    }
+
+    /// Writes a best-effort catch-up snapshot when a load replays at least `threshold` events past
+    /// the latest snapshot (or from the start, when there is none). 0, the default, disables it.
+    ///
+    /// Commits snapshot on the [interval](Store::snapshot_interval), so a stream that is read far
+    /// more often than it is written, or whose interval is large or 0, can replay a long tail on
+    /// every load. With a threshold, the load that finds such a tail writes the state it just
+    /// folded as the next snapshot ([`Repository::put_snapshot`], which never lowers a stored
+    /// snapshot), so later loads start from it. Every load the store makes catches up:
+    /// [`load`](Store::load), the execute paths, and the reads of the
+    /// [transactions](Store::transaction) it begins. The returned [`Loaded`] carries the new
+    /// snapshot sequence, so a commit from it stays in step with the stored snapshot.
+    ///
+    /// The write is best effort, as in Go's `snapshots.Store.WithCatchUpSnapshotThreshold`: a
+    /// failure is logged as a `tracing` warning and the load still succeeds with the state it read.
+    #[must_use]
+    pub fn with_catch_up_snapshot_threshold(mut self, threshold: usize) -> Self {
+        self.catch_up_threshold = threshold;
         self
     }
 
@@ -163,9 +192,16 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         &self.services
     }
 
-    /// The configured snapshot interval.
+    /// The snapshot interval this store commits `A` with: [`Aggregate::SNAPSHOT_INTERVAL`] when
+    /// the type declares one, otherwise the store's [interval](Store::with_snapshot_interval).
     pub fn snapshot_interval(&self) -> usize {
-        self.snapshot_interval
+        A::SNAPSHOT_INTERVAL.unwrap_or(self.snapshot_interval)
+    }
+
+    /// The catch-up snapshot threshold (0 when catch-up is off); see
+    /// [`with_catch_up_snapshot_threshold`](Store::with_catch_up_snapshot_threshold).
+    pub fn catch_up_snapshot_threshold(&self) -> usize {
+        self.catch_up_threshold
     }
 
     /// Loads an aggregate: from its snapshot plus later events when a snapshot exists, otherwise
@@ -181,9 +217,17 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     /// when it was read. A commit from it starts at or below the new
     /// snapshot and fails with [`Error::Conflict`], which [`execute_with_retry`] retries.
     ///
+    /// With a [catch-up threshold](Store::with_catch_up_snapshot_threshold), a load that replays
+    /// that many events writes a snapshot of the state it folded.
+    ///
+    /// Every load runs in a `tracing` span named `load` at `DEBUG` level, with the fields
+    /// `entity_type`, `entity_id`, `sequence` (the loaded head), `snapshot_seq` (the sequence of the
+    /// snapshot the load started from, 0 without one) and `events_replayed` (events folded after
+    /// it). They are the load telemetry; there is no freshness observer.
+    ///
     /// [`execute_with_retry`]: Store::execute_with_retry
     pub async fn load(&self, entity_id: impl Into<EntityId>) -> Result<Loaded<A>, Error> {
-        load_aggregate(&self.repository, entity_id.into()).await
+        load_with_catch_up(&self.repository, entity_id.into(), self.catch_up_threshold).await
     }
 
     /// Loads the aggregate, handles the command, and commits the resulting events.
@@ -337,7 +381,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         let serialized =
             serialize_events::<A>(&loaded.entity_id, loaded.sequence, &events, &stamped)?;
         let snapshot_due =
-            snapshot_events_due(loaded.sequence, events.len(), self.snapshot_interval) > 0;
+            snapshot_events_due(loaded.sequence, events.len(), self.snapshot_interval()) > 0;
         let projected_events = (!self.projectors.is_empty()).then(|| events.clone());
 
         for event in events {
@@ -906,27 +950,101 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 }
 
 /// Loads any aggregate type from a repository, retrying when a sequence gap shows a compaction
-/// raced the read. [`Store::load`] and [`Transaction::read`](crate::Transaction::read) share it.
+/// raced the read, with no catch-up snapshot.
 pub(crate) async fn load_aggregate<A: Aggregate, R: Repository>(
     repository: &R,
     entity_id: EntityId,
 ) -> Result<Loaded<A>, Error> {
-    let mut attempt = 1;
+    load_with_catch_up(repository, entity_id, 0).await
+}
 
-    // A sequence gap means another writer snapshotted and compacted the stream between the
-    // snapshot read and the event read. Loading again starts from the newer snapshot.
-    loop {
-        match load_once(repository, entity_id.clone()).await {
-            Err(err) if err.is_conflict() && attempt < LOAD_ATTEMPTS => attempt += 1,
-            result => return result,
+/// Loads any aggregate type from a repository, retrying when a sequence gap shows a compaction
+/// raced the read, then writes a catch-up snapshot when it replayed at least `catch_up_threshold`
+/// events (0 never does). [`Store::load`] and [`Transaction::read`](crate::Transaction::read)
+/// share it. The load runs in the `load` span that carries its telemetry fields.
+pub(crate) async fn load_with_catch_up<A: Aggregate, R: Repository>(
+    repository: &R,
+    entity_id: EntityId,
+    catch_up_threshold: usize,
+) -> Result<Loaded<A>, Error> {
+    let span = tracing::debug_span!(
+        "load",
+        entity_type = A::TYPE,
+        entity_id = %entity_id,
+        sequence = tracing::field::Empty,
+        snapshot_seq = tracing::field::Empty,
+        events_replayed = tracing::field::Empty,
+    );
+    let fields = span.clone();
+
+    async move {
+        let mut attempt = 1;
+
+        // A sequence gap means another writer snapshotted and compacted the stream between the
+        // snapshot read and the event read. Loading again starts from the newer snapshot.
+        let (mut loaded, replayed) = loop {
+            match load_once::<A, R>(repository, entity_id.clone()).await {
+                Err(err) if err.is_conflict() && attempt < LOAD_ATTEMPTS => attempt += 1,
+                result => break result?,
+            }
+        };
+
+        fields.record("sequence", loaded.sequence.0);
+        fields.record("snapshot_seq", loaded.snapshot_sequence.0);
+        fields.record("events_replayed", replayed as u64);
+
+        if catch_up_threshold > 0 && replayed >= catch_up_threshold {
+            catch_up_snapshot(repository, &mut loaded).await;
         }
+
+        Ok(loaded)
+    }
+    .instrument(span)
+    .await
+}
+
+/// Writes the loaded state as the stream's next snapshot, best effort: a failure is logged and the
+/// load keeps the state it read. On success the loaded snapshot sequence advances to it, so a
+/// commit from `loaded` writes the snapshot after it.
+async fn catch_up_snapshot<A: Aggregate, R: Repository>(repository: &R, loaded: &mut Loaded<A>) {
+    let payload = match json::to_vec(&loaded.aggregate) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(phase = "payload", %error, "snapshot catch-up failed");
+
+            return;
+        }
+    };
+
+    let snapshot = SerializedSnapshot {
+        entity_type: EntityType::new(A::TYPE),
+        entity_id: loaded.entity_id.clone(),
+        sequence: loaded.snapshot_sequence.next(),
+        event_sequence: loaded.sequence,
+        payload,
+    };
+
+    match repository.put_snapshot(&snapshot).await {
+        Ok(true) => {
+            loaded.snapshot_sequence = snapshot.sequence;
+            tracing::debug!(
+                snapshot_seq = snapshot.sequence.0,
+                event_sequence = snapshot.event_sequence.0,
+                "wrote a catch-up snapshot"
+            );
+        }
+        // Another writer already stored a snapshot past this load; it stays in place.
+        Ok(false) => tracing::debug!("a newer snapshot is already stored; catch-up skipped"),
+        Err(error) => tracing::warn!(phase = "write", %error, "snapshot catch-up failed"),
     }
 }
 
+/// Reads the snapshot and the events after it and folds them, returning the loaded state and the
+/// number of events folded after the snapshot.
 async fn load_once<A: Aggregate, R: Repository>(
     repository: &R,
     entity_id: EntityId,
-) -> Result<Loaded<A>, Error> {
+) -> Result<(Loaded<A>, usize), Error> {
     let snapshot = repository.snapshot(&entity_id).await?;
     let has_snapshot = snapshot.is_some();
 
@@ -957,11 +1075,12 @@ async fn load_once<A: Aggregate, R: Repository>(
         repository.events(&loaded.entity_id).await?
     };
 
+    let replayed = events.len();
     for event in events {
         loaded.replay(event)?;
     }
 
-    Ok(loaded)
+    Ok((loaded, replayed))
 }
 
 /// An aggregate loaded from the event log, with the stream position it was loaded at.
@@ -1180,6 +1299,9 @@ impl Decision {
 /// The future a [`Store::execute_transaction`] `prepare` function returns. Box it:
 /// `|tx| Box::pin(async move { ... })`.
 pub type PrepareFuture<'t> = Pin<Box<dyn Future<Output = Result<Decision, Error>> + Send + 't>>;
+
+#[cfg(test)]
+mod snapshot_policy_tests;
 
 #[cfg(test)]
 mod tests {

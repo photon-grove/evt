@@ -3356,9 +3356,23 @@ snapshot if interval > 0 and events_in_commit >= next
 - The snapshot always covers the whole commit: its `eventSequence` is the commit's last event.
 - Its sequence is the previous snapshot sequence plus one (1 for the first).
 - The default interval is 5 in both implementations. An interval of 0 disables snapshots.
+- An entity type can override the store's interval: Go `snapshots.Store.WithSnapshotSize(type, n)`,
+  Rust `Aggregate::SNAPSHOT_INTERVAL`. The override applies wherever the type is committed,
+  transactions included. Rust's `Some(0)` disables snapshots for the type; Go has no per-type
+  disable (a non-positive size removes the override).
 
 For example, with interval 3, a 6-event commit at sequence 1 snapshots at event 7, and a 1-event
 commit at sequence 7 does not snapshot because the next boundary is 9.
+
+A store can also write a catch-up snapshot on load (Go `WithCatchUpSnapshotThreshold`, Rust
+`Store::with_catch_up_snapshot_threshold`, both off by default). When a load replays at least the
+threshold of events after the snapshot (every event, without one), it writes the folded state as a
+standalone snapshot: sequence the loaded snapshot sequence plus one, `eventSequence` the loaded
+head. It uses the monotonic standalone snapshot write, so it never lowers a stored snapshot, and a
+failed write is logged and does not fail the load. Rust's loaded state then carries the new snapshot
+sequence, so a commit from it writes the next one. Go's loaded context keeps the old sequence, so
+on DynamoDB and in memory a commit from the same load that also snapshots conflicts on the snapshot
+sequence and is retried.
 
 ## Loading and duplicate commands
 

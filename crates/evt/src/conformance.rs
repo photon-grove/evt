@@ -655,6 +655,14 @@ impl<'a, R: Repository, V: ViewTarget<R>, H: HeadFixtures<R>> Suite<'a, R, V, H>
         );
         record("store loads from a snapshot", store_snapshots(repo).await);
         record(
+            "an aggregate's own snapshot interval overrides the store's and the transaction's",
+            Box::pin(snapshot_policy::aggregate_snapshot_interval(repo)).await,
+        );
+        record(
+            "a load that replays the threshold writes a catch-up snapshot",
+            Box::pin(snapshot_policy::catch_up_snapshots(repo)).await,
+        );
+        record(
             "store rejects a stale commit",
             store_stale_commit(repo).await,
         );
@@ -7294,6 +7302,7 @@ mod compaction;
 #[cfg(feature = "journal")]
 mod journal;
 mod rebuild;
+mod snapshot_policy;
 mod view_repository;
 mod views;
 
