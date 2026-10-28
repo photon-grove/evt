@@ -137,3 +137,26 @@ func Test_StoreInitializationConformance(t *testing.T) {
 			},
 		})
 }
+
+// Test_FeatureMarkerConformance runs the feature-marker cases on a table of their own: they declare
+// features no writer supports, which would refuse every other test's commits on a shared table. The
+// two writers are separate repositories over the same table, each with its own cached validation.
+func Test_FeatureMarkerConformance(t *testing.T) {
+	ctx := context.Background()
+
+	events, _ := newIsolatedEventLog(ctx, t)
+	client := isolatedClient
+
+	newRepo := func() *dynamo.Repository {
+		return dynamo.NewRepository(client, events.EventsTable).WithLazyInitialization(true)
+	}
+
+	conformance.RunFeatureMarkerSuite(t, newRepo(), newRepo(), conformance.FeatureMarkerOptions{
+		Declare: func(ctx context.Context, repo evt.Repository, change func(*evt.FeatureManifest)) (evt.FeatureManifest, error) {
+			return repo.(*dynamo.Repository).FeatureMarker(nil).Declare(ctx, change) //nolint:errcheck,forcetypeassert // the suite is handed *dynamo.Repository writers
+		},
+		Manifest: func(ctx context.Context, repo evt.Repository) (*evt.FeatureManifest, error) {
+			return repo.(*dynamo.Repository).FeatureMarker(nil).Manifest(ctx) //nolint:errcheck,forcetypeassert // the suite is handed *dynamo.Repository writers
+		},
+	})
+}

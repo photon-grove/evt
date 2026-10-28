@@ -122,3 +122,19 @@ func Test_StoreInitializationConformance(t *testing.T) {
 		},
 	})
 }
+
+// Test_FeatureMarkerConformance runs the feature-marker cases. The in-memory repository keeps no
+// cached validation (it checks the manifest on every write), so one store serves as both writers.
+func Test_FeatureMarkerConformance(t *testing.T) {
+	repo, ok := mem.NewRepository().(*mem.Repository)
+	require.True(t, ok)
+
+	conformance.RunFeatureMarkerSuite(t, repo, repo, conformance.FeatureMarkerOptions{
+		Declare: func(ctx context.Context, _ evt.Repository, change func(*evt.FeatureManifest)) (evt.FeatureManifest, error) {
+			return repo.Declare(ctx, change)
+		},
+		Manifest: func(ctx context.Context, _ evt.Repository) (*evt.FeatureManifest, error) {
+			return repo.Manifest(ctx)
+		},
+	})
+}
