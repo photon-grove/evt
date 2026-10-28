@@ -120,7 +120,7 @@ export const tour: TourStop[] = [
     id: 'command',
     title: 'Command',
     tagline: 'Decide, then record',
-    body: 'Handle validates a command against current state and returns the events it decides on, without changing anything. An error that is a rejection is stored too, so a retry gets the same answer.',
+    body: 'Handle validates a command against current state and returns the events it decides on, without changing anything. On a store with outcomes enabled, a rejection is stored too, so a retry gets the same answer.',
     doc: 'guide/commands',
     code: {
       go: `func (a *Account) Handle(_ context.Context, command evt.Command) (evt.CommandResult, error) {
@@ -157,24 +157,26 @@ export const tour: TourStop[] = [
     id: 'commit',
     title: 'Commit',
     tagline: 'One conditional write',
-    body: 'The store loads the stream, runs the command, and commits the events with an optimistic check on the stream head. Events, head, view rows and the command outcome land together or not at all.',
+    body: 'The store loads the stream, runs the command, and commits the events with an optimistic check on the stream head. With outcomes enabled and a command ID on every command, events, head, view rows and the command outcome land together or not at all.',
     doc: 'guide/getting-started',
     code: {
       go: `repo := dynamo.NewRepository(client, "event-log")
-store := snapshots.NewStore(repo, 25) // snapshot every 25 events
+store := snapshots.NewStore(repo, 25).WithOutcomes() // snapshot every 25 events, record outcomes
 
 metadata := evt.NewMetadata(ctx, nil, evt.WithCommandID("cmd-7f3a"))
-err := store.Execute(ctx, NewAccount("acct-1"), "acct-1",
+outcome, err := store.ExecuteWithOutcome(ctx, NewAccount("acct-1"), "acct-1",
 	&Deposit{AccountID: "acct-1", Amount: 50}, metadata)
-// a racing writer gets a conflict, never a silent overwrite,
-// and a retry with the same command ID is caught as a duplicate`,
+// a racing writer gets a conflict, never a silent overwrite;
+// a retry with "cmd-7f3a" returns the stored outcome (outcome.Replayed)`,
       rust: `let repository = DynamoRepository::new(client, "event-log");
-let store = Store::<Account, _>::new(repository, ());
+let store = Store::<Account, _>::new(repository, ()).with_outcomes(OutcomeConfig::new());
 
-let executed = store
-    .execute("acct-1", AccountCommand::Deposit { amount: 50 }, Metadata::new("us-west-2"))
+let metadata = Metadata::new("us-west-2").with_command_id("cmd-7f3a");
+let outcome = store
+    .execute_with_outcome("acct-1", AccountCommand::Deposit { amount: 50 }, metadata)
     .await?;
-// a racing writer gets Error::Conflict, never a silent overwrite`,
+// a racing writer gets Error::Conflict, never a silent overwrite;
+// a retry with "cmd-7f3a" returns the stored outcome (outcome.replayed)`,
     },
   },
   {
@@ -281,7 +283,7 @@ export const capabilities: ContentCard[] = [
   {
     icon: 'outcome',
     title: 'Durable command outcomes',
-    body: 'Every command gets a stored outcome, accepted or rejected. A retry gets the original answer back instead of running twice.',
+    body: 'Turn on outcomes and every command gets a stored outcome, accepted or rejected. A retry gets the original answer back instead of running twice.',
     doc: 'guide/commands',
   },
   {
