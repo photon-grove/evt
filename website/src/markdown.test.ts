@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'vitest'
 
-import {humanizeSlug, resolveDocLink, slugifyHeading, titleFromMarkdown} from './markdown'
+import {humanizeSlug, resolveDocLink, slugifyHeading, statusOf, titleFromMarkdown} from './markdown'
 import {parseHash} from './useHashRoute'
 import {docBySlug, docs, slugFromPath} from './docs'
 
@@ -75,11 +75,41 @@ describe('resolveDocLink', () => {
     })
   })
 
-  it('leaves non-markdown relative links untouched', () => {
+  it('sends links outside docs/ to the repository on GitHub', () => {
     expect(resolveDocLink('../infra/local/main.tf', 'projections')).toEqual({
-      kind: 'asis',
-      href: '../infra/local/main.tf',
+      kind: 'repo',
+      path: 'infra/local/main.tf',
     })
+    expect(resolveDocLink('../../go/errors.go#L12', 'guide/commands')).toEqual({
+      kind: 'repo',
+      path: 'go/errors.go#L12',
+    })
+    expect(resolveDocLink('../../crates/evt/README.md', 'guide/streams')).toEqual({
+      kind: 'repo',
+      path: 'crates/evt/README.md',
+    })
+  })
+
+  it('leaves links that climb above the repo root untouched', () => {
+    expect(resolveDocLink('../../../elsewhere', 'guide/commands')).toEqual({
+      kind: 'asis',
+      href: '../../../elsewhere',
+    })
+  })
+})
+
+describe('statusOf', () => {
+  it('reads the matrix legend markers at the start of a cell', () => {
+    expect(statusOf('✅')?.kind).toBe('shipped')
+    expect(statusOf(' 🚧 (commit path shipped)')?.kind).toBe('progress')
+    expect(statusOf('⏸ deferred per ADR 0005')?.kind).toBe('deferred')
+    expect(statusOf('🗑️')?.kind).toBe('cut')
+    expect(statusOf('—')?.kind).toBe('na')
+  })
+
+  it('ignores cells that do not start with a marker', () => {
+    expect(statusOf('core')).toBeUndefined()
+    expect(statusOf('see ✅ later')).toBeUndefined()
   })
 })
 

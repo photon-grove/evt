@@ -48,6 +48,11 @@ const DOC_CONFIG: Record<string, DocConfig> = {
     order: 2,
     summary: 'Aggregates, commands, events, snapshots, projections and the rules that tie them together.',
   },
+  'guide/examples': {
+    group: GUIDES,
+    order: 2.5,
+    summary: 'Every runnable example in both languages, what it shows, and the command that runs it.',
+  },
   'guide/projections': {
     group: GUIDES,
     order: 3,
