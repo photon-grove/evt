@@ -37,7 +37,7 @@ append to the same streams.
 
 ## Highlights
 
-|                                       |                                                                                                                                         |
+| Capability                            | What you get                                                                                                                            |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | **One conditional write per command** | Events, the stream's head, view rows and the command's outcome commit together, or not at all. A racing writer gets a conflict.          |
 | **Three backends, one contract**      | DynamoDB (single table, `pk`/`sk`), PostgreSQL, and an in-memory store for tests. Every backend passes the same conformance suite.       |
@@ -59,13 +59,12 @@ nothing is written.
 
 ```mermaid
 flowchart LR
-    cmd([Command]) --> agg["Aggregate<br/><code>Handle</code> decides"]
-    agg -->|events| commit{{"One atomic commit<br/>events · head · views · outcome"}}
-    commit --> log[("Event log<br/>append-only")]
-    commit --> views[("Views<br/>derived, rebuildable")]
-    log -. replay .-> agg
+    cmd([Command]) --> agg[Aggregate decides]
+    agg -- events --> commit{{One atomic commit}}
+    commit --> log[(Event log)]
+    commit --> views[(Views)]
     log -. rebuild .-> views
-    log -- DynamoDB Streams --> handlers["Stream handlers<br/>Lambda · SQS · SNS"]
+    log -- stream --> handlers[Stream handlers]
 ```
 
 Projectors can add view rows to that same commit, so a read model stays in step with the events
@@ -237,8 +236,11 @@ with their run commands.
 
 | Example | Go | Rust |
 | --- | --- | --- |
-| Banking: open, deposit, withdraw, conflicts | [`go/examples/banking`](go/examples/banking) | [`crates/evt/examples/banking.rs`](crates/evt/examples/banking.rs) |
-| Sync journal: scopes, high watermark, paging | — | [`crates/evt/examples/journal.rs`](crates/evt/examples/journal.rs) |
+| Banking: commands, conflicts, not-found errors | [`go/examples/banking`](go/examples/banking) | [`banking.rs`](crates/evt/examples/banking.rs) |
+| Todo: a commit-wide projector and a view rebuilt from the log | [`go/examples/todo`](go/examples/todo) | [`todo.rs`](crates/evt/examples/todo.rs) |
+| Transfer: two accounts in one commit (Go also replays retries from stored outcomes) | [`go/examples/transfer`](go/examples/transfer) | in [`banking.rs`](crates/evt/examples/banking.rs) |
+| Sync journal: scopes, high watermark, gap-checked paging | — | [`journal.rs`](crates/evt/examples/journal.rs) |
+| Lambda: a DynamoDB Streams batch with partial batch failures | — | [`stream_handler.rs`](crates/evt-lambda/examples/stream_handler.rs) |
 
 ## Documentation
 
