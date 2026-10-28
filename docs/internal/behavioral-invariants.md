@@ -555,9 +555,12 @@ lists the entities with `entity_heads` (so a stream compacted down to its snapsh
 loads each like `Store::load` (snapshot plus later events, with the sequence-gap check).
 `ProjectionRebuild` uses it to rebuild current-state commit-wide projectors from final states,
 under the rebuild lock. Its replay of history-dependent projectors needs every event from sequence
-1 and fails with `CompactionUncovered` on a compacted stream of their types. It computes every row
-before the first write, so any failure while reading or projecting releases the lock with nothing
-written.
+1 to the stream's enumerated head and fails with `CompactionUncovered` on a compacted stream of their
+types, or one whose tail TTL expired while an earlier event and the snapshot remain. It computes
+every row before the first write, so a failure while reading or projecting writes nothing. It then
+releases the lock only if it acquired it from a settled generation: a run that took over an expired
+lease or acquired after a force-release keeps the fence on any failure, because the earlier rebuild
+may have left the rows half-written.
 
 ## Commit-Wide Projectors (v0.9, C7)
 

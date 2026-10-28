@@ -727,12 +727,20 @@ of the log, or a commit that landed just before the lock was taken can be missed
 - A history-dependent projector is replayed as the next paragraph specifies, from the events of
   the types the history-dependent projectors name; a commit's streams of other types, which a live
   view carries by ID and type only, are absent from the replayed view. The rows the replay leaves
-  are written as puts, and a row the replay deleted last as a delete. A stream of those types whose history does not start at sequence 1 fails the
-  rebuild with `CompactionUncovered` before anything is written.
+  are written as puts, and a row the replay deleted last as a delete. A stream of those types whose history does not run from sequence 1 to its
+  enumerated head fails the rebuild with `CompactionUncovered` before anything is written: an early
+  part was compacted (`through` is the sequence before its first event), or, with retention, TTL
+  deleted a tail while an earlier event and the snapshot remain (`through` is the head). TTL deletes
+  lazily and in no order, so the remaining events alone cannot show that the tail is gone.
 
-A run that fails before attempting a write releases the lock and leaves the rows as they were. Once
-a write was attempted (even one whose result is unknown) a failure keeps the lock, because the rows
-may be half-written, until a retry takes over the lapsed lease.
+A run that acquired the lock from a settled generation and fails before attempting a write releases
+the lock and leaves the rows as they were. Once a write was attempted (even one whose result is
+unknown) a failure keeps the lock, because the rows may be half-written, until a retry takes over the
+lapsed lease. A run that took over an expired lease, or acquired from a force-released generation,
+starts from rows an earlier rebuild may have half-written, so it keeps the lock on any failure, a
+failure before its own first write included: only a rebuild that completes settles that generation.
+The run tells the cases apart by reading the generation just before it begins: the generation only
+grows, so a lease exactly one above a settled generation read then was acquired from it.
 
 Rebuilding a history-dependent projector (v0.9). A wipe-and-rebuild replays every
 commit grouped by `commitId`: each group's events, ordered by stream ID bytewise then by

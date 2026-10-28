@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use futures_core::Stream;
 
-use super::{RebuildFence, RebuildLease, lock_check_size, rebuild_batches};
+use super::{RebuildFence, RebuildGeneration, RebuildLease, lock_check_size, rebuild_batches};
 use crate::aggregate::Aggregate;
 use crate::enumerate::{EventLog, StreamFilter, unfold};
 use crate::error::Error;
@@ -109,10 +109,11 @@ use crate::store::Loaded;
 ///   operations are applied in that order and the rows they leave are written, puts and deletes,
 ///   refusing a row two owners wrote ([`Error::SharedViewKey`]). Live, the projector also saw the
 ///   commit's streams of other types, by ID and type only; the replay leaves those out, so a row
-///   must not depend on them. The replay needs the whole history: a stream of one of those types
-///   whose early events were compacted (or expired) fails the rebuild with
-///   [`Error::CompactionUncovered`] before anything is written, because the snapshot cannot stand
-///   in for the commits it covers.
+///   must not depend on them. The replay needs the whole history, from sequence 1 to the stream's
+///   head: a stream of one of those types whose early events were compacted (or expired), or whose
+///   tail expired while an earlier event and a snapshot remain (DynamoDB retention deletes lazily
+///   and in no order), fails the rebuild with [`Error::CompactionUncovered`] before anything is
+///   written, because the snapshot cannot stand in for the commits it covers.
 ///
 /// Only streams of the [registered](ProjectionRebuild::aggregate) types are read: register every
 /// type whose streams own the projectors' rows, and every type a history-dependent projector
@@ -130,11 +131,15 @@ use crate::store::Loaded;
 /// Every row is computed and checked before the first write, so a failure while reading or
 /// projecting (an entity that does not load, a projector error, a compacted stream, a row two
 /// owners would write, an operation too large to write) leaves the derived rows as they were, and
-/// [`run`](ProjectionRebuild::run) releases the lock. Once a write has been attempted, a failure
-/// (a lost lease, a backend error, an ambiguous write that may have applied) keeps the lock,
-/// because the rows may be half-written: commits stay refused and readers fenced until a retry
-/// takes over the lapsed lease (or an operator force-releases it, which leaves commits refused
-/// until a rebuild ends). Run the rebuild again.
+/// [`run`](ProjectionRebuild::run) releases the lock if it acquired it from a settled generation.
+/// Once a write has been attempted, a failure (a lost lease, a backend error, an ambiguous write
+/// that may have applied) keeps the lock, because the rows may be half-written: commits stay
+/// refused and readers fenced until a retry takes over the lapsed lease (or an operator
+/// force-releases it, which leaves commits refused until a rebuild ends). Run the rebuild again.
+///
+/// A run that took over an expired lease, or acquired the lock after a force-release, starts from
+/// rows an earlier rebuild may have half-written, so it keeps the lock on any failure, even one
+/// before its own first write: only a rebuild that completes settles that generation.
 pub struct ProjectionRebuild<'r, R> {
     repository: &'r R,
     projectors: Vec<Arc<dyn CommitProjector>>,
@@ -241,12 +246,17 @@ where
     /// Every row is computed before the first is written, so a failure while reading the log or
     /// projecting (a compacted stream a history-dependent projector reads, an entity that does not
     /// load, a projector error, a row two owners would write) leaves the derived rows as they were:
-    /// the run releases the lock and returns the error. A failure once writing has begun keeps the
-    /// lock (see [`ProjectionRebuild`]).
+    /// the run releases the lock and returns the error, provided it acquired the lock from a settled
+    /// generation. A run that took over an expired lease or acquired after a force-release keeps the
+    /// lock on any failure, because an earlier rebuild may have left the rows half-written; so does
+    /// a failure once writing has begun (see [`ProjectionRebuild`]). To tell the two apart it reads
+    /// the generation just before the begin.
     pub async fn run(&self, owner: &str, lease: Duration) -> Result<RebuildReport, Error> {
         self.check()?;
 
+        let before = self.repository.rebuild_generation().await?;
         let mut held = self.repository.begin_rebuild(owner, lease).await?;
+        let from_settled = acquired_from_settled(before, &held);
         let (result, touched) = self.fenced(&mut held, lease, Some(Instant::now())).await;
         match result {
             Ok(report) => {
@@ -255,10 +265,10 @@ where
                 Ok(report)
             }
             Err(error) => {
-                if !touched {
-                    // No write was attempted, so settling the generation is safe. A failed release
-                    // (a lost lease, say) leaves the lock to lapse; the run's own error is the one
-                    // to report.
+                if from_settled && !touched {
+                    // The rows were complete when the run began and it attempted no write, so
+                    // settling the generation is safe. A failed release (a lost lease, say) leaves
+                    // the lock to lapse; the run's own error is the one to report.
                     let _ = self.repository.end_rebuild(&held).await;
                 }
 
@@ -270,7 +280,10 @@ where
     /// Rebuilds under a lease the caller took ([`begin_rebuild`](RebuildFence::begin_rebuild)) and
     /// will end. The lease is renewed for `renew` (at least one second) when the run starts, and
     /// again whenever half of `renew` has passed; `lease` is updated in place, so the caller ends
-    /// the renewed lease. On failure, keep the lock unless you know no batch was attempted.
+    /// the renewed lease. On failure, keep the lock unless you know no batch was attempted **and**
+    /// your begin acquired the lock from a settled generation: a lease that took over an expired
+    /// one, or was acquired after a force-release, covers rows an earlier rebuild may have left
+    /// half-written, and only a completed rebuild may settle it.
     pub async fn run_with_lease(
         &self,
         lease: &mut RebuildLease,
@@ -482,7 +495,12 @@ where
     }
 
     /// Every event of every stream of one type, failing with [`Error::CompactionUncovered`] when a
-    /// stream's history does not start at sequence 1.
+    /// stream's history does not run from sequence 1 to its enumerated head: an early part was
+    /// compacted, or (on DynamoDB with retention, whose TTL deletes lazily and in no order) a tail
+    /// expired while an earlier event and a snapshot remain. `through` is the last missing
+    /// sequence before the first event, or the head for a missing tail. A gap in between fails
+    /// the fold with [`Error::SequenceGap`], and an event above the head is
+    /// [`Error::StreamHeadDrift`].
     async fn whole_history(&self, entity_type: &EntityType) -> Result<Vec<SerializedEvent>, Error> {
         let heads = self.repository.entity_heads(Some(entity_type)).await?;
 
@@ -504,24 +522,47 @@ where
             let stream = streams.entry(entity_id.clone()).or_default();
             stream.sort_by_key(|event| event.sequence);
 
+            // The replay must run from sequence 1 to the head. Missing early events were compacted
+            // (or expired) and a missing tail expired; either way the snapshot cannot stand in for
+            // the commits that are gone, and replaying what is left would build an earlier state.
             let first = stream.first().map(|event| event.sequence);
-            if first != Some(EventSequence(1)) {
-                let covered = self
-                    .repository
-                    .snapshot(&entity_id)
-                    .await?
-                    .map(|snapshot| snapshot.event_sequence);
+            let last = stream.last().map(|event| event.sequence);
+            let through = match (first, last) {
+                (Some(first), _) if first != EventSequence(1) => EventSequence(first.0 - 1),
+                (_, Some(last)) if last > head => {
+                    return Err(crate::heads::drift(&entity_id, head, last));
+                }
+                (_, Some(last)) if last == head => continue,
+                _ => head,
+            };
 
-                return Err(Error::CompactionUncovered {
-                    entity_id,
-                    through: first.map_or(head, |first| EventSequence(first.0 - 1)),
-                    covered,
-                });
-            }
+            let covered = self
+                .repository
+                .snapshot(&entity_id)
+                .await?
+                .map(|snapshot| snapshot.event_sequence);
+
+            return Err(Error::CompactionUncovered {
+                entity_id,
+                through,
+                covered,
+            });
         }
 
         Ok(streams.into_values().flatten().collect())
     }
+}
+
+/// Reports whether `held` was acquired from the settled generation `before`, read just before the
+/// begin, rather than taken over from an expired lease or acquired from a force-released
+/// generation, either of which may have left the rows half-written.
+///
+/// The generation only grows, and a begin adds one to the generation it observed only when that
+/// generation was settled (two for a takeover or from a force-release). So a lease of exactly
+/// `before + 1` over a settled `before` was acquired from it. Any other lease (a transition landed
+/// between the read and the begin) counts as not settled, which only keeps the fence.
+fn acquired_from_settled(before: RebuildGeneration, held: &RebuildLease) -> bool {
+    before.is_settled() && held.generation == before.value + 1
 }
 
 /// The operation a rebuild writes: the same row without its condition or mapped error, because a

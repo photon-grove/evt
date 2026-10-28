@@ -801,14 +801,18 @@ let report = ProjectionRebuild::new(&repository)
   snapshot. Only rebuild projectors whose rows depend on their owner's state alone: a row that
   reads another stream's state from the same commit is recomputed from one stream.
 - A history-dependent projector replays every commit of the types it names (`group_commits`).
-  Streams of other types in a commit are left out of the replayed view. A compacted stream of
-  those types fails the run with `CompactionUncovered` before anything is written.
+  Streams of other types in a commit are left out of the replayed view. A stream of those types
+  whose history doesn't run from sequence 1 to its head (compacted, or a tail that retention's TTL
+  deleted) fails the run with `CompactionUncovered` before anything is written.
 - Conditions aren't evaluated, so the run can go over existing rows, and running it twice is safe.
   It doesn't delete rows nothing produces any more, so wipe them first to rebuild from scratch.
 - It holds every row in memory, and needs strongly consistent reads of the log.
 - `operations()` is a dry run that returns what `run` would write, without taking the lock.
-- A failure before the first write releases the lock and leaves the rows alone. Once a write was
-  attempted, a failure keeps the lock until a retry takes over the lapsed lease. The journal has
+- A failure before the first write leaves the rows alone, and releases the lock if the run acquired
+  it from a settled generation. Once a write was attempted, a failure keeps the lock until a retry
+  takes over the lapsed lease. A run that took over a lapsed lease, or acquired after a
+  force-release, keeps the lock on any failure, since the rows may still be half-written from the
+  earlier run; only a rebuild that completes releases it. The journal has
   its own rebuild (`journal::rebuild_with_lock`), and its projector is refused here.
 
 ## Enumerating the log

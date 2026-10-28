@@ -320,13 +320,56 @@ async fn a_history_dependent_replay_of_a_compacted_stream_fails_and_releases_the
     );
 }
 
+#[tokio::test]
+async fn a_history_dependent_replay_refuses_a_stream_whose_tail_expired() {
+    let probe = Probe::new(MemRepository::new());
+    let store = Store::<Ledger, _>::new(&probe.inner, ()).with_snapshot_interval(3);
+    add(&store, "l-1", &[1, 2, 3]).await;
+    add(&store, "l-2", &[5]).await;
+    // TTL deleted events 2 and 3 of l-1 but not yet event 1 or the snapshot at 3, so its head is
+    // still 3 while its remaining history starts at 1.
+    probe.expired.lock().unwrap().extend([
+        (EntityId::new("l-1"), EventSequence(2)),
+        (EntityId::new("l-1"), EventSequence(3)),
+    ]);
+
+    let error = ProjectionRebuild::new(&probe)
+        .with_projector(Feed::arc("rebuilt"))
+        .aggregate::<Ledger>()
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            Error::CompactionUncovered { entity_id, through, covered }
+                if entity_id.as_str() == "l-1"
+                    && *through == EventSequence(3)
+                    && *covered == Some(EventSequence(3))
+        ),
+        "{error:?}"
+    );
+    assert!(
+        probe.writes.lock().unwrap().is_empty(),
+        "nothing is written from the state at sequence 1"
+    );
+    assert!(
+        probe.inner.rebuild_generation().await.unwrap().is_settled(),
+        "a run that wrote nothing releases the lock it acquired"
+    );
+}
+
 /// A [`MemRepository`] that records, at every guarded write, its batch size, whether the lock was
 /// held, and whether a commit was refused, and can fail the `n`th write (1-based, 0 for none)
-/// after applying it, as an ambiguous write does.
+/// after applying it, as an ambiguous write does. Events listed in `expired` are left out of the
+/// log enumeration, as DynamoDB's TTL deletes them: lazily and in no order, so the stream's head
+/// (its snapshot) can outlive them.
 struct Probe {
     inner: MemRepository,
     writes: Mutex<Vec<(usize, bool, bool)>>,
     fail_write: std::sync::atomic::AtomicUsize,
+    expired: Mutex<Vec<(EntityId, EventSequence)>>,
 }
 
 impl Probe {
@@ -335,6 +378,7 @@ impl Probe {
             inner,
             writes: Mutex::new(Vec::new()),
             fail_write: Default::default(),
+            expired: Mutex::new(Vec::new()),
         }
     }
 }
@@ -401,7 +445,24 @@ impl EventLog for Probe {
         &self,
         filter: StreamFilter,
     ) -> impl Stream<Item = crate::EventBatch> + Send {
-        self.inner.stream_all_events(filter)
+        let expired = self.expired.lock().unwrap().clone();
+        let inner: BoxStream<'_, crate::EventBatch> =
+            Box::pin(self.inner.stream_all_events(filter));
+
+        unfold((inner, expired), |(mut inner, expired)| async move {
+            let batch = poll_fn(|cx| inner.as_mut().poll_next(cx))
+                .await?
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .filter(|event| {
+                            !expired.contains(&(event.entity_id.clone(), event.sequence))
+                        })
+                        .collect()
+                });
+
+            Some((batch, (inner, expired)))
+        })
     }
 }
 
@@ -578,6 +639,122 @@ async fn a_projector_error_is_found_before_any_write_and_releases_the_lock() {
         "every row is computed before the first is written"
     );
     assert!(repository.rebuild_generation().await.unwrap().is_settled());
+}
+
+#[tokio::test]
+async fn a_run_that_took_over_a_half_written_rebuild_keeps_the_fence_when_it_fails_before_writing()
+{
+    let clock = TestClock::at(1_000_000);
+    let repository = MemRepository::new().with_clock(clock.reader());
+    ledgers(&repository, 3).await;
+    let failing = || {
+        ProjectionRebuild::new(&repository)
+            .with_projector(Arc::new(Totals {
+                pk: "totals",
+                fail_on: Some("l-001"),
+            }))
+            .aggregate::<Ledger>()
+    };
+    let fenced = |what: &'static str| {
+        let repository = &repository;
+        async move {
+            let state = repository.rebuild_state().await.unwrap();
+            assert!(
+                state.in_progress() && !state.generation.is_settled(),
+                "{what}: the fence is kept, {state:?}"
+            );
+            let refused = Store::<Ledger, _>::new(repository, ())
+                .execute("l-000", Add(1), Metadata::default())
+                .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(crate::ExecuteError::Store(Error::RebuildInProgress))
+                ),
+                "{what}: commits stay refused, {refused:?}"
+            );
+        }
+    };
+
+    // An earlier rebuild wrote part of its rows and died: they are half-written.
+    let crashed = repository.begin_rebuild("crashed", LEASE).await.unwrap();
+    repository
+        .write_rebuild_views(
+            &crashed,
+            &[ProjectedView::new(
+                "totals",
+                0,
+                0,
+                ViewOperation::put("totals", "l-000", "l-000", "ledger", "{}"),
+            )],
+        )
+        .await
+        .unwrap();
+    clock.advance(LEASE.as_secs() + 1);
+
+    // A retry takes over the lapsed lease and fails before its own first write. Releasing would
+    // settle the generation over the crashed run's rows.
+    let error = failing().run("retry", LEASE).await.unwrap_err();
+    assert!(matches!(error, Error::Projector(_)), "{error:?}");
+    fenced("after a takeover").await;
+    assert_eq!(
+        repository
+            .rebuild_state()
+            .await
+            .unwrap()
+            .lock
+            .unwrap()
+            .owner,
+        "retry"
+    );
+
+    // The same after an operator force-releases it: the run acquires from the force-released
+    // generation and keeps it.
+    repository.force_release_rebuild("retry").await.unwrap();
+    let error = failing().run("after-force", LEASE).await.unwrap_err();
+    assert!(matches!(error, Error::Projector(_)), "{error:?}");
+    fenced("after a force-release").await;
+
+    // Only a rebuild that completes settles the generation.
+    clock.advance(LEASE.as_secs() + 1);
+    ProjectionRebuild::new(&repository)
+        .with_projector(Totals::arc("totals"))
+        .aggregate::<Ledger>()
+        .run("recovery", LEASE)
+        .await
+        .unwrap();
+    let generation = repository.rebuild_generation().await.unwrap();
+    assert!(
+        generation.is_settled() && !generation.force_released,
+        "{generation:?}"
+    );
+    assert_eq!(
+        rows(&repository, "totals").await[0].2,
+        br#"{"total":1,"entries":1}"#.to_vec(),
+        "the crashed run's row is rebuilt"
+    );
+}
+
+#[test]
+fn only_a_lease_one_past_a_settled_generation_was_acquired_from_it() {
+    let lease = |generation| RebuildLease {
+        owner: "w".into(),
+        generation,
+        lease_expires_at: 0,
+    };
+    let generation = |value, force_released| RebuildGeneration {
+        value,
+        force_released,
+    };
+
+    assert!(acquired_from_settled(generation(4, false), &lease(5)));
+    assert!(acquired_from_settled(generation(0, false), &lease(1)));
+    // A takeover of 3, or an acquire from a force-released 3, produces 5.
+    assert!(!acquired_from_settled(generation(3, false), &lease(5)));
+    assert!(!acquired_from_settled(generation(3, true), &lease(5)));
+    // Another rebuild began and ended between the read and the begin, or began and was taken
+    // over: not provably from the generation read, so the fence is kept.
+    assert!(!acquired_from_settled(generation(4, false), &lease(7)));
 }
 
 /// A current-state projector that writes one row of `size` payload bytes per stream, and, when

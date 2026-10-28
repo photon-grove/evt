@@ -1722,31 +1722,63 @@ async fn engine_retry<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseRes
     Ok(())
 }
 
-/// Runs the projection rebuild case ([`ProjectionRebuild`], v0.9 P4 and P11) against a repository
-/// that keeps the rebuild fence, reads `clock`, enumerates its log, and writes views that `views`
-/// reads back. Like [`RebuildSuite`], it settles the fence before and after, so run it on a table no
-/// concurrent test commits to; it panics if the case fails.
+/// Runs the projection rebuild cases ([`ProjectionRebuild`], v0.9 P4 and P11) against a
+/// repository that keeps the rebuild fence, reads `clock`, enumerates its log, and writes views
+/// that `views` reads back. Like [`RebuildSuite`], it settles the fence before and after each case,
+/// so run it on a table no concurrent test commits to; it panics if a case fails.
 pub async fn projection_rebuild_cases<R, T>(repo: &R, clock: &TestClock, views: &T)
 where
     R: Repository + RebuildFence + EventLog,
     T: CommitViewTarget<R>,
 {
-    let env = Env {
+    let mut failures = Vec::new();
+    let env = || Env {
         repo,
         clock,
         ns: namespace(),
         leases: Mutex::new(BTreeMap::new()),
     };
-    let name = "a projection rebuild replays commit-wide projectors under the lock, seeding \
-                compacted streams from their snapshots";
 
-    let result = match env.settle().await {
-        Ok(()) => Box::pin(projection_rebuild(&env, views)).await,
+    let replay = env();
+    let result = match replay.settle().await {
+        Ok(()) => Box::pin(projection_rebuild(&replay, views)).await,
         Err(failure) => Err(failure),
     };
-    let cleanup = env.settle().await;
+    record_projection_case(
+        &mut failures,
+        "a projection rebuild replays commit-wide projectors under the lock, seeding compacted \
+         streams from their snapshots",
+        result,
+        replay.settle().await,
+    );
 
-    let mut failures = Vec::new();
+    let recovery = env();
+    let result = match recovery.settle().await {
+        Ok(()) => Box::pin(failed_recovery(&recovery, views)).await,
+        Err(failure) => Err(failure),
+    };
+    record_projection_case(
+        &mut failures,
+        "a projection rebuild that took over a half-written rebuild, or acquired after a \
+         force-release, keeps the fence when it fails before writing",
+        result,
+        recovery.settle().await,
+    );
+
+    if !failures.is_empty() {
+        panic!(
+            "projection rebuild cases failed:\n\n{}",
+            failures.join("\n\n")
+        );
+    }
+}
+
+fn record_projection_case(
+    failures: &mut Vec<String>,
+    name: &str,
+    result: CaseResult,
+    cleanup: CaseResult,
+) {
     match result {
         Ok(()) => println!("ok   {name}"),
         Err(Failure(message)) => {
@@ -1755,13 +1787,7 @@ where
         }
     }
     if let Err(Failure(message)) = cleanup {
-        failures.push(format!("cleanup: {message}"));
-    }
-    if !failures.is_empty() {
-        panic!(
-            "projection rebuild case failed:\n\n{}",
-            failures.join("\n\n")
-        );
+        failures.push(format!("{name}: cleanup: {message}"));
     }
 }
 
@@ -1939,6 +1965,108 @@ where
             format!("the replayed commit ending at {last}")
         );
     }
+
+    Ok(())
+}
+
+/// A projector whose every run fails, so a rebuild fails before its first write.
+struct FailingRows;
+
+impl CommitProjector for FailingRows {
+    fn name(&self) -> &str {
+        "failing-rows"
+    }
+
+    fn project(&self, _: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+        Err("this projector always fails".into())
+    }
+}
+
+/// A run that takes over an expired lease, or acquires after a force-release, may start from rows
+/// an earlier rebuild half-wrote. If it then fails before its own first write it must keep the
+/// fence: only a rebuild that completes settles the generation.
+async fn failed_recovery<R, T>(env: &Env<'_, R>, views: &T) -> CaseResult
+where
+    R: Repository + RebuildFence + EventLog,
+    T: CommitViewTarget<R>,
+{
+    let repo = env.repo;
+    let stream = Stream::new(&env.ns, "recovered", "recovery-ledger");
+    stream.commit(repo, stream.events(1..=1), None).await?;
+    let pk = format!("{}#recovery-rows", env.ns);
+    let failing = || {
+        ProjectionRebuild::new(repo)
+            .with_projector(Arc::new(FailingRows))
+            .aggregate_as::<Ledger>(stream.entity_type.clone())
+    };
+    let fenced = |what: &'static str, owner: String| async move {
+        let state = repo.rebuild_state().await?;
+        ensure!(
+            !state.generation.is_settled()
+                && state.lock.as_ref().is_some_and(|lock| lock.owner == owner),
+            "{what}: the run keeps the fence, {state:?}"
+        );
+        refused(env.commit(what).await, what)
+    };
+
+    // An earlier rebuild wrote part of its rows, then died.
+    env.begin("crashed", 10).await?;
+    repo.write_rebuild_views(
+        &env.lease("crashed"),
+        &[ProjectedView::new(
+            "crashed",
+            0,
+            0,
+            ViewOperation::put(pk.clone(), stream.id.as_str(), stream.id.as_str(), "", "{}"),
+        )],
+    )
+    .await?;
+    env.clock.advance(11);
+
+    // A retry takes over the lapsed lease and fails before its own first write.
+    expect_err(
+        failing()
+            .run(&env.owner("retry"), Duration::from_secs(60))
+            .await,
+        "the retry after a takeover",
+        |error| matches!(error, Error::Projector(_)),
+    )?;
+    fenced("after-takeover", env.owner("retry")).await?;
+
+    // The same after an operator force-releases it.
+    repo.force_release_rebuild(&env.owner("retry")).await?;
+    expect_err(
+        failing()
+            .run(&env.owner("after-force"), Duration::from_secs(60))
+            .await,
+        "the retry after a force-release",
+        |error| matches!(error, Error::Projector(_)),
+    )?;
+    fenced("after-force-release", env.owner("after-force")).await?;
+
+    // A rebuild that completes settles the generation, and commits land again.
+    env.clock.advance(61);
+    ProjectionRebuild::new(repo)
+        .with_projector(Arc::new(StateRows { pk: pk.clone() }))
+        .aggregate_as::<Ledger>(stream.entity_type.clone())
+        .run(&env.owner("recovery"), Duration::from_secs(60))
+        .await?;
+    let settled = env.generation().await?;
+    ensure!(
+        settled.is_settled() && !settled.force_released,
+        "the completed rebuild settles: {settled:?}"
+    );
+    let row = views
+        .row(&pk, stream.id.as_str())
+        .await
+        .map_err(|err| Failure(err.to_string()))?
+        .map(|row| String::from_utf8_lossy(&row.payload).into_owned());
+    ensure_eq!(
+        row,
+        Some(r#"{"total":1,"entries":1}"#.to_owned()),
+        "the crashed run's row is rebuilt"
+    );
+    env.commit("after-recovery").await?;
 
     Ok(())
 }
