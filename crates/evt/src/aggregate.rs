@@ -71,6 +71,15 @@ pub trait Aggregate: Default + Serialize + DeserializeOwned + Send + Sync + 'sta
     /// The stored entity type, such as `account`.
     const TYPE: &'static str;
 
+    /// This aggregate type's own snapshot interval: the number of events between snapshots, with
+    /// `Some(0)` disabling snapshots for the type. `None` (the default) uses the interval of the
+    /// [`Store`](crate::Store) or [`Transaction`](crate::Transaction) that commits it.
+    ///
+    /// When set, it overrides that interval wherever this type is committed, including streams of
+    /// it appended in a transaction of another store, as Go's per-type
+    /// `snapshots.Store.WithSnapshotSize` overrides the store's default size.
+    const SNAPSHOT_INTERVAL: Option<usize> = None;
+
     /// The commands this aggregate handles. Usually an enum.
     type Command: Send;
 

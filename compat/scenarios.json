@@ -369,6 +369,90 @@
       ]
     },
     {
+      "name": "latest-n",
+      "description": "Both languages read the newest n events of a stream newest-first by sequence, never the snapshot item, before and after compaction.",
+      "snapshotInterval": 2,
+      "steps": [
+        {"by": "go", "op": "execute", "commandId": "c1", "command": {"type": "open", "owner": "Mary Jackson"}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c2", "command": {"type": "deposit", "amountCents": 100}, "expect": {"result": "ok", "events": 1}},
+        {"by": "go", "op": "execute", "commandId": "c3", "command": {"type": "deposit", "amountCents": 200}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c4", "command": {"type": "deposit", "amountCents": 300}, "expect": {"result": "ok", "events": 1}},
+        {"by": "go", "op": "execute", "commandId": "c5", "command": {"type": "deposit", "amountCents": 400}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "readLatest", "n": 3, "expect": {"result": "ok", "events": 3, "sequences": [5, 4, 3]}},
+        {"by": "go", "op": "readLatest", "n": 3, "expect": {"result": "ok", "events": 3, "sequences": [5, 4, 3]}},
+        {"by": "go", "op": "readLatest", "n": 10, "expect": {"result": "ok", "events": 5, "sequences": [5, 4, 3, 2, 1]}},
+        {"by": "rust", "op": "compact", "through": 2, "expect": {"result": "compacted", "deleted": 2}},
+        {"by": "go", "op": "readLatest", "n": 10, "expect": {"result": "ok", "events": 3, "sequences": [5, 4, 3]}},
+        {"by": "rust", "op": "readLatest", "n": 2, "expect": {"result": "ok", "events": 2, "sequences": [5, 4]}}
+      ]
+    },
+    {
+      "name": "reserved-namespaces",
+      "description": "Commits, out-of-band snapshots, and transactions into SYSTEM# or command-outcome# are refused before any write in both languages; enumeration and entity heads skip the outcome rows either language wrote.",
+      "snapshotInterval": 0,
+      "outcomes": true,
+      "steps": [
+        {"by": "go", "op": "execute", "commandId": "c1", "command": {"type": "open", "owner": "Annie Easley"}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c2", "command": {"type": "deposit", "amountCents": 100}, "expect": {"result": "ok", "events": 1}},
+        {"by": "go", "op": "appendRaw", "commandId": "c3", "entityPrefix": "SYSTEM#", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":null}"}, "expect": {"result": "reserved"}},
+        {"by": "rust", "op": "appendRaw", "commandId": "c4", "entityPrefix": "command-outcome#", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":null}"}, "expect": {"result": "reserved"}},
+        {"by": "go", "op": "putSnapshot", "entityPrefix": "command-outcome#", "snapshot": {"sequence": 1, "payload": "{}"}, "eventSequence": 1, "expect": {"result": "reserved"}},
+        {"by": "rust", "op": "putSnapshot", "entityPrefix": "SYSTEM#", "snapshot": {"sequence": 1, "payload": "{}"}, "eventSequence": 1, "expect": {"result": "reserved"}},
+        {"by": "go", "op": "transaction", "commandId": "c5", "streams": [{"suffix": "", "sequence": 3, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":5,\"memo\":null}"}]}, {"suffix": "", "entityPrefix": "SYSTEM#", "sequence": 1, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":5,\"memo\":null}"}]}], "expect": {"result": "reserved"}},
+        {"by": "rust", "op": "transaction", "commandId": "c6", "streams": [{"suffix": "", "sequence": 3, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":6,\"memo\":null}"}]}, {"suffix": "", "entityPrefix": "command-outcome#", "sequence": 1, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":6,\"memo\":null}"}]}], "expect": {"result": "reserved"}},
+        {"by": "go", "op": "enumerate", "expect": {"result": "ok", "events": 2}},
+        {"by": "rust", "op": "enumerate", "expect": {"result": "ok", "events": 2}},
+        {"by": "go", "op": "execute", "commandId": "c7", "command": {"type": "deposit", "amountCents": 50}, "expect": {"result": "ok", "events": 1}}
+      ]
+    },
+    {
+      "name": "commit-too-large",
+      "description": "A commit over the 100-action budget (counting the marker check, the rebuild-lock check, the head update, the events, and the projector operations), with one item over 380,000 bytes, or over 3,800,000 bytes in all, fails with CommitTooLarge before any write in both languages; a commit at the action limit is written whole.",
+      "snapshotInterval": 0,
+      "steps": [
+        {"by": "go", "op": "execute", "commandId": "c1", "command": {"type": "open", "owner": "Dorothy Vaughan"}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "transaction", "commandId": "c2", "streams": [{"suffix": "", "sequence": 2, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":null}"}]}], "projectors": [{"name": "budget", "operations": [{"op": "put", "pk": "{id}-budget", "sk": "{n}", "owner": "{id}", "entityType": "account", "payload": "{\"n\":\"{n}\"}", "repeat": 97}]}], "expect": {"result": "commitTooLarge"}},
+        {"by": "go", "op": "transaction", "commandId": "c3", "streams": [{"suffix": "", "sequence": 2, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":null}"}]}], "projectors": [{"name": "budget", "operations": [{"op": "put", "pk": "{id}-budget", "sk": "{n}", "owner": "{id}", "entityType": "account", "payload": "{\"n\":\"{n}\"}", "repeat": 97}]}], "expect": {"result": "commitTooLarge"}},
+        {"by": "go", "op": "transaction", "commandId": "c4", "streams": [{"suffix": "", "sequence": 2, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 390000}]}], "expect": {"result": "commitTooLarge"}},
+        {"by": "rust", "op": "transaction", "commandId": "c5", "streams": [{"suffix": "", "sequence": 2, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 390000}]}], "expect": {"result": "commitTooLarge"}},
+        {"by": "rust", "op": "transaction", "commandId": "c6", "streams": [{"suffix": "", "sequence": 2, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}]}], "expect": {"result": "commitTooLarge"}},
+        {"by": "go", "op": "transaction", "commandId": "c7", "streams": [{"suffix": "", "sequence": 2, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"{pad}\"}", "pad": 360000}]}], "expect": {"result": "commitTooLarge"}},
+        {"by": "go", "op": "transaction", "commandId": "c8", "streams": [{"suffix": "", "sequence": 2, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":null}"}]}], "projectors": [{"name": "budget", "operations": [{"op": "put", "pk": "{id}-budget", "sk": "{n}", "owner": "{id}", "entityType": "account", "payload": "{\"n\":\"{n}\"}", "repeat": 96}]}], "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c9", "command": {"type": "deposit", "amountCents": 10}, "expect": {"result": "ok", "events": 1}}
+      ]
+    },
+    {
+      "name": "fence-aware-retry",
+      "description": "Multi-stream commands under fence-aware retry, interleaved: an engine-filled conflict re-prepares and only the committing attempt writes; a failed caller-stamped fence is a stale-fence rejection at once; a conflict on a written stream beside a valid caller-stamped fence re-prepares; exhausted attempts persist the stale-fence rejection; a write set that changes between attempts keeps one identity. The other language replays each outcome.",
+      "snapshotInterval": 0,
+      "outcomes": true,
+      "steps": [
+        {"by": "go", "op": "execute", "commandId": "c1", "command": {"type": "open", "owner": "Christine Darden"}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "executeTransaction", "commandId": "c2", "identity": {"type": "account:copy", "payload": {"case": "engine"}}, "attempts": 3, "reads": ["watched"], "writes": [{"suffix": "", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":100,\"memo\":null}"}}], "interfere": {"suffix": "watched", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"interference\"}"}, "times": 1}, "expect": {"result": "ok", "events": 1, "prepares": 2}},
+        {"by": "go", "op": "executeTransaction", "commandId": "c2", "identity": {"type": "account:copy", "payload": {"case": "engine"}}, "attempts": 3, "reads": ["watched"], "writes": [{"suffix": "", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":100,\"memo\":null}"}}], "expect": {"result": "ok", "events": 1, "replayed": true}},
+        {"by": "go", "op": "executeTransaction", "commandId": "c3", "identity": {"type": "account:copy", "payload": {"case": "stale-caller"}}, "attempts": 3, "fences": [{"suffix": "watched", "head": 0, "callerStamped": true}], "writes": [{"suffix": "", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":200,\"memo\":null}"}}], "expect": {"result": "rejected", "code": "stale-fence", "prepares": 1}},
+        {"by": "rust", "op": "executeTransaction", "commandId": "c3", "identity": {"type": "account:copy", "payload": {"case": "stale-caller"}}, "attempts": 3, "fences": [{"suffix": "watched", "head": 0, "callerStamped": true}], "writes": [{"suffix": "", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":200,\"memo\":null}"}}], "expect": {"result": "rejected", "code": "stale-fence", "replayed": true}},
+        {"by": "rust", "op": "executeTransaction", "commandId": "c4", "identity": {"type": "account:copy", "payload": {"case": "caller-holds"}}, "attempts": 3, "fences": [{"suffix": "watched", "head": 1, "callerStamped": true}], "writes": [{"suffix": "", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":300,\"memo\":null}"}}], "interfere": {"suffix": "", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"interference\"}"}, "times": 1}, "expect": {"result": "ok", "events": 1, "prepares": 2}},
+        {"by": "go", "op": "executeTransaction", "commandId": "c5", "identity": {"type": "account:copy", "payload": {"case": "exhausted"}}, "attempts": 2, "reads": ["watched"], "writes": [{"suffix": "", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":400,\"memo\":null}"}}], "interfere": {"suffix": "watched", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"interference\"}"}, "times": 2}, "expect": {"result": "rejected", "code": "stale-fence", "prepares": 2}},
+        {"by": "rust", "op": "executeTransaction", "commandId": "c5", "identity": {"type": "account:copy", "payload": {"case": "exhausted"}}, "attempts": 2, "reads": ["watched"], "writes": [{"suffix": "", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":400,\"memo\":null}"}}], "expect": {"result": "rejected", "code": "stale-fence", "replayed": true}},
+        {"by": "rust", "op": "executeTransaction", "commandId": "c6", "identity": {"type": "account:copy", "payload": {"case": "rename"}}, "attempts": 3, "reads": ["watched"], "writes": [{"suffix": "first", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":10,\"memo\":null}"}}], "retryWrites": [{"suffix": "second", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":20,\"memo\":null}"}}], "interfere": {"suffix": "watched", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":\"interference\"}"}, "times": 1}, "expect": {"result": "ok", "events": 1, "prepares": 2}},
+        {"by": "go", "op": "executeTransaction", "commandId": "c6", "identity": {"type": "account:copy", "payload": {"case": "rename"}}, "attempts": 3, "reads": ["watched"], "writes": [{"suffix": "first", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":10,\"memo\":null}"}}], "retryWrites": [{"suffix": "second", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":20,\"memo\":null}"}}], "expect": {"result": "ok", "events": 1, "replayed": true}}
+      ]
+    },
+    {
+      "name": "commit-grouping",
+      "description": "Every event of a multi-stream commit carries one commitId in both languages, and both regroup the streams into the same commits in the same replay order, each stream's events by sequence; an event with no commitId replays as a commit of its own.",
+      "snapshotInterval": 0,
+      "steps": [
+        {"by": "go", "op": "execute", "commandId": "c1", "command": {"type": "open", "owner": "Gladys West"}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "transaction", "commandId": "c2", "streams": [{"suffix": "", "sequence": 2, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":100,\"memo\":null}"}]}, {"suffix": "ledger", "sequence": 1, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":10,\"memo\":null}"}, {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":11,\"memo\":null}"}]}], "expect": {"result": "ok", "events": 3}},
+        {"by": "go", "op": "appendRaw", "suffix": "ledger", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":12,\"memo\":\"legacy\"}"}, "expect": {"result": "ok", "events": 1}},
+        {"by": "go", "op": "transaction", "commandId": "c3", "streams": [{"suffix": "other", "sequence": 1, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":1,\"memo\":null}"}]}, {"suffix": "ledger", "sequence": 4, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":13,\"memo\":null}"}]}, {"suffix": "", "sequence": 3, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":200,\"memo\":null}"}]}], "expect": {"result": "ok", "events": 3}},
+        {"by": "rust", "op": "groupCommits", "reads": ["ledger", "other"], "expect": {"result": "ok", "events": 8, "groups": ["c1 :1", "compat-rust-c2 :2 ledger:1 ledger:2", "- ledger:3", "compat-go-c3 :3 ledger:4 other:1"]}},
+        {"by": "go", "op": "groupCommits", "reads": ["ledger", "other"], "expect": {"result": "ok", "events": 8, "groups": ["c1 :1", "compat-rust-c2 :2 ledger:1 ledger:2", "- ledger:3", "compat-go-c3 :3 ledger:4 other:1"]}}
+      ]
+    },
+    {
       "name": "rebuild-fence",
       "exclusive": true,
       "description": "The durable rebuild fence (C10). While one language holds SYSTEM#REBUILD the other's commit fails with RebuildInProgress and writes nothing, its Begin is RebuildLockHeld, and its reader epoch check sees an odd generation. End settles the generation (even) and commits resume. A takeover of an expired lease bumps the generation by two and leaves it odd, and the displaced worker's renew and guarded view write are RebuildLeaseLost and write no row. A force-release ends the lease but leaves the generation odd and flagged: commits stay refused with RebuildInProgress and readers stay fenced, until a later Begin and End settle it and clear the flag, and the refused command then commits.",
@@ -405,6 +489,35 @@
         {"by": "go", "op": "rebuild", "action": "generation", "expect": {"result": "settled", "delta": 0}},
         {"by": "rust", "op": "execute", "commandId": "c4", "command": {"type": "deposit", "amountCents": 7}, "expect": {"result": "ok", "events": 1}},
         {"by": "go", "op": "execute", "commandId": "c3", "command": {"type": "deposit", "amountCents": 5}, "expect": {"result": "ok", "events": 1}}
+      ]
+    },
+    {
+      "name": "feature-marker",
+      "description": "Each declaration bumps the marker version by one, and the other language revalidates against it: a declared pair neither writer models, or a bumped stream-heads format, refuses every commit until it is retracted; the durable retention set refuses fences and the historyDependent set refuses compaction for a writer that configured neither. Exclusive: a declaration refuses every other scenario's commits.",
+      "snapshotInterval": 2,
+      "exclusive": true,
+      "steps": [
+        {"by": "go", "op": "execute", "commandId": "c1", "command": {"type": "open", "owner": "Katherine Goble"}, "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c2", "command": {"type": "deposit", "amountCents": 100}, "expect": {"result": "ok", "events": 1}},
+        {"by": "go", "op": "declare", "features": {"compat-unsupported": 1}, "expect": {"result": "ok", "delta": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c3", "command": {"type": "deposit", "amountCents": 200}, "expect": {"result": "unsupported"}},
+        {"by": "go", "op": "execute", "commandId": "c4", "command": {"type": "deposit", "amountCents": 300}, "expect": {"result": "unsupported"}},
+        {"by": "rust", "op": "declare", "features": {"compat-unsupported": 1}, "retract": true, "expect": {"result": "ok", "delta": 1}},
+        {"by": "go", "op": "execute", "commandId": "c5", "command": {"type": "deposit", "amountCents": 500}, "expect": {"result": "ok", "events": 1}},
+        {"by": "go", "op": "declare", "features": {"stream-heads": 2}, "expect": {"result": "ok", "delta": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c6", "command": {"type": "deposit", "amountCents": 600}, "expect": {"result": "unsupported"}},
+        {"by": "go", "op": "appendRaw", "commandId": "c7", "event": {"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":7,\"memo\":null}"}, "expect": {"result": "unsupported"}},
+        {"by": "rust", "op": "declare", "features": {"stream-heads": 1}, "expect": {"result": "ok", "delta": 1}},
+        {"by": "rust", "op": "execute", "commandId": "c8", "command": {"type": "deposit", "amountCents": 800}, "expect": {"result": "ok", "events": 1}},
+        {"by": "go", "op": "declare", "retention": ["retained-{id}"], "expect": {"result": "ok", "delta": 1}},
+        {"by": "rust", "op": "transaction", "commandId": "c9", "streams": [{"suffix": "", "sequence": 5, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":5,\"memo\":null}"}]}], "fences": [{"suffix": "retained", "head": 0, "entityType": "retained-{id}"}], "expect": {"result": "retentionConflict"}},
+        {"by": "go", "op": "transaction", "commandId": "c10", "streams": [{"suffix": "", "sequence": 5, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":5,\"memo\":null}"}]}], "fences": [{"suffix": "retained", "head": 0, "entityType": "retained-{id}"}], "expect": {"result": "retentionConflict"}},
+        {"by": "rust", "op": "declare", "retention": ["retained-{id}"], "retract": true, "expect": {"result": "ok", "delta": 1}},
+        {"by": "go", "op": "transaction", "commandId": "c11", "streams": [{"suffix": "", "sequence": 5, "events": [{"type": "account:deposited", "version": 1, "payload": "{\"amountCents\":5,\"memo\":null}"}]}], "fences": [{"suffix": "retained", "head": 0, "entityType": "retained-{id}"}], "expect": {"result": "ok", "events": 1}},
+        {"by": "rust", "op": "declare", "historyDependent": ["account"], "expect": {"result": "ok", "delta": 1}},
+        {"by": "go", "op": "compact", "through": 2, "expect": {"result": "historyDependent"}},
+        {"by": "go", "op": "declare", "historyDependent": ["account"], "retract": true, "expect": {"result": "ok", "delta": 1}},
+        {"by": "rust", "op": "compact", "through": 2, "expect": {"result": "compacted", "deleted": 2}}
       ]
     }
   ]

@@ -24,6 +24,9 @@
 //!   `high_watermark` / `page` reads that detect gaps.
 //! - Bound log growth with [`Repository::compact_below`], which only deletes events a durable
 //!   snapshot covers.
+//! - Tune snapshots per type with [`Aggregate::SNAPSHOT_INTERVAL`], and have loads of long tails
+//!   write catch-up snapshots with [`Store::with_catch_up_snapshot_threshold`]. Every load reports
+//!   `events_replayed` and `snapshot_seq` in a `tracing` span.
 //! - Fence projection rebuilds durably with [`RebuildFence`]: while a rebuild holds the lock every
 //!   commit is refused with [`Error::RebuildInProgress`], and readers check a [`RebuildEpoch`].
 //! - Rebuild commit-wide projections from the log with [`ProjectionRebuild`], under that fence,

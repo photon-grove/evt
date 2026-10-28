@@ -252,6 +252,11 @@ func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) 
 	repo := dynamo.NewRepository(fake, fakeTable).WithLazyInitialization(true).WithViewsTable(ViewsTable).
 		WithClock(func() time.Time { return time.Unix(now, 0) })
 
+	// Declarations go through the marker the repository validates against, so a declare step also
+	// refreshes the writer's cached validation.
+	marker := repo.FeatureMarker(nil)
+	repo = repo.WithFeatureMarker(marker)
+
 	var runner Runner
 
 	if scenario.Outcomes {
@@ -270,6 +275,7 @@ func newFakeRunner(scenario Scenario) (Runner, *FakeDynamo, *dynamo.Repository) 
 		},
 		Rows: func(_ context.Context, pk string) (int, error) { return len(fake.Views(pk)), nil },
 	}
+	runner.Marker = &MarkerDriver{Declare: marker.Declare, Manifest: marker.Manifest}
 
 	return runner, fake, repo
 }
@@ -402,7 +408,7 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 			if err != nil {
 				return fixtures, fmt.Errorf("%s step %d: %w", scenario.Name, index, err)
 			}
-			if outcome != step.Expect {
+			if !outcome.Equal(step.Expect) {
 				return fixtures, fmt.Errorf("%s step %d: got %s, want %s", scenario.Name, index, outcome, step.Expect)
 			}
 
@@ -492,7 +498,8 @@ func GenerateScenarioFixtures(ctx context.Context, scenarios Scenarios) (Scenari
 // is validated before the first write.
 func refusedBeforeWrite(result string) bool {
 	switch result {
-	case ResultViewKeyTooLong, ResultDuplicateViewKey, ResultProjectorOnly:
+	case ResultViewKeyTooLong, ResultDuplicateViewKey, ResultProjectorOnly, ResultCommitTooLarge, ResultReserved,
+		ResultRetentionConflict, ResultUnsupported:
 		return true
 	}
 

@@ -437,6 +437,33 @@ catches the repeat while the first run's events are after the latest snapshot: i
 wrote a snapshot, the reloaded entity no longer sees the ID, and running the command again applies
 it twice.
 
+## Snapshots and load telemetry
+
+A commit snapshots when it reaches the next multiple of the snapshot interval, 5 by default.
+`Store::with_snapshot_interval` sets the store's interval, which its transactions inherit. An
+aggregate type can declare its own, which wins wherever that type is committed, like Go's
+per-type `WithSnapshotSize`:
+
+```rust,ignore
+impl Aggregate for Account {
+    const TYPE: &'static str = "account";
+    const SNAPSHOT_INTERVAL: Option<usize> = Some(50); // Some(0) never snapshots this type
+    // ...
+}
+```
+
+A stream that is read far more often than written can still replay a long tail on every load.
+`Store::with_catch_up_snapshot_threshold(n)` (off by default, like Go's
+`WithCatchUpSnapshotThreshold`) has a load that replays at least `n` events write the state it
+folded as the next snapshot. The write never lowers a stored snapshot, and it is best effort: a
+failure is a `tracing` warning, and the load still returns. The store's loads, its execute paths and
+its transactions' reads all catch up.
+
+Every load runs in a `DEBUG` `tracing` span named `load` with `entity_type`, `entity_id`,
+`sequence`, `snapshot_seq` (the snapshot the load started from, 0 without one) and
+`events_replayed`. Alert on `events_replayed` to find streams that need a smaller interval or a
+catch-up threshold.
+
 ## Backends
 
 For DynamoDB, enable the `dynamodb` feature and bring your own `aws_sdk_dynamodb::Client`. The crate disables the

@@ -35,6 +35,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 futures-core.workspace = true
+# Structured load telemetry (`events_replayed`, `snapshot_seq`) and catch-up snapshot warnings.
+tracing.workspace = true
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
 # The timer behind recovery polling (`Repository::backoff`); the PostgreSQL feature already needs Tokio.

@@ -497,6 +497,13 @@ error before any write and is never split.
   full batch length
 - When a snapshot is taken it captures the entity state through the **last** event in the batch, so
   `eventSeq` always equals that last event's sequence and the payload is consistent with it
+- A per-type size overrides the default wherever the type is committed (Go
+  `Store.WithSnapshotSize`, Rust `Aggregate::SNAPSHOT_INTERVAL`, where `Some(0)` disables the
+  type's snapshots)
+- Catch-up (Go `WithCatchUpSnapshotThreshold`, Rust `with_catch_up_snapshot_threshold`, off by
+  default): a load that replays at least the threshold writes a standalone, monotonic snapshot of
+  the folded state at sequence `seq + 1`; a failed write is logged and never fails the load. Rust's
+  loaded state then carries the new `seq`; Go's does not
 
 ### Snapshot Creation
 

@@ -7,7 +7,7 @@ Rust `photon-evt` crate wire-compatible. The contract itself is
 
 | Path                      | Written by   | Contents                                                                                                                                                                                              |
 | ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes the metadata-extensions handoff (`metadata-extensions`) and the rebuild-fence scenario (`rebuild-fence`), which is `exclusive`. The v0.9 scenarios still to add are listed in the [storage format](../docs/reference/storage-format.md#compat-scenarios-to-add). |
+| `scenarios.json`          | hand         | Scenarios: a snapshot interval and steps, each naming its writer and expected outcome. Includes every v0.9 core scenario the [storage format](../docs/reference/storage-format.md#compat-scenarios) lists; `rebuild-fence` and `feature-marker` are `exclusive`. |
 | `fixtures/codec.json`     | Go generator | Encode/decode vectors: serialized JSON, DynamoDB items, SNS messages and attributes, view items, `ttl` items under a fixed clock, lenient decoding, integer map-key order, the snapshot policy table. |
 | `fixtures/views.json`     | Go generator | View repository vectors: the items `PutView` writes (default `VIEW` sort key, `ttl`), delete and get keys, items read back (lenient decoding), the `Query` requests of the paged lists (with their `ConsistentRead`: strong on the table, unset on the index), pagination cursors (encode and decode), and the payload bytes of the typed `viewcodec.Codec`. |
 | `fixtures/outcomes.json`  | Go generator | Command-outcome and rejection identity-digest vectors (canonical bytes and SHA-256, keyed by `targets`, including a rename whose write set comes from state), the encodings of outcome rows (DynamoDB item, budgeted item size, PostgreSQL row, rejection and event-ID JSON, including both stale-fence rejections and a rejection that lists the events it committed), the canonical text of rejection-detail numbers, and the fence-aware retry-policy defaults both languages assert. |
@@ -77,6 +77,19 @@ changed, and update the spec.
    | `outcomeOnly`   | `identity` (`type`, `payload` object), `response`, `commandId`   | outcomes scenarios: an accepted outcome with no events       |
    | `resolveOutcome`| `command`, `commandId`                                           | outcomes scenarios: `absent`, a replayed outcome, or `reuse` |
    | `rebuild`       | `action` (`begin`, `renew`, `end`, `forceRelease`, `generation`, `writeViews`, `wait`), `owner`, `leaseSeconds`, `seconds` | `ok`, `held`, `leaseLost`, `settled`, or `unavailable`, with `delta` (the generation after the step minus before), `forceReleased`, and (`writeViews`) `rows`. An `execute` or `transaction` step while the generation is unsettled (a rebuild holds the lock, or a force-release left it odd) expects `rebuildInProgress` |
+   | `readLatest`    | `n`, optional `suffix`                                           | `ok` with `events` and `sequences`, newest first              |
+   | `enumerate`     | none                                                             | `ok` with `events`: the scenario's events that `StreamAllEvents` yields. An engine row of the scenario in the enumeration or the entity heads fails the step |
+   | `declare`       | `features` (name → format version), `retention`, `historyDependent` (entity types, `{id}` scoped), optional `retract` | `ok` with `delta`, the manifest version after minus before (1) |
+   | `executeTransaction` | `commandId`, `identity` (`type`, `payload`; the target is the primary stream), `attempts`, `reads`, `fences` (caller-stamped), `writes` and optional `retryWrites` (`suffix`, `event`), optional `interfere` (`suffix`, `event`, `times`) | outcomes scenarios: as `execute`, plus `prepares`, how many times the decision step ran |
+   | `groupCommits`  | `reads` (the sibling suffixes to regroup with the primary stream) | `ok` with `events` and `groups`: each commit in replay order as its commit ID (`-` for none) then its events as `suffix:sequence` |
+
+   `appendRaw` and `putSnapshot` steps, and a `transaction` step's streams, may set `entityPrefix`
+   (`SYSTEM#` or `command-outcome#`) to write into a reserved namespace, which every write path
+   refuses as `reserved`. A transaction fence may set `entityType` (`{id}` scoped) for the durable
+   retention set, an event `pad` (the payload's `{pad}` becomes that many `x` bytes), and a view
+   operation `repeat` (`{n}` in its keys and payload becomes the copy's index). The refusals of the
+   v0.9 core are the results `commitTooLarge`, `reserved`, `unsupported`, `retentionConflict`, and
+   `historyDependent`.
 
    A `transaction` step may also carry `projectors` (commit-wide projectors): a list of `{name, operations}` whose
    operations (`op` `put` or `delete`, `pk`, `sk`, `owner`, `entityType`, `payload`, `condition`
@@ -91,8 +104,8 @@ changed, and update the spec.
    account domains) on its stores, so every commit that writes events puts or deletes the
    stream's row at `pk = "ledger"`, `sk` = the stream ID.
 
-   A scenario with `"exclusive": true` (the `rebuild-fence` scenario) holds store-wide state across its
-   steps: a rebuild lock refuses every other scenario's commits. The interleaved run skips it, and
+   A scenario with `"exclusive": true` (`rebuild-fence` and `feature-marker`) holds store-wide state
+   across its steps: a rebuild lock or a declared feature refuses every other scenario's commits. The interleaved run skips it, and
    `scripts/compat-integration.sh` runs it alone afterwards, one step at a time (`evt-compat steps
    -only NAME`, `step -only NAME`, and `exclusive` in the Go driver. The Rust driver takes the same
    arguments). `rebuild` owner tokens are scoped to the run and scenario like command IDs (a step that presents a lease rebuilds it from the store: the lock's fencing generation when it names the scoped owner), and a
