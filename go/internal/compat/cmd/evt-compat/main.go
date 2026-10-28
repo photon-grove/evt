@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -52,6 +53,9 @@ type backend struct {
 	table      string
 	viewsTable string
 	postgres   *pgxpool.Pool
+
+	// marker is the feature marker repo validates against, which the declare op drives.
+	marker *compat.MarkerDriver
 }
 
 func main() {
@@ -173,10 +177,15 @@ func enumerate(ctx context.Context, b backend, run string) error {
 	return nil
 }
 
-// settle ends a rebuild a failed exclusive step left behind, so a later run starts from a settled
-// fence: it force-releases a lock held by a compat owner, then runs and ends one rebuild if the
-// generation is still odd (a force-release leaves it odd). Locks of other owners are left alone.
+// settle undoes the store-wide state a failed exclusive step left behind, so a later run can write:
+// it retracts the compat declarations of the feature marker (settleMarker), force-releases a
+// rebuild lock held by a compat owner, then runs and ends one rebuild if the generation is still
+// odd (a force-release leaves it odd). Locks of other owners are left alone.
 func settle(ctx context.Context, b backend) error {
+	if err := settleMarker(ctx, b); err != nil {
+		return err
+	}
+
 	provider, ok := b.repo.(evt.RebuildFenceProvider)
 	if !ok {
 		return nil
@@ -213,6 +222,45 @@ func settle(ctx context.Context, b backend) error {
 	return err
 }
 
+// settleMarker retracts what a failed feature-marker step declared, so the next run can write: the
+// compat-only features, a bumped stream-heads format, and the scenario's entity types in the durable
+// sets. Declarations of other features are left alone.
+func settleMarker(ctx context.Context, b backend) error {
+	manifest, err := b.marker.Manifest(ctx)
+	if err != nil || manifest == nil {
+		return err
+	}
+
+	ours := func(entityType evt.EntityType) bool {
+		return entityType == compat.AccountType || strings.Contains(string(entityType), "compat-")
+	}
+
+	dirty := manifest.Features[evt.FeatureStreamHeads] != evt.StreamHeadsFormat ||
+		slices.ContainsFunc(manifest.Retention, ours) || slices.ContainsFunc(manifest.HistoryDependent, ours)
+
+	for name := range manifest.Features {
+		dirty = dirty || strings.HasPrefix(name, "compat-")
+	}
+
+	if !dirty {
+		return nil
+	}
+
+	_, err = b.marker.Declare(ctx, func(manifest *evt.FeatureManifest) {
+		for name := range manifest.Features {
+			if strings.HasPrefix(name, "compat-") {
+				delete(manifest.Features, name)
+			}
+		}
+
+		manifest.Features[evt.FeatureStreamHeads] = evt.StreamHeadsFormat
+		manifest.Retention = slices.DeleteFunc(manifest.Retention, ours)
+		manifest.HistoryDependent = slices.DeleteFunc(manifest.HistoryDependent, ours)
+	})
+
+	return err
+}
+
 func connect(ctx context.Context, name string) (backend, error) {
 	switch name {
 	case "dynamo":
@@ -231,10 +279,13 @@ func connect(ctx context.Context, name string) (backend, error) {
 		}
 
 		client := dynamodb.NewFromConfig(cfg)
+		repo := dynamo.NewRepository(client, table).WithLazyInitialization(true).WithViewsTable(viewsTable)
+		marker := repo.FeatureMarker(nil)
 
 		return backend{
-			repo:   dynamo.NewRepository(client, table).WithLazyInitialization(true).WithViewsTable(viewsTable),
+			repo:   repo.WithFeatureMarker(marker),
 			dynamo: client, table: table, viewsTable: viewsTable,
+			marker: &compat.MarkerDriver{Declare: marker.Declare, Manifest: marker.Manifest},
 		}, nil
 
 	case "postgres":
@@ -248,12 +299,18 @@ func connect(ctx context.Context, name string) (backend, error) {
 			return backend{}, err
 		}
 
+		marker := repo.FeatureMarker(nil)
+		repo = repo.WithFeatureMarker(marker)
+
 		// evt defines no view schema: the application owns its view tables, and so does this driver.
 		if _, err := pool.Exec(ctx, compat.PostgresViewDDL); err != nil {
 			return backend{}, err
 		}
 
-		return backend{repo: repo, postgres: pool}, nil
+		return backend{
+			repo: repo, postgres: pool,
+			marker: &compat.MarkerDriver{Declare: marker.Declare, Manifest: marker.Manifest},
+		}, nil
 	}
 
 	return backend{}, fmt.Errorf("unknown backend %q", name)
@@ -285,7 +342,7 @@ func step(ctx context.Context, b backend, run string, index int, only string) ([
 			return nil, fmt.Errorf("%s step %d: %w", scenario.Name, index, err)
 		}
 
-		if outcome != s.Expect {
+		if !outcome.Equal(s.Expect) {
 			failures = append(failures, fmt.Sprintf("%s step %d: got %s, want %s", scenario.Name, index, outcome, s.Expect))
 			continue
 		}
@@ -464,6 +521,7 @@ func newRunner(b backend, scenario compat.Scenario, run string) compat.Runner {
 	}
 
 	runner.Rebuild = b.rebuildDriver()
+	runner.Marker = b.marker
 
 	return runner
 }

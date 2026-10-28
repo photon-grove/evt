@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 
 	evt "github.com/photon-grove/evt/go"
 	"github.com/photon-grove/evt/go/internal/eventjson"
@@ -18,6 +19,9 @@ type TransactionStream struct {
 	Sequence int64                `json:"sequence"`
 	Events   []RawEvent           `json:"events"`
 	Snapshot *TransactionSnapshot `json:"snapshot,omitempty"`
+
+	// EntityPrefix prefixes the stream ID, so the stream lies in a reserved namespace (C8).
+	EntityPrefix string `json:"entityPrefix,omitempty"`
 }
 
 // TransactionSnapshot is one written stream's inline snapshot relative to the scenario ID.
@@ -31,10 +35,28 @@ type TransactionFence struct {
 	Suffix        string `json:"suffix"`
 	Head          int64  `json:"head"`
 	CallerStamped bool   `json:"callerStamped,omitempty"`
+
+	// EntityType is the fenced stream's entity type, the account type when empty. {id} is the
+	// scenario's entity ID, so a type in a durable set is scoped to the run.
+	EntityType string `json:"entityType,omitempty"`
+}
+
+// entityType is the fence's entity type, with {id} resolved against the scenario's entity ID.
+func (f TransactionFence) entityType(base evt.EntityID) evt.EntityType {
+	if f.EntityType == "" {
+		return AccountType
+	}
+
+	return evt.EntityType(scopeID(f.EntityType, base))
+}
+
+// scopeID replaces the {id} placeholder with the scenario's entity ID.
+func scopeID(text string, base evt.EntityID) string {
+	return strings.ReplaceAll(text, "{id}", string(base))
 }
 
 // SiblingSuffixes lists, in ascending order, every non-empty stream suffix the scenario writes,
-// fences, appends to, or compacts: each is a stream beside the primary one that the fixtures and
+// fences, reads, appends to, or compacts: each is a stream beside the primary one that the fixtures and
 // both languages' verification must observe.
 func (s Scenario) SiblingSuffixes() []string {
 	seen := map[string]bool{}
@@ -45,6 +67,15 @@ func (s Scenario) SiblingSuffixes() []string {
 		}
 		for _, fence := range step.Fences {
 			seen[fence.Suffix] = true
+		}
+		for _, suffix := range step.Reads {
+			seen[suffix] = true
+		}
+		for _, write := range append(slices.Clone(step.Writes), step.RetryWrites...) {
+			seen[write.Suffix] = true
+		}
+		if step.Interfere != nil {
+			seen[step.Interfere.Suffix] = true
 		}
 	}
 	delete(seen, "")
@@ -68,12 +99,12 @@ func transactionID(base evt.EntityID, suffix string) evt.EntityID {
 func transactionResult(base evt.EntityID, step Step) evt.SerializedResult {
 	result := evt.SerializedResult{}
 	for _, stream := range step.Streams {
-		id := transactionID(base, stream.Suffix)
+		id := evt.EntityID(stream.EntityPrefix) + transactionID(base, stream.Suffix)
 		for i, raw := range stream.Events {
 			seq := evt.EventSequence(stream.Sequence + int64(i))
 			result.Events = append(result.Events, evt.SerializedEvent{
 				ID: evt.GetEventID(id, seq), Sequence: seq, Type: raw.Type, Version: raw.Version,
-				EntityID: id, EntityType: AccountType, Payload: []byte(raw.Payload), Metadata: StepMetadata(step),
+				EntityID: id, EntityType: AccountType, Payload: raw.payload(), Metadata: StepMetadata(step),
 			})
 		}
 		if stream.Snapshot != nil {
@@ -85,7 +116,10 @@ func transactionResult(base evt.EntityID, step Step) evt.SerializedResult {
 	}
 	result.Views = viewsOf(base, step)
 	for _, fence := range step.Fences {
-		result.Fences = append(result.Fences, evt.ReadFence{EntityID: transactionID(base, fence.Suffix), EntityType: AccountType, Head: evt.EventSequence(fence.Head), CallerStamped: fence.CallerStamped})
+		result.Fences = append(result.Fences, evt.ReadFence{
+			EntityID: transactionID(base, fence.Suffix), EntityType: fence.entityType(base),
+			Head: evt.EventSequence(fence.Head), CallerStamped: fence.CallerStamped,
+		})
 	}
 	return result
 }
@@ -97,7 +131,10 @@ func (r Runner) transaction(ctx context.Context, base evt.EntityID, step Step) (
 	result := transactionResult(base, step)
 	ids := map[evt.EntityID]bool{}
 	for _, event := range result.Events {
-		ids[event.EntityID] = true
+		// A stream in a reserved namespace is refused before any write and never read.
+		if !evt.IsReservedEntityID(event.EntityID) {
+			ids[event.EntityID] = true
+		}
 	}
 	for _, fence := range result.Fences {
 		ids[fence.EntityID] = true

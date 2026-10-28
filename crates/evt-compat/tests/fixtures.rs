@@ -451,6 +451,7 @@ async fn scenarios_match_go_byte_for_byte() {
         let runner = Runner::for_scenario(repository.clone(), scenario, FIXTURE_RUN)
             .with_head_access(repository.clone())
             .with_rebuild_access(RebuildDriver::manual(repository.clone(), clock))
+            .with_marker_access(repository.clone())
             .with_view_access(repository);
         let entity_id = scenario.entity_id(FIXTURE_RUN);
 

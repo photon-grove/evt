@@ -3386,14 +3386,24 @@ mod tests {
             .flatten()
             .enumerate()
         {
-            for (operation, item) in projector["operations"]
+            // `repeat` emits an operation that many times, `{n}` numbering the copies.
+            let copies = projector["operations"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .enumerate()
-            {
-                let pk = pad(scope(&item["pk"]), item["pkPad"].as_u64().unwrap_or(0));
-                let sk = pad(scope(&item["sk"]), item["skPad"].as_u64().unwrap_or(0));
+                .flat_map(|item| {
+                    (0..item["repeat"].as_u64().unwrap_or(0).max(1)).map(move |copy| (item, copy))
+                });
+            for (operation, (item, copy)) in copies.enumerate() {
+                let number = |text: String| text.replace("{n}", &format!("{copy:03}"));
+                let pk = pad(
+                    number(scope(&item["pk"])),
+                    item["pkPad"].as_u64().unwrap_or(0),
+                );
+                let sk = pad(
+                    number(scope(&item["sk"])),
+                    item["skPad"].as_u64().unwrap_or(0),
+                );
                 let mut op = if item["op"] == "delete" {
                     ViewOperation::delete(pk, sk, scope(&item["owner"]))
                 } else {
@@ -3402,7 +3412,7 @@ mod tests {
                         sk,
                         scope(&item["owner"]),
                         scope(&item["entityType"]),
-                        scope(&item["payload"]).into_bytes(),
+                        number(scope(&item["payload"])).into_bytes(),
                     )
                 };
                 op = match item["condition"].as_str() {
@@ -3745,7 +3755,9 @@ mod tests {
 
             let steps = scenario["steps"].as_array().unwrap();
             // A transaction refused before any write (a key over the limit, a repeated key,
-            // operations with no event) sends no request and records no order.
+            // operations with no event, a commit over its budget, a reserved stream, a fence on a
+            // retained type, a manifest the writer does not model) sends no request and records
+            // no order.
             let planned: Vec<_> = steps
                 .iter()
                 .enumerate()
@@ -3753,7 +3765,15 @@ mod tests {
                 .filter(|(_, step)| {
                     !matches!(
                         step["expect"]["result"].as_str(),
-                        Some("viewKeyTooLong" | "duplicateViewKey" | "projectorOnly")
+                        Some(
+                            "viewKeyTooLong"
+                                | "duplicateViewKey"
+                                | "projectorOnly"
+                                | "commitTooLarge"
+                                | "reserved"
+                                | "retentionConflict"
+                                | "unsupported"
+                        )
                     )
                 })
                 .collect();
@@ -3819,7 +3839,10 @@ mod tests {
                             .map(|fence| {
                                 crate::ReadFence::new(
                                     id_of(&base, fence["suffix"].as_str().unwrap_or("")),
-                                    "account",
+                                    match fence["entityType"].as_str() {
+                                        Some(entity_type) => entity_type.replace("{id}", &base),
+                                        None => "account".to_owned(),
+                                    },
                                     EventSequence(fence["head"].as_i64().unwrap()),
                                     if fence["callerStamped"].as_bool().unwrap_or(false) {
                                         crate::FenceProvenance::Caller
@@ -3834,10 +3857,14 @@ mod tests {
                 commit.normalize().unwrap();
 
                 // The scenarios start on a fresh table, so the first writer declared
-                // `stream-heads` itself, which created the marker row at version 1.
+                // `stream-heads` itself, which created the marker row at version 1. A scenario
+                // that declares features commits at the version its marker check names.
+                let version = recorded["actions"][0]["values"][":v"]["N"]
+                    .as_str()
+                    .map_or(1, |version| version.parse().unwrap());
                 let (items, _) = offline_repository()
                     .with_views_table(VIEWS_TABLE)
-                    .transaction_stream_items(&commit, ValidatedMarker::Version(1))
+                    .transaction_stream_items(&commit, ValidatedMarker::Version(version))
                     .unwrap();
                 let actual: Vec<_> = items.iter().map(action_summary).collect();
 

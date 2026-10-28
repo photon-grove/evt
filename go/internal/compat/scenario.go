@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
@@ -68,6 +69,15 @@ const (
 	ResultLeaseLost         = "leaseLost"   // the caller does not hold the lock
 	ResultSettled           = "settled"     // a reader's observe found an even generation
 	ResultUnavailable       = "unavailable" // a reader's observe found an odd generation
+
+	// Refusals of the v0.9 core (ADR 0004): a commit over the item or byte budget (C1), a write to a
+	// reserved namespace (C8), a manifest declaring a pair the writer does not model (C9), a fence on
+	// a retained entity type and a compaction of a history-dependent one (C9's durable sets).
+	ResultCommitTooLarge    = "commitTooLarge"
+	ResultReserved          = "reserved"
+	ResultUnsupported       = "unsupported"
+	ResultRetentionConflict = "retentionConflict"
+	ResultHistoryDependent  = "historyDependent"
 )
 
 // Injected commit faults (the injectCommitFault step field).
@@ -152,6 +162,29 @@ type Step struct {
 	Owner        string `json:"owner,omitempty"`
 	LeaseSeconds int64  `json:"leaseSeconds,omitempty"`
 	Seconds      int64  `json:"seconds,omitempty"`
+
+	// N is the count of a readLatest step (C8).
+	N int `json:"n,omitempty"`
+
+	// EntityPrefix prefixes the stream ID of an appendRaw or putSnapshot step, so the step writes
+	// to a reserved namespace (C8): SYSTEM# or command-outcome#.
+	EntityPrefix string `json:"entityPrefix,omitempty"`
+
+	// Features, Retention, HistoryDependent, and Retract drive declare steps (C9): one declaration
+	// that sets the features at their format versions and adds the entity types to the durable sets,
+	// or, with Retract, removes all of them. {id} in an entity type is the scenario's entity ID.
+	Features         map[string]int64 `json:"features,omitempty"`
+	Retention        []string         `json:"retention,omitempty"`
+	HistoryDependent []string         `json:"historyDependent,omitempty"`
+	Retract          bool             `json:"retract,omitempty"`
+
+	// Attempts, Reads, Writes, RetryWrites, and Interfere drive executeTransaction steps (C5). See
+	// executeTransaction.
+	Attempts    int                `json:"attempts,omitempty"`
+	Reads       []string           `json:"reads,omitempty"`
+	Writes      []TransactionWrite `json:"writes,omitempty"`
+	RetryWrites []TransactionWrite `json:"retryWrites,omitempty"`
+	Interfere   *Interference      `json:"interfere,omitempty"`
 }
 
 // Identity is the command identity of an outcomeOnly step: its type string and payload object.
@@ -165,6 +198,15 @@ type RawEvent struct {
 	Type    evt.EventType    `json:"type"`
 	Version evt.EventVersion `json:"version"`
 	Payload string           `json:"payload"`
+
+	// Pad replaces the placeholder {pad} in the payload with that many "x" bytes, so the byte-budget
+	// cases need not store a large payload in the scenario file.
+	Pad int `json:"pad,omitempty"`
+}
+
+// payload is the event's payload with {pad} expanded.
+func (e RawEvent) payload() []byte {
+	return []byte(strings.Replace(e.Payload, "{pad}", strings.Repeat("x", e.Pad), 1))
 }
 
 // Outcome is the observable result of a step.
@@ -191,12 +233,40 @@ type Outcome struct {
 	Delta         int64 `json:"delta,omitempty"`
 	ForceReleased bool  `json:"forceReleased,omitempty"`
 	Rows          int   `json:"rows,omitempty"`
+
+	// Prepares is how many times an executeTransaction step's decision step ran (C5): 0 for a
+	// replayed outcome, 1 for a single attempt, more when the engine re-prepared.
+	Prepares int `json:"prepares,omitempty"`
+
+	// Sequences are the sequences a readLatest step read, in the order it returned them (C8).
+	Sequences []int64 `json:"sequences,omitempty"`
+
+	// Groups are the commits a groupCommits step regrouped the scenario's streams into, in replay
+	// order, each rendered as its commit ID then its events as suffix:sequence (C6/C7).
+	Groups []string `json:"groups,omitempty"`
+}
+
+// Equal reports whether two outcomes are the same, treating an empty list as an absent one.
+func (o Outcome) Equal(other Outcome) bool {
+	normalize := func(outcome Outcome) Outcome {
+		if len(outcome.Sequences) == 0 {
+			outcome.Sequences = nil
+		}
+
+		if len(outcome.Groups) == 0 {
+			outcome.Groups = nil
+		}
+
+		return outcome
+	}
+
+	return reflect.DeepEqual(normalize(o), normalize(other))
 }
 
 func (o Outcome) String() string {
-	return fmt.Sprintf("%s(events=%d, deleted=%d, code=%q, replayed=%t, projector=%q, operation=%d, mapped=%q, delta=%d, forceReleased=%t, rows=%d)",
+	return fmt.Sprintf("%s(events=%d, deleted=%d, code=%q, replayed=%t, projector=%q, operation=%d, mapped=%q, delta=%d, forceReleased=%t, rows=%d, prepares=%d, sequences=%v, groups=%q)",
 		o.Result, o.Events, o.Deleted, o.Code, o.Replayed, o.Projector, o.Operation, o.Mapped,
-		o.Delta, o.ForceReleased, o.Rows)
+		o.Delta, o.ForceReleased, o.Rows, o.Prepares, o.Sequences, o.Groups)
 }
 
 // Dir returns the repository's compat/ directory.
@@ -301,6 +371,19 @@ type Runner struct {
 
 	// Rebuild backs the rebuild op (C10); nil refuses the op.
 	Rebuild *RebuildDriver
+
+	// Marker backs the declare op (C9); nil refuses the op.
+	Marker *MarkerDriver
+}
+
+// MarkerDriver is what a declare step needs of a backend: the feature marker the runner's
+// repository validates against, so a declaration also refreshes the runner's own cached validation.
+type MarkerDriver struct {
+	// Declare applies a change to the stored manifest in one declaration transaction.
+	Declare func(ctx context.Context, change func(*evt.FeatureManifest)) (evt.FeatureManifest, error)
+
+	// Manifest reads the stored manifest, or nil when the store has no marker row.
+	Manifest func(ctx context.Context) (*evt.FeatureManifest, error)
 }
 
 // RebuildDriver is what a rebuild step needs of a backend: the fence over the store, a way to wait
@@ -409,6 +492,16 @@ func (r Runner) Execute(ctx context.Context, entityID evt.EntityID, step Step) (
 		return r.resolveOutcome(ctx, entityID, step)
 	case "rebuild":
 		return r.rebuild(ctx, entityID, step)
+	case "readLatest":
+		return r.readLatest(ctx, entityID, step)
+	case "enumerate":
+		return r.enumerate(ctx, entityID)
+	case "declare":
+		return r.declare(ctx, entityID, step)
+	case "executeTransaction":
+		return r.executeTransaction(ctx, entityID, step)
+	case "groupCommits":
+		return r.groupCommits(ctx, entityID, step)
 	}
 
 	return Outcome{}, fmt.Errorf("unknown op %q", step.Op)
@@ -460,6 +553,13 @@ func (r Runner) appendRaw(ctx context.Context, entityID evt.EntityID, step Step)
 	}
 
 	entityID = transactionID(entityID, step.Suffix)
+
+	// A stream in a reserved namespace is never loaded: the write is refused before anything is
+	// read, so it is tried at sequence 1.
+	if step.EntityPrefix != "" {
+		return r.commitRaw(ctx, evt.EntityID(step.EntityPrefix)+entityID, 1, *step.Event, step)
+	}
+
 	current, err := r.sequence(ctx, entityID)
 	if err != nil {
 		return Outcome{}, err
@@ -494,7 +594,7 @@ func (r Runner) appendRawBypassingHead(ctx context.Context, entityID evt.EntityI
 		Version:    step.Event.Version,
 		EntityID:   entityID,
 		EntityType: AccountType,
-		Payload:    []byte(step.Event.Payload),
+		Payload:    step.Event.payload(),
 		Metadata:   StepMetadata(step),
 	}
 
@@ -529,7 +629,7 @@ func (r Runner) putSnapshot(ctx context.Context, entityID evt.EntityID, step Ste
 		return Outcome{}, fmt.Errorf("repository %T cannot write snapshots outside a commit", r.Repo)
 	}
 
-	entityID = transactionID(entityID, step.Suffix)
+	entityID = evt.EntityID(step.EntityPrefix) + transactionID(entityID, step.Suffix)
 
 	err := writer.PutSnapshot(ctx, AccountType, entityID, []byte(step.Snapshot.Payload),
 		evt.EventSequence(step.Snapshot.Sequence), evt.EventSequence(*step.EventSequence))
@@ -563,7 +663,7 @@ func (r Runner) commitRaw(
 		Version:    raw.Version,
 		EntityID:   entityID,
 		EntityType: AccountType,
-		Payload:    []byte(raw.Payload),
+		Payload:    raw.payload(),
 		Metadata:   StepMetadata(step),
 	}
 
@@ -589,6 +689,10 @@ func (r Runner) compact(ctx context.Context, entityID evt.EntityID, step Step) (
 	deleted, err := compactor.CompactBelow(ctx, entityID, evt.EventSequence(step.Through))
 	if errors.Is(err, evt.ErrCompactionUncovered) {
 		return Outcome{Result: ResultUncovered}, nil
+	}
+
+	if outcome, ok := classify(err); ok {
+		return outcome, nil
 	}
 	if err != nil {
 		return Outcome{}, err
@@ -715,9 +819,22 @@ func classify(err error) (Outcome, bool) {
 		keyTooLong *evt.ViewKeyTooLongError
 		duplicate  *evt.DuplicateViewKeyError
 		onlyViews  *evt.ProjectorOnlyCommitError
+		tooLarge   *evt.CommitTooLargeError
+		retained   *evt.RetentionConflictError
+		history    *evt.HistoryDependentProjectionError
 	)
 
 	switch {
+	case errors.As(err, &tooLarge):
+		return Outcome{Result: ResultCommitTooLarge}, true
+	case evt.IsReservedEntityIdErr(err):
+		return Outcome{Result: ResultReserved}, true
+	case evt.IsUnsupportedFeatureErr(err):
+		return Outcome{Result: ResultUnsupported}, true
+	case errors.As(err, &retained):
+		return Outcome{Result: ResultRetentionConflict}, true
+	case errors.As(err, &history):
+		return Outcome{Result: ResultHistoryDependent}, true
 	case errors.As(err, &projection):
 		outcome := Outcome{Result: ResultProjector, Projector: projection.Projector, Operation: projection.Operation}
 		if projection.Err != nil {

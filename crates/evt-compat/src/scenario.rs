@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use photon_evt::EventLog;
 use photon_evt::conformance::{FaultInjectingRepository, HeadFixtures};
 use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
@@ -19,6 +20,10 @@ use photon_evt::{
     Store, TransactionCommit, ViewOperation, ViewRow, default_digest, json, observe_rebuild_epoch,
 };
 use serde::{Deserialize, Serialize};
+
+mod c11;
+
+pub use c11::{MarkerAccess, MarkerFuture};
 
 use crate::account::{
     Account, AccountCommand, AccountEvent, LEDGER_PK, LedgerProjector, balance_response,
@@ -130,6 +135,14 @@ impl Scenario {
             suffixes.extend(step.suffix.clone());
             suffixes.extend(step.streams.iter().map(|stream| stream.suffix.clone()));
             suffixes.extend(step.fences.iter().map(|fence| fence.suffix.clone()));
+            suffixes.extend(step.reads.iter().cloned());
+            suffixes.extend(
+                step.writes
+                    .iter()
+                    .chain(&step.retry_writes)
+                    .map(|write| write.suffix.clone()),
+            );
+            suffixes.extend(step.interfere.iter().map(|moved| moved.suffix.clone()));
         }
         suffixes.remove("");
 
@@ -217,6 +230,61 @@ pub struct Step {
     /// How long a `rebuild` step's `wait` waits.
     #[serde(default)]
     pub seconds: u64,
+    /// The count of a `readLatest` step (C8).
+    #[serde(default)]
+    pub n: usize,
+    /// Prefixes the stream ID of an `appendRaw` or `putSnapshot` step, so the step writes to a
+    /// reserved namespace (C8): `SYSTEM#` or `command-outcome#`.
+    #[serde(default)]
+    pub entity_prefix: String,
+    /// The features a `declare` step sets at their format versions (or, with `retract`, removes).
+    #[serde(default)]
+    pub features: BTreeMap<String, i64>,
+    /// The entity types a `declare` step adds to the durable retention set (or removes). `{id}` is
+    /// the scenario's entity ID.
+    #[serde(default)]
+    pub retention: Vec<String>,
+    /// The entity types a `declare` step adds to the durable historyDependent set (or removes).
+    #[serde(default)]
+    pub history_dependent: Vec<String>,
+    /// Makes a `declare` step remove what it names instead of declaring it.
+    #[serde(default)]
+    pub retract: bool,
+    /// The attempts of an `executeTransaction` step's retry policy (C5).
+    #[serde(default)]
+    pub attempts: u32,
+    /// The streams an `executeTransaction` step's decision step reads (engine-filled fences); for
+    /// a `groupCommits` step, the sibling streams it regroups with the primary one.
+    #[serde(default)]
+    pub reads: Vec<String>,
+    /// The events an `executeTransaction` step's decision step appends on its first attempt.
+    #[serde(default)]
+    pub writes: Vec<TransactionWrite>,
+    /// The events it appends on the attempts after the first, when set.
+    #[serde(default)]
+    pub retry_writes: Vec<TransactionWrite>,
+    /// Another writer moving a stream before the step's first commits.
+    #[serde(default)]
+    pub interfere: Option<Interference>,
+}
+
+/// One event an `executeTransaction` step's decision step appends, to the stream named by the
+/// suffix.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TransactionWrite {
+    #[serde(default)]
+    pub suffix: String,
+    pub event: RawEvent,
+}
+
+/// Another writer: before each of an `executeTransaction` step's first `times` commits, `event`
+/// is appended to the stream named by `suffix`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Interference {
+    #[serde(default)]
+    pub suffix: String,
+    pub event: RawEvent,
+    pub times: usize,
 }
 
 /// One projector of a transaction step: its name and the operations it emits.
@@ -252,6 +320,10 @@ pub struct StepView {
     /// Maps the operation's failed condition to an error with this message.
     #[serde(default)]
     pub conflict: String,
+    /// Emits the operation that many times (once when 0), with `{n}` in its keys and payload
+    /// replaced by the copy's index, zero-padded to three digits.
+    #[serde(default)]
+    pub repeat: usize,
 }
 
 /// The operation's mapped error: a message, matched across languages by its text.
@@ -279,36 +351,41 @@ pub fn views_of(base: &EntityId, step: &Step) -> Vec<ProjectedView> {
 
     let mut views = Vec::new();
     for (index, projector) in step.projectors.iter().enumerate() {
-        for (operation, item) in projector.operations.iter().enumerate() {
-            let (pk, sk) = (
-                pad(scope(&item.pk), item.pk_pad),
-                pad(scope(&item.sk), item.sk_pad),
-            );
-            // The owner is the operation's `owner` (`{id}` resolves to the scenario's stream),
-            // required on a delete as well as a put.
-            let owner = scope(&item.owner);
-            let mut op = if item.op == "delete" {
-                ViewOperation::delete(pk, sk, owner)
-            } else {
-                ViewOperation::put(
-                    pk,
-                    sk,
-                    owner,
-                    item.entity_type.clone(),
-                    scope(&item.payload).into_bytes(),
-                )
-            };
+        let mut operation = 0;
+        for item in &projector.operations {
+            for copy in 0..item.repeat.max(1) {
+                let number = |text: String| text.replace("{n}", &format!("{copy:03}"));
+                let (pk, sk) = (
+                    pad(number(scope(&item.pk)), item.pk_pad),
+                    pad(number(scope(&item.sk)), item.sk_pad),
+                );
+                // The owner is the operation's `owner` (`{id}` resolves to the scenario's stream),
+                // required on a delete as well as a put.
+                let owner = scope(&item.owner);
+                let mut op = if item.op == "delete" {
+                    ViewOperation::delete(pk, sk, owner)
+                } else {
+                    ViewOperation::put(
+                        pk,
+                        sk,
+                        owner,
+                        item.entity_type.clone(),
+                        number(scope(&item.payload)).into_bytes(),
+                    )
+                };
 
-            op = match item.condition.as_str() {
-                "absent" => op.if_absent(),
-                "present" => op.if_present(),
-                _ => op,
-            };
-            if !item.conflict.is_empty() {
-                op = op.on_conflict(Mapped(item.conflict.clone()));
+                op = match item.condition.as_str() {
+                    "absent" => op.if_absent(),
+                    "present" => op.if_present(),
+                    _ => op,
+                };
+                if !item.conflict.is_empty() {
+                    op = op.on_conflict(Mapped(item.conflict.clone()));
+                }
+
+                views.push(ProjectedView::new(&projector.name, index, operation, op));
+                operation += 1;
             }
-
-            views.push(ProjectedView::new(&projector.name, index, operation, op));
         }
     }
 
@@ -386,6 +463,9 @@ pub struct TransactionStream {
     pub events: Vec<RawEvent>,
     #[serde(default)]
     pub snapshot: Option<TransactionSnapshot>,
+    /// Prefixes the stream ID, so the stream lies in a reserved namespace (C8).
+    #[serde(default)]
+    pub entity_prefix: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -403,6 +483,25 @@ pub struct TransactionFence {
     pub head: i64,
     #[serde(default)]
     pub caller_stamped: bool,
+    /// The fenced stream's entity type, `account` when empty. `{id}` is the scenario's entity ID.
+    #[serde(default)]
+    pub entity_type: String,
+}
+
+impl TransactionFence {
+    /// The fence's entity type, with `{id}` resolved against the scenario's entity ID.
+    pub fn entity_type(&self, base: &EntityId) -> EntityType {
+        if self.entity_type.is_empty() {
+            EntityType::new("account")
+        } else {
+            EntityType::new(scope_id(&self.entity_type, base))
+        }
+    }
+}
+
+/// Replaces the `{id}` placeholder with the scenario's entity ID.
+pub fn scope_id(text: &str, base: &EntityId) -> String {
+    text.replace("{id}", base.as_str())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -411,6 +510,18 @@ pub struct RawEvent {
     pub event_type: String,
     pub version: i64,
     pub payload: String,
+    /// Replaces the placeholder `{pad}` in the payload with that many `x` bytes.
+    #[serde(default)]
+    pub pad: usize,
+}
+
+impl RawEvent {
+    /// The payload with `{pad}` expanded.
+    pub fn payload(&self) -> Vec<u8> {
+        self.payload
+            .replacen("{pad}", &"x".repeat(self.pad), 1)
+            .into_bytes()
+    }
 }
 
 /// The observable result of a step.
@@ -448,6 +559,16 @@ pub struct Outcome {
     /// A `writeViews` step's rows in the scenario's rebuild partition after the step.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub rows: usize,
+    /// How many times an `executeTransaction` step's decision step ran (C5).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub prepares: usize,
+    /// The sequences a `readLatest` step read, in the order it returned them (C8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequences: Vec<i64>,
+    /// The commits a `groupCommits` step regrouped the scenario's streams into, in replay order,
+    /// each rendered as its commit ID then its events as `suffix:sequence` (C6/C7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -478,6 +599,20 @@ impl Outcome {
             Error::ProjectorWithoutEvents { .. } => Some(Self::of("projectorOnly")),
             Error::ViewKeyTooLong { .. } => Some(Self::of("viewKeyTooLong")),
             Error::DuplicateViewKey { .. } => Some(Self::of("duplicateViewKey")),
+            _ => None,
+        }
+    }
+
+    /// The step outcome of a v0.9 core refusal, if `error` is one: a commit over its budget (C1), a
+    /// write to a reserved namespace (C8), a manifest pair the writer does not model, and the
+    /// refusals of the manifest's durable sets (C9).
+    fn of_refusal(error: &Error) -> Option<Self> {
+        match error {
+            Error::CommitTooLarge { .. } => Some(Self::of("commitTooLarge")),
+            Error::ReservedEntityId { .. } => Some(Self::of("reserved")),
+            Error::UnsupportedFeature { .. } => Some(Self::of("unsupported")),
+            Error::RetentionConflict { .. } => Some(Self::of("retentionConflict")),
+            Error::HistoryDependentProjection { .. } => Some(Self::of("historyDependent")),
             _ => None,
         }
     }
@@ -679,6 +814,7 @@ pub struct Runner<R: Repository> {
     heads: Option<Arc<dyn HeadAccess>>,
     views: Option<Arc<dyn ViewAccess>>,
     rebuild: Option<Arc<dyn RebuildAccess>>,
+    marker: Option<Arc<dyn MarkerAccess>>,
     /// The scenario registers the shared [`LedgerProjector`] on every store the runner builds.
     projector: bool,
 }
@@ -726,7 +862,7 @@ impl HeadAccess for photon_evt::MemRepository {
     }
 }
 
-impl<R: Repository> Runner<R> {
+impl<R: Repository + EventLog> Runner<R> {
     pub fn new(repository: R, snapshot_interval: usize) -> Self {
         Self {
             store: Store::new(repository, ()).with_snapshot_interval(snapshot_interval),
@@ -735,8 +871,17 @@ impl<R: Repository> Runner<R> {
             heads: None,
             views: None,
             rebuild: None,
+            marker: None,
             projector: false,
         }
+    }
+
+    /// Gives the runner the backend's feature marker, which the `declare` steps drive (C9).
+    #[must_use]
+    pub fn with_marker_access(mut self, marker: impl MarkerAccess + 'static) -> Self {
+        self.marker = Some(Arc::new(marker));
+
+        self
     }
 
     /// Gives the runner the backend's rebuild fence, which the `rebuild` steps drive (C10). The
@@ -835,6 +980,14 @@ impl<R: Repository> Runner<R> {
             "appendRaw" => {
                 let raw = step.event.as_ref().ok_or(StepError::Missing("event"))?;
                 let id = transaction_id(entity_id, step.suffix.as_deref().unwrap_or(""));
+                // A stream in a reserved namespace is never loaded: the write is refused before
+                // anything is read, so it is tried at sequence 1.
+                if !step.entity_prefix.is_empty() {
+                    let reserved = EntityId::new(format!("{}{id}", step.entity_prefix));
+                    return self
+                        .commit_raw(&reserved, EventSequence(1), raw, step)
+                        .await;
+                }
                 let sequence = self.store.load(&id).await?.sequence().next();
                 self.commit_raw(&id, sequence, raw, step).await
             }
@@ -843,6 +996,7 @@ impl<R: Repository> Runner<R> {
                     event_type: "account:deposited".to_owned(),
                     version: 1,
                     payload: r#"{"amountCents":1,"memo":null}"#.to_owned(),
+                    pad: 0,
                 };
                 self.commit_raw(entity_id, EventSequence(step.sequence), &probe, step)
                     .await
@@ -853,6 +1007,11 @@ impl<R: Repository> Runner<R> {
             "outcomeOnly" => self.outcome_only(step).await,
             "rebuild" => self.rebuild(entity_id, step).await,
             "resolveOutcome" => self.resolve_outcome(entity_id, step).await,
+            "readLatest" => self.read_latest(entity_id, step).await,
+            "enumerate" => self.enumerate(entity_id).await,
+            "declare" => self.declare(entity_id, step).await,
+            "executeTransaction" => self.execute_transaction(entity_id, step).await,
+            "groupCommits" => self.group_commits(entity_id, step).await,
             "compact" => {
                 let id = transaction_id(entity_id, step.suffix.as_deref().unwrap_or(""));
                 match self
@@ -866,7 +1025,7 @@ impl<R: Repository> Runner<R> {
                         ..Outcome::of("compacted")
                     }),
                     Err(Error::CompactionUncovered { .. }) => Ok(Outcome::of("uncovered")),
-                    Err(err) => Err(err.into()),
+                    Err(err) => Outcome::of_refusal(&err).ok_or_else(|| err.into()),
                 }
             }
             other => Err(StepError::UnknownOp(other.to_owned())),
@@ -995,7 +1154,11 @@ impl<R: Repository> Runner<R> {
             .repository()
             .put_snapshot(&SerializedSnapshot {
                 entity_type: EntityType::new("account"),
-                entity_id: transaction_id(entity_id, step.suffix.as_deref().unwrap_or("")),
+                entity_id: EntityId::new(format!(
+                    "{}{}",
+                    step.entity_prefix,
+                    transaction_id(entity_id, step.suffix.as_deref().unwrap_or(""))
+                )),
                 sequence: EventSequence(snapshot.sequence),
                 event_sequence: EventSequence(event_sequence),
                 payload: snapshot.payload.as_bytes().to_vec(),
@@ -1005,7 +1168,7 @@ impl<R: Repository> Runner<R> {
         match result {
             Ok(_) => Ok(Outcome::of("ok")),
             Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
-            Err(error) => Err(error.into()),
+            Err(error) => Outcome::of_refusal(&error).ok_or_else(|| error.into()),
         }
     }
 
@@ -1016,7 +1179,11 @@ impl<R: Repository> Runner<R> {
 
         let mut streams = Vec::new();
         for stream in &step.streams {
-            let id = transaction_id(entity_id, &stream.suffix);
+            let id = EntityId::new(format!(
+                "{}{}",
+                stream.entity_prefix,
+                transaction_id(entity_id, &stream.suffix)
+            ));
             let mut events = Vec::new();
             for (index, raw) in stream.events.iter().enumerate() {
                 let sequence = EventSequence(stream.sequence + index as i64);
@@ -1041,7 +1208,7 @@ impl<R: Repository> Runner<R> {
             .iter()
             .map(|fence| ReadFence {
                 entity_id: transaction_id(entity_id, &fence.suffix),
-                entity_type: EntityType::new("account"),
+                entity_type: fence.entity_type(entity_id),
                 head: EventSequence(fence.head),
                 provenance: if fence.caller_stamped {
                     FenceProvenance::Caller
@@ -1054,7 +1221,9 @@ impl<R: Repository> Runner<R> {
         // A commit refused before any write: a key over the limit, a repeated key, operations
         // with no event.
         if let Err(error) = commit.normalize() {
-            return Outcome::of_view_error(&error).ok_or_else(|| error.into());
+            return Outcome::of_view_error(&error)
+                .or_else(|| Outcome::of_refusal(&error))
+                .ok_or_else(|| error.into());
         }
 
         // Every stream the transaction touches: a failed transaction must leave all of them
@@ -1091,6 +1260,9 @@ impl<R: Repository> Runner<R> {
                 }
                 if matches!(error, Error::RebuildInProgress) {
                     return Ok(Outcome::of("rebuildInProgress"));
+                }
+                if let Some(outcome) = Outcome::of_refusal(&error) {
+                    return Ok(outcome);
                 }
                 if error.is_conflict() {
                     return Ok(Outcome::of("conflict"));
@@ -1143,7 +1315,9 @@ impl<R: Repository> Runner<R> {
             Err(ExecuteError::Store(Error::RebuildInProgress)) => {
                 Ok(Outcome::of("rebuildInProgress"))
             }
-            Err(ExecuteError::Store(err)) => Outcome::of_view_error(&err).ok_or_else(|| err.into()),
+            Err(ExecuteError::Store(err)) => Outcome::of_view_error(&err)
+                .or_else(|| Outcome::of_refusal(&err))
+                .ok_or_else(|| err.into()),
             Err(other) => Err(StepError::Unexpected(other.to_string())),
         }
     }
@@ -1286,7 +1460,7 @@ impl<R: Repository> Runner<R> {
             version: EventVersion(raw.version),
             entity_id: entity_id.clone(),
             entity_type: EntityType::new("account"),
-            payload: raw.payload.as_bytes().to_vec(),
+            payload: raw.payload(),
             metadata: step.metadata(),
         };
 
@@ -1300,7 +1474,7 @@ impl<R: Repository> Runner<R> {
             Err(err) if err.is_conflict() => Ok(Outcome::of("conflict")),
             Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
             Err(Error::RebuildInProgress) => Ok(Outcome::of("rebuildInProgress")),
-            Err(err) => Err(err.into()),
+            Err(err) => Outcome::of_refusal(&err).ok_or_else(|| err.into()),
         }
     }
 
@@ -1655,7 +1829,9 @@ fn classify<E>(result: Result<CommandOutcome<E>, Error>) -> Result<Outcome, Step
         Err(error) if error.is_conflict() => Ok(Outcome::of("conflict")),
         Err(Error::StreamHeadDrift { .. }) => Ok(Outcome::of("drift")),
         Err(Error::RebuildInProgress) => Ok(Outcome::of("rebuildInProgress")),
-        Err(error) => Outcome::of_view_error(&error).ok_or_else(|| error.into()),
+        Err(error) => Outcome::of_view_error(&error)
+            .or_else(|| Outcome::of_refusal(&error))
+            .ok_or_else(|| error.into()),
     }
 }
 
@@ -1680,7 +1856,7 @@ fn raw_event(
         version: EventVersion(raw.version),
         entity_id: entity_id.clone(),
         entity_type: EntityType::new("account"),
-        payload: raw.payload.as_bytes().to_vec(),
+        payload: raw.payload(),
         metadata: metadata.clone(),
     }
 }

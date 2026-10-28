@@ -613,6 +613,16 @@ PostgreSQL — passes the same suite in both languages. The shared scenario list
 `compat/scenarios.json` grows interleaved Go/Rust steps for the new writes, and Go regenerates the
 core golden fixtures as today. The suite, not the ADR, is the executable contract.
 
+_Implementation (E2.8/E3.8)._ Both suites run every capability above on `mem`, DynamoDB, and
+PostgreSQL (Go adds `conformance.RunFeatureMarkerSuite` beside `RunRepositorySuite`; Rust runs
+`Suite`, `outcome_cases`, `feature_marker_cases`, `commit_view_cases`, and `RebuildSuite`), and
+`compat/scenarios.json` holds every scenario the storage spec's
+[Compat scenarios](../reference/storage-format.md#compat-scenarios) lists. The declarations a
+scenario makes on the shared marker refuse every other scenario's writes, so the durable-set
+refusals run in the exclusive `feature-marker` scenario. The current-state rebuild through the
+state entry point (C7) has no case yet, because neither language ships the entry point; it joins
+`commit-grouping` with the rebuild ports.
+
 ## Motivating consumers
 
 - **A downstream Rust game service**: needs atomic multi-aggregate commands — claiming a unique
