@@ -50,6 +50,10 @@ required-features = ["testing"]
 test = true
 
 [[example]]
+name = "todo"
+test = true
+
+[[example]]
 name = "journal"
 required-features = ["journal", "testing"]
 test = true

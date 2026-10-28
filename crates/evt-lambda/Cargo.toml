@@ -10,7 +10,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
+include = ["src/**", "examples/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [features]
 default = []
@@ -29,6 +29,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+
+[[example]]
+name = "stream_handler"
+test = true
 
 [package.metadata.docs.rs]
 all-features = true

@@ -906,6 +906,14 @@ read-fenced `bank` stream. Run it with
 `cargo run -p photon-evt --example banking --features testing`, and its tests run with
 `cargo test -p photon-evt --features testing --example banking`.
 
+[`examples/todo.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/todo.rs) is
+the commit-wide projector end to end: a current-state `CommitProjector` writes each todo list's
+summary row in the commit, and `group_commits` and `replay_views` rebuild the rows from the log
+into an empty set that equals the live one. Run it with
+`cargo run -p photon-evt --example todo`. The
+[examples guide](https://github.com/photon-grove/evt/blob/main/docs/guide/examples.md) lists every
+Go and Rust example.
+
 The `conformance` feature adds the backend conformance suite that this crate runs against its own
 backends:
 
