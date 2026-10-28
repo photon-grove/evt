@@ -31,7 +31,7 @@ use crate::repository::{
     snapshot_events_due,
 };
 use crate::store::{
-    DEFAULT_SNAPSHOT_INTERVAL, Loaded, Store, load_aggregate, serialize_events, stamp_commit_id,
+    DEFAULT_SNAPSHOT_INTERVAL, Loaded, Store, load_with_catch_up, serialize_events, stamp_commit_id,
 };
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
@@ -184,6 +184,9 @@ pub struct Transaction<'a, R: Repository> {
     repository: &'a R,
     commit_ids: CommitIdGenerator,
     snapshot_interval: usize,
+    /// Events a [`read`](Transaction::read) may replay before it writes a catch-up snapshot (0
+    /// never). [`Store::transaction`] carries the store's.
+    catch_up_threshold: usize,
     streams: Vec<StreamState<R::Operation>>,
     fences: Vec<ReadFence>,
     /// The commit-wide projectors, in declaration order. [`Store::transaction`] carries the
@@ -211,8 +214,9 @@ pub struct Transaction<'a, R: Repository> {
 
 impl<A: Aggregate, R: Repository> Store<A, R> {
     /// Begins a multi-stream transaction on this store's repository. It reads and appends any
-    /// aggregate type; the store's snapshot interval and commit-ID generator apply to it. To
-    /// run this store's projectors for its own aggregate type, stage events with
+    /// aggregate type; the store's snapshot interval (the default for types without their own
+    /// [`Aggregate::SNAPSHOT_INTERVAL`]), catch-up snapshot threshold, and commit-ID generator
+    /// apply to it. To run this store's projectors for its own aggregate type, stage events with
     /// [`Store::append_to`]; [`Transaction::append`] runs none.
     pub fn transaction(&self) -> Transaction<'_, R> {
         let mut transaction = Transaction::with_settings(
@@ -221,6 +225,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             self.snapshot_interval,
         );
         transaction.outcomes = self.outcomes.clone();
+        transaction.catch_up_threshold = self.catch_up_threshold;
         transaction.commit_projectors = self.commit_projectors.clone();
         transaction.history_declared = self.history_declared.clone();
 
@@ -228,15 +233,16 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     }
 
     /// Stages events for a stream of this store's aggregate type, running the store's projectors
-    /// and its snapshot interval, as [`Store::commit`] does for a single stream. The
-    /// transaction should come from [`Store::transaction`] (or share this store's repository).
+    /// and its [snapshot interval](Store::snapshot_interval), as [`Store::commit`] does for a
+    /// single stream. The transaction should come from [`Store::transaction`] (or share this
+    /// store's repository).
     pub fn append_to(
         &self,
         transaction: &mut Transaction<'_, R>,
         read: &mut Read<A, R::Operation>,
         events: Vec<A::Event>,
     ) -> Result<(), Error> {
-        transaction.stage(read, events, &self.projectors, self.snapshot_interval)
+        transaction.stage(read, events, &self.projectors, self.snapshot_interval())
     }
 }
 
@@ -261,6 +267,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             repository,
             commit_ids,
             snapshot_interval,
+            catch_up_threshold: 0,
             streams: Vec::new(),
             fences: Vec::new(),
             commit_projectors: Vec::new(),
@@ -386,7 +393,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
     }
 
     /// Sets the number of events between snapshots for streams staged with
-    /// [`append`](Transaction::append). 0 disables snapshots.
+    /// [`append`](Transaction::append). 0 disables snapshots. A stream whose aggregate type
+    /// declares [`Aggregate::SNAPSHOT_INTERVAL`] uses that instead.
     #[must_use]
     pub fn with_snapshot_interval(mut self, interval: usize) -> Self {
         self.snapshot_interval = interval;
@@ -405,17 +413,20 @@ impl<'a, R: Repository> Transaction<'a, R> {
         self.check_open()?;
         self.check_unread(&entity_id)?;
 
-        let loaded = match load_aggregate::<A, R>(self.repository, entity_id).await {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                self.read_failure = Some(ReadFailure {
-                    variant: std::mem::discriminant(&error),
-                    message: error.to_string(),
-                });
+        let loaded =
+            match load_with_catch_up::<A, R>(self.repository, entity_id, self.catch_up_threshold)
+                .await
+            {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    self.read_failure = Some(ReadFailure {
+                        variant: std::mem::discriminant(&error),
+                        message: error.to_string(),
+                    });
 
-                return Err(error);
-            }
-        };
+                    return Err(error);
+                }
+            };
 
         self.read_loaded(loaded)
     }
@@ -510,7 +521,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         events: Vec<A::Event>,
         projectors: &[Arc<dyn Projector<A, R::Operation>>],
     ) -> Result<&mut Self, Error> {
-        let interval = self.snapshot_interval;
+        let interval = A::SNAPSHOT_INTERVAL.unwrap_or(self.snapshot_interval);
         self.stage(read, events, projectors, interval)?;
 
         Ok(self)

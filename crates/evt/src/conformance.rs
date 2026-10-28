@@ -655,6 +655,14 @@ impl<'a, R: Repository, V: ViewTarget<R>, H: HeadFixtures<R>> Suite<'a, R, V, H>
         );
         record("store loads from a snapshot", store_snapshots(repo).await);
         record(
+            "an aggregate's own snapshot interval overrides the store's and the transaction's",
+            Box::pin(snapshot_policy::aggregate_snapshot_interval(repo)).await,
+        );
+        record(
+            "a load that replays the threshold writes a catch-up snapshot",
+            Box::pin(snapshot_policy::catch_up_snapshots(repo)).await,
+        );
+        record(
             "store rejects a stale commit",
             store_stale_commit(repo).await,
         );
@@ -3923,6 +3931,9 @@ struct FaultState<Op> {
     reads_before_failure: Option<(usize, ReadFault)>,
     /// A stalled read is armed or running: the read deadline fires at once.
     stalling: bool,
+    /// Outcome reads so far, and whether a held commit has landed (diagnostics).
+    outcome_reads: usize,
+    landed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3951,6 +3962,8 @@ impl<R: Repository> FaultInjectingRepository<R> {
                 rival: None,
                 reads_before_failure: None,
                 stalling: false,
+                outcome_reads: 0,
+                landed: false,
             }),
         }
     }
@@ -4126,6 +4139,7 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
         // A held commit lands just before the read it was waiting for.
         let landing = {
             let mut state = self.state();
+            state.outcome_reads += 1;
 
             match state.delayed.take() {
                 Some((held, 0 | 1)) => Some(held),
@@ -4139,6 +4153,7 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
         };
         if let Some(held) = landing {
             self.inner.commit(held).await?;
+            self.state().landed = true;
         }
 
         let fail = {
@@ -5185,9 +5200,25 @@ async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
     let id = ledger_id();
     let command = command_id();
     fault.arm_land_after_reads(3);
-    let late = store
+    let reads_before = fault.state().outcome_reads;
+    let started = std::time::Instant::now();
+    let late = match store
         .execute_with_outcome(&id, Add(5), command_metadata(&command))
-        .await?;
+        .await
+    {
+        Ok(late) => late,
+        Err(err) => {
+            let state = fault.state();
+
+            return Err(Failure(format!(
+                "a delayed commit is found by polling: {err} after {:?}, {} outcome reads, landed: {}, still held: {}",
+                started.elapsed(),
+                state.outcome_reads - reads_before,
+                state.landed,
+                state.delayed.is_some(),
+            )));
+        }
+    };
     ensure!(
         late.replayed && late.is_accepted(),
         "a delayed commit is found by polling: {late:?}"
@@ -7294,6 +7325,7 @@ mod compaction;
 #[cfg(feature = "journal")]
 mod journal;
 mod rebuild;
+mod snapshot_policy;
 mod view_repository;
 mod views;
 
