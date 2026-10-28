@@ -550,6 +550,15 @@ capability) seeds each entity from its `sk = 0` snapshot, then applies only even
 sequence 1. `RebuildProjections` uses this path when `RebuildConfig.SeedAggregate` is set, and errors
 if `SeedAggregate` is set on a repository that is not a `SnapshotStreamer`.
 
+Rust's counterpart is `EventLog::stream_entities_from_snapshots::<A>(filter)`, on every backend: it
+lists the entities with `entity_heads` (so a stream compacted down to its snapshot is included) and
+loads each like `Store::load` (snapshot plus later events, with the sequence-gap check).
+`ProjectionRebuild` uses it to rebuild current-state commit-wide projectors from final states,
+under the rebuild lock. Its replay of history-dependent projectors needs every event from sequence
+1 and fails with `CompactionUncovered` on a compacted stream of their types. It computes every row
+before the first write, so any failure while reading or projecting releases the lock with nothing
+written.
+
 ## Commit-Wide Projectors (v0.9, C7)
 
 A `CommitProjector` is a pure function over one commit; its view operations commit in the same

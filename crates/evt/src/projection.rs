@@ -717,8 +717,18 @@ pub fn project_commit(
         return Ok(Vec::new());
     }
 
+    project_with(projectors.iter().enumerate(), view)
+}
+
+/// Runs the given projectors, each with its index among the store's (or the rebuild's)
+/// projectors, over a commit view, whether or not it carries events, with the owner and
+/// operation checks of [`project_commit`].
+pub(crate) fn project_with<'a>(
+    projectors: impl IntoIterator<Item = (usize, &'a Arc<dyn CommitProjector>)>,
+    view: &CommitView,
+) -> Result<Vec<ProjectedView>, Error> {
     let mut projected = Vec::new();
-    for (index, projector) in projectors.iter().enumerate() {
+    for (index, projector) in projectors {
         let history = projector.history();
         let operations = projector
             .project(&view.visible_to(history, projector.engine_metadata()))
@@ -971,50 +981,62 @@ pub fn replay_views(
     projectors: &[Arc<dyn CommitProjector>],
     commits: &[CommitView],
 ) -> Result<Vec<ViewRow>, Error> {
-    let mut rows: BTreeMap<(Vec<u8>, Vec<u8>), ViewRow> = BTreeMap::new();
-    let mut owners: HashMap<(String, String), EntityId> = HashMap::new();
+    let mut replay = ViewReplay::default();
 
     for commit in commits {
         for item in project_commit(projectors, commit)? {
-            let op = item.op;
-            let target = (op.pk.clone(), op.sk.clone());
-
-            match owners.get(&target) {
-                Some(first) if *first != op.owner => {
-                    return Err(Error::SharedViewKey {
-                        pk: target.0,
-                        sk: target.1,
-                        first: first.to_string(),
-                        second: op.owner.to_string(),
-                    });
-                }
-                _ => {
-                    owners.insert(target.clone(), op.owner.clone());
-                }
-            }
-
-            let key = (op.pk.as_bytes().to_vec(), op.sk.as_bytes().to_vec());
-            match op.kind {
-                ViewOperationKind::Delete => {
-                    rows.remove(&key);
-                }
-                ViewOperationKind::Put => {
-                    rows.insert(
-                        key,
-                        ViewRow::new(
-                            op.pk,
-                            op.sk,
-                            op.owner.to_string(),
-                            op.entity_type,
-                            op.payload,
-                        ),
-                    );
-                }
-            }
+            replay.apply(item)?;
         }
     }
 
-    Ok(rows.into_values().collect())
+    Ok(replay.rows().collect())
+}
+
+/// The rows a replay's operations leave, keyed by `pk` then `sk` bytes: the last operation on each
+/// key, a put or a delete, with the owner check of [`replay_views`].
+#[derive(Debug, Default)]
+pub(crate) struct ViewReplay {
+    last: BTreeMap<(Vec<u8>, Vec<u8>), ProjectedView>,
+}
+
+impl ViewReplay {
+    /// Applies one operation, or refuses with [`Error::SharedViewKey`] when another owner already
+    /// wrote its row.
+    pub(crate) fn apply(&mut self, item: ProjectedView) -> Result<(), Error> {
+        let key = (
+            item.op.pk.as_bytes().to_vec(),
+            item.op.sk.as_bytes().to_vec(),
+        );
+
+        if let Some(first) = self.last.get(&key)
+            && first.op.owner != item.op.owner
+        {
+            return Err(Error::SharedViewKey {
+                pk: item.op.pk,
+                sk: item.op.sk,
+                first: first.op.owner.to_string(),
+                second: item.op.owner.to_string(),
+            });
+        }
+
+        self.last.insert(key, item);
+
+        Ok(())
+    }
+
+    /// The rows left, ascending by `pk` then `sk` bytes.
+    pub(crate) fn rows(&self) -> impl Iterator<Item = ViewRow> + '_ {
+        self.last
+            .values()
+            .filter(|item| item.op.kind == ViewOperationKind::Put)
+            .map(|item| ViewRow::of(&item.op))
+    }
+
+    /// The last operation on every key the replay touched, ascending by `pk` then `sk` bytes: a
+    /// key whose last operation deleted it keeps the delete.
+    pub(crate) fn into_last(self) -> impl Iterator<Item = ProjectedView> {
+        self.last.into_values()
+    }
 }
 
 /// Requires an operation to be owned by a stream the commit wrote, and, for a history-dependent

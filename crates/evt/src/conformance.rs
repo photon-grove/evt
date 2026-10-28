@@ -2864,6 +2864,10 @@ where
         enumerate_entities(repo).await,
     );
     record(
+        "stream_entities_from_snapshots seeds each entity from its snapshot, compacted or not",
+        enumerate_from_snapshots(repo).await,
+    );
+    record(
         "dropping an enumeration stream releases its resources",
         enumerate_cancellation(repo).await,
     );
@@ -3063,6 +3067,70 @@ async fn enumerate_entities<R: Repository + EventLog>(repo: &R) -> CaseResult {
     ensure!(
         entities.iter().filter(|entity| entity.is_ok()).count() >= 2,
         "the other entities still stream after the gap"
+    );
+
+    Ok(())
+}
+
+async fn enumerate_from_snapshots<R: Repository + EventLog>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let whole = Stream::new(&ns, "whole", "ledger");
+    let partial = Stream::new(&ns, "partial", "ledger");
+    let at_head = Stream::new(&ns, "at-head", "ledger");
+    let other = Stream::new(&ns, "other", "unrelated");
+
+    whole.commit(repo, whole.events(1..=3), None).await?;
+    // Compacted part-way: the snapshot covers 1..=2 (amounts 1 and 2), event 3 remains.
+    partial
+        .commit(
+            repo,
+            partial.events(1..=2),
+            Some(partial.new_snapshot(1, r#"{"total":3,"entries":2}"#)),
+        )
+        .await?;
+    partial.commit(repo, partial.events(3..=3), None).await?;
+    repo.compact_below(&partial.id, EventSequence(2)).await?;
+    // Compacted down to the snapshot: no events left.
+    at_head
+        .commit(
+            repo,
+            at_head.events(1..=2),
+            Some(at_head.new_snapshot(1, r#"{"total":3,"entries":2}"#)),
+        )
+        .await?;
+    repo.compact_below(&at_head.id, EventSequence(2)).await?;
+    other.commit(repo, other.events(1..=1), None).await?;
+
+    let entities = drain(
+        repo.stream_entities_from_snapshots::<Ledger>(StreamFilter::of_type(
+            whole.entity_type.clone(),
+        )),
+    )
+    .await;
+    let loaded = entities
+        .into_iter()
+        .map(|entity| {
+            entity.map(|loaded| {
+                (
+                    loaded.entity_id().clone(),
+                    (
+                        loaded.aggregate().total,
+                        loaded.sequence(),
+                        loaded.snapshot_sequence(),
+                    ),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    ensure_eq!(
+        loaded,
+        vec![
+            (at_head.id.clone(), (3, EventSequence(2), EventSequence(1))),
+            (partial.id.clone(), (6, EventSequence(3), EventSequence(1))),
+            (whole.id.clone(), (6, EventSequence(3), EventSequence::ZERO)),
+        ],
+        "every entity of the type, ascending by ID, from its snapshot plus the events after it"
     );
 
     Ok(())
@@ -7303,6 +7371,6 @@ pub use compaction::compaction_cases;
 #[cfg(feature = "journal")]
 #[cfg_attr(docsrs, doc(cfg(feature = "journal")))]
 pub use journal::journal_cases;
-pub use rebuild::{NoViewRows, RebuildSuite, TestClock};
+pub use rebuild::{NoViewRows, RebuildSuite, TestClock, projection_rebuild_cases};
 pub use view_repository::{committed_view_cases, view_repository_cases};
 pub use views::{CommitViewTarget, commit_view_cases};

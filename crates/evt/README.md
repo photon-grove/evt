@@ -63,7 +63,8 @@ write data of that type.
 The rest of this page covers the larger features. [Command outcomes](#command-outcomes) make a
 retried command return its stored answer instead of running twice. Then come
 [commit-wide projectors](#commit-wide-projectors), the [sync journal](#the-sync-journal), the
-[rebuild fence](#rebuild-fence), and [enumerating the log](#enumerating-the-log) with `EventLog`.
+[rebuild fence](#rebuild-fence), [rebuilding projections](#rebuilding-projections), and
+[enumerating the log](#enumerating-the-log) with `EventLog`.
 There's also `latest(n)`, which reads a stream's last `n` events newest-first. The guide pages on
 [commands and retries](https://github.com/photon-grove/evt/blob/main/docs/guide/commands.md), [projections](https://github.com/photon-grove/evt/blob/main/docs/guide/projections.md),
 [DynamoDB](https://github.com/photon-grove/evt/blob/main/docs/guide/dynamodb.md) and [PostgreSQL](https://github.com/photon-grove/evt/blob/main/docs/guide/postgres.md) explain the same
@@ -772,6 +773,44 @@ let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().awai
   `RebuildEpochChanged` as its own error. The engine returns it at once and records nothing.
 - Leases are whole seconds read from the repository's clock, and `with_clock` injects one in tests.
 
+## Rebuilding projections
+
+Views are derived state, so they can be rebuilt from the log. `ProjectionRebuild` replays
+commit-wide projectors over the aggregate types you register and writes their rows under the
+rebuild fence:
+
+```rust,ignore
+use std::time::Duration;
+
+use photon_evt::ProjectionRebuild;
+
+let report = ProjectionRebuild::new(&repository)
+    .with_projector(directory.clone())   // the same Arc<dyn CommitProjector>s the store runs
+    .with_projector(activity_feed.clone())
+    .aggregate::<Account>()
+    .aggregate::<Team>()
+    .run("rebuild-7", Duration::from_secs(300))
+    .await?;
+```
+
+- It takes the lock for the whole run, so commits fail with `RebuildInProgress` while it reads and
+  writes. It computes and checks every row first, then writes them in guarded batches (at most 99
+  operations within the commit byte budget), renews the lease, and releases the lock when it's done.
+- A current-state projector runs once per stream, over that stream's final state. Final states
+  come from `EventLog::stream_entities_from_snapshots`, so compacted streams start from their
+  snapshot. Only rebuild projectors whose rows depend on their owner's state alone: a row that
+  reads another stream's state from the same commit is recomputed from one stream.
+- A history-dependent projector replays every commit of the types it names (`group_commits`).
+  Streams of other types in a commit are left out of the replayed view. A compacted stream of
+  those types fails the run with `CompactionUncovered` before anything is written.
+- Conditions aren't evaluated, so the run can go over existing rows, and running it twice is safe.
+  It doesn't delete rows nothing produces any more, so wipe them first to rebuild from scratch.
+- It holds every row in memory, and needs strongly consistent reads of the log.
+- `operations()` is a dry run that returns what `run` would write, without taking the lock.
+- A failure before the first write releases the lock and leaves the rows alone. Once a write was
+  attempted, a failure keeps the lock until a retry takes over the lapsed lease. The journal has
+  its own rebuild (`journal::rebuild_with_lock`), and its projector is refused here.
+
 ## Enumerating the log
 
 `EventLog`, implemented by all three backends, is the Rust counterpart of Go's `StreamAllEvents`
@@ -811,7 +850,8 @@ let mut accounts = std::pin::pin!(repository.stream_entities::<Account>(StreamFi
 - Errors. A backend error ends the stream as its last item. An entity that fails to fold (an
   unknown event type, a failed upcast, a sequence gap from compaction) is yielded as an error and
   the stream continues. Entities fold from events only, as in Go, so a compacted stream reports
-  `SequenceGap`. Load it with `Store::load` instead.
+  `SequenceGap`. Use `stream_entities_from_snapshots` instead, which lists entities with
+  `entity_heads` and loads each from its snapshot plus later events, like `Store::load`.
 
 ## Reading and writing views
 

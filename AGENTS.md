@@ -42,7 +42,8 @@
   (`evt.Compactor.CompactBelow`) may delete events only where a durable snapshot already covers them
   (`snapshot.EventSequence >= throughSequence`); it must never delete the `sk=0` snapshot. After a
   stream is compacted, rebuild it via the snapshot-aware path (`RebuildConfig.SeedAggregate` /
-  `evt.SnapshotStreamer`), never full-replay-from-1. See
+  `evt.SnapshotStreamer`; Rust `ProjectionRebuild` / `stream_entities_from_snapshots`), never
+  full-replay-from-1. See
   `docs/adr/0001-event-compaction-and-snapshot-truncation.md`.
 - Do not persist mutable decisions, external signals, publish flags, accept/reject verdicts, or
   review state directly to a view table with no backing event.

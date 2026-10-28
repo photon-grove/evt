@@ -16,7 +16,8 @@ use futures_core::Stream as _;
 use photon_evt::conformance::{
     Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, RebuildSuite, Suite, TestClock,
     ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, feature_marker_cases,
-    fresh_store_cases, initialization_cases, outcome_cases, view_repository_cases,
+    fresh_store_cases, initialization_cases, outcome_cases, projection_rebuild_cases,
+    view_repository_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
@@ -459,6 +460,15 @@ async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
             ))
             .run(),
     )
+    .await;
+    Box::pin(projection_rebuild_cases(
+        &rebuilds,
+        &clock,
+        &DynamoViewRows {
+            client: client.clone(),
+            table: views.clone(),
+        },
+    ))
     .await;
 
     // The stored item has exactly the five string attributes, an empty entity type included.
@@ -1938,6 +1948,12 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository, events: &st
             .with_head_fixtures(PostgresHeads::new(pool.clone(), events.to_owned()))
             .run(),
     )
+    .await;
+    Box::pin(projection_rebuild_cases(
+        &rebuilds,
+        &clock,
+        &PostgresViewRows { pool: pool.clone() },
+    ))
     .await;
 
     let id = |label: &str| {

@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
 use super::*;
-use crate::projection::{ProjectedView, ViewOperation, ViewRow};
+use crate::projection::{CommitProjector, CommitView, ProjectedView, ViewOperation, ViewRow};
 use crate::rebuild::{
-    MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH, RebuildFence, RebuildGeneration, RebuildLease,
-    RebuildState, observe_rebuild_epoch, read_at_rebuild_epoch, verify_rebuild_epoch,
+    MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH, ProjectionRebuild, RebuildFence,
+    RebuildGeneration, RebuildLease, RebuildState, observe_rebuild_epoch, read_at_rebuild_epoch,
+    verify_rebuild_epoch,
 };
 
 /// A settable clock in whole Unix seconds for the rebuild cases: a repository reads it through
@@ -1717,6 +1718,227 @@ async fn engine_retry<R: Repository + RebuildFence>(env: &Env<'_, R>) -> CaseRes
             .is_rejected(),
         "the rejection is recorded"
     );
+
+    Ok(())
+}
+
+/// Runs the projection rebuild case ([`ProjectionRebuild`], v0.9 P4 and P11) against a repository
+/// that keeps the rebuild fence, reads `clock`, enumerates its log, and writes views that `views`
+/// reads back. Like [`RebuildSuite`], it settles the fence before and after, so run it on a table no
+/// concurrent test commits to; it panics if the case fails.
+pub async fn projection_rebuild_cases<R, T>(repo: &R, clock: &TestClock, views: &T)
+where
+    R: Repository + RebuildFence + EventLog,
+    T: CommitViewTarget<R>,
+{
+    let env = Env {
+        repo,
+        clock,
+        ns: namespace(),
+        leases: Mutex::new(BTreeMap::new()),
+    };
+    let name = "a projection rebuild replays commit-wide projectors under the lock, seeding \
+                compacted streams from their snapshots";
+
+    let result = match env.settle().await {
+        Ok(()) => Box::pin(projection_rebuild(&env, views)).await,
+        Err(failure) => Err(failure),
+    };
+    let cleanup = env.settle().await;
+
+    let mut failures = Vec::new();
+    match result {
+        Ok(()) => println!("ok   {name}"),
+        Err(Failure(message)) => {
+            println!("FAIL {name}");
+            failures.push(format!("{name}: {message}"));
+        }
+    }
+    if let Err(Failure(message)) = cleanup {
+        failures.push(format!("cleanup: {message}"));
+    }
+    if !failures.is_empty() {
+        panic!(
+            "projection rebuild case failed:\n\n{}",
+            failures.join("\n\n")
+        );
+    }
+}
+
+/// A current-state projector for the projection rebuild case: one row per stream with its state.
+struct StateRows {
+    pk: String,
+}
+
+impl CommitProjector for StateRows {
+    fn name(&self) -> &str {
+        "state-rows"
+    }
+
+    fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                ViewOperation::put(
+                    self.pk.clone(),
+                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(),
+                    stream.entity_type.as_str(),
+                    stream.state.clone(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// A history-dependent projector for the projection rebuild case: one row per commit and stream,
+/// keyed by the stream's last sequence in the commit.
+struct CommitRows {
+    pk: String,
+    history: Vec<EntityType>,
+}
+
+impl CommitProjector for CommitRows {
+    fn name(&self) -> &str {
+        "commit-rows"
+    }
+
+    fn history(&self) -> &[EntityType] {
+        &self.history
+    }
+
+    fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+        let mut operations = Vec::new();
+        for stream in &commit.streams {
+            let state: Ledger = serde_json::from_slice(&stream.state)?;
+            let last = stream.events.last().map_or(0, |event| event.sequence.0);
+            operations.push(ViewOperation::put(
+                self.pk.clone(),
+                format!("{}#{last:04}", stream.entity_id),
+                stream.entity_id.clone(),
+                stream.entity_type.as_str(),
+                format!(
+                    r#"{{"commit":{:?},"events":{},"total":{}}}"#,
+                    commit.commit_id,
+                    stream.events.len(),
+                    state.total
+                ),
+            ));
+        }
+
+        Ok(operations)
+    }
+}
+
+async fn projection_rebuild<R, T>(env: &Env<'_, R>, views: &T) -> CaseResult
+where
+    R: Repository + RebuildFence + EventLog,
+    T: CommitViewTarget<R>,
+{
+    let repo = env.repo;
+    let ns = &env.ns;
+
+    // A current-state type: one whole stream and one compacted below its snapshot at 3.
+    let whole = Stream::new(ns, "whole", "rebuild-ledger");
+    let compacted = Stream::new(ns, "compacted", "rebuild-ledger");
+    whole.commit(repo, whole.events(1..=2), None).await?;
+    compacted
+        .commit(
+            repo,
+            compacted.events(1..=3),
+            Some(compacted.new_snapshot(1, r#"{"total":6,"entries":3}"#)),
+        )
+        .await?;
+    compacted
+        .commit(repo, compacted.events(4..=4), None)
+        .await?;
+    repo.compact_below(&compacted.id, EventSequence(3)).await?;
+
+    // A history-dependent type, never compacted: a two-event commit, then a one-event commit.
+    let feed = Stream::new(ns, "feed", "rebuild-feed");
+    let mut events = feed.events(1..=3);
+    for (index, event) in events.iter_mut().enumerate() {
+        event.metadata.commit_id = format!("{ns}-c{}", 1 + index / 2);
+    }
+    feed.commit(repo, events[..2].to_vec(), None).await?;
+    feed.commit(repo, events[2..].to_vec(), None).await?;
+
+    let state_pk = format!("{ns}#state-rows");
+    let commit_pk = format!("{ns}#commit-rows");
+    let before = env.generation().await?;
+
+    let report = ProjectionRebuild::new(repo)
+        .with_projector(Arc::new(StateRows {
+            pk: state_pk.clone(),
+        }))
+        .with_projector(Arc::new(CommitRows {
+            pk: commit_pk.clone(),
+            history: vec![feed.entity_type.clone()],
+        }))
+        .aggregate_as::<Ledger>(whole.entity_type.clone())
+        .aggregate_as::<Ledger>(feed.entity_type.clone())
+        .run(&env.owner("projection"), Duration::from_secs(60))
+        .await?;
+
+    ensure_eq!(
+        (
+            report.entities,
+            report.commits,
+            report.puts,
+            report.deletes,
+            report.batches
+        ),
+        (3, 2, 5, 0, 1),
+        "the rebuild report"
+    );
+    ensure_eq!(
+        env.generation().await?,
+        RebuildGeneration {
+            value: before.value + 2,
+            force_released: false,
+        },
+        "the rebuild took the lock and released it"
+    );
+
+    let row = |pk: String, sk: String| async move {
+        views
+            .row(&pk, &sk)
+            .await
+            .map_err(|err| Failure(err.to_string()))?
+            .map(|row| {
+                (
+                    row.entity_id,
+                    String::from_utf8_lossy(&row.payload).into_owned(),
+                )
+            })
+            .ok_or_else(|| Failure(format!("no row {pk}/{sk}")))
+    };
+
+    for (stream, payload) in [
+        (&whole, r#"{"total":3,"entries":2}"#),
+        (&compacted, r#"{"total":10,"entries":4}"#),
+        (&feed, r#"{"total":6,"entries":3}"#),
+    ] {
+        ensure_eq!(
+            row(state_pk.clone(), stream.id.to_string()).await?,
+            (stream.id.to_string(), payload.to_owned()),
+            format!(
+                "the final state of {}, seeded from a snapshot when compacted",
+                stream.id
+            )
+        );
+    }
+    for (last, payload) in [
+        (2, format!(r#"{{"commit":"{ns}-c1","events":2,"total":3}}"#)),
+        (3, format!(r#"{{"commit":"{ns}-c2","events":1,"total":6}}"#)),
+    ] {
+        ensure_eq!(
+            row(commit_pk.clone(), format!("{}#{last:04}", feed.id)).await?,
+            (feed.id.to_string(), payload),
+            format!("the replayed commit ending at {last}")
+        );
+    }
 
     Ok(())
 }

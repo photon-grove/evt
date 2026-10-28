@@ -674,12 +674,13 @@ projectors are recorded in the feature manifest's `historyDependent` set
   them (below), and their rebuild replays every commit grouped by `commitId`.
 
 State entry point (v0.9). *Not implemented in this release.* The design below is the target
-for the rebuild ports. No interface, entry point, or rebuild for it exists in either
-language, and nothing in the commit path uses it. Until it lands, the only rebuild this engine
-reproduces is the in-memory replay of history-dependent projectors (Go `GroupCommits` and
-`ReplayViews`, Rust `group_commits` and `replay_views`): a current-state projector's rows are
-reproducible by that same replay only with the caller supplying each commit's post-commit state,
-and no durable view table is rebuilt by the engine. The target: every commit-wide projector
+for the rebuild ports. No interface or entry point for it exists in either language, and nothing
+in the commit path uses it. Until it lands, Go rebuilds no durable view table of commit-wide
+projectors: its in-memory replay of history-dependent projectors (`GroupCommits` and
+`ReplayViews`) reproduces their rows, and a current-state projector's rows only with the caller
+supplying each commit's post-commit state. Rust's `ProjectionRebuild` rebuilds the views table of
+both kinds under the rebuild lock (see "The Rust projection rebuild" below), standing in for the
+state entry point with one view per stream. The target: every commit-wide projector
 implements a second entry point alongside the per-commit one: the state entry point, called with a lookup by stream ID over
 the final state of every aggregate in scope and returning the projector's complete current row
 set. "Final state" is what a load at the head returns: the snapshot plus the events after it,
@@ -701,6 +702,37 @@ what its streams' final states say. (A per-stream snapshot seed cannot do this (
 from several aggregates is not a function of any one of their snapshots) which is why the entry
 point takes the complete state.) Compaction never invalidates such a rebuild, and `CompactBelow`
 never refuses these entity types.
+
+The Rust projection rebuild (v0.9, `photon_evt::ProjectionRebuild`). It takes the rebuild lock
+([Rebuild fence](#rebuild-fence)) for the whole run, so no commit lands and readers under the
+epoch check are fenced while it reads the log. It writes through the guarded writer in batches of
+at most 99 operations, renews the lease as it goes, and releases the lock at the end, which
+settles the generation. Only streams of the aggregate types registered with it are read. It
+computes every operation before the first write and refuses, before writing, a row two owners would
+write (`SharedViewKey`), a key planned twice (`DuplicateViewKey`), and an operation too large for
+any batch (`CommitTooLarge`); batches hold at most 99 operations within the commit byte budget.
+Each operation is written without its condition or mapped error (a replay applies what the live
+commits wrote), so a rebuild runs over existing rows and is idempotent. It does not wipe: rows no
+projector produces any more stay until the caller deletes them. It needs strongly consistent reads
+of the log, or a commit that landed just before the lock was taken can be missed.
+
+- A current-state projector runs once per stream of every registered type, over a view of that
+  stream alone: its final state (the snapshot plus the events after it, so a compacted stream is
+  seeded from its snapshot, the `StreamEntitiesFromSnapshots` enumeration), no events, and an
+  empty `commitId`. This is the state entry point with one stream in scope. It reproduces every row
+  whose owner's state alone determines it. A row that reads another stream's state from the same
+  commit is recomputed from the one stream, so such a projector must not be rebuilt this way until
+  the state entry point exists; a row owned by another stream fails the rebuild with
+  `InvalidViewOperation` before anything is written.
+- A history-dependent projector is replayed as the next paragraph specifies, from the events of
+  the types the history-dependent projectors name; a commit's streams of other types, which a live
+  view carries by ID and type only, are absent from the replayed view. The rows the replay leaves
+  are written as puts, and a row the replay deleted last as a delete. A stream of those types whose history does not start at sequence 1 fails the
+  rebuild with `CompactionUncovered` before anything is written.
+
+A run that fails before attempting a write releases the lock and leaves the rows as they were. Once
+a write was attempted (even one whose result is unknown) a failure keeps the lock, because the rows
+may be half-written, until a retry takes over the lapsed lease.
 
 Rebuilding a history-dependent projector (v0.9). A wipe-and-rebuild replays every
 commit grouped by `commitId`: each group's events, ordered by stream ID bytewise then by

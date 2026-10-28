@@ -26,6 +26,9 @@
 //!   snapshot covers.
 //! - Fence projection rebuilds durably with [`RebuildFence`]: while a rebuild holds the lock every
 //!   commit is refused with [`Error::RebuildInProgress`], and readers check a [`RebuildEpoch`].
+//! - Rebuild commit-wide projections from the log with [`ProjectionRebuild`], under that fence,
+//!   seeding compacted streams from their snapshots
+//!   ([`stream_entities_from_snapshots`](EventLog::stream_entities_from_snapshots)).
 //!
 //! The storage contract is documented in the
 //! [storage format spec](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md).
@@ -103,10 +106,10 @@ pub use projection::{
     view_operation_size,
 };
 pub use rebuild::{
-    MAX_REBUILD_BEGIN_ATTEMPTS, MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH,
+    MAX_REBUILD_BEGIN_ATTEMPTS, MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH, ProjectionRebuild,
     REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildEpoch, RebuildFence,
-    RebuildGeneration, RebuildLease, RebuildLock, RebuildState, observe_rebuild_epoch,
-    read_at_rebuild_epoch, verify_rebuild_epoch,
+    RebuildGeneration, RebuildLease, RebuildLock, RebuildReport, RebuildState,
+    observe_rebuild_epoch, read_at_rebuild_epoch, verify_rebuild_epoch,
 };
 pub use repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,

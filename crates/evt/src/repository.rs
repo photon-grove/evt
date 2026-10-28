@@ -598,6 +598,12 @@ fn stream_sizes<Op>(
     Ok(())
 }
 
+/// The most bytes one commit (or one guarded rebuild write) may carry, summed over its actions.
+pub(crate) const MAX_COMMIT_BYTES: usize = 3_800_000;
+
+/// The most bytes one action of a commit may carry.
+pub(crate) const MAX_COMMIT_ITEM_BYTES: usize = 380_000;
+
 pub(crate) fn check_budget(sizes: impl IntoIterator<Item = usize>) -> Result<(), Error> {
     let mut actions = 0usize;
     let mut bytes = 0usize;
@@ -607,7 +613,7 @@ pub(crate) fn check_budget(sizes: impl IntoIterator<Item = usize>) -> Result<(),
         bytes = bytes.saturating_add(size);
         largest_item = largest_item.max(size);
     }
-    if actions > 100 || bytes > 3_800_000 || largest_item > 380_000 {
+    if actions > 100 || bytes > MAX_COMMIT_BYTES || largest_item > MAX_COMMIT_ITEM_BYTES {
         return Err(Error::CommitTooLarge {
             actions,
             bytes,
