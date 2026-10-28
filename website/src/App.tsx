@@ -282,7 +282,7 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
           </div>
           <ul className="hero-facts" aria-label="At a glance">
             <li>Apache-2.0</li>
-            <li>Go module · Rust crates</li>
+            <li>Rust crates · Go module</li>
             <li>No runtime, no base types</li>
           </ul>
         </div>
