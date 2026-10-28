@@ -1,10 +1,486 @@
 # Getting started
 
-This guide builds a replayable aggregate, tests it against in-memory storage, and then moves it to
-DynamoDB without changing the aggregate. The complete runnable example lives in
-[`go/examples/banking`](https://github.com/photon-grove/evt/tree/main/go/examples/banking).
+This guide builds a bank account aggregate in Rust, tests it against the in-memory backend, makes
+retries safe, and moves it to DynamoDB or PostgreSQL without changing the aggregate. The same model
+in Go comes after. Every Rust snippet here is copied from
+[`crates/evt/examples/getting_started.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/getting_started.rs),
+which CI builds and tests, and a test fails if the two drift apart. From a checkout of this
+repository, run the whole program with:
+
+```sh
+cargo run -p photon-evt --example getting_started --features testing
+```
 
 ## Install
+
+```sh
+cargo add photon-evt
+cargo add serde --features derive
+cargo add thiserror
+cargo add tokio --features macros,rt-multi-thread
+cargo add photon-evt --dev --features testing
+```
+
+The default build is the core plus the in-memory backend, with no cloud dependencies, so unit tests
+stay fast and offline. The `dynamodb` and `postgres` features add the durable backends (step 6),
+and `testing` adds the given/when/then helpers (step 4).
+
+## 1. Declare the events
+
+The snippets in this guide share these imports:
+
+```rust
+use photon_evt::{
+    Aggregate, BoxError, ExecuteError, MemRepository, Metadata, OutcomeCommand, OutcomeConfig,
+    Rejection, Store, ToRejection, canonical_json, domain_events,
+};
+use serde::{Deserialize, Serialize};
+```
+
+Events are plain `serde` structs. `domain_events!` gathers them into one enum and gives each a type
+string and a version, which is how a stored event finds its way back to a Rust type on replay.
+
+```rust
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountOpened {
+    pub account_id: String,
+    pub balance: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoneyDeposited {
+    pub account_id: String,
+    pub amount: i64,
+}
+
+domain_events! {
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum AccountEvent {
+        Opened(AccountOpened) => ("bank_account.opened", 1),
+        Deposited(MoneyDeposited) => ("bank_account.money_deposited", 1),
+    }
+}
+```
+
+The type string, the version and the payload's JSON fields are your durable contract. Start every
+event at version `1`, and read about [schema evolution](concepts.md#upcaster) before you change a
+payload's shape.
+
+## 2. Write the aggregate
+
+An aggregate is the state that commands act on. It names its command, event and error types, and
+it can take shared services (a clock, a client) through `Services`. The state derives `Default`,
+because an entity with no events loads as the default, and `serde`, because snapshots store it.
+`#[serde(default)]` lets a snapshot written before you added a field still load. It also means a
+renamed field loads as its default instead of failing, so treat the state's field names as part of
+the contract too.
+
+```rust
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum AccountCommand {
+    Open {
+        account_id: String,
+        initial_balance: i64,
+    },
+    Deposit {
+        amount: i64,
+    },
+}
+
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum AccountError {
+    #[error("account already opened")]
+    AlreadyOpened,
+    #[error("account not opened")]
+    NotOpened,
+    #[error("amount must be positive")]
+    InvalidAmount,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Account {
+    pub id: String,
+    pub balance: i64,
+    pub opened: bool,
+}
+```
+
+`handle` validates a command against the current state and returns the events it decides on. It
+never changes the aggregate. `apply` changes the state and never validates, because the event
+already happened. Keep each side to its job.
+
+```rust
+impl Aggregate for Account {
+    const TYPE: &'static str = "bank_account";
+
+    type Command = AccountCommand;
+    type Event = AccountEvent;
+    type Error = AccountError;
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: AccountCommand,
+        _: &(),
+    ) -> Result<Vec<AccountEvent>, AccountError> {
+        match command {
+            AccountCommand::Open {
+                account_id,
+                initial_balance,
+            } => {
+                if self.opened {
+                    return Err(AccountError::AlreadyOpened);
+                }
+
+                Ok(vec![
+                    AccountOpened {
+                        account_id,
+                        balance: initial_balance,
+                    }
+                    .into(),
+                ])
+            }
+
+            AccountCommand::Deposit { amount } => {
+                if !self.opened {
+                    return Err(AccountError::NotOpened);
+                }
+                if amount <= 0 {
+                    return Err(AccountError::InvalidAmount);
+                }
+
+                let account_id = self.id.clone();
+
+                Ok(vec![MoneyDeposited { account_id, amount }.into()])
+            }
+        }
+    }
+
+    fn apply(&mut self, event: AccountEvent) {
+        match event {
+            AccountEvent::Opened(e) => {
+                self.id = e.account_id;
+                self.balance = e.balance;
+                self.opened = true;
+            }
+            AccountEvent::Deposited(e) => self.balance += e.amount,
+        }
+    }
+}
+```
+
+## 3. Run it in memory
+
+A `Store` puts the aggregate on a repository. `execute` loads the stream, runs `handle`, and commits
+the events in one conditional write on the stream's head, so a writer that raced you gets a
+conflict instead of a silent overwrite.
+
+```rust
+fn open(account_id: &str, initial_balance: i64) -> AccountCommand {
+    AccountCommand::Open {
+        account_id: account_id.to_owned(),
+        initial_balance,
+    }
+}
+
+async fn open_and_deposit() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Store::<Account, _>::new(MemRepository::new(), ());
+
+    store
+        .execute("acct-1", open("acct-1", 100), Metadata::default())
+        .await?;
+    store
+        .execute(
+            "acct-1",
+            AccountCommand::Deposit { amount: 25 },
+            Metadata::default(),
+        )
+        .await?;
+
+    // Each load folds the stream (from its latest snapshot, if any) into a fresh Account.
+    let loaded = store.load("acct-1").await?;
+    assert_eq!(loaded.aggregate().balance, 125);
+
+    // A rejected command commits nothing and returns the aggregate's error.
+    let rejected = store
+        .execute(
+            "acct-1",
+            AccountCommand::Deposit { amount: 0 },
+            Metadata::default(),
+        )
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(ExecuteError::Rejected(AccountError::InvalidAmount))
+    ));
+
+    Ok(())
+}
+```
+
+`execute` returns `ExecuteError::Rejected` when the aggregate refused the command and
+`ExecuteError::Store` when loading or committing failed. `is_conflict()` and `is_retryable()` tell
+the store errors apart, and `execute_with_retry` reloads and re-handles a command after a conflict.
+The store writes a snapshot every five events by default (`with_snapshot_interval` changes that),
+so a load reads the latest snapshot plus the tail instead of the whole stream.
+
+## 4. Test it with given/when/then
+
+The `testing` feature adds `Scenario`: seed a stream with events, run one command through a real
+`Store` over `MemRepository`, and assert the events, the resulting state, or the rejection. Keep
+these tests under `#[cfg(test)]`, since the Install step enables `testing` only for dev builds.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use photon_evt::testing::Scenario;
+
+    use super::*;
+
+    fn opened(account_id: &str, balance: i64) -> AccountEvent {
+        AccountOpened {
+            account_id: account_id.to_owned(),
+            balance,
+        }
+        .into()
+    }
+
+    #[tokio::test]
+    async fn opening_emits_an_opened_event() {
+        Scenario::<Account>::given([])
+            .when(open("acct-1", 100))
+            .then_events([opened("acct-1", 100)])
+            .await;
+    }
+
+    #[tokio::test]
+    async fn depositing_adds_to_the_balance() {
+        Scenario::<Account>::given([opened("acct-1", 100)])
+            .when(AccountCommand::Deposit { amount: 25 })
+            .then_state(|account| assert_eq!(account.balance, 125))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn depositing_before_opening_is_rejected() {
+        Scenario::<Account>::given([])
+            .when(AccountCommand::Deposit { amount: 10 })
+            .then_rejected(|error| *error == AccountError::NotOpened)
+            .await;
+    }
+}
+```
+
+`Fixture` is the multi-stream version, for tests of transactions that touch several aggregates.
+The [`photon-evt` README](https://github.com/photon-grove/evt/blob/main/crates/evt/README.md#testing)
+covers both.
+
+## 5. Make retries safe with command outcomes
+
+A client that times out will send the same command again. Put a command ID in `Metadata` (a request
+ID, job ID or message ID) and plain `execute` reports a repeat as
+`ExecuteError::Store(Error::DuplicateCommand)` (`is_duplicate_command()`), meaning the command
+already ran. It only sees command IDs recorded since the stream's latest snapshot, though. Command
+outcomes make the check durable. Turn them on with `with_outcomes`, and every command gets a stored
+outcome row, written in the same commit as its events.
+
+The store needs two things from your types. `OutcomeCommand` names the command and gives its
+canonical payload. Together with the entity ID and the caller's principal, they identify the
+request. Command IDs are global, so reusing one for any other request, on this account or another,
+fails with `Error::IdempotencyKeyReuse`. `ToRejection` decides which errors are stored as
+rejections. Return `None` for an internal failure that shouldn't be recorded.
+
+```rust
+impl OutcomeCommand for AccountCommand {
+    fn command_type(&self) -> String {
+        match self {
+            AccountCommand::Open { .. } => "bank_account.open".into(),
+            AccountCommand::Deposit { .. } => "bank_account.deposit".into(),
+        }
+    }
+
+    fn canonical_payload(&self) -> Result<Option<Vec<u8>>, BoxError> {
+        Ok(Some(canonical_json(self)?))
+    }
+}
+
+impl ToRejection for AccountError {
+    fn to_rejection(&self) -> Option<Rejection> {
+        let code = match self {
+            AccountError::AlreadyOpened => "already-opened",
+            AccountError::NotOpened => "not-opened",
+            AccountError::InvalidAmount => "invalid-amount",
+        };
+
+        Some(Rejection::new(code, self.to_string()))
+    }
+}
+```
+
+Then call `execute_with_outcome` with a command ID on every command. A store with outcomes enabled
+refuses the plain `execute`, so no command can skip its outcome.
+
+```rust
+async fn deposit_with_outcomes() -> Result<(), Box<dyn std::error::Error>> {
+    let store =
+        Store::<Account, _>::new(MemRepository::new(), ()).with_outcomes(OutcomeConfig::new());
+
+    let metadata = Metadata::default().with_command_id("open-acct-1");
+    store
+        .execute_with_outcome("acct-1", open("acct-1", 100), metadata)
+        .await?;
+
+    let deposit = AccountCommand::Deposit { amount: 25 };
+    let metadata = Metadata::default().with_command_id("deposit-7f3a");
+    let first = store
+        .execute_with_outcome("acct-1", deposit.clone(), metadata.clone())
+        .await?;
+    assert!(first.is_accepted() && !first.replayed);
+
+    // The retry returns the stored outcome. The handler doesn't run, so nothing is credited twice.
+    let retry = store
+        .execute_with_outcome("acct-1", deposit, metadata)
+        .await?;
+    assert!(retry.replayed);
+    assert_eq!(store.load("acct-1").await?.aggregate().balance, 125);
+
+    // A rejection is stored too, so a retry of this command ID gets the same answer.
+    let metadata = Metadata::default().with_command_id("deposit-zero");
+    let rejected = store
+        .execute_with_outcome("acct-1", AccountCommand::Deposit { amount: 0 }, metadata)
+        .await?;
+    assert_eq!(
+        rejected.rejection().map(|r| r.code.as_str()),
+        Some("invalid-amount")
+    );
+
+    Ok(())
+}
+```
+
+[Command outcomes and retries](commands.md) covers stored responses, multi-stream commands with
+`execute_transaction`, and what happens when two retries race.
+
+## 6. Move it to DynamoDB or PostgreSQL
+
+The aggregate doesn't change. Swap the repository behind the store. For DynamoDB, enable the
+`dynamodb` feature and bring your own client:
+
+```sh
+cargo add photon-evt --features dynamodb
+cargo add aws-config aws-sdk-dynamodb
+```
+
+A new table is initialized once, before any writer starts, by a deploy step with a role that may
+Scan it. You can call `initialize` from that step, or run `evt-doctor init` from the Go CLI:
+
+```sh
+go install github.com/photon-grove/evt/go/cmd/evt-doctor@latest
+```
+
+```rust
+async fn initialize_table(client: aws_sdk_dynamodb::Client) -> Result<(), photon_evt::Error> {
+    use photon_evt::dynamodb::DynamoRepository;
+
+    // A deploy step: run it once, before any writer starts, with a role that may Scan the table.
+    DynamoRepository::new(client, "event-log")
+        .initialize()
+        .await?;
+
+    Ok(())
+}
+```
+
+Writers refuse an uninitialized table instead of scanning it, so their roles need no
+`dynamodb:Scan`. For tests and a local emulator, `with_lazy_initialization(true)` lets the first
+write initialize the table instead.
+
+```rust
+async fn open_on_dynamodb(client: aws_sdk_dynamodb::Client) -> Result<(), photon_evt::Error> {
+    use photon_evt::dynamodb::DynamoRepository;
+
+    // A writer never scans, so its role needs no dynamodb:Scan.
+    let repository = DynamoRepository::new(client, "event-log");
+    let store = Store::<Account, _>::new(repository, ())
+        .with_snapshot_interval(25)
+        .with_outcomes(OutcomeConfig::new());
+
+    let metadata = Metadata::default().with_command_id("open-acct-1");
+    store
+        .execute_with_outcome("acct-1", open("acct-1", 100), metadata)
+        .await?;
+
+    Ok(())
+}
+```
+
+The table has a string partition key `pk` and a number sort key `sk`, and the
+[DynamoDB guide](dynamodb.md) describes it and the views table.
+
+For PostgreSQL, enable the `postgres` feature and pass a `deadpool_postgres::Pool` from the same
+`deadpool-postgres` release that `photon-evt` uses:
+
+```sh
+cargo add photon-evt --features postgres
+cargo add deadpool-postgres@0.14
+```
+
+`ensure_schema` creates the tables if they don't exist. It needs DDL rights, so run it from a deploy
+or startup step rather than in every writer.
+
+```rust
+async fn prepare_database(pool: deadpool_postgres::Pool) -> Result<(), photon_evt::Error> {
+    use photon_evt::postgres::PostgresRepository;
+
+    // A deploy or startup step: it creates the tables if they don't exist, so it needs DDL rights.
+    PostgresRepository::new(pool).ensure_schema().await
+}
+```
+
+A writer on a fresh database declares the storage features on its first write.
+
+```rust
+async fn open_on_postgres(pool: deadpool_postgres::Pool) -> Result<(), photon_evt::Error> {
+    use photon_evt::postgres::PostgresRepository;
+
+    // On a fresh database, the first write declares the storage features itself.
+    let repository = PostgresRepository::new(pool);
+    let store = Store::<Account, _>::new(repository, ()).with_outcomes(OutcomeConfig::new());
+
+    let metadata = Metadata::default().with_command_id("open-acct-1");
+    store
+        .execute_with_outcome("acct-1", open("acct-1", 100), metadata)
+        .await?;
+
+    Ok(())
+}
+```
+
+The [PostgreSQL guide](postgres.md) has the schema and local setup.
+
+## Project views deliberately
+
+Views are derived from the log, so record anything that can't be rebuilt, like a human decision or
+a publish flag, as an event first ([keeping the log](concepts.md#keeping-the-log) says why).
+[Projections and rebuilds](projections.md) covers how to write view rows in the same commit as the
+events, and what can rebuild them today.
+
+## The same model in Go
+
+The Go module reads and writes the same storage format, and the complete runnable Go version lives
+in [`go/examples/banking`](https://github.com/photon-grove/evt/tree/main/go/examples/banking). It's
+a separate model from the Rust one above, not a drop-in partner on the same streams. For a Rust and
+a Go service to share a stream, the events need the same type strings, versions and payload JSON,
+and the aggregate state needs the same JSON too, because both languages read each other's
+snapshots. Command outcomes also need the same command type and canonical payload for a retry to
+match across languages. The
+[compatibility notes](https://github.com/photon-grove/evt/blob/main/crates/evt/README.md#compatibility-with-go)
+list what to line up.
+
+### Install the Go module
 
 ```sh
 go get github.com/photon-grove/evt/go
@@ -14,7 +490,7 @@ The core `evt` and `mem` packages have no cloud dependencies, so unit tests stay
 The AWS SDK comes in only through `backends/dynamo`, and the `stream` and `projectors` packages
 pull in the AWS Lambda event types.
 
-## 1. Define an aggregate
+### Define an aggregate
 
 An aggregate implements [`evt.Aggregate`](concepts.md#aggregate). It does three jobs. It handles
 commands into new events, applies events to its own state, and deserializes historical events back
@@ -110,7 +586,7 @@ implement [`evt.Event`](concepts.md#event) (`Type`, `Version`, `EntityID` and `E
 every event at a `Version()` of `1`. That number is what lets you [upcast](concepts.md#upcaster) old
 payloads later.
 
-## 2. Drive it with `mem` in a test
+### Drive it with `mem` in a test
 
 `mem.NewStore()` gives you the full [`evt.Store`](concepts.md#store) contract with no
 infrastructure, so behavior tests stay fast. The store loads a fresh aggregate from the log on every
@@ -148,7 +624,7 @@ func TestOpenThenDepositAndReplay(t *testing.T) {
 The error constructors round-trip through typed predicates, so tests assert on intent instead of
 strings: `evt.IsNotFoundErr(err)`, `evt.IsConflictErr(err)` and `evt.IsDuplicateCommandErr(err)`.
 
-## 3. Make retries safe with metadata
+### Make retries safe with metadata
 
 [`evt.Metadata`](concepts.md#metadata) rides along with every command. It carries an optional
 command ID, trace context, origin, caller identity (`PrincipalID`), causation (`CausationID`) and
@@ -176,7 +652,7 @@ application-specific string entry.
 Use `evt.WithTrace(ctx)` to carry an OpenTelemetry context along, and `evt.WithAddress(addr)` when
 the caller has parsed a client address worth recording.
 
-## 4. Move the same model to DynamoDB
+### Move the same model to DynamoDB
 
 The aggregate does not change. Swap the store's backing repository:
 
@@ -200,16 +676,13 @@ The same swap works for PostgreSQL: `postgres.NewStore` (or `postgres.NewReposit
 `snapshots.NewStore`) over a `pgxpool.Pool`. The aggregate still doesn't change. The
 [PostgreSQL guide](postgres.md) has the schema and local setup.
 
-## 5. Project views deliberately
-
-Views are derived from the log, so record anything that can't be rebuilt, like a human decision or
-a publish flag, as an event first ([keeping the log](concepts.md#keeping-the-log) says why).
-[Projections and rebuilds](projections.md) covers how.
-
 ## Where to go next
 
 [Concepts](concepts.md) covers the vocabulary and the contract behind each type. The
 [DynamoDB](dynamodb.md) and [PostgreSQL](postgres.md) guides cover table shapes, snapshots,
 compaction and local setup. [Projections and rebuilds](projections.md) is about building read
 models and rebuilding them, [Command outcomes and retries](commands.md) is about idempotency, and
-[Streams and projectors](streams.md) is about async fan-out on Lambda.
+[Streams and projectors](streams.md) is about async fan-out on Lambda. The
+[`photon-evt` README](https://github.com/photon-grove/evt/blob/main/crates/evt/README.md) covers
+the rest of the Rust API: transactions, commit-wide projectors, the sync journal and Lambda
+handlers.

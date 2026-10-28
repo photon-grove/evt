@@ -60,6 +60,11 @@ name = "journal"
 required-features = ["journal", "testing"]
 test = true
 
+[[example]]
+name = "getting_started"
+required-features = ["testing"]
+test = true
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

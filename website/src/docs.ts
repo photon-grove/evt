@@ -41,7 +41,7 @@ const DOC_CONFIG: Record<string, DocConfig> = {
   'guide/getting-started': {
     group: GUIDES,
     order: 1,
-    summary: 'Model an aggregate, commit events and read it back, in memory first and then on DynamoDB.',
+    summary: 'Model an aggregate in Rust (then Go), test it in memory, make retries safe, and move it to DynamoDB or PostgreSQL.',
   },
   'guide/concepts': {
     group: GUIDES,
