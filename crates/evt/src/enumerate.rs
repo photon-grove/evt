@@ -11,7 +11,8 @@ use crate::aggregate::Aggregate;
 use crate::error::Error;
 use crate::event::SerializedEvent;
 use crate::ids::{EntityId, EntityType};
-use crate::store::Loaded;
+use crate::repository::Repository;
+use crate::store::{Loaded, load_aggregate};
 
 /// Narrows an enumeration. The default matches every entity.
 ///
@@ -142,6 +143,48 @@ pub trait EventLog: Send + Sync {
             next_entity::<A>,
         )
     }
+
+    /// Streams every entity seeded from its latest snapshot: the snapshot's state plus the events
+    /// after it, or every event when the entity has none. This is the snapshot-aware enumeration a
+    /// rebuild needs once [`compact_below`](Repository::compact_below) has run (Go's
+    /// `SnapshotStreamer.StreamEntitiesFromSnapshots`): an entity compacted part-way or down to its
+    /// snapshot loads its final state instead of failing with [`Error::SequenceGap`].
+    ///
+    /// The filter narrows to [`Aggregate::TYPE`] unless it names a type, as in
+    /// [`stream_entities`](EventLog::stream_entities). Entities come from
+    /// [`entity_heads`](Repository::entity_heads), so a stream with only a snapshot left is
+    /// included and reserved namespaces are not, and they come ascending by entity-ID bytes. Each
+    /// is read with its own snapshot and event reads, the snapshot-aware load
+    /// [`Store::load`](crate::Store::load) makes (with its retry of a compaction race and its
+    /// sequence-gap check), so memory holds one entity at a time beside the list of IDs.
+    ///
+    /// The first item is the error of a failed [`entity_heads`](Repository::entity_heads), and
+    /// nothing follows it, so a rebuild never covers a subset silently. A failure to load one
+    /// entity is yielded as an item and the stream goes on with the next.
+    ///
+    /// Unlike Go's, which loads with a pool of workers in no fixed order and reports a failed
+    /// enumeration last, it loads one entity at a time in ID order, reports a failed enumeration
+    /// first, and refuses a sequence gap after the snapshot.
+    fn stream_entities_from_snapshots<A: Aggregate>(
+        &self,
+        filter: StreamFilter,
+    ) -> impl Stream<Item = Result<Loaded<A>, Error>> + Send
+    where
+        Self: Repository + Sized,
+    {
+        let entity_type = filter
+            .entity_type
+            .unwrap_or_else(|| EntityType::new(A::TYPE));
+
+        unfold(
+            Seeded {
+                repository: self,
+                entity_type,
+                ids: None,
+            },
+            next_seeded::<A, Self>,
+        )
+    }
 }
 
 impl<L: EventLog + ?Sized> EventLog for &L {
@@ -158,6 +201,37 @@ impl<L: EventLog + ?Sized> EventLog for std::sync::Arc<L> {
     fn stream_all_events(&self, filter: StreamFilter) -> impl Stream<Item = EventBatch> + Send {
         (**self).stream_all_events(filter)
     }
+}
+
+/// The state of [`EventLog::stream_entities_from_snapshots`]: the IDs, listed on the first poll.
+struct Seeded<'a, R> {
+    repository: &'a R,
+    entity_type: EntityType,
+    ids: Option<std::vec::IntoIter<EntityId>>,
+}
+
+async fn next_seeded<A: Aggregate, R: Repository>(
+    mut state: Seeded<'_, R>,
+) -> Option<(Result<Loaded<A>, Error>, Seeded<'_, R>)> {
+    if state.ids.is_none() {
+        match state
+            .repository
+            .entity_heads(Some(&state.entity_type))
+            .await
+        {
+            Ok(heads) => state.ids = Some(heads.into_keys().collect::<Vec<_>>().into_iter()),
+            Err(err) => {
+                state.ids = Some(Vec::new().into_iter());
+
+                return Some((Err(err), state));
+            }
+        }
+    }
+
+    let id = state.ids.as_mut()?.next()?;
+    let loaded = load_aggregate::<A, R>(state.repository, id).await;
+
+    Some((loaded, state))
 }
 
 type Batches<'a> = Pin<Box<dyn Stream<Item = EventBatch> + Send + 'a>>;

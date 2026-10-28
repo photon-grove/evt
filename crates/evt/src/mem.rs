@@ -926,6 +926,7 @@ mod tests {
             .with_head_fixtures(repository.clone())
             .run()
             .await;
+        crate::conformance::projection_rebuild_cases(&repository, &clock, &repository).await;
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use super::scope::{Scope, allocations};
 use crate::error::Error;
 use crate::event::SerializedEvent;
 use crate::projection::{ProjectedView, ViewOperation, ViewRow};
-use crate::rebuild::{MAX_REBUILD_VIEW_BATCH, RebuildFence, RebuildLease};
+use crate::rebuild::{RebuildFence, RebuildLease, rebuild_batches};
 
 /// The journal rows and counters a set of stored events imply.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -91,7 +91,7 @@ pub const REBUILD_OWNER: &str = "journal-rebuild";
 
 /// Rebuilds the journal under a rebuild lease (C10): derives the state from `events` and writes
 /// every row and counter through [`RebuildFence::write_rebuild_views`], in batches of at most
-/// [`MAX_REBUILD_VIEW_BATCH`] operations.
+/// [`MAX_REBUILD_VIEW_BATCH`](crate::MAX_REBUILD_VIEW_BATCH) operations that fit the commit byte budget.
 ///
 /// `lease` is the one [`begin_rebuild`](RebuildFence::begin_rebuild) returned; the caller renews and
 /// ends it. While it is held every live commit to the table fails with
@@ -126,7 +126,7 @@ pub async fn rebuild<'a, F: RebuildFence>(
         ));
     }
 
-    for batch in operations.chunks(MAX_REBUILD_VIEW_BATCH) {
+    for batch in rebuild_batches(&operations) {
         fence.write_rebuild_views(lease, batch).await?;
     }
 

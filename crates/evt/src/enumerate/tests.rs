@@ -163,6 +163,87 @@ async fn a_compacted_entity_reports_its_gap_and_the_rest_still_stream() {
     assert_eq!(entities[1].as_ref().unwrap().aggregate().total, 4);
 }
 
+fn snapshot(entity: &str, event_sequence: i64, payload: &str) -> crate::SerializedSnapshot {
+    crate::SerializedSnapshot {
+        entity_type: "ledger".into(),
+        entity_id: entity.into(),
+        sequence: EventSequence(1),
+        event_sequence: EventSequence(event_sequence),
+        payload: payload.as_bytes().to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn snapshot_seeded_entities_load_compacted_streams_from_their_snapshots() {
+    let repo = MemRepository::new();
+    // Compacted part-way: the snapshot covers 1..=2, event 3 remains.
+    append(&repo, "b", "ledger", &[1, 2, 3]).await;
+    repo.put_snapshot(&snapshot("b", 2, r#"{"total":3,"entries":2}"#))
+        .await
+        .unwrap();
+    repo.compact_below(&"b".into(), EventSequence(2))
+        .await
+        .unwrap();
+    // Compacted down to the snapshot: no events left at all.
+    append(&repo, "a", "ledger", &[4, 5]).await;
+    repo.put_snapshot(&snapshot("a", 2, r#"{"total":9,"entries":2}"#))
+        .await
+        .unwrap();
+    repo.compact_below(&"a".into(), EventSequence(2))
+        .await
+        .unwrap();
+    // No snapshot: every event.
+    append(&repo, "c", "ledger", &[7]).await;
+    append(&repo, "d", "other", &[100]).await;
+
+    let entities =
+        collect(repo.stream_entities_from_snapshots::<Ledger>(StreamFilter::all())).await;
+
+    let loaded: Vec<_> = entities
+        .into_iter()
+        .map(|entity| {
+            let entity = entity.unwrap();
+            (
+                entity.entity_id().to_string(),
+                entity.aggregate().total,
+                entity.sequence().0,
+                entity.snapshot_sequence().0,
+            )
+        })
+        .collect();
+    assert_eq!(
+        loaded,
+        vec![
+            ("a".to_owned(), 9, 2, 1),
+            ("b".to_owned(), 6, 3, 1),
+            ("c".to_owned(), 7, 1, 0),
+        ],
+        "ascending by ID, the stored type only, each from its snapshot plus the events after it"
+    );
+
+    let other =
+        collect(repo.stream_entities_from_snapshots::<Ledger>(StreamFilter::of_type("other")))
+            .await;
+    assert_eq!(other.len(), 1);
+    assert_eq!(other[0].as_ref().unwrap().aggregate().total, 100);
+}
+
+#[tokio::test]
+async fn a_snapshot_seeded_entity_that_fails_to_load_does_not_end_the_stream() {
+    let repo = MemRepository::new();
+    append(&repo, "a", "ledger", &[1]).await;
+    repo.put_snapshot(&snapshot("a", 1, "not json"))
+        .await
+        .unwrap();
+    append(&repo, "b", "ledger", &[2]).await;
+
+    let entities =
+        collect(repo.stream_entities_from_snapshots::<Ledger>(StreamFilter::all())).await;
+
+    assert!(matches!(&entities[0], Err(Error::Snapshot { .. })));
+    assert_eq!(entities[1].as_ref().unwrap().aggregate().total, 2);
+}
+
 /// A log that serves canned pages, like a DynamoDB Scan: no entity grouping, and every pull counted.
 struct Paged {
     pages: Vec<Option<Vec<SerializedEvent>>>,

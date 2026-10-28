@@ -52,6 +52,10 @@ use std::time::{Duration, SystemTime};
 use crate::error::Error;
 use crate::projection::{ProjectedView, check_views, view_operation_size};
 
+mod projections;
+
+pub use projections::{ProjectionRebuild, RebuildReport};
+
 /// The partition key of the rebuild-lock row (sort key [`REBUILD_SORT_KEY`]).
 pub const REBUILD_LOCK_ID: &str = "SYSTEM#REBUILD";
 
@@ -548,6 +552,35 @@ pub(crate) fn check_view_batch(views: &[ProjectedView]) -> Result<(), Error> {
             .map(|view| view_operation_size(&view.op))
             .chain([lock_check_size()]),
     )
+}
+
+/// Splits rebuild view operations into guarded batches in order: each at most
+/// [`MAX_REBUILD_VIEW_BATCH`] operations whose sizes, with the lease guard, fit the commit byte
+/// budget. An operation too large for any batch gets one of its own, which the write refuses.
+pub(crate) fn rebuild_batches(views: &[ProjectedView]) -> impl Iterator<Item = &[ProjectedView]> {
+    let mut rest = views;
+
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+
+        let mut end = 0;
+        let mut bytes = lock_check_size();
+        while end < rest.len() && end < MAX_REBUILD_VIEW_BATCH {
+            let size = view_operation_size(&rest[end].op);
+            if end > 0 && bytes + size > crate::repository::MAX_COMMIT_BYTES {
+                break;
+            }
+            bytes += size;
+            end += 1;
+        }
+
+        let (batch, tail) = rest.split_at(end);
+        rest = tail;
+
+        Some(batch)
+    })
 }
 
 /// A repository's clock: the system time by default, injectable for tests (`with_clock`). The

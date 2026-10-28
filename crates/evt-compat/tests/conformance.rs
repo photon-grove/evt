@@ -16,7 +16,8 @@ use futures_core::Stream as _;
 use photon_evt::conformance::{
     Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, RebuildSuite, Suite, TestClock,
     ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, feature_marker_cases,
-    fresh_store_cases, initialization_cases, outcome_cases, view_repository_cases,
+    fresh_store_cases, initialization_cases, outcome_cases, projection_rebuild_cases,
+    view_repository_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
@@ -291,6 +292,130 @@ impl CommitViewTarget<DynamoRepository> for DynamoViewRows {
     }
 }
 
+/// A history-dependent projector for the expired-tail case: a row per stream with the total its
+/// last replayed commit left.
+struct ReplayedTotals {
+    pk: String,
+    history: Vec<photon_evt::EntityType>,
+}
+
+impl CommitProjector for ReplayedTotals {
+    fn name(&self) -> &str {
+        "replayed-totals"
+    }
+
+    fn history(&self) -> &[photon_evt::EntityType] {
+        &self.history
+    }
+
+    fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+        commit
+            .streams
+            .iter()
+            .map(|stream| {
+                Ok(ViewOperation::put(
+                    self.pk.clone(),
+                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(),
+                    stream.entity_type.as_str(),
+                    stream.state.clone(),
+                ))
+            })
+            .collect()
+    }
+}
+
+/// Retention's TTL deletes lazily and in no order, so a stream can keep its first event and a
+/// snapshot covering sequence 3 after events 2 and 3 are gone: its enumerated head is still 3. A
+/// history-dependent rebuild must refuse it (`CompactionUncovered` through the head) rather than
+/// replay the one event left and write the state at sequence 1. Moto never deletes expired items,
+/// so the expiry is a raw delete.
+async fn dynamo_rebuild_refuses_an_expired_tail(
+    rebuilds: &DynamoRepository,
+    rows: &DynamoViewRows,
+) {
+    use photon_evt::{NewSnapshot, ProjectionRebuild, RebuildFence};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let entity_type = photon_evt::EntityType::new(format!("expired-tail-{nanos}"));
+    let id = EntityId::new(format!("expired-tail-{nanos}"));
+    let events = (1..=3)
+        .map(|sequence| SerializedEvent {
+            id: EventId::for_event(&id, EventSequence(sequence)),
+            sequence: EventSequence(sequence),
+            event_type: EventType::new("ledger:added"),
+            version: EventVersion(1),
+            entity_id: id.clone(),
+            entity_type: entity_type.clone(),
+            payload: br#"{"amount":1}"#.to_vec(),
+            metadata: Metadata::new("local"),
+        })
+        .collect();
+    rebuilds
+        .commit(
+            Commit::new(id.clone(), events).with_snapshot(NewSnapshot::new(
+                entity_type.clone(),
+                EventSequence(1),
+                r#"{"total":3,"entries":3}"#,
+            )),
+        )
+        .await
+        .unwrap();
+    for sequence in 2..=3 {
+        rebuilds
+            .client()
+            .delete_item()
+            .table_name(rebuilds.table())
+            .key("pk", AttributeValue::S(id.to_string()))
+            .key("sk", AttributeValue::N(sequence.to_string()))
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        rebuilds
+            .entity_heads(Some(&entity_type))
+            .await
+            .unwrap()
+            .get(&id),
+        Some(&EventSequence(3)),
+        "the snapshot keeps the enumerated head at 3"
+    );
+
+    let pk = format!("expired-tail-{nanos}#totals");
+    let error = ProjectionRebuild::new(rebuilds)
+        .with_projector(Arc::new(ReplayedTotals {
+            pk: pk.clone(),
+            history: vec![entity_type.clone()],
+        }))
+        .aggregate_as::<Ledger>(entity_type.clone())
+        .run(&format!("expired-tail-{nanos}"), Duration::from_secs(60))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            Error::CompactionUncovered { entity_id, through, covered }
+                if *entity_id == id
+                    && *through == EventSequence(3)
+                    && *covered == Some(EventSequence(3))
+        ),
+        "an expired tail is refused through the head: {error:?}"
+    );
+    assert!(
+        rows.row(&pk, id.as_str()).await.unwrap().is_none(),
+        "nothing is written from the state at sequence 1"
+    );
+    assert!(
+        rebuilds.rebuild_generation().await.unwrap().is_settled(),
+        "the run acquired from a settled generation and wrote nothing, so it released the lock"
+    );
+}
+
 /// A private views table (string `pk` and `sk`, no stream), like the event-log table of the suite.
 async fn create_dynamo_views_table(client: &aws_sdk_dynamodb::Client, name: &str) {
     create_dynamo_views_table_with(client, name, false).await;
@@ -460,6 +585,16 @@ async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
             .run(),
     )
     .await;
+    Box::pin(projection_rebuild_cases(
+        &rebuilds,
+        &clock,
+        &DynamoViewRows {
+            client: client.clone(),
+            table: views.clone(),
+        },
+    ))
+    .await;
+    dynamo_rebuild_refuses_an_expired_tail(&rebuilds, &rows).await;
 
     // The stored item has exactly the five string attributes, an empty entity type included.
     let store = Store::<Ledger, _>::new(&writer, ()).with_commit_projector(std::sync::Arc::new(
@@ -1938,6 +2073,12 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository, events: &st
             .with_head_fixtures(PostgresHeads::new(pool.clone(), events.to_owned()))
             .run(),
     )
+    .await;
+    Box::pin(projection_rebuild_cases(
+        &rebuilds,
+        &clock,
+        &PostgresViewRows { pool: pool.clone() },
+    ))
     .await;
 
     let id = |label: &str| {
