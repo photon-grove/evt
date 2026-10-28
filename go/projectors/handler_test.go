@@ -2,6 +2,8 @@ package projectors_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -85,50 +87,115 @@ func TestLambdaHandler_SkipsNonINSERTRecords(t *testing.T) {
 	assert.Equal(t, 0, proj.called, "projector should not be called for non-INSERT events")
 }
 
-func TestLambdaHandler_ReturnsPartialBatchFailures(t *testing.T) {
-	proj := &stubProjector{
-		name: "handler-test",
-		failures: []projectors.BatchItemFailure{
-			{ItemIdentifier: "shardId-001:22222"},
-		},
-	}
-	rt := newTestRuntime(proj)
-	handler := projectors.NewLambdaHandler(rt)
+// orderedProjector records every event it is handed, in order, and fails the ones named in failing
+// (with failErr as a batch error when set, otherwise as a per-record failure).
+type orderedProjector struct {
+	failing map[string]bool
+	failErr error
+	seen    []string
+}
 
-	ctx := context.Background()
-	event := events.DynamoDBEvent{
-		Records: []events.DynamoDBEventRecord{
-			{
-				EventID:   "shardId-001:11111",
-				EventName: "INSERT",
-				Change: events.DynamoDBStreamRecord{
-					NewImage: map[string]events.DynamoDBAttributeValue{
-						"pk":         events.NewStringAttribute("entity-1"),
-						"sk":         events.NewNumberAttribute("1"),
-						"type":       events.NewStringAttribute("universe:created"),
-						"entityType": events.NewStringAttribute("universe"),
-					},
-				},
-			},
-			{
-				EventID:   "shardId-001:22222",
-				EventName: "INSERT",
-				Change: events.DynamoDBStreamRecord{
-					NewImage: map[string]events.DynamoDBAttributeValue{
-						"pk":         events.NewStringAttribute("entity-2"),
-						"sk":         events.NewNumberAttribute("1"),
-						"type":       events.NewStringAttribute("universe:updated"),
-						"entityType": events.NewStringAttribute("universe"),
-					},
-				},
-			},
-		},
+func (p *orderedProjector) Name() string { return "ordered" }
+
+func (p *orderedProjector) Process(_ context.Context, records []projectors.StreamRecord) ([]projectors.BatchItemFailure, error) {
+	var failures []projectors.BatchItemFailure
+	for _, record := range records {
+		p.seen = append(p.seen, record.EventID)
+		if !p.failing[record.EventID] {
+			continue
+		}
+		if p.failErr != nil {
+			return nil, p.failErr
+		}
+		failures = append(failures, projectors.BatchItemFailure{ItemIdentifier: record.EventID})
 	}
 
-	resp, err := handler(ctx, event)
+	return failures, nil
+}
+
+// insertRecord is the stream record of an event INSERT, with distinct event ID and sequence number.
+func insertRecord(eventID, sequenceNumber, entityID string) events.DynamoDBEventRecord {
+	return events.DynamoDBEventRecord{
+		EventID:   eventID,
+		EventName: "INSERT",
+		Change: events.DynamoDBStreamRecord{
+			SequenceNumber: sequenceNumber,
+			NewImage: map[string]events.DynamoDBAttributeValue{
+				"pk":         events.NewStringAttribute(entityID),
+				"sk":         events.NewNumberAttribute("1"),
+				"type":       events.NewStringAttribute("universe:created"),
+				"entityType": events.NewStringAttribute("universe"),
+			},
+		},
+	}
+}
+
+func streamEvent(records ...events.DynamoDBEventRecord) events.DynamoDBEvent {
+	return events.DynamoDBEvent{Records: records}
+}
+
+// Lambda resumes a stream from the lowest reported sequence number, so a mid-batch failure reports
+// that record's SequenceNumber (not its EventID) and stops there: the records after it are not
+// attempted, and their redelivery projects them after the failed one.
+func TestLambdaHandler_FailureReportsSequenceNumberAndStopsTheBatch(t *testing.T) {
+	proj := &orderedProjector{failing: map[string]bool{"evt-b": true}}
+	handler := projectors.NewLambdaHandler(projectors.NewRuntime(proj, projectors.NewInMemoryIdempotencyGuard(), testLogger()))
+	a := insertRecord("evt-a", "100", "entity-a")
+	b := insertRecord("evt-b", "101", "entity-b")
+	c := insertRecord("evt-c", "102", "entity-c")
+
+	resp, err := handler(context.Background(), streamEvent(a, b, c))
 	require.NoError(t, err)
-	require.Len(t, resp.BatchItemFailures, 1)
-	assert.Equal(t, "shardId-001:22222", resp.BatchItemFailures[0].ItemIdentifier)
+
+	body, err := json.Marshal(resp)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"batchItemFailures":[{"itemIdentifier":"101"}]}`, string(body))
+	assert.Equal(t, []string{"evt-a", "evt-b"}, proj.seen, "records after the failure are not attempted")
+
+	// Lambda delivers the failed record and every later one again.
+	delete(proj.failing, "evt-b")
+	resp, err = handler(context.Background(), streamEvent(b, c))
+	require.NoError(t, err)
+	assert.Empty(t, resp.BatchItemFailures)
+	assert.Equal(t, []string{"evt-a", "evt-b", "evt-b", "evt-c"}, proj.seen)
+}
+
+func TestLambdaHandler_PermanentErrorReportsThatRecordsSequenceNumber(t *testing.T) {
+	proj := &orderedProjector{
+		failing: map[string]bool{"evt-b": true},
+		failErr: projectors.NewPermanentError(errors.New("bad payload")),
+	}
+	handler := projectors.NewLambdaHandler(projectors.NewRuntime(proj, projectors.NewInMemoryIdempotencyGuard(), testLogger()))
+
+	resp, err := handler(context.Background(), streamEvent(
+		insertRecord("evt-a", "100", "entity-a"),
+		insertRecord("evt-b", "101", "entity-b"),
+		insertRecord("evt-c", "102", "entity-c"),
+	))
+	require.NoError(t, err)
+	assert.Equal(t, []projectors.BatchItemFailure{{ItemIdentifier: "101"}}, resp.BatchItemFailures)
+	assert.Equal(t, []string{"evt-a", "evt-b"}, proj.seen)
+}
+
+// A transient error fails the whole invocation; the records that succeeded are skipped on the retry.
+func TestLambdaHandler_TransientErrorFailsTheInvocation(t *testing.T) {
+	proj := &orderedProjector{failing: map[string]bool{"evt-b": true}, failErr: errors.New("timeout")}
+	handler := projectors.NewLambdaHandler(projectors.NewRuntime(proj, projectors.NewInMemoryIdempotencyGuard(), testLogger()))
+	batch := streamEvent(
+		insertRecord("evt-a", "100", "entity-a"),
+		insertRecord("evt-b", "101", "entity-b"),
+		insertRecord("evt-c", "102", "entity-c"),
+	)
+
+	_, err := handler(context.Background(), batch)
+	require.Error(t, err)
+	assert.Equal(t, []string{"evt-a", "evt-b"}, proj.seen)
+
+	proj.failing = nil
+	resp, err := handler(context.Background(), batch)
+	require.NoError(t, err)
+	assert.Empty(t, resp.BatchItemFailures)
+	assert.Equal(t, []string{"evt-a", "evt-b", "evt-b", "evt-c"}, proj.seen)
 }
 
 func TestLambdaHandler_SkipsRecordsMissingRequiredFields(t *testing.T) {
