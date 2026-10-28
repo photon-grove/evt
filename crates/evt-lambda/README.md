@@ -67,6 +67,11 @@ assert!(response.is_success());
 its mapping has no filter, or an outdated one. Upcasting is the consumer's job: run your upcasters
 on `streamed.event` before you decode its payload.
 
+[`examples/stream_handler.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt-lambda/examples/stream_handler.rs)
+runs a sample batch, inline as the JSON Lambda delivers it, through an idempotent projector: one
+record fails, the response names it, and the redelivered records and a duplicate delivery are
+applied once. Run it with `cargo run -p photon-evt-lambda --example stream_handler`.
+
 ## Batch failure semantics
 
 These rules assume `FunctionResponseTypes: ["ReportBatchItemFailures"]` on the mapping.

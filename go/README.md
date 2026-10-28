@@ -68,6 +68,13 @@ store := snapshots.NewStore(repo, 25)
 [Concepts](../docs/guide/concepts.md) explains aggregates, the `CommandContext` a load returns,
 metadata, snapshots and projectors.
 
+Two more runnable examples sit beside banking. [`examples/todo`](examples/todo) writes a view row
+in the same commit as the events with a commit-wide projector, then rebuilds the rows from the log
+alone. [`examples/transfer`](examples/transfer) moves money between two accounts in one commit
+across both streams, with durable command outcomes, so a retried command ID replays its stored
+answer. Run any of them with `go run ./examples/<name>` from this directory, and see
+[Examples](../docs/guide/examples.md) for the full list in both languages.
+
 ## Packages
 
 The core is the module root, `github.com/photon-grove/evt/go`. The three backends sit under
