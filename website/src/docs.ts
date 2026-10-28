@@ -96,7 +96,7 @@ const DOC_CONFIG: Record<string, DocConfig> = {
   'reference/storage-format': {
     group: REFERENCE,
     order: 20,
-    summary: 'The normative byte-level format that Go and Rust both read and write.',
+    summary: 'The normative byte-level format that Rust and Go both read and write.',
   },
   'reference/feature-matrix': {
     group: REFERENCE,

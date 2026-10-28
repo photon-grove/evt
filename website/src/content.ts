@@ -4,15 +4,15 @@ export const repoUrl = 'https://github.com/photon-grove/evt'
 export type Lang = 'go' | 'rust'
 
 export const langs: {id: Lang; label: string}[] = [
-  {id: 'go', label: 'Go'},
   {id: 'rust', label: 'Rust'},
+  {id: 'go', label: 'Go'},
 ]
 
 export type PerLang<T> = Record<Lang, T>
 
 export const installCommand: PerLang<string> = {
-  go: 'go get github.com/photon-grove/evt/go',
   rust: 'cargo add photon-evt --features dynamodb',
+  go: 'go get github.com/photon-grove/evt/go',
 }
 
 // The quick start is the root README's counter example, trimmed to its moving parts. The README's
@@ -222,7 +222,7 @@ let store = Store::<Account, _>::new(repository, ()).with_commit_projector(Arc::
     id: 'derived',
     title: 'Rebuild and sync',
     tagline: 'Derived state you can throw away',
-    body: 'Views are derived, so the log can reproduce them. In Go, RebuildProjections replays the log into per-entity views behind a rebuild fence; the Rust port is in progress. In Rust, the sync journal hands each scope an ordered, gap-checked feed for realtime clients.',
+    body: 'Views are derived, so the log can reproduce them. In Rust, the sync journal hands each scope an ordered, gap-checked feed for realtime clients. In Go, RebuildProjections replays the log into per-entity views behind a rebuild fence; the Rust port is in progress.',
     doc: 'guide/projections',
     code: {
       go: `lease, err := fence.Begin(ctx, owner, 10*time.Minute) // fence out writers and readers
@@ -291,13 +291,6 @@ export const capabilities: ContentCard[] = [
     doc: 'guide/projections',
   },
   {
-    icon: 'fence',
-    title: 'Fenced rebuilds',
-    tag: 'Go',
-    body: 'RebuildProjections replays the log into per-entity views while a rebuild fence keeps writers out and tells readers when the views are settled. The Rust port is in progress.',
-    doc: 'guide/projections',
-  },
-  {
     icon: 'snapshot',
     title: 'Snapshots and upcasters',
     body: 'Inline snapshots keep loads short, verified compaction trims old history, and upcasters let payloads change shape safely.',
@@ -318,8 +311,15 @@ export const capabilities: ContentCard[] = [
     doc: 'guide/streams',
   },
   {
+    icon: 'fence',
+    title: 'Fenced rebuilds',
+    tag: 'Go',
+    body: 'RebuildProjections replays the log into per-entity views while a rebuild fence keeps writers out and tells readers when the views are settled. The Rust port is in progress.',
+    doc: 'guide/projections',
+  },
+  {
     icon: 'compat',
-    title: 'Go and Rust, one format',
+    title: 'Rust and Go, one format',
     body: 'Both languages read and write the same bytes, checked by golden fixtures and live interleaved runs against each backend.',
     doc: 'reference/feature-matrix',
   },
@@ -394,13 +394,6 @@ export interface ExampleEntry {
 export const examples: ExampleEntry[] = [
   {
     title: 'Banking',
-    lang: 'Go',
-    body: 'Open an account and deposit to it on the in-memory store, with conflicts and not-found errors.',
-    command: 'go -C go test ./examples/banking',
-    href: `${repoUrl}/tree/main/go/examples/banking`,
-  },
-  {
-    title: 'Banking',
     lang: 'Rust',
     body: 'Typed commands and rejections, a transfer across two accounts in one transaction, a balance view, and given/when/then tests.',
     command: 'cargo run -p photon-evt --example banking --features testing',
@@ -408,22 +401,8 @@ export const examples: ExampleEntry[] = [
   },
   {
     title: 'Todo with a rebuildable view',
-    lang: 'Go',
-    body: 'A commit-wide projector keeps each list\'s open and done counts in the commit, then replays the commits in memory and checks the rows match.',
-    command: 'go -C go run ./examples/todo',
-    href: `${repoUrl}/tree/main/go/examples/todo`,
-  },
-  {
-    title: 'Transfer with outcomes',
-    lang: 'Go',
-    body: 'Debit one account and credit another in one commit, replay a retry from its stored outcome, and store an overdraft as a rejection.',
-    command: 'go -C go run ./examples/transfer',
-    href: `${repoUrl}/tree/main/go/examples/transfer`,
-  },
-  {
-    title: 'Todo with a rebuildable view',
     lang: 'Rust',
-    body: 'The Rust port of the todo example: a CommitProjector writes the summary row, and group_commits plus replay_views reproduce it from the log.',
+    body: 'A CommitProjector keeps each list\'s open and done counts in the commit, and group_commits plus replay_views reproduce the row from the log.',
     command: 'cargo run -p photon-evt --example todo',
     href: `${repoUrl}/blob/main/crates/evt/examples/todo.rs`,
   },
@@ -440,6 +419,27 @@ export const examples: ExampleEntry[] = [
     body: 'Map events to scopes, journal every commit, and poll a scope page by page with gap detection.',
     command: 'cargo run -p photon-evt --example journal --features journal,testing',
     href: `${repoUrl}/blob/main/crates/evt/examples/journal.rs`,
+  },
+  {
+    title: 'Banking',
+    lang: 'Go',
+    body: 'Open an account and deposit to it on the in-memory store, with conflicts and not-found errors.',
+    command: 'go -C go test ./examples/banking',
+    href: `${repoUrl}/tree/main/go/examples/banking`,
+  },
+  {
+    title: 'Todo with a rebuildable view',
+    lang: 'Go',
+    body: 'A commit-wide projector keeps each list\'s open and done counts in the commit, then replays the commits in memory and checks the rows match.',
+    command: 'go -C go run ./examples/todo',
+    href: `${repoUrl}/tree/main/go/examples/todo`,
+  },
+  {
+    title: 'Transfer with outcomes',
+    lang: 'Go',
+    body: 'Debit one account and credit another in one commit, replay a retry from its stored outcome, and store an overdraft as a rejection.',
+    command: 'go -C go run ./examples/transfer',
+    href: `${repoUrl}/tree/main/go/examples/transfer`,
   },
 ]
 

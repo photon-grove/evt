@@ -72,7 +72,7 @@ export function useTheme(): [Theme, () => void] {
 
 // useLang is the reader's language for every code sample on the landing page.
 export function useLang(): [Lang, (lang: Lang) => void] {
-  const [lang, setLang] = useState<Lang>(() => (read(LANG_KEY) === 'rust' ? 'rust' : 'go'))
+  const [lang, setLang] = useState<Lang>(() => (read(LANG_KEY) === 'go' ? 'go' : 'rust'))
 
   const choose = useCallback((next: Lang) => {
     write(LANG_KEY, next)

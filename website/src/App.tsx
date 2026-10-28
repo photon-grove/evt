@@ -146,7 +146,7 @@ function Brand() {
     <a className="brand" href="#/" aria-label="evt home">
       <EvtMark size={34} />
       <span className="brand-word">evt</span>
-      <span className="brand-text">Event sourcing for Go and Rust</span>
+      <span className="brand-text">Event sourcing for Rust and Go</span>
     </a>
   )
 }
@@ -256,7 +256,7 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
     <>
       <section className="hero" id="top">
         <div className="hero-copy">
-          <p className="eyebrow">Event sourcing for Go and Rust</p>
+          <p className="eyebrow">Event sourcing for Rust and Go</p>
           <h1>
             Immutable events as truth. <span className="accent">Views you can rebuild.</span>
           </h1>
@@ -264,7 +264,7 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
             evt is a library for event-sourced services. Aggregates handle commands, the events they
             decide on go into an append-only log in <strong>DynamoDB</strong> or{' '}
             <strong>PostgreSQL</strong>, and views are projections derived from that log, so it can
-            reproduce them. Go and Rust read and write the same bytes.
+            reproduce them. Rust and Go read and write the same bytes.
           </p>
           <div className="install">
             <LangSwitch lang={lang} onChange={onLang} label="Install language" />
