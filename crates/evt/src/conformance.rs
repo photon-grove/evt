@@ -3931,6 +3931,9 @@ struct FaultState<Op> {
     reads_before_failure: Option<(usize, ReadFault)>,
     /// A stalled read is armed or running: the read deadline fires at once.
     stalling: bool,
+    /// Outcome reads so far, and whether a held commit has landed (diagnostics).
+    outcome_reads: usize,
+    landed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3959,6 +3962,8 @@ impl<R: Repository> FaultInjectingRepository<R> {
                 rival: None,
                 reads_before_failure: None,
                 stalling: false,
+                outcome_reads: 0,
+                landed: false,
             }),
         }
     }
@@ -4134,6 +4139,7 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
         // A held commit lands just before the read it was waiting for.
         let landing = {
             let mut state = self.state();
+            state.outcome_reads += 1;
 
             match state.delayed.take() {
                 Some((held, 0 | 1)) => Some(held),
@@ -4147,6 +4153,7 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
         };
         if let Some(held) = landing {
             self.inner.commit(held).await?;
+            self.state().landed = true;
         }
 
         let fail = {
@@ -5193,9 +5200,25 @@ async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
     let id = ledger_id();
     let command = command_id();
     fault.arm_land_after_reads(3);
-    let late = store
+    let reads_before = fault.state().outcome_reads;
+    let started = std::time::Instant::now();
+    let late = match store
         .execute_with_outcome(&id, Add(5), command_metadata(&command))
-        .await?;
+        .await
+    {
+        Ok(late) => late,
+        Err(err) => {
+            let state = fault.state();
+
+            return Err(Failure(format!(
+                "a delayed commit is found by polling: {err} after {:?}, {} outcome reads, landed: {}, still held: {}",
+                started.elapsed(),
+                state.outcome_reads - reads_before,
+                state.landed,
+                state.delayed.is_some(),
+            )));
+        }
+    };
     ensure!(
         late.replayed && late.is_accepted(),
         "a delayed commit is found by polling: {late:?}"
