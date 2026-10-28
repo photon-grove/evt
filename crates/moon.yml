@@ -43,6 +43,8 @@ tasks:
       # The READMEs are doctests.
       - '/README.md'
       - '/crates/*/README.md'
+      # Its Rust blocks are checked against crates/evt/examples/getting_started.rs.
+      - '/docs/guide/getting-started.md'
   integration:
     script: >-
       cargo test -p evt-compat --features drivers --test conformance dynamo &&

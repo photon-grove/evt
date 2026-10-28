@@ -64,9 +64,9 @@ repo := dynamo.NewRepository(dynamoClient, "event-log")
 store := snapshots.NewStore(repo, 25)
 ```
 
-[Getting started](../docs/guide/getting-started.md) walks through all of this end to end, and
-[Concepts](../docs/guide/concepts.md) explains aggregates, the `CommandContext` a load returns,
-metadata, snapshots and projectors.
+[Getting started](../docs/guide/getting-started.md#the-same-model-in-go) walks through all of
+this end to end, and [Concepts](../docs/guide/concepts.md) explains aggregates, the
+`CommandContext` a load returns, metadata, snapshots and projectors.
 
 Two more runnable examples sit beside banking. [`examples/todo`](examples/todo) writes a view row
 in the same commit as the events with a commit-wide projector, then rebuilds the rows from the log
