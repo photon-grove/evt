@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://photon-grove.github.io/evt/
+    about: Guides, concepts, the storage format spec and the feature matrix.
+  - name: Report a vulnerability
+    url: https://github.com/photon-grove/evt/security/advisories/new
+    about: Please report security issues privately, not as public issues.
