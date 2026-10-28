@@ -8,6 +8,13 @@
 // folded again, and evt.ReplayViews runs the projector over that history into an empty set of rows,
 // which is what a wiped view table holds. The rebuilt rows equal the live ones.
 //
+// The rebuild is an in-memory check that the projector is a deterministic function of the log, not
+// a durable rebuild to copy into production. It needs the full, uncompacted history: CompactBelow
+// does not refuse a current-state projector's entity type, and folding from an empty list over a
+// compacted stream would give wrong counts. It also refolds each list from its first event for
+// every commit, which is quadratic. evt has no engine entry point yet that rebuilds a durable view
+// table from current state; docs/guide/projections.md tracks what exists today.
+//
 // Run it with `go -C go run ./examples/todo`.
 package main
 
@@ -321,7 +328,8 @@ func ReadSummary(repo *mem.Repository, list evt.EntityID) (Summary, bool, error)
 // RebuildSummaries rebuilds every summary row from the event log alone, into an empty set of rows.
 // It reads the stored list events (StreamAllEvents is the rebuild and diagnostic path, not a hot
 // read), regroups them into the commits that wrote them, folds each stream's state as it stood
-// after each commit, and replays the projector over that history.
+// after each commit, and replays the projector over that history. It assumes an uncompacted log
+// (see the package comment).
 func RebuildSummaries(ctx context.Context, repo evt.Repository) ([]evt.SerializedView, int, error) {
 	var stored []evt.SerializedEvent
 

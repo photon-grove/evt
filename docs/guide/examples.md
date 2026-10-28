@@ -1,7 +1,7 @@
 # Examples
 
 Each example is a small program that shows one part of evt, runs against the in-memory backend, and
-has tests that check what it prints. CI builds and tests all of them, so they track the current API.
+has tests. CI builds and tests all of them, so they track the current API.
 Run the commands from the repository root.
 
 ## Go
@@ -18,8 +18,9 @@ The Go examples live in `go/examples/`, one package per example.
 
 - **Todo** ([source](../../go/examples/todo/main.go)). A commit-wide projector writes each todo
   list's open and done counts as a view row in the same commit as the events. The example then
-  rebuilds every row from the log alone with `evt.GroupCommits` and `evt.ReplayViews` and checks
-  that the rebuilt rows equal the live ones. See [Projections and rebuilds](projections.md).
+  replays the commits from the log with `evt.GroupCommits` and `evt.ReplayViews` and checks that
+  the replayed rows equal the live ones. That replay is an in-memory check that needs an
+  uncompacted log, not a durable rebuild. See [Projections and rebuilds](projections.md).
 
   ```sh
   go -C go run ./examples/todo
@@ -58,7 +59,7 @@ The Rust examples are Cargo examples of the crate they use.
 
 - **Todo** ([source](../../crates/evt/examples/todo.rs)). The Rust port of the Go todo example: a
   `CommitProjector` writes each list's summary row in the commit, and `group_commits` and
-  `replay_views` rebuild the rows from the log.
+  `replay_views` replay the rows from the log, with the same caveat.
 
   ```sh
   cargo run -p photon-evt --example todo

@@ -12,6 +12,13 @@
 //!   `replay_views`, which starts from an empty set of rows, as a wiped view table does. The
 //!   rebuilt rows equal the live ones.
 //!
+//! The rebuild is an in-memory check that the projector is a deterministic function of the log,
+//! not a durable rebuild to copy into production. It needs the full, uncompacted history:
+//! compaction does not refuse a current-state projector's entity type, and folding from an empty
+//! list over a compacted stream would give wrong counts. It also refolds each list from its first
+//! event for every commit, which is quadratic. There is no engine entry point yet that rebuilds a
+//! durable view table from current state; `docs/guide/projections.md` tracks what exists today.
+//!
 //! Run it with `cargo run -p photon-evt --example todo`.
 
 use std::future::poll_fn;
@@ -232,7 +239,8 @@ pub async fn seed(lists: &Lists) -> Result<(), Box<dyn std::error::Error>> {
 // ---- Rebuild ----
 
 /// Rebuilds every summary row from the stored events alone, into an empty set of rows, and returns
-/// the rows and the number of commits replayed.
+/// the rows and the number of commits replayed. It assumes an uncompacted log (see the module
+/// docs).
 pub async fn rebuild_summaries(
     repository: &MemRepository,
 ) -> Result<(Vec<ViewRow>, usize), Box<dyn std::error::Error>> {
