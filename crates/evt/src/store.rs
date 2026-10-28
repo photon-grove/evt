@@ -2098,5 +2098,104 @@ mod tests {
                 "{error:?}"
             );
         }
+
+        /// A repository whose writes take a moment (each commit yields once) and whose read
+        /// deadline has always already passed, as a slow backend under load looks to recovery.
+        struct SlowWrites<R>(R);
+
+        impl<R: crate::Repository> crate::Repository for SlowWrites<R> {
+            type Operation = R::Operation;
+
+            fn writes_views(&self) -> bool {
+                self.0.writes_views()
+            }
+
+            async fn commit(&self, commit: crate::Commit<R::Operation>) -> Result<(), Error> {
+                tokio::task::yield_now().await;
+
+                self.0.commit(commit).await
+            }
+
+            fn deadline(&self, _: std::time::Duration) -> impl Future<Output = ()> + Send {
+                std::future::ready(())
+            }
+
+            async fn outcome(
+                &self,
+                command_id: &CommandId,
+            ) -> Result<Option<crate::Outcome>, Error> {
+                self.0.outcome(command_id).await
+            }
+
+            async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
+                self.0.events(entity_id).await
+            }
+
+            async fn events_after(
+                &self,
+                entity_id: &EntityId,
+                after: EventSequence,
+            ) -> Result<Vec<SerializedEvent>, Error> {
+                self.0.events_after(entity_id, after).await
+            }
+
+            async fn latest(
+                &self,
+                entity_id: &EntityId,
+                n: usize,
+            ) -> Result<Vec<SerializedEvent>, Error> {
+                self.0.latest(entity_id, n).await
+            }
+
+            async fn snapshot(
+                &self,
+                entity_id: &EntityId,
+            ) -> Result<Option<crate::SerializedSnapshot>, Error> {
+                self.0.snapshot(entity_id).await
+            }
+
+            async fn put_snapshot(
+                &self,
+                snapshot: &crate::SerializedSnapshot,
+            ) -> Result<bool, Error> {
+                self.0.put_snapshot(snapshot).await
+            }
+
+            async fn compact_below(
+                &self,
+                entity_id: &EntityId,
+                through: EventSequence,
+            ) -> Result<usize, Error> {
+                self.0.compact_below(entity_id, through).await
+            }
+
+            async fn entity_heads(
+                &self,
+                entity_type: Option<&crate::EntityType>,
+            ) -> Result<std::collections::BTreeMap<EntityId, EventSequence>, Error> {
+                self.0.entity_heads(entity_type).await
+            }
+        }
+
+        #[tokio::test]
+        async fn a_held_commit_landing_slowly_is_not_cut_short_by_the_read_deadline() {
+            let fault = FaultInjectingRepository::new(SlowWrites(MemRepository::new()));
+            let store = Store::<Counter, _>::new(&fault, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(1)));
+
+            // The landing write stands in for the transaction finishing on the server, so its
+            // time does not count against the caller's read deadline.
+            fault.arm_land_after_reads(3);
+            let late = store
+                .execute_with_outcome("c-1", Bump(4), command("c"))
+                .await
+                .unwrap();
+            assert!(late.replayed && late.is_accepted(), "{late:?}");
+            assert_eq!(
+                fault.inner().0.events(&"c-1".into()).await.unwrap().len(),
+                1
+            );
+        }
     }
 }

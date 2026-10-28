@@ -25,6 +25,7 @@ use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Poll, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -3999,9 +4000,32 @@ struct FaultState<Op> {
     reads_before_failure: Option<(usize, ReadFault)>,
     /// A stalled read is armed or running: the read deadline fires at once.
     stalling: bool,
-    /// Outcome reads so far, and whether a held commit has landed (diagnostics).
+    /// A held commit is landing: the read deadline waits until its read returns, which wakes it.
+    landing: bool,
+    landing_waker: Option<Waker>,
+    /// Outcome reads so far, whether a held commit has landed, and why landing it failed
+    /// (diagnostics).
     outcome_reads: usize,
     landed: bool,
+    landing_error: Option<String>,
+}
+
+/// Marks a held commit as landing for as long as the outcome read that lands it runs, and wakes a
+/// read deadline waiting on it when that read returns or is dropped.
+struct Landing<'a, Op>(&'a Mutex<FaultState<Op>>);
+
+impl<Op> Drop for Landing<'_, Op> {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        state.landing = false;
+        if let Some(waker) = state.landing_waker.take() {
+            waker.wake();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4030,8 +4054,11 @@ impl<R: Repository> FaultInjectingRepository<R> {
                 rival: None,
                 reads_before_failure: None,
                 stalling: false,
+                landing: false,
+                landing_waker: None,
                 outcome_reads: 0,
                 landed: false,
+                landing_error: None,
             }),
         }
     }
@@ -4060,7 +4087,8 @@ impl<R: Repository> FaultInjectingRepository<R> {
     /// The next outcome-carrying commit (through [`Repository::commit`]) is held and fails with
     /// [`Error::Indeterminate`]; it really applies just before the `reads`-th outcome read after
     /// that, the way a transaction that was still executing when the caller gave up lands a moment
-    /// later. Recovery must poll for it, not call the first miss "not applied".
+    /// later. Recovery must poll for it, not call the first miss "not applied". Landing it stands
+    /// in for time spent on the server, so the read deadline waits until that read returns.
     pub fn arm_land_after_reads(&self, reads: usize) {
         self.state().fault = Some(Fault::LandAfterReads(reads));
     }
@@ -4197,9 +4225,27 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
         let inner = self.inner.deadline(duration);
 
         async move {
-            if !stalling {
-                inner.await;
+            if stalling {
+                return;
             }
+
+            inner.await;
+
+            // A held commit landing stands in for a transaction finishing on the server, which
+            // takes none of the caller's time: the deadline waits for it and its read to return,
+            // so a slow landing write cannot cut recovery short.
+            std::future::poll_fn(|cx| {
+                let mut state = self.state();
+
+                if !state.landing {
+                    return Poll::Ready(());
+                }
+
+                state.landing_waker = Some(cx.waker().clone());
+
+                Poll::Pending
+            })
+            .await;
         }
     }
 
@@ -4210,7 +4256,11 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
             state.outcome_reads += 1;
 
             match state.delayed.take() {
-                Some((held, 0 | 1)) => Some(held),
+                Some((held, 0 | 1)) => {
+                    state.landing = true;
+
+                    Some(held)
+                }
                 Some((held, remaining)) => {
                     state.delayed = Some((held, remaining - 1));
 
@@ -4219,8 +4269,15 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
                 None => None,
             }
         };
+        let _landing = landing.is_some().then(|| Landing(&self.state));
         if let Some(held) = landing {
-            self.inner.commit(held).await?;
+            // The held commit is consumed either way; a failure is kept for the diagnostics.
+            if let Err(err) = self.inner.commit(held).await {
+                self.state().landing_error = Some(err.to_string());
+
+                return Err(err);
+            }
+
             self.state().landed = true;
         }
 
@@ -5279,11 +5336,12 @@ async fn outcome_ambiguous<R: Repository>(repo: &R) -> CaseResult {
             let state = fault.state();
 
             return Err(Failure(format!(
-                "a delayed commit is found by polling: {err} after {:?}, {} outcome reads, landed: {}, still held: {}",
+                "a delayed commit is found by polling: {err} after {:?}, {} outcome reads, landed: {}, still held: {}, landing error: {:?}",
                 started.elapsed(),
                 state.outcome_reads - reads_before,
                 state.landed,
                 state.delayed.is_some(),
+                state.landing_error,
             )));
         }
     };
