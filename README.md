@@ -43,7 +43,7 @@ append to the same streams.
 | **Three backends, one contract**      | DynamoDB (single table, `pk`/`sk`), PostgreSQL, and an in-memory store for tests. Every backend passes the same conformance suite.       |
 | **Multi-stream transactions**         | Append to several aggregates in one atomic commit, with read fences on streams you only looked at.                                      |
 | **Durable command outcomes**          | A retried command gets its stored answer, accepted or rejected, instead of running twice. Rejections can carry events of their own.     |
-| **Views you can rebuild**             | Projectors write read-model rows in the same commit as the events. Wipe a view table and replay the log to get it back.                 |
+| **Views derived from events**         | Projectors write read-model rows in the same commit as the events. In Go, `RebuildProjections` replays the log into per-entity views behind a rebuild fence; the Rust port is in progress. |
 | **Snapshots and upcasters**           | Inline snapshots keep loads short, snapshot-verified compaction trims old history, and versioned upcasters let payloads change shape.    |
 | **Go and Rust, wire-compatible**      | Golden fixtures and live interleaved runs keep both languages writing the same bytes. See the [feature matrix](docs/reference/feature-matrix.md). |
 | **Realtime sync and Lambda (Rust)**   | A per-scope sync journal with gap detection and compaction, and `photon-evt-lambda` for DynamoDB Streams handlers.                       |
@@ -60,7 +60,7 @@ nothing is written.
 ```mermaid
 flowchart LR
     cmd([Command]) --> agg[Aggregate decides]
-    agg -- events --> commit{{One atomic commit}}
+    agg -- events --> commit(One atomic commit)
     commit --> log[(Event log)]
     commit --> views[(Views)]
     log -. rebuild .-> views
@@ -68,8 +68,9 @@ flowchart LR
 ```
 
 Projectors can add view rows to that same commit, so a read model stays in step with the events
-behind it, and a rebuild can reproduce it from the log. [Concepts](docs/guide/concepts.md) walks
-through each piece.
+behind it, and every row stays a deterministic function of the log.
+[Projections and rebuilds](docs/guide/projections.md) covers what can rebuild views today, and
+[Concepts](docs/guide/concepts.md) walks through each piece.
 
 ## Quick start: Go
 
@@ -237,7 +238,7 @@ with their run commands.
 | Example | Go | Rust |
 | --- | --- | --- |
 | Banking: commands, conflicts, not-found errors | [`go/examples/banking`](go/examples/banking) | [`banking.rs`](crates/evt/examples/banking.rs) |
-| Todo: a commit-wide projector and a view rebuilt from the log | [`go/examples/todo`](go/examples/todo) | [`todo.rs`](crates/evt/examples/todo.rs) |
+| Todo: a commit-wide projector, its rows replayed from the log | [`go/examples/todo`](go/examples/todo) | [`todo.rs`](crates/evt/examples/todo.rs) |
 | Transfer: two accounts in one commit (Go also replays retries from stored outcomes) | [`go/examples/transfer`](go/examples/transfer) | in [`banking.rs`](crates/evt/examples/banking.rs) |
 | Sync journal: scopes, high watermark, gap-checked paging | — | [`journal.rs`](crates/evt/examples/journal.rs) |
 | Lambda: a DynamoDB Streams batch with partial batch failures | — | [`stream_handler.rs`](crates/evt-lambda/examples/stream_handler.rs) |
