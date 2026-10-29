@@ -1372,9 +1372,18 @@ async fn a_diff_keeps_stale_rows_it_cannot_vouch_for_and_refuses_rows_no_batch_c
             .diff(&repository, ["ledger"])
     };
 
-    // Owned rows whose owner is no stream the run read (an unregistered type's, or a bad manual
-    // write with no owner) are kept and counted, not deleted.
-    for owner in ["not-a-ledger", ""] {
+    // Owned rows whose owner the run did not read: a stream of a type it does not register, and a
+    // bad manual write with no owner, are kept and counted; one whose owner is no stream at all is
+    // deleted.
+    Store::<crate::conformance::Wallet, _>::new(&repository, ())
+        .execute(
+            "w-1",
+            crate::conformance::WalletCommand::Fund(5),
+            Metadata::default(),
+        )
+        .await
+        .unwrap();
+    for owner in ["w-1", "", "ghost"] {
         repository
             .put_view(&ViewRow::new(
                 "totals",
@@ -1387,7 +1396,21 @@ async fn a_diff_keeps_stale_rows_it_cannot_vouch_for_and_refuses_rows_no_batch_c
             .unwrap();
     }
     let report = diffing().run("rebuild-1", LEASE).await.unwrap();
-    assert_eq!((report.deletes, report.kept), (0, 2), "{report:?}");
+    assert_eq!((report.deletes, report.kept), (1, 2), "{report:?}");
+    assert!(
+        repository
+            .get_view_at("totals", "x-ghost")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .get_view_at("totals", "x-w-1")
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     // A stale row a guarded write would refuse fails the dry run and the run before any write,
     // so the lock is released rather than wedged.

@@ -877,7 +877,8 @@ let report = ProjectionRebuild::new(&repository)
   be exact: a planned put of an unowned type fails the run before any write, and nothing else may
   write an owned type. A listing that may lag (DynamoDB's type index) is confirmed by a strongly
   consistent read by key before a row is skipped or deleted. A stale row is deleted only when its
-  owner is a stream the run read (others are kept and counted in `kept`), and a planned delete of
+  owner is a stream the run read or no stream at all; one owned by a stream of an unregistered type,
+  or with no owner, is kept and counted in `kept`, and a planned delete of
   a row of an unowned type fails the run. Register every type and every projector that writes an
   owned type, and run `plan()` first. The report adds `unchanged`, `existing`, `kept` and the
   changes per row type.

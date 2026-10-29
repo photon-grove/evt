@@ -246,8 +246,8 @@ pub struct RebuildReport {
     /// Diff mode: the owned rows the run listed before comparing.
     pub existing: usize,
     /// Diff mode: owned rows the plan does not produce that were kept, not deleted, because their
-    /// owner is not a stream the run read: a row of a type that is not registered, which a
-    /// rebuild that registers it would reproduce or delete.
+    /// owner is a stream of a type the run did not read (a type that is not registered, which a
+    /// rebuild that registers it would reproduce or delete), or they have no owner.
     pub kept: usize,
     /// Diff mode: the puts and deletes by row type (the row's `entityType`).
     pub changes: BTreeMap<String, RowChanges>,
@@ -385,8 +385,10 @@ where
     /// not skipped).
     ///
     /// A stale row is deleted only when its owner is a stream the run read (or the journal's
-    /// counter owner); others are kept and counted ([`RebuildReport::kept`]), so a type left out
-    /// of the registration does not have its rows deleted. Register every type and every projector
+    /// counter owner), or no stream of that ID exists in the log; a row owned by a stream of a
+    /// type the run did not read, or with no owner, is kept and counted
+    /// ([`RebuildReport::kept`]), so a type left out of the registration does not have its rows
+    /// deleted. Register every type and every projector
     /// that writes an owned type, and look at [`plan`](Self::plan) first: a projector left out
     /// would have its rows deleted. A planned delete at a key holding a row of a type the diff
     /// does not own fails with [`Error::InvalidConfig`]; a planned put writes its key whatever is
@@ -731,12 +733,48 @@ where
         }
 
         if let Some(diff) = &self.diff {
-            output
+            let unread = output
                 .diff(diff.rows, &self.owned_types(diff), &streams)
                 .await?;
+
+            // An owned row whose owner the run did not read is deleted only when no such stream
+            // exists: one of a type left out of the registration is kept, as is a row with no
+            // owner (no guarded write could delete it).
+            let (mut orphans, mut kept) = (Vec::new(), 0);
+            let mut exists: BTreeMap<String, bool> = BTreeMap::new();
+            for row in unread {
+                let found = match exists.get(&row.entity_id) {
+                    Some(found) => *found,
+                    None if row.entity_id.is_empty() => true,
+                    None => {
+                        let found = self.stream_exists(&row.entity_id).await?;
+                        exists.insert(row.entity_id.clone(), found);
+                        output.keep_alive().await?;
+
+                        found
+                    }
+                };
+                if found {
+                    kept += 1;
+                } else {
+                    orphans.push(row);
+                }
+            }
+            output.finish_diff(orphans, kept)?;
         }
 
         Ok(())
+    }
+
+    /// Whether the log holds a stream `id`: any event, or a snapshot (a stream compacted to its
+    /// head keeps its snapshot).
+    async fn stream_exists(&self, id: &str) -> Result<bool, Error> {
+        let id = EntityId::new(id);
+        if !self.repository.latest(&id, 1).await?.is_empty() {
+            return Ok(true);
+        }
+
+        Ok(self.repository.snapshot(&id).await?.is_some())
     }
 
     /// The row types a diff owns: the declared ones, and the journal's rows and counters when the

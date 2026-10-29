@@ -65,8 +65,9 @@ impl<R: RebuildFence> Output<'_, R> {
     /// - a planned delete is kept when a read by key finds the row; one that finds a row of a type
     ///   the diff does not own fails with [`Error::InvalidConfig`];
     /// - an owned row the plan does not produce is deleted when a read by key still finds it with
-    ///   an owned type, and its owner is a stream the run read (`streams`); one owned by a stream
-    ///   the run did not read (an unregistered type's) is kept and counted.
+    ///   an owned type and its owner is a stream the run read (`streams`). One whose owner the run
+    ///   did not read is returned, for [`finish_diff`](Self::finish_diff) to delete only if no
+    ///   such stream exists.
     ///
     /// A put of a type the diff does not own is refused with [`Error::InvalidConfig`]: the diff
     /// could neither tell it apart from another writer's row nor delete it once stale. The final
@@ -77,7 +78,7 @@ impl<R: RebuildFence> Output<'_, R> {
         rows: &dyn Rows,
         owned: &BTreeSet<String>,
         streams: &BTreeSet<String>,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<ViewRow>, Error> {
         let planned = std::mem::take(&mut self.planned);
         if let Some(item) = planned.iter().find(|item| {
             item.op.kind == ViewOperationKind::Put && !owned.contains(&item.op.entity_type)
@@ -158,6 +159,7 @@ impl<R: RebuildFence> Output<'_, R> {
             operations.push(item);
         }
 
+        let mut unread = Vec::new();
         for key in stale {
             let Some(row) = stored.get(&key) else {
                 continue;
@@ -166,27 +168,45 @@ impl<R: RebuildFence> Output<'_, R> {
                 continue;
             }
             if !streams.contains(&row.entity_id) {
-                self.report.kept += 1;
+                unread.push(row.clone());
                 continue;
             }
 
             changes.entry(row.entity_type.clone()).or_default().deletes += 1;
-            operations.push(ProjectedView::new(
-                STALE_ROWS,
-                usize::MAX,
-                operations.len(),
-                ViewOperation::delete(row.pk.clone(), row.sk.clone(), row.entity_id.as_str()),
-            ));
+            operations.push(stale_delete(row, operations.len()));
         }
 
-        // A row a guarded write refuses (a stale row with no owner, say, from a bad manual write)
-        // fails the run here, before the first write and in the dry run alike.
-        check_views(&operations)?;
-
-        self.report.puts = changes.values().map(|change| change.puts).sum();
-        self.report.deletes = changes.values().map(|change| change.deletes).sum();
         self.report.changes = changes;
         self.planned = operations;
+
+        Ok(unread)
+    }
+
+    /// Completes a diff: deletes the stale rows in `orphans` (owned rows whose owner is no stream
+    /// in the log), counts the rows `kept`, then checks the operations as a guarded write checks
+    /// them, so a row no batch could write fails here, before the first write and in the dry run
+    /// alike, rather than in the middle of writing.
+    pub(super) fn finish_diff(&mut self, orphans: Vec<ViewRow>, kept: usize) -> Result<(), Error> {
+        for row in &orphans {
+            self.report
+                .changes
+                .entry(row.entity_type.clone())
+                .or_default()
+                .deletes += 1;
+            let delete = stale_delete(row, self.planned.len());
+            self.planned.push(delete);
+        }
+        self.report.kept = kept;
+
+        check_views(&self.planned)?;
+
+        self.report.puts = self.report.changes.values().map(|change| change.puts).sum();
+        self.report.deletes = self
+            .report
+            .changes
+            .values()
+            .map(|change| change.deletes)
+            .sum();
 
         Ok(())
     }
@@ -213,6 +233,16 @@ impl<R: RebuildFence> Output<'_, R> {
 
         Ok(stored)
     }
+}
+
+/// The delete of a stale owned row, as its owner.
+fn stale_delete(row: &ViewRow, operation: usize) -> ProjectedView {
+    ProjectedView::new(
+        STALE_ROWS,
+        usize::MAX,
+        operation,
+        ViewOperation::delete(row.pk.clone(), row.sk.clone(), row.entity_id.as_str()),
+    )
 }
 
 /// Whether a stored row already holds what a put would write: owner, type, payload, and no TTL
