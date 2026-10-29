@@ -311,7 +311,9 @@ update or fence check counts by the rule below for updates and checks: its key a
 its expression strings, name placeholders and names, and attribute values (the number of a value
 counts as its decimal text). A head update's `:t` is estimated with the commit's own `ttl`. A
 commit over either byte budget fails with the same typed `CommitTooLarge` error before any write,
-and is never split.
+and is never split. A store never stages a snapshot over the per-item budget, so an aggregate whose
+state outgrows it keeps committing without snapshots
+([Oversized snapshots](#oversized-snapshots)).
 
 The preflight counts projector operations on every backend that writes them. DynamoDB sizes
 each projector item exactly: a put counts its item, and an update, delete, or condition check
@@ -3403,6 +3405,35 @@ snapshot if interval > 0 and events_in_commit >= next
 
 For example, with interval 3, a 6-event commit at sequence 1 snapshots at event 7, and a 1-event
 commit at sequence 7 does not snapshot because the next boundary is 9.
+
+### Oversized snapshots
+
+A snapshot is one item, never chunked, so the aggregate's state must stay bounded: keep unbounded
+history (every reaction an aggregate has seen, say) in events, not in state. A state that outgrows
+the per-item budget would otherwise make every commit that reaches the interval fail with
+`CommitTooLarge` ([Writes](#writes)), however small its events, bricking the stream.
+
+So a store measures each snapshot before it stages it, and leaves out one that does not fit:
+
+- The measure is the snapshot item's preflight size (the same estimate the commit budget uses)
+  plus a `ttl` attribute at its widest, 22 bytes (the name and the 19 digits of the largest
+  int64), whether or not the type is retained: Go `evt.SnapshotCommitSize`, Rust
+  `photon_evt::snapshot_commit_size`.
+- A snapshot whose measure is over 380,000 bytes (Go `evt.MaxCommitItemBytes`, Rust
+  `photon_evt::MAX_COMMIT_ITEM_BYTES`) is not written. The commit proceeds without it, as a commit
+  that does not reach the interval would: the stored snapshot stays, the loaded or executed
+  state keeps its snapshot sequence, and the next commit that reaches the interval tries again,
+  with the same sequence. The store logs the skip as a warning (Go `slog`, Rust `tracing`).
+- The rule applies wherever the engine writes a snapshot: commands, transactions (each written
+  stream), outcome commits, and catch-up snapshots on load. It is the same on every backend,
+  PostgreSQL included, whose rows have no such limit, so a stream's snapshots do not depend on
+  where it is stored.
+
+Loads of such a stream replay every event after the last snapshot that fit, and compaction cannot
+move past it, so the skip is a safety net, not a mode to run in. A repository commit built by hand
+(`CommitWithSnapshot`, `Commit::with_snapshot`) is not measured: an oversized snapshot there still
+fails with `CommitTooLarge`. An out-of-band `PutSnapshot` / `put_snapshot` is not budgeted, and
+DynamoDB refuses an item over 400 KB.
 
 A store can also write a catch-up snapshot on load (Go `WithCatchUpSnapshotThreshold`, Rust
 `Store::with_catch_up_snapshot_threshold`, both off by default). When a load replays at least the

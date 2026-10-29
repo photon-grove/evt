@@ -504,6 +504,13 @@ error before any write and is never split.
   default): a load that replays at least the threshold writes a standalone, monotonic snapshot of
   the folded state at sequence `seq + 1`; a failed write is logged and never fails the load. Rust's
   loaded state then carries the new `seq`; Go's does not
+- An oversized snapshot is skipped, never a failed commit: before staging a snapshot (commit,
+  transaction, outcome commit, or catch-up), the store measures its item as the commit preflight
+  does plus the widest `ttl` (Go `evt.SnapshotCommitSize`, Rust `snapshot_commit_size`). Over
+  380,000 bytes (`MaxCommitItemBytes` / `MAX_COMMIT_ITEM_BYTES`) the snapshot is left out with a
+  warning, the commit proceeds as one that does not reach the interval, and the snapshot sequence
+  does not advance. Same rule on every backend. Aggregate state must stay bounded; unbounded
+  history belongs in events
 
 ### Snapshot Creation
 
