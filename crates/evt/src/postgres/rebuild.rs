@@ -98,7 +98,7 @@ impl PostgresRepository {
     /// One `begin` attempt in one transaction under the exclusive advisory lock.
     async fn begin_once(&self, owner: &str, seconds: i64) -> Result<Attempt, Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = super::read_committed(&mut client).await?;
         self.lock_fence(&tx).await?;
 
         let generation = self.read_generation(&tx, true).await?;
@@ -221,7 +221,7 @@ impl PostgresRepository {
         rebuild::check_owner(owner)?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = super::read_committed(&mut client).await?;
         self.lock_fence(&tx).await?;
 
         // A settled generation means no rebuild holds the fence, so the caller cannot hold it; a
@@ -367,7 +367,7 @@ impl RebuildFence for PostgresRepository {
         let statements = self.view_statements(views)?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = super::read_committed(&mut client).await?;
 
         let lock = self.read_lock(&tx, true).await?;
         let now = self.clock.unix_seconds();

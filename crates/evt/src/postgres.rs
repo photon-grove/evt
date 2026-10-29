@@ -271,7 +271,7 @@ impl PostgresRepository {
     /// Creates the event and snapshot tables if they do not exist.
     pub async fn ensure_schema(&self) -> Result<(), Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
         // IF NOT EXISTS can still race in PostgreSQL's catalogs. Go takes this same lock.
         tx.execute(
             "SELECT pg_advisory_xact_lock(1702261762, hashtext($1))",
@@ -382,7 +382,7 @@ impl PostgresRepository {
         only_if_empty: bool,
     ) -> Result<bool, Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
         let lock_key = features_lock_key(&self.events_table);
         tx.execute(FEATURES_LOCK_EXCLUSIVE, &[&lock_key])
             .await
@@ -913,7 +913,7 @@ impl PostgresRepository {
         self.ensure_stream_heads().await?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
 
         // Every touched stream, written and fenced, takes its advisory lock in canonical
         // (sorted) order, so concurrent multi-stream commits cannot deadlock. An outcome-only
@@ -1283,7 +1283,7 @@ impl Repository for PostgresRepository {
         self.ensure_stream_heads().await?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
         tx.execute(ENTITY_LOCK, &[&snapshot.entity_id.as_str()])
             .await
             .map_err(statement_error)?;
@@ -1327,7 +1327,7 @@ impl Repository for PostgresRepository {
         }
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
         let lock_key = features_lock_key(&self.events_table);
         tx.execute(FEATURES_LOCK_SHARED, &[&lock_key])
             .await
@@ -1624,6 +1624,22 @@ fn transient(err: &tokio_postgres::Error) -> bool {
     err.code().is_some_and(|code| {
         *code == SqlState::T_R_SERIALIZATION_FAILURE || *code == SqlState::T_R_DEADLOCK_DETECTED
     })
+}
+
+/// Starts a transaction at `READ COMMITTED`, whatever the server's or role's
+/// `default_transaction_isolation`. The engine's transactions read fence rows (the rebuild lock and
+/// generation, stream heads, the feature manifest) after waiting for advisory locks, and only
+/// `READ COMMITTED` takes each statement's snapshot after the wait: a `REPEATABLE READ` snapshot,
+/// taken at the first statement, would miss a rebuild or a commit that landed while it waited.
+async fn read_committed(
+    client: &mut deadpool_postgres::Client,
+) -> Result<deadpool_postgres::Transaction<'_>, Error> {
+    client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await
+        .map_err(Error::backend)
 }
 
 mod enumerate;

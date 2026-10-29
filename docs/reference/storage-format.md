@@ -3152,6 +3152,22 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
 );
 ```
 
+- Every transaction the engine opens (commits, out-of-band snapshot writes, compaction, the
+  rebuild lifecycle and its guarded view writes, feature declarations, `EnsureSchema`, and the
+  stream-head migration and repair writes) runs at `READ COMMITTED`, set explicitly whatever the
+  server's or role's `default_transaction_isolation` (Go issues `SET TRANSACTION ISOLATION LEVEL
+  READ COMMITTED` as the first statement, Rust starts it with `START TRANSACTION ISOLATION LEVEL
+  READ COMMITTED`). The one exception is Go's read-only stream-head scans (`VerifyStreamHeads`
+  and the dry runs of the migration and repair), which take no locks and want one consistent
+  `REPEATABLE READ READ ONLY` snapshot. A Go `DB` that is itself an ambient transaction must
+  already run at `READ COMMITTED`: PostgreSQL cannot change the level of a transaction under way,
+  so the repository refuses to begin inside one at a stricter level.
+  The fence reads below (the rebuild lock and generation, stream heads, the feature manifest) run
+  after advisory-lock waits, and only `READ COMMITTED` takes each statement's snapshot after the
+  wait: a `REPEATABLE READ` or `SERIALIZABLE` snapshot is taken at the transaction's first
+  statement, so a commit that waited would not see a rebuild that began, or a commit that moved a
+  fenced stream, while it waited. Single statements outside a transaction always see the latest
+  committed rows.
 - A commit is one transaction: the entity locks, the feature-marker `SELECT`, a probe for an
   existing outcome row, the head statements and fence reads ([Stream Heads](#postgresql-head-table)),
   one insert per event, projector statements, the snapshot upserts, then the outcome insert.
