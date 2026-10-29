@@ -664,7 +664,9 @@ Behind that call, every commit that writes a journaled event reads the scopes' c
 positions, stores them in the event's metadata (`evt.journal`), and adds the journal rows and the
 counters to the commit's view operations, so they are atomic with the events. Because the
 allocations are on the events, `journal::replay` and `journal::rebuild` rebuild the rows and counters
-from stored events in any order. The journaled entity types are declared history-dependent in the
+from stored events in any order. The allocations are added after your commit-wide projectors run, so
+they never see `evt.journal`, live or on replay, and cannot opt in: only the journal's own projector
+reads engine metadata. The journaled entity types are declared history-dependent in the
 feature marker with the `journal` feature (`journal: 1`), so they are never compacted and builds
 without the feature refuse the table.
 

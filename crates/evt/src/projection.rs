@@ -437,6 +437,10 @@ impl CommitView {
 /// wrote (and, for a history-dependent projector, one of the types it names). **A row's owner must
 /// never change**: never delete a row to hand its key to another stream; keep the row and rewrite
 /// it with a tombstone payload.
+///
+/// Events reach a projector without the engine's own metadata extensions (the journal's
+/// `evt.journal` allocation), live and on replay alike. Only the engine's own projectors read
+/// them; the method that opts in is sealed, so an application's projector cannot.
 pub trait CommitProjector: Send + Sync {
     /// Identifies the projector in errors. It should be unique within a store.
     fn name(&self) -> &str;
@@ -453,16 +457,62 @@ pub trait CommitProjector: Send + Sync {
     }
 
     /// Whether the projector reads the engine's own metadata extensions on events (the journal's
-    /// `evt.journal` allocation, which the journal adds when it commits). Default `false`: the
-    /// projector is given events without them, live and on replay alike, so its rows are the same
-    /// either way. Only the journal's own projector needs them.
-    fn engine_metadata(&self) -> bool {
+    /// `evt.journal` allocation, which the journal adds when it commits). It is `false` for every
+    /// projector outside this crate: the projector is given events without them, live and on
+    /// replay alike, so its rows are the same either way. Only the journal's own projector reads
+    /// them.
+    ///
+    /// The method is sealed. Its argument is a token that only this crate can name or construct,
+    /// so an application's projector can neither override it nor call it. Opting in would not work
+    /// anyway: the allocation is added after the live projectors run, so such a projector would see
+    /// it on replay and not live, and its rows would diverge.
+    ///
+    /// ```compile_fail,E0050
+    /// use photon_evt::{BoxError, CommitProjector, CommitView, ViewOperation};
+    ///
+    /// struct Sneaky;
+    ///
+    /// impl CommitProjector for Sneaky {
+    ///     fn name(&self) -> &str {
+    ///         "sneaky"
+    ///     }
+    ///
+    ///     // Refused: an application projector cannot opt into the engine's metadata.
+    ///     fn engine_metadata(&self) -> bool {
+    ///         true
+    ///     }
+    ///
+    ///     fn project(&self, _: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+    ///         Ok(Vec::new())
+    ///     }
+    /// }
+    /// ```
+    #[doc(hidden)]
+    fn engine_metadata(&self, _: EngineOnly) -> bool {
         false
     }
 
     /// Returns the commit's view operations. An error fails the command before any write, as an
     /// internal failure ([`Error::Projector`]).
     fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError>;
+}
+
+mod sealed {
+    /// The argument of [`CommitProjector::engine_metadata`]. It is public so the trait can name it,
+    /// in a private module so no other crate can, and only this crate can construct it: the method
+    /// is sealed, so only the engine's own projectors (the journal's) read engine metadata.
+    #[derive(Clone, Copy, Debug)]
+    pub struct EngineOnly(pub(crate) ());
+}
+
+pub(crate) use sealed::EngineOnly;
+
+impl dyn CommitProjector {
+    /// Whether the projector reads the engine's own metadata
+    /// ([`CommitProjector::engine_metadata`]): the engine's way to ask the sealed method.
+    pub(crate) fn reads_engine_metadata(&self) -> bool {
+        self.engine_metadata(EngineOnly(()))
+    }
 }
 
 /// A view operation with its provenance: which projector emitted it, at which position of the
@@ -731,7 +781,7 @@ pub(crate) fn project_with<'a>(
     for (index, projector) in projectors {
         let history = projector.history();
         let operations = projector
-            .project(&view.visible_to(history, projector.engine_metadata()))
+            .project(&view.visible_to(history, projector.reads_engine_metadata()))
             .map_err(|source| {
                 Error::Projector(Box::new(CommitProjectorFailed {
                     projector: projector.name().to_owned(),

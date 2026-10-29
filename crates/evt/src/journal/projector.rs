@@ -8,7 +8,7 @@ use super::row::encode_row;
 use super::scope::{ROW_ENTITY_TYPE, allocations, row_sk};
 use crate::error::BoxError;
 use crate::ids::EntityType;
-use crate::projection::{CommitProjector, CommitView, ViewOperation};
+use crate::projection::{CommitProjector, CommitView, EngineOnly, ViewOperation};
 
 /// The error a journal row's operation maps to when its position is already taken: another commit
 /// allocated the same position of the scope first. The journal's retry matches it, re-reads the
@@ -70,7 +70,7 @@ impl CommitProjector for JournalProjector {
         self.journal.entity_types()
     }
 
-    fn engine_metadata(&self) -> bool {
+    fn engine_metadata(&self, _: EngineOnly) -> bool {
         true
     }
 
