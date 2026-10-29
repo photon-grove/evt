@@ -1641,7 +1641,10 @@ declares it before a writer writes, by an explicit initialization or by a lazily
 ([Stream Heads](#required-feature)). `photon-evt` models
 `journal` and `journal-compaction` at format version 1 when built with its `journal` cargo feature.
 It declares `journal` with the first journaled commit ([Journal](#feature-marker-and-history)) and
-`journal-compaction` with the first compaction lease ([Compaction](#journal-compaction)). The `historyDependent` set declares the entity types whose commit-wide projectors are
+`journal-compaction` with the first compaction lease ([Compaction](#journal-compaction)). A
+fourth, `postgres-views` (format version 1, planned for `photon-evt` 0.3, ADR 0008), records that
+a PostgreSQL store's commit-wide views live in its evt-owned
+[views table](#postgresql-views-table). The `historyDependent` set declares the entity types whose commit-wide projectors are
 history-dependent ([Views](#views)), compaction is forbidden for them. The `retention` set
 declares the entity types configured with retention (a positive `ttl`), fences are refused for
 them ([Read fences](#read-fences)). Both sets are JSON arrays of entity-type names, sorted and deduplicated,
@@ -2736,7 +2739,8 @@ operation's owner is a stream: the engine's check (`InvalidViewOperation`) runs 
 pipeline, which the journal's counter operations do not go through. A counter write is a
 compare-and-set on the counter the commit read: `attribute_not_exists(pk)` when it read none,
 otherwise `entityID = :owner AND payload = :expected`, binding the exact payload it read (an
-engine-only view condition, crate-private, so projectors cannot set it. PostgreSQL refuses it).
+engine-only view condition, crate-private, so projectors cannot set it. PostgreSQL refuses it
+until the [PostgreSQL views table](#postgresql-views-table) lands).
 A commit allocates a scope's positions from the counter it read, so the rows it writes are the
 positions above it. If any is taken, or the counter moved, the commit fails whole.
 The rows' `absent` conditions alone are not enough once [compaction](#journal-compaction) deletes
@@ -3066,13 +3070,17 @@ would read deleted rows as a gap and could allocate below the floor.
 
 ### Backends
 
-DynamoDB (a views table) and the in-memory repository. The Rust PostgreSQL repository does not
-write commit-wide view operations yet, so it does not support the journal.
+DynamoDB (a views table) and the in-memory repository. The Rust PostgreSQL repository writes
+commit-wide view operations through an application's view writer, which cannot express the
+counter's compare-and-set (`applies_expected_payload()` is false), and it implements none of the
+journal stores, so `JournalRepository<PostgresRepository>` does not compile. [Journal on PostgreSQL](#journal-on-postgresql) specifies the
+`photon-evt` 0.3 support over an evt-owned views table (ADR 0008).
 
 ## PostgreSQL
 
 The schema is created by Go's `postgres.Repository.EnsureSchema` or Rust's
-`PostgresRepository::ensure_schema`, which run the same idempotent DDL. Table names default to
+`PostgresRepository::ensure_schema`, which run the same idempotent DDL (until the Rust-only
+[PostgreSQL views table](#postgresql-views-table) lands). Table names default to
 `evt_events` and `evt_snapshots` and can be changed in both implementations. The v0.9 auxiliary
 relations derive from the configured events table name through a reserved infix
 (`{events}__evt_command_outcomes`, `{events}__evt_features`, `{events}__evt_rebuild_lock`,
@@ -3101,7 +3109,8 @@ so every derived name fits PostgreSQL's 63-byte identifier limit without truncat
 derived relation name, `{events}__evt_rebuild_generation_pkey`, adds 29 bytes to the base name
 (`34 + 29 = 63`), ahead of `{events}__evt_rebuild_generation` (+24),
 `{events}__evt_entity_type_idx` (+21), and `{events}__evt_stream_heads_pkey` (+23). Both also reject a pair of names where two of the
-relations the schema creates (the seven tables, the index, and each table's `{table}_pkey`) would
+relations the schema creates (the seven tables, the index, and each table's `{table}_pkey`; the
+[views table](#postgresql-views-table) adds its own) would
 share a name after case folding, because `CREATE TABLE IF NOT EXISTS` would skip the second one.
 
 ```sql
@@ -3191,7 +3200,8 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   Projector statements run after the events, so a writer that lost a race fails on its head
   statement (a conflict) before it reaches a view row. Commit-wide
   view operations execute inside the commit transaction in both languages in v0.9. evt
-  defines no PostgreSQL view schema (applications own their view tables) so each repository is
+  defines no PostgreSQL view schema yet (applications own their view tables; the planned
+  [views table](#postgresql-views-table) is the exception) so each repository is
   configured with a view writer that turns one view operation into one SQL statement (Go
   `postgres.Repository.WithViewWriter`, Rust `PostgresRepository::with_view_writer`), and a
   repository without one refuses a commit that carries view operations with `ViewsNotConfigured`.
@@ -3392,6 +3402,213 @@ name.)
   declaration's exclusive lock waits for every commit holding the shared lock. Commits do not
   serialize against each other.
 
+### PostgreSQL views table
+
+Planned for `photon-evt` 0.3 ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)). Not
+implemented yet. This section is the contract the implementation is written against.
+
+`ensure_schema` creates one more derived relation, the views table, and two indexes:
+
+```sql
+CREATE TABLE IF NOT EXISTS evt_events__evt_views (
+    pk          text COLLATE "C" NOT NULL,
+    sk          text COLLATE "C" NOT NULL,
+    entity_id   text   NOT NULL,
+    entity_type text   NOT NULL,
+    payload     text   NOT NULL,
+    ttl         bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (pk, sk)
+);
+CREATE INDEX IF NOT EXISTS evt_events__evt_views_type_idx
+    ON evt_events__evt_views (entity_type, pk, sk);
+CREATE INDEX IF NOT EXISTS evt_events__evt_views_ttl_idx
+    ON evt_events__evt_views (ttl) WHERE ttl > 0;
+```
+
+- The relations derive from the configured events table name like the others, and the name rules
+  above apply to them: the table (`{events}__evt_views`, +11 bytes), its key
+  (`{events}__evt_views_pkey`, +16), and the indexes (`{events}__evt_views_type_idx`, +20, and
+  `{events}__evt_views_ttl_idx`, +19) stay under the 29 bytes the 34-byte limit leaves, and all four
+  join the set of relations checked for a case-folded collision.
+- The database encoding must be `UTF8`. `ensure_schema` and `with_views_table()` refuse any other
+  (`SHOW server_encoding`), because the byte order and the exact-bytes rule below hold only for
+  UTF-8 text.
+- Each column is the [view item](#views) attribute of the same name: `entity_id` is `entityID`
+  (the owner), `entity_type` is `entityType`, and `ttl` is the item's `ttl` in epoch seconds, `0`
+  when the item has none. An empty `sk` is stored as `VIEW`, as on DynamoDB.
+- `pk` and `sk` collate as `"C"`, so the primary key orders by UTF-8 bytes, which is DynamoDB's
+  sort-key order. Every `ORDER BY` below relies on it.
+- `payload` is `text`, not `jsonb`, and keeps its exact bytes (`jsonb` normalizes whitespace and
+  key order). The [journal](#journal) digests and the expected-payload condition compare payload
+  bytes, so normalization would break both.
+- Key size. A btree index entry holds at most 2,704 bytes, less than DynamoDB's 2,048-byte `pk`
+  plus 1,024-byte `sk`. A row whose `entity_type`, `pk` and `sk` together exceed 2,600 UTF-8 bytes
+  is refused with `ViewKeyTooLong` before any write (see [Known differences](#known-differences)).
+
+View repository (`PgViewRepository`, `photon_evt::ViewRepository`), outside the commit path:
+
+| Operation | Statement |
+| --- | --- |
+| put | `INSERT … ON CONFLICT (pk, sk) DO UPDATE SET entity_id = EXCLUDED.entity_id, entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload, ttl = EXCLUDED.ttl`: no condition, no owner check |
+| delete | `DELETE … WHERE pk = $1 AND sk = $2`: no condition |
+| get | `SELECT … WHERE pk = $1 AND sk = $2` |
+| list by partition | `SELECT … WHERE pk = $1 AND sk > $2 ORDER BY sk LIMIT $3` (no `sk` bound on the first page) |
+| list by entity type | `SELECT … WHERE entity_type = $1 AND (pk, sk) > ($2, $3) ORDER BY pk, sk LIMIT $4` (no key bound on the first page) |
+
+- A batch of writes is one transaction, applied in order, so a repeated `(pk, sk)` keeps its last
+  row, as in Rust on DynamoDB. A batch is atomic here (DynamoDB's `BatchWriteItem` is not), which
+  the contract allows.
+- Every read sees every committed transaction, including lists by entity type (DynamoDB's index
+  is eventually consistent). A page without a limit holds at most 1,000 rows.
+- The cursor is the last row's keys as a JSON object, keys sorted and escaped like every other Go
+  JSON, in padded base64url: `pk` and `sk` for a partition list, plus `entityType` for an
+  entity-type list, the same shape DynamoDB's `LastEvaluatedKey` produces. A full page returns a
+  cursor even when no row follows, as on DynamoDB. A cursor with the wrong keys is
+  `InvalidArgument`.
+- TTL. Readers return a row whose `ttl` has passed, as DynamoDB does until its sweep deletes it.
+  `PgViewRepository::purge_expired(now)` deletes them through the partial index, a batch at a time:
+  `DELETE … WHERE (pk, sk) IN (SELECT pk, sk FROM … WHERE ttl > 0 AND ttl <= $1 ORDER BY ttl LIMIT 1000)`,
+  repeated until a batch deletes nothing. An operator or a scheduled job runs it. Journal rows,
+  counters and compaction rows carry no `ttl`, so it never touches them.
+
+Commit target. `PostgresRepository::with_views_table()` makes the views table the target of a
+commit's view operations, in place of an application view writer (`with_view_writer`; a
+repository has one or the other). The engine builds each statement itself, under the same
+contract as a view writer's ([PostgreSQL](#postgresql)), and every put replaces the whole row as
+DynamoDB's `Put` replaces the item (`ttl` included, `0` when the operation sets none):
+
+- an `absent` put is a plain `INSERT` whose unique violation (`23505`) of
+  `{events}__evt_views_pkey` is the failed condition;
+- any other put is the owner-guarded upsert
+  (`… DO UPDATE SET … WHERE evt_events__evt_views.entity_id = EXCLUDED.entity_id`, zero rows when
+  another stream owns the row);
+- a `present` delete deletes the owner's row (`… AND entity_id = $owner`) and fails on zero rows;
+- an unconditional delete deletes the owner's row and fails when the row belongs to another owner.
+
+Each statement is sized in the commit budget as the DynamoDB item it mirrors would be (its
+attribute names and values), not by its SQL text, so `CommitTooLarge` fires at the same commit on
+both backends.
+
+With the views table, and only with it, the repository applies the engine's expected-payload
+condition (`applies_expected_payload()` is true). An operation that expects the payload it read is:
+
+```sql
+-- the commit read no row: claim it
+INSERT INTO evt_events__evt_views (pk, sk, entity_id, entity_type, payload, ttl)
+VALUES ($1, $2, $3, $4, $5, 0);                         -- 23505 on the key: the condition failed
+-- the commit read a row: replace exactly that row
+UPDATE evt_events__evt_views
+SET entity_type = $4, payload = $5, ttl = 0
+WHERE pk = $1 AND sk = $2 AND entity_id = $3 AND payload = $6;   -- zero rows: the condition failed
+```
+
+A failed condition is a projector operation failure, ranked as on DynamoDB ([Views](#views)). An
+application view writer still refuses the condition (`InvalidViewOperation`).
+
+Isolation. Commits, compaction batches and rebuild view writes on a repository with the views table
+start with `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`, whatever the server's default. Their
+fence reads follow advisory-lock waits, and only `READ COMMITTED` takes each statement's snapshot
+after the wait: a `REPEATABLE READ` snapshot, taken at the first statement, would read a rebuild
+generation or a counter from before the lock. Under `READ COMMITTED` an `UPDATE` that waits on a row
+a concurrent commit is changing re-checks its `WHERE` against the committed row, so two commits
+that read the same counter cannot both pass: the second matches zero rows.
+
+Rebuild view writes (`write_rebuild_views`) use the commit target's statements without the
+`absent` and `present` conditions, owner guard included, so a rebuild row whose key another owner
+holds fails with `ConditionalCheckFailed` as it does on DynamoDB. Rebuild deletes are the
+unconditional delete above. Both run under the lock-row guard of the
+[rebuild fence](#postgresql).
+
+Feature marker. A repository configured `with_views_table()` declares the feature `postgres-views`
+(format version 1) before its first commit, and requires it on every later one. A writer that
+does not support it refuses the store, as for any unknown feature ([Feature marker](#feature-marker)):
+a Go writer and a Rust repository that uses `with_view_writer` cannot write a store whose views
+live in `{events}__evt_views`, so commit-wide rows never split across two tables.
+
+### Journal on PostgreSQL
+
+Planned for `photon-evt` 0.3 ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)), on a
+repository configured `with_views_table()`. Not implemented yet. The [journal](#journal) and its
+[compaction](#journal-compaction) are specified backend-neutrally above. This section pins the
+PostgreSQL statements.
+
+Rows. Journal rows, counters and compaction rows are rows of `{events}__evt_views`, column for
+attribute, with the same keys, owners, entity types and payload bytes as the DynamoDB items, so
+`compat/fixtures/journal.json` pins both backends.
+
+Commits. The journal's row puts and counter puts are view operations of the commit, so they run as
+the commit target's statements above: each row is an `absent` insert, and each counter is the
+expected-payload operation. A failed row insert or counter update is the journal's
+`PositionTaken`, retried as on DynamoDB ([The commit](#the-commit)), and a serialization failure
+or deadlock (`40001`, `40P01`) is `Error::Transient`.
+
+Reads (`JournalStore`, `JournalCompactionStore`), each one statement, each seeing every committed
+transaction:
+
+```sql
+-- read_counter / read_counters
+SELECT pk, payload FROM evt_events__evt_views WHERE pk = ANY($1) AND sk = 'COUNTER';
+-- read_last_position
+SELECT sk FROM evt_events__evt_views WHERE pk = $1 ORDER BY sk DESC LIMIT 1;
+-- read_rows ($2: `after` as 20 zero-padded digits)
+SELECT pk, sk, entity_id, entity_type, payload, ttl FROM evt_events__evt_views
+WHERE pk = $1 AND sk > $2 ORDER BY sk LIMIT $3;
+-- read_compaction_row
+SELECT pk, sk, entity_id, entity_type, payload, ttl FROM evt_events__evt_views
+WHERE pk = $1 AND sk = $2;
+```
+
+Compaction writes (`CompactionStore::write_compaction`, 1 to 99 writes to distinct keys) are one
+`READ COMMITTED` transaction:
+
+1. With an `epoch`: take the shared rebuild advisory lock
+   (`pg_advisory_xact_lock_shared(1702261761, hashtext('{events}:rebuild'))`) and read the
+   generation. Unless it is the epoch's, roll back: `EpochChanged`.
+2. Lock the rows the batch names, in ascending `(pk, sk)` byte order:
+   `SELECT entity_id, payload FROM evt_events__evt_views WHERE pk = $1 AND sk = $2 FOR UPDATE`.
+3. Check every write's condition against what step 2 read: `Any` passes, `Absent` needs no row, and
+   `Payload(bytes)` needs a row owned by `SYSTEM#JOURNAL` whose payload is exactly those bytes.
+   Then apply the writes in request order, each guarded again in its own statement:
+   - a put with `Absent` is a plain `INSERT` (a `23505` fails it);
+   - any other put is an upsert of the whole row;
+   - a delete is `DELETE … WHERE pk = $1 AND sk = $2 AND entity_id = $owner`, which a row absent
+     at step 2 passes.
+4. A failed condition, at step 3's check or in a statement, rolls everything back:
+   `Refused(i)`, where `i` is the first failing write in request order, as the in-memory and
+   DynamoDB stores report it. A serialization failure or deadlock is `Error::Transient`.
+   Otherwise `COMMIT`.
+
+`FOR UPDATE` cannot lock an absent row, so two batches that find the same key absent could both
+pass step 2. The protocol keeps that from mattering: every batch of a scope either puts the
+scope's `LEASE` row with `Absent` (the first acquire, a plain insert, which two racing acquirers
+cannot both make) or checks it by payload (a row that step 2 locks), so batches of one scope
+serialize on their lease row. A `Check` with `Absent` on any other key has no `23505` backstop and
+relies on that serialization alone. Compaction takes no lock a commit waits on (it never writes
+counters, and it takes the shared rebuild lock before anything else), so the two cannot deadlock.
+A commit that re-inserts a deleted position below the floor still fails on its counter.
+
+Wake-ups. After its view statements, a commit that wrote journal rows runs, once per distinct
+scope in ascending byte order:
+
+```sql
+SELECT pg_notify('evt_events__evt_journal', $1);   -- $1: the scope itself, not its journal# pk
+```
+
+- The channel is the canonical (lowercase) events table name with `__evt_journal` (+13 bytes).
+  The payload is the scope, at most 512 bytes (`MAX_SCOPE_BYTES`), well under `NOTIFY`'s 8,000.
+- PostgreSQL delivers a transaction's notifications at `COMMIT`, in commit order, and drops them on
+  rollback, so a wake-up never names a write that did not happen. A notification writes nothing
+  and is not counted in the commit's action budget.
+- A listener (`JournalListener`) holds one connection with `LISTEN` on the channel and yields
+  scope wake-ups. A wake-up is not a delivery: the consumer pages the scope from its own cursor,
+  exactly as with a DynamoDB stream record (Wake-ups, under the journal's Reads above).
+- Notifications sent while a listener is disconnected are lost. The listener reports every
+  (re)connect, and the consumer then pages each scope it follows, and again on a polling interval
+  (default 30 seconds), as a backstop.
+- Compaction and rebuild do not notify. A compaction moves no reader's position, and a rebuild
+  changes the generation, which a reader detects on its next read.
+- `with_wakeups(false)` turns the notifications off for a deployment that only polls.
+
 ## Stream envelope
 
 The stream envelope is the cross-language wire format. Go ships no publisher for it, so a
@@ -3520,6 +3737,10 @@ See [ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
 
 These differences are deliberate and covered by tests. Keep them documented here.
 
+- View key size on PostgreSQL (planned, [PostgreSQL views table](#postgresql-views-table)). A
+  btree index entry holds at most 2,704 bytes, so the views table refuses a row whose `entity_type`,
+  `pk` and `sk` together exceed 2,600 UTF-8 bytes with `ViewKeyTooLong`, which DynamoDB would
+  accept up to its 2,048-byte `pk` and 1,024-byte `sk`. Real keys are far shorter.
 - `null` payloads. Go keeps a JSON `null` payload as a nil `[]byte` and re-encodes it as
   `null`. Rust decodes it to empty bytes and writes `""`. Only hand-built JSON can contain a `null`
   payload. Neither store writes one.
