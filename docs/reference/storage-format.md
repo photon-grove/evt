@@ -3196,9 +3196,22 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   `Error::Transient` and Go returns as the database error.
 - The head table makes the floor a consequence of the head condition: a snapshot's `event_sequence`
   never exceeds the head (H3), so a commit that starts at `head + 1` starts above it.
+- Each commit snapshot checks the snapshot sequence chain, as the DynamoDB snapshot put's
+  condition does ([Writes](#writes)). Under the entity's advisory lock, just before its upsert, the
+  commit reads the stored row's sequence with `SELECT sequence FROM evt_snapshots WHERE entity_id =
+  $1` (both languages run this statement). With no row, the snapshot's sequence must be 1. With a
+  row, it must be the stored sequence plus one. Otherwise the commit fails as an
+  optimistic-concurrency conflict and the transaction rolls back, so nothing is written: Go returns
+  an `evt.ConflictError` wrapped in a transient `policy.ClassifiedError` (the fence-aware retry
+  loop retries it), and Rust returns `Error::Conflict`. The check runs after the view statements,
+  so a failed view statement is reported first ([Known differences](#known-differences)). A
+  racing writer usually fails earlier, on its head statement. The check still catches a commit
+  built from a stale snapshot sequence, such as a Go context loaded before a catch-up snapshot
+  ([Snapshot policy](#snapshot-policy)), exactly as DynamoDB and the in-memory repositories do.
 - The snapshot upsert only replaces a snapshot whose `event_sequence` is lower or equal
   (`ON CONFLICT (entity_id) DO UPDATE … WHERE EXCLUDED.event_sequence >= evt_snapshots.event_sequence`).
-  PostgreSQL does not check the snapshot sequence: a racing writer already fails on the event key.
+  In a commit the sequence check above has already passed. The `WHERE` keeps an out-of-band
+  snapshot write (which checks no sequence) monotonic.
 - `metadata` is `jsonb`, which normalizes whitespace and key order. Compare it as JSON, not bytes.
   `payload` is `bytea` and keeps its exact bytes.
 - Entity heads read the head table once the store declares `stream-heads`. Until then they take
@@ -3411,7 +3424,7 @@ standalone snapshot: sequence the loaded snapshot sequence plus one, `eventSeque
 head. It uses the monotonic standalone snapshot write, so it never lowers a stored snapshot, and a
 failed write is logged and does not fail the load. Rust's loaded state then carries the new snapshot
 sequence, so a commit from it writes the next one. Go's loaded context keeps the old sequence, so
-on DynamoDB and in memory a commit from the same load that also snapshots conflicts on the snapshot
+on every backend a commit from the same load that also snapshots conflicts on the snapshot
 sequence and is retried.
 
 ## Loading and duplicate commands

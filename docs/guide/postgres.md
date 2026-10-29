@@ -41,7 +41,10 @@ command. The commit also conditions on the stream's row in the head table, so a 
 sequence is at or below the entity's snapshot `event_sequence` fails with a conflict too, even
 though compaction deleted those keys. An `entity_type` index backs `StreamFilter` narrowing.
 
-`evt_snapshots` holds one durable snapshot per entity, keyed by `entity_id`.
+`evt_snapshots` holds one durable snapshot per entity, keyed by `entity_id`. A commit's snapshot
+must continue the stored one's sequence (1 for the first, then the stored sequence plus one), as on
+DynamoDB: the commit reads the stored sequence under the entity's lock and fails with a transient
+`evt.ConflictError` otherwise.
 
 `evt_events__evt_stream_heads` holds one row per written stream
 ([ADR 0007](../adr/0007-per-stream-head-item.md)), keyed by `entity_id`, with `entity_type` and

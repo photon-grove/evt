@@ -498,11 +498,13 @@ func (repo *Repository) lockTransactionEntities(ctx context.Context, tx pgx.Tx, 
 // and the commit starts above its floor.
 func (repo *Repository) commitSnapshots(ctx context.Context, tx pgx.Tx, result evt.SerializedResult) error {
 	for _, snapshot := range result.Snapshots {
-		var stored struct{ sequence, eventSequence int64 }
+		// The snapshot sequence chain (storage spec, PostgreSQL): the same read as Rust's
+		// check_snapshot_predecessor, under the entity's advisory lock.
+		var stored struct{ sequence int64 }
 		err := tx.QueryRow(ctx,
-			fmt.Sprintf(`SELECT sequence, event_sequence FROM %s WHERE entity_id = $1`, repo.snapshotsTable),
+			fmt.Sprintf(`SELECT sequence FROM %s WHERE entity_id = $1`, repo.snapshotsTable),
 			string(snapshot.EntityID),
-		).Scan(&stored.sequence, &stored.eventSequence)
+		).Scan(&stored.sequence)
 		if errors.Is(err, pgx.ErrNoRows) {
 			if snapshot.Sequence != 1 {
 				return transientConflict(fmt.Sprintf(
