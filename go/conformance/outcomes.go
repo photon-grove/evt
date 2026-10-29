@@ -322,6 +322,7 @@ func testResolveByIdentity(t *testing.T, repo evt.OutcomeRepository) {
 	for _, store := range []*snapshots.Store{env.store, second} {
 		resolved, resolveErr := store.ResolveCommand(ctx, identity, metadata)
 		require.NoError(t, resolveErr)
+		require.NotNil(t, resolved, "the stored outcome is found")
 		require.True(t, resolved.Replayed)
 		require.Equal(t, first.Outcome, resolved.Outcome)
 		require.Equal(t, []byte("paired"), resolved.Response)
@@ -332,31 +333,44 @@ func testResolveByIdentity(t *testing.T, repo evt.OutcomeRepository) {
 	require.True(t, retried.Replayed)
 	require.Equal(t, first.Outcome, retried.Outcome)
 
-	// Another payload, or another principal, under the same command ID is another command.
+	// Another payload, another target, or another principal under the same command ID is another
+	// command, on either store, and a retry of it is refused the same way.
 	otherPayload := identity
 	otherPayload.Payload = map[string]int{"amount": 3}
 
-	_, err = env.store.ResolveCommand(ctx, otherPayload, metadata)
-
-	var reuse *evt.IdempotencyKeyReuseError
-	require.ErrorAs(t, err, &reuse, "another payload")
-	require.Equal(t, first.Outcome, reuse.Prior)
-
-	_, err = env.store.ExecuteTransaction(ctx, otherPayload, metadata, prepare)
-	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse, "a retry with another payload")
+	otherTargets := identity
+	otherTargets.Targets = []evt.EntityID{env.id}
 
 	otherPrincipal := withCommand(id)
 	someoneElse := evt.PrincipalID("user:2")
 	otherPrincipal.PrincipalID = &someoneElse
 
-	_, err = env.store.ResolveCommand(ctx, identity, otherPrincipal)
-	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse, "another principal")
+	cases := []struct {
+		name     string
+		identity evt.CommandIdentity
+		metadata evt.Metadata
+	}{
+		{"another payload", otherPayload, metadata},
+		{"another target", otherTargets, metadata},
+		{"another principal", identity, otherPrincipal},
+		{"no principal", identity, withCommand(id)},
+	}
+
+	for _, store := range []*snapshots.Store{env.store, second} {
+		for _, reused := range cases {
+			_, resolveErr := store.ResolveCommand(ctx, reused.identity, reused.metadata)
+
+			var reuse *evt.IdempotencyKeyReuseError
+			require.ErrorAs(t, resolveErr, &reuse, reused.name)
+			require.Equal(t, first.Outcome, reuse.Prior, reused.name)
+		}
+	}
+
+	_, err = env.store.ExecuteTransaction(ctx, otherPayload, metadata, prepare)
+	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse, "a retry with another payload")
 
 	_, err = env.store.ExecuteTransaction(ctx, identity, otherPrincipal, prepare)
 	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse, "a retry by another principal")
-
-	_, err = env.store.ResolveCommand(ctx, identity, withCommand(id))
-	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse, "no principal")
 
 	// Nothing above wrote anything.
 	require.Len(t, env.events(t, env.id), 1)

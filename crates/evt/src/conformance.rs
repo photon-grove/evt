@@ -6822,42 +6822,45 @@ async fn outcome_resolve_by_identity<R: Repository>(repo: &R, other: &R) -> Case
     ensure!(retried.replayed, "a retry replays: {retried:?}");
     ensure_eq!(retried.outcome, first.outcome, "the retry's outcome");
 
-    // Another payload, or another principal, under the same command ID is another command.
+    // Another payload, another target, or another principal under the same command ID is
+    // another command, on either writer, and a retry of it is refused the same way.
     let other_payload = CommandIdentity::new("ledger:pair")
         .with_targets([a.clone(), b.clone()])
         .with_payload(&serde_json::json!({"amount": 3}))?;
-    let prior = expect_reuse(
-        store.resolve_command(&other_payload, &metadata).await,
-        "another payload",
-    )?;
-    ensure_eq!(
-        prior,
-        first.outcome,
-        "the reuse error carries the stored outcome"
-    );
+    let other_targets = CommandIdentity::new("ledger:pair")
+        .with_targets([a.clone()])
+        .with_payload(&serde_json::json!({"amount": 2}))?;
+    let other_principal = command_metadata(&command).with_principal_id("user:2");
+    let no_principal = command_metadata(&command);
+    for (writer, resolver) in [("this writer", &store), ("another writer", &second)] {
+        for (what, identity, metadata) in [
+            ("another payload", &other_payload, &metadata),
+            ("another target", &other_targets, &metadata),
+            ("another principal", &identity, &other_principal),
+            ("no principal", &identity, &no_principal),
+        ] {
+            let prior = expect_reuse(
+                resolver.resolve_command(identity, metadata).await,
+                &format!("{writer}: {what}"),
+            )?;
+            ensure_eq!(
+                prior,
+                first.outcome,
+                format!("{writer}: {what} carries the stored outcome")
+            );
+        }
+    }
     expect_reuse(
         store
             .execute_transaction(&other_payload, &metadata, |tx| pair(tx, &a, &b))
             .await,
         "a retry with another payload",
     )?;
-
-    let other_principal = command_metadata(&command).with_principal_id("user:2");
-    expect_reuse(
-        store.resolve_command(&identity, &other_principal).await,
-        "another principal",
-    )?;
     expect_reuse(
         store
             .execute_transaction(&identity, &other_principal, |tx| pair(tx, &a, &b))
             .await,
         "a retry by another principal",
-    )?;
-    expect_reuse(
-        store
-            .resolve_command(&identity, &command_metadata(&command))
-            .await,
-        "no principal",
     )?;
 
     // Nothing above wrote anything.

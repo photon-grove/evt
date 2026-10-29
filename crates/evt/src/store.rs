@@ -741,6 +741,11 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         A::Command: OutcomeCommand,
     {
         self.outcomes_config()?;
+
+        // Checked in the order execute_with_outcome checks them, before the payload is encoded.
+        let entity_id = entity_id.into();
+        crate::outcome::check_targets([&entity_id])?;
+        require_command_id(metadata)?;
         let identity = CommandIdentity::for_command(command, entity_id)?;
 
         Ok(self

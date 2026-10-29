@@ -950,11 +950,11 @@ The same read is public as an outcome lookup by identity (Go `Store.ResolveComma
 `Store::resolve_command`): the caller passes the command's identity and metadata, the engine
 digests them with the store's digester and reads the row, and the branches are the same except
 that an absent row is reported as not found and nothing is prepared or written. A
-single-aggregate command's identity is its command type, its one entity as the only target, and
-its payload.
+single-aggregate command's identity is the one its execution digests: its command type, its one
+entity as the only target, and its payload (Go: the command value; Rust: its canonical payload).
 
-Every outcome read (the pre-check above, the lookup, the race resolution after a failed outcome put, and the
-ambiguous-write recovery below) is strongly consistent: on DynamoDB, `GetItem` with
+Every outcome read (the pre-check above, the lookup, the race resolution after a failed outcome put,
+and the ambiguous-write recovery below) is strongly consistent: on DynamoDB, `GetItem` with
 `ConsistentRead = true`, regardless of the repository's read-consistency setting. An eventually
 consistent read can return absent after the transaction applied, and the absent branch would then
 re-execute a command that already committed. PostgreSQL's reads are transactionally consistent, so
