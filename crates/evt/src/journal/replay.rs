@@ -14,7 +14,9 @@ use super::scope::{Scope, allocations};
 use crate::error::Error;
 use crate::event::SerializedEvent;
 use crate::projection::{ProjectedView, ViewOperation, ViewRow};
-use crate::rebuild::{RebuildFence, RebuildLease, rebuild_batches};
+use crate::rebuild::{
+    Held, RebuildFailure, RebuildFence, RebuildLease, Renewing, check_renew, rebuild_batches,
+};
 
 /// The journal rows and counters a set of stored events imply.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -98,7 +100,8 @@ pub const REBUILD_OWNER: &str = "journal-rebuild";
 /// [`Error::RebuildInProgress`], so the unconditional rewrite of rows and counters cannot race a
 /// writer (a lowered counter under a live writer is exactly what the lock prevents), and every
 /// batch asserts the lease is still the lock's, owner and fencing token, so a worker that lost its
-/// lock writes nothing. Readers of derived state use the epoch check
+/// lock writes nothing. Read `events` after the lease was taken: a commit that landed before the
+/// lock but after the read would be missing. Readers of derived state use the epoch check
 /// ([`page_at_epoch`](super::page_at_epoch)).
 ///
 /// Rows are rewritten as they were: owned by the event's stream, counters by the engine, with no
@@ -109,6 +112,8 @@ pub const REBUILD_OWNER: &str = "journal-rebuild";
 /// compaction floor included, and the compaction partition (manifest, chunks, lease, audit) is not
 /// read or written. The floor and its snapshot stay valid, readers below the floor are served the
 /// restored rows, and [`compact`](super::compact) at the manifest's checkpoint prunes them again.
+///
+/// It does not renew the lease; [`rebuild_with_lease`] does.
 pub async fn rebuild<'a, F: RebuildFence>(
     fence: &F,
     events: impl IntoIterator<Item = &'a SerializedEvent>,
@@ -116,42 +121,116 @@ pub async fn rebuild<'a, F: RebuildFence>(
 ) -> Result<JournalState, Error> {
     let state = replay(events)?;
 
-    let mut operations = Vec::with_capacity(state.rows.len() + state.counters.len());
-    for row in state.views() {
-        operations.push(ProjectedView::new(
-            PROJECTOR_NAME,
-            0,
-            operations.len(),
-            ViewOperation::put(row.pk, row.sk, row.entity_id, row.entity_type, row.payload),
-        ));
-    }
-
-    for batch in rebuild_batches(&operations) {
+    for batch in rebuild_batches(&operations(&state)) {
         fence.write_rebuild_views(lease, batch).await?;
     }
 
     Ok(state)
 }
 
-/// [`rebuild`] holding the lock for its whole run: takes it as [`REBUILD_OWNER`] for `lease`
-/// ([`begin_rebuild`](RebuildFence::begin_rebuild)), rebuilds, and releases it, which settles the
-/// generation for readers. A lock another rebuild holds is [`Error::RebuildLockHeld`].
+/// [`rebuild`] under a lease the caller took and will end, renewing it as it goes, so one lease can
+/// cover the journal and other derived state and a long rebuild does not lapse. The lease is renewed
+/// for `renew` (at least one second) before the first batch, and again before each later batch
+/// whenever half of `renew` has passed; `lease` is updated in place, so the caller ends the renewed
+/// lease. A renewal that finds the lock gone (taken over, force-released) stops the run with
+/// [`Error::RebuildLeaseLost`] before another write.
 ///
-/// If the rebuild fails the lock is **kept**: the derived rows may be half-written, so commits stay
-/// refused and readers stay fenced until the lease lapses and a retry takes it over. An operator
-/// may force-release it instead, but that does not let commits through: the generation stays
-/// unsettled, and every commit (a journaled one would allocate positions from counters the failed
-/// rebuild may have cleared) is refused with [`Error::RebuildInProgress`] until a later rebuild,
-/// this function run again, ends. The lease is not renewed; use [`rebuild`] and
-/// [`renew_rebuild`](RebuildFence::renew_rebuild) for a long run.
+/// A failure says how many batches were attempted ([`RebuildFailure::attempted`]). Keep the lock
+/// unless none was **and** your begin acquired it from a settled generation; otherwise the rows and
+/// counters may be half-written, and only a rebuild that runs to its end may settle the generation.
+pub async fn rebuild_with_lease<'a, F: RebuildFence>(
+    fence: &F,
+    events: impl IntoIterator<Item = &'a SerializedEvent>,
+    lease: &mut RebuildLease,
+    renew: Duration,
+) -> Result<JournalState, RebuildFailure> {
+    let unattempted = |error| RebuildFailure {
+        error: Box::new(error),
+        attempted: 0,
+        batches: 0,
+    };
+    check_renew(renew).map_err(unattempted)?;
+    let state = replay(events).map_err(unattempted)?;
+
+    write(
+        &mut Renewing::new(fence, lease, renew, None),
+        &operations(&state),
+    )
+    .await?;
+
+    Ok(state)
+}
+
+/// [`rebuild`] holding the lock for its whole run: derives the state from `events`, takes the lock
+/// as [`REBUILD_OWNER`] for `lease` ([`begin_rebuild`](RebuildFence::begin_rebuild)), writes it,
+/// renewing the lease for another `lease` before a batch whenever half of it has passed, and
+/// releases the lock, which settles the generation for readers. A lock another rebuild holds is
+/// [`Error::RebuildLockHeld`]; events that cannot be replayed ([`Error::InvalidJournal`]) fail
+/// before the lock is taken. `events` are read before the lock, so a commit that lands in between
+/// is missing from the rebuild: rebuild a table nothing writes to, or read the events under a lease
+/// and use [`rebuild_with_lease`].
+///
+/// If a write was attempted and the rebuild fails, the lock is **kept**: the derived rows may be
+/// half-written, so commits stay refused and readers stay fenced until the lease lapses and a retry
+/// takes it over. So does a run that took over a lapsed lease or acquired after a force-release,
+/// whatever failed, because it started from rows an earlier rebuild may have half-written. Only a
+/// run that acquired from a settled generation and failed before its first write releases the lock.
+/// An operator may force-release a kept lock, but that does not let commits through: the
+/// generation stays unsettled, and every commit (a journaled one would allocate positions from
+/// counters the failed rebuild may have cleared) is refused with [`Error::RebuildInProgress`] until
+/// a later rebuild, this function run again, ends.
 pub async fn rebuild_with_lock<'a, F: RebuildFence>(
     fence: &F,
     events: impl IntoIterator<Item = &'a SerializedEvent>,
     lease: Duration,
 ) -> Result<JournalState, Error> {
-    let held = fence.begin_rebuild(REBUILD_OWNER, lease).await?;
-    let state = rebuild(fence, events, &held).await?;
-    fence.end_rebuild(&held).await?;
+    let state = replay(events)?;
+    let operations = operations(&state);
 
-    Ok(state)
+    let mut held = Held::take(fence, REBUILD_OWNER, lease).await?;
+    let taken = held.taken;
+    let result = write(
+        &mut Renewing::new(fence, &mut held.lease, lease, Some(taken)),
+        &operations,
+    )
+    .await;
+
+    held.finish(fence, result.map(|()| state)).await
+}
+
+/// The journal's rows and then its counters as rebuild puts, owned as the live commits own them.
+pub(crate) fn operations(state: &JournalState) -> Vec<ProjectedView> {
+    state
+        .views()
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            ProjectedView::new(
+                PROJECTOR_NAME,
+                0,
+                index,
+                ViewOperation::put(row.pk, row.sk, row.entity_id, row.entity_type, row.payload),
+            )
+        })
+        .collect()
+}
+
+/// Writes `operations` in guarded batches under a renewing lease.
+async fn write<F: RebuildFence>(
+    fence: &mut Renewing<'_, F>,
+    operations: &[ProjectedView],
+) -> Result<(), RebuildFailure> {
+    let batches: Vec<&[ProjectedView]> = rebuild_batches(operations).collect();
+
+    for batch in &batches {
+        if let Err(error) = fence.write(batch).await {
+            return Err(RebuildFailure {
+                error: Box::new(error),
+                attempted: fence.attempted,
+                batches: batches.len(),
+            });
+        }
+    }
+
+    Ok(())
 }

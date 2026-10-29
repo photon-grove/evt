@@ -2878,11 +2878,18 @@ order and no commit grouping, so a rebuild reads the events of the journaled typ
 Fence](#rebuild-fence)): the worker takes a lease (`begin_rebuild`), writes the rows and the counters
 as view puts with no `absent` condition through the guarded writer (`write_rebuild_views`, batches of
 at most 99 operations, each asserting the lease's owner and fencing token), and releases the lease
-(`end_rebuild`), which settles the generation. While the lock is held every live commit, journaled
-or not, fails with `RebuildInProgress`, so the unconditional rewrite of counters cannot lower a
-counter under a live writer, and a worker that lost its lock writes nothing (`RebuildLeaseLost`).
-A rebuild that fails keeps the lock (its rows may be half-written) until the lease lapses and a
-retry takes it over, or an operator force-releases it. A force-release does not let journaled
+(`end_rebuild`), which settles the generation. Before each batch the worker renews the lease
+(`renew_rebuild`) once half of it has passed since it was taken or last renewed, so a rebuild that
+outlasts its first lease is not taken over; a renewal that finds the lock gone (taken over or
+force-released) stops the run before another write. While the lock is held every live commit,
+journaled or not, fails with `RebuildInProgress`, so the unconditional rewrite of counters cannot
+lower a counter under a live writer, and a worker that lost its lock writes nothing
+(`RebuildLeaseLost`). The events are read after the lease is taken, or a commit that lands between
+the read and the lock is missing. A rebuild that fails once it attempted a write keeps the lock (its
+rows may be half-written) until the lease lapses and a retry takes it over, or an operator
+force-releases it. One that fails before its first write releases the lock only if its begin
+acquired it from a settled generation; a takeover of a lapsed lease, or an acquire after a
+force-release, keeps it on any failure, as the projection rebuild does ([Views](#views)). A force-release does not let journaled
 commits through: the failed rebuild may have cleared counters, and a commit that allocated from
 them would stamp duplicate positions into immutable event metadata, so every commit is refused
 with `RebuildInProgress` until a rebuild runs to its end ([Rebuild fence](#rebuild-fence)). It does not delete: wipe the journal

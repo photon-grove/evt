@@ -99,7 +99,9 @@ pub use read::{
     Gap, JournalCompactionStore, JournalPage, JournalStore, MAX_PAGE_ROWS, high_watermark,
     high_watermark_at_epoch, page, page_at_epoch,
 };
-pub use replay::{JournalState, REBUILD_OWNER, rebuild, rebuild_with_lock, replay};
+pub use replay::{
+    JournalState, REBUILD_OWNER, rebuild, rebuild_with_lease, rebuild_with_lock, replay,
+};
 pub use repository::JournalRepository;
 pub use row::{
     JournalRow, counter_payload, counter_view, encode_row, read_counter, row_size, row_view,

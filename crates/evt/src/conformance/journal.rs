@@ -109,6 +109,10 @@ where
         Box::pin(rebuild_under_the_lock(repo, views)).await,
     );
     record(
+        "a rebuild under a caller's lease renews it in place, and stops at a lost lease",
+        Box::pin(rebuild_under_a_callers_lease(repo, views)).await,
+    );
+    record(
         "a failed rebuild that wiped the counters keeps journaled commits refused after a force-release",
         Box::pin(force_released_rebuild_refuses_journaled_commits(
             repo, views,
@@ -1514,6 +1518,73 @@ where
         "a rebuild on a released lease",
         |err| matches!(err, Error::RebuildLeaseLost { .. }),
     )?;
+
+    Ok(())
+}
+
+/// [`rebuild_with_lease`](crate::journal::rebuild_with_lease): the caller's lease is renewed before
+/// the first batch and comes back renewed; a lease that was lost stops the run at that renewal,
+/// before any write, and the failure says so.
+async fn rebuild_under_a_callers_lease<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let a = Stream::new(&ns, "a", "ledger");
+    let world = scope(&ns, "world");
+
+    a.commit(&journaled, a.events(1..=3), None).await?;
+    let live_rows = views.list_views_by_pk(&world.row_pk()).await?;
+    let events = repo.events(&a.id).await?;
+    for row in &live_rows {
+        views.delete_view(&row.pk, &row.sk).await?;
+    }
+
+    let owner = format!("{ns}-caller");
+    let mut lease = repo.begin_rebuild(&owner, LEASE).await?;
+    let taken = lease.clone();
+    let rebuilt = crate::journal::rebuild_with_lease(repo, &events, &mut lease, LEASE * 2).await;
+    let held = repo
+        .rebuild_state()
+        .await?
+        .lock
+        .is_some_and(|lock| lease.holds(&lock));
+    // End the lease before checking, so a failed check leaves the fence settled for the next case.
+    repo.end_rebuild(&lease).await?;
+
+    let state = rebuilt.map_err(Error::from)?;
+    ensure_eq!(state.rows.len(), 6, "three rows in each of two scopes");
+    ensure!(
+        lease.generation == taken.generation && lease.lease_expires_at > taken.lease_expires_at,
+        "the caller's lease was renewed in place: {taken:?} -> {lease:?}"
+    );
+    ensure!(held, "the caller still held the lock after the run");
+    ensure_eq!(
+        views.list_views_by_pk(&world.row_pk()).await?,
+        live_rows,
+        "the rebuilt rows are the live rows"
+    );
+
+    // A lease that was lost fails its first renewal, before any write.
+    let mut stale = repo.begin_rebuild(&owner, LEASE).await?;
+    repo.end_rebuild(&stale).await?;
+    for row in &live_rows {
+        views.delete_view(&row.pk, &row.sk).await?;
+    }
+    match crate::journal::rebuild_with_lease(repo, &events, &mut stale, LEASE).await {
+        Err(failure) => ensure!(
+            matches!(*failure.error, Error::RebuildLeaseLost { .. }) && failure.attempted == 0,
+            "a lost lease stops the run before its first write: {failure:?}"
+        ),
+        Ok(_) => return Err(Failure("a rebuild on a released lease succeeded".into())),
+    }
+    ensure!(
+        views.list_views_by_pk(&world.row_pk()).await?.is_empty(),
+        "nothing was written under the lost lease"
+    );
 
     Ok(())
 }

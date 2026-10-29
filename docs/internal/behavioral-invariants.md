@@ -700,7 +700,12 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 - **Rebuilds run under the rebuild lock.** `rebuild` writes rows and counters unconditionally
   through the lease-guarded `write_rebuild_views` (owner and fencing token, at most 99 operations a
   batch); live commits fail with `RebuildInProgress` while the lock is held, and consumers read with
-  `page_at_epoch` / `high_watermark_at_epoch`. A failed rebuild keeps the lock. Enable the journal before writing the events it covers: earlier events have no row and no gap.
+  `page_at_epoch` / `high_watermark_at_epoch`. `rebuild_with_lock` and `rebuild_with_lease` renew
+  the lease before a batch once half of it has passed, and a lost renewal stops the run before
+  another write. A failed rebuild keeps the lock once it attempted a write, or when it took over a
+  lapsed lease or acquired after a force-release; only one that acquired from a settled generation
+  and failed before its first write releases it. `rebuild_with_lease` reports the batches it
+  attempted so a caller holding the lease applies the same rule. Enable the journal before writing the events it covers: earlier events have no row and no gap.
 - **Live and replayed projector views agree.** The `evt.journal` allocation is added after the
   store runs the application's projectors, so no projector but the journal's own is shown it
   (`CommitProjector::engine_metadata`), live or on replay. A repository that does not write views is
