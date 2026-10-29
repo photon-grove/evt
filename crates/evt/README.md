@@ -696,9 +696,12 @@ without the feature refuse the table.
   first two renew the lease before a batch whenever half of it has passed, so a long rebuild is not
   taken over, and a renewal that finds the lock gone stops the run before another write. Live
   commits fail with `Error::RebuildInProgress` while the lock is held, so a rebuild cannot lower a
-  counter under a writer. A failure that attempted a write keeps the lock (the rows may be
-  half-written); `rebuild_with_lease` reports the batches it attempted (`RebuildFailure`) so you can
-  apply the same rule. Readers that can overlap a rebuild use
+  counter under a writer. A failed run releases the lock only when it attempted no write and its
+  begin acquired the lock from a settled generation; otherwise it keeps the lock (the rows may be
+  half-written). Under your own lease, apply the same rule: `rebuild_with_lease` reports the batches
+  it attempted (`RebuildFailure`), and `RebuildLease::acquired_from` tells, from the generation you
+  read just before your begin, whether the lease was acquired from a settled one. Count every write
+  you made under the lease, not just this call's. Readers that can overlap a rebuild use
   `page_at_epoch` / `high_watermark_at_epoch`: they fail with `RebuildUnavailable` or
   `RebuildEpochChanged` (both transient) instead of showing half-written rows. Keep the cursor, back
   off, and read the same page again.
@@ -842,8 +845,9 @@ let report = ProjectionRebuild::new(&repository)
 - It holds every row in memory, and needs strongly consistent reads of the log.
 - `operations()` is a dry run that returns what `run` would write, without taking the lock.
 - `run_with_lease` rebuilds under a lease you took and end, renewing it in place. A failure
-  (`RebuildFailure`) says how many guarded batches it attempted, so you can apply the release rule
-  below to your own lease.
+  (`RebuildFailure`) says how many guarded batches it attempted, and `RebuildLease::acquired_from`
+  says whether your begin acquired the lock from a settled generation, so you can apply the release
+  rule below to your own lease (counting every write made under it).
 - A failure before the first write leaves the rows alone, and releases the lock if the run acquired
   it from a settled generation. Once a write was attempted, a failure keeps the lock until a retry
   takes over the lapsed lease. A run that took over a lapsed lease, or acquired after a

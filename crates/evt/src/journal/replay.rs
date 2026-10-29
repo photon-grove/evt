@@ -136,7 +136,8 @@ pub async fn rebuild<'a, F: RebuildFence>(
 /// [`Error::RebuildLeaseLost`] before another write.
 ///
 /// A failure says how many batches were attempted ([`RebuildFailure::attempted`]). Keep the lock
-/// unless none was **and** your begin acquired it from a settled generation; otherwise the rows and
+/// unless no write was attempted under the lease (this run's or your own) **and** your begin
+/// acquired it from a settled generation ([`RebuildLease::acquired_from`]); otherwise the rows and
 /// counters may be half-written, and only a rebuild that runs to its end may settle the generation.
 pub async fn rebuild_with_lease<'a, F: RebuildFence>(
     fence: &F,
@@ -152,11 +153,10 @@ pub async fn rebuild_with_lease<'a, F: RebuildFence>(
     check_renew(renew).map_err(unattempted)?;
     let state = replay(events).map_err(unattempted)?;
 
-    write(
-        &mut Renewing::new(fence, lease, renew, None),
-        &operations(&state),
-    )
-    .await?;
+    // Renew (and so check) the lease even when there is nothing to write.
+    let mut fence = Renewing::new(fence, lease, renew, None);
+    fence.keep_alive().await.map_err(unattempted)?;
+    write(&mut fence, &operations(&state)).await?;
 
     Ok(state)
 }

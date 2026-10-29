@@ -2884,8 +2884,11 @@ outlasts its first lease is not taken over; a renewal that finds the lock gone (
 force-released) stops the run before another write. While the lock is held every live commit,
 journaled or not, fails with `RebuildInProgress`, so the unconditional rewrite of counters cannot
 lower a counter under a live writer, and a worker that lost its lock writes nothing
-(`RebuildLeaseLost`). The events are read after the lease is taken, or a commit that lands between
-the read and the lock is missing. A rebuild that fails once it attempted a write keeps the lock (its
+(`RebuildLeaseLost`). Read the events after the lease is taken: a commit that lands between the
+read and the lock keeps its rows (a rebuild does not delete), but the rebuild may write a counter
+below them, which the next allocation heals from the highest row. Rust's `rebuild_with_lock`
+takes the events already read, so it is for a table no one writes to, such as one whose commits a
+force-release still refuses. A rebuild that fails once it attempted a write keeps the lock (its
 rows may be half-written) until the lease lapses and a retry takes it over, or an operator
 force-releases it. One that fails before its first write releases the lock only if its begin
 acquired it from a settled generation; a takeover of a lapsed lease, or an acquire after a

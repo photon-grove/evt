@@ -270,10 +270,11 @@ where
     /// passed; `lease` is updated in place, so the caller ends the renewed lease.
     ///
     /// A failure says how many guarded batches were attempted ([`RebuildFailure::attempted`]).
-    /// Keep the lock unless none was **and** your begin acquired the lock from a settled
-    /// generation: a lease that took over an expired one, or was acquired after a force-release,
-    /// covers rows an earlier rebuild may have left half-written, and only a completed rebuild may
-    /// settle it.
+    /// Keep the lock unless no write was attempted under the lease (this run's or your own)
+    /// **and** your begin acquired the lock from a settled generation
+    /// ([`RebuildLease::acquired_from`]): a lease that took over an expired one, or was acquired
+    /// after a force-release, covers rows an earlier rebuild may have left half-written, and only
+    /// a completed rebuild may settle it.
     pub async fn run_with_lease(
         &self,
         lease: &mut RebuildLease,

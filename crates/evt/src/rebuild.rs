@@ -160,6 +160,21 @@ impl RebuildLease {
     pub fn holds(&self, lock: &RebuildLock) -> bool {
         lock.owner == self.owner && lock.generation == self.generation
     }
+
+    /// Reports whether this lease was acquired from the settled generation `before`, read with
+    /// [`rebuild_generation`](RebuildFence::rebuild_generation) just before the
+    /// [`begin_rebuild`](RebuildFence::begin_rebuild) that returned it, rather than taken over
+    /// from an expired lease or acquired from a force-released generation (either may have left
+    /// the derived rows half-written). A rebuild under this lease that fails before any write may
+    /// release it only when this is true ([`RebuildFailure`]).
+    ///
+    /// The generation only grows, and a begin adds one to the generation it observed only when that
+    /// generation was settled (two for a takeover or from a force-release). So a lease of exactly
+    /// `before + 1` over a settled `before` was acquired from it. Any other lease (a transition
+    /// landed between the read and the begin) counts as not settled, which only keeps the fence.
+    pub fn acquired_from(&self, before: RebuildGeneration) -> bool {
+        before.is_settled() && self.generation == before.value + 1
+    }
 }
 
 /// The lifecycle of the durable rebuild fence over one event log (v0.9, C10). The in-memory,
@@ -584,9 +599,11 @@ pub(crate) fn rebuild_batches(views: &[ProjectedView]) -> impl Iterator<Item = &
 }
 
 /// A rebuild under a caller's lease that failed: the error, and how far it got. The caller holds
-/// the lock and decides what to do with it: release it only when no batch was attempted
-/// (`attempted == 0`) **and** its own begin acquired the lock from a settled generation. Otherwise
-/// keep it, because the rows may be half-written, until a rebuild completes.
+/// the lock and decides what to do with it: release it only when no write was attempted under the
+/// lease (`attempted == 0` here, and none of the caller's own) **and** its own begin acquired the
+/// lock from a settled generation ([`RebuildLease::acquired_from`] over the generation read just
+/// before the begin). Otherwise keep it, because the rows may be half-written, until a rebuild
+/// completes.
 ///
 /// It converts into its [`Error`], so `?` works in a function that returns one.
 #[derive(Debug, thiserror::Error)]
@@ -646,12 +663,15 @@ impl<'a, F: RebuildFence + ?Sized> Renewing<'a, F> {
         }
     }
 
-    /// Renews the lease for another `renew` when half of it has passed since it was taken or last
-    /// renewed (at once when that time is unknown), so a long read or write does not let it lapse.
+    /// Renews the lease for another `renew` when half of it, less a second, has passed since it was
+    /// taken or last renewed (at once when that time is unknown), so a long read or write does not
+    /// let it lapse. The second covers the whole-second expiry: a lease taken late in a second
+    /// lapses up to a second before `renew` has passed.
     /// A lease another rebuild took over, or an operator force-released, is
     /// [`Error::RebuildLeaseLost`].
     pub(crate) async fn keep_alive(&mut self) -> Result<(), Error> {
-        if self.renewed.is_none_or(|at| at.elapsed() >= self.renew / 2) {
+        let due = (self.renew / 2).saturating_sub(Duration::from_secs(1));
+        if self.renewed.is_none_or(|at| at.elapsed() >= due) {
             *self.lease = self.fence.renew_rebuild(self.lease, self.renew).await?;
             self.renewed = Some(Instant::now());
         }
@@ -721,16 +741,9 @@ impl Held {
     }
 }
 
-/// Reports whether `held` was acquired from the settled generation `before`, read just before the
-/// begin, rather than taken over from an expired lease or acquired from a force-released
-/// generation, either of which may have left the rows half-written.
-///
-/// The generation only grows, and a begin adds one to the generation it observed only when that
-/// generation was settled (two for a takeover or from a force-release). So a lease of exactly
-/// `before + 1` over a settled `before` was acquired from it. Any other lease (a transition landed
-/// between the read and the begin) counts as not settled, which only keeps the fence.
+/// [`RebuildLease::acquired_from`], for the tests of the release rule.
 pub(crate) fn acquired_from_settled(before: RebuildGeneration, held: &RebuildLease) -> bool {
-    before.is_settled() && held.generation == before.value + 1
+    held.acquired_from(before)
 }
 
 /// A repository's clock: the system time by default, injectable for tests (`with_clock`). The
