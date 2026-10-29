@@ -4440,6 +4440,10 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         Box::pin(outcome_write_set_is_not_identity(repo)).await,
     );
     record(
+        "a command's outcome resolves by identity: the same identity, another payload, another principal",
+        Box::pin(outcome_resolve_by_identity(repo, other)).await,
+    );
+    record(
         "an engine-filled conflict re-prepares the command and only the committing attempt writes",
         Box::pin(retry_engine_filled(repo)).await,
     );
@@ -6765,6 +6769,149 @@ async fn outcome_write_set_is_not_identity<R: Repository>(repo: &R) -> CaseResul
     )?;
 
     Ok(())
+}
+
+/// [`Store::resolve_command`] answers a transaction command's outcome from its identity alone, as
+/// a retry of the command would: the stored outcome for the same identity, `IdempotencyKeyReuse`
+/// for another payload or another principal, and nothing for an unknown command ID. A
+/// single-aggregate command resolves the same way through [`CommandIdentity::for_command`].
+async fn outcome_resolve_by_identity<R: Repository>(repo: &R, other: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let second = outcome_store(other);
+    let (a, b) = (ledger_id(), ledger_id());
+    let command = command_id();
+    let identity = CommandIdentity::new("ledger:pair")
+        .with_targets([a.clone(), b.clone()])
+        .with_payload(&serde_json::json!({"amount": 2}))?;
+    let metadata = command_metadata(&command).with_principal_id("user:1");
+
+    let before = store.resolve_command(&identity, &metadata).await?;
+    ensure!(
+        before.is_none(),
+        "a command that never ran is not found: {before:?}"
+    );
+
+    let first = store
+        .execute_transaction(&identity, &metadata, |tx| pair(tx, &a, &b))
+        .await?;
+    ensure!(
+        first.is_accepted() && !first.replayed,
+        "the transaction committed: {first:?}"
+    );
+
+    // The same identity resolves to the stored outcome, on either writer, and a retry agrees.
+    for (writer, resolver) in [("this writer", &store), ("another writer", &second)] {
+        let resolved = resolver
+            .resolve_command(&identity, &metadata)
+            .await?
+            .ok_or(Failure(format!("{writer}: the stored outcome is found")))?;
+        ensure!(
+            resolved.replayed,
+            "{writer}: a resolved outcome is replayed"
+        );
+        ensure_eq!(resolved.outcome, first.outcome, writer);
+        ensure_eq!(
+            resolved.response(),
+            Some(&b"paired"[..]),
+            "the stored response"
+        );
+    }
+    let retried = store
+        .execute_transaction(&identity, &metadata, |tx| pair(tx, &a, &b))
+        .await?;
+    ensure!(retried.replayed, "a retry replays: {retried:?}");
+    ensure_eq!(retried.outcome, first.outcome, "the retry's outcome");
+
+    // Another payload, or another principal, under the same command ID is another command.
+    let other_payload = CommandIdentity::new("ledger:pair")
+        .with_targets([a.clone(), b.clone()])
+        .with_payload(&serde_json::json!({"amount": 3}))?;
+    let prior = expect_reuse(
+        store.resolve_command(&other_payload, &metadata).await,
+        "another payload",
+    )?;
+    ensure_eq!(
+        prior,
+        first.outcome,
+        "the reuse error carries the stored outcome"
+    );
+    expect_reuse(
+        store
+            .execute_transaction(&other_payload, &metadata, |tx| pair(tx, &a, &b))
+            .await,
+        "a retry with another payload",
+    )?;
+
+    let other_principal = command_metadata(&command).with_principal_id("user:2");
+    expect_reuse(
+        store.resolve_command(&identity, &other_principal).await,
+        "another principal",
+    )?;
+    expect_reuse(
+        store
+            .execute_transaction(&identity, &other_principal, |tx| pair(tx, &a, &b))
+            .await,
+        "a retry by another principal",
+    )?;
+    expect_reuse(
+        store
+            .resolve_command(&identity, &command_metadata(&command))
+            .await,
+        "no principal",
+    )?;
+
+    // Nothing above wrote anything.
+    ensure_eq!(repo.events(&a).await?.len(), 1, "stream a");
+    ensure_eq!(repo.events(&b).await?.len(), 1, "stream b");
+
+    // A single-aggregate command resolves by its identity too, as `resolve_outcome` does.
+    let single = command_id();
+    let single_metadata = command_metadata(&single);
+    let executed = store
+        .execute_with_outcome(&a, Add(4), single_metadata.clone())
+        .await?;
+    let by_identity = store
+        .resolve_command(
+            &CommandIdentity::for_command(&Add(4), &a)?,
+            &single_metadata,
+        )
+        .await?
+        .ok_or(Failure("the single-aggregate outcome is found".into()))?;
+    ensure_eq!(by_identity.outcome, executed.outcome, "by identity");
+    let by_command = store
+        .resolve_outcome(&a, &Add(4), &single_metadata)
+        .await?
+        .ok_or(Failure("resolve_outcome finds it".into()))?;
+    ensure_eq!(by_command.outcome, executed.outcome, "by command");
+    expect_reuse(
+        store
+            .resolve_command(
+                &CommandIdentity::for_command(&Add(4), &b)?,
+                &single_metadata,
+            )
+            .await,
+        "another target",
+    )?;
+
+    Ok(())
+}
+
+/// A decision step that adds 2 to each of two ledgers and accepts with a response.
+fn pair<'t, R: Repository>(
+    tx: &'t mut crate::Transaction<'_, R>,
+    a: &EntityId,
+    b: &EntityId,
+) -> crate::PrepareFuture<'t> {
+    let (a, b) = (a.clone(), b.clone());
+
+    Box::pin(async move {
+        for id in [&a, &b] {
+            let mut read = tx.read::<Ledger>(id).await?;
+            tx.append(&mut read, added(2))?;
+        }
+
+        Ok(Decision::accept_with(b"paired".to_vec()))
+    })
 }
 
 fn metadata_for_plain() -> Metadata {

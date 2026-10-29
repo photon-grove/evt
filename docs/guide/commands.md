@@ -92,7 +92,14 @@ row is polled for a bounded window (`snapshots.WithRecoveryWait`, 10 s by defaul
 detached from the caller's cancellation). A row that never appears becomes a retryable
 `*evt.AmbiguousWriteError` (`errors.Is(err, evt.ErrAmbiguousWrite)`, transient). It's never reported
 as "not applied", because a transaction can land after any single read. So retrying the same command
-ID is safe. `Store.ResolveCommand` runs the same read for a caller that lost the result entirely.
+ID is safe. `Store.ResolveCommand` (Rust `Store::resolve_command`) runs the same read for a caller
+that lost the result entirely, or that reconciles results it keeps elsewhere. Give it the command's
+identity and metadata: it compares digests with the store's own digester, so you never recompute
+one. It returns the stored outcome for the same identity, `IdempotencyKeyReuse` (carrying the
+stored outcome) when the command ID was recorded for another payload, target or principal, and
+nothing when there is no row. It works for transaction commands and single-aggregate ones alike (a
+single-aggregate command's identity is its type, its one entity and its payload; Rust builds it
+with `CommandIdentity::for_command`).
 
 A lost race on the outcome row is resolved the same way and never surfaces as a generic conflict.
 The loser returns only the winner's stored outcome. A first execution returns its rejection in the

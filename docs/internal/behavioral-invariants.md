@@ -353,6 +353,13 @@ error before any write and is never split.
 - A multi-stream command begins with the outcome pre-check (`BeginCommand` /
   `Transaction::begin_command`) before any read, append, or fence; a transaction whose pre-check
   returned a stored outcome is finished and accepts no further work
+- The pre-check is public as a lookup by identity (`Store.ResolveCommand` /
+  `Store::resolve_command`): it validates the identity and command ID as execution does, digests
+  with the store's digester, reads the row strongly consistent, and writes nothing. The same
+  digest returns the stored outcome (replayed), another digest (another payload, target, or
+  principal) is `IdempotencyKeyReuse` carrying it, and no row is "not found", never "did not
+  apply". A single-aggregate command resolves the same way with its identity (type, the one entity
+  as the only target, payload); Rust's `resolve_outcome` and `CommandIdentity::for_command` build it
 - The outcome-row check covers commands executed with outcomes enabled, including IDs folded into
   snapshots and compacted away; on an upgraded log the load-time event window remains the only
   guard for pre-v0.9 IDs, and it sees only those after the latest snapshot

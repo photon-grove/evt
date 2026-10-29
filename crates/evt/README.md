@@ -203,6 +203,16 @@ unknown with `Error::Indeterminate`, and every definitive failure with `Error::B
 recovery read, so override both if your runtime has one, or bound your own reads if it has none.
 Decoded outcome rows must pass `Outcome::validate_stored`.
 
+To look an outcome up without running anything, for a caller that lost a command's result or
+reconciles results it holds elsewhere, call `Store::resolve_command(&identity, &metadata)` with the
+`CommandIdentity` the command ran with and its metadata (command ID and principal). It compares
+digests with the store's own digester, so you never recompute one, and works for a transaction
+command and, through `CommandIdentity::for_command(&command, entity_id)`, a single-aggregate one
+(`Store::resolve_outcome` is that shortcut). It returns `Ok(Some(outcome))` with the stored
+outcome for the same identity, `Error::IdempotencyKeyReuse` (carrying the stored outcome) when the
+ID was recorded for another payload, target or principal, and `Ok(None)` when there is no row,
+which doesn't prove the command never landed.
+
 `execute_with_outcome`, `execute_with_response` and `Store::execute_transaction` retry a command
 that conflicts with another writer, up to the store's `RetryPolicy` (`OutcomeConfig::with_retry`).
 The default is 5 attempts, 25 ms doubling to 1 s, jittered, waiting on `Repository::backoff`.
