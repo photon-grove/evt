@@ -15,7 +15,6 @@
       "release-type": "rust",
       "package-name": "photon-evt",
       "initial-version": "0.1.0",
-      "release-as": "0.2.0",
       "component": "photon-evt",
       "include-component-in-tag": true,
       "changelog-path": "CHANGELOG.md",
