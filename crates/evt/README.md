@@ -668,6 +668,12 @@ from stored events in any order. The journaled entity types are declared history
 feature marker with the `journal` feature (`journal: 1`), so they are never compacted and builds
 without the feature refuse the table.
 
+- Returned allocations. A commit returns its events as stored, allocations included:
+  `Executed::events`, `CommandOutcome::events` and the events `Transaction::commit` returns carry
+  `evt.journal`, and `Repository::commit_with_receipt` / `commit_transaction_with_receipt` return
+  them as a `CommitReceipt`. Read an event's `(scope, position)` pairs with
+  `journal::allocations(&event.metadata)`; they are the positions of the attempt that committed and
+  equal what `page` returns. A replayed outcome returns no events.
 - Row-size guard. A row over the cap (default 30,000 bytes of stored payload, at most 370,000)
   fails the commit before any write with `Error::JournalRowTooLarge`. A store with outcomes records
   that as the command's `journal-row-too-large` rejection. `Journal::pre_check` (or

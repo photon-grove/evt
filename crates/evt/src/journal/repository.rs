@@ -22,7 +22,7 @@ use crate::outcome::Outcome;
 use crate::projection::{
     CommitProjector, CommitStream, CommitView, ProjectedView, ViewOperation, project_commit,
 };
-use crate::repository::{Commit, Repository, TransactionCommit};
+use crate::repository::{Commit, CommitReceipt, Repository, TransactionCommit};
 use crate::retry::Budget;
 
 /// A [`Repository`] that journals the events it commits (ADR 0005, X1).
@@ -49,9 +49,14 @@ use crate::retry::Budget;
 /// [`RetryPolicy`](crate::RetryPolicy); when attempts run out it returns [`Error::Conflict`] for
 /// the caller's own retry. Nothing else about a commit's failures changes.
 ///
-/// Everything else (reads, snapshots, compaction, outcomes) is the wrapped repository's. Events the
-/// store hands back from [`Store::execute`](crate::Store::execute) are the ones the store
-/// serialized; read the stream (or a journal row) to see the stored allocation.
+/// Everything else (reads, snapshots, compaction, outcomes) is the wrapped repository's.
+///
+/// The allocations are only known once the commit lands, so a commit's
+/// [receipt](Repository::commit_with_receipt) returns the events as stored, allocations
+/// included, and the store hands those back: [`Executed::events`](crate::Executed::events),
+/// [`CommandOutcome::events`](crate::CommandOutcome::events), and the events
+/// [`Transaction::commit`](crate::Transaction::commit) returns. Read an event's allocations with
+/// [`allocations`](super::allocations); they equal the rows a [`page`](super::page) read returns.
 ///
 /// Every writer that commits to a journal table must go through a `JournalRepository` with an
 /// equivalent configuration: an event committed any other way is silently missing from the
@@ -500,11 +505,14 @@ where
     ///
     /// The order matters: counters are read and the commit staged (allocation, size guard, rows)
     /// before the marker is touched, so a commit that cannot be built declares nothing.
-    async fn drive<C, F, Fut>(&self, mut base: C, send: F) -> Result<(), Error>
+    ///
+    /// Returns what `send` returns for the attempt that committed: the wrapped repository's
+    /// receipt, whose events carry the allocations this attempt staged.
+    async fn drive<C, F, Fut>(&self, mut base: C, send: F) -> Result<CommitReceipt, Error>
     where
         C: Staged,
         F: Fn(C) -> Fut,
-        Fut: Future<Output = Result<(), Error>>,
+        Fut: Future<Output = Result<CommitReceipt, Error>>,
     {
         let covered = base
             .event_streams()
@@ -563,7 +571,7 @@ where
 
             let declared_now = self.ensure_declared().await?;
             let error = match send(attempt).await {
-                Ok(()) => return Ok(()),
+                Ok(receipt) => return Ok(receipt),
                 Err(error) => error,
             };
 
@@ -659,15 +667,32 @@ where
     type Operation = R::Operation;
 
     async fn commit(&self, commit: Commit<Self::Operation>) -> Result<(), Error> {
-        self.drive(commit, |commit| self.inner.commit(commit)).await
+        self.commit_with_receipt(commit).await.map(drop)
     }
 
     async fn commit_transaction(
         &self,
         commit: TransactionCommit<Self::Operation>,
     ) -> Result<(), Error> {
-        self.drive(commit, |commit| self.inner.commit_transaction(commit))
+        self.commit_transaction_with_receipt(commit).await.map(drop)
+    }
+
+    async fn commit_with_receipt(
+        &self,
+        commit: Commit<Self::Operation>,
+    ) -> Result<CommitReceipt, Error> {
+        self.drive(commit, |commit| self.inner.commit_with_receipt(commit))
             .await
+    }
+
+    async fn commit_transaction_with_receipt(
+        &self,
+        commit: TransactionCommit<Self::Operation>,
+    ) -> Result<CommitReceipt, Error> {
+        self.drive(commit, |commit| {
+            self.inner.commit_transaction_with_receipt(commit)
+        })
+        .await
     }
 
     fn writes_views(&self) -> bool {

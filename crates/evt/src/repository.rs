@@ -642,6 +642,63 @@ pub(crate) fn item_size(item: &crate::wire::dynamo::Item) -> usize {
         .sum()
 }
 
+/// What a repository stored for one commit: its events exactly as they were written, which can
+/// differ from the events the commit was built with. A
+/// [`JournalRepository`](crate::journal::JournalRepository) writes each event's journal
+/// allocations into its metadata (`evt.journal`) as it commits, so only the receipt carries them;
+/// read them back with [`journal::allocations`](crate::journal::allocations).
+///
+/// The events are in the order the commit persists them: stream ID bytewise, then sequence. A
+/// commit that writes no event (an outcome-only commit, a fence-only transaction) has none.
+///
+/// Returned by [`Repository::commit_with_receipt`] and
+/// [`Repository::commit_transaction_with_receipt`]. The store hands back the same events as
+/// [`Executed::events`](crate::Executed::events),
+/// [`CommandOutcome::events`](crate::CommandOutcome::events), and the return of
+/// [`Transaction::commit`](crate::Transaction::commit).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommitReceipt {
+    /// The committed events, as stored.
+    pub events: Vec<SerializedEvent>,
+}
+
+impl CommitReceipt {
+    /// A receipt for the events a commit stored.
+    pub fn new(events: Vec<SerializedEvent>) -> Self {
+        Self { events }
+    }
+
+    /// The receipt of a commit that stores its events exactly as given: the default of
+    /// [`Repository::commit_with_receipt`].
+    fn of_commit<Op>(commit: &Commit<Op>) -> Self {
+        Self::new(commit.events.clone())
+    }
+
+    /// The receipt of a transaction that stores its events exactly as given, in persisted order:
+    /// the default of [`Repository::commit_transaction_with_receipt`].
+    fn of_transaction<Op>(commit: &TransactionCommit<Op>) -> Self {
+        let mut streams: Vec<&Commit<Op>> = commit
+            .streams
+            .iter()
+            .filter(|stream| !stream.events.is_empty())
+            .collect();
+        streams.sort_by(|a, b| {
+            a.entity_id
+                .as_str()
+                .as_bytes()
+                .cmp(b.entity_id.as_str().as_bytes())
+        });
+
+        Self::new(
+            streams
+                .into_iter()
+                .flat_map(|stream| stream.events.iter().cloned())
+                .collect(),
+        )
+    }
+}
+
 /// An append-only event log with one optional snapshot per entity and one head per stream (ADR
 /// 0007).
 ///
@@ -701,6 +758,40 @@ pub trait Repository: Send + Sync {
             Err(Error::InvalidConfig(
                 "repository does not support transactions".into(),
             ))
+        }
+    }
+
+    /// Commits like [`commit`](Self::commit), and returns the events as stored
+    /// ([`CommitReceipt`]). The default commits and returns the commit's own events, which is
+    /// right for a repository that stores them as given (the in-memory, DynamoDB, and PostgreSQL
+    /// repositories). A repository that rewrites events as it commits, such as the journal's,
+    /// overrides it. A wrapper must forward it, or its callers get the events as they were built.
+    fn commit_with_receipt(
+        &self,
+        commit: Commit<Self::Operation>,
+    ) -> impl Future<Output = Result<CommitReceipt, Error>> + Send {
+        let receipt = CommitReceipt::of_commit(&commit);
+
+        async move {
+            self.commit(commit).await?;
+
+            Ok(receipt)
+        }
+    }
+
+    /// Commits like [`commit_transaction`](Self::commit_transaction), and returns the events as
+    /// stored, in persisted order ([`CommitReceipt`]). The default and the forwarding rule are
+    /// those of [`commit_with_receipt`](Self::commit_with_receipt).
+    fn commit_transaction_with_receipt(
+        &self,
+        commit: TransactionCommit<Self::Operation>,
+    ) -> impl Future<Output = Result<CommitReceipt, Error>> + Send {
+        let receipt = CommitReceipt::of_transaction(&commit);
+
+        async move {
+            self.commit_transaction(commit).await?;
+
+            Ok(receipt)
         }
     }
 
@@ -871,6 +962,14 @@ macro_rules! forward_repository {
 
             fn commit_transaction(&self, commit: TransactionCommit<Self::Operation>) -> impl Future<Output = Result<(), Error>> + Send {
                 (**self).commit_transaction(commit)
+            }
+
+            fn commit_with_receipt(&self, commit: Commit<Self::Operation>) -> impl Future<Output = Result<CommitReceipt, Error>> + Send {
+                (**self).commit_with_receipt(commit)
+            }
+
+            fn commit_transaction_with_receipt(&self, commit: TransactionCommit<Self::Operation>) -> impl Future<Output = Result<CommitReceipt, Error>> + Send {
+                (**self).commit_transaction_with_receipt(commit)
             }
 
             fn writes_views(&self) -> bool {

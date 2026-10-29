@@ -115,7 +115,7 @@ pub use rebuild::{
     observe_rebuild_epoch, read_at_rebuild_epoch, verify_rebuild_epoch,
 };
 pub use repository::{
-    Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
+    Commit, CommitReceipt, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
     snapshot_events_due,
 };
 pub use retry::{DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY_MS, RetryPolicy};
