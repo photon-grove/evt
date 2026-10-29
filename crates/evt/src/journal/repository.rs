@@ -57,6 +57,9 @@ use crate::retry::Budget;
 /// [`CommandOutcome::events`](crate::CommandOutcome::events), and the events
 /// [`Transaction::commit`](crate::Transaction::commit) returns. Read an event's allocations with
 /// [`allocations`](super::allocations); they equal the rows a [`page`](super::page) read returns.
+/// A decorator belongs underneath the journal (wrap the inner repository), or must forward both
+/// receipt methods: one that wraps the journal and forwards only `commit` hands back the drafted
+/// events, with no allocations.
 ///
 /// Every writer that commits to a journal table must go through a `JournalRepository` with an
 /// equivalent configuration: an event committed any other way is silently missing from the

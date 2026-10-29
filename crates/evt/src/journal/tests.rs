@@ -878,20 +878,80 @@ async fn a_receipt_from_the_repository_carries_the_allocations_it_staged() {
         ]
     );
 
-    // An event of a type the journal does not cover comes back without an allocation.
+    // An event of a type the journal does not cover comes back without an allocation, even one
+    // a caller forged on the draft.
+    let mut drafts = crate::serialize_events::<crate::conformance::Wallet>(
+        &"w-1".into(),
+        crate::EventSequence(0),
+        &[crate::conformance::Funded { amount: 1 }.into()],
+        &Metadata::new("local"),
+    )
+    .unwrap();
+    super::set_allocations(&mut drafts[0], &[super::Allocation::new(&scope("all"), 99)]);
     let receipt = repository
-        .commit_with_receipt(crate::Commit::new(
-            "w-1",
-            crate::serialize_events::<crate::conformance::Wallet>(
-                &"w-1".into(),
-                crate::EventSequence(0),
-                &[crate::conformance::Funded { amount: 1 }.into()],
-                &Metadata::new("local"),
-            )
-            .unwrap(),
-        ))
+        .commit_with_receipt(crate::Commit::new("w-1", drafts))
         .await
         .unwrap();
     assert!(held(&receipt.events[0]).is_empty());
     assert_eq!(receipt.events, memory.events(&"w-1".into()).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_rejection_that_commits_events_returns_them_with_their_allocations() {
+    let memory = MemRepository::new();
+    let journal = Journal::new(["ledger", "wallet"], |_: &SerializedEvent| {
+        vec![scope("all")]
+    })
+    .unwrap();
+    let repository = JournalRepository::new(memory.clone(), journal);
+    let config = OutcomeConfig::new().with_retry(RetryPolicy::immediate(3));
+    let wallets = Store::<crate::conformance::Wallet, _>::new(&repository, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config.clone());
+    let ledgers = Store::<Ledger, _>::new(&repository, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config);
+
+    // A single-aggregate rejection whose refusal is recorded as an event.
+    let refused = wallets
+        .execute_with_outcome(
+            "w-1",
+            crate::conformance::WalletCommand::Spend(5),
+            Metadata::new("local").with_command_id("c-1"),
+        )
+        .await
+        .unwrap();
+    assert!(refused.is_rejected());
+    assert_eq!(refused.events, memory.events(&"w-1".into()).await.unwrap());
+    assert_eq!(held(&refused.events[0]), [("all".into(), 1)]);
+
+    // A transaction that rejects with the events it staged.
+    let identity = crate::CommandIdentity::new("ledger:refuse").with_targets(["l-1"]);
+    let rejected = ledgers
+        .execute_transaction(
+            &identity,
+            &Metadata::new("local").with_command_id("c-2"),
+            |tx| {
+                Box::pin(async move {
+                    let mut read = tx.read::<Ledger>("l-1").await?;
+                    tx.append(
+                        &mut read,
+                        vec![crate::conformance::Added { amount: 1 }.into()],
+                    )?;
+
+                    Ok(crate::Decision::reject_with_events(Rejection::new(
+                        "refused", "no",
+                    )))
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(rejected.is_rejected());
+    assert_eq!(rejected.events, memory.events(&"l-1".into()).await.unwrap());
+    assert_eq!(held(&rejected.events[0]), [("all".into(), 2)]);
+
+    let page = repository.page(&scope("all"), 0, 10).await.unwrap();
+    assert_eq!(page.rows[0].event, refused.events[0]);
+    assert_eq!(page.rows[1].event, rejected.events[0]);
 }
