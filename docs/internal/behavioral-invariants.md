@@ -705,7 +705,9 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   another write. A failed rebuild keeps the lock once it attempted a write, or when it took over a
   lapsed lease or acquired after a force-release; only one that acquired from a settled generation
   and failed before its first write releases it. `rebuild_with_lease` reports the batches it
-  attempted so a caller holding the lease applies the same rule. Enable the journal before writing the events it covers: earlier events have no row and no gap.
+  attempted so a caller holding the lease applies the same rule. `ProjectionRebuild::with_journal`
+  rebuilds the journal with commit-wide views under one lease and one generation, from events it
+  reads under the lock; a key both would write fails the run before any write. Enable the journal before writing the events it covers: earlier events have no row and no gap.
 - **Live and replayed projector views agree.** The `evt.journal` allocation is added after the
   store runs the application's projectors, so no projector but the journal's own is shown it
   (`CommitProjector::engine_metadata`), live or on replay. A repository that does not write views is

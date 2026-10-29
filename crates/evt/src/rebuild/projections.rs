@@ -148,6 +148,8 @@ pub struct ProjectionRebuild<'r, R> {
     projectors: Vec<Arc<dyn CommitProjector>>,
     scopes: Vec<Arc<dyn Scope<R> + 'r>>,
     duplicate: Option<EntityType>,
+    #[cfg(feature = "journal")]
+    journal: Option<crate::journal::Journal>,
 }
 
 impl<R> fmt::Debug for ProjectionRebuild<'_, R> {
@@ -169,7 +171,29 @@ impl<R> fmt::Debug for ProjectionRebuild<'_, R> {
                     .map(|scope| scope.entity_type().clone())
                     .collect::<Vec<_>>(),
             )
+            .field("journal", &self.has_journal())
             .finish_non_exhaustive()
+    }
+}
+
+impl<R> ProjectionRebuild<'_, R> {
+    /// Whether the run rebuilds the journal too.
+    fn has_journal(&self) -> bool {
+        #[cfg(feature = "journal")]
+        return self.journal.is_some();
+
+        #[cfg(not(feature = "journal"))]
+        false
+    }
+
+    /// The entity types the journal reads, none without one.
+    fn journal_types(&self) -> &[EntityType] {
+        #[cfg(feature = "journal")]
+        if let Some(journal) = &self.journal {
+            return journal.entity_types();
+        }
+
+        &[]
     }
 }
 
@@ -187,6 +211,13 @@ pub struct RebuildReport {
     pub deletes: usize,
     /// Guarded batches written ([`RebuildFence::write_rebuild_views`] calls).
     pub batches: usize,
+    /// Events read from the log: every event of the types the history-dependent projectors and
+    /// the journal read, each counted once.
+    pub events: usize,
+    /// Journal rows the events imply ([`with_journal`](ProjectionRebuild::with_journal)).
+    pub journal_rows: usize,
+    /// Journal scope counters the events imply.
+    pub journal_counters: usize,
 }
 
 impl<'r, R> ProjectionRebuild<'r, R>
@@ -200,15 +231,36 @@ where
             projectors: Vec::new(),
             scopes: Vec::new(),
             duplicate: None,
+            #[cfg(feature = "journal")]
+            journal: None,
         }
     }
 
     /// Adds a commit-wide projector. Projectors run in the order they are added, as on a store.
     /// One that reads the engine's own metadata ([`CommitProjector::engine_metadata`], the
-    /// journal's) is refused when the rebuild runs; rebuild the journal with its own rebuild.
+    /// journal's projector) is refused when the rebuild runs; rebuild the journal with
+    /// [`with_journal`](ProjectionRebuild::with_journal).
     #[must_use]
     pub fn with_projector(mut self, projector: Arc<dyn CommitProjector>) -> Self {
         self.projectors.push(projector);
+        self
+    }
+
+    /// Rebuilds the sync journal (ADR 0005) in the same run, under the same lease: its rows and
+    /// counters are derived from every event of `journal`'s entity types
+    /// ([`journal::replay`](crate::journal::replay)), read under the lock, and written in the same
+    /// guarded batches as the views, so readers see one rebuild (one generation) for both. A
+    /// journal key that a view row also plans fails the run with [`Error::SharedViewKey`] before
+    /// anything is written. With a journal the rebuild may have no projectors: it then rebuilds the
+    /// journal alone, and needs no aggregate types.
+    ///
+    /// Pass the journal configuration the table's [`JournalRepository`](crate::journal::JournalRepository)
+    /// commits with; only its entity types are read. Like the journal's own rebuild, it restores
+    /// rows a journal compaction pruned, and does not touch the compaction partition.
+    #[cfg(feature = "journal")]
+    #[must_use]
+    pub fn with_journal(mut self, journal: crate::journal::Journal) -> Self {
+        self.journal = Some(journal);
         self
     }
 
@@ -335,17 +387,19 @@ where
     fn check(&self) -> Result<(), Error> {
         let invalid = |message: String| Err(Error::InvalidConfig(message));
 
-        if self.projectors.is_empty() {
-            return invalid("a projection rebuild needs at least one commit-wide projector".into());
+        if self.projectors.is_empty() && !self.has_journal() {
+            return invalid(
+                "a projection rebuild needs at least one commit-wide projector or a journal".into(),
+            );
         }
         if let Some(projector) = self.projectors.iter().find(|p| p.engine_metadata()) {
             return invalid(format!(
-                "projector {:?} reads engine metadata (the journal's); rebuild the journal with its \
-                 own rebuild",
+                "projector {:?} reads engine metadata (the journal's); rebuild the journal with \
+                 `with_journal`",
                 projector.name()
             ));
         }
-        if self.scopes.is_empty() {
+        if self.scopes.is_empty() && !self.projectors.is_empty() {
             return invalid("a projection rebuild needs at least one aggregate type".into());
         }
         if let Some(entity_type) = &self.duplicate {
@@ -390,13 +444,51 @@ where
             .filter(|(_, projector)| !projector.history().is_empty())
             .collect();
 
-        // The history replay reads every event of its types and checks them before anything is
-        // written, so a compacted stream fails the rebuild with nothing written.
+        let history_types: BTreeSet<EntityType> = history
+            .iter()
+            .flat_map(|(_, projector)| projector.history().iter().cloned())
+            .collect();
+
+        // Every event the history replay and the journal read, each type read once. The history
+        // replay's types are checked to run from sequence 1 to the head, so a compacted stream
+        // fails the rebuild with nothing written.
+        let mut events: BTreeMap<EntityType, Vec<SerializedEvent>> = BTreeMap::new();
+        for entity_type in &history_types {
+            events.insert(entity_type.clone(), self.whole_history(entity_type).await?);
+            output.keep_alive().await?;
+        }
+        for entity_type in self.journal_types() {
+            if !events.contains_key(entity_type) {
+                events.insert(entity_type.clone(), self.all_events(entity_type).await?);
+                output.keep_alive().await?;
+            }
+        }
+        output.report.events = events.values().map(Vec::len).sum();
+
+        #[cfg(feature = "journal")]
+        let journal = match &self.journal {
+            Some(journal) => Some(crate::journal::replay(
+                journal
+                    .entity_types()
+                    .iter()
+                    .filter_map(|entity_type| events.get(entity_type))
+                    .flatten(),
+            )?),
+            None => None,
+        };
+
         let replayed = if history.is_empty() {
             None
         } else {
-            Some(self.replay_history(&history, output).await?)
+            let replayed: Vec<SerializedEvent> = history_types
+                .iter()
+                .filter_map(|entity_type| events.remove(entity_type))
+                .flatten()
+                .collect();
+
+            Some(self.replay_history(&history, replayed, output).await?)
         };
+        drop(events);
 
         if !current.is_empty() {
             for scope in &self.scopes {
@@ -429,27 +521,26 @@ where
             }
         }
 
+        #[cfg(feature = "journal")]
+        if let Some(journal) = journal {
+            output.report.journal_rows = journal.rows.len();
+            output.report.journal_counters = journal.counters.len();
+            for item in crate::journal::operations(&journal) {
+                output.plan(item)?;
+            }
+        }
+
         Ok(())
     }
 
-    /// Replays every commit of the history-dependent projectors' types and returns the rows the
-    /// replay leaves, with the number of commits replayed.
+    /// Replays every commit of `events`, the history-dependent projectors' types, and returns the
+    /// rows the replay leaves, with the number of commits replayed.
     async fn replay_history(
         &self,
         projectors: &[(usize, &Arc<dyn CommitProjector>)],
+        events: Vec<SerializedEvent>,
         output: &mut Output<'_, R>,
     ) -> Result<(ViewReplay, usize), Error> {
-        let types: BTreeSet<EntityType> = projectors
-            .iter()
-            .flat_map(|(_, projector)| projector.history().iter().cloned())
-            .collect();
-
-        let mut events = Vec::new();
-        for entity_type in &types {
-            events.extend(self.whole_history(entity_type).await?);
-            output.keep_alive().await?;
-        }
-
         let commits = group_commits(events)?;
         let count = commits.len();
         let mut folds: HashMap<EntityId, Box<dyn Fold>> = HashMap::new();
@@ -485,6 +576,21 @@ where
         }
 
         Ok((replay, count))
+    }
+
+    /// Every stored event of one type, in no particular order, for the journal: its rows are a
+    /// function of the events' stored allocations, whatever was compacted.
+    async fn all_events(&self, entity_type: &EntityType) -> Result<Vec<SerializedEvent>, Error> {
+        let mut events = Vec::new();
+        let mut batches = pin!(
+            self.repository
+                .stream_all_events(StreamFilter::of_type(entity_type.clone()))
+        );
+        while let Some(batch) = poll_fn(|cx| batches.as_mut().poll_next(cx)).await {
+            events.extend(batch?);
+        }
+
+        Ok(events)
     }
 
     /// Every event of every stream of one type, failing with [`Error::CompactionUncovered`] when a

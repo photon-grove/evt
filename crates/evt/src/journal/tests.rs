@@ -935,3 +935,216 @@ async fn a_journal_that_cannot_be_replayed_takes_no_lock() {
         "{state:?}"
     );
 }
+
+/// A current-state projector: each ledger's state under `totals`.
+struct Totals;
+
+impl crate::CommitProjector for Totals {
+    fn name(&self) -> &str {
+        "totals"
+    }
+
+    fn project(
+        &self,
+        commit: &crate::CommitView,
+    ) -> Result<Vec<crate::ViewOperation>, crate::BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                crate::ViewOperation::put(
+                    "totals",
+                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(),
+                    "ledger",
+                    stream.state.clone(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// Every row the views and the journal hold: the totals, the journal rows, and the counters.
+async fn derived_rows(memory: &MemRepository) -> Vec<crate::ViewRow> {
+    let mut rows = memory.list_views_by_pk("totals").await.unwrap();
+    for entity_type in [super::ROW_ENTITY_TYPE, super::COUNTER_ENTITY_TYPE] {
+        rows.extend(memory.list_views_by_entity_type(entity_type).await.unwrap());
+    }
+    rows.sort_by(|a, b| (&a.pk, &a.sk).cmp(&(&b.pk, &b.sk)));
+
+    rows
+}
+
+async fn wipe(memory: &MemRepository) {
+    for row in derived_rows(memory).await {
+        memory.delete_view(&row.pk, &row.sk).await.unwrap();
+    }
+}
+
+/// Two ledgers through a journaled store that runs [`Totals`]: 3 events in 2 scopes each (6 rows),
+/// 3 counters, and 2 totals.
+async fn journaled_ledgers() -> MemRepository {
+    let memory = MemRepository::new();
+    let repository = JournalRepository::new(memory.clone(), journal());
+    let store =
+        Store::<Ledger, _>::new(&repository, ()).with_commit_projector(std::sync::Arc::new(Totals));
+    for (id, amount) in [("l-1", 1), ("l-2", 2), ("l-1", 3)] {
+        store
+            .execute(id, Add(amount), Metadata::new("local"))
+            .await
+            .unwrap();
+    }
+
+    memory
+}
+
+const LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[tokio::test]
+async fn views_and_the_journal_rebuild_under_one_lease_and_one_generation() {
+    let memory = journaled_ledgers().await;
+    let live = derived_rows(&memory).await;
+    assert_eq!(live.len(), 2 + 6 + 3);
+    wipe(&memory).await;
+    let before = memory.rebuild_generation().await.unwrap();
+
+    let report = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(Totals))
+        .aggregate::<Ledger>()
+        .with_journal(journal())
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            report.entities,
+            report.events,
+            report.journal_rows,
+            report.journal_counters,
+            report.puts,
+            report.batches
+        ),
+        (2, 3, 6, 3, 11, 1)
+    );
+    assert_eq!(derived_rows(&memory).await, live, "both are rebuilt");
+    assert_eq!(
+        memory.rebuild_generation().await.unwrap().value,
+        before.value + 2,
+        "one lock, so readers see one rebuild"
+    );
+
+    // The journal alone needs no projector or aggregate type.
+    wipe(&memory).await;
+    let report = crate::ProjectionRebuild::new(&memory)
+        .with_journal(journal())
+        .run("rebuild-2", LEASE)
+        .await
+        .unwrap();
+    assert_eq!((report.entities, report.puts), (0, 9));
+    assert_eq!(derived_rows(&memory).await.len(), 9);
+
+    // Without either there is nothing to rebuild; the journal's projector is still refused.
+    let repository = JournalRepository::new(memory.clone(), journal());
+    for rebuild in [
+        crate::ProjectionRebuild::new(&memory).aggregate::<Ledger>(),
+        crate::ProjectionRebuild::new(&memory)
+            .with_projector(repository.projector())
+            .aggregate::<Ledger>()
+            .with_journal(journal()),
+    ] {
+        assert!(matches!(
+            rebuild.run("rebuild-3", LEASE).await,
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+}
+
+/// A projector that writes at the key of the journal's first row in the shared scope.
+struct OnTheJournal;
+
+impl crate::CommitProjector for OnTheJournal {
+    fn name(&self) -> &str {
+        "on-the-journal"
+    }
+
+    fn project(
+        &self,
+        commit: &crate::CommitView,
+    ) -> Result<Vec<crate::ViewOperation>, crate::BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .filter(|stream| stream.entity_id.as_str() == "l-2")
+            .map(|stream| {
+                crate::ViewOperation::put(
+                    scope("all").row_pk(),
+                    super::row_sk(1),
+                    stream.entity_id.clone(),
+                    "ledger",
+                    "{}",
+                )
+            })
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn a_journal_key_a_view_row_also_plans_fails_before_any_write_and_releases_the_lock() {
+    let memory = journaled_ledgers().await;
+    wipe(&memory).await;
+
+    let error = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(OnTheJournal))
+        .aggregate::<Ledger>()
+        .with_journal(journal())
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::SharedViewKey { .. }), "{error:?}");
+    assert!(
+        derived_rows(&memory).await.is_empty(),
+        "nothing was written"
+    );
+    assert!(memory.rebuild_generation().await.unwrap().is_settled());
+}
+
+#[tokio::test]
+async fn a_journal_that_cannot_be_replayed_fails_the_rebuild_before_any_write() {
+    let memory = journaled_ledgers().await;
+    wipe(&memory).await;
+
+    // An event written around the journal that claims a position another event holds.
+    let forged = super::encode_allocations(&[super::Allocation {
+        scope: "all".into(),
+        position: 1,
+    }]);
+    Store::<Ledger, _>::new(&memory, ())
+        .execute(
+            "l-3",
+            Add(1),
+            Metadata::new("local").with_extension(super::ALLOCATION_KEY, forged),
+        )
+        .await
+        .unwrap();
+
+    let error = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(Totals))
+        .aggregate::<Ledger>()
+        .with_journal(journal())
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidJournal(_)), "{error:?}");
+    assert!(
+        derived_rows(&memory).await.is_empty(),
+        "nothing was written"
+    );
+    let state = memory.rebuild_state().await.unwrap();
+    assert!(
+        !state.in_progress() && state.generation.is_settled(),
+        "{state:?}"
+    );
+}

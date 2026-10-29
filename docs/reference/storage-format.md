@@ -714,7 +714,12 @@ any batch (`CommitTooLarge`); batches hold at most 99 operations within the comm
 Each operation is written without its condition or mapped error (a replay applies what the live
 commits wrote), so a rebuild runs over existing rows and is idempotent. It does not wipe: rows no
 projector produces any more stay until the caller deletes them. It needs strongly consistent reads
-of the log, or a commit that landed just before the lock was taken can be missed.
+of the log, or a commit that landed just before the lock was taken can be missed. Given the
+journal's configuration (`with_journal`), the same run also rebuilds the [journal](#journal): it
+reads every event of the journal's entity types under the lock (each type read once, shared with
+the history replay), derives the rows and counters as the journal's rebuild does, checks their keys
+against the view rows (`SharedViewKey`, `DuplicateViewKey`), and writes them in the same guarded
+batches, so the views and the journal move through one generation.
 
 - A current-state projector runs once per stream of every registered type, over a view of that
   stream alone: its final state (the snapshot plus the events after it, so a compacted stream is
@@ -2890,7 +2895,9 @@ below them, which the next allocation heals from the highest row. Rust's `rebuil
 takes the events already read, so it is for a table no one writes to, such as one whose commits a
 force-release still refuses. A rebuild that fails once it attempted a write keeps the lock (its
 rows may be half-written) until the lease lapses and a retry takes it over, or an operator
-force-releases it. One that fails before its first write releases the lock only if its begin
+force-releases it. The projection rebuild can carry the journal in its own run
+(`ProjectionRebuild::with_journal`, [Views](#views)), so one lease and one generation cover the
+journal and the commit-wide views. One that fails before its first write releases the lock only if its begin
 acquired it from a settled generation; a takeover of a lapsed lease, or an acquire after a
 force-release, keeps it on any failure, as the projection rebuild does ([Views](#views)). A force-release does not let journaled
 commits through: the failed rebuild may have cleared counters, and a commit that allocated from

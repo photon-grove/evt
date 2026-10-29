@@ -99,6 +99,7 @@ pub use read::{
     Gap, JournalCompactionStore, JournalPage, JournalStore, MAX_PAGE_ROWS, high_watermark,
     high_watermark_at_epoch, page, page_at_epoch,
 };
+pub(crate) use replay::operations;
 pub use replay::{
     JournalState, REBUILD_OWNER, rebuild, rebuild_with_lease, rebuild_with_lock, replay,
 };
