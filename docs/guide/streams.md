@@ -17,9 +17,9 @@ write that handler yourself (see [Publishing onward](#publishing-onward)). The `
 provides the consumer-side Lambda runtimes, and it can also read the stream directly with no topic
 in between.
 
-Every consumer follows the same reliability contract. It processes records independently, returns
-partial-batch failures so only the affected records retry, and stays idempotent, because the same
-event can be delivered more than once.
+Every consumer follows the same reliability contract. It returns partial-batch failures so retries
+skip the records that already succeeded, and stays idempotent, because the same event can be
+delivered more than once.
 
 ### Head items are not events
 
@@ -85,10 +85,34 @@ The runtime takes care of four things around your `Process`:
   them to partial-batch failures and, eventually, a DLQ. Transient errors (timeouts, context
   deadlines) retry the whole invocation.
 - Partial-batch failure responses. `NewSQSHandler` returns an
-  `events.SQSEventResponse{BatchItemFailures: […]}` and `NewLambdaHandler` a
-  `DynamoDBStreamResponse{…}`, so Lambda redelivers only the failed records.
+  `events.SQSEventResponse{BatchItemFailures: […]}` that names the failed messages' IDs, so Lambda
+  redelivers only those messages. `NewLambdaHandler` returns a `DynamoDBStreamResponse{…}` that
+  names a stream record's `SequenceNumber` (see [Reading the stream directly](#reading-the-stream-directly)).
 - Structured logging through the `*slog.Logger` you pass in, falling back to `slog.Default()` when
   it's nil.
+
+### Reading the stream directly
+
+`NewLambdaHandler` needs `FunctionResponseTypes: ["ReportBatchItemFailures"]` on the event source
+mapping. It hands records to the runtime one at a time, in stream order, so each `Process` call gets
+a single record, and the first record that fails stops the batch. The response reports that record's `SequenceNumber`, the identifier Lambda
+expects for a stream:
+
+```json
+{ "batchItemFailures": [{ "itemIdentifier": "4421584500000000017450439091" }] }
+```
+
+Lambda checkpoints before the lowest reported sequence number: it treats the earlier records as
+done and delivers the failed record and every record after it again. The handler doesn't attempt
+the later records, so they're projected after the failed one and per-item order holds. Your
+`Process` still reports a failure by the record's `EventID`, and the handler translates it. A
+transient error fails the whole invocation instead, and on the retry the idempotency guard skips
+the records that already succeeded.
+
+An `itemIdentifier` Lambda doesn't recognize, including an empty one, fails the whole batch, and
+without `ReportBatchItemFailures` Lambda ignores the response. Bound the retries on the mapping
+(`MaximumRetryAttempts` or `MaximumRecordAgeInSeconds`) and give it an on-failure destination, or
+one poison record stops its shard until it leaves the stream.
 
 ## Publishing onward
 

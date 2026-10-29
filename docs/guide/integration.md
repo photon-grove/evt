@@ -89,6 +89,7 @@ matching tables.
 
 ## Stream handlers are batch processors
 
-[Projectors](streams.md) receive batches. Process each record on its own, report partial-batch
-failures precisely so retries cover only the records that failed, and keep every handler idempotent,
-because delivery is at least once.
+[Projectors](streams.md) receive batches. Report partial-batch failures precisely so retries skip
+the records that succeeded (for a DynamoDB Stream, the failed record's sequence number, after which
+Lambda redelivers the rest in order), and keep every handler idempotent, because delivery is at least
+once.

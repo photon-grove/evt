@@ -36,7 +36,11 @@ type StreamRecord struct {
 }
 
 // BatchItemFailure identifies a single record that Lambda should retry.
-// The ItemIdentifier corresponds to the DynamoDB stream record's EventID.
+//
+// A Projector (and Runtime.Process) sets ItemIdentifier to the failed
+// StreamRecord's EventID. The handlers translate it into what their event source
+// expects: NewSQSHandler reports the SQS message ID, and NewLambdaHandler the
+// DynamoDB stream record's SequenceNumber.
 type BatchItemFailure struct {
 	ItemIdentifier string `json:"itemIdentifier"`
 }
