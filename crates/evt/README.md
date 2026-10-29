@@ -876,8 +876,11 @@ let report = ProjectionRebuild::new(&repository)
   table with a change stream wakes no consumer. Ownership is by row type (`entityType`) and must
   be exact: a planned put of an unowned type fails the run before any write, and nothing else may
   write an owned type. A listing that may lag (DynamoDB's type index) is confirmed by a strongly
-  consistent read by key before a row is skipped or deleted. The report adds `unchanged`,
-  `existing` and the changes per row type.
+  consistent read by key before a row is skipped or deleted. A stale row is deleted only when its
+  owner is a stream the run read (others are kept and counted in `kept`), and a planned delete of
+  a row of an unowned type fails the run. Register every type and every projector that writes an
+  owned type, and run `plan()` first. The report adds `unchanged`, `existing`, `kept` and the
+  changes per row type.
 - `plan()` is the dry run with its counts (`RebuildPlan`); `on_progress` reports the planned batches
   and each batch written.
 - It holds every row in memory, and needs strongly consistent reads of the log.

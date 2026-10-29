@@ -719,8 +719,10 @@ wipe: rows no projector produces any more stay until the caller deletes them. In
 (`diff`) the run owns the rows of the row types it is given (the stored `entityType`, plus the
 journal's row and counter types when it rebuilds the journal). After planning it lists them, and
 writes a put only for a planned row that is missing or differs in owner, type, payload or TTL, a
-planned delete only for a row that exists, and a delete for every owned row the plan does not
-produce. A row is skipped as unchanged, or deleted as stale, only after a strongly consistent read
+planned delete only for a row of an owned type that exists (one of another type fails the run),
+and a delete for every owned row the plan does not produce whose owner is a stream the run read
+(others are kept and counted). The final operations are checked as a guarded write checks them,
+before the first write. A row is skipped as unchanged, or deleted as stale, only after a strongly consistent read
 of its key: the type listing may lag (DynamoDB's `entityType-index` is eventually consistent).
 Every planned put must be of an owned type (`InvalidConfig` before any write), and nothing else
 may write an owned type, since the run deletes what it does not plan. It needs strongly consistent reads

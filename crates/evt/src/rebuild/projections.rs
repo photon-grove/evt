@@ -245,6 +245,10 @@ pub struct RebuildReport {
     pub unchanged: usize,
     /// Diff mode: the owned rows the run listed before comparing.
     pub existing: usize,
+    /// Diff mode: owned rows the plan does not produce that were kept, not deleted, because their
+    /// owner is not a stream the run read: a row of a type that is not registered, which a
+    /// rebuild that registers it would reproduce or delete.
+    pub kept: usize,
     /// Diff mode: the puts and deletes by row type (the row's `entityType`).
     pub changes: BTreeMap<String, RowChanges>,
     /// Guarded batches written ([`RebuildFence::write_rebuild_views`] calls).
@@ -377,8 +381,18 @@ where
     /// index), so a row is skipped as unchanged, or deleted as stale, only after a strongly
     /// consistent read of its key finds it so; a planned row the listing misses is simply written.
     /// An owned row that a commit wrote just before the lock, and that the listing does not show
-    /// yet, is not seen as stale until a later run. Owning no type without a journal, a journal
-    /// type without the journal, or the journal compaction's rows is refused before the lock.
+    /// yet, is not seen as stale until a later run (and a row the listing shows late is rewritten,
+    /// not skipped).
+    ///
+    /// A stale row is deleted only when its owner is a stream the run read (or the journal's
+    /// counter owner); others are kept and counted ([`RebuildReport::kept`]), so a type left out
+    /// of the registration does not have its rows deleted. Register every type and every projector
+    /// that writes an owned type, and look at [`plan`](Self::plan) first: a projector left out
+    /// would have its rows deleted. A planned delete at a key holding a row of a type the diff
+    /// does not own fails with [`Error::InvalidConfig`]; a planned put writes its key whatever is
+    /// there, as a rebuild without the diff does. A stale row no guarded write could delete fails
+    /// the run (and the dry run) before any write. Owning no type without a journal, a journal type
+    /// without the journal, or the journal compaction's rows is refused before the lock.
     #[must_use]
     pub fn diff<V: ViewRepository>(
         mut self,
@@ -432,7 +446,8 @@ where
     /// passed: checked after each entity, after each type's events are read, every 1024 replayed
     /// commits, and before each batch. A lock another rebuild holds is
     /// [`Error::RebuildLockHeld`]; a configuration error is [`Error::InvalidConfig`], before the
-    /// lock is taken.
+    /// lock is taken, except a diff's ownership errors, which are found while planning (before any
+    /// write, so the lock is released).
     ///
     /// Every row is computed before the first is written, so a failure while reading the log or
     /// projecting (a compacted stream a history-dependent projector reads, an entity that does not
@@ -632,6 +647,21 @@ where
         }
         output.report.events = events.values().map(Vec::len).sum();
 
+        // The streams the run read: a diff deletes a stale owned row only when its owner is one.
+        let mut streams: BTreeSet<String> = BTreeSet::new();
+        if self.diff.is_some() {
+            streams.extend(
+                events
+                    .values()
+                    .flatten()
+                    .map(|event| event.entity_id.to_string()),
+            );
+            #[cfg(feature = "journal")]
+            if self.has_journal() {
+                streams.insert(crate::journal::COUNTER_OWNER.to_owned());
+            }
+        }
+
         #[cfg(feature = "journal")]
         let journal = match &self.journal {
             Some(journal) => Some(crate::journal::replay(
@@ -662,6 +692,9 @@ where
                 let mut states = scope.final_states(self.repository);
                 while let Some(state) = poll_fn(|cx| states.as_mut().poll_next(cx)).await {
                     let (entity_id, state) = state?;
+                    if self.diff.is_some() {
+                        streams.insert(entity_id.to_string());
+                    }
                     let view = CommitView::new(
                         "",
                         vec![CommitStream::new(
@@ -698,7 +731,9 @@ where
         }
 
         if let Some(diff) = &self.diff {
-            output.diff(diff.rows, &self.owned_types(diff)).await?;
+            output
+                .diff(diff.rows, &self.owned_types(diff), &streams)
+                .await?;
         }
 
         Ok(())

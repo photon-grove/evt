@@ -1000,6 +1000,14 @@ fn a_rebuild_future_is_send() {
         .aggregate::<Ledger>();
     send(&rebuild.run("rebuild-1", LEASE));
     send(&rebuild.operations());
+
+    let diffing = ProjectionRebuild::new(&repository)
+        .with_projector(Totals::arc("totals"))
+        .aggregate::<Ledger>()
+        .diff(&repository, ["ledger"])
+        .on_progress(|_| {});
+    send(&diffing.run("rebuild-1", LEASE));
+    send(&diffing.plan());
 }
 
 /// A current-state projector that takes longer than half a second over its first stream.
@@ -1111,7 +1119,7 @@ async fn a_diff_rebuild_repairs_owned_rows_deletes_stale_ones_and_leaves_the_res
         .unwrap();
     views.delete_view("totals", "l-001").await.unwrap();
     views
-        .put_view(&ViewRow::new("totals", "gone", "gone", "ledger", "{}"))
+        .put_view(&ViewRow::new("totals", "gone", "l-002", "ledger", "{}"))
         .await
         .unwrap();
     views
@@ -1299,4 +1307,160 @@ async fn a_lagging_listing_is_confirmed_by_key_before_a_row_is_skipped_or_delete
         "l-000 is rewritten, l-001 is written because the listing missed it, and nothing is deleted"
     );
     assert_eq!(repository.list_views_by_pk("totals").await.unwrap(), live);
+}
+
+#[tokio::test]
+async fn a_diff_deletes_a_row_a_replay_deleted_only_when_it_owns_the_row() {
+    let repository = MemRepository::new();
+    let store = Store::<Ledger, _>::new(&repository, ()).with_commit_projector(Feed::arc("f"));
+    add(&store, "l-1", &[1, 2]).await;
+    let marker = ("f-marker", "l-1");
+    assert!(
+        repository
+            .get_view_at(marker.0, marker.1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let diffing = || {
+        ProjectionRebuild::new(&repository)
+            .with_projector(Feed::arc("f"))
+            .aggregate::<Ledger>()
+            .diff(&repository, ["ledger"])
+    };
+
+    // The replay ends with the marker deleted; a row back at its key is deleted again.
+    repository
+        .put_view(&ViewRow::new(marker.0, marker.1, "l-1", "ledger", "{}"))
+        .await
+        .unwrap();
+    let report = diffing().run("rebuild-1", LEASE).await.unwrap();
+    assert_eq!((report.puts, report.deletes), (0, 1), "{report:?}");
+    assert!(
+        repository
+            .get_view_at(marker.0, marker.1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A row of a type the diff does not own at that key is not the diff's to delete.
+    repository
+        .put_view(&ViewRow::new(marker.0, marker.1, "l-1", "other", "{}"))
+        .await
+        .unwrap();
+    let error = diffing().run("rebuild-2", LEASE).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidConfig(_)), "{error:?}");
+    assert!(
+        repository
+            .get_view_at(marker.0, marker.1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(repository.rebuild_generation().await.unwrap().is_settled());
+}
+
+#[tokio::test]
+async fn a_diff_keeps_stale_rows_it_cannot_vouch_for_and_refuses_rows_no_batch_can_write() {
+    let repository = MemRepository::new();
+    live_totals(&repository, 1).await;
+    let diffing = || {
+        ProjectionRebuild::new(&repository)
+            .with_projector(Totals::arc("totals"))
+            .aggregate::<Ledger>()
+            .diff(&repository, ["ledger"])
+    };
+
+    // Owned rows whose owner is no stream the run read (an unregistered type's, or a bad manual
+    // write with no owner) are kept and counted, not deleted.
+    for owner in ["not-a-ledger", ""] {
+        repository
+            .put_view(&ViewRow::new(
+                "totals",
+                format!("x-{owner}"),
+                owner,
+                "ledger",
+                "{}",
+            ))
+            .await
+            .unwrap();
+    }
+    let report = diffing().run("rebuild-1", LEASE).await.unwrap();
+    assert_eq!((report.deletes, report.kept), (0, 2), "{report:?}");
+
+    // A stale row a guarded write would refuse fails the dry run and the run before any write,
+    // so the lock is released rather than wedged.
+    let long = "s".repeat(crate::MAX_VIEW_SK_BYTES + 1);
+    repository
+        .put_view(&ViewRow::new(
+            "totals",
+            long.as_str(),
+            "l-000",
+            "ledger",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert!(diffing().plan().await.is_err());
+    let before = repository.rebuild_generation().await.unwrap();
+    assert!(diffing().run("rebuild-2", LEASE).await.is_err());
+    assert_eq!(
+        repository.rebuild_generation().await.unwrap().value,
+        before.value + 2,
+        "nothing was written, so the lock was released"
+    );
+}
+
+#[tokio::test]
+async fn a_listed_row_whose_stored_type_is_no_longer_owned_is_not_deleted() {
+    let repository = MemRepository::new();
+    live_totals(&repository, 1).await;
+    repository
+        .put_view(&ViewRow::new("totals", "moved", "l-000", "other", "{}"))
+        .await
+        .unwrap();
+    // The listing still shows the row under an owned type.
+    let lagging = Lagging {
+        inner: repository.clone(),
+        listing: vec![ViewRow::new("totals", "moved", "l-000", "ledger", "{}")],
+    };
+
+    let report = ProjectionRebuild::new(&repository)
+        .with_projector(Totals::arc("totals"))
+        .aggregate::<Ledger>()
+        .diff(&lagging, ["ledger"])
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap();
+
+    assert_eq!(report.deletes, 0, "{report:?}");
+    assert!(
+        repository
+            .get_view_at("totals", "moved")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn stale_rows_are_deleted_in_key_order_so_the_dry_run_matches_the_run() {
+    let probe = Probe::new(MemRepository::new());
+    live_totals(&probe.inner, 3).await;
+    for sk in ["z", "a", "m", "c"] {
+        probe
+            .inner
+            .put_view(&ViewRow::new("totals", sk, "l-001", "ledger", "{}"))
+            .await
+            .unwrap();
+    }
+
+    let plan = diffing(&probe).plan().await.unwrap();
+    let order: Vec<&str> = plan
+        .operations
+        .iter()
+        .map(|item| item.op.sk.as_str())
+        .collect();
+    assert_eq!(order, ["a", "c", "m", "z"]);
 }
