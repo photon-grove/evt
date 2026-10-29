@@ -118,14 +118,15 @@ use crate::store::Loaded;
 ///   and in no order), fails the rebuild with [`Error::CompactionUncovered`] before anything is
 ///   written, because the snapshot cannot stand in for the commits it covers.
 ///
-/// Only streams of the [registered](ProjectionRebuild::aggregate) types are read: register every
-/// type whose streams own the projectors' rows, and every type a history-dependent projector
-/// names. Conditions are not evaluated: a put is written over the owner's row and a delete removes
+/// Only streams of the [registered](ProjectionRebuild::aggregate) types are read (and, with the
+/// journal, every event of the journal's entity types): register every type whose streams own the
+/// projectors' rows, and every type a history-dependent projector names. Conditions are not evaluated: a put is written over the owner's row and a delete removes
 /// it, so the rebuild can run over existing rows, and it is idempotent. It does not delete rows that
 /// no projector produces any more; wipe the projectors' rows first to rebuild from scratch.
 ///
 /// The run holds every row it will write in memory, and the history replay every event of its
-/// types, twice. Read the log strongly consistently (DynamoDB's default): an eventually consistent
+/// types, twice. With the journal it also holds every event of the journal's types, and each
+/// journal row, which carries its whole event. Read the log strongly consistently (DynamoDB's default): an eventually consistent
 /// read can miss a commit that landed just before the lock was taken, and the rebuilt row would
 /// then overwrite the newer one that commit wrote.
 ///
@@ -214,7 +215,7 @@ pub struct RebuildReport {
     /// Events read from the log: every event of the types the history-dependent projectors and
     /// the journal read, each counted once.
     pub events: usize,
-    /// Journal rows the events imply ([`with_journal`](ProjectionRebuild::with_journal)).
+    /// Journal rows the events imply (`with_journal`, with the `journal` cargo feature).
     pub journal_rows: usize,
     /// Journal scope counters the events imply.
     pub journal_counters: usize,
@@ -239,7 +240,7 @@ where
     /// Adds a commit-wide projector. Projectors run in the order they are added, as on a store.
     /// One that reads the engine's own metadata ([`CommitProjector::engine_metadata`], the
     /// journal's projector) is refused when the rebuild runs; rebuild the journal with
-    /// [`with_journal`](ProjectionRebuild::with_journal).
+    /// `with_journal` (the `journal` cargo feature).
     #[must_use]
     pub fn with_projector(mut self, projector: Arc<dyn CommitProjector>) -> Self {
         self.projectors.push(projector);
@@ -250,7 +251,8 @@ where
     /// counters are derived from every event of `journal`'s entity types
     /// ([`journal::replay`](crate::journal::replay)), read under the lock, and written in the same
     /// guarded batches as the views, so readers see one rebuild (one generation) for both. A
-    /// journal key that a view row also plans fails the run with [`Error::SharedViewKey`] before
+    /// journal key that a view row also plans fails the run with [`Error::SharedViewKey`] (or
+    /// [`Error::DuplicateViewKey`] when the same stream owns both) before
     /// anything is written. With a journal the rebuild may have no projectors: it then rebuilds the
     /// journal alone, and needs no aggregate types.
     ///

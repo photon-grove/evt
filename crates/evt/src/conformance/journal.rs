@@ -26,7 +26,7 @@ use crate::views::ViewRepository;
 /// feature manifest and leave them there, so run them on a table you can reset.
 pub async fn journal_cases<R, V>(repo: &R, views: &V)
 where
-    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + EventLog + Clone,
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + Clone,
     R::Operation: Clone,
     V: ViewRepository,
 {
@@ -111,10 +111,6 @@ where
     record(
         "a rebuild under a caller's lease renews it in place, and stops at a lost lease",
         Box::pin(rebuild_under_a_callers_lease(repo, views)).await,
-    );
-    record(
-        "views and the journal rebuild under one lease, so readers see one generation",
-        Box::pin(views_and_journal_under_one_lease(repo, views)).await,
     );
     record(
         "a failed rebuild that wiped the counters keeps journaled commits refused after a force-release",
@@ -1591,6 +1587,22 @@ where
     );
 
     Ok(())
+}
+
+/// Runs the cases of a projection rebuild that carries the journal
+/// ([`ProjectionRebuild::with_journal`](crate::ProjectionRebuild::with_journal)) against a
+/// repository that writes views and enumerates its log, with `views` reading the same view table.
+/// Like [`journal_cases`], it panics if a case fails, and leaves the rebuild fence settled.
+pub async fn journal_rebuild_cases<R, V>(repo: &R, views: &V)
+where
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + EventLog + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    if let Err(Failure(message)) = Box::pin(views_and_journal_under_one_lease(repo, views)).await {
+        panic!("journal rebuild case failed: views and the journal under one lease: {message}");
+    }
+    println!("ok   views and the journal rebuild under one lease, so readers see one generation");
 }
 
 /// A current-state projector over the namespace's ledgers: each stream's state under `pk`.

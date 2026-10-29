@@ -858,8 +858,9 @@ let report = ProjectionRebuild::new(&repository)
 - `with_journal(journal)` rebuilds the sync journal in the same run, under the same lease: its rows
   and counters come from the events of the journal's types, read under the lock, and go out in the
   same guarded batches, so readers see one rebuild (one generation) for the views and the journal.
-  A key both would write fails the run before anything is written. With a journal, projectors and
-  aggregate types are optional. The journal's projector itself is refused as a projector here.
+  A key both would write fails the run before anything is written. With a journal and no
+  projectors, aggregate types are optional. It needs the `journal` cargo feature. The journal's
+  projector itself is refused as a projector here.
 
 ## Enumerating the log
 

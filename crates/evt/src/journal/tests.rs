@@ -38,6 +38,7 @@ async fn the_journal_conformance_cases_pass_on_the_in_memory_repository() {
     let repository = MemRepository::new();
 
     journal_cases(&repository, &repository.clone()).await;
+    crate::conformance::journal_rebuild_cases(&repository, &repository.clone()).await;
 }
 
 #[tokio::test]
@@ -1147,4 +1148,81 @@ async fn a_journal_that_cannot_be_replayed_fails_the_rebuild_before_any_write() 
         !state.in_progress() && state.generation.is_settled(),
         "{state:?}"
     );
+}
+
+/// A history-dependent projector over ledgers, the journal's own type: a row per commit and
+/// stream.
+struct Commits;
+
+impl crate::CommitProjector for Commits {
+    fn name(&self) -> &str {
+        "commits"
+    }
+
+    fn history(&self) -> &[crate::EntityType] {
+        static LEDGER: std::sync::LazyLock<[crate::EntityType; 1]> =
+            std::sync::LazyLock::new(|| [crate::EntityType::new("ledger")]);
+
+        &*LEDGER
+    }
+
+    fn project(
+        &self,
+        commit: &crate::CommitView,
+    ) -> Result<Vec<crate::ViewOperation>, crate::BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                let last = stream.events.last().map_or(0, |event| event.sequence.0);
+                crate::ViewOperation::put(
+                    "commits",
+                    format!("{}#{last}", stream.entity_id),
+                    stream.entity_id.clone(),
+                    "ledger",
+                    stream.state.clone(),
+                )
+            })
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn a_history_projector_and_the_journal_share_one_read_of_their_type() {
+    let memory = journaled_ledgers().await;
+    let journal_rows = |memory: &MemRepository| {
+        let memory = memory.clone();
+        async move {
+            let mut rows = Vec::new();
+            for entity_type in [super::ROW_ENTITY_TYPE, super::COUNTER_ENTITY_TYPE] {
+                rows.extend(memory.list_views_by_entity_type(entity_type).await.unwrap());
+            }
+            rows.sort_by(|a, b| (&a.pk, &a.sk).cmp(&(&b.pk, &b.sk)));
+
+            rows
+        }
+    };
+    let live = journal_rows(&memory).await;
+    wipe(&memory).await;
+
+    let report = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(Commits))
+        .aggregate::<Ledger>()
+        .with_journal(journal())
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            report.events,
+            report.commits,
+            report.journal_rows,
+            report.journal_counters
+        ),
+        (3, 3, 6, 3),
+        "each event read once, for the replay and the journal alike"
+    );
+    assert_eq!(journal_rows(&memory).await, live, "the journal is rebuilt");
+    assert_eq!(memory.list_views_by_pk("commits").await.unwrap().len(), 3);
 }
