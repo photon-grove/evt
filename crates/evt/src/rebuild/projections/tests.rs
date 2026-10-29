@@ -8,7 +8,7 @@ use crate::metadata::Metadata;
 use crate::rebuild::acquired_from_settled;
 use crate::store::Store;
 use crate::views::ViewRepository;
-use crate::{Commit, Outcome, RebuildGeneration, RebuildState, SerializedSnapshot};
+use crate::{Commit, Outcome, RebuildGeneration, RebuildState, SerializedSnapshot, ViewRow};
 
 const LEASE: Duration = Duration::from_secs(60);
 
@@ -1061,4 +1061,242 @@ async fn a_run_under_a_callers_lease_renews_it_in_place() {
         "the caller's lock is still held"
     );
     repository.end_rebuild(&lease).await.unwrap();
+}
+
+/// Ledgers whose live commits ran [`Totals`], so the table holds the rows a rebuild plans.
+async fn live_totals(repository: &MemRepository, count: usize) {
+    let store =
+        Store::<Ledger, _>::new(repository, ()).with_commit_projector(Totals::arc("totals"));
+    for index in 0..count {
+        add(&store, &format!("l-{index:03}"), &[1]).await;
+    }
+}
+
+fn diffing(probe: &Probe) -> ProjectionRebuild<'_, Probe> {
+    ProjectionRebuild::new(probe)
+        .with_projector(Totals::arc("totals"))
+        .aggregate::<Ledger>()
+        .diff(&probe.inner, ["ledger"])
+}
+
+#[tokio::test]
+async fn a_diff_rebuild_of_intact_views_writes_nothing() {
+    let probe = Probe::new(MemRepository::new());
+    live_totals(&probe.inner, 120).await;
+    let before = rows(&probe.inner, "totals").await;
+
+    let report = diffing(&probe).run("rebuild-1", LEASE).await.unwrap();
+
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(
+        (report.existing, report.unchanged, report.batches),
+        (120, 120, 0)
+    );
+    assert!(probe.writes.lock().unwrap().is_empty(), "no guarded write");
+    assert_eq!(rows(&probe.inner, "totals").await, before);
+    assert!(probe.inner.rebuild_generation().await.unwrap().is_settled());
+}
+
+#[tokio::test]
+async fn a_diff_rebuild_repairs_owned_rows_deletes_stale_ones_and_leaves_the_rest() {
+    let probe = Probe::new(MemRepository::new());
+    live_totals(&probe.inner, 3).await;
+    let before = rows(&probe.inner, "totals").await;
+
+    // A changed row, a missing row, a stale owned row, and a row of a type nobody here owns.
+    let views = &probe.inner;
+    views
+        .put_view(&ViewRow::new("totals", "l-000", "l-000", "ledger", "{}"))
+        .await
+        .unwrap();
+    views.delete_view("totals", "l-001").await.unwrap();
+    views
+        .put_view(&ViewRow::new("totals", "gone", "gone", "ledger", "{}"))
+        .await
+        .unwrap();
+    views
+        .put_view(&ViewRow::new("totals", "foreign", "x", "other", "{}"))
+        .await
+        .unwrap();
+
+    let plan = diffing(&probe).plan().await.unwrap();
+    let kinds: Vec<_> = plan
+        .operations
+        .iter()
+        .map(|item| (item.op.kind, item.op.sk.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (ViewOperationKind::Put, "l-000"),
+            (ViewOperationKind::Put, "l-001"),
+            (ViewOperationKind::Delete, "gone"),
+        ],
+        "the dry run shows the difference"
+    );
+    assert_eq!(
+        (
+            plan.report.puts,
+            plan.report.deletes,
+            plan.report.unchanged,
+            plan.batches
+        ),
+        (2, 1, 1, 1)
+    );
+    assert!(
+        probe.writes.lock().unwrap().is_empty(),
+        "a dry run writes nothing"
+    );
+
+    let progress = Mutex::new(Vec::new());
+    let report = diffing(&probe)
+        .on_progress(|step| {
+            progress.lock().unwrap().push(match step {
+                RebuildProgress::Planned { report, batches } => (report.puts, batches),
+                RebuildProgress::Wrote { batch, of } => (batch, of),
+            });
+        })
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            report.puts,
+            report.deletes,
+            report.unchanged,
+            report.existing,
+            report.batches
+        ),
+        (2, 1, 1, 3, 1)
+    );
+    assert_eq!(
+        report.changes.get("ledger"),
+        Some(&RowChanges {
+            puts: 2,
+            deletes: 1
+        })
+    );
+    assert_eq!(
+        *progress.lock().unwrap(),
+        [(2, 1), (1, 1)],
+        "planned two puts in one batch, then wrote it"
+    );
+
+    let mut after = rows(&probe.inner, "totals").await;
+    let foreign = after.remove(after.iter().position(|row| row.0 == "foreign").unwrap());
+    assert_eq!(
+        after, before,
+        "owned rows are back to what the commits wrote"
+    );
+    assert_eq!(foreign.1, "x", "a row of another type is untouched");
+}
+
+#[tokio::test]
+async fn a_diff_refuses_a_planned_row_of_a_type_it_does_not_own() {
+    let repository = MemRepository::new();
+    live_totals(&repository, 2).await;
+    let before = repository.rebuild_generation().await.unwrap();
+
+    let error = ProjectionRebuild::new(&repository)
+        .with_projector(Totals::arc("totals"))
+        .aggregate::<Ledger>()
+        .diff(&repository, ["other"])
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidConfig(_)), "{error:?}");
+    let after = repository.rebuild_generation().await.unwrap();
+    assert_eq!(
+        after.value,
+        before.value + 2,
+        "found before any write: released"
+    );
+
+    // Owning nothing is refused before the lock.
+    let error = ProjectionRebuild::new(&repository)
+        .with_projector(Totals::arc("totals"))
+        .aggregate::<Ledger>()
+        .diff(&repository, Vec::<String>::new())
+        .run("rebuild-2", LEASE)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidConfig(_)), "{error:?}");
+    assert_eq!(repository.rebuild_generation().await.unwrap(), after);
+}
+
+/// A view repository whose type listing shows a fixed, out-of-date picture of the table, as an
+/// eventually consistent index can.
+struct Lagging {
+    inner: MemRepository,
+    listing: Vec<ViewRow>,
+}
+
+impl ViewRepository for Lagging {
+    async fn get_view_at(&self, pk: &str, sk: &str) -> Result<Option<ViewRow>, Error> {
+        self.inner.get_view_at(pk, sk).await
+    }
+
+    async fn put_view(&self, view: &ViewRow) -> Result<(), Error> {
+        self.inner.put_view(view).await
+    }
+
+    async fn delete_view(&self, pk: &str, sk: &str) -> Result<(), Error> {
+        self.inner.delete_view(pk, sk).await
+    }
+
+    async fn list_views_by_pk_paged(
+        &self,
+        pk: &str,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> Result<crate::ViewPage, Error> {
+        self.inner.list_views_by_pk_paged(pk, limit, cursor).await
+    }
+
+    async fn list_views_by_entity_type_paged(
+        &self,
+        _: &str,
+        _: Option<usize>,
+        _: Option<&str>,
+    ) -> Result<crate::ViewPage, Error> {
+        Ok(crate::ViewPage::new(self.listing.clone(), None))
+    }
+}
+
+#[tokio::test]
+async fn a_lagging_listing_is_confirmed_by_key_before_a_row_is_skipped_or_deleted() {
+    let repository = MemRepository::new();
+    live_totals(&repository, 2).await;
+    let live = repository.list_views_by_pk("totals").await.unwrap();
+
+    // The listing still shows l-000 as the commits wrote it, but the table has changed since; it
+    // still shows a stale row that is already gone; and it does not show l-001 yet.
+    repository
+        .put_view(&ViewRow::new("totals", "l-000", "l-000", "ledger", "{}"))
+        .await
+        .unwrap();
+    let lagging = Lagging {
+        inner: repository.clone(),
+        listing: vec![
+            live[0].clone(),
+            ViewRow::new("totals", "gone", "gone", "ledger", "{}"),
+        ],
+    };
+
+    let report = ProjectionRebuild::new(&repository)
+        .with_projector(Totals::arc("totals"))
+        .aggregate::<Ledger>()
+        .diff(&lagging, ["ledger"])
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (report.puts, report.deletes, report.unchanged),
+        (2, 0, 0),
+        "l-000 is rewritten, l-001 is written because the listing missed it, and nothing is deleted"
+    );
+    assert_eq!(repository.list_views_by_pk("totals").await.unwrap(), live);
 }

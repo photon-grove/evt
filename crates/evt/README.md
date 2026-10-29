@@ -869,7 +869,17 @@ let report = ProjectionRebuild::new(&repository)
   whose history doesn't run from sequence 1 to its head (compacted, or a tail that retention's TTL
   deleted) fails the run with `CompactionUncovered` before anything is written.
 - Conditions aren't evaluated, so the run can go over existing rows, and running it twice is safe.
-  It doesn't delete rows nothing produces any more, so wipe them first to rebuild from scratch.
+  By default it rewrites every row and doesn't delete rows nothing produces any more.
+- `diff(&views, owned_row_types)` writes only what changed: after planning it reads the rows of the
+  types it owns (and the journal's, with `with_journal`), puts only missing or different rows, and
+  deletes owned rows the plan no longer produces. A rebuild of intact views writes nothing, so a
+  table with a change stream wakes no consumer. Ownership is by row type (`entityType`) and must
+  be exact: a planned put of an unowned type fails the run before any write, and nothing else may
+  write an owned type. A listing that may lag (DynamoDB's type index) is confirmed by a strongly
+  consistent read by key before a row is skipped or deleted. The report adds `unchanged`,
+  `existing` and the changes per row type.
+- `plan()` is the dry run with its counts (`RebuildPlan`); `on_progress` reports the planned batches
+  and each batch written.
 - It holds every row in memory, and needs strongly consistent reads of the log.
 - `operations()` is a dry run that returns what `run` would write, without taking the lock.
 - `run_with_lease` rebuilds under a lease you took and end, renewing it in place. A failure

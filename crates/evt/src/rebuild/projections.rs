@@ -28,6 +28,9 @@ use crate::projection::{
 };
 use crate::repository::{MAX_COMMIT_BYTES, MAX_COMMIT_ITEM_BYTES, Repository};
 use crate::store::Loaded;
+use crate::views::ViewRepository;
+
+mod diff;
 
 /// A full rebuild of commit-wide projectors (v0.9, C7) from the event log, under the rebuild fence
 /// (C10): the Rust counterpart of Go's `RebuildProjections`, for commit-wide projectors.
@@ -120,14 +123,17 @@ use crate::store::Loaded;
 ///
 /// Only streams of the [registered](ProjectionRebuild::aggregate) types are read (and, with the
 /// journal, every event of the journal's entity types): register every type whose streams own the
-/// projectors' rows, and every type a history-dependent projector names. Conditions are not evaluated: a put is written over the owner's row and a delete removes
-/// it, so the rebuild can run over existing rows, and it is idempotent. It does not delete rows that
-/// no projector produces any more; wipe the projectors' rows first to rebuild from scratch.
+/// projectors' rows, and every type a history-dependent projector names. Conditions are not
+/// evaluated: a put is written over the owner's row and a delete removes it, so the rebuild can run
+/// over existing rows, and it is idempotent. By default it rewrites every row it plans and does not
+/// delete rows that no projector produces any more; in [diff mode](ProjectionRebuild::diff) it
+/// writes only the rows that changed and deletes the owned rows the plan no longer produces.
 ///
 /// The run holds every row it will write in memory, and the history replay every event of its
 /// types, twice. With the journal it also holds every event of the journal's types, and each
-/// journal row, which carries its whole event. Read the log strongly consistently (DynamoDB's default): an eventually consistent
-/// read can miss a commit that landed just before the lock was taken, and the rebuilt row would
+/// journal row, which carries its whole event. Read the log strongly consistently (DynamoDB's
+/// default): an eventually consistent read can miss a commit that landed just before the lock was
+/// taken, and the rebuilt row would
 /// then overwrite the newer one that commit wrote.
 ///
 /// # Failure
@@ -151,6 +157,17 @@ pub struct ProjectionRebuild<'r, R> {
     duplicate: Option<EntityType>,
     #[cfg(feature = "journal")]
     journal: Option<crate::journal::Journal>,
+    diff: Option<Diff<'r>>,
+    progress: Option<Arc<Observer<'r>>>,
+}
+
+/// A progress observer ([`ProjectionRebuild::on_progress`]).
+type Observer<'a> = dyn Fn(RebuildProgress<'_>) + Send + Sync + 'a;
+
+/// A diff-mode rebuild's reader and the row types it owns.
+struct Diff<'r> {
+    rows: &'r dyn diff::Rows,
+    owned: BTreeSet<String>,
 }
 
 impl<R> fmt::Debug for ProjectionRebuild<'_, R> {
@@ -173,6 +190,7 @@ impl<R> fmt::Debug for ProjectionRebuild<'_, R> {
                     .collect::<Vec<_>>(),
             )
             .field("journal", &self.has_journal())
+            .field("owned", &self.diff.as_ref().map(|diff| &diff.owned))
             .finish_non_exhaustive()
     }
 }
@@ -187,6 +205,19 @@ impl<R> ProjectionRebuild<'_, R> {
         false
     }
 
+    /// The row types of the journal's rows and counters when the run rebuilds it, none otherwise.
+    fn journal_row_types(&self) -> &'static [&'static str] {
+        #[cfg(feature = "journal")]
+        if self.has_journal() {
+            return &[
+                crate::journal::ROW_ENTITY_TYPE,
+                crate::journal::COUNTER_ENTITY_TYPE,
+            ];
+        }
+
+        &[]
+    }
+
     /// The entity types the journal reads, none without one.
     fn journal_types(&self) -> &[EntityType] {
         #[cfg(feature = "journal")]
@@ -199,17 +230,23 @@ impl<R> ProjectionRebuild<'_, R> {
 }
 
 /// What a [`ProjectionRebuild`] did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RebuildReport {
     /// Entities whose final state the current-state projectors ran over.
     pub entities: usize,
     /// Commits the history-dependent projectors replayed.
     pub commits: usize,
-    /// Rows written.
+    /// Rows written (in [diff mode](ProjectionRebuild::diff), only missing or changed rows).
     pub puts: usize,
-    /// Rows deleted.
+    /// Rows deleted (in diff mode, including owned rows the plan no longer produces).
     pub deletes: usize,
+    /// Diff mode: planned rows the table already held as planned, which were not rewritten.
+    pub unchanged: usize,
+    /// Diff mode: the owned rows the run listed before comparing.
+    pub existing: usize,
+    /// Diff mode: the puts and deletes by row type (the row's `entityType`).
+    pub changes: BTreeMap<String, RowChanges>,
     /// Guarded batches written ([`RebuildFence::write_rebuild_views`] calls).
     pub batches: usize,
     /// Events read from the log: every event of the types the history-dependent projectors and
@@ -219,6 +256,56 @@ pub struct RebuildReport {
     pub journal_rows: usize,
     /// Journal scope counters the events imply.
     pub journal_counters: usize,
+}
+
+impl RebuildReport {
+    /// Whether the run changed no row: nothing to put or delete.
+    pub fn is_clean(&self) -> bool {
+        self.puts == 0 && self.deletes == 0
+    }
+}
+
+/// The puts and deletes of one row type, in a [diff-mode](ProjectionRebuild::diff) report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RowChanges {
+    /// Rows written: missing, or different from the plan.
+    pub puts: usize,
+    /// Rows deleted.
+    pub deletes: usize,
+}
+
+/// What a [`plan`](ProjectionRebuild::plan) found: the operations a run would write, in order,
+/// the report it would return, and the guarded batches they split into.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RebuildPlan {
+    /// The counts a run would report; `batches` is 0, because nothing was written.
+    pub report: RebuildReport,
+    /// The operations, in the order a run writes them.
+    pub operations: Vec<ProjectedView>,
+    /// The guarded batches the operations split into.
+    pub batches: usize,
+}
+
+/// Where a run is, for an operator watching it ([`on_progress`](ProjectionRebuild::on_progress)).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RebuildProgress<'a> {
+    /// Every row is computed (and, in diff mode, compared); nothing is written yet.
+    Planned {
+        /// The counts so far; `batches` is 0.
+        report: &'a RebuildReport,
+        /// The guarded batches the run will write.
+        batches: usize,
+    },
+    /// A guarded batch was written.
+    Wrote {
+        /// The batches written so far.
+        batch: usize,
+        /// The batches to write.
+        of: usize,
+    },
 }
 
 impl<'r, R> ProjectionRebuild<'r, R>
@@ -234,6 +321,8 @@ where
             duplicate: None,
             #[cfg(feature = "journal")]
             journal: None,
+            diff: None,
+            progress: None,
         }
     }
 
@@ -263,6 +352,51 @@ where
     #[must_use]
     pub fn with_journal(mut self, journal: crate::journal::Journal) -> Self {
         self.journal = Some(journal);
+        self
+    }
+
+    /// Diff mode: writes only what changed, and deletes owned rows the log no longer implies.
+    ///
+    /// After computing every row, the run reads the rows it owns through `views`: every row whose
+    /// type (the `entityType` a put stores, [`ViewOperation::entity_type`]) is one of `owned`, and
+    /// the journal's row and counter types when it [rebuilds the journal](Self::with_journal).
+    /// Then it writes a put only for a planned row that is missing or differs (owner, type,
+    /// payload, or a TTL), a planned delete only for a row that exists, and a delete for every
+    /// owned row the plan does not produce (a row a projector change orphaned, a bad manual
+    /// write). Rows that already match are not rewritten, so a rebuild of intact views writes
+    /// nothing, and a table with a change stream emits no record for them. The report counts the
+    /// rows left unchanged and the changes by row type, and [`plan`](Self::plan) (the dry run)
+    /// shows the same difference.
+    ///
+    /// `views` reads the table the repository writes views to (the in-memory repository itself,
+    /// or DynamoDB's [`view_repository`](crate::dynamodb::DynamoRepository::view_repository)).
+    /// Ownership is by row type and must be exact. Every put the projectors plan must be of an
+    /// owned type, or the run fails with [`Error::InvalidConfig`] before writing; and nothing else
+    /// may write rows of an owned type, because the run deletes the ones it does not plan. The
+    /// type listing may lag behind the table (DynamoDB serves it from an eventually consistent
+    /// index), so a row is skipped as unchanged, or deleted as stale, only after a strongly
+    /// consistent read of its key finds it so; a planned row the listing misses is simply written.
+    /// An owned row that a commit wrote just before the lock, and that the listing does not show
+    /// yet, is not seen as stale until a later run. Owning no type without a journal, a journal
+    /// type without the journal, or the journal compaction's rows is refused before the lock.
+    #[must_use]
+    pub fn diff<V: ViewRepository>(
+        mut self,
+        views: &'r V,
+        owned: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.diff = Some(Diff {
+            rows: views,
+            owned: owned.into_iter().map(Into::into).collect(),
+        });
+        self
+    }
+
+    /// Calls `observe` as a run goes: once every row is computed (and compared, in diff mode),
+    /// before the first write, and after each guarded batch. A dry run reports nothing.
+    #[must_use]
+    pub fn on_progress(mut self, observe: impl Fn(RebuildProgress<'_>) + Send + Sync + 'r) -> Self {
+        self.progress = Some(Arc::new(observe));
         self
     }
 
@@ -354,6 +488,7 @@ where
         renewed: Option<Instant>,
     ) -> Result<RebuildReport, RebuildFailure> {
         let mut output = Output::new(Some(Renewing::new(self.repository, lease, renew, renewed)));
+        output.progress = self.progress.as_deref();
 
         let result = match output.keep_alive().await {
             Ok(()) => match self.rebuild(&mut output).await {
@@ -374,15 +509,25 @@ where
     }
 
     /// A dry run: the operations a [`run`](ProjectionRebuild::run) would write, in order, without
-    /// taking the lock or writing anything, with the same checks. Live commits may land while it
-    /// reads.
+    /// taking the lock or writing anything, with the same checks (in diff mode, the difference).
+    /// Live commits may land while it reads.
     pub async fn operations(&self) -> Result<Vec<ProjectedView>, Error> {
+        Ok(self.plan().await?.operations)
+    }
+
+    /// A dry run with its counts: what [`operations`](Self::operations) returns, the report a run
+    /// would return, and the batches it would write.
+    pub async fn plan(&self) -> Result<RebuildPlan, Error> {
         self.check()?;
 
         let mut output = Output::new(None);
         self.rebuild(&mut output).await?;
 
-        Ok(output.planned)
+        Ok(RebuildPlan {
+            batches: rebuild_batches(&output.planned).count(),
+            report: output.report,
+            operations: output.planned,
+        })
     }
 
     /// Refuses a configuration the rebuild cannot run, before it reads or locks anything.
@@ -403,6 +548,26 @@ where
         }
         if self.scopes.is_empty() && !self.projectors.is_empty() {
             return invalid("a projection rebuild needs at least one aggregate type".into());
+        }
+        if let Some(diff) = &self.diff {
+            if diff.owned.is_empty() && !self.has_journal() {
+                return invalid("a diff-mode rebuild owns at least one row type".into());
+            }
+            #[cfg(feature = "journal")]
+            for entity_type in &diff.owned {
+                let journal = [
+                    crate::journal::ROW_ENTITY_TYPE,
+                    crate::journal::COUNTER_ENTITY_TYPE,
+                ];
+                if *entity_type == crate::journal::COMPACTION_ENTITY_TYPE
+                    || (journal.contains(&entity_type.as_str()) && !self.has_journal())
+                {
+                    return invalid(format!(
+                        "a diff cannot own the journal's {entity_type:?} rows on their own: rebuild \
+                         the journal with `with_journal`, which owns its rows and counters"
+                    ));
+                }
+            }
         }
         if let Some(entity_type) = &self.duplicate {
             return invalid(format!(
@@ -532,7 +697,20 @@ where
             }
         }
 
+        if let Some(diff) = &self.diff {
+            output.diff(diff.rows, &self.owned_types(diff)).await?;
+        }
+
         Ok(())
+    }
+
+    /// The row types a diff owns: the declared ones, and the journal's rows and counters when the
+    /// run rebuilds it.
+    fn owned_types(&self, diff: &Diff<'_>) -> BTreeSet<String> {
+        let mut owned = diff.owned.clone();
+        owned.extend(self.journal_row_types().iter().map(|t| (*t).to_owned()));
+
+        owned
     }
 
     /// Replays every commit of `events`, the history-dependent projectors' types, and returns the
@@ -679,6 +857,7 @@ struct Output<'a, R> {
     /// The batches the plan splits into, once it is complete.
     batches: usize,
     report: RebuildReport,
+    progress: Option<&'a Observer<'a>>,
 }
 
 impl<'a, R: RebuildFence> Output<'a, R> {
@@ -689,6 +868,7 @@ impl<'a, R: RebuildFence> Output<'a, R> {
             keys: HashMap::new(),
             batches: 0,
             report: RebuildReport::default(),
+            progress: None,
         }
     }
 
@@ -765,9 +945,21 @@ impl<'a, R: RebuildFence> Output<'a, R> {
         let Some(fence) = &mut self.fence else {
             return Ok(());
         };
+        if let Some(observe) = self.progress {
+            observe(RebuildProgress::Planned {
+                report: &self.report,
+                batches: self.batches,
+            });
+        }
         for batch in batches {
             fence.write(batch).await?;
             self.report.batches += 1;
+            if let Some(observe) = self.progress {
+                observe(RebuildProgress::Wrote {
+                    batch: self.report.batches,
+                    of: self.batches,
+                });
+            }
         }
 
         Ok(())
