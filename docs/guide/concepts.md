@@ -185,6 +185,11 @@ optimization and never a source of truth. `snapshots.NewStore(repo, size)` write
 `size` events, so loading a long stream reads the latest snapshot plus the tail instead of replaying
 from sequence 1. On DynamoDB the snapshot lives inline in the event log at `sk = 0`.
 
+A snapshot is one item, so keep aggregate state bounded and put unbounded history in events. A
+snapshot whose item would be over the commit's per-item budget (380,000 bytes, 95% of DynamoDB's
+400 KB) is skipped with a warning rather than failing the commit, and the stream's loads replay
+from the last snapshot that fit ([Oversized snapshots](../reference/storage-format.md#oversized-snapshots)).
+
 ## Projector
 
 A projector turns event-sourced state into deterministic read models:

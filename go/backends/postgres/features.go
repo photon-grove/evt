@@ -108,7 +108,7 @@ func (m *FeatureMarker) declare(
 	update func(*evt.FeatureManifest),
 	guard func(context.Context, pgx.Tx, *evt.FeatureManifest) error,
 ) (evt.FeatureManifest, error) {
-	tx, err := m.db.Begin(ctx)
+	tx, err := beginReadCommitted(ctx, m.db)
 	if err != nil {
 		return evt.FeatureManifest{}, fmt.Errorf("features: begin declaration: %w", err)
 	}

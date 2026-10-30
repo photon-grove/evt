@@ -98,7 +98,7 @@ impl PostgresRepository {
     /// One `begin` attempt in one transaction under the exclusive advisory lock.
     async fn begin_once(&self, owner: &str, seconds: i64) -> Result<Attempt, Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = super::read_committed(&mut client).await?;
         self.lock_fence(&tx).await?;
 
         let generation = self.read_generation(&tx, true).await?;
@@ -221,7 +221,7 @@ impl PostgresRepository {
         rebuild::check_owner(owner)?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = super::read_committed(&mut client).await?;
         self.lock_fence(&tx).await?;
 
         // A settled generation means no rebuild holds the fence, so the caller cannot hold it; a
@@ -364,16 +364,25 @@ impl RebuildFence for PostgresRepository {
         let owner = lease.owner.as_str();
         rebuild::check_owner(owner)?;
         rebuild::check_view_batch(views)?;
+        if self.views_table_target {
+            self.ensure_stream_heads().await?;
+            self.ensure_views_declared().await?;
+        }
         let statements = self.view_statements(views)?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = super::read_committed(&mut client).await?;
 
         let lock = self.read_lock(&tx, true).await?;
         let now = self.clock.unix_seconds();
         if !lock.is_some_and(|lock| lease.holds(&lock) && lock.lease_expires_at > now) {
             return Err(lease_lost(owner));
         }
+
+        // A store whose views live in the views table is rebuilt only through it, as it is
+        // committed to.
+        let manifest = self.read_manifest_in(&tx).await?;
+        self.refuse_foreign_views(manifest.as_ref())?;
 
         run_view_statements(&tx, &view_writes(views, &statements)).await?;
 

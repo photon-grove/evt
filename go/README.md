@@ -64,6 +64,11 @@ repo := dynamo.NewRepository(dynamoClient, "event-log")
 store := snapshots.NewStore(repo, 25)
 ```
 
+A snapshot is a single item, so keep an aggregate's state bounded and its unbounded history in
+events. The store skips (and logs) a snapshot over the commit's per-item budget,
+`evt.MaxCommitItemBytes`, instead of failing the commit, and loads then replay from the last
+snapshot that fit ([Oversized snapshots](../docs/reference/storage-format.md#oversized-snapshots)).
+
 [Getting started](../docs/guide/getting-started.md#the-same-model-in-go) walks through all of
 this end to end, and [Concepts](../docs/guide/concepts.md) explains aggregates, the
 `CommandContext` a load returns, metadata, snapshots and projectors.

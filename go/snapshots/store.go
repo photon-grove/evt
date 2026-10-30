@@ -190,7 +190,15 @@ func (store *Store) commitWithTransaction(
 
 	serializedResult := evt.SerializedResult{Events: serializedEvents, Transaction: transaction}
 
-	if commitSnapshotToEvent == 0 {
+	// Capture the Snapshot from the (already-applied) entity state, unless it is too large to write.
+	var snapshot *evt.SerializedSnapshot
+	if commitSnapshotToEvent > 0 {
+		if snapshot, err = commitSnapshot(&cc, entityType, cc.EntityID, serializedEvents); err != nil {
+			return nil, err
+		}
+	}
+
+	if snapshot == nil {
 		// If not needed, execute a simple commit, with the commit-wide projectors' operations.
 		// A commit that writes no event runs no projector, so its state is never encoded.
 		if len(serializedEvents) > 0 {
@@ -211,17 +219,8 @@ func (store *Store) commitWithTransaction(
 		return serializedEvents, nil
 	}
 
-	// Otherwise, capture the Snapshot payload from the (already-applied) entity state
-	payload, err := store.updateSnapshotWithEvents(
-		serializedEvents,
-		&cc,
-	)
-	if err != nil {
-		return nil, err
-	}
-
 	// The snapshot payload is the stream's state after the commit, the same bytes the projectors see.
-	if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{cc.EntityID: payload}); err != nil {
+	if serializedResult.Views, err = store.projectCommit(ctx, serializedEvents, map[evt.EntityID][]byte{cc.EntityID: snapshot.Payload}); err != nil {
 		return nil, err
 	}
 
@@ -231,8 +230,8 @@ func (store *Store) commitWithTransaction(
 		serializedResult,
 		entityType,
 		cc.EntityID,
-		payload,
-		*cc.CurrentSnapshot,
+		snapshot.Payload,
+		snapshot.Sequence,
 	); err != nil {
 		return nil, err
 	}
@@ -306,22 +305,73 @@ func (store *Store) Execute(
 	return nil
 }
 
-// updateSnapshotWithEvents advances sequence counters and captures current entity state.
-// The entity must already include the events; they are not reapplied to avoid corrupting additive state.
-func (store *Store) updateSnapshotWithEvents(
-	serializedEvents []evt.SerializedEvent,
+// commitSnapshot captures the snapshot a commit that reaches the snapshot interval writes: the
+// entity's state after the commit's events, which cc.Aggregate already includes, at the commit's
+// last event. A snapshot whose item is over the per-item commit budget (evt.SnapshotCommitSize
+// above evt.MaxCommitItemBytes) is left out: writing it would fail this commit, and every later
+// one that reaches the interval, with CommitTooLargeError, so the commit proceeds without it, the
+// skip is logged, and commitSnapshot returns nil and leaves cc unchanged. Otherwise it advances
+// cc's event and snapshot sequences past the commit.
+func commitSnapshot(
 	cc *evt.CommandContext,
-) ([]byte, error) {
+	entityType evt.EntityType,
+	entityID evt.EntityID,
+	serializedEvents []evt.SerializedEvent,
+) (*evt.SerializedSnapshot, error) {
+	if len(serializedEvents) == 0 {
+		return nil, nil
+	}
+
+	payload, err := generateSnapshotPayload(cc.Aggregate)
+	if err != nil {
+		return nil, err
+	}
+
+	sequence := evt.EventSequence(1)
+	if cc.CurrentSnapshot != nil {
+		sequence = *cc.CurrentSnapshot + 1
+	}
+
+	snapshot := &evt.SerializedSnapshot{
+		EntityType:    entityType,
+		EntityID:      entityID,
+		Sequence:      sequence,
+		EventSequence: serializedEvents[len(serializedEvents)-1].Sequence,
+		Payload:       payload,
+	}
+	if !snapshotFits(*snapshot) {
+		return nil, nil
+	}
+
 	// Advance the running event sequence to account for the committed batch.
 	if cc.CurrentSequence != nil {
 		*cc.CurrentSequence += evt.EventSequence(len(serializedEvents))
 	}
 
-	// Update snapshot sequence
 	updateSnapshotSequence(cc)
 
-	// Capture the entity's current (already-applied) state as the snapshot payload
-	return generateSnapshotPayload(cc.Aggregate)
+	return snapshot, nil
+}
+
+// snapshotFits reports whether a snapshot's item fits the per-item commit budget, and logs a
+// snapshot that does not: the store skips it, and the stream's loads replay from the snapshot
+// before it until the aggregate's state shrinks below the budget.
+func snapshotFits(snapshot evt.SerializedSnapshot) bool {
+	size := evt.SnapshotCommitSize(snapshot)
+	if size <= evt.MaxCommitItemBytes {
+		return true
+	}
+
+	slog.Warn("snapshot skipped: its item is over the per-item commit budget",
+		"entityType", string(snapshot.EntityType),
+		"entityID", string(snapshot.EntityID),
+		"sequence", int64(snapshot.Sequence),
+		"eventSequence", int64(snapshot.EventSequence),
+		"bytes", size,
+		"limit", evt.MaxCommitItemBytes,
+	)
+
+	return false
 }
 
 func buildProjectorTransaction(
@@ -396,6 +446,16 @@ func (store *Store) maybeCatchUpSnapshot(
 	}
 
 	nextSnapshot := *cc.CurrentSnapshot + 1
+	if !snapshotFits(evt.SerializedSnapshot{
+		EntityType:    aggregate.Type(),
+		EntityID:      entityID,
+		Sequence:      nextSnapshot,
+		EventSequence: *cc.CurrentSequence,
+		Payload:       payload,
+	}) {
+		return
+	}
+
 	err = writer.PutSnapshot(ctx, aggregate.Type(), entityID, payload, nextSnapshot, *cc.CurrentSequence)
 	if err != nil {
 		logCatchUpError(ctx, aggregate.Type(), entityID, "write", err)

@@ -706,6 +706,27 @@ impl CommandIdentity {
         self
     }
 
+    /// The identity a single-aggregate command has on
+    /// [`Store::execute_with_outcome`](crate::Store::execute_with_outcome): its
+    /// [type](OutcomeCommand::command_type), the one target `entity_id`, and its
+    /// [canonical payload](OutcomeCommand::canonical_payload). It digests exactly as that call
+    /// does, so [`Store::resolve_command`](crate::Store::resolve_command) answers a single-aggregate
+    /// command and a transaction command the same way. A payload that fails to encode is
+    /// [`Error::InvalidArgument`].
+    pub fn for_command<C: OutcomeCommand + ?Sized>(
+        command: &C,
+        entity_id: impl Into<EntityId>,
+    ) -> Result<Self, Error> {
+        let payload = command
+            .canonical_payload()
+            .map_err(|err| Error::InvalidArgument(format!("the command payload: {err}")))?
+            .unwrap_or_default();
+
+        Ok(Self::new(command.command_type())
+            .with_targets([entity_id.into()])
+            .with_payload_json(payload))
+    }
+
     pub(crate) fn targets(&self) -> &[EntityId] {
         &self.targets
     }

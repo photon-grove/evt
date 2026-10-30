@@ -127,9 +127,24 @@ type CodecFixtures struct {
 	MetadataDecode []DecodeVector   `json:"metadataDecode"`
 	EventDecode    []DecodeVector   `json:"eventDecode"`
 	SnapshotPolicy [][4]int64       `json:"snapshotPolicy"`
+	SnapshotBudget []SnapshotBudget `json:"snapshotBudget"`
 	Views          []ViewVector     `json:"views"`
 	IntKeyMap      string           `json:"intKeyMap"`
 	TTL            TTLVector        `json:"ttl"`
+}
+
+// SnapshotBudget pins the size a store measures before it writes a snapshot with a commit: the
+// snapshot's preflight item size with the widest ttl attribute, for a payload of PayloadBytes 'x'
+// bytes, and whether it fits the per-item budget (a snapshot that does not is skipped).
+type SnapshotBudget struct {
+	Name          string `json:"name"`
+	EntityID      string `json:"entityId"`
+	EntityType    string `json:"entityType"`
+	Sequence      int64  `json:"sequence"`
+	EventSequence int64  `json:"eventSequence"`
+	PayloadBytes  int    `json:"payloadBytes"`
+	Size          int    `json:"size"`
+	Fits          bool   `json:"fits"`
 }
 
 // TTLVector pins the retention policy: streams committed with a snapshot through a repository with

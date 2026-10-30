@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -236,7 +237,37 @@ func GenerateCodecFixtures(ctx context.Context) (CodecFixtures, error) {
 		}
 	}
 
+	fixtures.SnapshotBudget = snapshotBudgetVectors()
+
 	return fixtures, nil
+}
+
+// snapshotBudgetVectors measures a small snapshot and the two either side of the per-item budget.
+func snapshotBudgetVectors() []SnapshotBudget {
+	base := evt.SerializedSnapshot{EntityType: AccountType, EntityID: "acct-budget", Sequence: 12, EventSequence: 60}
+	limit := evt.MaxCommitItemBytes - evt.SnapshotCommitSize(base)
+
+	vectors := make([]SnapshotBudget, 0, 3)
+	for _, c := range []struct {
+		name  string
+		bytes int
+	}{{"small", 2}, {"at-limit", limit}, {"over-limit", limit + 1}} {
+		snapshot := base
+		snapshot.Payload = []byte(strings.Repeat("x", c.bytes))
+		size := evt.SnapshotCommitSize(snapshot)
+		vectors = append(vectors, SnapshotBudget{
+			Name:          c.name,
+			EntityID:      string(snapshot.EntityID),
+			EntityType:    string(snapshot.EntityType),
+			Sequence:      int64(snapshot.Sequence),
+			EventSequence: int64(snapshot.EventSequence),
+			PayloadBytes:  c.bytes,
+			Size:          size,
+			Fits:          size <= evt.MaxCommitItemBytes,
+		})
+	}
+
+	return vectors
 }
 
 // seedHead declares stream-heads on an empty fake table and stores a stream's head item, the state a

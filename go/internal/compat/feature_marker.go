@@ -165,6 +165,8 @@ func (tx *featurePGTx) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row
 
 func (tx *featurePGTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	switch {
+	case sql == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED":
+		return pgconn.NewCommandTag("SET"), nil
 	case strings.HasPrefix(sql, "SELECT pg_advisory_xact_lock("):
 		return pgconn.NewCommandTag("SELECT 1"), nil
 	case strings.HasPrefix(sql, "INSERT INTO ") && len(args) == 3:
@@ -328,6 +330,10 @@ type featureSchemaTx struct {
 }
 
 func (tx *featureSchemaTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if sql == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED" {
+		return pgconn.NewCommandTag("SET"), nil
+	}
+
 	if strings.HasPrefix(sql, "SELECT pg_advisory_xact_lock(") {
 		return pgconn.NewCommandTag("SELECT 1"), nil
 	}

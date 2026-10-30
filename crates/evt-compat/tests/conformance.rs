@@ -15,9 +15,9 @@ use evt_compat::drivers::{self, DynamoHeads, PostgresHeads};
 use futures_core::Stream as _;
 use photon_evt::conformance::{
     Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, RebuildSuite, Suite, TestClock,
-    ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, feature_marker_cases,
-    fresh_store_cases, initialization_cases, outcome_cases, projection_rebuild_cases,
-    view_repository_cases,
+    ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, expected_payload_cases,
+    feature_marker_cases, fresh_store_cases, initialization_cases, outcome_cases,
+    projection_rebuild_cases, view_repository_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
@@ -567,6 +567,8 @@ async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
         table: views.clone(),
     };
     commit_view_cases(&writer, &rows).await;
+    // The journal counter's condition, on the backend that defines it.
+    expected_payload_cases(&writer, &rows).await;
 
     // The rebuild fence (C10) over the same private tables, with an injected clock: the lock is
     // table-wide, and every case leaves it settled.
@@ -1883,7 +1885,7 @@ async fn postgres_schema_setup_is_concurrent_safe() {
         .await
         .unwrap()
         .batch_execute(&format!(
-            "DROP TABLE IF EXISTS {events}, {snapshots}, {events}__evt_features, {events}__evt_stream_heads"
+            "DROP TABLE IF EXISTS {events}, {snapshots}, {events}__evt_features, {events}__evt_stream_heads, {events}__evt_views"
         ))
         .await
         .unwrap();
@@ -1945,7 +1947,7 @@ async fn postgres_conforms() {
         .await
         .unwrap()
         .batch_execute(&format!(
-            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, {events}__evt_views"
         ))
         .await
         .expect("drop the isolated event log");
@@ -2364,7 +2366,7 @@ async fn postgres_fresh_and_unmigrated_databases() {
                 .await
                 .unwrap()
                 .batch_execute(&format!(
-                    "DROP TABLE {events}, {events}s, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads"
+                    "DROP TABLE {events}, {events}s, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads, {events}__evt_views"
                 ))
                 .await
                 .unwrap();
@@ -3493,8 +3495,473 @@ async fn postgres_rebuild_relations(pool: Pool) {
         .batch_execute(&format!(
             "DROP TABLE {events}, {snapshots}, {events}__evt_features, \
              {events}__evt_command_outcomes, {events}__evt_stream_heads, \
-             {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
+             {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, {events}__evt_views"
         ))
         .await
         .expect("drop the isolated event log");
+}
+
+/// A repository over `events` whose sessions default to `REPEATABLE READ`, as a server or role
+/// configured with `default_transaction_isolation` would give them.
+fn repeatable_read(events: &str, snapshots: &str) -> PostgresRepository {
+    use deadpool_postgres::{Manager, ManagerConfig, RecyclingMethod};
+
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://evt:evt@localhost:5432/evt_local?sslmode=disable".into());
+    let mut config: tokio_postgres::Config = url.parse().unwrap();
+    config.options("-c default_transaction_isolation=repeatable\\ read");
+    let manager = Manager::from_config(
+        config,
+        tokio_postgres::NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        },
+    );
+
+    PostgresRepository::new(Pool::builder(manager).max_size(2).build().unwrap())
+        .with_tables(events, snapshots)
+        .unwrap()
+}
+
+/// A commit reads the rebuild fence after it waits for its locks, so it must read it as of that
+/// moment, whatever the server's default isolation. Under `REPEATABLE READ` its snapshot would be
+/// the one taken before the wait: a rebuild that began meanwhile would be invisible to it, and the
+/// commit would land under the fence.
+#[tokio::test]
+async fn postgres_commit_sees_a_rebuild_that_began_while_it_waited() {
+    use photon_evt::{Commit, EntityId, EventId, EventType, EventVersion, Metadata, RebuildFence};
+
+    // Tables of its own: the rebuild lock it takes must refuse nobody else's commits.
+    let events = format!(
+        "rc{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let snapshots = format!("{events}_s");
+    let base = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    base.ensure_schema().await.unwrap();
+    let repo = repeatable_read(&events, &snapshots);
+    let id = EntityId::from(format!("{events}-waits"));
+    let pool = drivers::postgres_pool().unwrap();
+    let mut holder = pool.get().await.unwrap();
+    let lock = holder.transaction().await.unwrap();
+    lock.execute(
+        "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))",
+        &[&id.as_str()],
+    )
+    .await
+    .unwrap();
+
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("account:opened"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: "account".into(),
+        payload: b"{}".to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    let committing = {
+        let repo = repo.clone();
+        let commit = Commit::new(id.clone(), vec![event.clone()]);
+
+        tokio::spawn(async move { repo.commit(commit).await })
+    };
+
+    // Wait until the commit is blocked on the entity lock, after its first statement.
+    let watcher = pool.get().await.unwrap();
+    let waiting = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                   AND classid = 1702261760::oid \
+                   AND objid = (hashtext($1)::bigint & 4294967295)::oid";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = watcher.query_one(waiting, &[&id.as_str()]).await.unwrap();
+        if row.get::<_, i64>(0) > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the commit never waited on its entity lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let lease = base
+        .begin_rebuild("job", Duration::from_secs(60))
+        .await
+        .unwrap();
+    lock.rollback().await.unwrap();
+
+    let refused = committing.await.unwrap();
+    assert!(
+        matches!(refused, Err(Error::RebuildInProgress)),
+        "the commit saw the rebuild that began while it waited: {refused:?}"
+    );
+    assert!(
+        base.events(&id).await.unwrap().is_empty(),
+        "nothing landed under the fence"
+    );
+
+    base.end_rebuild(&lease).await.unwrap();
+    repo.commit(Commit::new(id.clone(), vec![event]))
+        .await
+        .unwrap();
+
+    drop(watcher);
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, \
+             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, {events}__evt_views"
+        ))
+        .await
+        .unwrap();
+}
+
+/// The evt-owned views table (ADR 0008) through [`photon_evt::postgres::PgViewRepository`]: the
+/// shared view-repository cases, then what is PostgreSQL's own: exact payload bytes, byte order of
+/// non-ASCII keys, the combined key bound, and `purge_expired`.
+#[tokio::test]
+async fn postgres_view_repository_conforms() {
+    let events = format!(
+        "vr{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let snapshots = format!("{events}_s");
+    let repository = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    repository.ensure_schema().await.unwrap();
+    let views = repository.view_repository();
+    assert_eq!(views.table(), format!("{events}__evt_views"));
+
+    view_repository_cases(&views).await;
+
+    // The payload is text, not jsonb: whitespace and key order survive.
+    let exact = br#"{ "b": 1,   "a": [ 2 ] }"#.to_vec();
+    let mut row = ViewRow::new("exact", "VIEW", "owner", "kind", exact.clone());
+    views.put_view(&row).await.unwrap();
+    assert_eq!(
+        views.get_view("exact").await.unwrap().unwrap().payload,
+        exact,
+        "the payload bytes"
+    );
+
+    // Sort keys order by UTF-8 bytes, as on DynamoDB: "Z" (0x5A) < "b" (0x62) < "é" (0xC3 0xA9).
+    for sk in ["é", "b", "Z"] {
+        row = ViewRow::new("ordered", sk, "owner", "kind", b"{}".to_vec());
+        views.put_view(&row).await.unwrap();
+    }
+    let order: Vec<String> = views
+        .list_views_by_pk("ordered")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.sk)
+        .collect();
+    assert_eq!(order, ["Z", "b", "é"], "bytewise order");
+
+    // A key the btree index cannot hold is refused before anything is written.
+    let long = ViewRow::new(
+        "p".repeat(2_048),
+        "s".repeat(1_000),
+        "owner",
+        "kind",
+        b"{}".to_vec(),
+    );
+    assert!(matches!(
+        views.put_view(&long).await,
+        Err(Error::InvalidArgument(message)) if message.contains("2600")
+    ));
+
+    // At the bound, an incompressible key fits both btree indexes.
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut noise = |len: usize| -> String {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                char::from(b'!' + u8::try_from((seed >> 33) % 94).unwrap())
+            })
+            .collect()
+    };
+    let boundary = ViewRow::new(noise(1_598), noise(998), "owner", noise(4), b"{}".to_vec());
+    assert_eq!(
+        boundary.pk.len() + boundary.sk.len() + boundary.entity_type.len(),
+        2_600
+    );
+    views.put_view(&boundary).await.unwrap();
+    assert!(
+        views
+            .get_view_at(&boundary.pk, &boundary.sk)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // PostgreSQL text cannot hold U+0000: a typed refusal, not the database's error.
+    for row in [
+        ViewRow::new("nul\0pk", "VIEW", "owner", "kind", b"{}".to_vec()),
+        ViewRow::new("nul", "s\0k", "owner", "kind", b"{}".to_vec()),
+        ViewRow::new("nul", "VIEW", "own\0er", "kind", b"{}".to_vec()),
+        ViewRow::new("nul", "VIEW", "owner", "ki\0nd", b"{}".to_vec()),
+        ViewRow::new("nul", "VIEW", "owner", "kind", b"{\"a\":\"\0\"}".to_vec()),
+    ] {
+        assert!(
+            matches!(views.put_view(&row).await, Err(Error::InvalidArgument(_))),
+            "{row:?}"
+        );
+    }
+    assert!(matches!(
+        views.get_view_at("nul\0pk", "VIEW").await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        views.list_views_by_pk_paged("nul\0pk", None, None).await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // A batch keeps a repeated key's last row, whatever order the keys come in.
+    views
+        .put_views(&[
+            ViewRow::new("batch", "b", "owner", "kind", b"{\"n\":1}".to_vec()),
+            ViewRow::new("batch", "a", "owner", "kind", b"{\"n\":2}".to_vec()),
+            ViewRow::new("batch", "b", "owner", "kind", b"{\"n\":3}".to_vec()),
+        ])
+        .await
+        .unwrap();
+    let batch: Vec<(String, Vec<u8>)> = views
+        .list_views_by_pk("batch")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.sk, row.payload))
+        .collect();
+    assert_eq!(
+        batch,
+        [
+            ("a".to_owned(), b"{\"n\":2}".to_vec()),
+            ("b".to_owned(), b"{\"n\":3}".to_vec())
+        ]
+    );
+
+    // A page without a limit holds at most 1,000 rows and says more follow; the full listing
+    // follows the cursor past it.
+    let many: Vec<ViewRow> = (0..1_001)
+        .map(|i| ViewRow::new("many", format!("{i:04}"), "owner", "many", b"{}".to_vec()))
+        .collect();
+    views.put_views(&many).await.unwrap();
+    let first = views
+        .list_views_by_pk_paged("many", None, None)
+        .await
+        .unwrap();
+    assert_eq!(first.views.len(), 1_000);
+    assert!(
+        first.next_cursor.is_some(),
+        "a full unbounded page has a cursor"
+    );
+    assert_eq!(views.list_views_by_pk("many").await.unwrap().len(), 1_001);
+    assert_eq!(
+        views.list_views_by_entity_type("many").await.unwrap().len(),
+        1_001
+    );
+
+    // Expired rows stay readable until a purge, which deletes only them.
+    let mut expired = ViewRow::new("ttl", "old", "owner", "kind", b"{}".to_vec());
+    expired.ttl = 1_000;
+    let mut live = ViewRow::new("ttl", "new", "owner", "kind", b"{}".to_vec());
+    live.ttl = 4_102_444_800;
+    let forever = ViewRow::new("ttl", "none", "owner", "kind", b"{}".to_vec());
+    views
+        .put_views(&[expired.clone(), live.clone(), forever.clone()])
+        .await
+        .unwrap();
+    assert!(views.get_view_at("ttl", "old").await.unwrap().is_some());
+    assert_eq!(views.purge_expired(2_000).await.unwrap(), 1);
+    let left: Vec<String> = views
+        .list_views_by_pk("ttl")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.sk)
+        .collect();
+    assert_eq!(left, ["new", "none"]);
+
+    repository
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, \
+             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, \
+             {events}__evt_views"
+        ))
+        .await
+        .unwrap();
+}
+
+/// The views table's rows through its view repository, for the commit-wide view cases.
+struct PgViewsTableRows(photon_evt::postgres::PgViewRepository);
+
+impl CommitViewTarget<PostgresRepository> for PgViewsTableRows {
+    async fn row(&self, pk: &str, sk: &str) -> Result<Option<ViewRow>, BoxError> {
+        Ok(self.0.get_view_at(pk, sk).await?)
+    }
+
+    fn max_view_key_bytes(&self) -> Option<usize> {
+        Some(photon_evt::wire::postgres::MAX_VIEW_INDEX_KEY_BYTES)
+    }
+}
+
+/// The evt-owned views table as the commit's view target (`with_views_table()`, ADR 0008): the
+/// commit-wide view cases (the byte budget included, since its statements count as DynamoDB
+/// items), the journal counter's expected-payload condition, the committed rows through
+/// `PgViewRepository`, the rebuild suites, and the `postgres-views` marker feature, which keeps any
+/// other writer off the store.
+#[tokio::test]
+async fn postgres_views_table_conforms() {
+    use photon_evt::{POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION};
+
+    let events = format!(
+        "vt{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let snapshots = format!("{events}_s");
+    let base = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    base.ensure_schema().await.unwrap();
+    let repository = base.clone().with_views_table();
+    assert!(repository.applies_expected_payload());
+    assert!(!base.applies_expected_payload());
+    let rows = || PgViewsTableRows(repository.view_repository());
+
+    commit_view_cases(&repository, &rows()).await;
+    expected_payload_cases(&repository, &rows()).await;
+    committed_view_cases(&repository, &repository.view_repository()).await;
+
+    // The first commit declared the feature, and every other writer now refuses the store.
+    let manifest = repository.read_manifest().await.unwrap().unwrap();
+    assert_eq!(
+        manifest.features.get(POSTGRES_VIEWS_FEATURE),
+        Some(&POSTGRES_VIEWS_VERSION)
+    );
+    let id = EntityId::new(format!("{events}-other-writer"));
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("account:opened"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: "account".into(),
+        payload: b"{}".to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    for other in [
+        PostgresRepository::new(base.pool().clone())
+            .with_tables(&events, &snapshots)
+            .unwrap(),
+        PostgresRepository::new(base.pool().clone())
+            .with_tables(&events, &snapshots)
+            .unwrap()
+            .with_view_writer(postgres_view_writer()),
+    ] {
+        assert!(
+            matches!(
+                other.commit(Commit::new(id.clone(), vec![event.clone()])).await,
+                Err(Error::UnsupportedFeature { ref feature, .. }) if feature == POSTGRES_VIEWS_FEATURE
+            ),
+            "a writer without the views table refuses the store"
+        );
+    }
+
+    // A clone that switches to a view writer refuses the store too, though its marker
+    // validation is cached from the views-table commits it was cloned from.
+    let switched = repository.clone().with_view_writer(postgres_view_writer());
+    assert!(
+        matches!(
+            switched.commit(Commit::new(id.clone(), vec![event.clone()])).await,
+            Err(Error::UnsupportedFeature { ref feature, .. }) if feature == POSTGRES_VIEWS_FEATURE
+        ),
+        "a clone switched to a view writer refuses the store"
+    );
+
+    // Initialization still works on the declared store (a deploy step treats it like any other),
+    // and a repository without the views table refuses the store on every other write path too.
+    assert!(
+        !repository.initialize().await.unwrap(),
+        "already initialized"
+    );
+    let plain = PostgresRepository::new(base.pool().clone())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    let foreign = |result: Result<_, Error>| matches!(result, Err(Error::UnsupportedFeature { ref feature, .. }) if feature == POSTGRES_VIEWS_FEATURE);
+    let snapshot = SerializedSnapshot {
+        entity_type: "account".into(),
+        entity_id: EntityId::new(format!("{events}-snapshot")),
+        sequence: EventSequence(0),
+        event_sequence: EventSequence(0),
+        payload: b"{}".to_vec(),
+    };
+    assert!(
+        foreign(plain.put_snapshot(&snapshot).await.map(drop)),
+        "a snapshot write"
+    );
+    {
+        use photon_evt::{ProjectedView, RebuildFence};
+
+        // A writer with its own view tables would rebuild into them: refused in the transaction.
+        let plain = plain.clone().with_view_writer(postgres_view_writer());
+        let lease = plain
+            .begin_rebuild("foreign", std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        let view = ProjectedView::new(
+            "rebuild",
+            0,
+            0,
+            ViewOperation::put(format!("{events}-rebuilt"), "VIEW", id.clone(), "", "{}"),
+        );
+        assert!(
+            foreign(plain.write_rebuild_views(&lease, &[view]).await),
+            "a rebuild view write"
+        );
+        plain.end_rebuild(&lease).await.unwrap();
+    }
+
+    // The rebuild fence and the projection rebuild, writing their rows to the views table.
+    let clock = TestClock::starting_now();
+    let rebuilds = repository.clone().with_clock(clock.reader());
+    Box::pin(
+        RebuildSuite::new(&rebuilds, &clock)
+            .with_views(rows())
+            .with_head_fixtures(PostgresHeads::new(base.pool().clone(), events.clone()))
+            .run(),
+    )
+    .await;
+    Box::pin(projection_rebuild_cases(&rebuilds, &clock, &rows())).await;
+
+    base.pool()
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, \
+             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, \
+             {events}__evt_views"
+        ))
+        .await
+        .unwrap();
 }
