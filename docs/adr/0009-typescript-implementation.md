@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-10-30). Tracking: the `TS` column of
+Accepted (2026-10-30). Tracking: the `TS` column of
 [`docs/reference/feature-matrix.md`](../reference/feature-matrix.md).
 
 ## Context
