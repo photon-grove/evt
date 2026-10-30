@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.1](https://github.com/photon-grove/evt/compare/photon-evt-v0.2.0...photon-evt-v0.2.1) (2026-10-30)
+
+
+### Features
+
+* **rust:** full projection rebuild under the rebuild fence, seeded from snapshots ([#213](https://github.com/photon-grove/evt/issues/213)) ([083786e](https://github.com/photon-grove/evt/commit/083786e1658a32b98bbfb9ce149d5a5340fedc43))
+* **rust:** per-aggregate snapshot interval, catch-up snapshots and load tracing ([#208](https://github.com/photon-grove/evt/issues/208)) ([492f1e7](https://github.com/photon-grove/evt/commit/492f1e7ae26f47ffbf93c6ee0a2c709796fc0ebb))
+* **rust:** rebuild views and the sync journal under one rebuild fence ([#228](https://github.com/photon-grove/evt/issues/228)) ([70b6e58](https://github.com/photon-grove/evt/commit/70b6e582aefe083acb851581b5a99f56ab7f6263))
+* **rust:** renew the lease during a journal rebuild ([#227](https://github.com/photon-grove/evt/issues/227)) ([517c2a8](https://github.com/photon-grove/evt/commit/517c2a814f89b026422be5a53266a3defe6b8191))
+
+
+### Bug Fixes
+
+* **postgres:** run engine transactions at READ COMMITTED whatever the server default ([#229](https://github.com/photon-grove/evt/issues/229)) ([27a30e0](https://github.com/photon-grove/evt/commit/27a30e0431a452c6aa41b2314d1705c929e53b20)), closes [#223](https://github.com/photon-grove/evt/issues/223)
+* **rust:** keep the read deadline from cutting a held commit's landing short ([#217](https://github.com/photon-grove/evt/issues/217)) ([9fb73e4](https://github.com/photon-grove/evt/commit/9fb73e41d91460de13115f8ef7cc5d96c35c0057)), closes [#216](https://github.com/photon-grove/evt/issues/216)
+
 ## [0.2.0](https://github.com/photon-grove/evt/compare/photon-evt-v0.1.0...photon-evt-v0.2.0) (2026-10-26)
 
 
