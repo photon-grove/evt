@@ -15,9 +15,9 @@ use evt_compat::drivers::{self, DynamoHeads, PostgresHeads};
 use futures_core::Stream as _;
 use photon_evt::conformance::{
     Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, RebuildSuite, Suite, TestClock,
-    ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, feature_marker_cases,
-    fresh_store_cases, initialization_cases, outcome_cases, projection_rebuild_cases,
-    view_repository_cases,
+    ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, expected_payload_cases,
+    feature_marker_cases, fresh_store_cases, initialization_cases, outcome_cases,
+    projection_rebuild_cases, view_repository_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
@@ -567,6 +567,8 @@ async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
         table: views.clone(),
     };
     commit_view_cases(&writer, &rows).await;
+    // The journal counter's condition, on the backend that defines it.
+    expected_payload_cases(&writer, &rows).await;
 
     // The rebuild fence (C10) over the same private tables, with an injected clock: the lock is
     // table-wide, and every case leaves it settled.
@@ -3795,6 +3797,163 @@ async fn postgres_view_repository_conforms() {
 
     repository
         .pool()
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, \
+             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, \
+             {events}__evt_views"
+        ))
+        .await
+        .unwrap();
+}
+
+/// The views table's rows through its view repository, for the commit-wide view cases.
+struct PgViewsTableRows(photon_evt::postgres::PgViewRepository);
+
+impl CommitViewTarget<PostgresRepository> for PgViewsTableRows {
+    async fn row(&self, pk: &str, sk: &str) -> Result<Option<ViewRow>, BoxError> {
+        Ok(self.0.get_view_at(pk, sk).await?)
+    }
+
+    fn max_view_key_bytes(&self) -> Option<usize> {
+        Some(photon_evt::wire::postgres::MAX_VIEW_INDEX_KEY_BYTES)
+    }
+}
+
+/// The evt-owned views table as the commit's view target (`with_views_table()`, ADR 0008): the
+/// commit-wide view cases (the byte budget included, since its statements count as DynamoDB
+/// items), the journal counter's expected-payload condition, the committed rows through
+/// `PgViewRepository`, the rebuild suites, and the `postgres-views` marker feature, which keeps any
+/// other writer off the store.
+#[tokio::test]
+async fn postgres_views_table_conforms() {
+    use photon_evt::{POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION};
+
+    let events = format!(
+        "vt{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let snapshots = format!("{events}_s");
+    let base = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    base.ensure_schema().await.unwrap();
+    let repository = base.clone().with_views_table();
+    assert!(repository.applies_expected_payload());
+    assert!(!base.applies_expected_payload());
+    let rows = || PgViewsTableRows(repository.view_repository());
+
+    commit_view_cases(&repository, &rows()).await;
+    expected_payload_cases(&repository, &rows()).await;
+    committed_view_cases(&repository, &repository.view_repository()).await;
+
+    // The first commit declared the feature, and every other writer now refuses the store.
+    let manifest = repository.read_manifest().await.unwrap().unwrap();
+    assert_eq!(
+        manifest.features.get(POSTGRES_VIEWS_FEATURE),
+        Some(&POSTGRES_VIEWS_VERSION)
+    );
+    let id = EntityId::new(format!("{events}-other-writer"));
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("account:opened"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: "account".into(),
+        payload: b"{}".to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    for other in [
+        PostgresRepository::new(base.pool().clone())
+            .with_tables(&events, &snapshots)
+            .unwrap(),
+        PostgresRepository::new(base.pool().clone())
+            .with_tables(&events, &snapshots)
+            .unwrap()
+            .with_view_writer(postgres_view_writer()),
+    ] {
+        assert!(
+            matches!(
+                other.commit(Commit::new(id.clone(), vec![event.clone()])).await,
+                Err(Error::UnsupportedFeature { ref feature, .. }) if feature == POSTGRES_VIEWS_FEATURE
+            ),
+            "a writer without the views table refuses the store"
+        );
+    }
+
+    // A clone that switches to a view writer refuses the store too, though its marker
+    // validation is cached from the views-table commits it was cloned from.
+    let switched = repository.clone().with_view_writer(postgres_view_writer());
+    assert!(
+        matches!(
+            switched.commit(Commit::new(id.clone(), vec![event.clone()])).await,
+            Err(Error::UnsupportedFeature { ref feature, .. }) if feature == POSTGRES_VIEWS_FEATURE
+        ),
+        "a clone switched to a view writer refuses the store"
+    );
+
+    // Initialization still works on the declared store (a deploy step treats it like any other),
+    // and a repository without the views table refuses the store on every other write path too.
+    assert!(
+        !repository.initialize().await.unwrap(),
+        "already initialized"
+    );
+    let plain = PostgresRepository::new(base.pool().clone())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    let foreign = |result: Result<_, Error>| matches!(result, Err(Error::UnsupportedFeature { ref feature, .. }) if feature == POSTGRES_VIEWS_FEATURE);
+    let snapshot = SerializedSnapshot {
+        entity_type: "account".into(),
+        entity_id: EntityId::new(format!("{events}-snapshot")),
+        sequence: EventSequence(0),
+        event_sequence: EventSequence(0),
+        payload: b"{}".to_vec(),
+    };
+    assert!(
+        foreign(plain.put_snapshot(&snapshot).await.map(drop)),
+        "a snapshot write"
+    );
+    {
+        use photon_evt::{ProjectedView, RebuildFence};
+
+        // A writer with its own view tables would rebuild into them: refused in the transaction.
+        let plain = plain.clone().with_view_writer(postgres_view_writer());
+        let lease = plain
+            .begin_rebuild("foreign", std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        let view = ProjectedView::new(
+            "rebuild",
+            0,
+            0,
+            ViewOperation::put(format!("{events}-rebuilt"), "VIEW", id.clone(), "", "{}"),
+        );
+        assert!(
+            foreign(plain.write_rebuild_views(&lease, &[view]).await),
+            "a rebuild view write"
+        );
+        plain.end_rebuild(&lease).await.unwrap();
+    }
+
+    // The rebuild fence and the projection rebuild, writing their rows to the views table.
+    let clock = TestClock::starting_now();
+    let rebuilds = repository.clone().with_clock(clock.reader());
+    Box::pin(
+        RebuildSuite::new(&rebuilds, &clock)
+            .with_views(rows())
+            .with_head_fixtures(PostgresHeads::new(base.pool().clone(), events.clone()))
+            .run(),
+    )
+    .await;
+    Box::pin(projection_rebuild_cases(&rebuilds, &clock, &rows())).await;
+
+    base.pool()
         .get()
         .await
         .unwrap()

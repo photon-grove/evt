@@ -885,6 +885,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conforms_to_the_expected_payload_condition() {
+        let repository = MemRepository::new();
+
+        crate::conformance::expected_payload_cases(&repository, &repository.clone()).await;
+    }
+
+    #[tokio::test]
     async fn conforms_to_the_view_repository() {
         let repository = MemRepository::new();
 

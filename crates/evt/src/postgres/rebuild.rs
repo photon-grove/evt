@@ -364,6 +364,10 @@ impl RebuildFence for PostgresRepository {
         let owner = lease.owner.as_str();
         rebuild::check_owner(owner)?;
         rebuild::check_view_batch(views)?;
+        if self.views_table_target {
+            self.ensure_stream_heads().await?;
+            self.ensure_views_declared().await?;
+        }
         let statements = self.view_statements(views)?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
@@ -374,6 +378,11 @@ impl RebuildFence for PostgresRepository {
         if !lock.is_some_and(|lock| lease.holds(&lock) && lock.lease_expires_at > now) {
             return Err(lease_lost(owner));
         }
+
+        // A store whose views live in the views table is rebuilt only through it, as it is
+        // committed to.
+        let manifest = self.read_manifest_in(&tx).await?;
+        self.refuse_foreign_views(manifest.as_ref())?;
 
         run_view_statements(&tx, &view_writes(views, &statements)).await?;
 

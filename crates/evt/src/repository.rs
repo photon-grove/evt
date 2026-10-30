@@ -720,8 +720,9 @@ pub trait Repository: Send + Sync {
     /// exactly those bytes, or the commit fails with [`Error::ProjectorOperation`]. The default is
     /// `false`, and the journal refuses to commit through a repository that does not opt in
     /// ([`Error::ExpectedPayloadUnsupported`]), so a backend that ignored the condition cannot
-    /// write an unconditional counter. The in-memory and DynamoDB repositories return `true`;
-    /// PostgreSQL does not. A wrapper must forward it.
+    /// write an unconditional counter. The in-memory and DynamoDB repositories return `true`, and so
+    /// does PostgreSQL with the views table (`with_views_table()`); with an application view writer
+    /// it does not. A wrapper must forward it.
     fn applies_expected_payload(&self) -> bool {
         false
     }
