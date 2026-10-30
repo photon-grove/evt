@@ -9,8 +9,12 @@ function, and builds the partial batch failure response Lambda resumes from. The
 ```toml
 [dependencies]
 # Add features = ["journal"] for journal wake-ups.
-photon-evt-lambda = "0.1"
+photon-evt-lambda = "0.2"
 ```
+
+Its API hands you `photon-evt` types (decoded events, journal wake-ups), so pick the release built
+against the `photon-evt` you use, and Cargo resolves both to one copy: `photon-evt-lambda` 0.2 for
+`photon-evt` 0.3, and 0.1 for `photon-evt` 0.2.
 
 There is no Lambda runtime or AWS SDK dependency. `StreamEvent` deserializes from the payload Lambda
 delivers and `BatchResponse` serializes to the response it expects, so you can wire both into
