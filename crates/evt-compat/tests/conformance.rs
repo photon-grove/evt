@@ -3887,6 +3887,17 @@ async fn postgres_views_table_conforms() {
         );
     }
 
+    // A clone that switches to a view writer refuses the store too, though its marker
+    // validation is cached from the views-table commits it was cloned from.
+    let switched = repository.clone().with_view_writer(postgres_view_writer());
+    assert!(
+        matches!(
+            switched.commit(Commit::new(id.clone(), vec![event.clone()])).await,
+            Err(Error::UnsupportedFeature { ref feature, .. }) if feature == POSTGRES_VIEWS_FEATURE
+        ),
+        "a clone switched to a view writer refuses the store"
+    );
+
     // Initialization still works on the declared store (a deploy step treats it like any other),
     // and a repository without the views table refuses the store on every other write path too.
     assert!(

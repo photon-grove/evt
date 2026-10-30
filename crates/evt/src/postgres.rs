@@ -661,6 +661,10 @@ impl PostgresRepository {
         } else if views {
             // The cache says nothing about postgres-views: check it on every commit.
             self.validate_for_write(observed, true)?;
+        } else {
+            // Nor does it know this handle's view target, which a clone can change
+            // (`with_view_writer` on a views-table repository): refuse a foreign store every time.
+            self.refuse_foreign_views(observed)?;
         }
 
         Ok(())
