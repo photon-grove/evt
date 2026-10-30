@@ -1465,6 +1465,7 @@ async fn a_rejection_that_commits_events_returns_them_with_their_allocations() {
     let page = repository.page(&scope("all"), 0, 10).await.unwrap();
     assert_eq!(page.rows[0].event, refused.events[0]);
     assert_eq!(page.rows[1].event, rejected.events[0]);
+}
 
 #[tokio::test]
 async fn a_diff_rebuild_with_the_journal_deletes_journal_rows_no_event_holds() {
