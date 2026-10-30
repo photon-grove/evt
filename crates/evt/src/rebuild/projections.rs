@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use futures_core::Stream;
 
-use super::{RebuildFence, RebuildGeneration, RebuildLease, lock_check_size, rebuild_batches};
+use super::{
+    Held, RebuildFailure, RebuildFence, RebuildLease, Renewing, check_renew, lock_check_size,
+    rebuild_batches,
+};
 use crate::aggregate::Aggregate;
 use crate::enumerate::{EventLog, StreamFilter, unfold};
 use crate::error::Error;
@@ -115,14 +118,15 @@ use crate::store::Loaded;
 ///   and in no order), fails the rebuild with [`Error::CompactionUncovered`] before anything is
 ///   written, because the snapshot cannot stand in for the commits it covers.
 ///
-/// Only streams of the [registered](ProjectionRebuild::aggregate) types are read: register every
-/// type whose streams own the projectors' rows, and every type a history-dependent projector
-/// names. Conditions are not evaluated: a put is written over the owner's row and a delete removes
+/// Only streams of the [registered](ProjectionRebuild::aggregate) types are read (and, with the
+/// journal, every event of the journal's entity types): register every type whose streams own the
+/// projectors' rows, and every type a history-dependent projector names. Conditions are not evaluated: a put is written over the owner's row and a delete removes
 /// it, so the rebuild can run over existing rows, and it is idempotent. It does not delete rows that
 /// no projector produces any more; wipe the projectors' rows first to rebuild from scratch.
 ///
 /// The run holds every row it will write in memory, and the history replay every event of its
-/// types, twice. Read the log strongly consistently (DynamoDB's default): an eventually consistent
+/// types, twice. With the journal it also holds every event of the journal's types, and each
+/// journal row, which carries its whole event. Read the log strongly consistently (DynamoDB's default): an eventually consistent
 /// read can miss a commit that landed just before the lock was taken, and the rebuilt row would
 /// then overwrite the newer one that commit wrote.
 ///
@@ -145,6 +149,8 @@ pub struct ProjectionRebuild<'r, R> {
     projectors: Vec<Arc<dyn CommitProjector>>,
     scopes: Vec<Arc<dyn Scope<R> + 'r>>,
     duplicate: Option<EntityType>,
+    #[cfg(feature = "journal")]
+    journal: Option<crate::journal::Journal>,
 }
 
 impl<R> fmt::Debug for ProjectionRebuild<'_, R> {
@@ -166,7 +172,29 @@ impl<R> fmt::Debug for ProjectionRebuild<'_, R> {
                     .map(|scope| scope.entity_type().clone())
                     .collect::<Vec<_>>(),
             )
+            .field("journal", &self.has_journal())
             .finish_non_exhaustive()
+    }
+}
+
+impl<R> ProjectionRebuild<'_, R> {
+    /// Whether the run rebuilds the journal too.
+    fn has_journal(&self) -> bool {
+        #[cfg(feature = "journal")]
+        return self.journal.is_some();
+
+        #[cfg(not(feature = "journal"))]
+        false
+    }
+
+    /// The entity types the journal reads, none without one.
+    fn journal_types(&self) -> &[EntityType] {
+        #[cfg(feature = "journal")]
+        if let Some(journal) = &self.journal {
+            return journal.entity_types();
+        }
+
+        &[]
     }
 }
 
@@ -184,6 +212,13 @@ pub struct RebuildReport {
     pub deletes: usize,
     /// Guarded batches written ([`RebuildFence::write_rebuild_views`] calls).
     pub batches: usize,
+    /// Events read from the log: every event of the types the history-dependent projectors and
+    /// the journal read, each counted once.
+    pub events: usize,
+    /// Journal rows the events imply (`with_journal`, with the `journal` cargo feature).
+    pub journal_rows: usize,
+    /// Journal scope counters the events imply.
+    pub journal_counters: usize,
 }
 
 impl<'r, R> ProjectionRebuild<'r, R>
@@ -197,15 +232,37 @@ where
             projectors: Vec::new(),
             scopes: Vec::new(),
             duplicate: None,
+            #[cfg(feature = "journal")]
+            journal: None,
         }
     }
 
     /// Adds a commit-wide projector. Projectors run in the order they are added, as on a store.
     /// One that reads the engine's own metadata ([`CommitProjector::engine_metadata`], the
-    /// journal's) is refused when the rebuild runs; rebuild the journal with its own rebuild.
+    /// journal's projector) is refused when the rebuild runs; rebuild the journal with
+    /// `with_journal` (the `journal` cargo feature).
     #[must_use]
     pub fn with_projector(mut self, projector: Arc<dyn CommitProjector>) -> Self {
         self.projectors.push(projector);
+        self
+    }
+
+    /// Rebuilds the sync journal (ADR 0005) in the same run, under the same lease: its rows and
+    /// counters are derived from every event of `journal`'s entity types
+    /// ([`journal::replay`](crate::journal::replay)), read under the lock, and written in the same
+    /// guarded batches as the views, so readers see one rebuild (one generation) for both. A
+    /// journal key that a view row also plans fails the run with [`Error::SharedViewKey`] (or
+    /// [`Error::DuplicateViewKey`] when the same stream owns both) before
+    /// anything is written. With a journal the rebuild may have no projectors: it then rebuilds the
+    /// journal alone, and needs no aggregate types.
+    ///
+    /// Pass the journal configuration the table's [`JournalRepository`](crate::journal::JournalRepository)
+    /// commits with; only its entity types are read. Like the journal's own rebuild, it restores
+    /// rows a journal compaction pruned, and does not touch the compaction partition.
+    #[cfg(feature = "journal")]
+    #[must_use]
+    pub fn with_journal(mut self, journal: crate::journal::Journal) -> Self {
+        self.journal = Some(journal);
         self
     }
 
@@ -254,66 +311,49 @@ where
     pub async fn run(&self, owner: &str, lease: Duration) -> Result<RebuildReport, Error> {
         self.check()?;
 
-        let before = self.repository.rebuild_generation().await?;
-        let mut held = self.repository.begin_rebuild(owner, lease).await?;
-        let from_settled = acquired_from_settled(before, &held);
-        let (result, touched) = self.fenced(&mut held, lease, Some(Instant::now())).await;
-        match result {
-            Ok(report) => {
-                self.repository.end_rebuild(&held).await?;
+        let mut held = Held::take(self.repository, owner, lease).await?;
+        let taken = held.taken;
+        let result = self.fenced(&mut held.lease, lease, Some(taken)).await;
 
-                Ok(report)
-            }
-            Err(error) => {
-                if from_settled && !touched {
-                    // The rows were complete when the run began and it attempted no write, so
-                    // settling the generation is safe. A failed release (a lost lease, say) leaves
-                    // the lock to lapse; the run's own error is the one to report.
-                    let _ = self.repository.end_rebuild(&held).await;
-                }
-
-                Err(error)
-            }
-        }
+        held.finish(self.repository, result).await
     }
 
     /// Rebuilds under a lease the caller took ([`begin_rebuild`](RebuildFence::begin_rebuild)) and
-    /// will end. The lease is renewed for `renew` (at least one second) when the run starts, and
-    /// again whenever half of `renew` has passed; `lease` is updated in place, so the caller ends
-    /// the renewed lease. On failure, keep the lock unless you know no batch was attempted **and**
-    /// your begin acquired the lock from a settled generation: a lease that took over an expired
-    /// one, or was acquired after a force-release, covers rows an earlier rebuild may have left
-    /// half-written, and only a completed rebuild may settle it.
+    /// will end, so one lease can cover this rebuild and other work. The lease is renewed for
+    /// `renew` (at least one second) when the run starts, and again whenever half of `renew` has
+    /// passed; `lease` is updated in place, so the caller ends the renewed lease.
+    ///
+    /// A failure says how many guarded batches were attempted ([`RebuildFailure::attempted`]).
+    /// Keep the lock unless no write was attempted under the lease (this run's or your own)
+    /// **and** your begin acquired the lock from a settled generation
+    /// ([`RebuildLease::acquired_from`]): a lease that took over an expired one, or was acquired
+    /// after a force-release, covers rows an earlier rebuild may have left half-written, and only
+    /// a completed rebuild may settle it.
     pub async fn run_with_lease(
         &self,
         lease: &mut RebuildLease,
         renew: Duration,
-    ) -> Result<RebuildReport, Error> {
-        self.check()?;
-        if renew < Duration::from_secs(1) {
-            return Err(Error::InvalidArgument(
-                "a rebuild lease is renewed for at least one second".into(),
-            ));
-        }
+    ) -> Result<RebuildReport, RebuildFailure> {
+        let unattempted = |error| RebuildFailure {
+            error: Box::new(error),
+            attempted: 0,
+            batches: 0,
+        };
+        self.check().map_err(unattempted)?;
+        check_renew(renew).map_err(unattempted)?;
 
-        self.fenced(lease, renew, None).await.0
+        self.fenced(lease, renew, None).await
     }
 
-    /// Rebuilds under `lease`, returning the result and whether a write was attempted (a failed
-    /// write may still have applied, so it counts). `renewed` is when the lease was last taken or
-    /// renewed; `None` renews it first.
+    /// Rebuilds under `lease`. `renewed` is when the lease was last taken or renewed; `None` renews
+    /// it first.
     async fn fenced(
         &self,
         lease: &mut RebuildLease,
         renew: Duration,
         renewed: Option<Instant>,
-    ) -> (Result<RebuildReport, Error>, bool) {
-        let mut output = Output::new(Target::Fence {
-            fence: self.repository,
-            lease,
-            renew,
-            renewed,
-        });
+    ) -> Result<RebuildReport, RebuildFailure> {
+        let mut output = Output::new(Some(Renewing::new(self.repository, lease, renew, renewed)));
 
         let result = match output.keep_alive().await {
             Ok(()) => match self.rebuild(&mut output).await {
@@ -323,7 +363,14 @@ where
             Err(error) => Err(error),
         };
 
-        (result.map(|()| output.report), output.touched)
+        match result {
+            Ok(()) => Ok(output.report),
+            Err(error) => Err(RebuildFailure {
+                error: Box::new(error),
+                attempted: output.attempted(),
+                batches: output.batches,
+            }),
+        }
     }
 
     /// A dry run: the operations a [`run`](ProjectionRebuild::run) would write, in order, without
@@ -332,7 +379,7 @@ where
     pub async fn operations(&self) -> Result<Vec<ProjectedView>, Error> {
         self.check()?;
 
-        let mut output = Output::new(Target::Collect);
+        let mut output = Output::new(None);
         self.rebuild(&mut output).await?;
 
         Ok(output.planned)
@@ -342,17 +389,19 @@ where
     fn check(&self) -> Result<(), Error> {
         let invalid = |message: String| Err(Error::InvalidConfig(message));
 
-        if self.projectors.is_empty() {
-            return invalid("a projection rebuild needs at least one commit-wide projector".into());
+        if self.projectors.is_empty() && !self.has_journal() {
+            return invalid(
+                "a projection rebuild needs at least one commit-wide projector or a journal".into(),
+            );
         }
         if let Some(projector) = self.projectors.iter().find(|p| p.reads_engine_metadata()) {
             return invalid(format!(
-                "projector {:?} reads engine metadata (the journal's); rebuild the journal with its \
-                 own rebuild",
+                "projector {:?} reads engine metadata (the journal's); rebuild the journal with \
+                 `with_journal`",
                 projector.name()
             ));
         }
-        if self.scopes.is_empty() {
+        if self.scopes.is_empty() && !self.projectors.is_empty() {
             return invalid("a projection rebuild needs at least one aggregate type".into());
         }
         if let Some(entity_type) = &self.duplicate {
@@ -397,13 +446,51 @@ where
             .filter(|(_, projector)| !projector.history().is_empty())
             .collect();
 
-        // The history replay reads every event of its types and checks them before anything is
-        // written, so a compacted stream fails the rebuild with nothing written.
+        let history_types: BTreeSet<EntityType> = history
+            .iter()
+            .flat_map(|(_, projector)| projector.history().iter().cloned())
+            .collect();
+
+        // Every event the history replay and the journal read, each type read once. The history
+        // replay's types are checked to run from sequence 1 to the head, so a compacted stream
+        // fails the rebuild with nothing written.
+        let mut events: BTreeMap<EntityType, Vec<SerializedEvent>> = BTreeMap::new();
+        for entity_type in &history_types {
+            events.insert(entity_type.clone(), self.whole_history(entity_type).await?);
+            output.keep_alive().await?;
+        }
+        for entity_type in self.journal_types() {
+            if !events.contains_key(entity_type) {
+                events.insert(entity_type.clone(), self.all_events(entity_type).await?);
+                output.keep_alive().await?;
+            }
+        }
+        output.report.events = events.values().map(Vec::len).sum();
+
+        #[cfg(feature = "journal")]
+        let journal = match &self.journal {
+            Some(journal) => Some(crate::journal::replay(
+                journal
+                    .entity_types()
+                    .iter()
+                    .filter_map(|entity_type| events.get(entity_type))
+                    .flatten(),
+            )?),
+            None => None,
+        };
+
         let replayed = if history.is_empty() {
             None
         } else {
-            Some(self.replay_history(&history, output).await?)
+            let replayed: Vec<SerializedEvent> = history_types
+                .iter()
+                .filter_map(|entity_type| events.remove(entity_type))
+                .flatten()
+                .collect();
+
+            Some(self.replay_history(&history, replayed, output).await?)
         };
+        drop(events);
 
         if !current.is_empty() {
             for scope in &self.scopes {
@@ -436,27 +523,26 @@ where
             }
         }
 
+        #[cfg(feature = "journal")]
+        if let Some(journal) = journal {
+            output.report.journal_rows = journal.rows.len();
+            output.report.journal_counters = journal.counters.len();
+            for item in crate::journal::operations(&journal) {
+                output.plan(item)?;
+            }
+        }
+
         Ok(())
     }
 
-    /// Replays every commit of the history-dependent projectors' types and returns the rows the
-    /// replay leaves, with the number of commits replayed.
+    /// Replays every commit of `events`, the history-dependent projectors' types, and returns the
+    /// rows the replay leaves, with the number of commits replayed.
     async fn replay_history(
         &self,
         projectors: &[(usize, &Arc<dyn CommitProjector>)],
+        events: Vec<SerializedEvent>,
         output: &mut Output<'_, R>,
     ) -> Result<(ViewReplay, usize), Error> {
-        let types: BTreeSet<EntityType> = projectors
-            .iter()
-            .flat_map(|(_, projector)| projector.history().iter().cloned())
-            .collect();
-
-        let mut events = Vec::new();
-        for entity_type in &types {
-            events.extend(self.whole_history(entity_type).await?);
-            output.keep_alive().await?;
-        }
-
         let commits = group_commits(events)?;
         let count = commits.len();
         let mut folds: HashMap<EntityId, Box<dyn Fold>> = HashMap::new();
@@ -492,6 +578,21 @@ where
         }
 
         Ok((replay, count))
+    }
+
+    /// Every stored event of one type, in no particular order, for the journal: its rows are a
+    /// function of the events' stored allocations, whatever was compacted.
+    async fn all_events(&self, entity_type: &EntityType) -> Result<Vec<SerializedEvent>, Error> {
+        let mut events = Vec::new();
+        let mut batches = pin!(
+            self.repository
+                .stream_all_events(StreamFilter::of_type(entity_type.clone()))
+        );
+        while let Some(batch) = poll_fn(|cx| batches.as_mut().poll_next(cx)).await {
+            events.extend(batch?);
+        }
+
+        Ok(events)
     }
 
     /// Every event of every stream of one type, failing with [`Error::CompactionUncovered`] when a
@@ -553,18 +654,6 @@ where
     }
 }
 
-/// Reports whether `held` was acquired from the settled generation `before`, read just before the
-/// begin, rather than taken over from an expired lease or acquired from a force-released
-/// generation, either of which may have left the rows half-written.
-///
-/// The generation only grows, and a begin adds one to the generation it observed only when that
-/// generation was settled (two for a takeover or from a force-release). So a lease of exactly
-/// `before + 1` over a settled `before` was acquired from it. Any other lease (a transition landed
-/// between the read and the begin) counts as not settled, which only keeps the fence.
-fn acquired_from_settled(before: RebuildGeneration, held: &RebuildLease) -> bool {
-    before.is_settled() && held.generation == before.value + 1
-}
-
 /// The operation a rebuild writes: the same row without its condition or mapped error, because a
 /// replay applies what the live commits wrote rather than evaluating them again.
 fn unconditioned(item: ProjectedView) -> ProjectedView {
@@ -579,37 +668,33 @@ fn unconditioned(item: ProjectedView) -> ProjectedView {
     ProjectedView { op, ..item }
 }
 
-/// Where a rebuild's operations go: collected for a dry run, or written under the lease.
-enum Target<'a, R> {
-    Collect,
-    Fence {
-        fence: &'a R,
-        lease: &'a mut RebuildLease,
-        renew: Duration,
-        renewed: Option<Instant>,
-    },
-}
-
-/// A rebuild's planned operations, checked across the whole run, then written in batches.
+/// A rebuild's planned operations, checked across the whole run, then written in batches under
+/// the lease, or only collected for a dry run.
 struct Output<'a, R> {
-    target: Target<'a, R>,
+    /// The lease the operations are written under; `None` for a dry run.
+    fence: Option<Renewing<'a, R>>,
     planned: Vec<ProjectedView>,
     /// Each planned key: its owner and the provenance of the operation that planned it.
     keys: HashMap<(String, String), (EntityId, String, usize)>,
-    /// Whether a write was attempted.
-    touched: bool,
+    /// The batches the plan splits into, once it is complete.
+    batches: usize,
     report: RebuildReport,
 }
 
 impl<'a, R: RebuildFence> Output<'a, R> {
-    fn new(target: Target<'a, R>) -> Self {
+    fn new(fence: Option<Renewing<'a, R>>) -> Self {
         Self {
-            target,
+            fence,
             planned: Vec::new(),
             keys: HashMap::new(),
-            touched: false,
+            batches: 0,
             report: RebuildReport::default(),
         }
+    }
+
+    /// The guarded batches attempted.
+    fn attempted(&self) -> usize {
+        self.fence.as_ref().map_or(0, |fence| fence.attempted)
     }
 
     /// Plans one operation, refusing what no batch could write: a key the run already planned
@@ -661,37 +746,27 @@ impl<'a, R: RebuildFence> Output<'a, R> {
         Ok(())
     }
 
-    /// Renews the lease when half of it has passed since it was taken or last renewed (at once
-    /// when that time is unknown), so a long read does not let it lapse.
+    /// Renews the lease when half of it has passed (see [`Renewing::keep_alive`]); a dry run has
+    /// none.
     async fn keep_alive(&mut self) -> Result<(), Error> {
-        if let Target::Fence {
-            fence,
-            lease,
-            renew,
-            renewed,
-        } = &mut self.target
-            && renewed.is_none_or(|at| at.elapsed() >= *renew / 2)
-        {
-            **lease = fence.renew_rebuild(lease, *renew).await?;
-            *renewed = Some(Instant::now());
+        match &mut self.fence {
+            Some(fence) => fence.keep_alive().await,
+            None => Ok(()),
         }
-
-        Ok(())
     }
 
     /// Writes the planned operations in guarded batches of at most [`MAX_REBUILD_VIEW_BATCH`](crate::MAX_REBUILD_VIEW_BATCH)
     /// operations that fit the commit byte budget with the lease guard.
     async fn write(&mut self) -> Result<(), Error> {
         let planned = std::mem::take(&mut self.planned);
+        let batches: Vec<&[ProjectedView]> = rebuild_batches(&planned).collect();
+        self.batches = batches.len();
 
-        for batch in rebuild_batches(&planned) {
-            self.keep_alive().await?;
-            let Target::Fence { fence, lease, .. } = &self.target else {
-                return Ok(());
-            };
-
-            self.touched = true;
-            fence.write_rebuild_views(lease, batch).await?;
+        let Some(fence) = &mut self.fence else {
+            return Ok(());
+        };
+        for batch in batches {
+            fence.write(batch).await?;
             self.report.batches += 1;
         }
 

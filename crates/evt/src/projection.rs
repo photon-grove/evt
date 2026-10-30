@@ -111,8 +111,9 @@ pub struct ViewOperation {
     /// be the owner's, and hold exactly these payload bytes. It is private to the crate, so a
     /// projector cannot set it; only the journal does. A repository that writes the journal must
     /// apply it in the commit (DynamoDB: `entityID = :owner AND payload = :expected`) and say so
-    /// ([`Repository::applies_expected_payload`](crate::Repository::applies_expected_payload));
-    /// PostgreSQL refuses the operation with [`Error::InvalidViewOperation`].
+    /// ([`Repository::applies_expected_payload`](crate::Repository::applies_expected_payload)).
+    /// PostgreSQL applies it with the views table (`with_views_table()`), and an application view
+    /// writer refuses the operation with [`Error::InvalidViewOperation`].
     ///
     /// ```compile_fail,E0616
     /// use photon_evt::ViewOperation;

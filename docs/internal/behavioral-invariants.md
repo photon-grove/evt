@@ -353,6 +353,13 @@ error before any write and is never split.
 - A multi-stream command begins with the outcome pre-check (`BeginCommand` /
   `Transaction::begin_command`) before any read, append, or fence; a transaction whose pre-check
   returned a stored outcome is finished and accepts no further work
+- The pre-check is public as a lookup by identity (`Store.ResolveCommand` /
+  `Store::resolve_command`): it validates the identity and command ID as execution does, digests
+  with the store's digester, reads the row strongly consistent, and writes nothing. The same
+  digest returns the stored outcome (replayed), another digest (another payload, target, or
+  principal) is `IdempotencyKeyReuse` carrying it, and no row is "not found", never "did not
+  apply". A single-aggregate command resolves the same way with its identity (type, the one entity
+  as the only target, payload); Rust's `resolve_outcome` and `CommandIdentity::for_command` build it
 - The outcome-row check covers commands executed with outcomes enabled, including IDs folded into
   snapshots and compacted away; on an upgraded log the load-time event window remains the only
   guard for pre-v0.9 IDs, and it sees only those after the latest snapshot
@@ -366,6 +373,11 @@ error before any write and is never split.
   a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust
   `Error::Indeterminate`). A definitive failure (validation, a missing table or relation,
   authorization, a constraint error other than the outcome-row conflict) is returned as is
+- Every PostgreSQL transaction that writes or checks a fence runs at `READ COMMITTED`, set
+  explicitly, so its fence reads after an advisory-lock wait see what committed during the wait,
+  whatever the server's default isolation (Go's read-only stream-head scans keep their
+  `REPEATABLE READ READ ONLY` snapshot, and an ambient Go transaction at a stricter level is
+  refused)
 - U+0000 in a command ID, a digest, any persisted metadata string (principal, causation, extension
   keys and values, ...), or a rejection's code, message, details strings, or details keys is
   `ErrInvalidArgument` / `Error::InvalidArgument` on every backend (PostgreSQL cannot store it),
@@ -504,6 +516,13 @@ error before any write and is never split.
   default): a load that replays at least the threshold writes a standalone, monotonic snapshot of
   the folded state at sequence `seq + 1`; a failed write is logged and never fails the load. Rust's
   loaded state then carries the new `seq`; Go's does not
+- An oversized snapshot is skipped, never a failed commit: before staging a snapshot (commit,
+  transaction, outcome commit, or catch-up), the store measures its item as the commit preflight
+  does plus the widest `ttl` (Go `evt.SnapshotCommitSize`, Rust `snapshot_commit_size`). Over
+  380,000 bytes (`MaxCommitItemBytes` / `MAX_COMMIT_ITEM_BYTES`) the snapshot is left out with a
+  warning, the commit proceeds as one that does not reach the interval, and the snapshot sequence
+  does not advance. Same rule on every backend. Aggregate state must stay bounded; unbounded
+  history belongs in events
 
 ### Snapshot Creation
 
@@ -666,6 +685,13 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   grouping. The scope resolver is a pure function of the event and is never consulted after the
   commit. The engine replaces the key on every event a journaled commit writes, so it cannot be
   forged.
+- **A commit returns its events as stored.** `Repository::commit_with_receipt` and
+  `commit_transaction_with_receipt` return the events exactly as written, in persisted order
+  (stream ID bytewise, then sequence); the defaults return the commit's own events, and
+  `JournalRepository` overrides both to return the attempt that committed, allocations included.
+  `Executed::events`, `CommandOutcome::events` and `Transaction::commit` hand back those events, so
+  every returned allocation equals the row a `page` read finds at that position. Wrappers must
+  forward both methods. A replayed or recovered outcome returns no events.
 - **Rows and counters commit with the events.** Journal rows come from a history-dependent
   commit-wide projector: owned by the event's stream, written only if absent, owner never changes.
   Counters (the highest position per scope) are shared by every stream of a scope, so they are
@@ -700,7 +726,14 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 - **Rebuilds run under the rebuild lock.** `rebuild` writes rows and counters unconditionally
   through the lease-guarded `write_rebuild_views` (owner and fencing token, at most 99 operations a
   batch); live commits fail with `RebuildInProgress` while the lock is held, and consumers read with
-  `page_at_epoch` / `high_watermark_at_epoch`. A failed rebuild keeps the lock. Enable the journal before writing the events it covers: earlier events have no row and no gap.
+  `page_at_epoch` / `high_watermark_at_epoch`. `rebuild_with_lock` and `rebuild_with_lease` renew
+  the lease before a batch once half of it has passed, and a lost renewal stops the run before
+  another write. A failed rebuild keeps the lock once it attempted a write, or when it took over a
+  lapsed lease or acquired after a force-release; only one that acquired from a settled generation
+  and failed before its first write releases it. `rebuild_with_lease` reports the batches it
+  attempted so a caller holding the lease applies the same rule. `ProjectionRebuild::with_journal`
+  rebuilds the journal with commit-wide views under one lease and one generation, from events it
+  reads under the lock; a key both would write fails the run before any write. Enable the journal before writing the events it covers: earlier events have no row and no gap.
 - **Live and replayed projector views agree.** The `evt.journal` allocation is added after the
   store runs the application's projectors, so no projector but the journal's own is shown it
   (`CommitProjector::engine_metadata`, sealed by a crate-private token so an application projector
@@ -828,6 +861,10 @@ evt.Metadata{
 - Snapshot conditional for later snapshots: `seq = :seq`, where `:seq` is the new sequence minus
   one. Continuity and the floor are the head update's, so the snapshot put carries the sequence
   chain only
+- PostgreSQL enforces the same chain: under the entity's advisory lock the commit reads the stored
+  snapshot's `sequence` before the upsert and refuses anything but 1 (no row) or stored + 1 with a
+  transient-classified `ConflictError` (Rust `Error::Conflict`). The in-memory repositories do the
+  same, and the conformance suites check it on every backend
 
 ### GetEvents
 

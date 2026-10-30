@@ -54,6 +54,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
 	t.Run("WriteSetIsNotIdentity", func(t *testing.T) { testWriteSetIsNotIdentity(t, outcomes(t)) })
+	t.Run("ResolveByIdentity", func(t *testing.T) { testResolveByIdentity(t, outcomes(t)) })
 	t.Run("EngineFilledConflictRePrepares", func(t *testing.T) { testEngineFilledRePrepare(t, outcomes(t)) })
 	t.Run("CallerFencedConflictFailsFast", func(t *testing.T) { testCallerFencedFailsFast(t, outcomes(t), enforcesConcurrency) })
 	t.Run("ExhaustedRetriesPersistStaleRejection", func(t *testing.T) { testExhaustedRetries(t, outcomes(t)) })
@@ -276,6 +277,105 @@ func (l *ledger) Handle(ctx context.Context, command evt.Command) (evt.CommandRe
 // recoveryWait is the ambiguous-write polling window the suite's stores use: long enough to catch
 // a commit that lands a moment after the caller gave up, short enough to keep the suite quick.
 const recoveryWait = 300 * time.Millisecond
+
+// ResolveCommand answers a transaction command's outcome from its identity alone, as a retry of the
+// command would: the stored outcome for the same identity, an *evt.IdempotencyKeyReuseError for
+// another payload or another principal, and nil for an unknown command ID. Nothing it does writes.
+func testResolveByIdentity(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newOutcomeEnv(t, repo, 0)
+	second := snapshots.NewStore(repo, 0).WithOutcomes(snapshots.WithRecoveryWait(recoveryWait))
+
+	other := evt.EntityID(env.ns + "-aaa-first")
+	identity := evt.CommandIdentity{
+		Type: "ledger:pair", Targets: []evt.EntityID{env.id, other}, Payload: map[string]int{"amount": 2},
+	}
+	id := env.commandID("resolve")
+	metadata := withCommand(id)
+	principal := evt.PrincipalID("user:1")
+	metadata.PrincipalID = &principal
+
+	prepare := func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+		for _, stream := range []evt.EntityID{env.id, other} {
+			if err := tx.Read(ctx, newLedger(stream), stream); err != nil {
+				return nil, err
+			}
+
+			if err := tx.Append(stream, &ledgerEvent{Kind: "deposited", Amount: 2}); err != nil {
+				return nil, err
+			}
+		}
+
+		return []byte("paired"), nil
+	}
+
+	before, err := env.store.ResolveCommand(ctx, identity, metadata)
+	require.NoError(t, err)
+	require.Nil(t, before, "a command that never ran is not found")
+
+	first, err := env.store.ExecuteTransaction(ctx, identity, metadata, prepare)
+	require.NoError(t, err)
+	require.True(t, first.Accepted())
+	require.False(t, first.Replayed)
+
+	// The same identity resolves to the stored outcome, on either store, and a retry agrees.
+	for _, store := range []*snapshots.Store{env.store, second} {
+		resolved, resolveErr := store.ResolveCommand(ctx, identity, metadata)
+		require.NoError(t, resolveErr)
+		require.NotNil(t, resolved, "the stored outcome is found")
+		require.True(t, resolved.Replayed)
+		require.Equal(t, first.Outcome, resolved.Outcome)
+		require.Equal(t, []byte("paired"), resolved.Response)
+	}
+
+	retried, err := env.store.ExecuteTransaction(ctx, identity, metadata, prepare)
+	require.NoError(t, err)
+	require.True(t, retried.Replayed)
+	require.Equal(t, first.Outcome, retried.Outcome)
+
+	// Another payload, another target, or another principal under the same command ID is another
+	// command, on either store, and a retry of it is refused the same way.
+	otherPayload := identity
+	otherPayload.Payload = map[string]int{"amount": 3}
+
+	otherTargets := identity
+	otherTargets.Targets = []evt.EntityID{env.id}
+
+	otherPrincipal := withCommand(id)
+	someoneElse := evt.PrincipalID("user:2")
+	otherPrincipal.PrincipalID = &someoneElse
+
+	cases := []struct {
+		name     string
+		identity evt.CommandIdentity
+		metadata evt.Metadata
+	}{
+		{"another payload", otherPayload, metadata},
+		{"another target", otherTargets, metadata},
+		{"another principal", identity, otherPrincipal},
+		{"no principal", identity, withCommand(id)},
+	}
+
+	for _, store := range []*snapshots.Store{env.store, second} {
+		for _, reused := range cases {
+			_, resolveErr := store.ResolveCommand(ctx, reused.identity, reused.metadata)
+
+			var reuse *evt.IdempotencyKeyReuseError
+			require.ErrorAs(t, resolveErr, &reuse, reused.name)
+			require.Equal(t, first.Outcome, reuse.Prior, reused.name)
+		}
+	}
+
+	_, err = env.store.ExecuteTransaction(ctx, otherPayload, metadata, prepare)
+	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse, "a retry with another payload")
+
+	_, err = env.store.ExecuteTransaction(ctx, identity, otherPrincipal, prepare)
+	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse, "a retry by another principal")
+
+	// Nothing above wrote anything.
+	require.Len(t, env.events(t, env.id), 1)
+	require.Len(t, env.events(t, other), 1)
+}
 
 // --- helpers ---
 

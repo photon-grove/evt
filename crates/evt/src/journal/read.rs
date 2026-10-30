@@ -16,8 +16,9 @@ pub const MAX_PAGE_ROWS: usize = 1000;
 /// A backend that holds a journal: it reads a scope's counter and its rows, strongly consistently,
 /// from the views table the commit path writes to.
 ///
-/// [`MemRepository`](crate::MemRepository) and the DynamoDB repository
-/// ([`DynamoRepository`](crate::dynamodb::DynamoRepository), with a views table) implement it.
+/// [`MemRepository`](crate::MemRepository), the DynamoDB repository
+/// ([`DynamoRepository`](crate::dynamodb::DynamoRepository), with a views table) and the PostgreSQL
+/// repository (with `with_views_table()`) implement it.
 /// Application code calls [`high_watermark`] and [`page`] rather than these two reads.
 pub trait JournalStore: Send + Sync {
     /// The scope's counter: the highest position allocated, `0` when the scope has none. Strongly
@@ -62,7 +63,8 @@ pub trait JournalStore: Send + Sync {
 /// store that cannot read the floor fails to compile with them instead of skipping the `410 Gone`
 /// check or allocating below a floor. [`JournalStore`] itself is unchanged since X1.
 ///
-/// [`MemRepository`](crate::MemRepository) and the DynamoDB repository implement it.
+/// [`MemRepository`](crate::MemRepository), the DynamoDB repository and the PostgreSQL repository
+/// (with their views tables) implement it.
 pub trait JournalCompactionStore: JournalStore {
     /// The row at `sort_key` in the scope's compaction partition (`journal-compaction#<scope>`),
     /// as stored, strongly consistent. Callers check it is the engine's

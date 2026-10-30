@@ -601,8 +601,73 @@ fn stream_sizes<Op>(
 /// The most bytes one commit (or one guarded rebuild write) may carry, summed over its actions.
 pub(crate) const MAX_COMMIT_BYTES: usize = 3_800_000;
 
-/// The most bytes one action of a commit may carry.
-pub(crate) const MAX_COMMIT_ITEM_BYTES: usize = 380_000;
+/// The most bytes one action of a commit may carry: 95% of DynamoDB's 400 KB item limit. A commit
+/// with a larger item fails with [`Error::CommitTooLarge`] on every backend.
+pub const MAX_COMMIT_ITEM_BYTES: usize = 380_000;
+
+/// Returns the bytes the commit preflight would budget for the snapshot's item, counting a `ttl`
+/// attribute at its widest whether or not the entity type is retained. A [`Store`](crate::Store)
+/// or [`Transaction`](crate::Transaction) writes a snapshot with a commit only when this is at
+/// most [`MAX_COMMIT_ITEM_BYTES`]: a larger one would fail every commit that carries it with
+/// [`Error::CommitTooLarge`], so the snapshot is left out and the commit proceeds without it
+/// (storage spec, Snapshot policy).
+///
+/// # Errors
+///
+/// [`Error::Payload`] when the payload is not UTF-8.
+pub fn snapshot_commit_size(snapshot: &SerializedSnapshot) -> Result<usize, Error> {
+    Ok(item_size(&crate::wire::dynamo::snapshot_item(
+        snapshot,
+        Some(i64::MAX),
+    )?))
+}
+
+/// Whether a snapshot's item fits the per-item commit budget ([`snapshot_commit_size`]). A
+/// snapshot that does not is logged: the store skips it, and the stream's loads replay from the
+/// snapshot before it until the aggregate's state shrinks below the budget.
+pub(crate) fn snapshot_fits(snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+    let size = snapshot_commit_size(snapshot)?;
+    if size <= MAX_COMMIT_ITEM_BYTES {
+        return Ok(true);
+    }
+
+    tracing::warn!(
+        entity_type = snapshot.entity_type.as_str(),
+        entity_id = snapshot.entity_id.as_str(),
+        sequence = snapshot.sequence.0,
+        event_sequence = snapshot.event_sequence.0,
+        bytes = size,
+        limit = MAX_COMMIT_ITEM_BYTES,
+        "snapshot skipped: its item is over the per-item commit budget"
+    );
+
+    Ok(false)
+}
+
+impl NewSnapshot {
+    /// Keeps this snapshot of `entity_id` at `event_sequence` (the commit's last event) when its
+    /// item fits the per-item commit budget, and drops it otherwise ([`snapshot_fits`]).
+    pub(crate) fn within_budget(
+        self,
+        entity_id: &EntityId,
+        event_sequence: EventSequence,
+    ) -> Result<Option<Self>, Error> {
+        let snapshot = SerializedSnapshot {
+            entity_type: self.entity_type,
+            entity_id: entity_id.clone(),
+            sequence: self.sequence,
+            event_sequence,
+            payload: self.payload,
+        };
+        let fits = snapshot_fits(&snapshot)?;
+
+        Ok(fits.then_some(Self {
+            entity_type: snapshot.entity_type,
+            sequence: snapshot.sequence,
+            payload: snapshot.payload,
+        }))
+    }
+}
 
 pub(crate) fn check_budget(sizes: impl IntoIterator<Item = usize>) -> Result<(), Error> {
     let mut actions = 0usize;
@@ -642,6 +707,63 @@ pub(crate) fn item_size(item: &crate::wire::dynamo::Item) -> usize {
         .sum()
 }
 
+/// What a repository stored for one commit: its events exactly as they were written, which can
+/// differ from the events the commit was built with. A
+/// [`JournalRepository`](crate::journal::JournalRepository) writes each event's journal
+/// allocations into its metadata (`evt.journal`) as it commits, so only the receipt carries them;
+/// read them back with [`journal::allocations`](crate::journal::allocations).
+///
+/// The events are in the order the commit persists them: stream ID bytewise, then sequence. A
+/// commit that writes no event (an outcome-only commit, a fence-only transaction) has none.
+///
+/// Returned by [`Repository::commit_with_receipt`] and
+/// [`Repository::commit_transaction_with_receipt`]. The store hands back the same events as
+/// [`Executed::events`](crate::Executed::events),
+/// [`CommandOutcome::events`](crate::CommandOutcome::events), and the return of
+/// [`Transaction::commit`](crate::Transaction::commit).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommitReceipt {
+    /// The committed events, as stored.
+    pub events: Vec<SerializedEvent>,
+}
+
+impl CommitReceipt {
+    /// A receipt for the events a commit stored.
+    pub fn new(events: Vec<SerializedEvent>) -> Self {
+        Self { events }
+    }
+
+    /// The receipt of a commit that stores its events exactly as given: the default of
+    /// [`Repository::commit_with_receipt`].
+    fn of_commit<Op>(commit: &Commit<Op>) -> Self {
+        Self::new(commit.events.clone())
+    }
+
+    /// The receipt of a transaction that stores its events exactly as given, in persisted order:
+    /// the default of [`Repository::commit_transaction_with_receipt`].
+    fn of_transaction<Op>(commit: &TransactionCommit<Op>) -> Self {
+        let mut streams: Vec<&Commit<Op>> = commit
+            .streams
+            .iter()
+            .filter(|stream| !stream.events.is_empty())
+            .collect();
+        streams.sort_by(|a, b| {
+            a.entity_id
+                .as_str()
+                .as_bytes()
+                .cmp(b.entity_id.as_str().as_bytes())
+        });
+
+        Self::new(
+            streams
+                .into_iter()
+                .flat_map(|stream| stream.events.iter().cloned())
+                .collect(),
+        )
+    }
+}
+
 /// An append-only event log with one optional snapshot per entity and one head per stream (ADR
 /// 0007).
 ///
@@ -658,8 +780,8 @@ pub(crate) fn item_size(item: &crate::wire::dynamo::Item) -> usize {
 /// - report a stream whose head disagrees with its events or snapshot as
 ///   [`Error::StreamHeadDrift`], never retried, ranked above a gap and any other conflict;
 /// - reject a snapshot whose sequence is not the stored snapshot's sequence plus one (or 1 when
-///   there is no stored snapshot) with [`Error::Conflict`] (DynamoDB), or keep the stored snapshot's event sequence monotonic
-///   (PostgreSQL, where the head conflict already covers racing writers);
+///   there is no stored snapshot) with [`Error::Conflict`] (DynamoDB's condition, PostgreSQL's
+///   read under the entity lock, and the in-memory check alike);
 /// - write events, head, snapshot, and operations atomically;
 /// - refuse an out-of-band snapshot that the stream's head does not cover with
 ///   [`Error::StreamHeadDrift`] (a snapshot of event sequence 0 needs no head);
@@ -704,6 +826,40 @@ pub trait Repository: Send + Sync {
         }
     }
 
+    /// Commits like [`commit`](Self::commit), and returns the events as stored
+    /// ([`CommitReceipt`]). The default commits and returns the commit's own events, which is
+    /// right for a repository that stores them as given (the in-memory, DynamoDB, and PostgreSQL
+    /// repositories). A repository that rewrites events as it commits, such as the journal's,
+    /// overrides it. A wrapper must forward it, or its callers get the events as they were built.
+    fn commit_with_receipt(
+        &self,
+        commit: Commit<Self::Operation>,
+    ) -> impl Future<Output = Result<CommitReceipt, Error>> + Send {
+        let receipt = CommitReceipt::of_commit(&commit);
+
+        async move {
+            self.commit(commit).await?;
+
+            Ok(receipt)
+        }
+    }
+
+    /// Commits like [`commit_transaction`](Self::commit_transaction), and returns the events as
+    /// stored, in persisted order ([`CommitReceipt`]). The default and the forwarding rule are
+    /// those of [`commit_with_receipt`](Self::commit_with_receipt).
+    fn commit_transaction_with_receipt(
+        &self,
+        commit: TransactionCommit<Self::Operation>,
+    ) -> impl Future<Output = Result<CommitReceipt, Error>> + Send {
+        let receipt = CommitReceipt::of_transaction(&commit);
+
+        async move {
+            self.commit_transaction(commit).await?;
+
+            Ok(receipt)
+        }
+    }
+
     /// Whether the repository writes the commit-wide view operations of [`Commit::views`] and
     /// [`TransactionCommit::views`] atomically with the events (or refuses them with
     /// [`Error::ViewsNotConfigured`] when it has nowhere to write them). The default is `false`: a
@@ -720,8 +876,9 @@ pub trait Repository: Send + Sync {
     /// exactly those bytes, or the commit fails with [`Error::ProjectorOperation`]. The default is
     /// `false`, and the journal refuses to commit through a repository that does not opt in
     /// ([`Error::ExpectedPayloadUnsupported`]), so a backend that ignored the condition cannot
-    /// write an unconditional counter. The in-memory and DynamoDB repositories return `true`;
-    /// PostgreSQL does not. A wrapper must forward it.
+    /// write an unconditional counter. The in-memory and DynamoDB repositories return `true`, and so
+    /// does PostgreSQL with the views table (`with_views_table()`); with an application view writer
+    /// it does not. A wrapper must forward it.
     fn applies_expected_payload(&self) -> bool {
         false
     }
@@ -871,6 +1028,14 @@ macro_rules! forward_repository {
 
             fn commit_transaction(&self, commit: TransactionCommit<Self::Operation>) -> impl Future<Output = Result<(), Error>> + Send {
                 (**self).commit_transaction(commit)
+            }
+
+            fn commit_with_receipt(&self, commit: Commit<Self::Operation>) -> impl Future<Output = Result<CommitReceipt, Error>> + Send {
+                (**self).commit_with_receipt(commit)
+            }
+
+            fn commit_transaction_with_receipt(&self, commit: TransactionCommit<Self::Operation>) -> impl Future<Output = Result<CommitReceipt, Error>> + Send {
+                (**self).commit_transaction_with_receipt(commit)
             }
 
             fn writes_views(&self) -> bool {
@@ -1086,6 +1251,49 @@ mod tests {
         let over = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
             .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
         assert_eq!(over.sizes(|_| None).unwrap().len(), 101);
+    }
+
+    #[test]
+    fn a_snapshot_is_measured_as_the_preflight_sizes_it_with_the_widest_ttl() {
+        let commit = Commit::<u8>::new("a", vec![event("a", 1)]).with_snapshot(NewSnapshot::new(
+            "t",
+            EventSequence(1),
+            "{}",
+        ));
+        // The marker check, the lock check, the head update, the event put, then the snapshot put.
+        let preflight = commit.sizes(|_| None).unwrap()[4];
+        let snapshot = SerializedSnapshot {
+            entity_type: EntityType::new("t"),
+            entity_id: EntityId::new("a"),
+            sequence: EventSequence(1),
+            event_sequence: EventSequence(1),
+            payload: b"{}".to_vec(),
+        };
+        let widest_ttl = "ttl".len() + i64::MAX.to_string().len();
+        assert_eq!(
+            snapshot_commit_size(&snapshot).unwrap(),
+            preflight + widest_ttl
+        );
+
+        // At the budget a snapshot is kept; one byte over, it is dropped.
+        let mut at_limit = NewSnapshot::new("t", EventSequence(1), Vec::new());
+        at_limit.payload = vec![
+            b'x';
+            MAX_COMMIT_ITEM_BYTES
+                - snapshot_commit_size(&SerializedSnapshot {
+                    payload: Vec::new(),
+                    ..snapshot
+                })
+                .unwrap()
+        ];
+        let kept = at_limit
+            .clone()
+            .within_budget(&EntityId::new("a"), EventSequence(1));
+        assert_eq!(kept.unwrap(), Some(at_limit.clone()));
+
+        at_limit.payload.push(b'x');
+        let dropped = at_limit.within_budget(&EntityId::new("a"), EventSequence(1));
+        assert_eq!(dropped.unwrap(), None);
     }
 
     #[test]

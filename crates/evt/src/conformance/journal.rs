@@ -15,7 +15,7 @@ use crate::journal::{
     allocations, counter_view, encode_allocations, rebuild_with_lock, replay, row_size, row_sk,
 };
 use crate::projection::{ProjectedView, ViewOperation, ViewRow, group_commits, replay_views};
-use crate::rebuild::RebuildFence;
+use crate::rebuild::{RebuildFence, RebuildGeneration};
 use crate::repository::TransactionCommit;
 use crate::views::ViewRepository;
 
@@ -51,6 +51,10 @@ where
     record(
         "a multi-stream commit allocates in stream-ID then sequence order",
         Box::pin(multi_stream_commit(repo)).await,
+    );
+    record(
+        "a commit's receipt returns the events as stored, with the allocations a page read returns",
+        Box::pin(receipts_carry_allocations(repo)).await,
     );
     record(
         "a row over the cap is refused before any write, at the cap it passes, and a pre-check agrees",
@@ -107,6 +111,10 @@ where
     record(
         "a rebuild under the lock refuses live commits and reproduces the live journal",
         Box::pin(rebuild_under_the_lock(repo, views)).await,
+    );
+    record(
+        "a rebuild under a caller's lease renews it in place, and stops at a lost lease",
+        Box::pin(rebuild_under_a_callers_lease(repo, views)).await,
     );
     record(
         "a failed rebuild that wiped the counters keeps journaled commits refused after a force-release",
@@ -393,6 +401,94 @@ where
         journaled.high_watermark(&scope(&ns, "world")).await?,
         3,
         "an empty transaction moves nothing"
+    );
+
+    Ok(())
+}
+
+/// The allocations live only in the stored events, so a commit's receipt is how the writer learns
+/// them: they must equal what the stored events and a page read say, for a single-stream commit,
+/// a multi-stream one given out of order, and a retried one that lost its first positions.
+async fn receipts_carry_allocations<R>(repo: &R) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
+    R::Operation: Clone,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let (a, b, c) = (
+        Stream::new(&ns, "a", "ledger"),
+        Stream::new(&ns, "b", "ledger"),
+        Stream::new(&ns, "c", "ledger"),
+    );
+    let world = scope(&ns, "world");
+
+    let single = journaled
+        .commit_with_receipt(Commit::new(a.id.clone(), a.events(1..=2)))
+        .await?;
+    ensure_eq!(
+        single.events,
+        repo.events(&a.id).await?,
+        "the single-stream receipt is the stored events"
+    );
+
+    let multi = journaled
+        .commit_transaction_with_receipt(TransactionCommit::new(vec![
+            Commit::new(c.id.clone(), c.events(1..=1)),
+            Commit::new(b.id.clone(), b.events(1..=2)),
+        ]))
+        .await?;
+    let mut stored = repo.events(&b.id).await?;
+    stored.extend(repo.events(&c.id).await?);
+    ensure_eq!(
+        multi.events,
+        stored,
+        "the multi-stream receipt is the stored events, in persisted order"
+    );
+
+    // Another writer takes the next world position between this writer's counter read and its
+    // commit; the retried commit's receipt carries the positions it finally holds, not the ones
+    // it first allocated.
+    let stale = Lagging::new(repo.clone(), 2);
+    let lagging = JournalRepository::new(stale.clone(), journal(&ns));
+    a.commit(&journaled, a.events(3..=3), None).await?;
+    let retried = lagging
+        .commit_with_receipt(Commit::new(c.id.clone(), c.events(2..=2)))
+        .await?;
+    ensure_eq!(stale.backoffs(), 1, "one retry after one lost attempt");
+    ensure_eq!(
+        retried.events,
+        repo.events_after(&c.id, EventSequence(1)).await?,
+        "the retried receipt is the stored event"
+    );
+
+    let page = journaled.page(&world, 0, 100).await?;
+    let mut returned = Vec::new();
+    for event in [single.events, multi.events, retried.events].concat() {
+        let world_position = allocations(&event.metadata)?
+            .into_iter()
+            .find(|allocation| allocation.scope == world.as_str())
+            .map(|allocation| allocation.position)
+            .ok_or(Failure(format!("{} holds no world position", event.id)))?;
+        returned.push((world_position, event));
+    }
+    returned.sort_by_key(|(position, _)| *position);
+
+    let rows: Vec<_> = page
+        .rows
+        .iter()
+        .filter(|row| row.event.id.to_string() != format!("{}:3", a.id))
+        .map(|row| (row.position, row.event.clone()))
+        .collect();
+    ensure_eq!(
+        returned,
+        rows,
+        "every returned allocation is the world row at that position, holding that event"
+    );
+    ensure_eq!(
+        positions(&page),
+        vec![1, 2, 3, 4, 5, 6, 7],
+        "world positions are contiguous"
     );
 
     Ok(())
@@ -1514,6 +1610,200 @@ where
         "a rebuild on a released lease",
         |err| matches!(err, Error::RebuildLeaseLost { .. }),
     )?;
+
+    Ok(())
+}
+
+/// [`rebuild_with_lease`](crate::journal::rebuild_with_lease): the caller's lease is renewed before
+/// the first batch and comes back renewed; a lease that was lost stops the run at that renewal,
+/// before any write, and the failure says so.
+async fn rebuild_under_a_callers_lease<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let a = Stream::new(&ns, "a", "ledger");
+    let world = scope(&ns, "world");
+
+    a.commit(&journaled, a.events(1..=3), None).await?;
+    let live_rows = views.list_views_by_pk(&world.row_pk()).await?;
+    let events = repo.events(&a.id).await?;
+    for row in &live_rows {
+        views.delete_view(&row.pk, &row.sk).await?;
+    }
+
+    let owner = format!("{ns}-caller");
+    let mut lease = repo.begin_rebuild(&owner, LEASE).await?;
+    let taken = lease.clone();
+    let rebuilt = crate::journal::rebuild_with_lease(repo, &events, &mut lease, LEASE * 2).await;
+    let held = repo
+        .rebuild_state()
+        .await?
+        .lock
+        .is_some_and(|lock| lease.holds(&lock));
+    // End the lease before checking, so a failed check leaves the fence settled for the next case.
+    repo.end_rebuild(&lease).await?;
+
+    let state = rebuilt.map_err(Error::from)?;
+    ensure_eq!(state.rows.len(), 6, "three rows in each of two scopes");
+    ensure!(
+        lease.generation == taken.generation && lease.lease_expires_at > taken.lease_expires_at,
+        "the caller's lease was renewed in place: {taken:?} -> {lease:?}"
+    );
+    ensure!(held, "the caller still held the lock after the run");
+    ensure_eq!(
+        views.list_views_by_pk(&world.row_pk()).await?,
+        live_rows,
+        "the rebuilt rows are the live rows"
+    );
+
+    // A lease that was lost fails its first renewal, before any write.
+    let mut stale = repo.begin_rebuild(&owner, LEASE).await?;
+    repo.end_rebuild(&stale).await?;
+    for row in &live_rows {
+        views.delete_view(&row.pk, &row.sk).await?;
+    }
+    match crate::journal::rebuild_with_lease(repo, &events, &mut stale, LEASE).await {
+        Err(failure) => ensure!(
+            matches!(*failure.error, Error::RebuildLeaseLost { .. }) && failure.attempted == 0,
+            "a lost lease stops the run before its first write: {failure:?}"
+        ),
+        Ok(_) => return Err(Failure("a rebuild on a released lease succeeded".into())),
+    }
+    ensure!(
+        views.list_views_by_pk(&world.row_pk()).await?.is_empty(),
+        "nothing was written under the lost lease"
+    );
+
+    Ok(())
+}
+
+/// Runs the cases of a projection rebuild that carries the journal
+/// ([`ProjectionRebuild::with_journal`](crate::ProjectionRebuild::with_journal)) against a
+/// repository that writes views and enumerates its log, with `views` reading the same view table.
+/// Like [`journal_cases`], it panics if a case fails, and leaves the rebuild fence settled.
+pub async fn journal_rebuild_cases<R, V>(repo: &R, views: &V)
+where
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + EventLog + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    if let Err(Failure(message)) = Box::pin(views_and_journal_under_one_lease(repo, views)).await {
+        panic!("journal rebuild case failed: views and the journal under one lease: {message}");
+    }
+    println!("ok   views and the journal rebuild under one lease, so readers see one generation");
+}
+
+/// A current-state projector over the namespace's ledgers: each stream's state under `pk`.
+struct LedgerTotals {
+    pk: String,
+}
+
+impl crate::projection::CommitProjector for LedgerTotals {
+    fn name(&self) -> &str {
+        "ledger-totals"
+    }
+
+    fn project(
+        &self,
+        commit: &crate::projection::CommitView,
+    ) -> Result<Vec<ViewOperation>, BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                ViewOperation::put(
+                    self.pk.clone(),
+                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(),
+                    stream.entity_type.as_str(),
+                    stream.state.clone(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// [`ProjectionRebuild::with_journal`](crate::ProjectionRebuild::with_journal): one run rebuilds a
+/// projector's views and the journal from events it reads under its own lock, so the generation
+/// moves once, from settled to settled.
+async fn views_and_journal_under_one_lease<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalCompactionStore + RebuildFence + EventLog + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let (a, b) = (
+        Stream::new(&ns, "a", "ledger"),
+        Stream::new(&ns, "b", "ledger"),
+    );
+    let world = scope(&ns, "world");
+    let totals = format!("{ns}#totals");
+
+    a.commit(&journaled, a.events(1..=2), None).await?;
+    b.commit(&journaled, b.events(1..=1), None).await?;
+
+    let live_rows = views.list_views_by_pk(&world.row_pk()).await?;
+    for row in &live_rows {
+        views.delete_view(&row.pk, &row.sk).await?;
+    }
+    views.delete_view(&world.counter_pk(), "COUNTER").await?;
+    let before = repo.rebuild_generation().await?;
+
+    let report = crate::ProjectionRebuild::new(repo)
+        .with_projector(Arc::new(LedgerTotals { pk: totals.clone() }))
+        .aggregate_as::<Ledger>(a.entity_type.clone())
+        .with_journal(journal(&ns))
+        .run(&format!("{ns}-both"), LEASE)
+        .await?;
+
+    ensure_eq!(
+        (
+            report.entities,
+            report.events,
+            report.journal_rows,
+            report.journal_counters,
+            report.puts
+        ),
+        (2, 3, 6, 3, 11),
+        "two totals, and three events in two scopes each with three counters"
+    );
+    ensure_eq!(
+        repo.rebuild_generation().await?,
+        RebuildGeneration {
+            value: before.value + 2,
+            force_released: false,
+        },
+        "one lock covered both"
+    );
+    ensure_eq!(
+        views.list_views_by_pk(&world.row_pk()).await?,
+        live_rows,
+        "the rebuilt journal rows are the live rows"
+    );
+    ensure_eq!(
+        journaled.high_watermark(&world).await?,
+        3,
+        "the world counter is restored"
+    );
+    for (stream, payload) in [
+        (&a, r#"{"total":3,"entries":2}"#),
+        (&b, r#"{"total":1,"entries":1}"#),
+    ] {
+        ensure_eq!(
+            views
+                .get_view_at(&totals, stream.id.as_str())
+                .await?
+                .map(|row| String::from_utf8_lossy(&row.payload).into_owned()),
+            Some(payload.to_owned()),
+            format!("the total of {}", stream.id)
+        );
+    }
 
     Ok(())
 }

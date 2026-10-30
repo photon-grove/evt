@@ -31,7 +31,8 @@ use crate::repository::{
     snapshot_events_due,
 };
 use crate::store::{
-    DEFAULT_SNAPSHOT_INTERVAL, Loaded, Store, load_with_catch_up, serialize_events, stamp_commit_id,
+    DEFAULT_SNAPSHOT_INTERVAL, Loaded, Store, load_with_catch_up, serialize_events, split_receipt,
+    stamp_commit_id,
 };
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
@@ -653,11 +654,16 @@ impl<'a, R: Repository> Transaction<'a, R> {
             Vec::new()
         };
 
-        let snapshot = snapshot_due.then(|| NewSnapshot {
-            entity_type: EntityType::new(A::TYPE),
-            sequence: read.loaded.snapshot_sequence.next(),
-            payload: state.clone(),
-        });
+        // A snapshot over the per-item commit budget is left out, so the commit still succeeds.
+        let snapshot = match (snapshot_due, serialized.last()) {
+            (true, Some(last)) => NewSnapshot {
+                entity_type: EntityType::new(A::TYPE),
+                sequence: read.loaded.snapshot_sequence.next(),
+                payload: state.clone(),
+            }
+            .within_budget(&read.loaded.entity_id, last.sequence)?,
+            _ => None,
+        };
         let state = if self.commit_projectors.is_empty() {
             Vec::new()
         } else {
@@ -690,8 +696,10 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
     /// Stamps the commit ID once, fences every unwritten read at the head it saw, and persists
     /// exactly one atomic repository commit. On failure nothing is written. It returns the
-    /// committed events in the canonical order the commit persists them: stream ID bytewise,
-    /// then sequence.
+    /// committed events as stored (the repository's
+    /// [receipt](Repository::commit_transaction_with_receipt), so they carry whatever it wrote into
+    /// them, such as a journal's allocations), in the canonical order the commit persists them:
+    /// stream ID bytewise, then sequence.
     ///
     /// A transaction with [outcomes enabled](Transaction::with_outcomes) refuses with
     /// [`Error::InvalidConfig`]: use [`commit_with_outcome`](Transaction::commit_with_outcome).
@@ -706,11 +714,14 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
         self.ready_projectors().await?;
 
-        let (commit, committed) = self.prepare(metadata)?;
+        let commit = self.prepare(metadata)?;
 
-        self.repository.commit_transaction(commit).await?;
+        let receipt = self
+            .repository
+            .commit_transaction_with_receipt(commit)
+            .await?;
 
-        Ok(committed)
+        Ok(receipt.events)
     }
 
     /// Commits the transaction and records the command as an accepted outcome, in one atomic
@@ -738,7 +749,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         let pending = self.take_command()?;
         self.ready_projectors().await?;
 
-        let (mut commit, committed) = self.prepare(&pending.metadata)?;
+        let mut commit = self.prepare(&pending.metadata)?;
 
         let mut outcome = Outcome::accepted(pending.command_id.clone(), pending.digest.clone());
         if let Some(response) = response {
@@ -749,7 +760,11 @@ impl<'a, R: Repository> Transaction<'a, R> {
             .stored_outcome()
             .expect("the commit carries the outcome");
 
-        let result = self.repository.commit_transaction(commit).await;
+        let (result, committed) = split_receipt(
+            self.repository
+                .commit_transaction_with_receipt(commit)
+                .await,
+        );
         if let Err(Error::FenceConflict {
             provenance: FenceProvenance::Caller,
             ..
@@ -823,8 +838,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
         let commit = TransactionCommit::new(Vec::new()).with_fences(fences);
 
-        self.commit_rejection(&pending, rejection, commit, Vec::new())
-            .await
+        self.commit_rejection(&pending, rejection, commit).await
     }
 
     /// Records the command as a rejected outcome and commits the events staged with
@@ -847,10 +861,9 @@ impl<'a, R: Repository> Transaction<'a, R> {
         let pending = self.take_command()?;
         self.ready_projectors().await?;
 
-        let (commit, committed) = self.prepare(&pending.metadata)?;
+        let commit = self.prepare(&pending.metadata)?;
 
-        self.commit_rejection(&pending, rejection, commit, committed)
-            .await
+        self.commit_rejection(&pending, rejection, commit).await
     }
 
     /// Writes a rejected outcome with the fences and events of `commit` and settles the result,
@@ -860,7 +873,6 @@ impl<'a, R: Repository> Transaction<'a, R> {
         pending: &PendingCommand,
         rejection: Rejection,
         mut commit: TransactionCommit<R::Operation>,
-        committed: Vec<SerializedEvent>,
     ) -> Result<CommandOutcome, Error> {
         commit.outcome = Some(Outcome::rejected(
             pending.command_id.clone(),
@@ -871,7 +883,11 @@ impl<'a, R: Repository> Transaction<'a, R> {
             .stored_outcome()
             .expect("the commit carries the outcome");
 
-        let result = self.repository.commit_transaction(commit).await;
+        let (result, committed) = split_receipt(
+            self.repository
+                .commit_transaction_with_receipt(commit)
+                .await,
+        );
         if let Err(Error::FenceConflict {
             provenance: FenceProvenance::Caller,
             ..
@@ -947,12 +963,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
     /// Stamps the commit ID once and builds the repository commit: every unwritten read becomes
     /// an engine fence at the head it saw, the written streams carry their events, snapshots, and
-    /// operations. Returns it with the events in their persisted order.
-    #[allow(clippy::type_complexity)]
-    fn prepare(
-        &mut self,
-        metadata: &Metadata,
-    ) -> Result<(TransactionCommit<R::Operation>, Vec<SerializedEvent>), Error> {
+    /// operations. The events the caller gets back come from the repository's receipt.
+    fn prepare(&mut self, metadata: &Metadata) -> Result<TransactionCommit<R::Operation>, Error> {
         if self.poisoned {
             return Err(Error::TransactionPoisoned);
         }
@@ -1005,7 +1017,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
             written.push(stream);
         }
 
-        // The persisted order, so the returned events match it whatever order streams were read.
+        // The persisted order, so the commit-wide projectors see the streams in it whatever order
+        // they were read.
         written.sort_by(|a, b| {
             a.entity_id
                 .as_str()
@@ -1013,7 +1026,6 @@ impl<'a, R: Repository> Transaction<'a, R> {
                 .cmp(b.entity_id.as_str().as_bytes())
         });
 
-        let mut committed = Vec::new();
         let mut commits = Vec::new();
         let mut view_streams = Vec::new();
         for stream in written {
@@ -1022,7 +1034,6 @@ impl<'a, R: Repository> Transaction<'a, R> {
                 event.metadata = metadata.clone();
             }
 
-            committed.extend(events.iter().cloned());
             if !self.commit_projectors.is_empty() {
                 view_streams.push(CommitStream::new(
                     stream.entity_id.clone(),
@@ -1055,7 +1066,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         commit.operations = operations;
         commit.views = views;
 
-        Ok((commit, committed))
+        Ok(commit)
     }
 }
 

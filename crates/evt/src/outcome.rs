@@ -470,8 +470,10 @@ impl Outcome {
 pub struct CommandOutcome<E = ()> {
     /// The recorded outcome: the row this call wrote, or the stored row it replayed.
     pub outcome: Outcome,
-    /// The events this call committed, in the order the commit persists them. Empty when the
-    /// outcome was replayed, and for a rejection or a no-op.
+    /// The events this call committed, as the repository stored them
+    /// ([`Repository::commit_with_receipt`](crate::Repository::commit_with_receipt), so a
+    /// journal's allocations included), in the order the commit persists them. Empty when the
+    /// outcome was replayed, and for a no-op or a rejection that carries no events.
     pub events: Vec<SerializedEvent>,
     /// The typed events the handler decided, when the call ran a handler that returned them.
     pub typed_events: Vec<E>,
@@ -702,6 +704,27 @@ impl CommandIdentity {
     pub fn with_payload_json(mut self, payload: impl Into<Vec<u8>>) -> Self {
         self.payload = payload.into();
         self
+    }
+
+    /// The identity a single-aggregate command has on
+    /// [`Store::execute_with_outcome`](crate::Store::execute_with_outcome): its
+    /// [type](OutcomeCommand::command_type), the one target `entity_id`, and its
+    /// [canonical payload](OutcomeCommand::canonical_payload). It digests exactly as that call
+    /// does, so [`Store::resolve_command`](crate::Store::resolve_command) answers a single-aggregate
+    /// command and a transaction command the same way. A payload that fails to encode is
+    /// [`Error::InvalidArgument`].
+    pub fn for_command<C: OutcomeCommand + ?Sized>(
+        command: &C,
+        entity_id: impl Into<EntityId>,
+    ) -> Result<Self, Error> {
+        let payload = command
+            .canonical_payload()
+            .map_err(|err| Error::InvalidArgument(format!("the command payload: {err}")))?
+            .unwrap_or_default();
+
+        Ok(Self::new(command.command_type())
+            .with_targets([entity_id.into()])
+            .with_payload_json(payload))
     }
 
     pub(crate) fn targets(&self) -> &[EntityId] {

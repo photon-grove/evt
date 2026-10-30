@@ -179,8 +179,15 @@
   ```
 
 - Use `gh` for GitHub operations when needed.
-- PR descriptions should be concise Markdown, start with `## Summary`, and include verification
-  notes when manual evidence or non-obvious test selection matters.
+- PR bodies follow the shared
+  [`/pr-description` skill](https://github.com/photon-grove/skills/blob/main/skills/pr-description/SKILL.md):
+  a reviewer gets why + what in under a minute. `## Summary` (1–3 sentences, why-first, one clause
+  of newcomer context) + `## Change` (1–2 sentences, key call sites, scope/safety — what isn't
+  affected); optional one-line tail (related work, caveat, follow-up). Show, don't tell: link code
+  at a pinned commit SHA, evidence via durable query URLs, related PRs/issues as full URLs (never
+  bare `#123`). Omit routine CI/validation notes; add a one-line validation note only for
+  change-specific checks CI doesn't cover (manual evidence, non-obvious test selection). Keep the
+  PR template's checklist.
 - An automatic PR review agent reviews every PR and posts findings as inline review threads; treat
   them like any reviewer's — reply, then resolve before merge. The reviewer is configured outside the
   repo (provider settings), so keep guidance here agent-agnostic. What it flags is tuned by the

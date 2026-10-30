@@ -548,18 +548,16 @@ func (store *Store) stage(
 		return serialized, nil, nil
 	}
 
-	payload, err := store.updateSnapshotWithEvents(serialized, cc)
+	snapshot, err := commitSnapshot(cc, aggregate.Type(), entityID, serialized)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return serialized, []evt.SerializedSnapshot{{
-		EntityType:    aggregate.Type(),
-		EntityID:      entityID,
-		Sequence:      *cc.CurrentSnapshot,
-		EventSequence: serialized[len(serialized)-1].Sequence,
-		Payload:       payload,
-	}}, nil
+	if snapshot == nil {
+		return serialized, nil, nil
+	}
+
+	return serialized, []evt.SerializedSnapshot{*snapshot}, nil
 }
 
 // command is one command's outcome bookkeeping: its ID and its pre-execution identity digest.

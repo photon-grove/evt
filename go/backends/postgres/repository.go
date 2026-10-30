@@ -100,6 +100,10 @@ func sharedRelationName(eventsTable, snapshotsTable string) string {
 // DB is the minimal subset of the pgx API the Repository depends on. Both *pgxpool.Pool and pgx.Tx
 // satisfy it, so callers can pass a pool (the common case) or an ambient transaction. It is the
 // abstraction point for the backend, mirroring dynamo.Client.
+//
+// An ambient transaction must run at READ COMMITTED, the level every engine transaction needs
+// (beginReadCommitted). PostgreSQL cannot change the level of a transaction already under way, so
+// the Repository refuses to begin inside one at REPEATABLE READ or SERIALIZABLE.
 type DB interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -498,11 +502,13 @@ func (repo *Repository) lockTransactionEntities(ctx context.Context, tx pgx.Tx, 
 // and the commit starts above its floor.
 func (repo *Repository) commitSnapshots(ctx context.Context, tx pgx.Tx, result evt.SerializedResult) error {
 	for _, snapshot := range result.Snapshots {
-		var stored struct{ sequence, eventSequence int64 }
+		// The snapshot sequence chain (storage spec, PostgreSQL): the same read as Rust's
+		// check_snapshot_predecessor, under the entity's advisory lock.
+		var stored struct{ sequence int64 }
 		err := tx.QueryRow(ctx,
-			fmt.Sprintf(`SELECT sequence, event_sequence FROM %s WHERE entity_id = $1`, repo.snapshotsTable),
+			fmt.Sprintf(`SELECT sequence FROM %s WHERE entity_id = $1`, repo.snapshotsTable),
 			string(snapshot.EntityID),
-		).Scan(&stored.sequence, &stored.eventSequence)
+		).Scan(&stored.sequence)
 		if errors.Is(err, pgx.ErrNoRows) {
 			if snapshot.Sequence != 1 {
 				return transientConflict(fmt.Sprintf(
@@ -703,6 +709,26 @@ func (repo *Repository) checkFeaturesManifest(ctx context.Context, tx pgx.Tx) (*
 	return repo.features.checkManifestTx(ctx, tx)
 }
 
+// beginReadCommitted starts a transaction at READ COMMITTED, whatever the server's or role's
+// default_transaction_isolation. The engine's transactions read fence rows (the rebuild lock and
+// generation, stream heads, the feature manifest) after waiting for advisory locks, and only READ
+// COMMITTED takes each statement's snapshot after the wait: a REPEATABLE READ snapshot, taken at the
+// first statement, would miss a rebuild or a commit that landed while the transaction waited.
+func beginReadCommitted(ctx context.Context, db DB) (pgx.Tx, error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		_ = tx.Rollback(ctx) //nolint:errcheck // the SET's error is the one to report
+
+		return nil, fmt.Errorf("set READ COMMITTED (an ambient transaction must already run at it): %w", err)
+	}
+
+	return tx, nil
+}
+
 // inTx runs fn inside a transaction, committing on success and rolling back on error or panic.
 func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return repo.inTxMapping(ctx, fn, false)
@@ -712,7 +738,7 @@ func (repo *Repository) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 // COMMIT of one is the projector's failure (a deferred constraint on its table), not the event log's
 // conflict.
 func (repo *Repository) inTxMapping(ctx context.Context, fn func(pgx.Tx) error, carriesViews bool) error {
-	tx, err := repo.db.Begin(ctx)
+	tx, err := beginReadCommitted(ctx, repo.db)
 	if err != nil {
 		return fmt.Errorf("postgres: begin: %w", err)
 	}

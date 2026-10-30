@@ -54,20 +54,38 @@ pub const JOURNAL_COMPACTION_FEATURE: &str = "journal-compaction";
 /// `journal` cargo feature is enabled.
 pub const JOURNAL_COMPACTION_VERSION: i64 = 1;
 
+/// The feature name a PostgreSQL store declares once its commit-wide views live in the evt-owned
+/// views table (`{events}__evt_views`, ADR 0008). Only a PostgreSQL repository configured with
+/// `with_views_table()` writes such a store; every other writer, Go's and a Rust repository with an
+/// application view writer included, refuses it, so a store's views never split across two tables.
+/// It is in [`SUPPORTED_FEATURES`], and the PostgreSQL repository adds its own rule: one without the
+/// views table refuses a store that declares it.
+pub const POSTGRES_VIEWS_FEATURE: &str = "postgres-views";
+
+/// The stored-format version of [`POSTGRES_VIEWS_FEATURE`].
+pub const POSTGRES_VIEWS_VERSION: i64 = 1;
+
 /// The `(name, stored-format version)` pairs this build of the crate models. A writer refuses a
 /// table whose manifest declares anything else. The extensions this spec defines (`journal`,
-/// `journal-compaction`) are Rust-first: this build models `stream-heads`, which every writer here
-/// also *requires* (see [`validate_marker_for_write`]), and, with the `journal` cargo feature,
+/// `journal-compaction`, `postgres-views`) are Rust-first: this build models `stream-heads`, which
+/// every writer here also *requires* (see [`validate_marker_for_write`]), `postgres-views` (which
+/// a PostgreSQL repository without the views table refuses on its own), and, with the `journal`
+/// cargo feature,
 /// `journal` and `journal-compaction` at format version 1. A build without the feature refuses a
 /// journal table, so a writer that cannot maintain the journal cannot leave it short, and a build
 /// that predates compaction refuses a compacted one.
 #[cfg(not(feature = "journal"))]
-pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[(STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION)];
+pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[
+    (POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION),
+    (STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION),
+];
 
 /// The `(name, stored-format version)` pairs this build of the crate models. A writer refuses a
 /// table whose manifest declares anything else. The extensions this spec defines (`journal`,
-/// `journal-compaction`) are Rust-first: this build models `stream-heads`, which every writer here
-/// also *requires* (see [`validate_marker_for_write`]), and, with the `journal` cargo feature,
+/// `journal-compaction`, `postgres-views`) are Rust-first: this build models `stream-heads`, which
+/// every writer here also *requires* (see [`validate_marker_for_write`]), `postgres-views` (which
+/// a PostgreSQL repository without the views table refuses on its own), and, with the `journal`
+/// cargo feature,
 /// `journal` and `journal-compaction` at format version 1. A build without the feature refuses a
 /// journal table, so a writer that cannot maintain the journal cannot leave it short, and a build
 /// that predates compaction refuses a compacted one.
@@ -75,6 +93,7 @@ pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[(STREAM_HEADS_FEATURE, STREAM_H
 pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[
     (JOURNAL_FEATURE, JOURNAL_VERSION),
     (JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION),
+    (POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION),
     (STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION),
 ];
 

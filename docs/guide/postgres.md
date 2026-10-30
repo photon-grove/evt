@@ -41,7 +41,10 @@ command. The commit also conditions on the stream's row in the head table, so a 
 sequence is at or below the entity's snapshot `event_sequence` fails with a conflict too, even
 though compaction deleted those keys. An `entity_type` index backs `StreamFilter` narrowing.
 
-`evt_snapshots` holds one durable snapshot per entity, keyed by `entity_id`.
+`evt_snapshots` holds one durable snapshot per entity, keyed by `entity_id`. A commit's snapshot
+must continue the stored one's sequence (1 for the first, then the stored sequence plus one), as on
+DynamoDB: the commit reads the stored sequence under the entity's lock and fails with a transient
+`evt.ConflictError` otherwise.
 
 `evt_events__evt_stream_heads` holds one row per written stream
 ([ADR 0007](../adr/0007-per-stream-head-item.md)), keyed by `entity_id`, with `entity_type` and
@@ -80,6 +83,13 @@ in the transaction that carries the view statements. So a takeover waits for it,
 lost the lock aborts without writing. A database created before the fence has neither table, and
 commits pass until `EnsureSchema` creates them.
 
+These assertions run after the commit waits for its locks, so every transaction that writes or
+checks a fence runs at `READ COMMITTED` whatever the server's `default_transaction_isolation`: a
+`REPEATABLE READ` snapshot would be taken before the wait and miss a rebuild that began meanwhile.
+A server or role configured for a stricter default needs no change. If you pass `NewRepository`
+an ambient `pgx.Tx` instead of a pool, begin it at `READ COMMITTED` (the default): the repository
+refuses to work inside a transaction at a stricter level, which it cannot lower.
+
 ### Compaction
 
 A stream can opt into compaction with `evt.Compactor.CompactBelow(ctx, entityID, throughSequence)`.
@@ -100,7 +110,8 @@ for streams whose early events were compacted away.
 
 ### Views
 
-evt defines no PostgreSQL view schema. Your application owns its view tables and their DDL. But
+In Go, evt defines no PostgreSQL view schema (Rust has one, [below](#the-rust-views-table)). Your
+application owns its view tables and their DDL. But
 [commit-wide projectors](projections.md#commit-wide-projectors) still commit their rows atomically
 with the events, through a view writer that turns each view operation into the SQL statement for
 your table:
@@ -160,6 +171,33 @@ An integrity violation raised at `COMMIT`, which only a deferred constraint on y
 cause, is a `*evt.ProjectorError`. A commit that carries view operations but has no writer fails
 with `*evt.ViewsNotConfiguredError` before any write. Each statement counts as one action in the
 commit budget, sized by its SQL text.
+
+#### The Rust views table
+
+`photon-evt`'s `PostgresRepository::ensure_schema` also creates an evt-owned views table,
+`{events}__evt_views` ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)), and
+`view_repository()` reads and writes it with the same semantics as the DynamoDB view repository:
+
+```rust
+use photon_evt::{ViewRepository, ViewRow};
+
+let views = repository.view_repository();
+views.put_view(&ViewRow::new("USER#1#teams", "t1", "user-1", "team", r#"{"name":"core"}"#)).await?;
+let page = views.list_views_by_pk_paged("USER#1#teams", Some(50), None).await?;
+views.purge_expired(now_unix_seconds).await?; // PostgreSQL does not expire rows by itself
+```
+
+Its keys order by UTF-8 bytes, as on DynamoDB, and its payloads keep their exact bytes. It needs a
+`UTF8` database, and it refuses a row whose entity type, `pk` and `sk` together exceed 2,600 bytes,
+the most a btree index entry holds.
+
+`with_views_table()` makes the table the commit's view target, in place of a view writer: evt
+builds every statement with the DynamoDB repository's owner rules, so you write no SQL. The
+repository declares the `postgres-views` marker feature before its first commit, after which a Go
+writer, or a Rust repository with a view writer, refuses the store instead of putting views
+somewhere else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
+wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
+DynamoDB. Wake-ups for a journal on PostgreSQL follow in `photon-evt` 0.3.
 
 ## Local development
 

@@ -12,7 +12,9 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use evt_compat::drivers;
-use photon_evt::conformance::{Add, Ledger, TestClock, compaction_cases, journal_cases};
+use photon_evt::conformance::{
+    Add, Ledger, TestClock, compaction_cases, journal_cases, journal_rebuild_cases,
+};
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository};
 use photon_evt::journal::{
     Journal, JournalRepository, JournalStore, Scope, allocations, high_watermark, page,
@@ -124,6 +126,7 @@ async fn journal_conforms_and_works_end_to_end() {
         let repository = tables.repository();
 
         journal_cases(&repository, &tables.view_repository()).await;
+        journal_rebuild_cases(&repository, &tables.view_repository()).await;
         tables.drop().await;
 
         // Compaction (X2) on tables of its own, with a clock its lease cases move.

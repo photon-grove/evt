@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/photon-grove/evt/compare/go/v0.9.0...go/v0.9.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **go:** report SequenceNumber for stream batch failures and stop at the first one ([#218](https://github.com/photon-grove/evt/issues/218)) ([92a724c](https://github.com/photon-grove/evt/commit/92a724c664852317fd5ef9356aced0d84795d4b0)), closes [#190](https://github.com/photon-grove/evt/issues/190)
+* **postgres:** run engine transactions at READ COMMITTED whatever the server default ([#229](https://github.com/photon-grove/evt/issues/229)) ([27a30e0](https://github.com/photon-grove/evt/commit/27a30e0431a452c6aa41b2314d1705c929e53b20)), closes [#223](https://github.com/photon-grove/evt/issues/223)
+
 ## [0.9.0](https://github.com/photon-grove/evt/compare/go/v0.8.0...go/v0.9.0) (2026-10-26)
 
 
