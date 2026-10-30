@@ -3467,8 +3467,11 @@ View repository (`PgViewRepository`, `photon_evt::ViewRepository`), outside the 
   `InvalidArgument`.
 - TTL. Readers return a row whose `ttl` has passed, as DynamoDB does until its sweep deletes it.
   `PgViewRepository::purge_expired(now)` deletes them through the partial index, a batch at a time:
-  `DELETE … WHERE (pk, sk) IN (SELECT pk, sk FROM … WHERE ttl > 0 AND ttl <= $1 ORDER BY ttl LIMIT 1000)`,
-  repeated until a batch deletes nothing. An operator or a scheduled job runs it. Journal rows,
+  `DELETE … WHERE (pk, sk) IN (SELECT pk, sk FROM … WHERE ttl > 0 AND ttl <= $1 ORDER BY ttl LIMIT 1000) AND ttl > 0 AND ttl <= $1`,
+  repeated until a batch deletes nothing. The outer condition repeats the expiry because the
+  subquery picks keys from its snapshot: a row a concurrent write renewed (a new `ttl`, or none)
+  while the delete waited on it is re-checked against the committed row and kept. An operator or a
+  scheduled job runs it. Journal rows,
   counters and compaction rows carry no `ttl`, so it never touches them.
 
 Commit target. `PostgresRepository::with_views_table()` makes the views table the target of a
