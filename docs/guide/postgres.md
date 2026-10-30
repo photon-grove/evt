@@ -107,7 +107,8 @@ for streams whose early events were compacted away.
 
 ### Views
 
-evt defines no PostgreSQL view schema. Your application owns its view tables and their DDL. But
+In Go, evt defines no PostgreSQL view schema (Rust has one, [below](#the-rust-views-table)). Your
+application owns its view tables and their DDL. But
 [commit-wide projectors](projections.md#commit-wide-projectors) still commit their rows atomically
 with the events, through a view writer that turns each view operation into the SQL statement for
 your table:
@@ -167,6 +168,26 @@ An integrity violation raised at `COMMIT`, which only a deferred constraint on y
 cause, is a `*evt.ProjectorError`. A commit that carries view operations but has no writer fails
 with `*evt.ViewsNotConfiguredError` before any write. Each statement counts as one action in the
 commit budget, sized by its SQL text.
+
+#### The Rust views table
+
+`photon-evt`'s `PostgresRepository::ensure_schema` also creates an evt-owned views table,
+`{events}__evt_views` ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)), and
+`view_repository()` reads and writes it with the same semantics as the DynamoDB view repository:
+
+```rust
+use photon_evt::{ViewRepository, ViewRow};
+
+let views = repository.view_repository();
+views.put_view(&ViewRow::new("USER#1#teams", "t1", "user-1", "team", r#"{"name":"core"}"#)).await?;
+let page = views.list_views_by_pk_paged("USER#1#teams", Some(50), None).await?;
+views.purge_expired(now_unix_seconds).await?; // PostgreSQL does not expire rows by itself
+```
+
+Its keys order by UTF-8 bytes, as on DynamoDB, and its payloads keep their exact bytes. It needs a
+`UTF8` database, and it refuses a row whose entity type, `pk` and `sk` together exceed 2,600 bytes,
+the most a btree index entry holds. Writing commit-wide views to it from the commit
+(`with_views_table()`) and the journal on PostgreSQL follow in `photon-evt` 0.3.
 
 ## Local development
 
