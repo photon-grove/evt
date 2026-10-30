@@ -21,14 +21,16 @@ jobs:
       go: ${{ steps.classify.outputs.go }}
       rust: ${{ steps.classify.outputs.rust }}
       compat: ${{ steps.classify.outputs.compat }}
+      ts: ${{ steps.classify.outputs.ts }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      # go: anything outside the Rust crates (Go, docs, website, infra), plus moon config, which
-      # Quality checks from a renamed checkout.
+      # go: anything outside the Rust crates and the TypeScript packages (Go, docs, website, infra),
+      # plus moon config, which Quality checks from a renamed checkout.
       # rust: the Rust crates and the shared compatibility fixtures.
+      # ts: the TypeScript packages and the shared compatibility fixtures.
       # compat: anything that can change the shared storage format, which runs the
       # cross-language suite against live backends.
       - name: Classify changed files
@@ -39,28 +41,38 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ "$EVENT" != "pull_request" ]; then
-            printf 'go=true\nrust=true\ncompat=true\n' >> "$GITHUB_OUTPUT"
+            printf 'go=true\nrust=true\ncompat=true\nts=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Capture the list first so a failed diff fails the job instead of skipping everything.
           files="$(git diff --name-only "$BASE...$HEAD")"
 
-          go=false rust=false compat=false
+          go=false rust=false compat=false ts=false
           while IFS= read -r file; do
             case "$file" in
-              .github/* | crates/moon.yml)
+              .github/*)
+                go=true rust=true compat=true ts=true ;;
+              crates/moon.yml)
                 go=true rust=true compat=true ;;
               README.md)
                 go=true rust=true ;;
               docs/guide/getting-started.md)
-                # Its Rust blocks are checked against crates/evt/examples/getting_started.rs.
-                go=true rust=true ;;
+                # Its Rust blocks are checked against crates/evt/examples/getting_started.rs, and
+                # its TypeScript blocks will be against packages/evt/examples/getting-started.ts.
+                go=true rust=true ts=true ;;
               crates/* | Cargo.toml | Cargo.lock | rust-toolchain.toml)
                 rust=true compat=true ;;
               .moon/* | package.json | pnpm-lock.yaml | pnpm-workspace.yaml)
-                go=true rust=true ;;
-              compat/* | go/internal/compat/* | scripts/compat-integration.sh)
+                go=true rust=true ts=true ;;
+              packages/evt/* | packages/evt-compat/*)
+                ts=true ;;
+              .prototools)
+                # It pins Go and golangci-lint, and Bun and Deno for the TypeScript job.
+                go=true ts=true ;;
+              compat/*)
+                go=true rust=true compat=true ts=true ;;
+              go/internal/compat/* | scripts/compat-integration.sh)
                 go=true rust=true compat=true ;;
               go/serialization.go | go/metadata.go | go/compaction.go | go/types.go | \
                 go/repository.go | go/transactions.go | \
@@ -72,7 +84,7 @@ jobs:
             esac
           done <<< "$files"
 
-          printf 'go=%s\nrust=%s\ncompat=%s\n' "$go" "$rust" "$compat" | tee -a "$GITHUB_OUTPUT"
+          printf 'go=%s\nrust=%s\ncompat=%s\nts=%s\n' "$go" "$rust" "$compat" "$ts" | tee -a "$GITHUB_OUTPUT"
 
   quality:
     name: Quality
@@ -168,6 +180,49 @@ jobs:
           rustup toolchain install "$msrv" --profile minimal
           cargo "+$msrv" check -p photon-evt --features postgres,conformance,journal --locked
           cargo "+$msrv" check -p photon-evt-lambda --all-features --locked
+
+  typescript:
+    name: TypeScript
+    needs: changes
+    if: needs.changes.outputs.ts == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.20.0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.5
+          cache: pnpm
+
+      # Keep in step with bun and deno in .prototools.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.9.6
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: TypeScript checks
+        run: pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes
+
+      # The oldest Node that engines allows runs the fixture runner against the same build, and
+      # loads the package with require(), which fails if the package gains top-level await.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+
+      - name: Fixture runner on Node 22
+        run: |
+          node packages/evt-compat/dist/fixtures.js
+          (cd packages/evt && node -e "require('@photon-grove/evt')")
 
   integration:
     name: DynamoDB integration
@@ -338,7 +393,7 @@ jobs:
   summary:
     name: Summary
     runs-on: ubuntu-24.04-arm
-    needs: [changes, quality, rust, integration, postgres-integration]
+    needs: [changes, quality, rust, typescript, integration, postgres-integration]
     if: always()
     steps:
       - name: Check required jobs
@@ -347,6 +402,7 @@ jobs:
             changes=${{ needs.changes.result }}
             quality=${{ needs.quality.result }}
             rust=${{ needs.rust.result }}
+            typescript=${{ needs.typescript.result }}
             integration=${{ needs.integration.result }}
             postgres-integration=${{ needs.postgres-integration.result }}
         run: |

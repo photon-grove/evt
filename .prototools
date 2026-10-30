@@ -1,4 +1,7 @@
 actionlint = "~1.7"
+# Keep bun and deno in step with the TypeScript job in .github/workflows/ci.yml.
+bun = "1.4.3"
+deno = "2.9.6"
 go = "1.26.4"
 golangci-lint = "2.12.2"
 moon = "2.6.1"

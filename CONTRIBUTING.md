@@ -1,9 +1,11 @@
 # Contributing
 
-The repo holds three things that ship separately: the Go module in `go/`, the Rust crates in
-`crates/`, and the docs site in `website/` (with its diagram package in `packages/`). The Go and
-Rust sides share one storage format, so most changes touch one language, and the ones that touch
-the format touch both. The [`docs/`](docs/) directory splits the guide, the reference spec, the ADRs and
+The repo holds the things that ship separately: the Go module in `go/`, the Rust crates in
+`crates/`, the TypeScript package in `packages/evt` (being built in phases, see
+[ADR 0009](docs/adr/0009-typescript-implementation.md)), and the docs site in `website/` (with its
+diagram package in `packages/react-flow-diagrams`). The Go and Rust sides share one storage
+format, so most changes touch one language, and the ones that touch the format touch both.
+TypeScript checks itself against the same fixtures. The [`docs/`](docs/) directory splits the guide, the reference spec, the ADRs and
 internal process notes.
 
 ## Local checks
@@ -29,6 +31,19 @@ crate tests with the feature sets CI uses:
 cargo fmt --all
 moon run evt-rust:check evt-rust:test
 ```
+
+The TypeScript package runs on Node 24, and its fixture runner (`packages/evt-compat`) also runs on
+Bun and Deno, whose versions are pinned in `.prototools`. `evt-ts:check` type-checks `src/` with
+only the web-standard globals in `packages/evt/src/globals.d.ts`, runs oxlint, and rejects any
+Node built-in import. `evt-ts:test` runs the Vitest unit tests and the fixture runner on Node, and
+`evt-ts:runtimes` runs the fixture runner on Bun and Deno:
+
+```sh
+proto install bun && proto install deno
+moon run evt-ts:check evt-ts:test evt-ts:runtimes
+```
+
+CI also runs the fixture runner on Node 22.12, the oldest Node that `engines` allows.
 
 ## Integration tests
 
@@ -62,10 +77,12 @@ Go and Rust take turns writing the same streams.
 
 DynamoDB items, PostgreSQL rows, serialized JSON, stream envelopes and the snapshot policy are all
 part of the [storage format](docs/reference/storage-format.md). Go and Rust both read and write
-it, so a change there has a longer checklist:
+it, and the TypeScript package checks itself against its fixtures, so a change there has a longer
+checklist:
 
 1. Regenerate the fixtures with `go -C go test ./internal/compat -run TestFixtures -update`.
-2. Pass `go test ./...` from `go/` and `cargo test --workspace`.
+2. Pass `go test ./...` from `go/`, `cargo test --workspace`, and
+   `moon run evt-ts:test evt-ts:runtimes`.
 3. Pass both live cross-language runs.
 4. Keep older stored data readable, with upcasters and fixture coverage.
 5. Update the spec. [`compat/README.md`](compat/README.md) has the details.

@@ -1,0 +1,74 @@
+# Without an explicit id, packages/evt falls back to `evt`, which go/moon.yml already uses.
+id: evt-ts
+language: typescript
+layer: library
+toolchains:
+  default: node
+project:
+  name: evt-ts
+  description: The TypeScript implementation, @photon-grove/evt, and its fixture runner in packages/evt-compat.
+fileGroups:
+  sources:
+    - src/**/*
+    - package.json
+    - tsconfig.json
+    - /pnpm-lock.yaml
+  tests:
+    - test/**/*
+    - scripts/**/*
+    - tsconfig.test.json
+    - vitest.config.ts
+    - .oxlintrc.json
+  # The fixture runner imports the built package, so it lives in its own workspace package.
+  compat:
+    - /packages/evt-compat/src/**/*
+    - /packages/evt-compat/package.json
+    - /packages/evt-compat/tsconfig.json
+    - /packages/evt-compat/.oxlintrc.json
+    - /compat/**/*
+tasks:
+  build:
+    command: pnpm run build
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - dist/**/*
+  build-compat:
+    command: pnpm --filter @photon-grove/evt-compat run build
+    deps:
+      - build
+    inputs:
+      - '@group(compat)'
+    outputs:
+      - /packages/evt-compat/dist/**/*
+  # tsc for the published code (web globals only) and for the tests, oxlint, and the check that
+  # src/ imports no Node built-in. The runner type-checks against the built package's declarations.
+  check:
+    script: pnpm run check && pnpm --filter @photon-grove/evt-compat run check
+    deps:
+      - build
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+      - '@group(compat)'
+  # The require() keeps the package loadable from CommonJS, which rules out top-level await.
+  test:
+    script: >-
+      pnpm run test && node ../evt-compat/dist/fixtures.js &&
+      node -e "require('@photon-grove/evt')"
+    deps:
+      - build-compat
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+      - '@group(compat)'
+  # The fixture runner on the other runtimes, against the same build. Bun and Deno come from
+  # .prototools locally and from the pinned setup actions in CI.
+  runtimes:
+    script: bun ../evt-compat/dist/fixtures.js && deno run --allow-read ../evt-compat/dist/fixtures.js
+    deps:
+      - build-compat
+    inputs:
+      - '@group(sources)'
+      - '@group(compat)'
+      - /.prototools

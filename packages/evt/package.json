@@ -1,0 +1,39 @@
+{
+  "name": "@photon-grove/evt",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Event sourcing for TypeScript, wire-compatible with the Go and Rust evt implementations.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/photon-grove/evt.git",
+    "directory": "packages/evt"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.12"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit && tsc -p tsconfig.test.json && oxlint --deny-warnings && node scripts/check-imports.ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.9",
+    "oxlint": "1.88.0",
+    "typescript": "^7.0.2",
+    "vitest": "5.0.5"
+  }
+}

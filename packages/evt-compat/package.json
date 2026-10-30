@@ -1,0 +1,21 @@
+{
+  "name": "@photon-grove/evt-compat",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The fixture runner that holds @photon-grove/evt to the shared compat/fixtures vectors.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit && oxlint --deny-warnings",
+    "fixtures": "node dist/fixtures.js"
+  },
+  "dependencies": {
+    "@photon-grove/evt": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.9",
+    "oxlint": "1.88.0",
+    "typescript": "^7.0.2"
+  }
+}
