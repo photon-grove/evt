@@ -4298,6 +4298,35 @@ async fn postgres_journal_wakeups() {
     }
     assert!(polled, "a Poll arrives at its cadence under steady traffic");
 
+    // Nor does a backlog: one commit wakes 30 scopes, and once the deadline has passed with all
+    // of them waiting, the next wake-up is the Poll, ahead of the backlog.
+    let fanned = Journal::new(["ledger"], |event: &SerializedEvent| {
+        (0..30)
+            .map(|i| Scope::new(format!("fan:{}:{i}", event.entity_id)).unwrap())
+            .collect::<Vec<_>>()
+    })
+    .unwrap();
+    let fanning = JournalRepository::new(repository.clone(), fanned);
+    while !matches!(listener.next().await.unwrap(), Wakeup::Poll) {}
+    let c = EntityId::new(format!("{events}-c"));
+    fanning
+        .commit(Commit::new(c.clone(), vec![event(&c, 1)]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        listener.next().await.unwrap(),
+        Wakeup::Poll,
+        "the overdue Poll comes before the backlog"
+    );
+    let mut woken = 0;
+    while let Ok(Ok(wakeup)) =
+        tokio::time::timeout(Duration::from_millis(200), listener.next()).await
+    {
+        woken += usize::from(matches!(wakeup, Wakeup::Scope(_)));
+    }
+    assert_eq!(woken, 30, "and every scope of the backlog follows");
+
     drop(listener);
     drop_log(&repository, &events, &snapshots).await;
 }

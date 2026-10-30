@@ -144,6 +144,15 @@ where
     /// after a backoff; the next call connects again.
     pub async fn next(&mut self) -> Result<Wakeup, Error> {
         loop {
+            // The backstop first: a backlog of queued or buffered notifications (each one ready
+            // at once, before any timer) must not hold it back.
+            if self.connected.is_some() && Instant::now() >= self.next_poll {
+                self.next_poll = Instant::now() + self.poll_interval;
+                self.check_due = true;
+
+                return Ok(Wakeup::Poll);
+            }
+
             if let Some(wakeup) = self.pending.pop_front() {
                 return Ok(wakeup);
             }
