@@ -3058,6 +3058,38 @@
       6
     ]
   ],
+  "snapshotBudget": [
+    {
+      "name": "small",
+      "entityId": "acct-budget",
+      "entityType": "account",
+      "sequence": 12,
+      "eventSequence": 60,
+      "payloadBytes": 2,
+      "size": 79,
+      "fits": true
+    },
+    {
+      "name": "at-limit",
+      "entityId": "acct-budget",
+      "entityType": "account",
+      "sequence": 12,
+      "eventSequence": 60,
+      "payloadBytes": 379923,
+      "size": 380000,
+      "fits": true
+    },
+    {
+      "name": "over-limit",
+      "entityId": "acct-budget",
+      "entityType": "account",
+      "sequence": 12,
+      "eventSequence": 60,
+      "payloadBytes": 379924,
+      "size": 380001,
+      "fits": false
+    }
+  ],
   "views": [
     {
       "name": "account",

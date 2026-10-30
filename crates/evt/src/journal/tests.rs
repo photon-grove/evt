@@ -9,8 +9,8 @@ use super::{
 use crate::conformance::{Add, Claim, Ledger, TestClock, compaction_cases, journal_cases};
 use crate::{
     Aggregate, Error, FeatureMarker, MemRepository, Metadata, OutcomeCommand, OutcomeConfig,
-    Rejection, Repository, RetryPolicy, SerializedEvent, Store, ToRejection, ViewRepository,
-    canonical_json,
+    RebuildFence, Rejection, Repository, RetryPolicy, SerializedEvent, Store, ToRejection,
+    ViewRepository, canonical_json,
 };
 
 fn scope(name: &str) -> Scope {
@@ -38,6 +38,7 @@ async fn the_journal_conformance_cases_pass_on_the_in_memory_repository() {
     let repository = MemRepository::new();
 
     journal_cases(&repository, &repository.clone()).await;
+    crate::conformance::journal_rebuild_cases(&repository, &repository.clone()).await;
 }
 
 #[tokio::test]
@@ -714,4 +715,514 @@ async fn a_projector_that_reads_metadata_sees_the_same_events_live_and_on_replay
         replayed, live,
         "a replay of the stored events reproduces the live rows"
     );
+}
+
+/// A fence over the in-memory repository whose first write takes longer than half a one-second
+/// lease and moves the repository's clock past the lease's expiry. Before each write another
+/// worker tries to begin a rebuild, which takes over the lease if it lapsed; after the first write
+/// an operator may force-release the lock.
+struct SlowFence {
+    inner: MemRepository,
+    clock: TestClock,
+    force_release: Option<String>,
+    /// For each write attempt: whether the intruder's begin was refused.
+    writes: std::sync::Mutex<Vec<bool>>,
+}
+
+impl SlowFence {
+    fn new(inner: MemRepository, clock: TestClock) -> Self {
+        Self {
+            inner,
+            clock,
+            force_release: None,
+            writes: std::sync::Mutex::default(),
+        }
+    }
+
+    fn writes(&self) -> Vec<bool> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl RebuildFence for SlowFence {
+    async fn rebuild_generation(&self) -> Result<crate::RebuildGeneration, Error> {
+        self.inner.rebuild_generation().await
+    }
+
+    async fn rebuild_state(&self) -> Result<crate::RebuildState, Error> {
+        self.inner.rebuild_state().await
+    }
+
+    async fn begin_rebuild(
+        &self,
+        owner: &str,
+        lease: std::time::Duration,
+    ) -> Result<crate::RebuildLease, Error> {
+        self.inner.begin_rebuild(owner, lease).await
+    }
+
+    async fn renew_rebuild(
+        &self,
+        lease: &crate::RebuildLease,
+        extend: std::time::Duration,
+    ) -> Result<crate::RebuildLease, Error> {
+        self.inner.renew_rebuild(lease, extend).await
+    }
+
+    async fn end_rebuild(
+        &self,
+        lease: &crate::RebuildLease,
+    ) -> Result<crate::RebuildGeneration, Error> {
+        self.inner.end_rebuild(lease).await
+    }
+
+    async fn force_release_rebuild(&self, owner: &str) -> Result<crate::RebuildGeneration, Error> {
+        self.inner.force_release_rebuild(owner).await
+    }
+
+    async fn write_rebuild_views(
+        &self,
+        lease: &crate::RebuildLease,
+        views: &[crate::ProjectedView],
+    ) -> Result<(), Error> {
+        let intruder = self
+            .inner
+            .begin_rebuild("intruder", std::time::Duration::from_secs(60))
+            .await;
+        let first = {
+            let mut writes = self.writes.lock().unwrap();
+            writes.push(matches!(intruder, Err(Error::RebuildLockHeld { .. })));
+            writes.len() == 1
+        };
+
+        self.inner.write_rebuild_views(lease, views).await?;
+
+        if first {
+            if let Some(owner) = &self.force_release {
+                self.inner.force_release_rebuild(owner).await?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            self.clock.advance(2);
+        }
+
+        Ok(())
+    }
+}
+
+/// 60 events in two scopes each: 120 rows and 2 counters, which the rebuild writes in two batches.
+async fn two_batches_of_journal(memory: &MemRepository) -> Vec<SerializedEvent> {
+    let repository = JournalRepository::new(memory.clone(), journal());
+    let store = Store::<Ledger, _>::new(&repository, ());
+    for _ in 0..60 {
+        store
+            .execute("l-1", Add(1), Metadata::new("local"))
+            .await
+            .unwrap();
+    }
+
+    memory.events(&"l-1".into()).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_journal_rebuild_that_outlasts_its_lease_renews_it_and_is_not_taken_over() {
+    let clock = TestClock::at(1_000_000);
+    let memory = MemRepository::new().with_clock(clock.reader());
+    let events = two_batches_of_journal(&memory).await;
+    let before = memory.rebuild_generation().await.unwrap();
+
+    let fence = SlowFence::new(memory.clone(), clock.clone());
+    let state = rebuild_with_lock(&fence, &events, std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!((state.rows.len(), state.counters.len()), (120, 2));
+    assert_eq!(
+        fence.writes(),
+        [true, true],
+        "the lease was renewed before the second batch, so nobody could take it over"
+    );
+    assert_eq!(
+        memory.rebuild_generation().await.unwrap().value,
+        before.value + 2,
+        "the run released its own lock"
+    );
+
+    // The same under a caller's lease: it is renewed in place and the caller ends it.
+    let fence = SlowFence::new(memory.clone(), clock.clone());
+    let mut lease = memory
+        .begin_rebuild("caller", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    let generation = lease.generation;
+    super::rebuild_with_lease(
+        &fence,
+        &events,
+        &mut lease,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fence.writes(), [true, true]);
+    assert_eq!(
+        (lease.generation, lease.lease_expires_at),
+        (generation, clock.seconds() + 1),
+        "the same lease, renewed"
+    );
+    memory.end_rebuild(&lease).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_journal_rebuild_that_loses_its_lease_stops_before_the_next_write() {
+    let clock = TestClock::at(1_000_000);
+    let memory = MemRepository::new().with_clock(clock.reader());
+    let events = two_batches_of_journal(&memory).await;
+
+    let mut fence = SlowFence::new(memory.clone(), clock.clone());
+    fence.force_release = Some(super::REBUILD_OWNER.to_owned());
+    let error = rebuild_with_lock(&fence, &events, std::time::Duration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::RebuildLeaseLost { .. }), "{error:?}");
+    assert_eq!(fence.writes().len(), 1, "no write after the lost renewal");
+    let generation = memory.rebuild_generation().await.unwrap();
+    assert!(
+        !generation.is_settled() && generation.force_released,
+        "the force-release stands until a rebuild completes: {generation:?}"
+    );
+
+    // Under a caller's lease the failure reports the batch it attempted.
+    let mut fence = SlowFence::new(memory.clone(), clock.clone());
+    fence.force_release = Some("caller".to_owned());
+    let mut lease = memory
+        .begin_rebuild("caller", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    let failure = super::rebuild_with_lease(
+        &fence,
+        &events,
+        &mut lease,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(*failure.error, Error::RebuildLeaseLost { .. }),
+        "{failure:?}"
+    );
+    assert_eq!((failure.attempted, failure.batches), (1, 2));
+    assert_eq!(fence.writes().len(), 1);
+}
+
+#[tokio::test]
+async fn a_journal_that_cannot_be_replayed_takes_no_lock() {
+    let memory = MemRepository::new();
+    let mut events = two_batches_of_journal(&memory).await;
+    // Two different records claiming one position.
+    let mut forged = events[0].clone();
+    forged.id = "forged".into();
+    events.push(forged);
+
+    let error = rebuild_with_lock(&memory, &events, std::time::Duration::from_secs(60))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidJournal(_)), "{error:?}");
+    let state = memory.rebuild_state().await.unwrap();
+    assert!(
+        !state.in_progress() && state.generation.is_settled(),
+        "{state:?}"
+    );
+}
+
+/// A current-state projector: each ledger's state under `totals`.
+struct Totals;
+
+impl crate::CommitProjector for Totals {
+    fn name(&self) -> &str {
+        "totals"
+    }
+
+    fn project(
+        &self,
+        commit: &crate::CommitView,
+    ) -> Result<Vec<crate::ViewOperation>, crate::BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                crate::ViewOperation::put(
+                    "totals",
+                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(),
+                    "ledger",
+                    stream.state.clone(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// Every row the views and the journal hold: the totals, the journal rows, and the counters.
+async fn derived_rows(memory: &MemRepository) -> Vec<crate::ViewRow> {
+    let mut rows = memory.list_views_by_pk("totals").await.unwrap();
+    for entity_type in [super::ROW_ENTITY_TYPE, super::COUNTER_ENTITY_TYPE] {
+        rows.extend(memory.list_views_by_entity_type(entity_type).await.unwrap());
+    }
+    rows.sort_by(|a, b| (&a.pk, &a.sk).cmp(&(&b.pk, &b.sk)));
+
+    rows
+}
+
+async fn wipe(memory: &MemRepository) {
+    for row in derived_rows(memory).await {
+        memory.delete_view(&row.pk, &row.sk).await.unwrap();
+    }
+}
+
+/// Two ledgers through a journaled store that runs [`Totals`]: 3 events in 2 scopes each (6 rows),
+/// 3 counters, and 2 totals.
+async fn journaled_ledgers() -> MemRepository {
+    let memory = MemRepository::new();
+    let repository = JournalRepository::new(memory.clone(), journal());
+    let store =
+        Store::<Ledger, _>::new(&repository, ()).with_commit_projector(std::sync::Arc::new(Totals));
+    for (id, amount) in [("l-1", 1), ("l-2", 2), ("l-1", 3)] {
+        store
+            .execute(id, Add(amount), Metadata::new("local"))
+            .await
+            .unwrap();
+    }
+
+    memory
+}
+
+const LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[tokio::test]
+async fn views_and_the_journal_rebuild_under_one_lease_and_one_generation() {
+    let memory = journaled_ledgers().await;
+    let live = derived_rows(&memory).await;
+    assert_eq!(live.len(), 2 + 6 + 3);
+    wipe(&memory).await;
+    let before = memory.rebuild_generation().await.unwrap();
+
+    let report = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(Totals))
+        .aggregate::<Ledger>()
+        .with_journal(journal())
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            report.entities,
+            report.events,
+            report.journal_rows,
+            report.journal_counters,
+            report.puts,
+            report.batches
+        ),
+        (2, 3, 6, 3, 11, 1)
+    );
+    assert_eq!(derived_rows(&memory).await, live, "both are rebuilt");
+    assert_eq!(
+        memory.rebuild_generation().await.unwrap().value,
+        before.value + 2,
+        "one lock, so readers see one rebuild"
+    );
+
+    // The journal alone needs no projector or aggregate type.
+    wipe(&memory).await;
+    let report = crate::ProjectionRebuild::new(&memory)
+        .with_journal(journal())
+        .run("rebuild-2", LEASE)
+        .await
+        .unwrap();
+    assert_eq!((report.entities, report.puts), (0, 9));
+    assert_eq!(derived_rows(&memory).await.len(), 9);
+
+    // Without either there is nothing to rebuild; the journal's projector is still refused.
+    let repository = JournalRepository::new(memory.clone(), journal());
+    for rebuild in [
+        crate::ProjectionRebuild::new(&memory).aggregate::<Ledger>(),
+        crate::ProjectionRebuild::new(&memory)
+            .with_projector(repository.projector())
+            .aggregate::<Ledger>()
+            .with_journal(journal()),
+    ] {
+        assert!(matches!(
+            rebuild.run("rebuild-3", LEASE).await,
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+}
+
+/// A projector that writes at the key of the journal's first row in the shared scope.
+struct OnTheJournal;
+
+impl crate::CommitProjector for OnTheJournal {
+    fn name(&self) -> &str {
+        "on-the-journal"
+    }
+
+    fn project(
+        &self,
+        commit: &crate::CommitView,
+    ) -> Result<Vec<crate::ViewOperation>, crate::BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .filter(|stream| stream.entity_id.as_str() == "l-2")
+            .map(|stream| {
+                crate::ViewOperation::put(
+                    scope("all").row_pk(),
+                    super::row_sk(1),
+                    stream.entity_id.clone(),
+                    "ledger",
+                    "{}",
+                )
+            })
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn a_journal_key_a_view_row_also_plans_fails_before_any_write_and_releases_the_lock() {
+    let memory = journaled_ledgers().await;
+    wipe(&memory).await;
+
+    let error = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(OnTheJournal))
+        .aggregate::<Ledger>()
+        .with_journal(journal())
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::SharedViewKey { .. }), "{error:?}");
+    assert!(
+        derived_rows(&memory).await.is_empty(),
+        "nothing was written"
+    );
+    assert!(memory.rebuild_generation().await.unwrap().is_settled());
+}
+
+#[tokio::test]
+async fn a_journal_that_cannot_be_replayed_fails_the_rebuild_before_any_write() {
+    let memory = journaled_ledgers().await;
+    wipe(&memory).await;
+
+    // An event written around the journal that claims a position another event holds.
+    let forged = super::encode_allocations(&[super::Allocation {
+        scope: "all".into(),
+        position: 1,
+    }]);
+    Store::<Ledger, _>::new(&memory, ())
+        .execute(
+            "l-3",
+            Add(1),
+            Metadata::new("local").with_extension(super::ALLOCATION_KEY, forged),
+        )
+        .await
+        .unwrap();
+
+    let error = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(Totals))
+        .aggregate::<Ledger>()
+        .with_journal(journal())
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidJournal(_)), "{error:?}");
+    assert!(
+        derived_rows(&memory).await.is_empty(),
+        "nothing was written"
+    );
+    let state = memory.rebuild_state().await.unwrap();
+    assert!(
+        !state.in_progress() && state.generation.is_settled(),
+        "{state:?}"
+    );
+}
+
+/// A history-dependent projector over ledgers, the journal's own type: a row per commit and
+/// stream.
+struct Commits;
+
+impl crate::CommitProjector for Commits {
+    fn name(&self) -> &str {
+        "commits"
+    }
+
+    fn history(&self) -> &[crate::EntityType] {
+        static LEDGER: std::sync::LazyLock<[crate::EntityType; 1]> =
+            std::sync::LazyLock::new(|| [crate::EntityType::new("ledger")]);
+
+        &*LEDGER
+    }
+
+    fn project(
+        &self,
+        commit: &crate::CommitView,
+    ) -> Result<Vec<crate::ViewOperation>, crate::BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                let last = stream.events.last().map_or(0, |event| event.sequence.0);
+                crate::ViewOperation::put(
+                    "commits",
+                    format!("{}#{last}", stream.entity_id),
+                    stream.entity_id.clone(),
+                    "ledger",
+                    stream.state.clone(),
+                )
+            })
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn a_history_projector_and_the_journal_share_one_read_of_their_type() {
+    let memory = journaled_ledgers().await;
+    let journal_rows = |memory: &MemRepository| {
+        let memory = memory.clone();
+        async move {
+            let mut rows = Vec::new();
+            for entity_type in [super::ROW_ENTITY_TYPE, super::COUNTER_ENTITY_TYPE] {
+                rows.extend(memory.list_views_by_entity_type(entity_type).await.unwrap());
+            }
+            rows.sort_by(|a, b| (&a.pk, &a.sk).cmp(&(&b.pk, &b.sk)));
+
+            rows
+        }
+    };
+    let live = journal_rows(&memory).await;
+    wipe(&memory).await;
+
+    let report = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(Commits))
+        .aggregate::<Ledger>()
+        .with_journal(journal())
+        .run("rebuild-1", LEASE)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            report.events,
+            report.commits,
+            report.journal_rows,
+            report.journal_counters
+        ),
+        (3, 3, 6, 3),
+        "each event read once, for the replay and the journal alike"
+    );
+    assert_eq!(journal_rows(&memory).await, live, "the journal is rebuilt");
+    assert_eq!(memory.list_views_by_pk("commits").await.unwrap().len(), 3);
 }

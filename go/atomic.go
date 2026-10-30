@@ -59,6 +59,31 @@ func (e *CommitTooLargeError) Error() string {
 	return fmt.Sprintf("commit too large: %d items, %d bytes, largest item %d bytes", e.Items, e.Bytes, e.LargestItem)
 }
 
+// MaxCommitItemBytes is the largest item a commit may carry: 95% of DynamoDB's 400 KB item limit.
+// CommitBudget refuses a commit with a larger item on every backend.
+const MaxCommitItemBytes = 380_000
+
+// widestTTLSize is the budgeted size of the widest ttl attribute: its name and the 19 digits of the
+// largest int64 (a ttl is a positive number of epoch seconds).
+const widestTTLSize = len("ttl") + len("9223372036854775807")
+
+// SnapshotCommitSize returns the bytes the commit preflight would budget for the snapshot's item,
+// counting a ttl attribute at its widest whether or not the entity type is retained. A store
+// writes a snapshot with a commit only when this is at most MaxCommitItemBytes: a larger one
+// would fail every commit that carries it with CommitTooLargeError, so the store leaves it out
+// and the commit proceeds without it (storage spec, Snapshot policy).
+func SnapshotCommitSize(snapshot SerializedSnapshot) int {
+	return snapshotItemSize(snapshot) + widestTTLSize
+}
+
+// snapshotItemSize is the budgeted size of a snapshot put without its ttl attribute.
+func snapshotItemSize(snapshot SerializedSnapshot) int {
+	return len("pk") + len("sk") + len(snapshot.EntityID) + len("0") +
+		len("seq") + len(strconv.Itoa(int(snapshot.Sequence))) +
+		len("eventSeq") + len(strconv.Itoa(int(snapshot.EventSequence))) +
+		len("entityType") + len(snapshot.EntityType) + len("payload") + len(snapshot.Payload)
+}
+
 // CommitBudget checks DynamoDB's transaction limits — 100 items, 4 MB per request, 400 KB per
 // item — against 95% of each limit, a 5% safety margin for key-encoding and rounding
 // differences. The budgets apply on every backend, so an oversized commit fails identically
@@ -74,7 +99,7 @@ func CommitBudget(itemSizes []int) error {
 		largest = max(largest, size)
 	}
 
-	if len(itemSizes) > 100 || total > 3_800_000 || largest > 380_000 {
+	if len(itemSizes) > 100 || total > 3_800_000 || largest > MaxCommitItemBytes {
 		return &CommitTooLargeError{Items: len(itemSizes), Bytes: total, LargestItem: largest}
 	}
 
@@ -481,11 +506,7 @@ func TransactionItemSizesWithTTL(result SerializedResult, ttlFor func(EntityType
 		streams[event.EntityID] = stream
 	}
 	for _, snapshot := range result.Snapshots {
-		sizes = append(sizes, keySize(snapshot.EntityID, 0)+
-			len("seq")+len(strconv.Itoa(int(snapshot.Sequence)))+
-			len("eventSeq")+len(strconv.Itoa(int(snapshot.EventSequence)))+
-			len("entityType")+len(snapshot.EntityType)+len("payload")+len(snapshot.Payload)+
-			ttlSize(snapshot.EntityType))
+		sizes = append(sizes, snapshotItemSize(snapshot)+ttlSize(snapshot.EntityType))
 	}
 
 	// Every written stream contributes its head update, whether it creates or appends and whether

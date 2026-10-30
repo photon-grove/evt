@@ -14,9 +14,9 @@ use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Aggregate, CommandIdentity, DigestInput, EntityId, EntityType, Error, EventId, EventSequence,
     EventType, EventVersion, FeatureManifest, FeatureMarker, MAX_COMMAND_ID_BYTES,
-    MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, Rejection, RejectionCode, RetryPolicy,
-    SerializedEvent, SerializedSnapshot, canonical_digest_bytes, canonical_numbers, default_digest,
-    json, snapshot_events_due,
+    MAX_COMMIT_ITEM_BYTES, MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, Rejection,
+    RejectionCode, RetryPolicy, SerializedEvent, SerializedSnapshot, canonical_digest_bytes,
+    canonical_numbers, default_digest, json, snapshot_commit_size, snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,9 +29,23 @@ struct CodecFixtures {
     metadata_decode: Vec<DecodeVector>,
     event_decode: Vec<DecodeVector>,
     snapshot_policy: Vec<[i64; 4]>,
+    snapshot_budget: Vec<SnapshotBudgetVector>,
     views: Vec<ViewVector>,
     int_key_map: String,
     ttl: TtlVector,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotBudgetVector {
+    name: String,
+    entity_id: String,
+    entity_type: String,
+    sequence: i64,
+    event_sequence: i64,
+    payload_bytes: usize,
+    size: usize,
+    fits: bool,
 }
 
 #[derive(Deserialize)]
@@ -427,6 +441,31 @@ fn snapshot_policy_matches_go() {
         assert_eq!(
             due as i64, expected,
             "current={current} events={events} interval={interval}"
+        );
+    }
+}
+
+#[test]
+fn snapshot_budget_matches_go() {
+    let vectors = codec_fixtures().snapshot_budget;
+    assert_eq!(vectors.len(), 3, "small, at the limit, and one byte over");
+
+    for vector in vectors {
+        let snapshot = SerializedSnapshot {
+            entity_type: EntityType::new(vector.entity_type),
+            entity_id: EntityId::new(vector.entity_id),
+            sequence: EventSequence(vector.sequence),
+            event_sequence: EventSequence(vector.event_sequence),
+            payload: vec![b'x'; vector.payload_bytes],
+        };
+        let size = snapshot_commit_size(&snapshot).unwrap();
+
+        assert_eq!(size, vector.size, "{}", vector.name);
+        assert_eq!(
+            size <= MAX_COMMIT_ITEM_BYTES,
+            vector.fits,
+            "{}",
+            vector.name
         );
     }
 }

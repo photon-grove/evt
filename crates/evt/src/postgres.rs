@@ -1,8 +1,8 @@
 //! A PostgreSQL event log, row-for-row compatible with Go's `postgres.Repository`.
 //!
 //! It uses a [`deadpool_postgres::Pool`]. Call [`PostgresRepository::ensure_schema`] at startup.
-//! It runs the same idempotent DDL as Go's `EnsureSchema`. See [`crate::wire::postgres`] for the
-//! table layout.
+//! It runs the same idempotent DDL as Go's `EnsureSchema`, plus the Rust-only views table
+//! ([`PgViewRepository`], ADR 0008). See [`crate::wire::postgres`] for the table layout.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,7 +17,8 @@ use tokio_postgres::types::ToSql;
 use crate::error::Error;
 use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{
-    self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
+    self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker,
+    POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION, SYSTEM_PREFIX,
 };
 use crate::heads::{self, Probe};
 use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
@@ -32,7 +33,7 @@ use crate::wire::postgres::{
     DEFAULT_EVENTS_TABLE, DEFAULT_SNAPSHOTS_TABLE, ENTITY_LOCK, EventRow, FEATURES_LOCK_EXCLUSIVE,
     FEATURES_LOCK_SHARED, OutcomeRow, SnapshotRow, check_table_names, features_lock_key,
     features_table, insert_outcome_sql, outcomes_table, rebuild_generation_table, rebuild_lock_key,
-    rebuild_lock_table, schema_ddl, select_outcome_sql, stream_heads_table,
+    rebuild_lock_table, schema_ddl, select_outcome_sql, stream_heads_table, views_table,
 };
 
 /// Turns one commit-wide view operation (v0.9, C7) into the statement that writes it. evt defines
@@ -78,7 +79,8 @@ impl PgStatement {
     /// The statement's size in the shared commit budget: one action, sized by its SQL text. The
     /// bound parameters are opaque, so the estimate is a lower bound; the action count, which
     /// the budget checks exactly, is what makes `CommitTooLarge` fire at the same point as on
-    /// DynamoDB.
+    /// DynamoDB. A view operation on the views table is sized as its DynamoDB action instead
+    /// ([`PostgresRepository::view_sizes`]).
     fn budget_size(&self) -> usize {
         self.sql.len()
     }
@@ -108,6 +110,15 @@ pub struct PostgresRepository {
     /// Records that the rebuild-lock relation exists, so a commit's lock assertion probes the
     /// catalog only until it first finds it. Shared by clones, like the database it describes.
     rebuild_ready: Arc<AtomicBool>,
+    /// Records that the database's encoding was found to be UTF-8, so the views table's check runs
+    /// once per handle and its clones rather than once per view repository.
+    views_encoding_checked: Arc<AtomicBool>,
+    /// Whether the commit's view operations go to the evt-owned views table
+    /// ([`with_views_table`](Self::with_views_table)) instead of a view writer.
+    views_table_target: bool,
+    /// Records that the marker declares `postgres-views`, so the declaration runs once per
+    /// handle and its clones.
+    views_declared: Arc<AtomicBool>,
 }
 
 impl Clone for PostgresRepository {
@@ -120,6 +131,9 @@ impl Clone for PostgresRepository {
             validated_marker: Mutex::new(*self.validated_marker()),
             clock: self.clock.clone(),
             rebuild_ready: self.rebuild_ready.clone(),
+            views_encoding_checked: self.views_encoding_checked.clone(),
+            views_table_target: self.views_table_target,
+            views_declared: self.views_declared.clone(),
         }
     }
 }
@@ -130,6 +144,7 @@ impl fmt::Debug for PostgresRepository {
             .field("events_table", &self.events_table)
             .field("snapshots_table", &self.snapshots_table)
             .field("view_writer", &self.view_writer.is_some())
+            .field("views_table_target", &self.views_table_target)
             .finish_non_exhaustive()
     }
 }
@@ -148,6 +163,9 @@ impl PostgresRepository {
             validated_marker: Mutex::new(None),
             clock: Clock::default(),
             rebuild_ready: Arc::new(AtomicBool::new(false)),
+            views_encoding_checked: Arc::new(AtomicBool::new(false)),
+            views_table_target: false,
+            views_declared: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -195,6 +213,22 @@ impl PostgresRepository {
     #[must_use]
     pub fn with_view_writer(mut self, writer: ViewWriter) -> Self {
         self.view_writer = Some(writer);
+        self.views_table_target = false;
+        self
+    }
+
+    /// Makes the evt-owned views table (`{events}__evt_views`, see [`PgViewRepository`]) the
+    /// target of a commit's view operations, in place of a [view writer](Self::with_view_writer):
+    /// a repository has one or the other. evt builds each statement with the DynamoDB repository's
+    /// owner rules, applies the journal's expected-payload condition
+    /// ([`applies_expected_payload`](Repository::applies_expected_payload) is true), sizes it in
+    /// the commit budget as its DynamoDB item, and declares the `postgres-views` marker feature
+    /// before the first commit, so a writer that would put the views elsewhere refuses the store.
+    /// The database must be `UTF8`.
+    #[must_use]
+    pub fn with_views_table(mut self) -> Self {
+        self.view_writer = None;
+        self.views_table_target = true;
         self
     }
 
@@ -205,6 +239,16 @@ impl PostgresRepository {
         if views.is_empty() {
             return Ok(Vec::new());
         }
+
+        if self.views_table_target {
+            let table = views_table(&self.events_table);
+
+            return views
+                .iter()
+                .map(|view| views_table_statement(&table, view))
+                .collect();
+        }
+
         let Some(writer) = &self.view_writer else {
             return Err(Error::ViewsNotConfigured {
                 backend: "postgres",
@@ -259,6 +303,7 @@ impl PostgresRepository {
         self.snapshots_table = snapshots_table.to_ascii_lowercase();
         *self.validated_marker() = None;
         self.rebuild_ready = Arc::new(AtomicBool::new(false));
+        self.views_declared = Arc::new(AtomicBool::new(false));
 
         Ok(self)
     }
@@ -268,10 +313,11 @@ impl PostgresRepository {
         &self.pool
     }
 
-    /// Creates the event and snapshot tables if they do not exist.
+    /// Creates the event and snapshot tables if they do not exist, and the views table
+    /// ([`PgViewRepository`], ADR 0008), which Go's `EnsureSchema` does not create.
     pub async fn ensure_schema(&self) -> Result<(), Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
         // IF NOT EXISTS can still race in PostgreSQL's catalogs. Go takes this same lock.
         tx.execute(
             "SELECT pg_advisory_xact_lock(1702261762, hashtext($1))",
@@ -282,7 +328,20 @@ impl PostgresRepository {
         tx.batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
             .await
             .map_err(Error::backend)?;
+        tx.batch_execute(&crate::wire::postgres::views_ddl(&self.events_table))
+            .await
+            .map_err(Error::backend)?;
         tx.commit().await.map_err(Error::backend)
+    }
+
+    /// The view repository over this event log's views table (`{events}__evt_views`), which
+    /// [`ensure_schema`](Self::ensure_schema) creates.
+    pub fn view_repository(&self) -> PgViewRepository {
+        PgViewRepository::new(
+            self.pool.clone(),
+            &self.events_table,
+            self.views_encoding_checked.clone(),
+        )
     }
 
     fn validated_marker(&self) -> std::sync::MutexGuard<'_, CachedMarker> {
@@ -382,7 +441,7 @@ impl PostgresRepository {
         only_if_empty: bool,
     ) -> Result<bool, Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
         let lock_key = features_lock_key(&self.events_table);
         tx.execute(FEATURES_LOCK_EXCLUSIVE, &[&lock_key])
             .await
@@ -491,21 +550,121 @@ impl PostgresRepository {
 
         let observed = self.read_manifest().await?;
 
-        match features::validate_marker_for_write(observed.as_ref()) {
+        match self.validate_for_write(observed.as_ref(), false) {
             Ok(_) => Ok(()),
             Err(Error::StreamHeadsNotMigrated) => self.initialize().await.map(|_| ()),
             Err(error) => Err(error),
         }
     }
 
+    /// The commit-budget sizes of a commit's view operations: with the views table, each as the
+    /// DynamoDB action it mirrors ([`crate::view_operation_size`], which equals DynamoDB's own
+    /// sizing), so `CommitTooLarge` fires at the same commit on both backends; with a view writer,
+    /// each statement by its SQL text.
+    fn view_sizes(&self, views: &[ProjectedView], statements: &[PgStatement]) -> Vec<usize> {
+        if self.views_table_target {
+            views
+                .iter()
+                .map(|view| crate::view_operation_size(&view.op))
+                .collect()
+        } else {
+            statements.iter().map(PgStatement::budget_size).collect()
+        }
+    }
+
+    /// [`features::validate_marker_for_write`], with the PostgreSQL repository's own rule for
+    /// `postgres-views`: a repository without the views table refuses a store that declares it
+    /// ([`Error::UnsupportedFeature`]), so commit-wide views never split between the views table and
+    /// an application's tables. With `views` (a commit through the views table, which
+    /// [`ensure_views_declared`](Self::ensure_views_declared) declared the feature for), a store
+    /// that no longer declares it fails as [`Error::Transient`], and the retry declares it again.
+    fn validate_for_write(
+        &self,
+        observed: Option<&FeatureManifest>,
+        views: bool,
+    ) -> Result<features::ValidatedMarker, Error> {
+        self.refuse_foreign_views(observed)?;
+
+        let declared =
+            observed.is_some_and(|manifest| manifest.features.contains_key(POSTGRES_VIEWS_FEATURE));
+
+        if views && self.views_table_target && !declared {
+            self.views_declared.store(false, Ordering::Release);
+
+            return Err(Error::Transient(
+                "the store no longer declares postgres-views; declaring it again".into(),
+            ));
+        }
+
+        features::validate_marker_for_write(observed)
+    }
+
+    /// Refuses a store that declares `postgres-views` unless this repository writes its views to
+    /// the views table.
+    fn refuse_foreign_views(&self, observed: Option<&FeatureManifest>) -> Result<(), Error> {
+        match observed.and_then(|manifest| manifest.features.get(POSTGRES_VIEWS_FEATURE)) {
+            Some(&version) if !self.views_table_target => Err(Error::UnsupportedFeature {
+                feature: POSTGRES_VIEWS_FEATURE.to_owned(),
+                version,
+            }),
+
+            _ => Ok(()),
+        }
+    }
+
+    /// Declares `postgres-views` on a store whose views live in the views table, once per handle
+    /// (clones share the flag), after checking the database is `UTF8`. Runs before a commit or a
+    /// rebuild write, outside its transaction: a declaration takes the exclusive marker lock,
+    /// which a commit holding the shared lock must not wait for.
+    async fn ensure_views_declared(&self) -> Result<(), Error> {
+        if !self.views_table_target || self.views_declared.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        self.view_repository().check_encoding().await?;
+
+        let manifest = self.read_manifest().await?;
+        match manifest
+            .as_ref()
+            .and_then(|manifest| manifest.features.get(POSTGRES_VIEWS_FEATURE))
+        {
+            Some(&POSTGRES_VIEWS_VERSION) => {}
+            Some(&version) => {
+                return Err(Error::UnsupportedFeature {
+                    feature: POSTGRES_VIEWS_FEATURE.to_owned(),
+                    version,
+                });
+            }
+            None => {
+                self.update_manifest(|manifest| {
+                    manifest
+                        .features
+                        .insert(POSTGRES_VIEWS_FEATURE.to_owned(), POSTGRES_VIEWS_VERSION);
+                })
+                .await?;
+            }
+        }
+
+        self.views_declared.store(true, Ordering::Release);
+
+        Ok(())
+    }
+
     /// Compares the commit's manifest row against the writer's cached validation, re-validating
     /// when the row changed under it. Runs inside the commit transaction under the shared
     /// advisory lock, so a declaration cannot slip between this check and the `COMMIT`.
-    fn check_manifest(&self, observed: Option<&FeatureManifest>) -> Result<(), Error> {
+    fn check_manifest(&self, observed: Option<&FeatureManifest>, views: bool) -> Result<(), Error> {
         let mut cached = self.validated_marker();
 
         if !features::marker_matches(*cached, observed) {
-            *cached = Some(features::validate_marker_for_write(observed)?);
+            *cached = Some(self.validate_for_write(observed, views)?);
+        } else if views {
+            // The cache says nothing about postgres-views: check it on every commit.
+            self.validate_for_write(observed, true)?;
+        } else {
+            // Nor does it know this handle's view target, which a clone can change
+            // (`with_view_writer` on a views-table repository): refuse a foreign store every time.
+            self.refuse_foreign_views(observed)?;
         }
 
         Ok(())
@@ -911,9 +1070,10 @@ impl PostgresRepository {
             .collect();
 
         self.ensure_stream_heads().await?;
+        self.ensure_views_declared().await?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
 
         // Every touched stream, written and fenced, takes its advisory lock in canonical
         // (sorted) order, so concurrent multi-stream commits cannot deadlock. An outcome-only
@@ -939,7 +1099,7 @@ impl PostgresRepository {
             .await
             .map_err(statement_error)?;
         let manifest = self.read_manifest_in(&tx).await?;
-        self.check_manifest(manifest.as_ref())?;
+        self.check_manifest(manifest.as_ref(), self.views_table_target)?;
 
         // Fences are refused for entity types durably declared with retention: TTL deletes reopen
         // fenced slots without leaving a successor snapshot. The refusal consults the manifest in
@@ -1115,6 +1275,12 @@ impl Repository for PostgresRepository {
         true
     }
 
+    /// True with the views table ([`with_views_table`](PostgresRepository::with_views_table)),
+    /// whose statements evt builds; an application view writer cannot express the condition.
+    fn applies_expected_payload(&self) -> bool {
+        self.views_table_target
+    }
+
     async fn declare_history_dependent(&self, types: &[EntityType]) -> Result<(), Error> {
         crate::features::declare_history(self, types).await
     }
@@ -1136,7 +1302,7 @@ impl Repository for PostgresRepository {
         let view_statements = self.view_statements(&commit.views)?;
         let mut sizes = commit.sizes(|_| None)?;
         sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
-        sizes.extend(view_statements.iter().map(PgStatement::budget_size));
+        sizes.extend(self.view_sizes(&commit.views, &view_statements));
         crate::repository::check_budget(sizes)?;
 
         let operations: Vec<&PgStatement> = commit.operations.iter().collect();
@@ -1171,7 +1337,7 @@ impl Repository for PostgresRepository {
         let view_statements = self.view_statements(&commit.views)?;
         let mut sizes = commit.sizes(|_| None)?;
         sizes.extend(commit.operations.iter().map(PgStatement::budget_size));
-        sizes.extend(view_statements.iter().map(PgStatement::budget_size));
+        sizes.extend(self.view_sizes(&commit.views, &view_statements));
         crate::repository::check_budget(sizes)?;
 
         let streams: Vec<&Commit<PgStatement>> = commit.streams.iter().collect();
@@ -1283,7 +1449,7 @@ impl Repository for PostgresRepository {
         self.ensure_stream_heads().await?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
         tx.execute(ENTITY_LOCK, &[&snapshot.entity_id.as_str()])
             .await
             .map_err(statement_error)?;
@@ -1293,7 +1459,7 @@ impl Repository for PostgresRepository {
             .await
             .map_err(statement_error)?;
         let manifest = self.read_manifest_in(&tx).await?;
-        self.check_manifest(manifest.as_ref())?;
+        self.check_manifest(manifest.as_ref(), false)?;
 
         // H3: the stream's head must cover the snapshot. A snapshot of an empty stream (event
         // sequence 0) may have no head row at all. The entity lock holds the head steady.
@@ -1327,7 +1493,7 @@ impl Repository for PostgresRepository {
         }
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
-        let tx = client.transaction().await.map_err(Error::backend)?;
+        let tx = read_committed(&mut client).await?;
         let lock_key = features_lock_key(&self.events_table);
         tx.execute(FEATURES_LOCK_SHARED, &[&lock_key])
             .await
@@ -1337,7 +1503,7 @@ impl Repository for PostgresRepository {
         // declares a feature this build does not model) is refused before the snapshot is read,
         // so the refusal wins over `CompactionUncovered`. It never declares the feature itself,
         // and never touches a head row.
-        features::validate_marker_for_write(manifest.as_ref())?;
+        self.validate_for_write(manifest.as_ref(), false)?;
 
         let sql = format!(
             "SELECT entity_type, event_sequence FROM {} WHERE entity_id = $1",
@@ -1500,6 +1666,136 @@ fn projector_error(err: tokio_postgres::Error) -> Error {
     }
 }
 
+/// The statement of one commit-wide view operation on the evt-owned views table `table`, with the
+/// DynamoDB repository's owner rules (storage format: PostgreSQL views table, Commit target). It
+/// refuses, before any write, what the table cannot store: U+0000 anywhere, a payload that is not
+/// UTF-8, and a key too long for the btree indexes ([`Error::ViewKeyTooLong`]).
+fn views_table_statement(table: &str, view: &ProjectedView) -> Result<PgStatement, Error> {
+    use crate::wire::postgres::MAX_VIEW_INDEX_KEY_BYTES;
+
+    let op = &view.op;
+    let refuse = |reason: &str| {
+        Error::InvalidViewOperation(format!(
+            "projector {:?} (#{}) operation {}: {reason}",
+            view.projector, view.projector_index, view.operation
+        ))
+    };
+    let payload = std::str::from_utf8(&op.payload)
+        .map_err(|_| refuse("the views table stores a UTF-8 payload"))?
+        .to_owned();
+
+    for (field, value) in [
+        ("pk", op.pk.as_str()),
+        ("sk", op.sk.as_str()),
+        ("owner", op.owner.as_str()),
+        ("entity type", op.entity_type.as_str()),
+        ("payload", payload.as_str()),
+    ] {
+        if value.contains('\0') {
+            return Err(refuse(&format!(
+                "a PostgreSQL view {field} cannot contain U+0000"
+            )));
+        }
+    }
+
+    let key_bytes = op.entity_type.len() + op.pk.len() + op.sk.len();
+    if key_bytes > MAX_VIEW_INDEX_KEY_BYTES {
+        return Err(Error::ViewKeyTooLong {
+            field: "entity type, pk and sk",
+            length: key_bytes,
+            max: MAX_VIEW_INDEX_KEY_BYTES,
+            projector: view.projector.clone(),
+            operation: view.operation,
+        });
+    }
+
+    let (pk, sk, owner) = (op.pk.clone(), op.sk.clone(), op.owner.as_str().to_owned());
+    let columns = "(pk, sk, entity_id, entity_type, payload, ttl)";
+    let statement = match (op.kind, op.condition, &op.expected_payload) {
+        // The journal's counter: replace exactly the row the commit read.
+        (ViewOperationKind::Put, _, Some(expected)) => {
+            let expected = String::from_utf8(expected.clone())
+                .map_err(|_| refuse("an expected view payload must be UTF-8"))?;
+
+            PgStatement::new(
+                format!(
+                    "UPDATE {table} SET entity_type = $4, payload = $5, ttl = 0 \
+                     WHERE pk = $1 AND sk = $2 AND entity_id = $3 AND payload = $6"
+                ),
+                vec![
+                    Box::new(pk),
+                    Box::new(sk),
+                    Box::new(owner),
+                    Box::new(op.entity_type.clone()),
+                    Box::new(payload),
+                    Box::new(expected),
+                ],
+            )
+        }
+
+        // A plain insert: a violation of the key is the failed condition.
+        (ViewOperationKind::Put, ViewCondition::Absent, None) => PgStatement::new(
+            format!("INSERT INTO {table} {columns} VALUES ($1, $2, $3, $4, $5, 0)"),
+            vec![
+                Box::new(pk),
+                Box::new(sk),
+                Box::new(owner),
+                Box::new(op.entity_type.clone()),
+                Box::new(payload),
+            ],
+        )
+        .with_key_constraint(format!("{table}_pkey")),
+
+        // The owner's row must exist: an update of it, zero rows otherwise.
+        (ViewOperationKind::Put, ViewCondition::Present, None) => PgStatement::new(
+            format!(
+                "UPDATE {table} SET entity_type = $4, payload = $5, ttl = 0 \
+                 WHERE pk = $1 AND sk = $2 AND entity_id = $3"
+            ),
+            vec![
+                Box::new(pk),
+                Box::new(sk),
+                Box::new(owner),
+                Box::new(op.entity_type.clone()),
+                Box::new(payload),
+            ],
+        ),
+
+        // An upsert that replaces only the owner's row: zero rows when another stream owns it.
+        (ViewOperationKind::Put, ViewCondition::None, None) => PgStatement::new(
+            format!(
+                "INSERT INTO {table} {columns} VALUES ($1, $2, $3, $4, $5, 0) \
+                 ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, \
+                 payload = EXCLUDED.payload, ttl = 0 WHERE {table}.entity_id = EXCLUDED.entity_id"
+            ),
+            vec![
+                Box::new(pk),
+                Box::new(sk),
+                Box::new(owner),
+                Box::new(op.entity_type.clone()),
+                Box::new(payload),
+            ],
+        ),
+
+        // Deletes the owner's row; zero rows (absent, or another owner's) fails the condition.
+        (ViewOperationKind::Delete, ViewCondition::Present, _) => PgStatement::new(
+            format!("DELETE FROM {table} WHERE pk = $1 AND sk = $2 AND entity_id = $3"),
+            vec![Box::new(pk), Box::new(sk), Box::new(owner)],
+        ),
+
+        // Deletes the owner's row if there is one, and reports another owner's row instead of the
+        // rows it deleted: any row it reports fails the condition.
+        (ViewOperationKind::Delete, _, _) => PgStatement::new(
+            format!(
+                "WITH gone AS (DELETE FROM {table} WHERE pk = $1 AND sk = $2 AND entity_id = $3) \
+                 SELECT 1 FROM {table} WHERE pk = $1 AND sk = $2 AND entity_id <> $3"
+            ),
+            vec![Box::new(pk), Box::new(sk), Box::new(owner)],
+        ),
+    };
+    Ok(statement)
+}
+
 /// Reads a view statement's affected-row count (see
 /// [`with_view_writer`](PostgresRepository::with_view_writer)): a put without a presence condition
 /// and a delete that requires the row affect no row when the owner's condition fails; a delete
@@ -1626,8 +1922,27 @@ fn transient(err: &tokio_postgres::Error) -> bool {
     })
 }
 
+/// Starts a transaction at `READ COMMITTED`, whatever the server's or role's
+/// `default_transaction_isolation`. The engine's transactions read fence rows (the rebuild lock and
+/// generation, stream heads, the feature manifest) after waiting for advisory locks, and only
+/// `READ COMMITTED` takes each statement's snapshot after the wait: a `REPEATABLE READ` snapshot,
+/// taken at the first statement, would miss a rebuild or a commit that landed while it waited.
+async fn read_committed(
+    client: &mut deadpool_postgres::Client,
+) -> Result<deadpool_postgres::Transaction<'_>, Error> {
+    client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await
+        .map_err(Error::backend)
+}
+
 mod enumerate;
 mod rebuild;
+mod views;
+
+pub use views::PgViewRepository;
 
 #[cfg(test)]
 mod tests {

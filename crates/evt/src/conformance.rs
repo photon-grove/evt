@@ -6,7 +6,8 @@
 //! (snapshot-aware loads, stale-commit conflicts, retries, and in-band projector operations that
 //! commit atomically with events). Every case namespaces its entity IDs, so durable backends can
 //! share one table across runs. The repository cases also namespace entity types. The [`Store`]
-//! cases use the [`Ledger`] type, so a shared table accumulates `ledger` rows.
+//! cases use the [`Ledger`] type, so a shared table accumulates `ledger` rows (and `hoard` rows
+//! from the oversized-snapshot case).
 //!
 //! ```
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -664,6 +665,10 @@ impl<'a, R: Repository, V: ViewTarget<R>, H: HeadFixtures<R>> Suite<'a, R, V, H>
         record(
             "a load that replays the threshold writes a catch-up snapshot",
             Box::pin(snapshot_policy::catch_up_snapshots(repo)).await,
+        );
+        record(
+            "a snapshot over the per-item budget is skipped, not a failed commit",
+            Box::pin(snapshot_policy::oversized_snapshots_are_skipped(repo)).await,
         );
         record(
             "store rejects a stale commit",
@@ -4442,6 +4447,10 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         Box::pin(outcome_write_set_is_not_identity(repo)).await,
     );
     record(
+        "a command's outcome resolves by identity: the same identity, another payload, another principal",
+        Box::pin(outcome_resolve_by_identity(repo, other)).await,
+    );
+    record(
         "an engine-filled conflict re-prepares the command and only the committing attempt writes",
         Box::pin(retry_engine_filled(repo)).await,
     );
@@ -6769,6 +6778,152 @@ async fn outcome_write_set_is_not_identity<R: Repository>(repo: &R) -> CaseResul
     Ok(())
 }
 
+/// [`Store::resolve_command`] answers a transaction command's outcome from its identity alone, as
+/// a retry of the command would: the stored outcome for the same identity, `IdempotencyKeyReuse`
+/// for another payload or another principal, and nothing for an unknown command ID. A
+/// single-aggregate command resolves the same way through [`CommandIdentity::for_command`].
+async fn outcome_resolve_by_identity<R: Repository>(repo: &R, other: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let second = outcome_store(other);
+    let (a, b) = (ledger_id(), ledger_id());
+    let command = command_id();
+    let identity = CommandIdentity::new("ledger:pair")
+        .with_targets([a.clone(), b.clone()])
+        .with_payload(&serde_json::json!({"amount": 2}))?;
+    let metadata = command_metadata(&command).with_principal_id("user:1");
+
+    let before = store.resolve_command(&identity, &metadata).await?;
+    ensure!(
+        before.is_none(),
+        "a command that never ran is not found: {before:?}"
+    );
+
+    let first = store
+        .execute_transaction(&identity, &metadata, |tx| pair(tx, &a, &b))
+        .await?;
+    ensure!(
+        first.is_accepted() && !first.replayed,
+        "the transaction committed: {first:?}"
+    );
+
+    // The same identity resolves to the stored outcome, on either writer, and a retry agrees.
+    for (writer, resolver) in [("this writer", &store), ("another writer", &second)] {
+        let resolved = resolver
+            .resolve_command(&identity, &metadata)
+            .await?
+            .ok_or(Failure(format!("{writer}: the stored outcome is found")))?;
+        ensure!(
+            resolved.replayed,
+            "{writer}: a resolved outcome is replayed"
+        );
+        ensure_eq!(resolved.outcome, first.outcome, writer);
+        ensure_eq!(
+            resolved.response(),
+            Some(&b"paired"[..]),
+            "the stored response"
+        );
+    }
+    let retried = store
+        .execute_transaction(&identity, &metadata, |tx| pair(tx, &a, &b))
+        .await?;
+    ensure!(retried.replayed, "a retry replays: {retried:?}");
+    ensure_eq!(retried.outcome, first.outcome, "the retry's outcome");
+
+    // Another payload, another target, or another principal under the same command ID is
+    // another command, on either writer, and a retry of it is refused the same way.
+    let other_payload = CommandIdentity::new("ledger:pair")
+        .with_targets([a.clone(), b.clone()])
+        .with_payload(&serde_json::json!({"amount": 3}))?;
+    let other_targets = CommandIdentity::new("ledger:pair")
+        .with_targets([a.clone()])
+        .with_payload(&serde_json::json!({"amount": 2}))?;
+    let other_principal = command_metadata(&command).with_principal_id("user:2");
+    let no_principal = command_metadata(&command);
+    for (writer, resolver) in [("this writer", &store), ("another writer", &second)] {
+        for (what, identity, metadata) in [
+            ("another payload", &other_payload, &metadata),
+            ("another target", &other_targets, &metadata),
+            ("another principal", &identity, &other_principal),
+            ("no principal", &identity, &no_principal),
+        ] {
+            let prior = expect_reuse(
+                resolver.resolve_command(identity, metadata).await,
+                &format!("{writer}: {what}"),
+            )?;
+            ensure_eq!(
+                prior,
+                first.outcome,
+                format!("{writer}: {what} carries the stored outcome")
+            );
+        }
+    }
+    expect_reuse(
+        store
+            .execute_transaction(&other_payload, &metadata, |tx| pair(tx, &a, &b))
+            .await,
+        "a retry with another payload",
+    )?;
+    expect_reuse(
+        store
+            .execute_transaction(&identity, &other_principal, |tx| pair(tx, &a, &b))
+            .await,
+        "a retry by another principal",
+    )?;
+
+    // Nothing above wrote anything.
+    ensure_eq!(repo.events(&a).await?.len(), 1, "stream a");
+    ensure_eq!(repo.events(&b).await?.len(), 1, "stream b");
+
+    // A single-aggregate command resolves by its identity too, as `resolve_outcome` does.
+    let single = command_id();
+    let single_metadata = command_metadata(&single);
+    let executed = store
+        .execute_with_outcome(&a, Add(4), single_metadata.clone())
+        .await?;
+    let by_identity = store
+        .resolve_command(
+            &CommandIdentity::for_command(&Add(4), &a)?,
+            &single_metadata,
+        )
+        .await?
+        .ok_or(Failure("the single-aggregate outcome is found".into()))?;
+    ensure_eq!(by_identity.outcome, executed.outcome, "by identity");
+    let by_command = store
+        .resolve_outcome(&a, &Add(4), &single_metadata)
+        .await?
+        .ok_or(Failure("resolve_outcome finds it".into()))?;
+    ensure_eq!(by_command.outcome, executed.outcome, "by command");
+    expect_reuse(
+        store
+            .resolve_command(
+                &CommandIdentity::for_command(&Add(4), &b)?,
+                &single_metadata,
+            )
+            .await,
+        "another target",
+    )?;
+
+    Ok(())
+}
+
+/// A decision step that adds 2 to each of two ledgers and accepts with a response.
+fn pair<'t, R: Repository>(
+    tx: &'t mut crate::Transaction<'_, R>,
+    a: &EntityId,
+    b: &EntityId,
+) -> crate::PrepareFuture<'t> {
+    let (a, b) = (a.clone(), b.clone());
+
+    Box::pin(async move {
+        for id in [&a, &b] {
+            let mut read = tx.read::<Ledger>(id).await?;
+            tx.append(&mut read, added(2))?;
+        }
+
+        Ok(Decision::accept_with(b"paired".to_vec()))
+    })
+}
+
 fn metadata_for_plain() -> Metadata {
     metadata()
 }
@@ -7462,7 +7617,7 @@ mod views;
 pub use compaction::compaction_cases;
 #[cfg(feature = "journal")]
 #[cfg_attr(docsrs, doc(cfg(feature = "journal")))]
-pub use journal::journal_cases;
+pub use journal::{journal_cases, journal_rebuild_cases};
 pub use rebuild::{NoViewRows, RebuildSuite, TestClock, projection_rebuild_cases};
 pub use view_repository::{committed_view_cases, view_repository_cases};
-pub use views::{CommitViewTarget, commit_view_cases};
+pub use views::{CommitViewTarget, commit_view_cases, expected_payload_cases};

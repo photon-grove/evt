@@ -653,11 +653,16 @@ impl<'a, R: Repository> Transaction<'a, R> {
             Vec::new()
         };
 
-        let snapshot = snapshot_due.then(|| NewSnapshot {
-            entity_type: EntityType::new(A::TYPE),
-            sequence: read.loaded.snapshot_sequence.next(),
-            payload: state.clone(),
-        });
+        // A snapshot over the per-item commit budget is left out, so the commit still succeeds.
+        let snapshot = match (snapshot_due, serialized.last()) {
+            (true, Some(last)) => NewSnapshot {
+                entity_type: EntityType::new(A::TYPE),
+                sequence: read.loaded.snapshot_sequence.next(),
+                payload: state.clone(),
+            }
+            .within_budget(&read.loaded.entity_id, last.sequence)?,
+            _ => None,
+        };
         let state = if self.commit_projectors.is_empty() {
             Vec::new()
         } else {

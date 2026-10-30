@@ -4,8 +4,9 @@
 //!
 //! A [`ViewRow`] is the row a commit-wide view operation writes (v0.9, C7) plus an optional `ttl`:
 //! the owner stream is the row's `entityID`, and a repository reads and writes the same table and
-//! attributes the commit path does. [`MemRepository`](crate::MemRepository) and
-//! [`DynamoViewRepository`](crate::dynamodb::DynamoViewRepository) implement [`ViewRepository`];
+//! attributes the commit path does. [`MemRepository`](crate::MemRepository),
+//! [`DynamoViewRepository`](crate::dynamodb::DynamoViewRepository) and
+//! [`PgViewRepository`](crate::postgres::PgViewRepository) implement [`ViewRepository`];
 //! [`ViewCodec`](crate::ViewCodec) layers typed JSON values on top of it.
 //!
 //! **Views are projections.** Every row must be reproducible by replaying events. The writes here
@@ -33,7 +34,8 @@ pub struct ViewPage {
     pub views: Vec<ViewRow>,
     /// An opaque cursor for the next page, or `None` when the list is exhausted. DynamoDB returns
     /// a cursor whenever a bounded page was full, even when no row follows, so the next page can
-    /// be empty; [`MemRepository`](crate::MemRepository) returns one only when a row follows.
+    /// be empty, and so does PostgreSQL; [`MemRepository`](crate::MemRepository) returns one only
+    /// when a row follows.
     /// Either way, call until the cursor is `None`.
     pub next_cursor: Option<String>,
 }
@@ -54,8 +56,9 @@ impl ViewPage {
 /// returned, so a request handler can commit and then read its own write. The in-memory repository
 /// is trivially consistent; [`DynamoViewRepository`](crate::dynamodb::DynamoViewRepository) reads
 /// its base table strongly consistently (its `with_consistent_read(false)` trades that for half
-/// the read cost on partition listings). An entity-type listing may lag behind a commit: DynamoDB
-/// serves it from a global secondary index, which can only be read eventually consistently.
+/// the read cost on partition listings), and `PgViewRepository` sees every committed transaction,
+/// entity-type listings included. An entity-type listing may lag behind a commit on DynamoDB, which
+/// serves it from a global secondary index that can only be read eventually consistently.
 ///
 /// A `limit` of `None` or `Some(0)` leaves the page size to the backend (DynamoDB: its 1 MB
 /// response cap). A `cursor` is the opaque [`ViewPage::next_cursor`] of an earlier page of the

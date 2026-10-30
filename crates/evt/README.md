@@ -203,6 +203,16 @@ unknown with `Error::Indeterminate`, and every definitive failure with `Error::B
 recovery read, so override both if your runtime has one, or bound your own reads if it has none.
 Decoded outcome rows must pass `Outcome::validate_stored`.
 
+To look an outcome up without running anything, for a caller that lost a command's result or
+reconciles results it holds elsewhere, call `Store::resolve_command(&identity, &metadata)` with the
+`CommandIdentity` the command ran with and its metadata (command ID and principal). It compares
+digests with the store's own digester, so you never recompute one, and works for a transaction
+command and, through `CommandIdentity::for_command(&command, entity_id)`, a single-aggregate one
+(`Store::resolve_outcome` is that shortcut). It returns `Ok(Some(outcome))` with the stored
+outcome for the same identity, `Error::IdempotencyKeyReuse` (carrying the stored outcome) when the
+ID was recorded for another payload, target or principal, and `Ok(None)` when there is no row,
+which doesn't prove the command never landed.
+
 `execute_with_outcome`, `execute_with_response` and `Store::execute_transaction` retry a command
 that conflicts with another writer, up to the store's `RetryPolicy` (`OutcomeConfig::with_retry`).
 The default is 5 attempts, 25 ms doubling to 1 s, jittered, waiting on `Repository::backoff`.
@@ -459,6 +469,13 @@ folded as the next snapshot. The write never lowers a stored snapshot, and it is
 failure is a `tracing` warning, and the load still returns. The store's loads, its execute paths and
 its transactions' reads all catch up.
 
+A snapshot is a single item, so keep an aggregate's state bounded and its unbounded history in
+events. A snapshot whose item would be over the commit's per-item budget,
+`photon_evt::MAX_COMMIT_ITEM_BYTES` (measured by `snapshot_commit_size`), is skipped with a
+`tracing` warning instead of failing the commit with `Error::CommitTooLarge`, on commits,
+transactions and catch-up loads alike. Loads then replay from the last snapshot that fit
+([Oversized snapshots](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#oversized-snapshots)).
+
 Every load runs in a `DEBUG` `tracing` span named `load` with `entity_type`, `entity_id`,
 `sequence`, `snapshot_seq` (the snapshot the load started from, 0 without one) and
 `events_replayed`. Alert on `events_replayed` to find streams that need a smaller interval or a
@@ -488,7 +505,8 @@ The table needs a string partition key `pk` and a number sort key `sk`, the same
 `dynamo.Repository` uses.
 
 For PostgreSQL, enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
-`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`. Engine relations use the
+`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`, plus the Rust-only views table
+(`{events}__evt_views`, below). Engine relations use the
 reserved `__evt_` infix. Schema setup migrates the old `{events}_entity_type_idx` index to
 `{events}__evt_entity_type_idx`, and it creates the rebuild fence's `{events}__evt_rebuild_lock`
 and `{events}__evt_rebuild_generation` (a schema created before them treats a commit's lock check
@@ -689,10 +707,21 @@ without the feature refuse the table.
   wrapped or not. A bypassing writer's events would be missing from the scopes. Enable the journal
   before writing the events it covers: earlier events have no row and no gap shows it. A commit's
   journal rows and counters count toward the commit budget (97 event and projector operations, 96 with a snapshot).
-- Rebuilds (`journal::rebuild`, or `rebuild_with_lock`) run under the [rebuild lock](#rebuild-fence)
-  and write the rows and counters through `write_rebuild_views`, fenced on the lease's owner and
-  fencing token. Live commits fail with `Error::RebuildInProgress` while the lock is held, so a
-  rebuild cannot lower a counter under a writer. Readers that can overlap a rebuild use
+- Rebuilds run under the [rebuild lock](#rebuild-fence) and write the rows and counters through
+  `write_rebuild_views`, fenced on the lease's owner and fencing token. To rebuild the journal with
+  your commit-wide views under one lease, use `ProjectionRebuild::with_journal`
+  ([Rebuilding projections](#rebuilding-projections)). `rebuild_with_lock` takes the
+  lock for the run; `rebuild_with_lease` runs under a lease you took and end, so one lease can cover
+  the journal and your other derived state; `rebuild` writes under a lease without renewing it. The
+  first two renew the lease before a batch whenever half of it has passed, so a long rebuild is not
+  taken over, and a renewal that finds the lock gone stops the run before another write. Live
+  commits fail with `Error::RebuildInProgress` while the lock is held, so a rebuild cannot lower a
+  counter under a writer. A failed run releases the lock only when it attempted no write and its
+  begin acquired the lock from a settled generation; otherwise it keeps the lock (the rows may be
+  half-written). Under your own lease, apply the same rule: `rebuild_with_lease` reports the batches
+  it attempted (`RebuildFailure`), and `RebuildLease::acquired_from` tells, from the generation you
+  read just before your begin, whether the lease was acquired from a settled one. Count every write
+  you made under the lease, not just this call's. Readers that can overlap a rebuild use
   `page_at_epoch` / `high_watermark_at_epoch`: they fail with `RebuildUnavailable` or
   `RebuildEpochChanged` (both transient) instead of showing half-written rows. Keep the cursor, back
   off, and read the same page again.
@@ -795,7 +824,7 @@ let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().awai
   (`Error::RebuildUnavailable`) and every commit is still refused (`Error::RebuildInProgress`) until
   a later rebuild begins and ends. A failed rebuild may have cleared journal counters, and a
   journaled commit would otherwise allocate positions from them. To resume writes, run the rebuild
-  again to its end (for the journal, `rebuild_with_lock`).
+  again to its end (for the journal, `rebuild_with_lock` or a `ProjectionRebuild` `with_journal`).
 - A command handler that reads a view under the epoch check returns `RebuildUnavailable` or
   `RebuildEpochChanged` as its own error. The engine returns it at once and records nothing.
 - Leases are whole seconds read from the repository's clock, and `with_clock` injects one in tests.
@@ -835,12 +864,21 @@ let report = ProjectionRebuild::new(&repository)
   It doesn't delete rows nothing produces any more, so wipe them first to rebuild from scratch.
 - It holds every row in memory, and needs strongly consistent reads of the log.
 - `operations()` is a dry run that returns what `run` would write, without taking the lock.
+- `run_with_lease` rebuilds under a lease you took and end, renewing it in place. A failure
+  (`RebuildFailure`) says how many guarded batches it attempted, and `RebuildLease::acquired_from`
+  says whether your begin acquired the lock from a settled generation, so you can apply the release
+  rule below to your own lease (counting every write made under it).
 - A failure before the first write leaves the rows alone, and releases the lock if the run acquired
   it from a settled generation. Once a write was attempted, a failure keeps the lock until a retry
   takes over the lapsed lease. A run that took over a lapsed lease, or acquired after a
   force-release, keeps the lock on any failure, since the rows may still be half-written from the
-  earlier run; only a rebuild that completes releases it. The journal has
-  its own rebuild (`journal::rebuild_with_lock`), and its projector is refused here.
+  earlier run; only a rebuild that completes releases it.
+- `with_journal(journal)` rebuilds the sync journal in the same run, under the same lease: its rows
+  and counters come from the events of the journal's types, read under the lock, and go out in the
+  same guarded batches, so readers see one rebuild (one generation) for the views and the journal.
+  A key both would write fails the run before anything is written. With a journal and no
+  projectors, aggregate types are optional. It needs the `journal` cargo feature. The journal's
+  projector itself is refused as a projector here.
 
 ## Enumerating the log
 
@@ -892,7 +930,15 @@ operations write (the owner stream is the row's `entityID`) plus an optional `tt
 implements it over the rows commits write, and `DynamoViewRepository` (feature `dynamodb`) over
 the views table, which needs a string `pk` and `sk` and the `entityType-index` index on
 `entityType`. `DynamoRepository::view_repository` builds one for the table
-`with_views_table` configured.
+`with_views_table` configured. On PostgreSQL (feature `postgres`), evt owns the views table:
+`ensure_schema` creates `{events}__evt_views`, and `PostgresRepository::view_repository` returns a
+`PgViewRepository` over it. Its keys order by UTF-8 bytes like DynamoDB's, its payloads keep their
+exact bytes, every read (entity-type lists included) sees every committed transaction, and
+`purge_expired(now)` deletes rows whose `ttl` has passed, which PostgreSQL does not do by itself. It
+needs a `UTF8` database. `PostgresRepository::with_views_table()` makes it the commit's view
+target in place of `with_view_writer`: evt builds the statements with DynamoDB's owner rules,
+applies the expected-payload condition, and declares the `postgres-views` marker feature so no
+other writer puts the store's views elsewhere.
 
 ```rust,ignore
 use photon_evt::{ViewRepository, ViewRow};

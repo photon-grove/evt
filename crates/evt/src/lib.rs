@@ -88,7 +88,8 @@ pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
 pub use features::{
     COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker,
     JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION, JOURNAL_FEATURE, JOURNAL_VERSION,
-    STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION, SUPPORTED_FEATURES, SYSTEM_PREFIX, ValidatedMarker,
+    POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION, STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION,
+    SUPPORTED_FEATURES, SYSTEM_PREFIX, ValidatedMarker,
 };
 pub use ids::{
     CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion, PrincipalId,
@@ -110,13 +111,13 @@ pub use projection::{
 };
 pub use rebuild::{
     MAX_REBUILD_BEGIN_ATTEMPTS, MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH, ProjectionRebuild,
-    REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildEpoch, RebuildFence,
-    RebuildGeneration, RebuildLease, RebuildLock, RebuildReport, RebuildState,
+    REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildEpoch, RebuildFailure,
+    RebuildFence, RebuildGeneration, RebuildLease, RebuildLock, RebuildReport, RebuildState,
     observe_rebuild_epoch, read_at_rebuild_epoch, verify_rebuild_epoch,
 };
 pub use repository::{
-    Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
-    snapshot_events_due,
+    Commit, FenceProvenance, MAX_COMMIT_ITEM_BYTES, NewSnapshot, ReadFence, Repository,
+    TransactionCommit, snapshot_commit_size, snapshot_events_due,
 };
 pub use retry::{DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY_MS, RetryPolicy};
 pub use store::{

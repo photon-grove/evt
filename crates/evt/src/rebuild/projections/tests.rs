@@ -5,6 +5,7 @@ use crate::conformance::{Add, Added, Ledger, LedgerEvent, TestClock};
 use crate::error::BoxError;
 use crate::mem::MemRepository;
 use crate::metadata::Metadata;
+use crate::rebuild::acquired_from_settled;
 use crate::store::Store;
 use crate::views::ViewRepository;
 use crate::{Commit, Outcome, RebuildGeneration, RebuildState, SerializedSnapshot};
@@ -163,6 +164,7 @@ async fn current_state_projectors_rebuild_from_final_states_seeded_from_snapshot
             puts: 2,
             deletes: 0,
             batches: 1,
+            ..RebuildReport::default()
         }
     );
     assert_eq!(
@@ -1036,7 +1038,8 @@ async fn a_run_under_a_callers_lease_renews_it_in_place() {
             rebuild
                 .run_with_lease(&mut lease, Duration::from_millis(999))
                 .await,
-            Err(Error::InvalidArgument(_))
+            Err(RebuildFailure { ref error, attempted: 0, .. })
+                if matches!(**error, Error::InvalidArgument(_))
         ),
         "a renewal under a second is refused before anything is read"
     );

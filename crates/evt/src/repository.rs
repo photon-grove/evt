@@ -601,8 +601,73 @@ fn stream_sizes<Op>(
 /// The most bytes one commit (or one guarded rebuild write) may carry, summed over its actions.
 pub(crate) const MAX_COMMIT_BYTES: usize = 3_800_000;
 
-/// The most bytes one action of a commit may carry.
-pub(crate) const MAX_COMMIT_ITEM_BYTES: usize = 380_000;
+/// The most bytes one action of a commit may carry: 95% of DynamoDB's 400 KB item limit. A commit
+/// with a larger item fails with [`Error::CommitTooLarge`] on every backend.
+pub const MAX_COMMIT_ITEM_BYTES: usize = 380_000;
+
+/// Returns the bytes the commit preflight would budget for the snapshot's item, counting a `ttl`
+/// attribute at its widest whether or not the entity type is retained. A [`Store`](crate::Store)
+/// or [`Transaction`](crate::Transaction) writes a snapshot with a commit only when this is at
+/// most [`MAX_COMMIT_ITEM_BYTES`]: a larger one would fail every commit that carries it with
+/// [`Error::CommitTooLarge`], so the snapshot is left out and the commit proceeds without it
+/// (storage spec, Snapshot policy).
+///
+/// # Errors
+///
+/// [`Error::Payload`] when the payload is not UTF-8.
+pub fn snapshot_commit_size(snapshot: &SerializedSnapshot) -> Result<usize, Error> {
+    Ok(item_size(&crate::wire::dynamo::snapshot_item(
+        snapshot,
+        Some(i64::MAX),
+    )?))
+}
+
+/// Whether a snapshot's item fits the per-item commit budget ([`snapshot_commit_size`]). A
+/// snapshot that does not is logged: the store skips it, and the stream's loads replay from the
+/// snapshot before it until the aggregate's state shrinks below the budget.
+pub(crate) fn snapshot_fits(snapshot: &SerializedSnapshot) -> Result<bool, Error> {
+    let size = snapshot_commit_size(snapshot)?;
+    if size <= MAX_COMMIT_ITEM_BYTES {
+        return Ok(true);
+    }
+
+    tracing::warn!(
+        entity_type = snapshot.entity_type.as_str(),
+        entity_id = snapshot.entity_id.as_str(),
+        sequence = snapshot.sequence.0,
+        event_sequence = snapshot.event_sequence.0,
+        bytes = size,
+        limit = MAX_COMMIT_ITEM_BYTES,
+        "snapshot skipped: its item is over the per-item commit budget"
+    );
+
+    Ok(false)
+}
+
+impl NewSnapshot {
+    /// Keeps this snapshot of `entity_id` at `event_sequence` (the commit's last event) when its
+    /// item fits the per-item commit budget, and drops it otherwise ([`snapshot_fits`]).
+    pub(crate) fn within_budget(
+        self,
+        entity_id: &EntityId,
+        event_sequence: EventSequence,
+    ) -> Result<Option<Self>, Error> {
+        let snapshot = SerializedSnapshot {
+            entity_type: self.entity_type,
+            entity_id: entity_id.clone(),
+            sequence: self.sequence,
+            event_sequence,
+            payload: self.payload,
+        };
+        let fits = snapshot_fits(&snapshot)?;
+
+        Ok(fits.then_some(Self {
+            entity_type: snapshot.entity_type,
+            sequence: snapshot.sequence,
+            payload: snapshot.payload,
+        }))
+    }
+}
 
 pub(crate) fn check_budget(sizes: impl IntoIterator<Item = usize>) -> Result<(), Error> {
     let mut actions = 0usize;
@@ -720,8 +785,9 @@ pub trait Repository: Send + Sync {
     /// exactly those bytes, or the commit fails with [`Error::ProjectorOperation`]. The default is
     /// `false`, and the journal refuses to commit through a repository that does not opt in
     /// ([`Error::ExpectedPayloadUnsupported`]), so a backend that ignored the condition cannot
-    /// write an unconditional counter. The in-memory and DynamoDB repositories return `true`;
-    /// PostgreSQL does not. A wrapper must forward it.
+    /// write an unconditional counter. The in-memory and DynamoDB repositories return `true`, and so
+    /// does PostgreSQL with the views table (`with_views_table()`); with an application view writer
+    /// it does not. A wrapper must forward it.
     fn applies_expected_payload(&self) -> bool {
         false
     }
@@ -1086,6 +1152,49 @@ mod tests {
         let over = Commit::<u8>::new("a", (1..=97).map(|n| event("a", n)).collect())
             .with_snapshot(NewSnapshot::new("t", EventSequence(1), "{}"));
         assert_eq!(over.sizes(|_| None).unwrap().len(), 101);
+    }
+
+    #[test]
+    fn a_snapshot_is_measured_as_the_preflight_sizes_it_with_the_widest_ttl() {
+        let commit = Commit::<u8>::new("a", vec![event("a", 1)]).with_snapshot(NewSnapshot::new(
+            "t",
+            EventSequence(1),
+            "{}",
+        ));
+        // The marker check, the lock check, the head update, the event put, then the snapshot put.
+        let preflight = commit.sizes(|_| None).unwrap()[4];
+        let snapshot = SerializedSnapshot {
+            entity_type: EntityType::new("t"),
+            entity_id: EntityId::new("a"),
+            sequence: EventSequence(1),
+            event_sequence: EventSequence(1),
+            payload: b"{}".to_vec(),
+        };
+        let widest_ttl = "ttl".len() + i64::MAX.to_string().len();
+        assert_eq!(
+            snapshot_commit_size(&snapshot).unwrap(),
+            preflight + widest_ttl
+        );
+
+        // At the budget a snapshot is kept; one byte over, it is dropped.
+        let mut at_limit = NewSnapshot::new("t", EventSequence(1), Vec::new());
+        at_limit.payload = vec![
+            b'x';
+            MAX_COMMIT_ITEM_BYTES
+                - snapshot_commit_size(&SerializedSnapshot {
+                    payload: Vec::new(),
+                    ..snapshot
+                })
+                .unwrap()
+        ];
+        let kept = at_limit
+            .clone()
+            .within_budget(&EntityId::new("a"), EventSequence(1));
+        assert_eq!(kept.unwrap(), Some(at_limit.clone()));
+
+        at_limit.payload.push(b'x');
+        let dropped = at_limit.within_budget(&EntityId::new("a"), EventSequence(1));
+        assert_eq!(dropped.unwrap(), None);
     }
 
     #[test]

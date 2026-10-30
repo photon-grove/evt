@@ -47,7 +47,7 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::Error;
 use crate::projection::{ProjectedView, check_views, view_operation_size};
@@ -159,6 +159,21 @@ impl RebuildLease {
     /// Reports whether `lock` is this lease's: it names the same owner and fencing token.
     pub fn holds(&self, lock: &RebuildLock) -> bool {
         lock.owner == self.owner && lock.generation == self.generation
+    }
+
+    /// Reports whether this lease was acquired from the settled generation `before`, read with
+    /// [`rebuild_generation`](RebuildFence::rebuild_generation) just before the
+    /// [`begin_rebuild`](RebuildFence::begin_rebuild) that returned it, rather than taken over
+    /// from an expired lease or acquired from a force-released generation (either may have left
+    /// the derived rows half-written). A rebuild under this lease that fails before any write may
+    /// release it only when this is true ([`RebuildFailure`]).
+    ///
+    /// The generation only grows, and a begin adds one to the generation it observed only when that
+    /// generation was settled (two for a takeover or from a force-release). So a lease of exactly
+    /// `before + 1` over a settled `before` was acquired from it. Any other lease (a transition
+    /// landed between the read and the begin) counts as not settled, which only keeps the fence.
+    pub fn acquired_from(&self, before: RebuildGeneration) -> bool {
+        before.is_settled() && self.generation == before.value + 1
     }
 }
 
@@ -581,6 +596,154 @@ pub(crate) fn rebuild_batches(views: &[ProjectedView]) -> impl Iterator<Item = &
 
         Some(batch)
     })
+}
+
+/// A rebuild under a caller's lease that failed: the error, and how far it got. The caller holds
+/// the lock and decides what to do with it: release it only when no write was attempted under the
+/// lease (`attempted == 0` here, and none of the caller's own) **and** its own begin acquired the
+/// lock from a settled generation ([`RebuildLease::acquired_from`] over the generation read just
+/// before the begin). Otherwise keep it, because the rows may be half-written, until a rebuild
+/// completes.
+///
+/// It converts into its [`Error`], so `?` works in a function that returns one.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+#[non_exhaustive]
+pub struct RebuildFailure {
+    /// Why the rebuild failed (boxed: an [`Error`] is large, and this is the failure path).
+    pub error: Box<Error>,
+    /// The guarded batches attempted, the failed one included (a write whose result is unknown may
+    /// have applied). Zero means nothing was written.
+    pub attempted: usize,
+    /// The batches the run planned to write; zero when it failed before its plan was complete.
+    pub batches: usize,
+}
+
+impl From<RebuildFailure> for Error {
+    fn from(failure: RebuildFailure) -> Self {
+        *failure.error
+    }
+}
+
+/// Refuses a renewal under one second, before anything is read.
+pub(crate) fn check_renew(renew: Duration) -> Result<(), Error> {
+    if renew < Duration::from_secs(1) {
+        return Err(Error::InvalidArgument(
+            "a rebuild lease is renewed for at least one second".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// A lease a rebuild renews as it goes, and the guarded batches it wrote under it.
+pub(crate) struct Renewing<'a, F: ?Sized> {
+    fence: &'a F,
+    lease: &'a mut RebuildLease,
+    renew: Duration,
+    /// When the lease was taken or last renewed; `None` renews it at the next check.
+    renewed: Option<Instant>,
+    /// The batches attempted, a failed one included: it may have applied.
+    pub(crate) attempted: usize,
+}
+
+impl<'a, F: RebuildFence + ?Sized> Renewing<'a, F> {
+    pub(crate) fn new(
+        fence: &'a F,
+        lease: &'a mut RebuildLease,
+        renew: Duration,
+        renewed: Option<Instant>,
+    ) -> Self {
+        Self {
+            fence,
+            lease,
+            renew,
+            renewed,
+            attempted: 0,
+        }
+    }
+
+    /// Renews the lease for another `renew` when half of it, less a second, has passed since it was
+    /// taken or last renewed (at once when that time is unknown), so a long read or write does not
+    /// let it lapse. The second covers the whole-second expiry: a lease taken late in a second
+    /// lapses up to a second before `renew` has passed.
+    /// A lease another rebuild took over, or an operator force-released, is
+    /// [`Error::RebuildLeaseLost`].
+    pub(crate) async fn keep_alive(&mut self) -> Result<(), Error> {
+        let due = (self.renew / 2).saturating_sub(Duration::from_secs(1));
+        if self.renewed.is_none_or(|at| at.elapsed() >= due) {
+            *self.lease = self.fence.renew_rebuild(self.lease, self.renew).await?;
+            self.renewed = Some(Instant::now());
+        }
+
+        Ok(())
+    }
+
+    /// Writes one guarded batch, renewing the lease first if it is due.
+    pub(crate) async fn write(&mut self, batch: &[ProjectedView]) -> Result<(), Error> {
+        self.keep_alive().await?;
+
+        self.attempted += 1;
+        self.fence.write_rebuild_views(self.lease, batch).await
+    }
+}
+
+/// A lock a rebuild took for its own run, and whether it was acquired from a settled generation.
+pub(crate) struct Held {
+    pub(crate) lease: RebuildLease,
+    pub(crate) from_settled: bool,
+    pub(crate) taken: Instant,
+}
+
+impl Held {
+    /// Takes the lock as `owner` for `lease`, reading the generation just before the begin to tell
+    /// an acquire from a settled generation from a takeover or an acquire after a force-release.
+    pub(crate) async fn take<F: RebuildFence + ?Sized>(
+        fence: &F,
+        owner: &str,
+        lease: Duration,
+    ) -> Result<Self, Error> {
+        let before = fence.rebuild_generation().await?;
+        let lease = fence.begin_rebuild(owner, lease).await?;
+
+        Ok(Self {
+            from_settled: acquired_from_settled(before, &lease),
+            lease,
+            taken: Instant::now(),
+        })
+    }
+
+    /// Ends the run: a success releases the lock, which settles the generation. A failure releases
+    /// it only when no batch was attempted and the lock came from a settled generation, so the rows
+    /// are as they were; otherwise the lock is kept, because they may be half-written.
+    pub(crate) async fn finish<F: RebuildFence + ?Sized, T>(
+        &self,
+        fence: &F,
+        result: Result<T, RebuildFailure>,
+    ) -> Result<T, Error> {
+        match result {
+            Ok(value) => {
+                fence.end_rebuild(&self.lease).await?;
+
+                Ok(value)
+            }
+            Err(failure) => {
+                if self.from_settled && failure.attempted == 0 {
+                    // The rows were complete when the run began and it attempted no write, so
+                    // settling the generation is safe. A failed release (a lost lease, say) leaves
+                    // the lock to lapse; the run's own error is the one to report.
+                    let _ = fence.end_rebuild(&self.lease).await;
+                }
+
+                Err(*failure.error)
+            }
+        }
+    }
+}
+
+/// [`RebuildLease::acquired_from`], for the tests of the release rule.
+pub(crate) fn acquired_from_settled(before: RebuildGeneration, held: &RebuildLease) -> bool {
+    held.acquired_from(before)
 }
 
 /// A repository's clock: the system time by default, injectable for tests (`with_clock`). The

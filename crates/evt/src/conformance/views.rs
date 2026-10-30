@@ -32,6 +32,14 @@ pub trait CommitViewTarget<R: Repository>: Send + Sync {
     fn budgets_view_bytes(&self) -> bool {
         true
     }
+
+    /// The most UTF-8 bytes a row's entity type, `pk` and `sk` may hold together, when the backend
+    /// bounds them below DynamoDB's 2,048-byte `pk` and 1,024-byte `sk`: PostgreSQL's views table
+    /// stores them in btree indexes, whose entries hold at most 2,704 bytes, and refuses a row over
+    /// 2,600 with [`Error::ViewKeyTooLong`] (a known difference). `None` is DynamoDB's limits.
+    fn max_view_key_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl CommitViewTarget<MemRepository> for MemRepository {
@@ -1121,16 +1129,40 @@ where
     );
     ensure!(repo.events(&id).await?.is_empty(), "no event was written");
 
-    // Exactly at the limits is stored and read back.
+    // Exactly at the limits is stored and read back, unless the backend bounds keys lower: then a
+    // key at DynamoDB's limits is refused before any write, and one at its own bound is stored.
     let (long_pk, long_sk) = (padded(&ns, 2048), padded("", 1024));
+    let stored = match target.max_view_key_bytes() {
+        None => (long_pk, long_sk),
+        Some(max) => {
+            let error = error_of(
+                attempt(vec![view(
+                    0,
+                    ViewOperation::put(long_pk.clone(), long_sk.clone(), "o", "", "{}"),
+                )])
+                .await,
+                "a key over the backend's bound",
+            )?;
+            ensure!(
+                matches!(&error, Error::ViewKeyTooLong { max: bound, .. } if *bound == max),
+                "a key over the backend's bound: {error:?}"
+            );
+            ensure!(
+                row(target, &long_pk, &long_sk).await?.is_none(),
+                "nothing was written"
+            );
+
+            (padded(&ns, max - 1_000), padded("", 1_000))
+        }
+    };
     attempt(vec![view(
         0,
-        ViewOperation::put(long_pk.clone(), long_sk.clone(), "o", "", "{}"),
+        ViewOperation::put(stored.0.clone(), stored.1.clone(), "o", "", "{}"),
     )])
     .await?;
     ensure!(
-        row(target, &long_pk, &long_sk).await?.is_some(),
-        "a 2048-byte pk and a 1024-byte sk are stored"
+        row(target, &stored.0, &stored.1).await?.is_some(),
+        "a key at the limits is stored"
     );
 
     Ok(())
@@ -2086,6 +2118,140 @@ where
     ensure!(
         repo.outcome(&command).await?.is_none(),
         "an internal failure records no outcome"
+    );
+
+    Ok(())
+}
+
+/// Runs the journal counter's condition (an expected payload, ADR 0005) through a repository that
+/// says it applies it ([`Repository::applies_expected_payload`]): a put that expects the payload it
+/// read replaces exactly that row, and fails as a condition when the row moved, is gone, or belongs
+/// to another stream. The condition is crate-private, so only the engine can set it; these cases
+/// set it directly on committed view operations. Like [`commit_view_cases`], it panics after
+/// running every case if any failed.
+pub async fn expected_payload_cases<R, T>(repo: &R, target: &T)
+where
+    R: Repository,
+    T: CommitViewTarget<R>,
+{
+    assert!(
+        repo.applies_expected_payload(),
+        "the repository applies the expected payload"
+    );
+
+    if let Err(Failure(message)) = Box::pin(view_expected_payload(repo, target)).await {
+        println!("FAIL an expected payload replaces exactly the row the commit read");
+        panic!("expected-payload case failed: {message}");
+    }
+
+    println!("ok   an expected payload replaces exactly the row the commit read");
+}
+
+async fn view_expected_payload<R, T>(repo: &R, target: &T) -> CaseResult
+where
+    R: Repository,
+    T: CommitViewTarget<R>,
+{
+    let ns = namespace();
+    let (owner, other) = (
+        EntityId::new(format!("{ns}-owner")),
+        EntityId::new(format!("{ns}-other")),
+    );
+    let (pk, sk) = (format!("{ns}-counter"), "COUNTER".to_owned());
+    let event = |id: &EntityId, sequence: i64| SerializedEvent {
+        id: EventId::for_event(id, EventSequence(sequence)),
+        sequence: EventSequence(sequence),
+        event_type: EventType::new("counter:bumped"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: "counter".into(),
+        payload: b"{}".to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    let put = |owner: &EntityId, payload: &str, expected: Option<&str>| {
+        let mut op = ViewOperation::put(
+            pk.clone(),
+            sk.clone(),
+            owner.clone(),
+            "journal-counter",
+            payload,
+        );
+        match expected {
+            Some(expected) => op.expected_payload = Some(expected.as_bytes().to_vec()),
+            None => op = op.if_absent(),
+        }
+
+        ProjectedView::new("counter", 0, 0, op)
+    };
+    let commit = |id: &EntityId, sequence: i64, view: ProjectedView| {
+        repo.commit(Commit::new(id.clone(), vec![event(id, sequence)]).with_views([view]))
+    };
+    let payload =
+        |row: Option<ViewRow>| row.map(|row| String::from_utf8(row.payload).unwrap_or_default());
+    let condition_failed = |result: Result<(), Error>, label: &str| match result {
+        Err(Error::ProjectorOperation(failure)) if failure.reason == REASON_CONDITION_FAILED => {
+            Ok(())
+        }
+        other => Err(Failure(format!(
+            "{label}: expected a failed condition, got {other:?}"
+        ))),
+    };
+
+    // The first counter is claimed with an absent put, as when the commit read none.
+    commit(&owner, 1, put(&owner, r#"{"n":1}"#, None)).await?;
+    ensure_eq!(
+        payload(row(target, &pk, &sk).await?),
+        Some(r#"{"n":1}"#.to_owned()),
+        "claimed"
+    );
+
+    // Expecting what is stored replaces it.
+    commit(&owner, 2, put(&owner, r#"{"n":2}"#, Some(r#"{"n":1}"#))).await?;
+    ensure_eq!(
+        payload(row(target, &pk, &sk).await?),
+        Some(r#"{"n":2}"#.to_owned()),
+        "replaced"
+    );
+
+    // A stale expectation fails, and writes nothing: no event, no row change.
+    condition_failed(
+        commit(&owner, 3, put(&owner, r#"{"n":3}"#, Some(r#"{"n":1}"#))).await,
+        "a stale payload",
+    )?;
+    ensure_eq!(
+        payload(row(target, &pk, &sk).await?),
+        Some(r#"{"n":2}"#.to_owned()),
+        "unchanged"
+    );
+    ensure_eq!(
+        repo.events(&owner).await?.len(),
+        2,
+        "the failed commit wrote no event"
+    );
+
+    // Another stream cannot replace the row, even with the right payload.
+    condition_failed(
+        commit(&other, 1, put(&other, r#"{"n":3}"#, Some(r#"{"n":2}"#))).await,
+        "another owner",
+    )?;
+
+    // An expectation on a row that is not there fails.
+    let missing = format!("{ns}-missing");
+    let mut op = ViewOperation::put(
+        missing.clone(),
+        sk.clone(),
+        owner.clone(),
+        "journal-counter",
+        "{}",
+    );
+    op.expected_payload = Some(b"{}".to_vec());
+    condition_failed(
+        commit(&owner, 3, ProjectedView::new("counter", 0, 0, op)).await,
+        "an absent row",
+    )?;
+    ensure!(
+        row(target, &missing, &sk).await?.is_none(),
+        "nothing was created"
     );
 
     Ok(())
