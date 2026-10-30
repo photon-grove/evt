@@ -124,6 +124,8 @@ pub struct PostgresRepository {
     /// Records that the marker declares `postgres-views`, so the declaration runs once per
     /// handle and its clones.
     views_declared: Arc<AtomicBool>,
+    /// Whether a journaled commit notifies listeners ([`with_wakeups`](Self::with_wakeups)).
+    wakeups: bool,
 }
 
 impl Clone for PostgresRepository {
@@ -139,6 +141,7 @@ impl Clone for PostgresRepository {
             views_encoding_checked: self.views_encoding_checked.clone(),
             views_table_target: self.views_table_target,
             views_declared: self.views_declared.clone(),
+            wakeups: self.wakeups,
         }
     }
 }
@@ -171,6 +174,7 @@ impl PostgresRepository {
             views_encoding_checked: Arc::new(AtomicBool::new(false)),
             views_table_target: false,
             views_declared: Arc::new(AtomicBool::new(false)),
+            wakeups: true,
         }
     }
 
@@ -219,6 +223,17 @@ impl PostgresRepository {
     pub fn with_view_writer(mut self, writer: ViewWriter) -> Self {
         self.view_writer = Some(writer);
         self.views_table_target = false;
+        self
+    }
+
+    /// Whether a commit that writes journal rows (through the views table) notifies listeners
+    /// with `pg_notify` on the journal channel, one notification per written scope, delivered at
+    /// `COMMIT` (read them with `JournalListener`, feature `journal`). On by
+    /// default; `false` is for a deployment that only polls (`NOTIFY` serializes notifying commits
+    /// at `COMMIT`).
+    #[must_use]
+    pub fn with_wakeups(mut self, wakeups: bool) -> Self {
+        self.wakeups = wakeups;
         self
     }
 
@@ -1237,6 +1252,25 @@ impl PostgresRepository {
         // The view statements follow the legacy ones, in declaration then emission order.
         run_view_statements(&tx, views).await?;
 
+        // Wake listeners of every scope the commit journaled: delivered at COMMIT, in commit
+        // order, and dropped with a rollback.
+        #[cfg(feature = "journal")]
+        if self.wakeups && self.views_table_target {
+            let scopes = journaled_scopes(views);
+
+            if !scopes.is_empty() {
+                let channel = crate::wire::postgres::journal_channel(&self.events_table);
+
+                // One statement for every scope, in the array's (ascending) order.
+                tx.execute(
+                    "SELECT pg_notify($1, scope) FROM unnest($2::text[]) WITH ORDINALITY AS s(scope, n) ORDER BY n",
+                    &[&channel, &scopes],
+                )
+                .await
+                .map_err(statement_error)?;
+            }
+        }
+
         // Commit snapshots are written in the same transaction as their events, under the same
         // conditions the DynamoDB snapshot put expresses. The commit raised the head to the
         // snapshot's event sequence, so the snapshot is covered (H3).
@@ -1671,6 +1705,20 @@ fn projector_error(err: tokio_postgres::Error) -> Error {
     }
 }
 
+/// The scopes a commit's journal rows belong to, each once, in ascending byte order.
+#[cfg(feature = "journal")]
+fn journaled_scopes<'a>(views: &[(&'a ProjectedView, &PgStatement)]) -> Vec<&'a str> {
+    use crate::journal::{PROJECTOR_NAME, ROW_PARTITION_PREFIX};
+
+    let scopes: std::collections::BTreeSet<&str> = views
+        .iter()
+        .filter(|(view, _)| view.projector == PROJECTOR_NAME)
+        .filter_map(|(view, _)| view.op.pk.strip_prefix(ROW_PARTITION_PREFIX))
+        .collect();
+
+    scopes.into_iter().collect()
+}
+
 /// The statement of one commit-wide view operation on the evt-owned views table `table`, with the
 /// DynamoDB repository's owner rules (storage format: PostgreSQL views table, Commit target). It
 /// refuses, before any write, what the table cannot store: U+0000 anywhere, a payload that is not
@@ -1946,9 +1994,13 @@ async fn read_committed(
 mod enumerate;
 #[cfg(feature = "journal")]
 mod journal;
+#[cfg(feature = "journal")]
+mod listener;
 mod rebuild;
 mod views;
 
+#[cfg(feature = "journal")]
+pub use listener::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_POLL_INTERVAL, JournalListener, Wakeup};
 pub use views::PgViewRepository;
 
 #[cfg(test)]

@@ -197,7 +197,10 @@ repository declares the `postgres-views` marker feature before its first commit,
 writer, or a Rust repository with a view writer, refuses the store instead of putting views
 somewhere else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
 wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
-DynamoDB. Wake-ups for a journal on PostgreSQL follow in `photon-evt` 0.3.
+DynamoDB. Each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener`
+(one dedicated connection) turns those into wake-ups: page the scope it names, and every scope on
+`Connected` and `Poll`, since a notification sent while the listener was disconnected is lost.
+`with_wakeups(false)` turns the notifications off for a deployment that only polls.
 
 ## Local development
 

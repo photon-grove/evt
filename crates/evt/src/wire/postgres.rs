@@ -66,6 +66,16 @@ pub fn views_table(events_table: &str) -> String {
     format!("{events_table}{RESERVED_INFIX}views")
 }
 
+/// The `NOTIFY` channel a journaled commit wakes listeners on (`evt_events` yields
+/// `evt_events__evt_journal`, ADR 0008): the canonical, lower-case events table name with
+/// `__evt_journal`, which fits the 63-byte identifier limit at the longest events table name.
+pub fn journal_channel(events_table: &str) -> String {
+    format!(
+        "{}{RESERVED_INFIX}journal",
+        events_table.to_ascii_lowercase()
+    )
+}
+
 /// The most UTF-8 bytes a view row's `entity_type`, `pk` and `sk` may hold together in the views
 /// table. A btree index entry holds at most 2,704 bytes, less than DynamoDB's 2,048-byte `pk` plus
 /// 1,024-byte `sk`, so PostgreSQL refuses a longer key before writing (a known difference).
@@ -711,6 +721,12 @@ mod tests {
         assert!(ddl.contains("payload     text   NOT NULL"));
         assert!(ddl.contains("ON orders__evt_views (entity_type, pk, sk)"));
         assert!(ddl.contains("ON orders__evt_views (ttl) WHERE ttl > 0"));
+    }
+
+    #[test]
+    fn the_journal_channel_derives_from_the_events_table_and_fits_the_identifier_limit() {
+        assert_eq!(journal_channel("Evt_Events"), "evt_events__evt_journal");
+        assert!(journal_channel(&"e".repeat(MAX_EVENTS_TABLE_NAME_LEN)).len() <= 63);
     }
 
     #[test]

@@ -2871,7 +2871,8 @@ Wake-ups. A consumer learns that a scope has new rows from the views table's Dyn
 stream, filtered to the journal's partitions: `pk` beginning `journal#` (one record per row) or
 `journal-counter#` (one per scope per commit), `eventName` `INSERT` or `MODIFY`. The keys are
 enough (`KEYS_ONLY`). A `MODIFY` of a counter with a new image also carries its position. A
-record is a wake-up, not a delivery: stream order is per item, not per scope, so the consumer reads
+record is a wake-up, not a delivery (PostgreSQL's are `NOTIFY` messages:
+[Journal on PostgreSQL](#journal-on-postgresql)): stream order is per item, not per scope, so the consumer reads
 the scope with `page` from its own cursor. Removals are not wake-ups, and neither are keys in those
 partitions that the journal does not write (another sort key, an invalid scope): a decoder skips
 them rather than failing the batch, and the page read reports a corrupt journal. `photon-evt-lambda` (feature
@@ -3587,9 +3588,9 @@ rows never split across two tables.
 ### Journal on PostgreSQL
 
 [ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3, on a repository
-configured `with_views_table()`. Implemented: the journal's commits, its reads and its compaction,
-with the shared journal, journal-rebuild and compaction conformance suites on PostgreSQL. Planned:
-the wake-ups below. The [journal](#journal) and its [compaction](#journal-compaction) are specified
+configured `with_views_table()`. Implemented: the journal's commits, its reads, its compaction and
+its wake-ups, with the shared journal, journal-rebuild and compaction conformance suites on
+PostgreSQL. The [journal](#journal) and its [compaction](#journal-compaction) are specified
 backend-neutrally above. This section pins the PostgreSQL statements.
 
 Rows. Journal rows, counters and compaction rows are rows of `{events}__evt_views`, column for
@@ -3662,12 +3663,23 @@ SELECT pg_notify('evt_events__evt_journal', $1);   -- $1: the scope itself, not 
 - PostgreSQL delivers a transaction's notifications at `COMMIT`, in commit order, and drops them on
   rollback, so a wake-up never names a write that did not happen. A notification writes nothing
   and is not counted in the commit's action budget.
-- A listener (`JournalListener`) holds one connection with `LISTEN` on the channel and yields
-  scope wake-ups. A wake-up is not a delivery: the consumer pages the scope from its own cursor,
-  exactly as with a DynamoDB stream record (Wake-ups, under the journal's Reads above).
-- Notifications sent while a listener is disconnected are lost. The listener reports every
-  (re)connect, and the consumer then pages each scope it follows, and again on a polling interval
-  (default 30 seconds), as a backstop.
+- A listener (`photon_evt::postgres::JournalListener`, feature `journal`) holds one dedicated
+  connection (not a pooled one: `LISTEN` belongs to the session) with `LISTEN` on the channel, and
+  its `next()` yields a `Wakeup`: `Scope(scope)` for a notification, `Connected` on every
+  connection (the first one included), or `Poll` at a fixed interval from the last `Poll` or
+  `Connected` (default 30 seconds), however much else arrives, so a scope written without a
+  notification (by a repository with `with_wakeups(false)`, or a rebuild) is still read. The call
+  after each `Poll` first checks the connection with `SELECT 1`; that check and a connection
+  attempt are bounded by a connect timeout (default 10 seconds). It drives its connection only while `next()` runs, and when the connection ends or
+  fails the check it reconnects within the same call, which then returns `Connected`; a connection
+  that cannot be opened is an error, retried by the next call. A wake-up is not a delivery: the consumer pages the scope from
+  its own cursor, exactly as with a DynamoDB stream record (Wake-ups, under the journal's Reads
+  above).
+- Notifications sent while a listener is disconnected are lost, so on `Connected` and on `Poll`
+  the consumer pages every scope it follows, as a backstop.
+- PostgreSQL keeps notifications until every listening session has read them, so a listener that
+  stays connected but stops calling `next()` lets the queue fill, and then notifying commits fail
+  at `COMMIT`. A consumer that cannot keep up should drop the listener and rely on polling.
 - Compaction and rebuild do not notify. A compaction moves no reader's position, and a rebuild
   changes the generation, which a reader detects on its next read.
 - `with_wakeups(false)` turns the notifications off for a deployment that only polls.
