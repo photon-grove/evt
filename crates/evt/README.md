@@ -738,7 +738,23 @@ without the feature refuse the table.
 - Waking consumers. On DynamoDB, a consumer learns of new rows from the views table's stream,
   filtered to the journal's keys, and then reads `page` from its cursor. The
   [`photon-evt-lambda`](https://github.com/photon-grove/evt/tree/main/crates/evt-lambda) crate
-  (feature `journal`) has the filter patterns, the wake-up decode, and the batch handling.
+  (feature `journal`) has the filter patterns, the wake-up decode, and the batch handling. On
+  PostgreSQL, a journaled commit through the views table runs `pg_notify` per scope it wrote, and
+  `photon_evt::postgres::JournalListener` turns the notifications into wake-ups:
+
+  ```rust,ignore
+  use photon_evt::postgres::{JournalListener, Wakeup};
+
+  let mut listener = JournalListener::new(config, tokio_postgres::NoTls, "evt_events")?;
+  loop {
+      match listener.next().await {
+          Ok(Wakeup::Scope(scope)) => { /* page this scope from its cursor */ }
+          Ok(_) => { /* Connected or Poll: page every scope you follow */ }
+          // The server is unreachable: back off, then call `next` again to reconnect.
+          Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+      }
+  }
+  ```
 
 ### Compaction and `410 Gone`
 

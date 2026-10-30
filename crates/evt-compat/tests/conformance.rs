@@ -4188,3 +4188,145 @@ async fn postgres_compaction_absent_key_race() {
     drop(holder);
     drop_log(&repository, &events, &snapshots).await;
 }
+
+/// Journal wake-ups on PostgreSQL (ADR 0008): a journaled commit through the views table notifies
+/// its scopes at `COMMIT`; a refused commit and `with_wakeups(false)` notify nothing; a listener
+/// whose connection drops reconnects and reports it.
+#[tokio::test]
+async fn postgres_journal_wakeups() {
+    use photon_evt::journal::{Journal, JournalRepository, Scope};
+    use photon_evt::postgres::{JournalListener, Wakeup};
+
+    let (repository, events, snapshots) = views_table_log("jw").await;
+    let journal = Journal::new(["ledger"], |event: &SerializedEvent| {
+        vec![Scope::new(format!("ledger:{}", event.entity_id)).unwrap()]
+    })
+    .unwrap();
+    let journaled = JournalRepository::new(repository.clone(), journal.clone());
+    let quiet = JournalRepository::new(repository.clone().with_wakeups(false), journal);
+    let event = |id: &EntityId, sequence: i64| SerializedEvent {
+        id: EventId::for_event(id, EventSequence(sequence)),
+        sequence: EventSequence(sequence),
+        event_type: EventType::new("ledger:added"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: "ledger".into(),
+        payload: b"{}".to_vec(),
+        metadata: Metadata::new("local"),
+    };
+
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://evt:evt@localhost:5432/evt_local?sslmode=disable".into());
+    let mut config: tokio_postgres::Config = url.parse().unwrap();
+    let application = format!("{events}-listener");
+    config.application_name(&application);
+    let mut listener = JournalListener::new(config, tokio_postgres::NoTls, &events)
+        .unwrap()
+        .with_poll_interval(Duration::from_millis(500));
+    assert_eq!(listener.channel(), format!("{events}__evt_journal"));
+    assert_eq!(listener.next().await.unwrap(), Wakeup::Connected);
+
+    // A journaled commit wakes its scope.
+    let a = EntityId::new(format!("{events}-a"));
+    journaled
+        .commit(Commit::new(a.clone(), vec![event(&a, 1)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        listener.next().await.unwrap(),
+        Wakeup::Scope(Scope::new(format!("ledger:{a}")).unwrap())
+    );
+
+    // A refused commit (a conflict on the stream's head) and a repository with wake-ups off
+    // notify nothing: the listener's next wake-up is the poll.
+    assert!(
+        journaled
+            .commit(Commit::new(a.clone(), vec![event(&a, 1)]))
+            .await
+            .is_err()
+    );
+    let b = EntityId::new(format!("{events}-b"));
+    quiet
+        .commit(Commit::new(b.clone(), vec![event(&b, 1)]))
+        .await
+        .unwrap();
+    assert_eq!(listener.next().await.unwrap(), Wakeup::Poll);
+
+    // The listener's connection drops: it reconnects, says so, and hears later commits.
+    let admin = drivers::postgres_pool().unwrap().get().await.unwrap();
+    admin
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
+            &[&application],
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match listener.next().await {
+                Ok(Wakeup::Connected) => break,
+                Ok(Wakeup::Poll) | Err(_) => {}
+                Ok(other) => panic!("unexpected wake-up before the reconnect: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the listener reconnects after its connection is terminated");
+    journaled
+        .commit(Commit::new(a.clone(), vec![event(&a, 2)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        listener.next().await.unwrap(),
+        Wakeup::Scope(Scope::new(format!("ledger:{a}")).unwrap())
+    );
+
+    // Steady notifications never starve the backstop: commits every 150 ms for 1.5 s still let a
+    // Poll through at the listener's 500 ms cadence.
+    let mut polled = false;
+    for sequence in 3..13 {
+        journaled
+            .commit(Commit::new(a.clone(), vec![event(&a, sequence)]))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        while let Ok(Ok(wakeup)) =
+            tokio::time::timeout(Duration::from_millis(50), listener.next()).await
+        {
+            polled |= wakeup == Wakeup::Poll;
+        }
+    }
+    assert!(polled, "a Poll arrives at its cadence under steady traffic");
+
+    // Nor does a backlog: one commit wakes 30 scopes, and once the deadline has passed with all
+    // of them waiting, the next wake-up is the Poll, ahead of the backlog.
+    let fanned = Journal::new(["ledger"], |event: &SerializedEvent| {
+        (0..30)
+            .map(|i| Scope::new(format!("fan:{}:{i}", event.entity_id)).unwrap())
+            .collect::<Vec<_>>()
+    })
+    .unwrap();
+    let fanning = JournalRepository::new(repository.clone(), fanned);
+    while !matches!(listener.next().await.unwrap(), Wakeup::Poll) {}
+    let c = EntityId::new(format!("{events}-c"));
+    fanning
+        .commit(Commit::new(c.clone(), vec![event(&c, 1)]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        listener.next().await.unwrap(),
+        Wakeup::Poll,
+        "the overdue Poll comes before the backlog"
+    );
+    let mut woken = 0;
+    while let Ok(Ok(wakeup)) =
+        tokio::time::timeout(Duration::from_millis(200), listener.next()).await
+    {
+        woken += usize::from(matches!(wakeup, Wakeup::Scope(_)));
+    }
+    assert_eq!(woken, 30, "and every scope of the backlog follows");
+
+    drop(listener);
+    drop_log(&repository, &events, &snapshots).await;
+}

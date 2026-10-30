@@ -9,8 +9,9 @@ Accepted (2026-10-29). Supersedes the "Postgres view store: do not build" verdic
 [`docs/reference/feature-matrix.md`](../reference/feature-matrix.md). The normative text
 is the [PostgreSQL views table](../reference/storage-format.md#postgresql-views-table) and
 [Journal on PostgreSQL](../reference/storage-format.md#journal-on-postgresql) sections of the
-storage spec. The views table and `PgViewRepository` are implemented; the commit target, the
-journal, compaction and wake-ups follow, all in `photon-evt` 0.3.
+storage spec. Implemented in `photon-evt` 0.3: the views table and `PgViewRepository`, the commit
+target with the expected-payload condition and the `postgres-views` marker, the journal and its
+compaction, and the `NOTIFY` wake-ups with `JournalListener`.
 
 ### Amendment (2026-10-29): the encoding check and the repository's key refusal
 
@@ -134,9 +135,7 @@ deployment that only polls.
 
 As on DynamoDB, a wake-up is not a delivery: the consumer pages the scope from its own cursor.
 Notifications are lost while a listener is disconnected, so the listener reports every reconnect,
-and the consumer pages each of its scopes then and on a polling interval as a backstop. A scope
-key longer than `NOTIFY`'s payload limit is sent as an empty payload, meaning "any scope may have
-changed".
+and the consumer pages each of its scopes then and on a fixed polling interval as a backstop. Scopes are at most 512 bytes, well inside `NOTIFY`'s payload limit.
 
 ### Rollout
 
