@@ -9,8 +9,8 @@ use super::{
 use crate::conformance::{Add, Claim, Ledger, TestClock, compaction_cases, journal_cases};
 use crate::{
     Aggregate, Error, FeatureMarker, MemRepository, Metadata, OutcomeCommand, OutcomeConfig,
-    Rejection, Repository, RetryPolicy, SerializedEvent, Store, ToRejection, ViewRepository,
-    canonical_json,
+    RebuildFence, Rejection, Repository, RetryPolicy, SerializedEvent, Store, ToRejection,
+    ViewRepository, canonical_json,
 };
 
 fn scope(name: &str) -> Scope {
@@ -713,5 +713,225 @@ async fn a_projector_that_reads_metadata_sees_the_same_events_live_and_on_replay
     assert_eq!(
         replayed, live,
         "a replay of the stored events reproduces the live rows"
+    );
+}
+
+/// A fence over the in-memory repository whose first write takes longer than half a one-second
+/// lease and moves the repository's clock past the lease's expiry. Before each write another
+/// worker tries to begin a rebuild, which takes over the lease if it lapsed; after the first write
+/// an operator may force-release the lock.
+struct SlowFence {
+    inner: MemRepository,
+    clock: TestClock,
+    force_release: Option<String>,
+    /// For each write attempt: whether the intruder's begin was refused.
+    writes: std::sync::Mutex<Vec<bool>>,
+}
+
+impl SlowFence {
+    fn new(inner: MemRepository, clock: TestClock) -> Self {
+        Self {
+            inner,
+            clock,
+            force_release: None,
+            writes: std::sync::Mutex::default(),
+        }
+    }
+
+    fn writes(&self) -> Vec<bool> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl RebuildFence for SlowFence {
+    async fn rebuild_generation(&self) -> Result<crate::RebuildGeneration, Error> {
+        self.inner.rebuild_generation().await
+    }
+
+    async fn rebuild_state(&self) -> Result<crate::RebuildState, Error> {
+        self.inner.rebuild_state().await
+    }
+
+    async fn begin_rebuild(
+        &self,
+        owner: &str,
+        lease: std::time::Duration,
+    ) -> Result<crate::RebuildLease, Error> {
+        self.inner.begin_rebuild(owner, lease).await
+    }
+
+    async fn renew_rebuild(
+        &self,
+        lease: &crate::RebuildLease,
+        extend: std::time::Duration,
+    ) -> Result<crate::RebuildLease, Error> {
+        self.inner.renew_rebuild(lease, extend).await
+    }
+
+    async fn end_rebuild(
+        &self,
+        lease: &crate::RebuildLease,
+    ) -> Result<crate::RebuildGeneration, Error> {
+        self.inner.end_rebuild(lease).await
+    }
+
+    async fn force_release_rebuild(&self, owner: &str) -> Result<crate::RebuildGeneration, Error> {
+        self.inner.force_release_rebuild(owner).await
+    }
+
+    async fn write_rebuild_views(
+        &self,
+        lease: &crate::RebuildLease,
+        views: &[crate::ProjectedView],
+    ) -> Result<(), Error> {
+        let intruder = self
+            .inner
+            .begin_rebuild("intruder", std::time::Duration::from_secs(60))
+            .await;
+        let first = {
+            let mut writes = self.writes.lock().unwrap();
+            writes.push(matches!(intruder, Err(Error::RebuildLockHeld { .. })));
+            writes.len() == 1
+        };
+
+        self.inner.write_rebuild_views(lease, views).await?;
+
+        if first {
+            if let Some(owner) = &self.force_release {
+                self.inner.force_release_rebuild(owner).await?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            self.clock.advance(2);
+        }
+
+        Ok(())
+    }
+}
+
+/// 60 events in two scopes each: 120 rows and 2 counters, which the rebuild writes in two batches.
+async fn two_batches_of_journal(memory: &MemRepository) -> Vec<SerializedEvent> {
+    let repository = JournalRepository::new(memory.clone(), journal());
+    let store = Store::<Ledger, _>::new(&repository, ());
+    for _ in 0..60 {
+        store
+            .execute("l-1", Add(1), Metadata::new("local"))
+            .await
+            .unwrap();
+    }
+
+    memory.events(&"l-1".into()).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_journal_rebuild_that_outlasts_its_lease_renews_it_and_is_not_taken_over() {
+    let clock = TestClock::at(1_000_000);
+    let memory = MemRepository::new().with_clock(clock.reader());
+    let events = two_batches_of_journal(&memory).await;
+    let before = memory.rebuild_generation().await.unwrap();
+
+    let fence = SlowFence::new(memory.clone(), clock.clone());
+    let state = rebuild_with_lock(&fence, &events, std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!((state.rows.len(), state.counters.len()), (120, 2));
+    assert_eq!(
+        fence.writes(),
+        [true, true],
+        "the lease was renewed before the second batch, so nobody could take it over"
+    );
+    assert_eq!(
+        memory.rebuild_generation().await.unwrap().value,
+        before.value + 2,
+        "the run released its own lock"
+    );
+
+    // The same under a caller's lease: it is renewed in place and the caller ends it.
+    let fence = SlowFence::new(memory.clone(), clock.clone());
+    let mut lease = memory
+        .begin_rebuild("caller", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    let generation = lease.generation;
+    super::rebuild_with_lease(
+        &fence,
+        &events,
+        &mut lease,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fence.writes(), [true, true]);
+    assert_eq!(
+        (lease.generation, lease.lease_expires_at),
+        (generation, clock.seconds() + 1),
+        "the same lease, renewed"
+    );
+    memory.end_rebuild(&lease).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_journal_rebuild_that_loses_its_lease_stops_before_the_next_write() {
+    let clock = TestClock::at(1_000_000);
+    let memory = MemRepository::new().with_clock(clock.reader());
+    let events = two_batches_of_journal(&memory).await;
+
+    let mut fence = SlowFence::new(memory.clone(), clock.clone());
+    fence.force_release = Some(super::REBUILD_OWNER.to_owned());
+    let error = rebuild_with_lock(&fence, &events, std::time::Duration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::RebuildLeaseLost { .. }), "{error:?}");
+    assert_eq!(fence.writes().len(), 1, "no write after the lost renewal");
+    let generation = memory.rebuild_generation().await.unwrap();
+    assert!(
+        !generation.is_settled() && generation.force_released,
+        "the force-release stands until a rebuild completes: {generation:?}"
+    );
+
+    // Under a caller's lease the failure reports the batch it attempted.
+    let mut fence = SlowFence::new(memory.clone(), clock.clone());
+    fence.force_release = Some("caller".to_owned());
+    let mut lease = memory
+        .begin_rebuild("caller", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    let failure = super::rebuild_with_lease(
+        &fence,
+        &events,
+        &mut lease,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(*failure.error, Error::RebuildLeaseLost { .. }),
+        "{failure:?}"
+    );
+    assert_eq!((failure.attempted, failure.batches), (1, 2));
+    assert_eq!(fence.writes().len(), 1);
+}
+
+#[tokio::test]
+async fn a_journal_that_cannot_be_replayed_takes_no_lock() {
+    let memory = MemRepository::new();
+    let mut events = two_batches_of_journal(&memory).await;
+    // Two different records claiming one position.
+    let mut forged = events[0].clone();
+    forged.id = "forged".into();
+    events.push(forged);
+
+    let error = rebuild_with_lock(&memory, &events, std::time::Duration::from_secs(60))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidJournal(_)), "{error:?}");
+    let state = memory.rebuild_state().await.unwrap();
+    assert!(
+        !state.in_progress() && state.generation.is_settled(),
+        "{state:?}"
     );
 }

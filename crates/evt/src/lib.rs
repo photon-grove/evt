@@ -110,8 +110,8 @@ pub use projection::{
 };
 pub use rebuild::{
     MAX_REBUILD_BEGIN_ATTEMPTS, MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH, ProjectionRebuild,
-    REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildEpoch, RebuildFence,
-    RebuildGeneration, RebuildLease, RebuildLock, RebuildReport, RebuildState,
+    REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildEpoch, RebuildFailure,
+    RebuildFence, RebuildGeneration, RebuildLease, RebuildLock, RebuildReport, RebuildState,
     observe_rebuild_epoch, read_at_rebuild_epoch, verify_rebuild_epoch,
 };
 pub use repository::{
