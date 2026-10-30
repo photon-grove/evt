@@ -1,6 +1,12 @@
 ## Summary
 
-<!-- Why this change, then what it does. Link the issue it closes. -->
+<!-- 1–3 sentences, why-first, with one clause of context for a newcomer. Link the code (pinned to
+a commit SHA) and related PRs/issues (full URLs) instead of describing them. -->
+
+## Change
+
+<!-- 1–2 sentences naming what changed, linking the key call sites. Note scope/safety: what's
+affected and what isn't. Close with `Closes <full issue URL>` when it resolves an issue. -->
 
 ## Checklist
 
