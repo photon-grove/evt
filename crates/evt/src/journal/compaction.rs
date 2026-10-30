@@ -702,8 +702,8 @@ pub enum CompactionWritten {
 /// A journal store that can compact: it writes compaction rows and deletes journal rows in one
 /// atomic step fenced on the rebuild generation.
 ///
-/// [`MemRepository`](crate::MemRepository) and the DynamoDB repository with a views table
-/// implement it. Application code uses [`compact`](super::compact) and the lease functions rather
+/// [`MemRepository`](crate::MemRepository), and the DynamoDB and PostgreSQL repositories with their
+/// views tables, implement it. Application code uses [`compact`](super::compact) and the lease functions rather
 /// than this primitive.
 pub trait CompactionStore: JournalCompactionStore + RebuildFence + FeatureMarker {
     /// Applies `writes` atomically to the views table: all of them, or none when one of their

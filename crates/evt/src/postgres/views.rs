@@ -230,7 +230,7 @@ fn cursor_key(last: &ViewRow, entity_type: bool) -> Item {
 }
 
 /// Decodes one row of [`COLUMNS`].
-fn row(row: &Row) -> Result<ViewRow, Error> {
+pub(super) fn row(row: &Row) -> Result<ViewRow, Error> {
     let payload: String = row.try_get(4).map_err(Error::backend)?;
 
     Ok(ViewRow {

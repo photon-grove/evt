@@ -630,8 +630,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_max_row_bytes(30_000)? // the default
     .with_retry(photon_evt::RetryPolicy::new(5)); // the default
 
-    // Wrap a repository that writes views: in memory here, DynamoDB with a views table in
-    // production.
+    // Wrap a repository that writes views: in memory here, DynamoDB with a views table or
+    // PostgreSQL with `with_views_table()` in production.
     let repository = JournalRepository::new(MemRepository::new(), journal.clone());
     let store = Store::<Ledger, _>::new(&repository, ());
 
@@ -708,8 +708,8 @@ without the feature refuse the table.
   `page_at_epoch` / `high_watermark_at_epoch`: they fail with `RebuildUnavailable` or
   `RebuildEpochChanged` (both transient) instead of showing half-written rows. Keep the cursor, back
   off, and read the same page again.
-- Backends. DynamoDB and the in-memory repository. The Rust PostgreSQL repository does not write
-  commit-wide views yet.
+- Backends. DynamoDB, the in-memory repository, and PostgreSQL with its views table
+  (`with_views_table()`).
 - Waking consumers. On DynamoDB, a consumer learns of new rows from the views table's stream,
   filtered to the journal's keys, and then reads `page` from its cursor. The
   [`photon-evt-lambda`](https://github.com/photon-grove/evt/tree/main/crates/evt-lambda) crate
@@ -766,7 +766,7 @@ match page(&repository, &scope, after, 100).await {
   preflight refuses a gapped range or an oversized manifest before anything is written.
 - The first lease declares `journal-compaction` on the feature marker, so a build that predates
   compaction refuses the table. `photon_evt::conformance::compaction_cases` checks a backend
-  (`CompactionStore`, implemented by the in-memory and DynamoDB repositories).
+  (`CompactionStore`, implemented by the in-memory, DynamoDB and PostgreSQL repositories).
 
 The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#journal),
 and `photon_evt::conformance::journal_cases` (features `journal` and `conformance`) checks a backend.
@@ -921,7 +921,11 @@ exact bytes, every read (entity-type lists included) sees every committed transa
 needs a `UTF8` database. `PostgresRepository::with_views_table()` makes it the commit's view
 target in place of `with_view_writer`: evt builds the statements with DynamoDB's owner rules,
 applies the expected-payload condition, and declares the `postgres-views` marker feature so no
-other writer puts the store's views elsewhere.
+other writer puts the store's views elsewhere. With it, the PostgreSQL repository also implements
+the journal stores (feature `journal`), so `JournalRepository<PostgresRepository>` journals,
+pages and compacts on PostgreSQL as it does on DynamoDB. `PgStatement` is `Clone` for this: its
+parameters are shared `Arc`s (`params: Vec<Arc<dyn ToSql + Sync + Send>>`, a breaking change in
+0.3 for code that built the struct by hand or read `params`; `PgStatement::new` is unchanged).
 
 ```rust,ignore
 use photon_evt::{ViewRepository, ViewRow};
