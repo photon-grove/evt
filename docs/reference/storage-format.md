@@ -3042,8 +3042,8 @@ Readers and `410 Gone`. Reading a compaction row takes the extension trait
 `JournalCompactionStore` (`read_compaction_row`). `JournalStore` is unchanged from the first journal release. `page`,
 `page_at_epoch`, `JournalRepository`, and every compaction function require the extension, so a
 store that cannot read the floor fails to compile with them rather than skip the `410` check or
-allocate below a floor (`high_watermark` needs only `JournalStore`). The in-memory and DynamoDB
-repositories implement it. `page` is unchanged until it meets a gap. It then reads the manifest
+allocate below a floor (`high_watermark` needs only `JournalStore`). The in-memory, DynamoDB and
+PostgreSQL (with its views table) repositories implement it. `page` is unchanged until it meets a gap. It then reads the manifest
 (after the rows), and if the floor is above the page's last contiguous position (`next_after`) the
 read fails with `JournalGone`: the scope, `after`, the snapshot's `checkpoint`, its chunk count, and
 its manifest digest, and nothing of the deleted rows. An HTTP layer maps it to status 410. The
@@ -3081,11 +3081,10 @@ would read deleted rows as a gap and could allocate below the floor.
 
 ### Backends
 
-DynamoDB (a views table) and the in-memory repository. The Rust PostgreSQL repository applies the
-counter's compare-and-set with its [views table](#postgresql-views-table) (`with_views_table()`;
-an application view writer cannot express it), but it implements none of the journal stores yet,
-so a `JournalRepository` over it has no `Repository` impl. [Journal on PostgreSQL](#journal-on-postgresql)
-specifies the rest of the `photon-evt` 0.3 support (ADR 0008).
+DynamoDB (a views table), the in-memory repository, and PostgreSQL with its
+[views table](#postgresql-views-table) (`with_views_table()`, [Journal on PostgreSQL](#journal-on-postgresql)).
+A PostgreSQL repository with an application view writer cannot express the counter's
+compare-and-set, so its journal reads are refused with `ViewsNotConfigured`.
 
 ## PostgreSQL
 
@@ -3553,10 +3552,11 @@ rows never split across two tables.
 
 ### Journal on PostgreSQL
 
-Planned for `photon-evt` 0.3 ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)), on a
-repository configured `with_views_table()`. Not implemented yet. The [journal](#journal) and its
-[compaction](#journal-compaction) are specified backend-neutrally above. This section pins the
-PostgreSQL statements.
+[ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3, on a repository
+configured `with_views_table()`. Implemented: the journal's commits, its reads and its compaction,
+with the shared journal, journal-rebuild and compaction conformance suites on PostgreSQL. Planned:
+the wake-ups below. The [journal](#journal) and its [compaction](#journal-compaction) are specified
+backend-neutrally above. This section pins the PostgreSQL statements.
 
 Rows. Journal rows, counters and compaction rows are rows of `{events}__evt_views`, column for
 attribute, with the same keys, owners, entity types and payload bytes as the DynamoDB items, so
@@ -3590,12 +3590,15 @@ Compaction writes (`CompactionStore::write_compaction`, 1 to 99 writes to distin
 1. With an `epoch`: take the shared rebuild advisory lock
    (`pg_advisory_xact_lock_shared(1702261761, hashtext('{events}:rebuild'))`) and read the
    generation. Unless it is the epoch's, roll back: `EpochChanged`.
-2. Lock the rows the batch names, in ascending `(pk, sk)` byte order:
+2. Lock the rows the batch names, in one order every batch uses: the scope's `LEASE` row first,
+   then the rest in ascending `(pk, sk)` byte order:
    `SELECT entity_id, payload FROM evt_events__evt_views WHERE pk = $1 AND sk = $2 FOR UPDATE`.
+   Payloads that are not UTF-8, written or expected, are refused (`InvalidArgument`) before any of
+   this, as on DynamoDB.
 3. Check every write's condition against what step 2 read: `Any` passes, `Absent` needs no row, and
    `Payload(bytes)` needs a row owned by `SYSTEM#JOURNAL` whose payload is exactly those bytes.
-   Then apply the writes in request order, each guarded again in its own statement:
-   - a put with `Absent` is a plain `INSERT` (a `23505` fails it);
+   Then apply the writes in step 2's order, each guarded again in its own statement:
+   - a put with `Absent` is a plain `INSERT` (a violation of `{events}__evt_views_pkey` fails it);
    - any other put is an upsert of the whole row;
    - a delete is `DELETE … WHERE pk = $1 AND sk = $2 AND entity_id = $owner`, which a row absent
      at step 2 passes.
@@ -3607,8 +3610,8 @@ Compaction writes (`CompactionStore::write_compaction`, 1 to 99 writes to distin
 `FOR UPDATE` cannot lock an absent row, so two batches that find the same key absent could both
 pass step 2. The protocol keeps that from mattering: every batch of a scope either puts the
 scope's `LEASE` row with `Absent` (the first acquire, a plain insert, which two racing acquirers
-cannot both make) or checks it by payload (a row that step 2 locks), so batches of one scope
-serialize on their lease row. A `Check` with `Absent` on any other key has no `23505` backstop and
+cannot both make) or checks it by payload (a row that step 2 locks first), so batches of one scope
+serialize on their lease row before they read any other key. A `Check` with `Absent` on any other key has no `23505` backstop and
 relies on that serialization alone. Compaction takes no lock a commit waits on (it never writes
 counters, and it takes the shared rebuild lock before anything else), so the two cannot deadlock.
 A commit that re-inserts a deleted position below the floor still fails on its counter.

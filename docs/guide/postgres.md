@@ -192,7 +192,9 @@ the most a btree index entry holds.
 builds every statement with the DynamoDB repository's owner rules, so you write no SQL. The
 repository declares the `postgres-views` marker feature before its first commit, after which a Go
 writer, or a Rust repository with a view writer, refuses the store instead of putting views
-somewhere else. The journal on PostgreSQL follows in `photon-evt` 0.3.
+somewhere else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
+wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
+DynamoDB. Wake-ups for a journal on PostgreSQL follow in `photon-evt` 0.3.
 
 ## Local development
 

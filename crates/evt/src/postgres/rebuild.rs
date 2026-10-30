@@ -54,7 +54,7 @@ impl PostgresRepository {
     }
 
     /// Reads the generation row; no row is generation 0.
-    async fn read_generation(
+    pub(super) async fn read_generation(
         &self,
         client: &impl GenericClient,
         for_update: bool,
