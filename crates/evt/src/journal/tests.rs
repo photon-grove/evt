@@ -1226,3 +1226,243 @@ async fn a_history_projector_and_the_journal_share_one_read_of_their_type() {
     assert_eq!(journal_rows(&memory).await, live, "the journal is rebuilt");
     assert_eq!(memory.list_views_by_pk("commits").await.unwrap().len(), 3);
 }
+
+/// The `(scope, position)` pairs an event holds, read from its metadata.
+fn held(event: &SerializedEvent) -> Vec<(String, u64)> {
+    allocations(&event.metadata)
+        .unwrap()
+        .into_iter()
+        .map(|allocation| (allocation.scope, allocation.position))
+        .collect()
+}
+
+#[tokio::test]
+async fn every_store_entry_point_returns_the_events_as_stored_with_their_allocations() {
+    let memory = MemRepository::new();
+    let repository = JournalRepository::new(memory.clone(), journal());
+    let plain = Store::<Ledger, _>::new(&repository, ()).with_snapshot_interval(0);
+    let outcomes = Store::<Ledger, _>::new(&repository, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(3)));
+
+    // A plain execute.
+    let executed = plain
+        .execute("l-1", Add(1), Metadata::new("local"))
+        .await
+        .unwrap();
+    assert_eq!(executed.events, memory.events(&"l-1".into()).await.unwrap());
+    assert_eq!(
+        held(&executed.events[0]),
+        [("all".into(), 1), ("stream:l-1".into(), 1)]
+    );
+
+    // An outcome-recording execute.
+    let outcome = outcomes
+        .execute_with_outcome("l-2", Add(2), Metadata::new("local").with_command_id("c-1"))
+        .await
+        .unwrap();
+    assert_eq!(outcome.events, memory.events(&"l-2".into()).await.unwrap());
+    assert_eq!(
+        held(&outcome.events[0]),
+        [("all".into(), 2), ("stream:l-2".into(), 1)]
+    );
+
+    // A replay has no events of its own to return.
+    let replayed = outcomes
+        .execute_with_outcome("l-2", Add(2), Metadata::new("local").with_command_id("c-1"))
+        .await
+        .unwrap();
+    assert!(replayed.replayed && replayed.events.is_empty());
+
+    // A plain multi-stream transaction, in persisted order whatever order it read the streams.
+    let mut transaction = plain.transaction();
+    let mut late = transaction.read::<Ledger>("l-9").await.unwrap();
+    let mut early = transaction.read::<Ledger>("l-3").await.unwrap();
+    transaction
+        .append(
+            &mut late,
+            vec![crate::conformance::Added { amount: 1 }.into()],
+        )
+        .unwrap();
+    transaction
+        .append(
+            &mut early,
+            vec![crate::conformance::Added { amount: 1 }.into()],
+        )
+        .unwrap();
+    let committed = transaction.commit(&Metadata::new("local")).await.unwrap();
+    let mut stored = memory.events(&"l-3".into()).await.unwrap();
+    stored.extend(memory.events(&"l-9".into()).await.unwrap());
+    assert_eq!(committed, stored);
+    assert_eq!(
+        committed.iter().map(held).collect::<Vec<_>>(),
+        [
+            vec![("all".into(), 3), ("stream:l-3".into(), 1)],
+            vec![("all".into(), 4), ("stream:l-9".into(), 1)],
+        ]
+    );
+
+    // A multi-stream command with an outcome.
+    let identity = crate::CommandIdentity::new("ledger:pair").with_targets(["l-4", "l-5"]);
+    let metadata = Metadata::new("local").with_command_id("c-2");
+    let outcome = outcomes
+        .execute_transaction(&identity, &metadata, |tx| {
+            Box::pin(async move {
+                for id in ["l-5", "l-4"] {
+                    let mut read = tx.read::<Ledger>(id).await?;
+                    tx.append(
+                        &mut read,
+                        vec![crate::conformance::Added { amount: 1 }.into()],
+                    )?;
+                }
+
+                Ok(crate::Decision::accept())
+            })
+        })
+        .await
+        .unwrap();
+    let mut stored = memory.events(&"l-4".into()).await.unwrap();
+    stored.extend(memory.events(&"l-5".into()).await.unwrap());
+    assert_eq!(outcome.events, stored);
+
+    // Every returned allocation is the journal row at that position.
+    let page = repository.page(&scope("all"), 0, 100).await.unwrap();
+    for event in [executed.events, committed, outcome.events].concat() {
+        let (_, position) = held(&event)[0].clone();
+        let row = &page.rows[position as usize - 1];
+        assert_eq!(row.position, position);
+        assert_eq!(row.event, event);
+    }
+}
+
+#[tokio::test]
+async fn a_receipt_from_the_repository_carries_the_allocations_it_staged() {
+    let memory = MemRepository::new();
+    let repository = JournalRepository::new(memory.clone(), journal());
+    let event = |id: &str, sequence: i64| {
+        crate::serialize_events::<Ledger>(
+            &id.into(),
+            crate::EventSequence(sequence - 1),
+            &[crate::conformance::Added { amount: 1 }.into()],
+            &Metadata::new("local"),
+        )
+        .unwrap()
+        .remove(0)
+    };
+
+    // The drafts carry no allocation; the receipt does, and it is what the log stores.
+    let draft = event("l-1", 1);
+    assert!(allocations(&draft.metadata).unwrap().is_empty());
+    let receipt = repository
+        .commit_with_receipt(crate::Commit::new("l-1", vec![draft]))
+        .await
+        .unwrap();
+    assert_eq!(receipt.events, memory.events(&"l-1".into()).await.unwrap());
+    assert_eq!(
+        held(&receipt.events[0]),
+        [("all".into(), 1), ("stream:l-1".into(), 1)]
+    );
+
+    // A transaction given its streams out of order returns them in persisted order.
+    let receipt = repository
+        .commit_transaction_with_receipt(crate::TransactionCommit::new(vec![
+            crate::Commit::new("l-3", vec![event("l-3", 1)]),
+            crate::Commit::new("l-2", vec![event("l-2", 1)]),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt
+            .events
+            .iter()
+            .map(|event| (event.entity_id.to_string(), held(event)))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "l-2".to_owned(),
+                vec![("all".into(), 2), ("stream:l-2".into(), 1)]
+            ),
+            (
+                "l-3".to_owned(),
+                vec![("all".into(), 3), ("stream:l-3".into(), 1)]
+            ),
+        ]
+    );
+
+    // An event of a type the journal does not cover comes back without an allocation, even one
+    // a caller forged on the draft.
+    let mut drafts = crate::serialize_events::<crate::conformance::Wallet>(
+        &"w-1".into(),
+        crate::EventSequence(0),
+        &[crate::conformance::Funded { amount: 1 }.into()],
+        &Metadata::new("local"),
+    )
+    .unwrap();
+    super::set_allocations(&mut drafts[0], &[super::Allocation::new(&scope("all"), 99)]);
+    let receipt = repository
+        .commit_with_receipt(crate::Commit::new("w-1", drafts))
+        .await
+        .unwrap();
+    assert!(held(&receipt.events[0]).is_empty());
+    assert_eq!(receipt.events, memory.events(&"w-1".into()).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_rejection_that_commits_events_returns_them_with_their_allocations() {
+    let memory = MemRepository::new();
+    let journal = Journal::new(["ledger", "wallet"], |_: &SerializedEvent| {
+        vec![scope("all")]
+    })
+    .unwrap();
+    let repository = JournalRepository::new(memory.clone(), journal);
+    let config = OutcomeConfig::new().with_retry(RetryPolicy::immediate(3));
+    let wallets = Store::<crate::conformance::Wallet, _>::new(&repository, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config.clone());
+    let ledgers = Store::<Ledger, _>::new(&repository, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config);
+
+    // A single-aggregate rejection whose refusal is recorded as an event.
+    let refused = wallets
+        .execute_with_outcome(
+            "w-1",
+            crate::conformance::WalletCommand::Spend(5),
+            Metadata::new("local").with_command_id("c-1"),
+        )
+        .await
+        .unwrap();
+    assert!(refused.is_rejected());
+    assert_eq!(refused.events, memory.events(&"w-1".into()).await.unwrap());
+    assert_eq!(held(&refused.events[0]), [("all".into(), 1)]);
+
+    // A transaction that rejects with the events it staged.
+    let identity = crate::CommandIdentity::new("ledger:refuse").with_targets(["l-1"]);
+    let rejected = ledgers
+        .execute_transaction(
+            &identity,
+            &Metadata::new("local").with_command_id("c-2"),
+            |tx| {
+                Box::pin(async move {
+                    let mut read = tx.read::<Ledger>("l-1").await?;
+                    tx.append(
+                        &mut read,
+                        vec![crate::conformance::Added { amount: 1 }.into()],
+                    )?;
+
+                    Ok(crate::Decision::reject_with_events(Rejection::new(
+                        "refused", "no",
+                    )))
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(rejected.is_rejected());
+    assert_eq!(rejected.events, memory.events(&"l-1".into()).await.unwrap());
+    assert_eq!(held(&rejected.events[0]), [("all".into(), 2)]);
+
+    let page = repository.page(&scope("all"), 0, 10).await.unwrap();
+    assert_eq!(page.rows[0].event, refused.events[0]);
+    assert_eq!(page.rows[1].event, rejected.events[0]);
+}

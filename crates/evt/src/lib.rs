@@ -116,8 +116,8 @@ pub use rebuild::{
     observe_rebuild_epoch, read_at_rebuild_epoch, verify_rebuild_epoch,
 };
 pub use repository::{
-    Commit, FenceProvenance, MAX_COMMIT_ITEM_BYTES, NewSnapshot, ReadFence, Repository,
-    TransactionCommit, snapshot_commit_size, snapshot_events_due,
+    Commit, CommitReceipt, FenceProvenance, MAX_COMMIT_ITEM_BYTES, NewSnapshot, ReadFence,
+    Repository, TransactionCommit, snapshot_commit_size, snapshot_events_due,
 };
 pub use retry::{DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY_MS, RetryPolicy};
 pub use store::{

@@ -470,8 +470,10 @@ impl Outcome {
 pub struct CommandOutcome<E = ()> {
     /// The recorded outcome: the row this call wrote, or the stored row it replayed.
     pub outcome: Outcome,
-    /// The events this call committed, in the order the commit persists them. Empty when the
-    /// outcome was replayed, and for a rejection or a no-op.
+    /// The events this call committed, as the repository stored them
+    /// ([`Repository::commit_with_receipt`](crate::Repository::commit_with_receipt), so a
+    /// journal's allocations included), in the order the commit persists them. Empty when the
+    /// outcome was replayed, and for a no-op or a rejection that carries no events.
     pub events: Vec<SerializedEvent>,
     /// The typed events the handler decided, when the call ran a handler that returned them.
     pub typed_events: Vec<E>,

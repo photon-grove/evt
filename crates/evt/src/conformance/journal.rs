@@ -53,6 +53,10 @@ where
         Box::pin(multi_stream_commit(repo)).await,
     );
     record(
+        "a commit's receipt returns the events as stored, with the allocations a page read returns",
+        Box::pin(receipts_carry_allocations(repo)).await,
+    );
+    record(
         "a row over the cap is refused before any write, at the cap it passes, and a pre-check agrees",
         Box::pin(size_guard(repo, views)).await,
     );
@@ -397,6 +401,94 @@ where
         journaled.high_watermark(&scope(&ns, "world")).await?,
         3,
         "an empty transaction moves nothing"
+    );
+
+    Ok(())
+}
+
+/// The allocations live only in the stored events, so a commit's receipt is how the writer learns
+/// them: they must equal what the stored events and a page read say, for a single-stream commit,
+/// a multi-stream one given out of order, and a retried one that lost its first positions.
+async fn receipts_carry_allocations<R>(repo: &R) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
+    R::Operation: Clone,
+{
+    let ns = namespace();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let (a, b, c) = (
+        Stream::new(&ns, "a", "ledger"),
+        Stream::new(&ns, "b", "ledger"),
+        Stream::new(&ns, "c", "ledger"),
+    );
+    let world = scope(&ns, "world");
+
+    let single = journaled
+        .commit_with_receipt(Commit::new(a.id.clone(), a.events(1..=2)))
+        .await?;
+    ensure_eq!(
+        single.events,
+        repo.events(&a.id).await?,
+        "the single-stream receipt is the stored events"
+    );
+
+    let multi = journaled
+        .commit_transaction_with_receipt(TransactionCommit::new(vec![
+            Commit::new(c.id.clone(), c.events(1..=1)),
+            Commit::new(b.id.clone(), b.events(1..=2)),
+        ]))
+        .await?;
+    let mut stored = repo.events(&b.id).await?;
+    stored.extend(repo.events(&c.id).await?);
+    ensure_eq!(
+        multi.events,
+        stored,
+        "the multi-stream receipt is the stored events, in persisted order"
+    );
+
+    // Another writer takes the next world position between this writer's counter read and its
+    // commit; the retried commit's receipt carries the positions it finally holds, not the ones
+    // it first allocated.
+    let stale = Lagging::new(repo.clone(), 2);
+    let lagging = JournalRepository::new(stale.clone(), journal(&ns));
+    a.commit(&journaled, a.events(3..=3), None).await?;
+    let retried = lagging
+        .commit_with_receipt(Commit::new(c.id.clone(), c.events(2..=2)))
+        .await?;
+    ensure_eq!(stale.backoffs(), 1, "one retry after one lost attempt");
+    ensure_eq!(
+        retried.events,
+        repo.events_after(&c.id, EventSequence(1)).await?,
+        "the retried receipt is the stored event"
+    );
+
+    let page = journaled.page(&world, 0, 100).await?;
+    let mut returned = Vec::new();
+    for event in [single.events, multi.events, retried.events].concat() {
+        let world_position = allocations(&event.metadata)?
+            .into_iter()
+            .find(|allocation| allocation.scope == world.as_str())
+            .map(|allocation| allocation.position)
+            .ok_or(Failure(format!("{} holds no world position", event.id)))?;
+        returned.push((world_position, event));
+    }
+    returned.sort_by_key(|(position, _)| *position);
+
+    let rows: Vec<_> = page
+        .rows
+        .iter()
+        .filter(|row| row.event.id.to_string() != format!("{}:3", a.id))
+        .map(|row| (row.position, row.event.clone()))
+        .collect();
+    ensure_eq!(
+        returned,
+        rows,
+        "every returned allocation is the world row at that position, holding that event"
+    );
+    ensure_eq!(
+        positions(&page),
+        vec![1, 2, 3, 4, 5, 6, 7],
+        "world positions are contiguous"
     );
 
     Ok(())

@@ -21,7 +21,9 @@ use crate::outcome::{
     Rejection, Settled, ToRejection, pre_check, principal, require_command_id, settle,
 };
 use crate::projection::{CommitProjector, CommitStream, CommitView, HistoryLedger, project_commit};
-use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due, snapshot_fits};
+use crate::repository::{
+    Commit, CommitReceipt, NewSnapshot, Repository, snapshot_events_due, snapshot_fits,
+};
 use crate::retry::{Budget, Failed, Retry, RetryPolicy};
 use crate::transaction::{Begin, PendingCommand, Transaction, freeze_command, persist_rejection};
 use crate::upcast::upcast_event;
@@ -311,7 +313,9 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
     /// Applies events to a loaded aggregate and commits them, snapshotting when the commit
     /// reaches the snapshot interval. Consumes `loaded` so a failed commit cannot leave stale
-    /// state in use. On success it returns the updated state and the stored events.
+    /// state in use. On success it returns the updated state and the events as stored (the
+    /// repository's [receipt](Repository::commit_with_receipt)), which carry whatever the
+    /// repository wrote into them, such as a journal's allocations.
     ///
     /// Refuses with [`Error::InvalidConfig`] on a store with
     /// [outcomes enabled](Store::with_outcomes); use
@@ -336,11 +340,11 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
         self.ready_projectors().await?;
 
-        let (loaded, serialized, commit) = self.stage(loaded, events, metadata)?;
+        let (loaded, commit) = self.stage(loaded, events, metadata)?;
 
-        self.repository.commit(commit).await?;
+        let receipt = self.repository.commit_with_receipt(commit).await?;
 
-        Ok((loaded, serialized))
+        Ok((loaded, receipt.events))
     }
 
     /// Readies the repository for the commit-wide projectors before a commit that runs them: it
@@ -368,14 +372,14 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
     /// Applies the decided events to the loaded aggregate and builds the repository commit that
     /// persists them (events, snapshot, projector operations), without writing it. The returned
-    /// state is the one after the commit applies; it is only used if the commit succeeds.
-    #[allow(clippy::type_complexity)]
+    /// state is the one after the commit applies; it is only used if the commit succeeds. The
+    /// events the caller gets back come from the repository's receipt.
     fn stage(
         &self,
         mut loaded: Loaded<A>,
         events: Vec<A::Event>,
         metadata: &Metadata,
-    ) -> Result<(Loaded<A>, Vec<SerializedEvent>, Commit<R::Operation>), Error> {
+    ) -> Result<(Loaded<A>, Commit<R::Operation>), Error> {
         // The engine stamps the commit ID once per commit; every event of this commit carries it.
         let stamped = stamp_commit_id(metadata, &*self.commit_ids);
         let serialized =
@@ -434,18 +438,19 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
         let snapshot_sequence = snapshot.as_ref().map(|snapshot| snapshot.sequence);
 
+        loaded.sequence = serialized
+            .last()
+            .map_or(loaded.sequence, |event| event.sequence);
+
         let commit = Commit {
             entity_id: loaded.entity_id.clone(),
-            events: serialized.clone(),
+            events: serialized,
             snapshot,
             operations,
             views,
             outcome: None,
         };
 
-        loaded.sequence = serialized
-            .last()
-            .map_or(loaded.sequence, |event| event.sequence);
         if let Some(sequence) = snapshot_sequence {
             loaded.snapshot_sequence = sequence;
         }
@@ -457,7 +462,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             loaded.seen_command_ids.insert(command_id.clone());
         }
 
-        Ok((loaded, serialized, commit))
+        Ok((loaded, commit))
     }
 
     /// Loads the aggregate, handles the command, and records the result as a durable outcome on a
@@ -670,20 +675,20 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                     let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
 
                     return self
-                        .record(commit, Vec::new(), Vec::new())
+                        .record(commit, Vec::new())
                         .await
                         .map_err(Failed::committing);
                 }
 
                 let decided = failure_events.clone();
                 self.ready_projectors().await.map_err(Failed::internal)?;
-                let (_, serialized, mut commit) = self
+                let (_, mut commit) = self
                     .stage(loaded, failure_events, metadata)
                     .map_err(Failed::internal)?;
                 commit.outcome = Some(outcome);
 
                 return self
-                    .record(commit, serialized, decided)
+                    .record(commit, decided)
                     .await
                     .map_err(Failed::committing);
             }
@@ -699,13 +704,13 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
 
             return self
-                .record(commit, Vec::new(), decided)
+                .record(commit, decided)
                 .await
                 .map_err(Failed::committing);
         }
 
         self.ready_projectors().await.map_err(Failed::internal)?;
-        let (loaded, serialized, mut commit) = self
+        let (loaded, mut commit) = self
             .stage(loaded, events, metadata)
             .map_err(Failed::internal)?;
         let response = respond(&loaded.aggregate, &decided)
@@ -716,7 +721,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             response,
         ));
 
-        self.record(commit, serialized, decided)
+        self.record(commit, decided)
             .await
             .map_err(Failed::committing)
     }
@@ -805,11 +810,11 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         })
     }
 
-    /// Writes a commit that carries an outcome and settles the result.
+    /// Writes a commit that carries an outcome and settles the result. The outcome lists the
+    /// events as the repository stored them ([`Repository::commit_with_receipt`]).
     async fn record(
         &self,
         commit: Commit<R::Operation>,
-        serialized: Vec<SerializedEvent>,
         typed_events: Vec<A::Event>,
     ) -> Result<CommandOutcome<A::Event>, Error> {
         let stored = commit
@@ -817,7 +822,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             .expect("record is only called with an outcome");
         let (command_id, digest) = (stored.command_id.clone(), stored.digest.clone());
 
-        let result = self.repository.commit(commit).await;
+        let (result, committed) = split_receipt(self.repository.commit_with_receipt(commit).await);
 
         let window = self
             .outcomes
@@ -825,7 +830,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             .map_or(Duration::ZERO, OutcomeConfig::recovery_wait);
 
         match settle(&self.repository, &command_id, &digest, window, result).await? {
-            Settled::Committed => Ok(CommandOutcome::fresh(stored, serialized, typed_events)),
+            Settled::Committed => Ok(CommandOutcome::fresh(stored, committed, typed_events)),
             Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
         }
     }
@@ -1240,8 +1245,21 @@ impl<A: Aggregate> Loaded<A> {
 pub struct Executed<A> {
     /// The aggregate state after the new events.
     pub state: Loaded<A>,
-    /// The events as stored.
+    /// The events as stored, from the repository's
+    /// [receipt](Repository::commit_with_receipt): they carry whatever the repository wrote into
+    /// them as it committed, such as a journal's allocations.
     pub events: Vec<SerializedEvent>,
+}
+
+/// Splits a commit's result into the plain result that settling an outcome reads and the events
+/// the receipt carries (none when the commit failed).
+pub(crate) fn split_receipt(
+    result: Result<CommitReceipt, Error>,
+) -> (Result<(), Error>, Vec<SerializedEvent>) {
+    match result {
+        Ok(receipt) => (Ok(()), receipt.events),
+        Err(error) => (Err(error), Vec::new()),
+    }
 }
 
 fn response_error(err: BoxError) -> Error {

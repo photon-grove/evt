@@ -685,6 +685,13 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   grouping. The scope resolver is a pure function of the event and is never consulted after the
   commit. The engine replaces the key on every event a journaled commit writes, so it cannot be
   forged.
+- **A commit returns its events as stored.** `Repository::commit_with_receipt` and
+  `commit_transaction_with_receipt` return the events exactly as written, in persisted order
+  (stream ID bytewise, then sequence); the defaults return the commit's own events, and
+  `JournalRepository` overrides both to return the attempt that committed, allocations included.
+  `Executed::events`, `CommandOutcome::events` and `Transaction::commit` hand back those events, so
+  every returned allocation equals the row a `page` read finds at that position. Wrappers must
+  forward both methods. A replayed or recovered outcome returns no events.
 - **Rows and counters commit with the events.** Journal rows come from a history-dependent
   commit-wide projector: owned by the event's stream, written only if absent, owner never changes.
   Counters (the highest position per scope) are shared by every stream of a scope, so they are

@@ -676,6 +676,10 @@ impl<'a, R: Repository, V: ViewTarget<R>, H: HeadFixtures<R>> Suite<'a, R, V, H>
         );
         record("store retries a conflict", store_retry(repo).await);
         record(
+            "a commit returns its events as stored, in persisted order",
+            Box::pin(commit_receipts(repo)).await,
+        );
+        record(
             "store reloads when compaction races a load",
             store_load_during_compaction(repo).await,
         );
@@ -2454,6 +2458,74 @@ fn metadata() -> Metadata {
 
 fn ledger_id() -> EntityId {
     EntityId::new(format!("{}-ledger", namespace()))
+}
+
+/// A commit's receipt is the events as stored: through the repository's own receipt methods and
+/// through every store and transaction path that hands events back.
+async fn commit_receipts<R: Repository>(repo: &R) -> CaseResult {
+    let ns = namespace();
+    let (a, b) = (
+        Stream::new(&ns, "a", "ledger"),
+        Stream::new(&ns, "b", "ledger"),
+    );
+
+    let receipt = repo
+        .commit_with_receipt(Commit::new(a.id.clone(), a.events(1..=2)))
+        .await?;
+    ensure_eq!(
+        receipt.events,
+        repo.events(&a.id).await?,
+        "a single-stream receipt"
+    );
+
+    // Given in the opposite order, returned in persisted order: stream ID bytewise, then sequence.
+    let receipt = repo
+        .commit_transaction_with_receipt(TransactionCommit::new(vec![
+            Commit::new(b.id.clone(), b.events(1..=1)),
+            Commit::new(a.id.clone(), a.events(3..=3)),
+        ]))
+        .await?;
+    let mut stored = repo.events_after(&a.id, EventSequence(2)).await?;
+    stored.extend(repo.events(&b.id).await?);
+    ensure_eq!(receipt.events, stored, "a multi-stream receipt");
+
+    // An empty commit stores nothing and returns nothing.
+    let receipt = repo
+        .commit_transaction_with_receipt(TransactionCommit::new(Vec::new()))
+        .await?;
+    ensure!(
+        receipt.events.is_empty(),
+        "an empty transaction's receipt: {receipt:?}"
+    );
+
+    let store = Store::<Ledger, _>::new(repo, ()).with_snapshot_interval(0);
+    let (first, second) = (ledger_id(), ledger_id());
+
+    let executed = store.execute(&first, Add(5), metadata()).await?;
+    ensure_eq!(
+        executed.events,
+        repo.events(&first).await?,
+        "Store::execute"
+    );
+
+    let mut tx = store.transaction();
+    let mut one = tx.read::<Ledger>(&second).await?;
+    let mut two = tx.read::<Ledger>(&first).await?;
+    tx.append(&mut one, added(1))?;
+    tx.append(&mut two, added(2))?;
+    let committed = tx.commit(&metadata()).await?;
+    // The first stream's event from this commit and the second stream's, by stream ID bytes.
+    let mut stored = repo.events_after(&first, EventSequence(1)).await?;
+    stored.extend(repo.events(&second).await?);
+    stored.sort_by(|x, y| {
+        x.entity_id
+            .as_str()
+            .as_bytes()
+            .cmp(y.entity_id.as_str().as_bytes())
+    });
+    ensure_eq!(committed, stored, "Transaction::commit");
+
+    Ok(())
 }
 
 async fn store_snapshots<R: Repository>(repo: &R) -> CaseResult {

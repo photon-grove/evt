@@ -2690,6 +2690,14 @@ commit replaces the `evt.journal` key of every event it writes (removing it from
 has no scope), so a caller cannot forge an allocation. A reader that finds the key malformed,
 unsorted, or with a position 0 refuses the event (`InvalidJournal`) rather than guess.
 
+The writer learns its allocations from the commit itself: a commit returns its events as stored
+(the commit receipt, `Repository::commit_with_receipt` in Rust), `evt.journal` included, and the
+store returns those events from every entry point that hands events back. The allocations are
+those of the attempt that committed, after any contention retry, and equal what a `page` read of
+each scope returns at those positions. A replayed outcome returns no events, so a caller that
+needs a replayed command's positions reads the events its outcome lists. This is API behavior,
+not a stored shape: nothing extra is written.
+
 ### Rows and counters
 
 Both are ordinary [view rows](#views) in the repository's views table (string `pk` and `sk`, the
