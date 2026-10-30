@@ -2,14 +2,29 @@
 
 ## Status
 
-Proposed (2026-10-28). Supersedes the "Postgres view store: do not build" verdict of
+Accepted (2026-10-29). Supersedes the "Postgres view store: do not build" verdict of
 [ADR 0006](0006-parity-policy-and-feature-cuts.md#feature-verdicts). Tracking: the matrix rows
 "PostgreSQL views table" (P12), "Journal and journal compaction on PostgreSQL" (X4) and
 "PostgreSQL journal wake-ups" (X5) in
 [`docs/reference/feature-matrix.md`](../reference/feature-matrix.md). The normative text
 is the [PostgreSQL views table](../reference/storage-format.md#postgresql-views-table) and
 [Journal on PostgreSQL](../reference/storage-format.md#journal-on-postgresql) sections of the
-storage spec. Nothing is implemented yet: the Rust work lands in `photon-evt` 0.3.
+storage spec. The views table and `PgViewRepository` are implemented; the commit target, the
+journal, compaction and wake-ups follow, all in `photon-evt` 0.3.
+
+### Amendment (2026-10-29): the encoding check and the repository's key refusal
+
+Implementing the view repository changed two details of the decision below:
+
+- **Encoding.** `ensure_schema` creates the views table on any database encoding, so a store
+  that never uses its views is unaffected by them. The view repository and `with_views_table()`
+  check that the encoding is `UTF8` once, on first use, and refuse any other with
+  `InvalidConfig`.
+- **Refusals outside the commit path.** The view repository refuses an oversized key with
+  `InvalidArgument` (`ViewKeyTooLong` names a projector and an operation, which a repository write
+  does not have), and it refuses U+0000 in any key, owner, entity type or payload with
+  `InvalidArgument`, because PostgreSQL `text` cannot hold it. Both are listed under the storage
+  spec's known differences.
 
 ## Context
 
@@ -45,7 +60,7 @@ hand-roll it in the app.
 ### P12: an evt-owned PostgreSQL views table
 
 `ensure_schema` creates one more derived relation, `{events}__evt_views`, with the five view
-attributes and `ttl` as columns, on a `UTF8` database (it refuses any other encoding):
+attributes and `ttl` as columns (the database must be `UTF8`; see the amendment above):
 
 - `pk` and `sk` are `text COLLATE "C"`. The primary key `(pk, sk)` then orders by bytes, which is
   DynamoDB's sort-key order, so the journal's 20-digit positions page in numeric order on both
@@ -57,8 +72,9 @@ attributes and `ttl` as columns, on a `UTF8` database (it refuses any other enco
 - The derived names fit the 34-byte limit on the events table name: the longest,
   `{events}__evt_views_type_idx`, adds 20 bytes, under the existing 29.
 - One deliberate difference: a btree entry holds at most 2,704 bytes, so a row whose entity
-  type and keys together exceed 2,600 bytes is refused (`ViewKeyTooLong`), where DynamoDB would
-  accept a 2,048-byte `pk` with a 1,024-byte `sk`.
+  type and keys together exceed 2,600 bytes is refused (`ViewKeyTooLong` on the commit path,
+  `InvalidArgument` from the view repository), where DynamoDB would accept a 2,048-byte `pk` with a
+  1,024-byte `sk`.
 
 `PgViewRepository` implements `ViewRepository` over it, with the DynamoDB repository's semantics:
 unconditional puts and deletes outside the commit path, `get_view_at`, lists by partition and by

@@ -3079,8 +3079,8 @@ journal stores, so `JournalRepository<PostgresRepository>` does not compile. [Jo
 ## PostgreSQL
 
 The schema is created by Go's `postgres.Repository.EnsureSchema` or Rust's
-`PostgresRepository::ensure_schema`, which run the same idempotent DDL (until the Rust-only
-[PostgreSQL views table](#postgresql-views-table) lands). Table names default to
+`PostgresRepository::ensure_schema`, which run the same idempotent DDL. Rust's also creates the
+Rust-only [views table](#postgresql-views-table), which Go's does not. Table names default to
 `evt_events` and `evt_snapshots` and can be changed in both implementations. The v0.9 auxiliary
 relations derive from the configured events table name through a reserved infix
 (`{events}__evt_command_outcomes`, `{events}__evt_features`, `{events}__evt_rebuild_lock`,
@@ -3404,8 +3404,11 @@ name.)
 
 ### PostgreSQL views table
 
-Planned for `photon-evt` 0.3 ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)). Not
-implemented yet. This section is the contract the implementation is written against.
+[ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3. The table, its
+DDL and the view repository (`PgViewRepository`) are implemented. The commit target
+(`with_views_table()`), the expected-payload condition and the `postgres-views` marker feature are
+planned: until they land, the parts of this section that describe them are the contract the
+implementation is written against.
 
 `ensure_schema` creates one more derived relation, the views table, and two indexes:
 
@@ -3430,9 +3433,11 @@ CREATE INDEX IF NOT EXISTS evt_events__evt_views_ttl_idx
   (`{events}__evt_views_pkey`, +16), and the indexes (`{events}__evt_views_type_idx`, +20, and
   `{events}__evt_views_ttl_idx`, +19) stay under the 29 bytes the 34-byte limit leaves, and all four
   join the set of relations checked for a case-folded collision.
-- The database encoding must be `UTF8`. `ensure_schema` and `with_views_table()` refuse any other
-  (`SHOW server_encoding`), because the byte order and the exact-bytes rule below hold only for
-  UTF-8 text.
+- The database encoding must be `UTF8`: the byte order and the exact-bytes rule below hold only for
+  UTF-8 text. `ensure_schema` creates the table on any encoding, so a store that never uses its
+  views is unaffected; the view repository and `with_views_table()` check
+  `current_setting('server_encoding')` once, on first use, and refuse any other encoding
+  (`InvalidConfig`).
 - Each column is the [view item](#views) attribute of the same name: `entity_id` is `entityID`
   (the owner), `entity_type` is `entityType`, and `ttl` is the item's `ttl` in epoch seconds, `0`
   when the item has none. An empty `sk` is stored as `VIEW`, as on DynamoDB.
@@ -3443,7 +3448,8 @@ CREATE INDEX IF NOT EXISTS evt_events__evt_views_ttl_idx
   bytes, so normalization would break both.
 - Key size. A btree index entry holds at most 2,704 bytes, less than DynamoDB's 2,048-byte `pk`
   plus 1,024-byte `sk`. A row whose `entity_type`, `pk` and `sk` together exceed 2,600 UTF-8 bytes
-  is refused with `ViewKeyTooLong` before any write (see [Known differences](#known-differences)).
+  is refused before any write: `InvalidArgument` from the view repository, `ViewKeyTooLong` on the
+  commit path (see [Known differences](#known-differences)).
 
 View repository (`PgViewRepository`, `photon_evt::ViewRepository`), outside the commit path:
 
@@ -3455,15 +3461,18 @@ View repository (`PgViewRepository`, `photon_evt::ViewRepository`), outside the 
 | list by partition | `SELECT … WHERE pk = $1 AND sk > $2 ORDER BY sk LIMIT $3` (no `sk` bound on the first page) |
 | list by entity type | `SELECT … WHERE entity_type = $1 AND (pk, sk) > ($2, $3) ORDER BY pk, sk LIMIT $4` (no key bound on the first page) |
 
-- A batch of writes is one transaction, applied in order, so a repeated `(pk, sk)` keeps its last
-  row, as in Rust on DynamoDB. A batch is atomic here (DynamoDB's `BatchWriteItem` is not), which
-  the contract allows.
+- A batch of writes is one transaction. A repeated `(pk, sk)` keeps its last row, as in Rust on
+  DynamoDB, and the rows are written in `(pk, sk)` byte order, so two batches over the same keys
+  lock them in the same order and cannot deadlock. A batch is atomic here (DynamoDB's
+  `BatchWriteItem` is not), which the contract allows. A serialization failure or deadlock
+  (`40001`, `40P01`) of any view statement is `Error::Transient`.
 - Every read sees every committed transaction, including lists by entity type (DynamoDB's index
   is eventually consistent). A page without a limit holds at most 1,000 rows.
 - The cursor is the last row's keys as a JSON object, keys sorted and escaped like every other Go
   JSON, in padded base64url: `pk` and `sk` for a partition list, plus `entityType` for an
   entity-type list, the same shape DynamoDB's `LastEvaluatedKey` produces. A full page returns a
-  cursor even when no row follows, as on DynamoDB. A cursor with the wrong keys is
+  cursor even when no row follows, as on DynamoDB, and an empty cursor is the first page. A cursor
+  with the wrong keys, or one that continues another partition or entity type, is
   `InvalidArgument`.
 - TTL. Readers return a row whose `ttl` has passed, as DynamoDB does until its sweep deletes it.
   `PgViewRepository::purge_expired(now)` deletes them through the partial index, a batch at a time:
@@ -3739,10 +3748,13 @@ See [ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
 
 These differences are deliberate and covered by tests. Keep them documented here.
 
-- View key size on PostgreSQL (planned, [PostgreSQL views table](#postgresql-views-table)). A
-  btree index entry holds at most 2,704 bytes, so the views table refuses a row whose `entity_type`,
-  `pk` and `sk` together exceed 2,600 UTF-8 bytes with `ViewKeyTooLong`, which DynamoDB would
-  accept up to its 2,048-byte `pk` and 1,024-byte `sk`. Real keys are far shorter.
+- U+0000 in PostgreSQL view rows ([PostgreSQL views table](#postgresql-views-table)). PostgreSQL
+  `text` cannot hold it, so the view repository refuses it in a key, owner, entity type or payload
+  with `InvalidArgument`, where DynamoDB and the in-memory repository store it.
+- View key size on PostgreSQL ([PostgreSQL views table](#postgresql-views-table)). A btree index
+  entry holds at most 2,704 bytes, so the views table refuses a row whose `entity_type`, `pk` and
+  `sk` together exceed 2,600 UTF-8 bytes (`InvalidArgument` from the view repository), which
+  DynamoDB would accept up to its 2,048-byte `pk` and 1,024-byte `sk`. Real keys are far shorter.
 - `null` payloads. Go keeps a JSON `null` payload as a nil `[]byte` and re-encodes it as
   `null`. Rust decodes it to empty bytes and writes `""`. Only hand-built JSON can contain a `null`
   payload. Neither store writes one.

@@ -59,6 +59,44 @@ pub fn stream_heads_table(events_table: &str) -> String {
     format!("{events_table}{RESERVED_INFIX}stream_heads")
 }
 
+/// The views table for an events table (`evt_events` yields `evt_events__evt_views`): the
+/// evt-owned view rows of a PostgreSQL store (ADR 0008). Rust-only: Go keeps application-owned view
+/// tables, so [`schema_ddl`] (which both languages run) does not create it; [`views_ddl`] does.
+pub fn views_table(events_table: &str) -> String {
+    format!("{events_table}{RESERVED_INFIX}views")
+}
+
+/// The most UTF-8 bytes a view row's `entity_type`, `pk` and `sk` may hold together in the views
+/// table. A btree index entry holds at most 2,704 bytes, less than DynamoDB's 2,048-byte `pk` plus
+/// 1,024-byte `sk`, so PostgreSQL refuses a longer key before writing (a known difference).
+pub const MAX_VIEW_INDEX_KEY_BYTES: usize = 2_600;
+
+/// The most rows a view page without a limit holds.
+pub const MAX_VIEW_PAGE_ROWS: usize = 1_000;
+
+/// The idempotent DDL of the views table and its indexes: bytewise (`COLLATE "C"`) keys, so the
+/// primary key orders like DynamoDB's sort keys, an exact `text` payload, the entity-type index the
+/// entity-type lists use, and a partial `ttl` index for `purge_expired`.
+pub fn views_ddl(events_table: &str) -> String {
+    let views = views_table(events_table);
+
+    format!(
+        r#"
+CREATE TABLE IF NOT EXISTS {views} (
+    pk          text COLLATE "C" NOT NULL,
+    sk          text COLLATE "C" NOT NULL,
+    entity_id   text   NOT NULL,
+    entity_type text   NOT NULL,
+    payload     text   NOT NULL,
+    ttl         bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (pk, sk)
+);
+CREATE INDEX IF NOT EXISTS {views}_type_idx ON {views} (entity_type, pk, sk);
+CREATE INDEX IF NOT EXISTS {views}_ttl_idx ON {views} (ttl) WHERE ttl > 0;
+"#
+    )
+}
+
 /// Returns the idempotent DDL for the event and snapshot tables. It is the same DDL Go's
 /// `postgres.Repository.EnsureSchema` runs, so either implementation can create the schema.
 pub fn schema_ddl(events_table: &str, snapshots_table: &str) -> String {
@@ -303,8 +341,9 @@ pub fn is_valid_identifier(name: &str, max_len: usize) -> bool {
 
 /// Checks a pair of table names: each must be a valid identifier within its length cap and must
 /// not contain the reserved infix, and no two relations the schema creates (the tables, the
-/// entity-type index, the command-outcomes, feature-marker, rebuild-lock, rebuild-generation, and
-/// stream-heads tables, and each table's `{table}_pkey` index) may share a name. Unquoted
+/// entity-type index, the command-outcomes, feature-marker, rebuild-lock, rebuild-generation,
+/// stream-heads and views tables, the views table's indexes, and each table's `{table}_pkey`
+/// index) may share a name. Unquoted
 /// identifiers fold to lower case, so names are compared that way. `CREATE TABLE IF NOT EXISTS`
 /// would otherwise skip a table whose name an index already took.
 pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<(), String> {
@@ -330,6 +369,7 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
     let heads = stream_heads_table(&events);
     let rebuild_lock = rebuild_lock_table(&events);
     let rebuild_generation = rebuild_generation_table(&events);
+    let views = views_table(&events);
     let relations = [
         events.clone(),
         format!("{events}_pkey"),
@@ -344,6 +384,10 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
         format!("{rebuild_generation}_pkey"),
         heads.clone(),
         format!("{heads}_pkey"),
+        views.clone(),
+        format!("{views}_pkey"),
+        format!("{views}_type_idx"),
+        format!("{views}_ttl_idx"),
         snapshots.clone(),
         format!("{snapshots}_pkey"),
     ];
@@ -644,6 +688,29 @@ mod tests {
         // A snapshots table named like a derived rebuild relation is refused outright, by the
         // reserved infix.
         assert!(check_table_names("orders", "orders__evt_rebuild_lock_pkey").is_err());
+    }
+
+    #[test]
+    fn the_views_relations_derive_from_the_events_table_and_stay_out_of_the_shared_ddl() {
+        assert_eq!(views_table("evt_events"), "evt_events__evt_views");
+
+        // Every views relation fits the identifier limit at the longest events table name.
+        let events = "e".repeat(MAX_EVENTS_TABLE_NAME_LEN);
+        for suffix in ["", "_pkey", "_type_idx", "_ttl_idx"] {
+            assert!(
+                views_table(&events).len() + suffix.len() <= 63,
+                "{suffix:?}"
+            );
+        }
+
+        // Rust alone creates the views table: the DDL both languages run does not mention it.
+        assert!(!schema_ddl("orders", "orders_snapshots").contains("__evt_views"));
+        let ddl = views_ddl("orders");
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS orders__evt_views ("));
+        assert!(ddl.contains(r#"pk          text COLLATE "C" NOT NULL"#));
+        assert!(ddl.contains("payload     text   NOT NULL"));
+        assert!(ddl.contains("ON orders__evt_views (entity_type, pk, sk)"));
+        assert!(ddl.contains("ON orders__evt_views (ttl) WHERE ttl > 0"));
     }
 
     #[test]

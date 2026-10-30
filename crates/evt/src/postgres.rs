@@ -1,8 +1,8 @@
 //! A PostgreSQL event log, row-for-row compatible with Go's `postgres.Repository`.
 //!
 //! It uses a [`deadpool_postgres::Pool`]. Call [`PostgresRepository::ensure_schema`] at startup.
-//! It runs the same idempotent DDL as Go's `EnsureSchema`. See [`crate::wire::postgres`] for the
-//! table layout.
+//! It runs the same idempotent DDL as Go's `EnsureSchema`, plus the Rust-only views table
+//! ([`PgViewRepository`], ADR 0008). See [`crate::wire::postgres`] for the table layout.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -108,6 +108,9 @@ pub struct PostgresRepository {
     /// Records that the rebuild-lock relation exists, so a commit's lock assertion probes the
     /// catalog only until it first finds it. Shared by clones, like the database it describes.
     rebuild_ready: Arc<AtomicBool>,
+    /// Records that the database's encoding was found to be UTF-8, so the views table's check runs
+    /// once per handle and its clones rather than once per view repository.
+    views_encoding_checked: Arc<AtomicBool>,
 }
 
 impl Clone for PostgresRepository {
@@ -120,6 +123,7 @@ impl Clone for PostgresRepository {
             validated_marker: Mutex::new(*self.validated_marker()),
             clock: self.clock.clone(),
             rebuild_ready: self.rebuild_ready.clone(),
+            views_encoding_checked: self.views_encoding_checked.clone(),
         }
     }
 }
@@ -148,6 +152,7 @@ impl PostgresRepository {
             validated_marker: Mutex::new(None),
             clock: Clock::default(),
             rebuild_ready: Arc::new(AtomicBool::new(false)),
+            views_encoding_checked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -268,7 +273,8 @@ impl PostgresRepository {
         &self.pool
     }
 
-    /// Creates the event and snapshot tables if they do not exist.
+    /// Creates the event and snapshot tables if they do not exist, and the views table
+    /// ([`PgViewRepository`], ADR 0008), which Go's `EnsureSchema` does not create.
     pub async fn ensure_schema(&self) -> Result<(), Error> {
         let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = read_committed(&mut client).await?;
@@ -282,7 +288,20 @@ impl PostgresRepository {
         tx.batch_execute(&schema_ddl(&self.events_table, &self.snapshots_table))
             .await
             .map_err(Error::backend)?;
+        tx.batch_execute(&crate::wire::postgres::views_ddl(&self.events_table))
+            .await
+            .map_err(Error::backend)?;
         tx.commit().await.map_err(Error::backend)
+    }
+
+    /// The view repository over this event log's views table (`{events}__evt_views`), which
+    /// [`ensure_schema`](Self::ensure_schema) creates.
+    pub fn view_repository(&self) -> PgViewRepository {
+        PgViewRepository::new(
+            self.pool.clone(),
+            &self.events_table,
+            self.views_encoding_checked.clone(),
+        )
     }
 
     fn validated_marker(&self) -> std::sync::MutexGuard<'_, CachedMarker> {
@@ -1644,6 +1663,9 @@ async fn read_committed(
 
 mod enumerate;
 mod rebuild;
+mod views;
+
+pub use views::PgViewRepository;
 
 #[cfg(test)]
 mod tests {

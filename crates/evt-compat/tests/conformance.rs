@@ -1883,7 +1883,7 @@ async fn postgres_schema_setup_is_concurrent_safe() {
         .await
         .unwrap()
         .batch_execute(&format!(
-            "DROP TABLE IF EXISTS {events}, {snapshots}, {events}__evt_features, {events}__evt_stream_heads"
+            "DROP TABLE IF EXISTS {events}, {snapshots}, {events}__evt_features, {events}__evt_stream_heads, {events}__evt_views"
         ))
         .await
         .unwrap();
@@ -1945,7 +1945,7 @@ async fn postgres_conforms() {
         .await
         .unwrap()
         .batch_execute(&format!(
-            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, {events}__evt_views"
         ))
         .await
         .expect("drop the isolated event log");
@@ -2364,7 +2364,7 @@ async fn postgres_fresh_and_unmigrated_databases() {
                 .await
                 .unwrap()
                 .batch_execute(&format!(
-                    "DROP TABLE {events}, {events}s, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads"
+                    "DROP TABLE {events}, {events}s, {events}__evt_features, {events}__evt_command_outcomes, {events}__evt_stream_heads, {events}__evt_views"
                 ))
                 .await
                 .unwrap();
@@ -3493,7 +3493,7 @@ async fn postgres_rebuild_relations(pool: Pool) {
         .batch_execute(&format!(
             "DROP TABLE {events}, {snapshots}, {events}__evt_features, \
              {events}__evt_command_outcomes, {events}__evt_stream_heads, \
-             {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
+             {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, {events}__evt_views"
         ))
         .await
         .expect("drop the isolated event log");
@@ -3616,7 +3616,192 @@ async fn postgres_commit_sees_a_rebuild_that_began_while_it_waited() {
         .unwrap()
         .batch_execute(&format!(
             "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, \
-             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
+             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, {events}__evt_views"
+        ))
+        .await
+        .unwrap();
+}
+
+/// The evt-owned views table (ADR 0008) through [`photon_evt::postgres::PgViewRepository`]: the
+/// shared view-repository cases, then what is PostgreSQL's own: exact payload bytes, byte order of
+/// non-ASCII keys, the combined key bound, and `purge_expired`.
+#[tokio::test]
+async fn postgres_view_repository_conforms() {
+    let events = format!(
+        "vr{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let snapshots = format!("{events}_s");
+    let repository = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    repository.ensure_schema().await.unwrap();
+    let views = repository.view_repository();
+    assert_eq!(views.table(), format!("{events}__evt_views"));
+
+    view_repository_cases(&views).await;
+
+    // The payload is text, not jsonb: whitespace and key order survive.
+    let exact = br#"{ "b": 1,   "a": [ 2 ] }"#.to_vec();
+    let mut row = ViewRow::new("exact", "VIEW", "owner", "kind", exact.clone());
+    views.put_view(&row).await.unwrap();
+    assert_eq!(
+        views.get_view("exact").await.unwrap().unwrap().payload,
+        exact,
+        "the payload bytes"
+    );
+
+    // Sort keys order by UTF-8 bytes, as on DynamoDB: "Z" (0x5A) < "b" (0x62) < "é" (0xC3 0xA9).
+    for sk in ["é", "b", "Z"] {
+        row = ViewRow::new("ordered", sk, "owner", "kind", b"{}".to_vec());
+        views.put_view(&row).await.unwrap();
+    }
+    let order: Vec<String> = views
+        .list_views_by_pk("ordered")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.sk)
+        .collect();
+    assert_eq!(order, ["Z", "b", "é"], "bytewise order");
+
+    // A key the btree index cannot hold is refused before anything is written.
+    let long = ViewRow::new(
+        "p".repeat(2_048),
+        "s".repeat(1_000),
+        "owner",
+        "kind",
+        b"{}".to_vec(),
+    );
+    assert!(matches!(
+        views.put_view(&long).await,
+        Err(Error::InvalidArgument(message)) if message.contains("2600")
+    ));
+
+    // At the bound, an incompressible key fits both btree indexes.
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut noise = |len: usize| -> String {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                char::from(b'!' + u8::try_from((seed >> 33) % 94).unwrap())
+            })
+            .collect()
+    };
+    let boundary = ViewRow::new(noise(1_598), noise(998), "owner", noise(4), b"{}".to_vec());
+    assert_eq!(
+        boundary.pk.len() + boundary.sk.len() + boundary.entity_type.len(),
+        2_600
+    );
+    views.put_view(&boundary).await.unwrap();
+    assert!(
+        views
+            .get_view_at(&boundary.pk, &boundary.sk)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // PostgreSQL text cannot hold U+0000: a typed refusal, not the database's error.
+    for row in [
+        ViewRow::new("nul\0pk", "VIEW", "owner", "kind", b"{}".to_vec()),
+        ViewRow::new("nul", "s\0k", "owner", "kind", b"{}".to_vec()),
+        ViewRow::new("nul", "VIEW", "own\0er", "kind", b"{}".to_vec()),
+        ViewRow::new("nul", "VIEW", "owner", "ki\0nd", b"{}".to_vec()),
+        ViewRow::new("nul", "VIEW", "owner", "kind", b"{\"a\":\"\0\"}".to_vec()),
+    ] {
+        assert!(
+            matches!(views.put_view(&row).await, Err(Error::InvalidArgument(_))),
+            "{row:?}"
+        );
+    }
+    assert!(matches!(
+        views.get_view_at("nul\0pk", "VIEW").await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        views.list_views_by_pk_paged("nul\0pk", None, None).await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // A batch keeps a repeated key's last row, whatever order the keys come in.
+    views
+        .put_views(&[
+            ViewRow::new("batch", "b", "owner", "kind", b"{\"n\":1}".to_vec()),
+            ViewRow::new("batch", "a", "owner", "kind", b"{\"n\":2}".to_vec()),
+            ViewRow::new("batch", "b", "owner", "kind", b"{\"n\":3}".to_vec()),
+        ])
+        .await
+        .unwrap();
+    let batch: Vec<(String, Vec<u8>)> = views
+        .list_views_by_pk("batch")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.sk, row.payload))
+        .collect();
+    assert_eq!(
+        batch,
+        [
+            ("a".to_owned(), b"{\"n\":2}".to_vec()),
+            ("b".to_owned(), b"{\"n\":3}".to_vec())
+        ]
+    );
+
+    // A page without a limit holds at most 1,000 rows and says more follow; the full listing
+    // follows the cursor past it.
+    let many: Vec<ViewRow> = (0..1_001)
+        .map(|i| ViewRow::new("many", format!("{i:04}"), "owner", "many", b"{}".to_vec()))
+        .collect();
+    views.put_views(&many).await.unwrap();
+    let first = views
+        .list_views_by_pk_paged("many", None, None)
+        .await
+        .unwrap();
+    assert_eq!(first.views.len(), 1_000);
+    assert!(
+        first.next_cursor.is_some(),
+        "a full unbounded page has a cursor"
+    );
+    assert_eq!(views.list_views_by_pk("many").await.unwrap().len(), 1_001);
+    assert_eq!(
+        views.list_views_by_entity_type("many").await.unwrap().len(),
+        1_001
+    );
+
+    // Expired rows stay readable until a purge, which deletes only them.
+    let mut expired = ViewRow::new("ttl", "old", "owner", "kind", b"{}".to_vec());
+    expired.ttl = 1_000;
+    let mut live = ViewRow::new("ttl", "new", "owner", "kind", b"{}".to_vec());
+    live.ttl = 4_102_444_800;
+    let forever = ViewRow::new("ttl", "none", "owner", "kind", b"{}".to_vec());
+    views
+        .put_views(&[expired.clone(), live.clone(), forever.clone()])
+        .await
+        .unwrap();
+    assert!(views.get_view_at("ttl", "old").await.unwrap().is_some());
+    assert_eq!(views.purge_expired(2_000).await.unwrap(), 1);
+    let left: Vec<String> = views
+        .list_views_by_pk("ttl")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.sk)
+        .collect();
+    assert_eq!(left, ["new", "none"]);
+
+    repository
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, \
+             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, \
+             {events}__evt_views"
         ))
         .await
         .unwrap();

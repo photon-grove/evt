@@ -488,7 +488,8 @@ The table needs a string partition key `pk` and a number sort key `sk`, the same
 `dynamo.Repository` uses.
 
 For PostgreSQL, enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
-`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`. Engine relations use the
+`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`, plus the Rust-only views table
+(`{events}__evt_views`, below). Engine relations use the
 reserved `__evt_` infix. Schema setup migrates the old `{events}_entity_type_idx` index to
 `{events}__evt_entity_type_idx`, and it creates the rebuild fence's `{events}__evt_rebuild_lock`
 and `{events}__evt_rebuild_generation` (a schema created before them treats a commit's lock check
@@ -912,7 +913,12 @@ operations write (the owner stream is the row's `entityID`) plus an optional `tt
 implements it over the rows commits write, and `DynamoViewRepository` (feature `dynamodb`) over
 the views table, which needs a string `pk` and `sk` and the `entityType-index` index on
 `entityType`. `DynamoRepository::view_repository` builds one for the table
-`with_views_table` configured.
+`with_views_table` configured. On PostgreSQL (feature `postgres`), evt owns the views table:
+`ensure_schema` creates `{events}__evt_views`, and `PostgresRepository::view_repository` returns a
+`PgViewRepository` over it. Its keys order by UTF-8 bytes like DynamoDB's, its payloads keep their
+exact bytes, every read (entity-type lists included) sees every committed transaction, and
+`purge_expired(now)` deletes rows whose `ttl` has passed, which PostgreSQL does not do by itself. It
+needs a `UTF8` database.
 
 ```rust,ignore
 use photon_evt::{ViewRepository, ViewRow};
