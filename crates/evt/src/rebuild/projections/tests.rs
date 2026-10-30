@@ -901,7 +901,7 @@ impl CommitProjector for Engine {
         "engine"
     }
 
-    fn engine_metadata(&self) -> bool {
+    fn engine_metadata(&self, _: crate::projection::EngineOnly) -> bool {
         true
     }
 

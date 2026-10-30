@@ -394,7 +394,7 @@ where
                 "a projection rebuild needs at least one commit-wide projector or a journal".into(),
             );
         }
-        if let Some(projector) = self.projectors.iter().find(|p| p.engine_metadata()) {
+        if let Some(projector) = self.projectors.iter().find(|p| p.reads_engine_metadata()) {
             return invalid(format!(
                 "projector {:?} reads engine metadata (the journal's); rebuild the journal with \
                  `with_journal`",

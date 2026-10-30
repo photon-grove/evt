@@ -2739,7 +2739,9 @@ commits, after the store has run the application's commit-wide projectors, so it
 event and not on a live one. To keep a live commit and a replay of the stored events in agreement
 (ADR-0012), the engine does not show `evt.journal` to any projector but the journal's own: a
 projector's view of an event has the key removed, live and on replay
-(`CommitProjector::engine_metadata`, default false).
+(`CommitProjector::engine_metadata`, false for every projector but the journal's). The method is
+sealed: it takes a token only `photon-evt` can construct, so an application's projector can neither
+override it nor call it, and cannot opt into seeing the key.
 
 Ownership. The journal rows are produced by a commit-wide, history-dependent projector
 ([Views](#views)) and obey every rule of it: each row names the stream that wrote its event as
