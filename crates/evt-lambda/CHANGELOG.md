@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/photon-grove/evt/compare/photon-evt-lambda-v0.1.0...photon-evt-lambda-v0.2.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **lambda:** photon-evt-lambda 0.2 requires photon-evt 0.3. Stay on photon-evt-lambda 0.1 with photon-evt 0.2.
+
+### Features
+
+* **lambda:** release photon-evt-lambda 0.2 for photon-evt 0.3 ([#242](https://github.com/photon-grove/evt/issues/242)) ([ebec986](https://github.com/photon-grove/evt/commit/ebec9862a826e25c9c4867021043a2a741cd065f))
+
 ## 0.1.0 (2026-10-26)
 
 

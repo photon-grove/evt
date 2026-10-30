@@ -1,6 +1,6 @@
 [package]
 name = "photon-evt-lambda"
-version = "0.1.0"
+version = "0.2.0"
 description = "AWS Lambda helpers for photon-evt: DynamoDB Streams event decode, event-source filter patterns, journal wake-ups, and partial batch failures."
 readme = "README.md"
 keywords = ["event-sourcing", "dynamodb", "lambda", "aws", "streams"]
