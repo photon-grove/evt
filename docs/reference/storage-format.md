@@ -3509,9 +3509,8 @@ A failed condition is a projector operation failure, ranked as on DynamoDB ([Vie
 application view writer still refuses the condition (`InvalidViewOperation`).
 
 Isolation. Commits, compaction batches and rebuild view writes on a repository with the views table
-start with `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`, whatever the server's default. Their
-fence reads follow advisory-lock waits, and only `READ COMMITTED` takes each statement's snapshot
-after the wait: a `REPEATABLE READ` snapshot, taken at the first statement, would read a rebuild
+run at `READ COMMITTED`, like every engine transaction ([PostgreSQL](#postgresql)), whatever the
+server's default: a `REPEATABLE READ` snapshot, taken at the first statement, would read a rebuild
 generation or a counter from before the lock. Under `READ COMMITTED` an `UPDATE` that waits on a row
 a concurrent commit is changing re-checks its `WHERE` against the committed row, so two commits
 that read the same counter cannot both pass: the second matches zero rows.
