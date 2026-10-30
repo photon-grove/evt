@@ -54,7 +54,7 @@ use crate::projection::{ProjectedView, check_views, view_operation_size};
 
 mod projections;
 
-pub use projections::{ProjectionRebuild, RebuildReport};
+pub use projections::{ProjectionRebuild, RebuildPlan, RebuildProgress, RebuildReport, RowChanges};
 
 /// The partition key of the rebuild-lock row (sort key [`REBUILD_SORT_KEY`]).
 pub const REBUILD_LOCK_ID: &str = "SYSTEM#REBUILD";

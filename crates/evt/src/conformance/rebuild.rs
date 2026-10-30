@@ -2070,3 +2070,185 @@ where
 
     Ok(())
 }
+
+/// Runs the diff-mode projection rebuild cases ([`ProjectionRebuild::diff`]) against a repository
+/// that keeps the rebuild fence, enumerates its log, and writes views that `views` reads, lists by
+/// type, and writes. Like [`projection_rebuild_cases`], it settles the fence before and after each
+/// case, so run it on a table no concurrent test commits to; it panics if a case fails.
+pub async fn projection_diff_cases<R, V>(repo: &R, clock: &TestClock, views: &V)
+where
+    R: Repository + RebuildFence + EventLog,
+    V: crate::views::ViewRepository,
+{
+    let env = Env {
+        repo,
+        clock,
+        ns: namespace(),
+        leases: Mutex::new(BTreeMap::new()),
+    };
+    let mut failures = Vec::new();
+    let result = match env.settle().await {
+        Ok(()) => Box::pin(diff_rebuild(&env, views)).await,
+        Err(failure) => Err(failure),
+    };
+    record_projection_case(
+        &mut failures,
+        "a diff rebuild writes nothing over intact rows, repairs owned rows, deletes stale owned \
+         rows, and leaves other types alone",
+        result,
+        env.settle().await,
+    );
+
+    if !failures.is_empty() {
+        panic!("projection diff cases failed:\n\n{}", failures.join("\n\n"));
+    }
+}
+
+/// A current-state projector for the diff case: one row per stream under `pk`, of type `row_type`.
+struct TypedRows {
+    pk: String,
+    row_type: String,
+}
+
+impl CommitProjector for TypedRows {
+    fn name(&self) -> &str {
+        "typed-rows"
+    }
+
+    fn project(&self, commit: &CommitView) -> Result<Vec<ViewOperation>, BoxError> {
+        Ok(commit
+            .streams
+            .iter()
+            .map(|stream| {
+                ViewOperation::put(
+                    self.pk.clone(),
+                    stream.entity_id.as_str(),
+                    stream.entity_id.clone(),
+                    self.row_type.clone(),
+                    stream.state.clone(),
+                )
+            })
+            .collect())
+    }
+}
+
+async fn diff_rebuild<R, V>(env: &Env<'_, R>, views: &V) -> CaseResult
+where
+    R: Repository + RebuildFence + EventLog,
+    V: crate::views::ViewRepository,
+{
+    let repo = env.repo;
+    let ns = &env.ns;
+    let pk = format!("{ns}#diff-rows");
+    let owned = format!("{ns}-owned");
+    let other = format!("{ns}-other");
+    let streams = [
+        Stream::new(ns, "d1", "diff-ledger"),
+        Stream::new(ns, "d2", "diff-ledger"),
+        Stream::new(ns, "d3", "diff-ledger"),
+    ];
+    for stream in &streams {
+        stream.commit(repo, stream.events(1..=1), None).await?;
+    }
+    let rebuild = || {
+        ProjectionRebuild::new(repo)
+            .with_projector(Arc::new(TypedRows {
+                pk: pk.clone(),
+                row_type: owned.clone(),
+            }))
+            .aggregate_as::<Ledger>(streams[0].entity_type.clone())
+            .diff(views, [owned.clone()])
+    };
+    let row = |sk: &str, entity_id: &str, row_type: &str, payload: &str| {
+        ViewRow::new(pk.clone(), sk, entity_id, row_type, payload)
+    };
+    let stored = || async {
+        let mut rows = views.list_views_by_pk(&pk).await?;
+        rows.sort_by(|a, b| a.sk.cmp(&b.sk));
+
+        Ok::<_, Error>(rows)
+    };
+
+    // The first run writes every row; a second finds them intact and writes nothing.
+    let first = rebuild()
+        .run(&env.owner("diff-1"), Duration::from_secs(60))
+        .await?;
+    ensure_eq!(
+        (first.puts, first.deletes, first.unchanged),
+        (3, 0, 0),
+        "the first run writes every row"
+    );
+    let intact = stored().await?;
+    let before = env.generation().await?;
+    let second = rebuild()
+        .run(&env.owner("diff-2"), Duration::from_secs(60))
+        .await?;
+    ensure_eq!(
+        (
+            second.puts,
+            second.deletes,
+            second.unchanged,
+            second.batches
+        ),
+        (0, 0, 3, 0),
+        "a run over intact rows writes nothing"
+    );
+    ensure_eq!(
+        env.generation().await?.value,
+        before.value + 2,
+        "it still took and released the lock"
+    );
+
+    // A changed row, a missing row, a stale owned row, and a row of a type the diff does not own.
+    let (d1, d2) = (streams[0].id.as_str(), streams[1].id.as_str());
+    views.put_view(&row(d1, d1, &owned, "{}")).await?;
+    views.delete_view(&pk, d2).await?;
+    views.put_view(&row("stale", d1, &owned, "{}")).await?;
+    views.put_view(&row("foreign", d1, &other, "{}")).await?;
+
+    let plan = rebuild().plan().await?;
+    ensure_eq!(
+        (
+            plan.report.puts,
+            plan.report.deletes,
+            plan.report.unchanged,
+            plan.batches
+        ),
+        (2, 1, 1, 1),
+        "the dry run shows the difference"
+    );
+    ensure_eq!(stored().await?.len(), 4, "the dry run writes nothing");
+
+    let report = rebuild()
+        .run(&env.owner("diff-3"), Duration::from_secs(60))
+        .await?;
+    ensure_eq!(
+        (report.puts, report.deletes, report.unchanged),
+        (2, 1, 1),
+        "the run repairs two rows and deletes the stale one"
+    );
+    let mut after = stored().await?;
+    let foreign = after
+        .iter()
+        .position(|row| row.sk == "foreign")
+        .map(|index| after.remove(index));
+    ensure_eq!(
+        foreign.map(|row| row.entity_type),
+        Some(other.clone()),
+        "a row of another type is untouched"
+    );
+    ensure_eq!(
+        after
+            .iter()
+            .map(|row| (row.sk.clone(), row.payload.clone()))
+            .collect::<Vec<_>>(),
+        intact
+            .iter()
+            .map(|row| (row.sk.clone(), row.payload.clone()))
+            .collect::<Vec<_>>(),
+        "the owned rows are as the first run wrote them"
+    );
+    views.delete_view(&pk, "foreign").await?;
+
+    Ok(())
+}

@@ -17,7 +17,7 @@ use photon_evt::conformance::{
     Add, CommitViewTarget, HeadFixtures, Ledger, LedgerEvent, RebuildSuite, Suite, TestClock,
     ViewTarget, commit_view_cases, committed_view_cases, enumeration_cases, expected_payload_cases,
     feature_marker_cases, fresh_store_cases, initialization_cases, outcome_cases,
-    projection_rebuild_cases, view_repository_cases,
+    projection_diff_cases, projection_rebuild_cases, view_repository_cases,
 };
 use photon_evt::dynamodb::{DynamoRepository, DynamoViewRepository, ViewProjector};
 use photon_evt::postgres::{PgStatement, PostgresRepository, ViewWriter};
@@ -596,6 +596,23 @@ async fn dynamo_commit_wide_views(repository: &DynamoRepository) {
         },
     ))
     .await;
+    // The diff case lists its rows by type, so it needs the index, which refuses the empty entity
+    // types other cases write: a views table of its own.
+    let indexed = format!("{views}-indexed");
+    create_dynamo_views_table_with(&client, &indexed, true).await;
+    let diffing = rebuilds.clone().with_views_table(&indexed);
+    Box::pin(projection_diff_cases(
+        &diffing,
+        &clock,
+        &diffing.view_repository().expect("a views table"),
+    ))
+    .await;
+    client
+        .delete_table()
+        .table_name(&indexed)
+        .send()
+        .await
+        .expect("delete the indexed views table");
     dynamo_rebuild_refuses_an_expired_tail(&rebuilds, &rows).await;
 
     // The stored item has exactly the five string attributes, an empty entity type included.
@@ -3950,6 +3967,7 @@ async fn postgres_views_table_conforms() {
     )
     .await;
     Box::pin(projection_rebuild_cases(&rebuilds, &clock, &rows())).await;
+    Box::pin(projection_diff_cases(&rebuilds, &clock, &rows().0)).await;
 
     base.pool()
         .get()

@@ -7690,6 +7690,8 @@ pub use compaction::compaction_cases;
 #[cfg(feature = "journal")]
 #[cfg_attr(docsrs, doc(cfg(feature = "journal")))]
 pub use journal::{journal_cases, journal_rebuild_cases};
-pub use rebuild::{NoViewRows, RebuildSuite, TestClock, projection_rebuild_cases};
+pub use rebuild::{
+    NoViewRows, RebuildSuite, TestClock, projection_diff_cases, projection_rebuild_cases,
+};
 pub use view_repository::{committed_view_cases, view_repository_cases};
 pub use views::{CommitViewTarget, commit_view_cases, expected_payload_cases};

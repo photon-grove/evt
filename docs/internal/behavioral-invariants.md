@@ -586,7 +586,10 @@ types, or one whose tail TTL expired while an earlier event and the snapshot rem
 every row before the first write, so a failure while reading or projecting writes nothing. It then
 releases the lock only if it acquired it from a settled generation: a run that took over an expired
 lease or acquired after a force-release keeps the fence on any failure, because the earlier rebuild
-may have left the rows half-written.
+may have left the rows half-written. In diff mode (`diff`) it writes only the rows that differ
+from the plan and deletes owned rows (by row type) the plan no longer produces, confirming every
+skip and delete with a strongly consistent read by key; a planned put of an unowned type fails the
+run before any write.
 
 ## Commit-Wide Projectors (v0.9, C7)
 

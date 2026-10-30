@@ -1466,3 +1466,44 @@ async fn a_rejection_that_commits_events_returns_them_with_their_allocations() {
     assert_eq!(page.rows[0].event, refused.events[0]);
     assert_eq!(page.rows[1].event, rejected.events[0]);
 }
+
+#[tokio::test]
+async fn a_diff_rebuild_with_the_journal_deletes_journal_rows_no_event_holds() {
+    let memory = journaled_ledgers().await;
+    let live = derived_rows(&memory).await;
+
+    // A journal row at a position no event holds, as a bad manual write would leave.
+    let mut stale = live
+        .iter()
+        .find(|row| row.entity_type == super::ROW_ENTITY_TYPE)
+        .unwrap()
+        .clone();
+    stale.sk = super::row_sk(99);
+    memory.put_view(&stale).await.unwrap();
+
+    let rebuild = || {
+        crate::ProjectionRebuild::new(&memory)
+            .with_projector(std::sync::Arc::new(Totals))
+            .aggregate::<Ledger>()
+            .with_journal(journal())
+            .diff(&memory, ["ledger"])
+    };
+    let report = rebuild().run("rebuild-1", LEASE).await.unwrap();
+
+    assert_eq!(
+        (report.puts, report.deletes, report.unchanged),
+        (0, 1, live.len())
+    );
+    assert_eq!(report.changes[super::ROW_ENTITY_TYPE].deletes, 1);
+    assert_eq!(derived_rows(&memory).await, live);
+
+    // A diff cannot claim the journal's rows without rebuilding the journal.
+    let error = crate::ProjectionRebuild::new(&memory)
+        .with_projector(std::sync::Arc::new(Totals))
+        .aggregate::<Ledger>()
+        .diff(&memory, ["ledger", super::ROW_ENTITY_TYPE])
+        .run("rebuild-2", LEASE)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidConfig(_)), "{error:?}");
+}

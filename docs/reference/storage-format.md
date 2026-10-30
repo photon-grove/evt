@@ -714,8 +714,19 @@ computes every operation before the first write and refuses, before writing, a r
 write (`SharedViewKey`), a key planned twice (`DuplicateViewKey`), and an operation too large for
 any batch (`CommitTooLarge`); batches hold at most 99 operations within the commit byte budget.
 Each operation is written without its condition or mapped error (a replay applies what the live
-commits wrote), so a rebuild runs over existing rows and is idempotent. It does not wipe: rows no
-projector produces any more stay until the caller deletes them. It needs strongly consistent reads
+commits wrote), so a rebuild runs over existing rows and is idempotent. By default it does not
+wipe: rows no projector produces any more stay until the caller deletes them. In diff mode
+(`diff`) the run owns the rows of the row types it is given (the stored `entityType`, plus the
+journal's row and counter types when it rebuilds the journal). After planning it lists them, and
+writes a put only for a planned row that is missing or differs in owner, type, payload or TTL, a
+planned delete only for a row of an owned type that exists (one of another type fails the run),
+and a delete for every owned row the plan does not produce whose owner is a stream the run read or
+no stream in the log (one owned by a stream of a type the run did not read, or with no owner, is
+kept and counted). The final operations are checked as a guarded write checks them,
+before the first write. A row is skipped as unchanged, or deleted as stale, only after a strongly consistent read
+of its key: the type listing may lag (DynamoDB's `entityType-index` is eventually consistent).
+Every planned put must be of an owned type (`InvalidConfig` before any write), and nothing else
+may write an owned type, since the run deletes what it does not plan. It needs strongly consistent reads
 of the log, or a commit that landed just before the lock was taken can be missed. Given the
 journal's configuration (`with_journal`), the same run also rebuilds the [journal](#journal): it
 reads every event of the journal's entity types under the lock (each type read once, shared with
