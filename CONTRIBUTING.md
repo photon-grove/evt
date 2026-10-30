@@ -53,7 +53,8 @@ moon run evt:integration-postgres
 ```
 
 With both stacks up, `moon run evt-rust:integration evt-rust:integration-postgres` runs the Rust
-conformance suite and the Go/Rust cross-language suite against each backend. The cross-language
+conformance suite and the Go/Rust cross-language suite against each backend, and on PostgreSQL
+also the live parity checks in `crates/evt-compat/tests/postgres_atomicity.rs`. The cross-language
 half is `scripts/compat-integration.sh dynamo` and `scripts/compat-integration.sh postgres`, where
 Go and Rust take turns writing the same streams.
 

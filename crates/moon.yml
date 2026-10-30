@@ -62,6 +62,7 @@ tasks:
   integration-postgres:
     script: >-
       cargo test -p evt-compat --features drivers --test conformance postgres &&
+      cargo test -p evt-compat --features drivers --test postgres_atomicity &&
       bash scripts/compat-integration.sh postgres
     deps:
       - evt:check-postgres-readiness
