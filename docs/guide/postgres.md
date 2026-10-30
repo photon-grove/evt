@@ -186,8 +186,13 @@ views.purge_expired(now_unix_seconds).await?; // PostgreSQL does not expire rows
 
 Its keys order by UTF-8 bytes, as on DynamoDB, and its payloads keep their exact bytes. It needs a
 `UTF8` database, and it refuses a row whose entity type, `pk` and `sk` together exceed 2,600 bytes,
-the most a btree index entry holds. Writing commit-wide views to it from the commit
-(`with_views_table()`) and the journal on PostgreSQL follow in `photon-evt` 0.3.
+the most a btree index entry holds.
+
+`with_views_table()` makes the table the commit's view target, in place of a view writer: evt
+builds every statement with the DynamoDB repository's owner rules, so you write no SQL. The
+repository declares the `postgres-views` marker feature before its first commit, after which a Go
+writer, or a Rust repository with a view writer, refuses the store instead of putting views
+somewhere else. The journal on PostgreSQL follows in `photon-evt` 0.3.
 
 ## Local development
 

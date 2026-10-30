@@ -92,6 +92,11 @@ impl PgViewRepository {
         }
     }
 
+    /// Checks, once per repository handle, that the database is `UTF8`.
+    pub(super) async fn check_encoding(&self) -> Result<(), Error> {
+        self.client().await.map(drop)
+    }
+
     /// A pooled connection, after the one-time encoding check.
     async fn client(&self) -> Result<deadpool_postgres::Client, Error> {
         let client = self.pool.get().await.map_err(pool_error)?;

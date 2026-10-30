@@ -918,7 +918,10 @@ the views table, which needs a string `pk` and `sk` and the `entityType-index` i
 `PgViewRepository` over it. Its keys order by UTF-8 bytes like DynamoDB's, its payloads keep their
 exact bytes, every read (entity-type lists included) sees every committed transaction, and
 `purge_expired(now)` deletes rows whose `ttl` has passed, which PostgreSQL does not do by itself. It
-needs a `UTF8` database.
+needs a `UTF8` database. `PostgresRepository::with_views_table()` makes it the commit's view
+target in place of `with_view_writer`: evt builds the statements with DynamoDB's owner rules,
+applies the expected-payload condition, and declares the `postgres-views` marker feature so no
+other writer puts the store's views elsewhere.
 
 ```rust,ignore
 use photon_evt::{ViewRepository, ViewRow};

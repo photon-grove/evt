@@ -88,7 +88,8 @@ pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
 pub use features::{
     COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker,
     JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION, JOURNAL_FEATURE, JOURNAL_VERSION,
-    STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION, SUPPORTED_FEATURES, SYSTEM_PREFIX, ValidatedMarker,
+    POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION, STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION,
+    SUPPORTED_FEATURES, SYSTEM_PREFIX, ValidatedMarker,
 };
 pub use ids::{
     CommandId, EntityId, EntityType, EventId, EventSequence, EventType, EventVersion, PrincipalId,

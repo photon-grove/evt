@@ -1642,9 +1642,11 @@ declares it before a writer writes, by an explicit initialization or by a lazily
 `journal` and `journal-compaction` at format version 1 when built with its `journal` cargo feature.
 It declares `journal` with the first journaled commit ([Journal](#feature-marker-and-history)) and
 `journal-compaction` with the first compaction lease ([Compaction](#journal-compaction)). A
-fourth, `postgres-views` (format version 1, planned for `photon-evt` 0.3, ADR 0008), records that
-a PostgreSQL store's commit-wide views live in its evt-owned
-[views table](#postgresql-views-table). The `historyDependent` set declares the entity types whose commit-wide projectors are
+fourth, `postgres-views` (format version 1, `photon-evt` 0.3, ADR 0008), records that a
+PostgreSQL store's commit-wide views live in its evt-owned [views table](#postgresql-views-table).
+Rust models it (it is in `SUPPORTED_FEATURES`), and a Rust PostgreSQL repository without the views
+table refuses a store that declares it with `UnsupportedFeature`, on commits, snapshot writes,
+compaction and rebuild view writes. Go does not model it, so a Go writer refuses the store too. The `historyDependent` set declares the entity types whose commit-wide projectors are
 history-dependent ([Views](#views)), compaction is forbidden for them. The `retention` set
 declares the entity types configured with retention (a positive `ttl`), fences are refused for
 them ([Read fences](#read-fences)). Both sets are JSON arrays of entity-type names, sorted and deduplicated,
@@ -2712,7 +2714,7 @@ predates them) is refused with `ViewsUnsupported` before anything is planned or 
 the rows would otherwise be dropped while the events and their allocations were written. Likewise,
 a repository that does not declare that it applies the counter's compare-and-set
 (`Repository::applies_expected_payload`, default false. True for the in-memory and DynamoDB
-repositories) is refused with `ExpectedPayloadUnsupported`, so a backend that ignored the condition
+repositories, and for PostgreSQL with the [views table](#postgresql-views-table)) is refused with `ExpectedPayloadUnsupported`, so a backend that ignored the condition
 cannot write a counter unconditionally.
 
 Metadata seen by other projectors. The `evt.journal` allocation is added when the journal
@@ -3070,11 +3072,11 @@ would read deleted rows as a gap and could allocate below the floor.
 
 ### Backends
 
-DynamoDB (a views table) and the in-memory repository. The Rust PostgreSQL repository writes
-commit-wide view operations through an application's view writer, which cannot express the
-counter's compare-and-set (`applies_expected_payload()` is false), and it implements none of the
-journal stores, so `JournalRepository<PostgresRepository>` does not compile. [Journal on PostgreSQL](#journal-on-postgresql) specifies the
-`photon-evt` 0.3 support over an evt-owned views table (ADR 0008).
+DynamoDB (a views table) and the in-memory repository. The Rust PostgreSQL repository applies the
+counter's compare-and-set with its [views table](#postgresql-views-table) (`with_views_table()`;
+an application view writer cannot express it), but it implements none of the journal stores yet,
+so a `JournalRepository` over it has no `Repository` impl. [Journal on PostgreSQL](#journal-on-postgresql)
+specifies the rest of the `photon-evt` 0.3 support (ADR 0008).
 
 ## PostgreSQL
 
@@ -3404,11 +3406,11 @@ name.)
 
 ### PostgreSQL views table
 
-[ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3. The table, its
-DDL and the view repository (`PgViewRepository`) are implemented. The commit target
-(`with_views_table()`), the expected-payload condition and the `postgres-views` marker feature are
-planned: until they land, the parts of this section that describe them are the contract the
-implementation is written against.
+[ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3, Rust only.
+Implemented: the table and its DDL, the view repository (`PgViewRepository`), the commit target
+(`with_views_table()`) with the expected-payload condition, and the `postgres-views` marker
+feature. The conformance suites of commit-wide views, the expected payload, the view repository and
+the rebuild run on it.
 
 `ensure_schema` creates one more derived relation, the views table, and two indexes:
 
@@ -3531,10 +3533,14 @@ unconditional delete above. Both run under the lock-row guard of the
 [rebuild fence](#postgresql).
 
 Feature marker. A repository configured `with_views_table()` declares the feature `postgres-views`
-(format version 1) before its first commit, and requires it on every later one. A writer that
-does not support it refuses the store, as for any unknown feature ([Feature marker](#feature-marker)):
-a Go writer and a Rust repository that uses `with_view_writer` cannot write a store whose views
-live in `{events}__evt_views`, so commit-wide rows never split across two tables.
+(format version 1) before its first commit or rebuild write, outside that transaction (the
+declaration takes the exclusive marker lock), once per handle and its clones, after checking the
+database is `UTF8`. It then requires the feature: a store that stops declaring it (an operator
+removed it) fails the commit as `Error::Transient`, and the retry declares it again. A writer that
+does not support it refuses the store with `UnsupportedFeature`, as for any unknown feature
+([Feature marker](#feature-marker)): a Go writer and a Rust repository that uses `with_view_writer`
+or no view target cannot write a store whose views live in `{events}__evt_views`, so commit-wide
+rows never split across two tables.
 
 ### Journal on PostgreSQL
 
