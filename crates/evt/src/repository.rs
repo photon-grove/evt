@@ -780,8 +780,8 @@ impl CommitReceipt {
 /// - report a stream whose head disagrees with its events or snapshot as
 ///   [`Error::StreamHeadDrift`], never retried, ranked above a gap and any other conflict;
 /// - reject a snapshot whose sequence is not the stored snapshot's sequence plus one (or 1 when
-///   there is no stored snapshot) with [`Error::Conflict`] (DynamoDB), or keep the stored snapshot's event sequence monotonic
-///   (PostgreSQL, where the head conflict already covers racing writers);
+///   there is no stored snapshot) with [`Error::Conflict`] (DynamoDB's condition, PostgreSQL's
+///   read under the entity lock, and the in-memory check alike);
 /// - write events, head, snapshot, and operations atomically;
 /// - refuse an out-of-band snapshot that the stream's head does not cover with
 ///   [`Error::StreamHeadDrift`] (a snapshot of event sequence 0 needs no head);

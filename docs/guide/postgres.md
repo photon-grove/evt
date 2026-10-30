@@ -41,7 +41,10 @@ command. The commit also conditions on the stream's row in the head table, so a 
 sequence is at or below the entity's snapshot `event_sequence` fails with a conflict too, even
 though compaction deleted those keys. An `entity_type` index backs `StreamFilter` narrowing.
 
-`evt_snapshots` holds one durable snapshot per entity, keyed by `entity_id`.
+`evt_snapshots` holds one durable snapshot per entity, keyed by `entity_id`. A commit's snapshot
+must continue the stored one's sequence (1 for the first, then the stored sequence plus one), as on
+DynamoDB: the commit reads the stored sequence under the entity's lock and fails with a transient
+`evt.ConflictError` otherwise.
 
 `evt_events__evt_stream_heads` holds one row per written stream
 ([ADR 0007](../adr/0007-per-stream-head-item.md)), keyed by `entity_id`, with `entity_type` and
@@ -192,7 +195,9 @@ the most a btree index entry holds.
 builds every statement with the DynamoDB repository's owner rules, so you write no SQL. The
 repository declares the `postgres-views` marker feature before its first commit, after which a Go
 writer, or a Rust repository with a view writer, refuses the store instead of putting views
-somewhere else. The journal on PostgreSQL follows in `photon-evt` 0.3.
+somewhere else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
+wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
+DynamoDB. Wake-ups for a journal on PostgreSQL follow in `photon-evt` 0.3.
 
 ## Local development
 

@@ -1917,11 +1917,9 @@ async fn postgres_conforms() {
 
     clear_manifest(&repository).await;
 
-    // PostgreSQL does not check snapshot sequences: the event-sequence conflict already rejects
-    // racing writers, and the snapshot upsert keeps the event sequence monotonic.
+    // PostgreSQL checks the snapshot sequence chain under the entity lock, like every backend.
     let heads = PostgresHeads::new(repository.pool().clone(), events.clone());
     Suite::new(&repository)
-        .snapshot_sequence_conflicts(false)
         .with_views(views)
         .with_head_fixtures(heads)
         .run()
@@ -3964,4 +3962,211 @@ async fn postgres_views_table_conforms() {
         ))
         .await
         .unwrap();
+}
+
+/// A private event log on PostgreSQL whose commit-wide views go to its views table, dropped by
+/// [`drop_log`].
+async fn views_table_log(prefix: &str) -> (PostgresRepository, String, String) {
+    let events = format!(
+        "{prefix}{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let snapshots = format!("{events}_s");
+    let repository = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap()
+        .with_views_table();
+    repository.ensure_schema().await.unwrap();
+
+    (repository, events, snapshots)
+}
+
+async fn drop_log(repository: &PostgresRepository, events: &str, snapshots: &str) {
+    repository
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, \
+             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation, \
+             {events}__evt_views"
+        ))
+        .await
+        .unwrap();
+}
+
+/// The sync journal (ADR 0005) and its compaction on PostgreSQL's views table (ADR 0008): the
+/// shared journal, journal-rebuild and compaction cases, each over a private log.
+#[tokio::test]
+async fn postgres_journal_conforms() {
+    use photon_evt::conformance::{compaction_cases, journal_cases, journal_rebuild_cases};
+
+    let (repository, events, snapshots) = views_table_log("jr").await;
+    journal_cases(&repository, &repository.view_repository()).await;
+    journal_rebuild_cases(&repository, &repository.view_repository()).await;
+    drop_log(&repository, &events, &snapshots).await;
+
+    // Compaction on a log of its own, with a clock its lease cases move.
+    let (repository, events, snapshots) = views_table_log("jc").await;
+    let clock = TestClock::starting_now();
+    let compacting = repository.clone().with_clock(clock.reader());
+    compaction_cases(&compacting, &compacting.view_repository(), &clock).await;
+    drop_log(&repository, &events, &snapshots).await;
+
+    Box::pin(postgres_compaction_absent_key_race()).await;
+
+    // Without the views table there is no journal to read or compact.
+    {
+        use photon_evt::journal::{
+            CompactionStore, CompactionWrite, Expect, JournalCompactionStore, JournalStore, Scope,
+        };
+
+        let plain = PostgresRepository::new(drivers::postgres_pool().unwrap());
+        let scope = Scope::new("s").unwrap();
+        let unconfigured = |result: Result<(), Error>| {
+            matches!(
+                result,
+                Err(Error::ViewsNotConfigured {
+                    backend: "postgres"
+                })
+            )
+        };
+        assert!(unconfigured(plain.read_counter(&scope).await.map(drop)));
+        assert!(unconfigured(
+            plain
+                .read_counters(std::slice::from_ref(&scope))
+                .await
+                .map(drop)
+        ));
+        assert!(unconfigured(
+            plain.read_last_position(&scope).await.map(drop)
+        ));
+        assert!(unconfigured(plain.read_rows(&scope, 0, 10).await.map(drop)));
+        assert!(unconfigured(
+            plain.read_compaction_row(&scope, "LEASE").await.map(drop)
+        ));
+        assert!(unconfigured(
+            plain
+                .write_compaction(
+                    None,
+                    &[CompactionWrite::Check {
+                        pk: "p".into(),
+                        sk: "s".into(),
+                        expect: Expect::Any,
+                    }]
+                )
+                .await
+                .map(drop)
+        ));
+    }
+}
+
+/// A compaction batch that finds a key absent, then meets a row another transaction inserted there
+/// in the meantime (`FOR UPDATE` cannot lock an absent row), is refused at that write, with
+/// nothing written: its plain `INSERT` waits for the other transaction and then violates the key.
+async fn postgres_compaction_absent_key_race() {
+    use photon_evt::journal::{
+        CompactionStore, CompactionWrite, CompactionWritten, Expect, LEASE_SORT_KEY, Scope,
+        compaction_pk,
+    };
+
+    let (repository, events, snapshots) = views_table_log("jx").await;
+    let scope = Scope::new("race").unwrap();
+    let (pk, table) = (compaction_pk(&scope), format!("{events}__evt_views"));
+    let lease = |owner: &str| {
+        ViewRow::new(
+            pk.clone(),
+            LEASE_SORT_KEY,
+            "SYSTEM#JOURNAL",
+            "journal-compaction",
+            format!(r#"{{"scope":"race","token":"{owner}"}}"#).into_bytes(),
+        )
+    };
+
+    // Another transaction inserts the lease row and holds it uncommitted.
+    let pool = drivers::postgres_pool().unwrap();
+    let mut holder = pool.get().await.unwrap();
+    let held = holder.transaction().await.unwrap();
+    let theirs = lease("theirs");
+    held.execute(
+        &format!(
+            "INSERT INTO {table} (pk, sk, entity_id, entity_type, payload, ttl) \
+             VALUES ($1, $2, $3, $4, $5, 0)"
+        ),
+        &[
+            &theirs.pk,
+            &theirs.sk,
+            &theirs.entity_id,
+            &theirs.entity_type,
+            &std::str::from_utf8(&theirs.payload).unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let racing = {
+        let repository = repository.clone();
+        let ours = lease("ours");
+
+        tokio::spawn(async move {
+            repository
+                .write_compaction(
+                    None,
+                    &[CompactionWrite::Put {
+                        row: ours,
+                        expect: Expect::Absent,
+                    }],
+                )
+                .await
+        })
+    };
+
+    // The batch's insert waits on the holder's transaction.
+    let watcher = pool.get().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting: i64 = watcher
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the batch never waited on the other insert"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    held.commit().await.unwrap();
+
+    assert_eq!(
+        racing.await.unwrap().unwrap(),
+        CompactionWritten::Refused(0),
+        "the racing absent put is refused"
+    );
+    assert_eq!(
+        repository
+            .view_repository()
+            .get_view_at(&pk, LEASE_SORT_KEY)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        theirs.payload,
+        "the other transaction's row stands"
+    );
+
+    drop(watcher);
+    drop(holder);
+    drop_log(&repository, &events, &snapshots).await;
 }

@@ -24,8 +24,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_max_row_bytes(30_000)? // the default
     .with_retry(photon_evt::RetryPolicy::new(5)); // the default
 
-    // Wrap a repository that writes views: in memory here, DynamoDB with a views table in
-    // production.
+    // Wrap a repository that writes views: in memory here, DynamoDB with a views table or
+    // PostgreSQL with `with_views_table()` in production.
     let repository = JournalRepository::new(MemRepository::new(), journal.clone());
     let store = Store::<Ledger, _>::new(&repository, ());
 

@@ -3050,8 +3050,8 @@ Readers and `410 Gone`. Reading a compaction row takes the extension trait
 `JournalCompactionStore` (`read_compaction_row`). `JournalStore` is unchanged from the first journal release. `page`,
 `page_at_epoch`, `JournalRepository`, and every compaction function require the extension, so a
 store that cannot read the floor fails to compile with them rather than skip the `410` check or
-allocate below a floor (`high_watermark` needs only `JournalStore`). The in-memory and DynamoDB
-repositories implement it. `page` is unchanged until it meets a gap. It then reads the manifest
+allocate below a floor (`high_watermark` needs only `JournalStore`). The in-memory, DynamoDB and
+PostgreSQL (with its views table) repositories implement it. `page` is unchanged until it meets a gap. It then reads the manifest
 (after the rows), and if the floor is above the page's last contiguous position (`next_after`) the
 read fails with `JournalGone`: the scope, `after`, the snapshot's `checkpoint`, its chunk count, and
 its manifest digest, and nothing of the deleted rows. An HTTP layer maps it to status 410. The
@@ -3089,11 +3089,10 @@ would read deleted rows as a gap and could allocate below the floor.
 
 ### Backends
 
-DynamoDB (a views table) and the in-memory repository. The Rust PostgreSQL repository applies the
-counter's compare-and-set with its [views table](#postgresql-views-table) (`with_views_table()`;
-an application view writer cannot express it), but it implements none of the journal stores yet,
-so a `JournalRepository` over it has no `Repository` impl. [Journal on PostgreSQL](#journal-on-postgresql)
-specifies the rest of the `photon-evt` 0.3 support (ADR 0008).
+DynamoDB (a views table), the in-memory repository, and PostgreSQL with its
+[views table](#postgresql-views-table) (`with_views_table()`, [Journal on PostgreSQL](#journal-on-postgresql)).
+A PostgreSQL repository with an application view writer cannot express the counter's
+compare-and-set, so its journal reads are refused with `ViewsNotConfigured`.
 
 ## PostgreSQL
 
@@ -3258,9 +3257,22 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   `Error::Transient` and Go returns as the database error.
 - The head table makes the floor a consequence of the head condition: a snapshot's `event_sequence`
   never exceeds the head (H3), so a commit that starts at `head + 1` starts above it.
+- Each commit snapshot checks the snapshot sequence chain, as the DynamoDB snapshot put's
+  condition does ([Writes](#writes)). Under the entity's advisory lock, just before its upsert, the
+  commit reads the stored row's sequence with `SELECT sequence FROM evt_snapshots WHERE entity_id =
+  $1` (both languages run this statement). With no row, the snapshot's sequence must be 1. With a
+  row, it must be the stored sequence plus one. Otherwise the commit fails as an
+  optimistic-concurrency conflict and the transaction rolls back, so nothing is written: Go returns
+  an `evt.ConflictError` wrapped in a transient `policy.ClassifiedError` (the fence-aware retry
+  loop retries it), and Rust returns `Error::Conflict`. The check runs after the view statements,
+  so a failed view statement is reported first ([Known differences](#known-differences)). A
+  racing writer usually fails earlier, on its head statement. The check still catches a commit
+  built from a stale snapshot sequence, such as a Go context loaded before a catch-up snapshot
+  ([Snapshot policy](#snapshot-policy)), exactly as DynamoDB and the in-memory repositories do.
 - The snapshot upsert only replaces a snapshot whose `event_sequence` is lower or equal
   (`ON CONFLICT (entity_id) DO UPDATE … WHERE EXCLUDED.event_sequence >= evt_snapshots.event_sequence`).
-  PostgreSQL does not check the snapshot sequence: a racing writer already fails on the event key.
+  In a commit the sequence check above has already passed. The `WHERE` keeps an out-of-band
+  snapshot write (which checks no sequence) monotonic.
 - `metadata` is `jsonb`, which normalizes whitespace and key order. Compare it as JSON, not bytes.
   `payload` is `bytea` and keeps its exact bytes.
 - Entity heads read the head table once the store declares `stream-heads`. Until then they take
@@ -3561,10 +3573,11 @@ rows never split across two tables.
 
 ### Journal on PostgreSQL
 
-Planned for `photon-evt` 0.3 ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)), on a
-repository configured `with_views_table()`. Not implemented yet. The [journal](#journal) and its
-[compaction](#journal-compaction) are specified backend-neutrally above. This section pins the
-PostgreSQL statements.
+[ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3, on a repository
+configured `with_views_table()`. Implemented: the journal's commits, its reads and its compaction,
+with the shared journal, journal-rebuild and compaction conformance suites on PostgreSQL. Planned:
+the wake-ups below. The [journal](#journal) and its [compaction](#journal-compaction) are specified
+backend-neutrally above. This section pins the PostgreSQL statements.
 
 Rows. Journal rows, counters and compaction rows are rows of `{events}__evt_views`, column for
 attribute, with the same keys, owners, entity types and payload bytes as the DynamoDB items, so
@@ -3598,12 +3611,15 @@ Compaction writes (`CompactionStore::write_compaction`, 1 to 99 writes to distin
 1. With an `epoch`: take the shared rebuild advisory lock
    (`pg_advisory_xact_lock_shared(1702261761, hashtext('{events}:rebuild'))`) and read the
    generation. Unless it is the epoch's, roll back: `EpochChanged`.
-2. Lock the rows the batch names, in ascending `(pk, sk)` byte order:
+2. Lock the rows the batch names, in one order every batch uses: the scope's `LEASE` row first,
+   then the rest in ascending `(pk, sk)` byte order:
    `SELECT entity_id, payload FROM evt_events__evt_views WHERE pk = $1 AND sk = $2 FOR UPDATE`.
+   Payloads that are not UTF-8, written or expected, are refused (`InvalidArgument`) before any of
+   this, as on DynamoDB.
 3. Check every write's condition against what step 2 read: `Any` passes, `Absent` needs no row, and
    `Payload(bytes)` needs a row owned by `SYSTEM#JOURNAL` whose payload is exactly those bytes.
-   Then apply the writes in request order, each guarded again in its own statement:
-   - a put with `Absent` is a plain `INSERT` (a `23505` fails it);
+   Then apply the writes in step 2's order, each guarded again in its own statement:
+   - a put with `Absent` is a plain `INSERT` (a violation of `{events}__evt_views_pkey` fails it);
    - any other put is an upsert of the whole row;
    - a delete is `DELETE … WHERE pk = $1 AND sk = $2 AND entity_id = $owner`, which a row absent
      at step 2 passes.
@@ -3615,8 +3631,8 @@ Compaction writes (`CompactionStore::write_compaction`, 1 to 99 writes to distin
 `FOR UPDATE` cannot lock an absent row, so two batches that find the same key absent could both
 pass step 2. The protocol keeps that from mattering: every batch of a scope either puts the
 scope's `LEASE` row with `Absent` (the first acquire, a plain insert, which two racing acquirers
-cannot both make) or checks it by payload (a row that step 2 locks), so batches of one scope
-serialize on their lease row. A `Check` with `Absent` on any other key has no `23505` backstop and
+cannot both make) or checks it by payload (a row that step 2 locks first), so batches of one scope
+serialize on their lease row before they read any other key. A `Check` with `Absent` on any other key has no `23505` backstop and
 relies on that serialization alone. Compaction takes no lock a commit waits on (it never writes
 counters, and it takes the shared rebuild lock before anything else), so the two cannot deadlock.
 A commit that re-inserts a deleted position below the floor still fails on its counter.
@@ -3724,7 +3740,7 @@ standalone snapshot: sequence the loaded snapshot sequence plus one, `eventSeque
 head. It uses the monotonic standalone snapshot write, so it never lowers a stored snapshot, and a
 failed write is logged and does not fail the load. Rust's loaded state then carries the new snapshot
 sequence, so a commit from it writes the next one. Go's loaded context keeps the old sequence, so
-on DynamoDB and in memory a commit from the same load that also snapshots conflicts on the snapshot
+on every backend a commit from the same load that also snapshots conflicts on the snapshot
 sequence and is retried.
 
 ## Loading and duplicate commands

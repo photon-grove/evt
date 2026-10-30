@@ -45,11 +45,16 @@ pub type ViewWriter = Arc<dyn Fn(&ViewOperation) -> Result<PgStatement, Error> +
 /// A SQL statement that an in-band projector adds to a commit. It runs in the same transaction
 /// as the events, after the head statements and the event inserts and before the snapshot upsert,
 /// so a writer that lost a race fails on its head before it reaches a view row.
+///
+/// It is cheap to clone (the parameters are shared), which a journaled PostgreSQL repository
+/// (`JournalRepository`, the `journal` cargo feature) needs: it stages a commit again when the
+/// journal's positions are taken.
+#[derive(Clone)]
 pub struct PgStatement {
     /// The SQL text, with `$1`-style placeholders.
     pub sql: String,
-    /// The parameters.
-    pub params: Vec<Box<dyn ToSql + Sync + Send>>,
+    /// The parameters, shared so a statement can be cloned.
+    pub params: Vec<Arc<dyn ToSql + Sync + Send>>,
     /// For a [view writer](PostgresRepository::with_view_writer)'s statement: the name of the
     /// table's unique or primary-key constraint on `(pk, sk)`. It is required for a put with
     /// [`ViewCondition::Absent`]: only a violation of this constraint means the row already
@@ -63,7 +68,7 @@ impl PgStatement {
     pub fn new(sql: impl Into<String>, params: Vec<Box<dyn ToSql + Sync + Send>>) -> Self {
         Self {
             sql: sql.into(),
-            params,
+            params: params.into_iter().map(Arc::from).collect(),
             key_constraint: None,
         }
     }
@@ -1939,6 +1944,8 @@ async fn read_committed(
 }
 
 mod enumerate;
+#[cfg(feature = "journal")]
+mod journal;
 mod rebuild;
 mod views;
 

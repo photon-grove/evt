@@ -860,6 +860,10 @@ evt.Metadata{
 - Snapshot conditional for later snapshots: `seq = :seq`, where `:seq` is the new sequence minus
   one. Continuity and the floor are the head update's, so the snapshot put carries the sequence
   chain only
+- PostgreSQL enforces the same chain: under the entity's advisory lock the commit reads the stored
+  snapshot's `sequence` before the upsert and refuses anything but 1 (no row) or stored + 1 with a
+  transient-classified `ConflictError` (Rust `Error::Conflict`). The in-memory repositories do the
+  same, and the conformance suites check it on every backend
 
 ### GetEvents
 
