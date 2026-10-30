@@ -690,7 +690,9 @@ without the feature refuse the table.
   before writing the events it covers: earlier events have no row and no gap shows it. A commit's
   journal rows and counters count toward the commit budget (97 event and projector operations, 96 with a snapshot).
 - Rebuilds run under the [rebuild lock](#rebuild-fence) and write the rows and counters through
-  `write_rebuild_views`, fenced on the lease's owner and fencing token. `rebuild_with_lock` takes the
+  `write_rebuild_views`, fenced on the lease's owner and fencing token. To rebuild the journal with
+  your commit-wide views under one lease, use `ProjectionRebuild::with_journal`
+  ([Rebuilding projections](#rebuilding-projections)). `rebuild_with_lock` takes the
   lock for the run; `rebuild_with_lease` runs under a lease you took and end, so one lease can cover
   the journal and your other derived state; `rebuild` writes under a lease without renewing it. The
   first two renew the lease before a batch whenever half of it has passed, so a long rebuild is not
@@ -804,7 +806,7 @@ let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().awai
   (`Error::RebuildUnavailable`) and every commit is still refused (`Error::RebuildInProgress`) until
   a later rebuild begins and ends. A failed rebuild may have cleared journal counters, and a
   journaled commit would otherwise allocate positions from them. To resume writes, run the rebuild
-  again to its end (for the journal, `rebuild_with_lock`).
+  again to its end (for the journal, `rebuild_with_lock` or a `ProjectionRebuild` `with_journal`).
 - A command handler that reads a view under the epoch check returns `RebuildUnavailable` or
   `RebuildEpochChanged` as its own error. The engine returns it at once and records nothing.
 - Leases are whole seconds read from the repository's clock, and `with_clock` injects one in tests.
@@ -852,8 +854,13 @@ let report = ProjectionRebuild::new(&repository)
   it from a settled generation. Once a write was attempted, a failure keeps the lock until a retry
   takes over the lapsed lease. A run that took over a lapsed lease, or acquired after a
   force-release, keeps the lock on any failure, since the rows may still be half-written from the
-  earlier run; only a rebuild that completes releases it. The journal has
-  its own rebuild (`journal::rebuild_with_lock`), and its projector is refused here.
+  earlier run; only a rebuild that completes releases it.
+- `with_journal(journal)` rebuilds the sync journal in the same run, under the same lease: its rows
+  and counters come from the events of the journal's types, read under the lock, and go out in the
+  same guarded batches, so readers see one rebuild (one generation) for the views and the journal.
+  A key both would write fails the run before anything is written. With a journal and no
+  projectors, aggregate types are optional. It needs the `journal` cargo feature. The journal's
+  projector itself is refused as a projector here.
 
 ## Enumerating the log
 

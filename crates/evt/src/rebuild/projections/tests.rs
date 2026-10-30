@@ -164,6 +164,7 @@ async fn current_state_projectors_rebuild_from_final_states_seeded_from_snapshot
             puts: 2,
             deletes: 0,
             batches: 1,
+            ..RebuildReport::default()
         }
     );
     assert_eq!(
