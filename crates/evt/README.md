@@ -459,6 +459,13 @@ folded as the next snapshot. The write never lowers a stored snapshot, and it is
 failure is a `tracing` warning, and the load still returns. The store's loads, its execute paths and
 its transactions' reads all catch up.
 
+A snapshot is a single item, so keep an aggregate's state bounded and its unbounded history in
+events. A snapshot whose item would be over the commit's per-item budget,
+`photon_evt::MAX_COMMIT_ITEM_BYTES` (measured by `snapshot_commit_size`), is skipped with a
+`tracing` warning instead of failing the commit with `Error::CommitTooLarge`, on commits,
+transactions and catch-up loads alike. Loads then replay from the last snapshot that fit
+([Oversized snapshots](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#oversized-snapshots)).
+
 Every load runs in a `DEBUG` `tracing` span named `load` with `entity_type`, `entity_id`,
 `sequence`, `snapshot_seq` (the snapshot the load started from, 0 without one) and
 `events_replayed`. Alert on `events_replayed` to find streams that need a smaller interval or a

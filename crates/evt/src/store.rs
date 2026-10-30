@@ -21,7 +21,7 @@ use crate::outcome::{
     Rejection, Settled, ToRejection, pre_check, principal, require_command_id, settle,
 };
 use crate::projection::{CommitProjector, CommitStream, CommitView, HistoryLedger, project_commit};
-use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due};
+use crate::repository::{Commit, NewSnapshot, Repository, snapshot_events_due, snapshot_fits};
 use crate::retry::{Budget, Failed, Retry, RetryPolicy};
 use crate::transaction::{Begin, PendingCommand, Transaction, freeze_command, persist_rejection};
 use crate::upcast::upcast_event;
@@ -421,14 +421,15 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             )?
         };
 
-        let snapshot = if snapshot_due {
-            Some(NewSnapshot {
+        // A snapshot over the per-item commit budget is left out, so the commit still succeeds.
+        let snapshot = match (snapshot_due, serialized.last()) {
+            (true, Some(last)) => NewSnapshot {
                 entity_type: EntityType::new(A::TYPE),
                 sequence: loaded.snapshot_sequence.next(),
                 payload: state.unwrap_or_default(),
-            })
-        } else {
-            None
+            }
+            .within_budget(&loaded.entity_id, last.sequence)?,
+            _ => None,
         };
 
         let snapshot_sequence = snapshot.as_ref().map(|snapshot| snapshot.sequence);
@@ -1024,6 +1025,17 @@ async fn catch_up_snapshot<A: Aggregate, R: Repository>(repository: &R, loaded: 
         event_sequence: loaded.sequence,
         payload,
     };
+
+    // The same per-item budget a commit's snapshot honours: an oversized one is logged and skipped.
+    match snapshot_fits(&snapshot) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::warn!(phase = "payload", %error, "snapshot catch-up failed");
+
+            return;
+        }
+    }
 
     match repository.put_snapshot(&snapshot).await {
         Ok(true) => {

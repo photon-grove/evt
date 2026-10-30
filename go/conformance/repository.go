@@ -150,6 +150,10 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 		t.Run("RejectsFirstSnapshotAboveOne", func(t *testing.T) {
 			testRejectsFirstSnapshotAboveOne(t, newRepo())
 		})
+
+		t.Run("OversizedSnapshotIsSkipped", func(t *testing.T) {
+			testOversizedSnapshotIsSkipped(t, newRepo(), opts.SupportsTransactions)
+		})
 	}
 
 	if opts.SupportsTransactions {

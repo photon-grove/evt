@@ -178,3 +178,29 @@ func TestPreflightCommit_CountsProjectorOperations(t *testing.T) {
 		Events: []evt.SerializedEvent{event}, Transaction: evt.Transaction{sizedGroup{sizes: []int{400_000}}},
 	}), &tooLarge)
 }
+
+func TestSnapshotCommitSize_IsThePreflightSizeWithTheWidestTTL(t *testing.T) {
+	result := sizedResult()
+
+	plain, err := evt.TransactionItemSizes(result)
+	require.NoError(t, err)
+
+	// The snapshot put is the fifth action: the two control checks and the two event puts first.
+	require.Equal(t, plain[4]+len("ttl")+len("9223372036854775807"), evt.SnapshotCommitSize(result.Snapshots[0]))
+
+	// A snapshot at the per-item budget fits it; one byte more does not, and would fail its commit.
+	snapshot := evt.SerializedSnapshot{EntityType: "plain", EntityID: "a", Sequence: 2, EventSequence: 10}
+	snapshot.Payload = make([]byte, evt.MaxCommitItemBytes-evt.SnapshotCommitSize(snapshot))
+	require.Equal(t, evt.MaxCommitItemBytes, evt.SnapshotCommitSize(snapshot))
+
+	sizes, err := evt.TransactionItemSizesWithTTL(evt.SerializedResult{Snapshots: []evt.SerializedSnapshot{snapshot}},
+		func(evt.EntityType) int64 { return 9223372036854775807 })
+	require.NoError(t, err)
+	require.NoError(t, evt.CommitBudget(sizes))
+
+	snapshot.Payload = append(snapshot.Payload, 'x')
+	sizes, err = evt.TransactionItemSizes(evt.SerializedResult{Snapshots: []evt.SerializedSnapshot{snapshot}})
+	require.NoError(t, err)
+	require.NoError(t, evt.CommitBudget(sizes), "without a ttl the item itself still fits")
+	require.Greater(t, evt.SnapshotCommitSize(snapshot), evt.MaxCommitItemBytes, "but the guard counts the widest ttl")
+}

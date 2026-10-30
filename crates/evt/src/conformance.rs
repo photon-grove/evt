@@ -6,7 +6,8 @@
 //! (snapshot-aware loads, stale-commit conflicts, retries, and in-band projector operations that
 //! commit atomically with events). Every case namespaces its entity IDs, so durable backends can
 //! share one table across runs. The repository cases also namespace entity types. The [`Store`]
-//! cases use the [`Ledger`] type, so a shared table accumulates `ledger` rows.
+//! cases use the [`Ledger`] type, so a shared table accumulates `ledger` rows (and `hoard` rows
+//! from the oversized-snapshot case).
 //!
 //! ```
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -662,6 +663,10 @@ impl<'a, R: Repository, V: ViewTarget<R>, H: HeadFixtures<R>> Suite<'a, R, V, H>
         record(
             "a load that replays the threshold writes a catch-up snapshot",
             Box::pin(snapshot_policy::catch_up_snapshots(repo)).await,
+        );
+        record(
+            "a snapshot over the per-item budget is skipped, not a failed commit",
+            Box::pin(snapshot_policy::oversized_snapshots_are_skipped(repo)).await,
         );
         record(
             "store rejects a stale commit",
