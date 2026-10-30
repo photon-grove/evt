@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.0](https://github.com/photon-grove/evt/compare/photon-evt-v0.2.1...photon-evt-v0.3.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **rust:** an implementation of CommitProjector that overrides engine_metadata no longer compiles. Remove the override: only the journal's projector reads engine metadata, and returning true never gave a consistent view.
+* **rust:** `PgStatement::params` is now `Vec<Arc<dyn ToSql + Sync + Send>>`, so `PgStatement` is `Clone`, which a journaled repository needs to stage a commit again. Build statements with
+
+### Features
+
+* **rust:** add the evt-owned PostgreSQL views table and PgViewRepository ([#236](https://github.com/photon-grove/evt/issues/236)) ([6d88825](https://github.com/photon-grove/evt/commit/6d88825351e27f5538d744040231bfe8b2413468))
+* **rust:** diff-mode projection rebuild that writes only changes ([#234](https://github.com/photon-grove/evt/issues/234)) ([2815ebc](https://github.com/photon-grove/evt/commit/2815ebc65cb51e71ca991da41a2e58b7e1d4f350))
+* **rust:** look up a command's outcome by CommandIdentity ([#233](https://github.com/photon-grove/evt/issues/233)) ([6b3554e](https://github.com/photon-grove/evt/commit/6b3554ed595965b4dae3564bd15757946f3d95f4))
+* **rust:** return committed events, journal allocations included, from a commit ([#231](https://github.com/photon-grove/evt/issues/231)) ([5db0774](https://github.com/photon-grove/evt/commit/5db0774f5dd00cfdb5fd7e2f847250b03e13603b))
+* **rust:** run the sync journal and its compaction on PostgreSQL ([#239](https://github.com/photon-grove/evt/issues/239)) ([29ad621](https://github.com/photon-grove/evt/commit/29ad6212d4f88d2de3f6f1f7a7a5a0758c69247f))
+* **rust:** wake journal consumers on PostgreSQL with NOTIFY ([#241](https://github.com/photon-grove/evt/issues/241)) ([86c8001](https://github.com/photon-grove/evt/commit/86c8001d57cee3d41e2c65f55054960c2c944d9f))
+* **rust:** write commit-wide views to the PostgreSQL views table ([#238](https://github.com/photon-grove/evt/issues/238)) ([a623bba](https://github.com/photon-grove/evt/commit/a623bba1bd221861609ed442111ca00a84592d42))
+
+
+### Bug Fixes
+
+* **rust:** seal CommitProjector::engine_metadata to the engine's own projectors ([#230](https://github.com/photon-grove/evt/issues/230)) ([edaa2f7](https://github.com/photon-grove/evt/commit/edaa2f76e1eaab01f271e4f46284a3085a22be50)), closes [#179](https://github.com/photon-grove/evt/issues/179)
+* skip a snapshot over the per-item budget instead of failing the commit ([#226](https://github.com/photon-grove/evt/issues/226)) ([12fd9b0](https://github.com/photon-grove/evt/commit/12fd9b01688e0538fccc03dd47688648e9bd1d3e)), closes [#155](https://github.com/photon-grove/evt/issues/155)
+
 ## [0.2.1](https://github.com/photon-grove/evt/compare/photon-evt-v0.2.0...photon-evt-v0.2.1) (2026-10-30)
 
 

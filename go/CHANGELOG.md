@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.0](https://github.com/photon-grove/evt/compare/go/v0.9.1...go/v0.10.0) (2026-10-30)
+
+
+### Features
+
+* **rust:** look up a command's outcome by CommandIdentity ([#233](https://github.com/photon-grove/evt/issues/233)) ([6b3554e](https://github.com/photon-grove/evt/commit/6b3554ed595965b4dae3564bd15757946f3d95f4))
+
+
+### Bug Fixes
+
+* skip a snapshot over the per-item budget instead of failing the commit ([#226](https://github.com/photon-grove/evt/issues/226)) ([12fd9b0](https://github.com/photon-grove/evt/commit/12fd9b01688e0538fccc03dd47688648e9bd1d3e)), closes [#155](https://github.com/photon-grove/evt/issues/155)
+
 ## [0.9.1](https://github.com/photon-grove/evt/compare/go/v0.9.0...go/v0.9.1) (2026-10-30)
 
 
