@@ -1917,11 +1917,9 @@ async fn postgres_conforms() {
 
     clear_manifest(&repository).await;
 
-    // PostgreSQL does not check snapshot sequences: the event-sequence conflict already rejects
-    // racing writers, and the snapshot upsert keeps the event sequence monotonic.
+    // PostgreSQL checks the snapshot sequence chain under the entity lock, like every backend.
     let heads = PostgresHeads::new(repository.pool().clone(), events.clone());
     Suite::new(&repository)
-        .snapshot_sequence_conflicts(false)
         .with_views(views)
         .with_head_fixtures(heads)
         .run()

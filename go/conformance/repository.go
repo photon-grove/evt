@@ -151,6 +151,10 @@ func RunRepositorySuite(t *testing.T, newRepo func() evt.Repository, opts SuiteO
 			testRejectsFirstSnapshotAboveOne(t, newRepo())
 		})
 
+		t.Run("RejectsStaleSnapshotSequence", func(t *testing.T) {
+			testRejectsStaleSnapshotSequence(t, newRepo())
+		})
+
 		t.Run("OversizedSnapshotIsSkipped", func(t *testing.T) {
 			testOversizedSnapshotIsSkipped(t, newRepo(), opts.SupportsTransactions)
 		})
@@ -1167,4 +1171,49 @@ func testRejectsSequenceGaps(t *testing.T, repo evt.Repository, supportsSnapshot
 
 	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: serialize(t, idC, "test", 3, updated(idC))}),
 		"the stream continues from the snapshot's head")
+}
+
+// testRejectsStaleSnapshotSequence checks the snapshot sequence chain every backend enforces in a
+// commit: a later snapshot must have the stored snapshot's sequence plus one. One that repeats or
+// skips it is an optimistic-concurrency conflict the store retries (DynamoDB reports a transient
+// dynamo.ErrSnapshotRaceCondition, PostgreSQL a transient evt.ConflictError, memory an
+// evt.ConflictError), and the commit writes nothing (storage spec, Writes and PostgreSQL).
+func testRejectsStaleSnapshotSequence(t *testing.T, repo evt.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	id := evt.EntityID(newNamespace() + "-a")
+
+	events := serialize(t, id, "test", 0,
+		&test.AggregateCreated{ID: id, Value: "one"},
+		&test.AggregateUpdated{ID: id, Value: "two"},
+		&test.AggregateUpdated{ID: id, Value: "three"},
+		&test.AggregateUpdated{ID: id, Value: "four"},
+	)
+	snapshotAt := func(sequence, eventSequence evt.EventSequence) []evt.SerializedSnapshot {
+		return []evt.SerializedSnapshot{{
+			EntityType: "test", EntityID: id, Sequence: sequence, EventSequence: eventSequence, Payload: []byte(`{}`),
+		}}
+	}
+
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events[:2], Snapshots: snapshotAt(1, 2)}))
+
+	for _, sequence := range []evt.EventSequence{1, 3} {
+		err := repo.Commit(ctx, evt.SerializedResult{Events: events[2:], Snapshots: snapshotAt(sequence, 4)})
+		require.Error(t, err, "snapshot sequence %d after a stored 1", sequence)
+		require.True(t, evt.IsConflictErr(err) || policy.IsTransient(err),
+			"snapshot sequence %d is a conflict the store retries: %v", sequence, err)
+	}
+
+	stored, err := repo.GetEvents(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, stored, 2, "a refused commit writes no events")
+
+	snapshot, err := repo.GetSnapshot(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, snapshot)
+	require.Equal(t, [2]evt.EventSequence{1, 2}, [2]evt.EventSequence{snapshot.Sequence, snapshot.EventSequence},
+		"a refused commit leaves the stored snapshot")
+
+	// The stored sequence plus one is accepted.
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: events[2:], Snapshots: snapshotAt(2, 4)}))
 }

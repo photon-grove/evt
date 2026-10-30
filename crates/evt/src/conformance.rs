@@ -519,7 +519,9 @@ impl<'a, R: Repository> Suite<'a, R> {
 
 impl<'a, R: Repository, V: ViewTarget<R>, H: HeadFixtures<R>> Suite<'a, R, V, H> {
     /// Whether a commit whose snapshot sequence is not the stored one plus one is rejected
-    /// (default `true`). PostgreSQL relies on the event-sequence conflict instead, so it opts out.
+    /// (default `true`). The [`Repository`] contract requires it, and every repository in this
+    /// crate (in-memory, DynamoDB, PostgreSQL) enforces it. Turn it off only to run the rest of the
+    /// suite against a backend that does not yet.
     pub fn snapshot_sequence_conflicts(mut self, enforced: bool) -> Self {
         self.snapshot_sequence_conflicts = enforced;
         self
