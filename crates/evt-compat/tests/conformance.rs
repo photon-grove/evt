@@ -2061,112 +2061,6 @@ impl CommitViewTarget<PostgresRepository> for PostgresViewRows {
     }
 }
 
-/// The rows of [`postgres_view_writer`]'s table, for the diff-mode rebuild, which lists them by type
-/// and reads them by key. Listings are whole (no paging), and the table is strongly consistent.
-impl ViewRepository for PostgresViewRows {
-    async fn get_view_at(&self, pk: &str, sk: &str) -> Result<Option<ViewRow>, Error> {
-        Ok(self.select("pk = $1 AND sk = $2", &[&pk, &sk]).await?.pop())
-    }
-
-    async fn put_view(&self, view: &ViewRow) -> Result<(), Error> {
-        self.pool
-            .get()
-            .await
-            .map_err(Error::backend)?
-            .execute(
-                &format!(
-                    "INSERT INTO {PG_COMMIT_VIEWS_TABLE} (pk, sk, entity_id, entity_type, payload) \
-                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (pk, sk) DO UPDATE SET \
-                     entity_id = $3, entity_type = $4, payload = $5"
-                ),
-                &[
-                    &view.pk,
-                    &view.sk,
-                    &view.entity_id,
-                    &view.entity_type,
-                    &String::from_utf8_lossy(&view.payload).into_owned(),
-                ],
-            )
-            .await
-            .map_err(Error::backend)?;
-
-        Ok(())
-    }
-
-    async fn delete_view(&self, pk: &str, sk: &str) -> Result<(), Error> {
-        self.pool
-            .get()
-            .await
-            .map_err(Error::backend)?
-            .execute(
-                &format!("DELETE FROM {PG_COMMIT_VIEWS_TABLE} WHERE pk = $1 AND sk = $2"),
-                &[&pk, &sk],
-            )
-            .await
-            .map_err(Error::backend)?;
-
-        Ok(())
-    }
-
-    async fn list_views_by_pk_paged(
-        &self,
-        pk: &str,
-        _: Option<usize>,
-        _: Option<&str>,
-    ) -> Result<photon_evt::ViewPage, Error> {
-        let rows = self.select("pk = $1 ORDER BY sk", &[&pk]).await?;
-
-        Ok(photon_evt::ViewPage::new(rows, None))
-    }
-
-    async fn list_views_by_entity_type_paged(
-        &self,
-        entity_type: &str,
-        _: Option<usize>,
-        _: Option<&str>,
-    ) -> Result<photon_evt::ViewPage, Error> {
-        let rows = self.select("entity_type = $1", &[&entity_type]).await?;
-
-        Ok(photon_evt::ViewPage::new(rows, None))
-    }
-}
-
-impl PostgresViewRows {
-    async fn select(
-        &self,
-        filter: &str,
-        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-    ) -> Result<Vec<ViewRow>, Error> {
-        let rows = self
-            .pool
-            .get()
-            .await
-            .map_err(Error::backend)?
-            .query(
-                &format!(
-                    "SELECT pk, sk, entity_id, entity_type, payload FROM {PG_COMMIT_VIEWS_TABLE} \
-                     WHERE {filter}"
-                ),
-                params,
-            )
-            .await
-            .map_err(Error::backend)?;
-
-        Ok(rows
-            .iter()
-            .map(|row| {
-                ViewRow::new(
-                    row.get::<_, String>(0),
-                    row.get::<_, String>(1),
-                    row.get::<_, String>(2),
-                    row.get::<_, String>(3),
-                    row.get::<_, String>(4).into_bytes(),
-                )
-            })
-            .collect())
-    }
-}
-
 /// Commit-wide view operations (v0.9, C7) against PostgreSQL: the shared cases, the SQLSTATE
 /// reasons of other statement failures, and the refusals that need no writer or a bad one.
 async fn postgres_commit_wide_views(repository: &PostgresRepository, events: &str) {
@@ -2198,12 +2092,6 @@ async fn postgres_commit_wide_views(repository: &PostgresRepository, events: &st
     )
     .await;
     Box::pin(projection_rebuild_cases(
-        &rebuilds,
-        &clock,
-        &PostgresViewRows { pool: pool.clone() },
-    ))
-    .await;
-    Box::pin(projection_diff_cases(
         &rebuilds,
         &clock,
         &PostgresViewRows { pool: pool.clone() },
@@ -4079,6 +3967,7 @@ async fn postgres_views_table_conforms() {
     )
     .await;
     Box::pin(projection_rebuild_cases(&rebuilds, &clock, &rows())).await;
+    Box::pin(projection_diff_cases(&rebuilds, &clock, &rows().0)).await;
 
     base.pool()
         .get()
