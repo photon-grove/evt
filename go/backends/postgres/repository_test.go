@@ -199,12 +199,22 @@ func TestCommitRefusesProjectorOperationsBeforeAnyWrite(t *testing.T) {
 	require.NoError(t, evt.RequireTransactions(repo))
 }
 
-// commitStubTx is a pgx.Tx whose Commit fails with a scripted error; every other method panics via
-// the nil embedded interface, because inTx only commits and rolls back.
+// commitStubTx is a pgx.Tx whose Commit fails with a scripted error and which records the
+// statements it executes; every other method panics via the nil embedded interface, because inTx
+// only sets the isolation level, commits and rolls back.
 type commitStubTx struct {
 	pgx.Tx
 
 	commitErr error
+	executed  *[]string
+}
+
+func (tx commitStubTx) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+	if tx.executed != nil {
+		*tx.executed = append(*tx.executed, sql)
+	}
+
+	return pgconn.CommandTag{}, nil
 }
 
 func (tx commitStubTx) Commit(context.Context) error   { return tx.commitErr }
@@ -238,4 +248,18 @@ func TestInTxMarksOnlyNonDatabaseCommitFailuresIndeterminate(t *testing.T) {
 	require.True(t, evt.IsConflictErr(run(&pgconn.PgError{Code: uniqueViolation})))
 
 	require.NoError(t, run(nil))
+}
+
+// Every engine transaction sets READ COMMITTED before its first statement, whatever the server's
+// default isolation (the integration suite's Test_Isolation_* runs the race it prevents).
+func TestInTxSetsReadCommittedFirst(t *testing.T) {
+	var executed []string
+	repo := NewRepository(commitStubDB{tx: commitStubTx{executed: &executed}})
+
+	require.NoError(t, repo.inTx(context.Background(), func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), "SELECT 1")
+
+		return err
+	}))
+	require.Equal(t, []string{"SET TRANSACTION ISOLATION LEVEL READ COMMITTED", "SELECT 1"}, executed)
 }

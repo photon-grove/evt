@@ -366,6 +366,11 @@ error before any write and is never split.
   a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust
   `Error::Indeterminate`). A definitive failure (validation, a missing table or relation,
   authorization, a constraint error other than the outcome-row conflict) is returned as is
+- Every PostgreSQL transaction that writes or checks a fence runs at `READ COMMITTED`, set
+  explicitly, so its fence reads after an advisory-lock wait see what committed during the wait,
+  whatever the server's default isolation (Go's read-only stream-head scans keep their
+  `REPEATABLE READ READ ONLY` snapshot, and an ambient Go transaction at a stricter level is
+  refused)
 - U+0000 in a command ID, a digest, any persisted metadata string (principal, causation, extension
   keys and values, ...), or a rejection's code, message, details strings, or details keys is
   `ErrInvalidArgument` / `Error::InvalidArgument` on every backend (PostgreSQL cannot store it),

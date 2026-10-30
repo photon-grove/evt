@@ -80,6 +80,13 @@ in the transaction that carries the view statements. So a takeover waits for it,
 lost the lock aborts without writing. A database created before the fence has neither table, and
 commits pass until `EnsureSchema` creates them.
 
+These assertions run after the commit waits for its locks, so every transaction that writes or
+checks a fence runs at `READ COMMITTED` whatever the server's `default_transaction_isolation`: a
+`REPEATABLE READ` snapshot would be taken before the wait and miss a rebuild that began meanwhile.
+A server or role configured for a stricter default needs no change. If you pass `NewRepository`
+an ambient `pgx.Tx` instead of a pool, begin it at `READ COMMITTED` (the default): the repository
+refuses to work inside a transaction at a stricter level, which it cannot lower.
+
 ### Compaction
 
 A stream can opt into compaction with `evt.Compactor.CompactBelow(ctx, entityID, throughSequence)`.

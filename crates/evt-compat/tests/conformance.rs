@@ -3498,3 +3498,126 @@ async fn postgres_rebuild_relations(pool: Pool) {
         .await
         .expect("drop the isolated event log");
 }
+
+/// A repository over `events` whose sessions default to `REPEATABLE READ`, as a server or role
+/// configured with `default_transaction_isolation` would give them.
+fn repeatable_read(events: &str, snapshots: &str) -> PostgresRepository {
+    use deadpool_postgres::{Manager, ManagerConfig, RecyclingMethod};
+
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://evt:evt@localhost:5432/evt_local?sslmode=disable".into());
+    let mut config: tokio_postgres::Config = url.parse().unwrap();
+    config.options("-c default_transaction_isolation=repeatable\\ read");
+    let manager = Manager::from_config(
+        config,
+        tokio_postgres::NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        },
+    );
+
+    PostgresRepository::new(Pool::builder(manager).max_size(2).build().unwrap())
+        .with_tables(events, snapshots)
+        .unwrap()
+}
+
+/// A commit reads the rebuild fence after it waits for its locks, so it must read it as of that
+/// moment, whatever the server's default isolation. Under `REPEATABLE READ` its snapshot would be
+/// the one taken before the wait: a rebuild that began meanwhile would be invisible to it, and the
+/// commit would land under the fence.
+#[tokio::test]
+async fn postgres_commit_sees_a_rebuild_that_began_while_it_waited() {
+    use photon_evt::{Commit, EntityId, EventId, EventType, EventVersion, Metadata, RebuildFence};
+
+    // Tables of its own: the rebuild lock it takes must refuse nobody else's commits.
+    let events = format!(
+        "rc{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let snapshots = format!("{events}_s");
+    let base = PostgresRepository::new(drivers::postgres_pool().unwrap())
+        .with_tables(&events, &snapshots)
+        .unwrap();
+    base.ensure_schema().await.unwrap();
+    let repo = repeatable_read(&events, &snapshots);
+    let id = EntityId::from(format!("{events}-waits"));
+    let pool = drivers::postgres_pool().unwrap();
+    let mut holder = pool.get().await.unwrap();
+    let lock = holder.transaction().await.unwrap();
+    lock.execute(
+        "SELECT pg_advisory_xact_lock(1702261760, hashtext($1))",
+        &[&id.as_str()],
+    )
+    .await
+    .unwrap();
+
+    let event = SerializedEvent {
+        id: EventId::for_event(&id, EventSequence(1)),
+        sequence: EventSequence(1),
+        event_type: EventType::new("account:opened"),
+        version: EventVersion(1),
+        entity_id: id.clone(),
+        entity_type: "account".into(),
+        payload: b"{}".to_vec(),
+        metadata: Metadata::new("local"),
+    };
+    let committing = {
+        let repo = repo.clone();
+        let commit = Commit::new(id.clone(), vec![event.clone()]);
+
+        tokio::spawn(async move { repo.commit(commit).await })
+    };
+
+    // Wait until the commit is blocked on the entity lock, after its first statement.
+    let watcher = pool.get().await.unwrap();
+    let waiting = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                   AND classid = 1702261760::oid \
+                   AND objid = (hashtext($1)::bigint & 4294967295)::oid";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = watcher.query_one(waiting, &[&id.as_str()]).await.unwrap();
+        if row.get::<_, i64>(0) > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the commit never waited on its entity lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let lease = base
+        .begin_rebuild("job", Duration::from_secs(60))
+        .await
+        .unwrap();
+    lock.rollback().await.unwrap();
+
+    let refused = committing.await.unwrap();
+    assert!(
+        matches!(refused, Err(Error::RebuildInProgress)),
+        "the commit saw the rebuild that began while it waited: {refused:?}"
+    );
+    assert!(
+        base.events(&id).await.unwrap().is_empty(),
+        "nothing landed under the fence"
+    );
+
+    base.end_rebuild(&lease).await.unwrap();
+    repo.commit(Commit::new(id.clone(), vec![event]))
+        .await
+        .unwrap();
+
+    drop(watcher);
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DROP TABLE {events}, {snapshots}, {events}__evt_features, {events}__evt_command_outcomes, \
+             {events}__evt_stream_heads, {events}__evt_rebuild_lock, {events}__evt_rebuild_generation"
+        ))
+        .await
+        .unwrap();
+}
