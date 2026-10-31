@@ -45,85 +45,126 @@ export class RawJson {
  *   integers (`number` or `bigint`), which are written as text and sorted as text, like Go's.
  * - A `bigint` is an integer, a `Uint8Array` is a `[]byte` (padded base64), and a
  *   {@link JsonNumber} is written as its text.
- * - Strings escape `<`, `>`, `&`, U+2028 and U+2029, and a lone surrogate becomes `�`, as Go
+ * - Strings escape `<`, `>`, `&`, U+2028 and U+2029, and a lone surrogate becomes `\ufffd`, as Go
  *   writes invalid UTF-8.
  *
  * Anything else, such as a `Date`, a class instance or a number that isn't finite, is refused.
  */
 export function stringifyJson(value: unknown): string {
   const out: string[] = []
-  write(value, out, [])
+  // The arrays and objects being written, innermost last. The writer keeps its own stack, as the
+  // reader does, so a deep value is written without overflowing the call stack.
+  const open: Writing[] = []
+  const writing = new Set<object>()
+  let next = value
+  for (;;) {
+    const opened = writeValue(next, out)
+    if (opened !== undefined) {
+      if (writing.has(opened.value)) {
+        throw new EvtError('invalidArgument', 'cannot encode a cyclic value as JSON')
+      }
 
-  return out.join('')
+      writing.add(opened.value)
+      open.push(opened)
+    }
+
+    // Move to the next entry of the innermost open container, closing each one that is done.
+    for (;;) {
+      const top = open.at(-1)
+      if (top === undefined) {
+        return out.join('')
+      }
+
+      const entry = top.entries[top.next]
+      if (entry === undefined) {
+        out.push(top.close)
+        writing.delete(top.value)
+        open.pop()
+        continue
+      }
+
+      if (top.next > 0) {
+        out.push(',')
+      }
+      top.next++
+
+      const [key, entryValue] = entry
+      if (key !== undefined) {
+        out.push(quote(key), ':')
+      }
+      next = entryValue
+      break
+    }
+  }
 }
 
-function write(value: unknown, out: string[], path: object[]): void {
+// An array or object being written: its entries (keyed for an object), the next one to write,
+// and the character that closes it.
+interface Writing {
+  value: object
+  entries: [string | undefined, unknown][]
+  next: number
+  close: string
+}
+
+// Writes a scalar, or the opening of an array or object, which it returns for the caller to fill.
+function writeValue(value: unknown, out: string[]): Writing | undefined {
   switch (typeof value) {
     case 'string':
       out.push(quote(value))
-      return
+      return undefined
     case 'boolean':
       out.push(value ? 'true' : 'false')
-      return
+      return undefined
     case 'bigint':
       out.push(value.toString())
-      return
+      return undefined
     case 'number':
       out.push(formatNumber(value))
-      return
+      return undefined
     case 'object':
       if (value === null) {
         out.push('null')
-        return
+        return undefined
       }
 
-      writeObject(value, out, path)
-      return
+      return writeObject(value, out)
     default:
       throw new EvtError('invalidArgument', `cannot encode a ${typeof value} as JSON`)
   }
 }
 
-function writeObject(value: object, out: string[], path: object[]): void {
+function writeObject(value: object, out: string[]): Writing | undefined {
   if (value instanceof JsonNumber || value instanceof RawJson) {
     out.push(value.text)
-    return
+    return undefined
   }
   if (value instanceof Uint8Array) {
     out.push('"', base64Encode(value), '"')
-    return
+    return undefined
   }
-  if (path.includes(value)) {
-    throw new EvtError('invalidArgument', 'cannot encode a cyclic value as JSON')
+  if (Array.isArray(value)) {
+    out.push('[')
+    return {value, entries: arrayEntries(value), next: 0, close: ']'}
   }
 
-  path.push(value)
-  if (Array.isArray(value)) {
-    writeArray(value, out, path)
-  } else if (value instanceof Map) {
-    writeMap(value, out, path)
-  } else {
-    writeStruct(value, out, path)
-  }
-  path.pop()
+  const entries = value instanceof Map ? mapEntries(value) : structEntries(value)
+  out.push('{')
+
+  return {value, entries, next: 0, close: '}'}
 }
 
-function writeArray(value: unknown[], out: string[], path: object[]): void {
-  out.push('[')
-  for (let i = 0; i < value.length; i++) {
-    if (i > 0) {
-      out.push(',')
-    }
-    if (value[i] === undefined) {
+function arrayEntries(value: unknown[]): [undefined, unknown][] {
+  return Array.from(value, (entry) => {
+    if (entry === undefined) {
       throw new EvtError('invalidArgument', 'cannot encode undefined in an array as JSON')
     }
 
-    write(value[i], out, path)
-  }
-  out.push(']')
+    return [undefined, entry]
+  })
 }
 
-function writeMap(value: Map<unknown, unknown>, out: string[], path: object[]): void {
+function mapEntries(value: Map<unknown, unknown>): [string, unknown][] {
   const entries: [string, unknown][] = []
   const seen = new Set<string>()
   for (const [key, entry] of value) {
@@ -135,18 +176,10 @@ function writeMap(value: Map<unknown, unknown>, out: string[], path: object[]): 
     seen.add(text)
     entries.push([text, entry])
   }
+
   entries.sort(([a], [b]) => compareUtf8(a, b))
 
-  out.push('{')
-  entries.forEach(([key, entry], i) => {
-    if (i > 0) {
-      out.push(',')
-    }
-
-    out.push(quote(key), ':')
-    write(entry, out, path)
-  })
-  out.push('}')
+  return entries
 }
 
 function mapKey(key: unknown): string {
@@ -160,15 +193,14 @@ function mapKey(key: unknown): string {
   throw new EvtError('invalidArgument', 'map keys must be strings or integers')
 }
 
-function writeStruct(value: object, out: string[], path: object[]): void {
+function structEntries(value: object): [string, unknown][] {
   const prototype: unknown = Object.getPrototypeOf(value)
   if (prototype !== Object.prototype && prototype !== null) {
     const name = value.constructor.name || 'object'
     throw new EvtError('invalidArgument', `cannot encode a ${name} as JSON`)
   }
 
-  out.push('{')
-  let first = true
+  const entries: [string, unknown][] = []
   for (const [key, entry] of Object.entries(value)) {
     if (isArrayIndex(key)) {
       throw new EvtError(
@@ -176,18 +208,12 @@ function writeStruct(value: object, out: string[], path: object[]): void {
         `object key "${key}" is integer-like, so its order is lost: use a Map`,
       )
     }
-    if (entry === undefined) {
-      continue
+    if (entry !== undefined) {
+      entries.push([key, entry])
     }
-    if (!first) {
-      out.push(',')
-    }
-
-    first = false
-    out.push(quote(key), ':')
-    write(entry, out, path)
   }
-  out.push('}')
+
+  return entries
 }
 
 // The keys an engine enumerates first, in numeric order: canonical integers below 2^32 - 1.
@@ -407,7 +433,7 @@ class Parser {
           continue
         }
 
-        out += this.text.slice(start, this.pos) + '�'
+        out += this.text.slice(start, this.pos) + '\ufffd'
         this.pos++
         start = this.pos
         continue
@@ -440,7 +466,7 @@ class Parser {
       case 0x75: {
         const high = this.hex()
         if (!isHighSurrogate(high)) {
-          return isLowSurrogate(high) ? '�' : String.fromCharCode(high)
+          return isLowSurrogate(high) ? '\ufffd' : String.fromCharCode(high)
         }
 
         // A high surrogate pairs only with an escaped low surrogate right after it.
@@ -455,7 +481,7 @@ class Parser {
           this.pos = save
         }
 
-        return '�'
+        return '\ufffd'
       }
       default:
         this.pos -= 2

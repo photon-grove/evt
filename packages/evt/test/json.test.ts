@@ -80,6 +80,17 @@ describe('stringifyJson', () => {
     expect(code(() => stringifyJson(cyclic))).toBe('invalidArgument')
   })
 
+  test('writes a deep value without overflowing the call stack', () => {
+    const text = '['.repeat(10_000) + '0' + ']'.repeat(10_000)
+    expect(stringifyJson(parseJson(text))).toBe(text)
+
+    let deep: unknown = {}
+    for (let i = 0; i < 50_000; i++) {
+      deep = {a: [deep]}
+    }
+    expect(stringifyJson(deep)).toHaveLength(50_000 * 8 + 2)
+  })
+
   test('allows a value that appears twice without a cycle', () => {
     const shared = {a: 1}
     expect(stringifyJson({x: shared, y: shared})).toBe('{"x":{"a":1},"y":{"a":1}}')
