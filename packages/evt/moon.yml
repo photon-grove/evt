@@ -54,8 +54,8 @@ tasks:
   # The require() keeps the package loadable from CommonJS, which rules out top-level await.
   test:
     script: >-
-      pnpm run test && node ../evt-compat/dist/fixtures.js &&
-      node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb')"
+      pnpm run test && node ../evt-compat/dist/fixtures.js && node ../evt-compat/dist/memory.js &&
+      node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/memory')"
     deps:
       - build-compat
     inputs:
@@ -65,7 +65,9 @@ tasks:
   # The fixture runner on the other runtimes, against the same build. Bun and Deno come from
   # .prototools locally and from the pinned setup actions in CI.
   runtimes:
-    script: bun ../evt-compat/dist/fixtures.js && deno run --allow-read ../evt-compat/dist/fixtures.js
+    script: >-
+      bun ../evt-compat/dist/fixtures.js && bun ../evt-compat/dist/memory.js &&
+      deno run --allow-read ../evt-compat/dist/fixtures.js && deno run ../evt-compat/dist/memory.js
     deps:
       - build-compat
     inputs:
