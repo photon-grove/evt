@@ -252,8 +252,9 @@ func IsRebuildConflictErr(err error) bool {
 // would have returned, or the begin may still land: never treat it as "not taken", because a lock
 // that is taken and never ended keeps every commit refused. Settle it with RebuildState.HoldsBegun
 // over a fresh State read, which is exact when the owner token is unique to the caller. A throttled or cancelled begin is refused before anything is written and
-// never reports this. policy.Classify reports it as policy.ClassUnknown whatever its cause: a begin
-// that applied refuses a second one with *RebuildLockHeldError naming the caller's own owner.
+// never reports this. policy.Classify reports it as policy.ClassUnknown whatever its cause, unless
+// the caller wraps it in its own policy.ClassifiedError: a begin that applied refuses a second one
+// with *RebuildLockHeldError naming the caller's own owner.
 type RebuildBeginIndeterminateError struct {
 	// Lease is the lease the begin would have returned, fencing token included.
 	Lease RebuildLease
