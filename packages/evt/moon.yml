@@ -55,7 +55,7 @@ tasks:
   test:
     script: >-
       pnpm run test && node ../evt-compat/dist/fixtures.js &&
-      node -e "require('@photon-grove/evt')"
+      node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb')"
     deps:
       - build-compat
     inputs:
