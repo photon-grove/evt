@@ -889,6 +889,8 @@ evt.Metadata{
   paging until it has collected `n` items or the stream runs out. PostgreSQL: `ORDER BY sequence
 DESC LIMIT n`. The in-memory backend walks its stream backwards.
 - A `limit` below 1 is a programmer error returned before any request, in every backend.
+  TypeScript's `latest(n)` takes a `number`, so it also refuses one that isn't a safe integer
+  (`1.5`, `NaN`, `Infinity`) with `invalidArgument`.
   Initial buffer capacity is bounded by a page or the available events, even for the largest limit.
 
 ### Reserved Namespaces (ADR-0004 C8)
@@ -898,7 +900,8 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 - Every entity-addressed write path refuses a reserved entity ID before any request, with a typed
   `evt.ReservedEntityIdError`: `Commit` (one reserved stream fails a multi-stream commit whole),
   `CommitWithSnapshot`, out-of-band snapshot writes (`dynamo.PutSnapshot`), and
-  `CompactBelow` (which writes no new rows but is refused all the same).
+  `CompactBelow` (which writes no new rows but is refused all the same). TypeScript throws a
+  `ReservedEntityIdError` from `commit`, `putSnapshot` and `compactBelow`.
 - Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
   scans (`StreamEntitiesFromSnapshots`) skip every reserved partition. `ReservedNamespacePrefixes()` returns a copy; callers cannot
   change the authoritative namespace checks.

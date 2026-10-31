@@ -222,10 +222,11 @@ jobs:
         with:
           node-version: 22.12.0
 
-      - name: Fixture runner on Node 22
+      - name: Fixture runner and memory conformance on Node 22
         run: |
           node packages/evt-compat/dist/fixtures.js
-          (cd packages/evt && node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb')")
+          node packages/evt-compat/dist/memory.js
+          (cd packages/evt && node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/memory')")
 
   integration:
     name: DynamoDB integration

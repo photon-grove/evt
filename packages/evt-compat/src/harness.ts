@@ -110,6 +110,18 @@ export class Checks {
     }
   }
 
+  // case runs one named case that throws on its first failed check, as a conformance case does,
+  // and records a throw as a failure.
+  async case(name: string, run: () => Promise<void>): Promise<void> {
+    try {
+      await run()
+      this.passed++
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.failures.push(`${name}\n    ${message}`)
+    }
+  }
+
   // report prints the result and sets a failing exit code when any check failed.
   report(): void {
     for (const failure of this.failures) {

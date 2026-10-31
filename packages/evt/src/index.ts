@@ -4,7 +4,18 @@
 
 export {base64Decode, base64Encode} from './base64.js'
 export {encodeEnvelope, decodeEnvelope, messageAttributes} from './envelope.js'
-export {EvtError, type EvtErrorCode} from './errors.js'
+export {
+  CommitTooLargeError,
+  CompactionUncoveredError,
+  ConflictError,
+  EvtError,
+  type EvtErrorCode,
+  ReservedEntityIdError,
+  SequenceGapError,
+  StreamHeadDriftError,
+  isConflict,
+  isRetryable,
+} from './errors.js'
 export {
   type SerializedEvent,
   type SerializedSnapshot,
@@ -23,5 +34,6 @@ export {
   emptyMetadata,
   encodeMetadata,
 } from './metadata.js'
+export type {CallOptions, Commit, NewSnapshot, Repository} from './repository.js'
 export {MAX_COMMIT_ITEM_BYTES, snapshotCommitSize, snapshotEventsDue} from './snapshots.js'
 export {compareUtf8, utf8Length} from './utf8.js'
