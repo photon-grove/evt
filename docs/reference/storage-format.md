@@ -2,7 +2,9 @@
 
 This is the storage contract shared by the Go `evt` packages and the Rust `photon-evt` crate. Both
 implementations read and write the same DynamoDB items, PostgreSQL rows, serialized JSON, and
-stream envelopes, so services in either language can share one event log.
+stream envelopes, so services in either language can share one event log. A TypeScript
+implementation, `@photon-grove/evt`, is being built against the same contract and checks itself
+against the fixtures.
 
 The golden fixtures in [`compat/fixtures/`](../../compat/fixtures) are the executable form of this
 document. The Go implementation generates them, and both test suites check against them. If this

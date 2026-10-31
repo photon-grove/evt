@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  // Tests and scripts run on Node, so they get Node's types, which replace src/globals.d.ts. The
+  // published code is checked without them by tsconfig.json.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "rootDir": ".",
+    "noEmit": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src", "test", "scripts", "vitest.config.ts"],
+  "exclude": ["src/globals.d.ts"]
+}

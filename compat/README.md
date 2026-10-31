@@ -3,7 +3,9 @@
 This directory holds the shared inputs and golden outputs that keep the Go `evt` packages and the
 Rust `photon-evt` crate wire-compatible. The contract itself is
 [`docs/reference/storage-format.md`](../docs/reference/storage-format.md), and the reasoning is in
-[ADR 0003](../docs/adr/0003-rust-implementation-and-cross-language-compatibility.md).
+[ADR 0003](../docs/adr/0003-rust-implementation-and-cross-language-compatibility.md). The
+TypeScript package checks itself against the same fixtures and writes none
+([ADR 0009](../docs/adr/0009-typescript-implementation.md)).
 
 | Path                      | Written by   | Contents                                                                                                                                                                                              |
 | ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -25,6 +27,7 @@ Both sides implement the same account domain: `go/internal/compat/account.go` an
 | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `go -C go test ./internal/compat`              | The Go output still matches the fixtures.                                                                      |
 | `cargo test -p evt-compat`               | The Rust output matches the fixtures byte for byte, running every step in Rust against `MemRepository`.        |
+| `moon run evt-ts:test evt-ts:runtimes`   | The TypeScript fixture runner (`packages/evt-compat`) reproduces the vectors it covers so far, on Node, Bun and Deno. It generates no fixtures. |
 | `scripts/compat-integration.sh dynamo`   | Go and Rust take turns writing the same streams in the local DynamoDB emulator, then both verify every stream. |
 | `scripts/compat-integration.sh postgres` | The same against local PostgreSQL.                                                                             |
 
@@ -56,11 +59,12 @@ Fixtures change only when the storage format changes on purpose:
 ```sh
 go -C go test ./internal/compat -run TestFixtures -update
 cargo test --workspace
+moon run evt-ts:test evt-ts:runtimes
 ```
 
 Review the fixture diff. Every changed byte is a format change that existing data and the other
-language must handle. Then update the Rust side until it passes, add upcasters if stored payloads
-changed, and update the spec.
+languages must handle. Then update the Rust and TypeScript sides until they pass, add upcasters if
+stored payloads changed, and update the spec.
 
 ## Adding a scenario
 
@@ -122,6 +126,6 @@ changed, and update the spec.
    maps the run name in the target stream IDs to the fixture run's, so digests are run
    independent. The digested payload is the step's `command` object with sorted keys.
 2. If the scenario needs a new command or event, add it to both account domains.
-3. Regenerate the fixtures and run both test suites and both live runs.
+3. Regenerate the fixtures, run the Go, Rust and TypeScript fixture tests, and run both live runs.
 
 Use neutral names and local values only. This repository is public.

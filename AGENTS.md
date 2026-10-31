@@ -27,8 +27,9 @@
 
 - This repo is `evt`, a Go event-sourcing framework published as `github.com/photon-grove/evt/go`.
 - It contains the Go module (`go/`), native Rust crates (`crates/`) that share the Go storage
-  format, a Vite docs site (`website/`), a React diagram package (`packages/`), local Terraform
-  for integration tests (`infra/`), and the docs (`docs/`).
+  format, a TypeScript implementation that joins them (`packages/evt`, ADR 0009), a Vite docs site
+  (`website/`), a React diagram package (`packages/react-flow-diagrams`), local Terraform for
+  integration tests (`infra/`), and the docs (`docs/`).
 - The project is intentionally public-safe: examples should use neutral names, local emulator
   credentials, and no private application environment details.
 - Verify the remote if uncertain: `git remote get-url origin`.
@@ -52,9 +53,11 @@
 - Avoid table scans except for explicit migration, rebuild, or diagnostic flows.
 - When event JSON changes, add or update upcasters and fixture coverage so older stored events
   remain readable.
-- Go and Rust share one storage format (`docs/reference/storage-format.md`). Any change to it must
-  regenerate `compat/fixtures` (`go -C go test ./internal/compat -run TestFixtures -update`), pass in both
-  languages, and pass `scripts/compat-integration.sh dynamo|postgres`. Never hand-edit fixtures.
+- Go and Rust share one storage format (`docs/reference/storage-format.md`), and TypeScript checks
+  itself against its fixtures. Any change to it must regenerate `compat/fixtures`
+  (`go -C go test ./internal/compat -run TestFixtures -update`), pass in Go and Rust, pass the
+  TypeScript fixture runner (`pnpm exec moon run evt-ts:test evt-ts:runtimes`), and pass
+  `scripts/compat-integration.sh dynamo|postgres`. Never hand-edit fixtures.
   The exception is a Rust-first extension's fixtures (ADR 0005): Rust generates them,
   `compat/fixtures/journal.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test
   journal_fixtures` and `compat/fixtures/lambda.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p
@@ -75,6 +78,9 @@
     kept as history), `internal/` (process notes, behavioral invariants). Plan and epic IDs
     (K1, C3, X2 and so on) belong only in `adr/` and `internal/`, never in user-facing prose.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
+  - `packages/evt` (`@photon-grove/evt`, moon project `evt-ts`): the TypeScript implementation,
+    built phase by phase from ADR 0009. `packages/evt-compat` (private) is its fixture runner. TS
+    checks itself against `compat/fixtures` and generates none.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
   - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
   - `go/examples/`: public examples; keep names and scenarios neutral.
@@ -94,6 +100,12 @@
   - Use `gofmt -w -s` formatting.
   - Keep function bodies readable with blank lines between logical groups and before non-trivial
     returns. Prefer helper functions when spacing alone is not enough.
+- TypeScript (`packages/evt`):
+  - `src/` may use only the web-standard globals declared in `src/globals.d.ts`: no Node built-ins,
+    `Buffer` or `process`. `evt-ts:check` enforces it with `types: []` and an import check.
+  - ESM only, no runtime dependencies, and no top-level await in the package.
+  - `packages/evt-compat` imports the package through its `exports` map, never `src/`, and stays
+    framework-free so Bun, Deno and Node 22 run it unchanged.
 - TypeScript/React:
   - Use the repo's existing Vite, React, TypeScript, and package patterns.
   - Keep docs examples public, neutral, and inspectable.
@@ -107,7 +119,8 @@
 ## Tooling
 
 - Package manager: `pnpm` 10.x.
-- Node: 24.x, with Moon configured around Node `~24.5`.
+- Node: 24.x, with Moon configured around Node `~24.5`. The TypeScript package also supports Node
+  22.12+, Bun and Deno, pinned in `.prototools` and in CI's TypeScript job.
 - Go toolchain: Go 1.26.4 via `go/go.mod`.
 - Rust toolchain: 1.99.0 via `rust-toolchain.toml` (crate MSRV 1.88, `rust-version` in `Cargo.toml`,
   checked in CI without the `dynamodb` feature, which follows the AWS SDK's MSRV).
@@ -119,6 +132,9 @@
   - Go lint (golangci-lint, must report zero findings): `pnpm exec moon run evt:lint`
   - Website typecheck/build: `pnpm exec moon run website:typecheck website:build`
   - React diagram tests: `pnpm exec moon run react-flow-diagrams:test`
+  - TypeScript (`@photon-grove/evt`): `pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes`
+    (tsc, oxlint with `--deny-warnings`, the import check, Vitest, and the fixture runner on Node,
+    Bun and Deno)
   - Rust (toolchain pinned in `rust-toolchain.toml`): `pnpm exec moon run evt-rust:check
     evt-rust:test` (fmt check, clippy `-D warnings`, tests)
   - Rust and cross-language integration: `pnpm exec moon run evt-rust:integration
@@ -149,12 +165,15 @@
   - From `go/`: `go mod tidy` with no `go.mod`/`go.sum` diff, `go vet ./...` and `go test ./...`.
   - `pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build react-flow-diagrams:test`
   - `pnpm exec moon run evt-rust:check evt-rust:test` (Rust job)
+  - `pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes`, then the fixture runner on Node
+    22.12 (TypeScript job)
 - CI integration checks start Moto or PostgreSQL, apply the local Terraform, and run
   `evt:integration` / `evt:integration-postgres`, plus `evt-rust:integration` /
   `evt-rust:integration-postgres` when the storage format may have changed.
-- A `changes` job classifies changed paths: Rust-only changes skip Go jobs and Go-only changes skip
-  the Rust job. Keep its path lists in `.github/workflows/ci.yml` in sync when adding directories. Go lives
-  under `go/`, and the release tags are `go/vX.Y.Z`.
+- A `changes` job classifies changed paths: Rust-only changes skip Go jobs, Go-only changes skip
+  the Rust job, and only TypeScript, fixture and shared-config changes run the TypeScript job. Keep
+  its path lists in `.github/workflows/ci.yml` in sync when adding directories. Go lives under
+  `go/`, and the release tags are `go/vX.Y.Z`.
 - Before staging, inspect dependency and workspace churn:
 
   ```sh
