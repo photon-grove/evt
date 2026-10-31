@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 	"github.com/stretchr/testify/require"
 
 	evt "github.com/photon-grove/evt/go"
@@ -223,6 +224,66 @@ func TestRebuildFence_BeginGivesUpAfterEightLostRaces(t *testing.T) {
 	require.Equal(t, evt.MaxRebuildBeginAttempts, conflict.Attempts)
 	require.EqualValues(t, evt.MaxRebuildBeginAttempts, client.sent.Load())
 	require.True(t, policy.IsTransient(err))
+}
+
+// failingBegin fails every fence transaction with err, without applying it.
+type failingBegin struct {
+	*compat.FakeDynamo
+
+	err error
+}
+
+func (c *failingBegin) TransactWriteItems(
+	context.Context,
+	*dynamodb.TransactWriteItemsInput,
+	...func(*dynamodb.Options),
+) (*dynamodb.TransactWriteItemsOutput, error) {
+	return nil, c.err
+}
+
+// A begin whose result is unknown says so and carries the lease it would have returned; one that
+// was throttled or refused wrote nothing and keeps its classification.
+func TestRebuildFence_OnlyABeginWhoseResultIsUnknownIsIndeterminate(t *testing.T) {
+	begin := func(err error) error {
+		_, berr := newFenceRepo(&failingBegin{FakeDynamo: compat.NewFakeDynamo(), err: err}).
+			RebuildFence().Begin(context.Background(), "job", time.Minute)
+
+		return berr
+	}
+	cancelled := func(code string) error {
+		return &types.TransactionCanceledException{CancellationReasons: []types.CancellationReason{
+			{Code: aws.String(code)}, {Code: aws.String("None")},
+		}}
+	}
+
+	for name, err := range map[string]error{
+		"a timeout":      context.DeadlineExceeded,
+		"a server fault": &smithy.GenericAPIError{Code: "InternalServerError", Fault: smithy.FaultServer},
+		"in progress":    &smithy.GenericAPIError{Code: "TransactionInProgressException", Fault: smithy.FaultClient},
+	} {
+		berr := begin(err)
+
+		var indeterminate *evt.RebuildBeginIndeterminateError
+		require.ErrorAs(t, berr, &indeterminate, name)
+		require.Equal(t, evt.RebuildLease{Owner: "job", Generation: 1, LeaseExpiresAt: rebuildNow.Add(time.Minute)}, indeterminate.Lease, name)
+		require.Zero(t, indeterminate.Observed, name)
+		require.ErrorIs(t, berr, err, name)
+		require.Equal(t, policy.ClassUnknown, policy.Classify(berr), name)
+	}
+
+	for name, err := range map[string]error{
+		"a throttled cancellation":      cancelled("ThrottlingError"),
+		"a cancellation for throughput": cancelled("ProvisionedThroughputExceeded"),
+		"a throttled request":           &smithy.GenericAPIError{Code: "ThrottlingException", Fault: smithy.FaultClient},
+		"a validation failure":          &smithy.GenericAPIError{Code: "ValidationException", Fault: smithy.FaultClient},
+	} {
+		berr := begin(err)
+		require.Error(t, berr, name)
+		require.False(t, evt.IsRebuildBeginIndeterminateErr(berr), name)
+		require.ErrorIs(t, berr, err, name)
+	}
+
+	require.True(t, policy.IsTransient(begin(cancelled("ThrottlingError"))), "a throttled begin is retried later")
 }
 
 func TestRebuildFence_ReadsAreAlwaysConsistentAndRefuseCorruptItems(t *testing.T) {

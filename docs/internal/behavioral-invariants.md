@@ -1019,7 +1019,12 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   during a rebuild is not recorded and the same command ID runs again once the rebuild ends.
 - **Lifecycle** (`evt.RebuildFence`, from `evt.RebuildFenceProvider`; Rust `RebuildFence`):
   `Begin` acquires or takes over an expired lease (`*evt.RebuildLockHeldError` while one is held,
-  `*evt.RebuildStateInvalidError` for a state the protocol cannot produce), `Renew` extends the
+  `*evt.RebuildStateInvalidError` for a state the protocol cannot produce,
+  `*evt.RebuildBeginIndeterminateError` with the lease it would have returned and the generation it
+  observed when its transaction's result is unknown, never a throttle or a cancellation;
+  `RebuildState.HoldsBegun` settles it, exactly only for an owner token unique to the caller. Rust's
+  `ProjectionRebuild::run` and `rebuild_with_lock` begin again once it can no longer apply and
+  otherwise return it, never a lock not taken, and never carry on under it), `Renew` extends the
   lease, `End` releases it (both, and `WriteViews`, take the whole `evt.RebuildLease`), `ForceRelease` is the operator's escape hatch, and `WriteViews`
   writes one guarded batch of at most 99 view operations whose last action is a lease guard. A
   caller that no longer holds the lock gets `*evt.RebuildLeaseLostError` and must stop; on

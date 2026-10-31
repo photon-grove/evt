@@ -42,7 +42,9 @@ fence := repo.(evt.RebuildFenceProvider).RebuildFence()
 
 lease, err := fence.Begin(ctx, owner, 5*time.Minute)
 if err != nil {
-    return err // *evt.RebuildLockHeldError: another rebuild holds an unexpired lease
+    // *evt.RebuildLockHeldError: another rebuild holds an unexpired lease.
+    // *evt.RebuildBeginIndeterminateError: the begin may have taken the lock (see below).
+    return err
 }
 
 result, err := evt.RebuildProjections(ctx, repo, applyEvent, cfg)
@@ -64,6 +66,16 @@ which makes it a fencing token, meaning a value every later write must present s
 can't act after it's been replaced. `Renew`, `End` and `WriteViews` take the whole `evt.RebuildLease`,
 so a worker whose lease lapsed can't renew, write for, or end the lease of a later incarnation
 that took over under the same owner token. It gets `*evt.RebuildLeaseLostError` instead.
+
+A `Begin` that times out, loses its response, or hits a server fault may have taken the lock
+anyway. It returns `*evt.RebuildBeginIndeterminateError`, never a plain failure, with the `Lease`
+the begin would have returned and the generation it `Observed`. Don't treat it as "not taken": a
+lock nobody ends keeps every commit refused until it lapses and a later rebuild takes it over and
+finishes. Read `fence.State(ctx)` and call `state.HoldsBegun(err.Lease, err.Observed)`. Held means
+the begin applied, so carry on under that lease or `End` it, provided the owner token is your
+run's own (two concurrent begins under one token can write the same lease). Settled but not held
+means it can never apply, so begin again. Unsettled means it may still land. A throttled or cancelled `Begin` wrote nothing and keeps its
+usual classification.
 
 Renew well inside the lease you asked for, because a worker that pauses past its lease can be
 replaced by a takeover. Write view batches through `fence.WriteViews` to have each one conditioned

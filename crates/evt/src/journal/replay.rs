@@ -165,7 +165,9 @@ pub async fn rebuild_with_lease<'a, F: RebuildFence>(
 /// as [`REBUILD_OWNER`] for `lease` ([`begin_rebuild`](RebuildFence::begin_rebuild)), writes it,
 /// renewing the lease for another `lease` before a batch whenever half of it has passed, and
 /// releases the lock, which settles the generation for readers. A lock another rebuild holds is
-/// [`Error::RebuildLockHeld`]; events that cannot be replayed ([`Error::InvalidJournal`]) fail
+/// [`Error::RebuildLockHeld`]; a begin whose result is unknown that may still hold the lock is
+/// [`Error::RebuildBeginIndeterminate`] (every journal rebuild shares [`REBUILD_OWNER`], so the
+/// run never carries on under a lease another run could have written); events that cannot be replayed ([`Error::InvalidJournal`]) fail
 /// before the lock is taken. `events` are read before the lock, so a commit that lands in between
 /// is missing from the rebuild: rebuild a table nothing writes to, or read the events under a lease
 /// and use [`rebuild_with_lease`].

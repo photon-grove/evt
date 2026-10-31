@@ -250,6 +250,25 @@ func TestInTxMarksOnlyNonDatabaseCommitFailuresIndeterminate(t *testing.T) {
 	require.NoError(t, run(nil))
 }
 
+// A Begin whose COMMIT got no answer from the database may hold the lock: it says so with the lease
+// the attempt decided on. A database error at COMMIT is definitive.
+func TestBeginErrorReportsAnUnansweredCommitAsIndeterminate(t *testing.T) {
+	begun := evt.RebuildLease{Owner: "job", Generation: 1}
+	begin := func(commitErr error) error {
+		repo := NewRepository(commitStubDB{tx: commitStubTx{commitErr: commitErr}})
+
+		return beginError(repo.inTx(context.Background(), func(pgx.Tx) error { return nil }), begun, 0)
+	}
+
+	var indeterminate *evt.RebuildBeginIndeterminateError
+	require.ErrorAs(t, begin(errors.New("conn closed")), &indeterminate)
+	require.Equal(t, begun, indeterminate.Lease)
+	require.ErrorIs(t, begin(context.DeadlineExceeded), context.DeadlineExceeded)
+	require.Equal(t, policy.ClassUnknown, policy.Classify(begin(context.DeadlineExceeded)))
+
+	require.False(t, evt.IsRebuildBeginIndeterminateErr(begin(&pgconn.PgError{Code: "40001"})))
+}
+
 // Every engine transaction sets READ COMMITTED before its first statement, whatever the server's
 // default isolation (the integration suite's Test_Isolation_* runs the race it prevents).
 func TestInTxSetsReadCommittedFirst(t *testing.T) {

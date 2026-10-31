@@ -140,6 +140,26 @@ impl RebuildState {
     pub fn in_progress(&self) -> bool {
         self.lock.is_some()
     }
+
+    /// Settles a begin whose result is unknown ([`Error::RebuildBeginIndeterminate`]) from a state
+    /// read after it failed, given the error's `lease` and `observed` generation: `Some(true)` when
+    /// the lock holds `lease`, so the begin applied; `Some(false)` when it does not and the begin
+    /// can no longer take it, because the generation has moved from the `observed` value its
+    /// transaction was conditioned on (the generation only grows); `None` while the generation is
+    /// still `observed`, because the begin may still land.
+    ///
+    /// `Some(false)` means only that `lease` does not hold the lock: a begin that applied and was
+    /// then force-released or taken over settles the same way. `Some(true)` is exact only when the
+    /// owner token is unique to the caller, because a concurrent begin under the same token from
+    /// the same generation writes the same lease. The generation is read before the lock, so a
+    /// begin that lands between the two reads still settles as held.
+    pub fn holds_begun(&self, lease: &RebuildLease, observed: i64) -> Option<bool> {
+        if self.lock.as_ref().is_some_and(|lock| lease.holds(lock)) {
+            return Some(true);
+        }
+
+        (self.generation.value != observed).then_some(false)
+    }
 }
 
 /// What [`RebuildFence::begin_rebuild`] returns: the owner, the odd generation the transaction
@@ -203,6 +223,12 @@ pub trait RebuildFence: Send + Sync {
     /// persists through every attempt. The returned lease carries the odd generation the
     /// transaction produced: one more than a settled generation, two more after a force-release or
     /// for a takeover.
+    ///
+    /// A transaction whose result is unknown (a timeout, a lost response, a server fault, a
+    /// connection dropped during `COMMIT`) is [`Error::RebuildBeginIndeterminate`], carrying the
+    /// lease it would have returned and the generation it was conditioned on. A throttled or
+    /// cancelled one wrote nothing: a lost race is
+    /// decided again, and throttling stays [`Error::Transient`].
     fn begin_rebuild(
         &self,
         owner: &str,
@@ -698,18 +724,54 @@ pub(crate) struct Held {
 impl Held {
     /// Takes the lock as `owner` for `lease`, reading the generation just before the begin to tell
     /// an acquire from a settled generation from a takeover or an acquire after a force-release.
+    ///
+    /// A begin whose result is unknown is settled from a fresh read
+    /// ([`RebuildState::holds_begun`]). One that can no longer apply is begun again, for at most
+    /// [`MAX_REBUILD_BEGIN_ATTEMPTS`] rounds of `begin_rebuild` in all, then
+    /// [`Error::RebuildConflict`]. Every other outcome, a failed read included, is returned as
+    /// [`Error::RebuildBeginIndeterminate`], never as a lock not taken. That includes a begin the
+    /// read shows applied: the owner token may be shared (the journal's `REBUILD_OWNER`), and a
+    /// concurrent run under it writes the same lease, so carrying on, or ending the lock, could act
+    /// on that run's lock. The caller, which knows whether its token is its own, settles it.
     pub(crate) async fn take<F: RebuildFence + ?Sized>(
         fence: &F,
         owner: &str,
         lease: Duration,
     ) -> Result<Self, Error> {
-        let before = fence.rebuild_generation().await?;
-        let lease = fence.begin_rebuild(owner, lease).await?;
+        for _ in 0..MAX_REBUILD_BEGIN_ATTEMPTS {
+            let before = fence.rebuild_generation().await?;
+            let lease = match fence.begin_rebuild(owner, lease).await {
+                Ok(lease) => lease,
+                Err(Error::RebuildBeginIndeterminate {
+                    lease,
+                    observed,
+                    source,
+                }) => {
+                    let state = fence.rebuild_state().await;
+                    if let Ok(Some(false)) = state.map(|state| state.holds_begun(&lease, observed))
+                    {
+                        // Another transition moved the generation from the begin's: decide again.
+                        continue;
+                    }
 
-        Ok(Self {
-            from_settled: acquired_from_settled(before, &lease),
-            lease,
-            taken: Instant::now(),
+                    return Err(Error::RebuildBeginIndeterminate {
+                        lease,
+                        observed,
+                        source,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+
+            return Ok(Self {
+                from_settled: acquired_from_settled(before, &lease),
+                lease,
+                taken: Instant::now(),
+            });
+        }
+
+        Err(Error::RebuildConflict {
+            attempts: MAX_REBUILD_BEGIN_ATTEMPTS,
         })
     }
 
@@ -801,6 +863,58 @@ mod tests {
             generation: 3,
             lease_expires_at,
         })
+    }
+
+    #[test]
+    fn an_indeterminate_begin_settles_once_the_generation_moves_from_the_one_it_observed() {
+        // An acquire from settled 2, and a takeover of the odd 3, both to the fencing token 3 or 5.
+        let acquire = RebuildLease {
+            owner: "w".into(),
+            generation: 3,
+            lease_expires_at: 100,
+        };
+        let takeover = RebuildLease {
+            generation: 5,
+            ..acquire.clone()
+        };
+        let state = |value, lock| RebuildState {
+            generation: generation(value, false),
+            lock,
+        };
+
+        // The lock holds the lease: the begin applied (the two DynamoDB reads may straddle it).
+        assert_eq!(
+            state(3, lock("w", 100)).holds_begun(&acquire, 2),
+            Some(true)
+        );
+        assert_eq!(
+            state(2, lock("w", 100)).holds_begun(&acquire, 2),
+            Some(true)
+        );
+
+        // The generation is still the one the begin was conditioned on: it may yet land.
+        assert_eq!(state(2, None).holds_begun(&acquire, 2), None);
+        let expired = state(3, lock("x", 10));
+        assert_eq!(expired.holds_begun(&takeover, 3), None);
+
+        // It moved without the lease: another begin won, or this one was replaced.
+        assert_eq!(
+            state(3, lock("other", 100)).holds_begun(&acquire, 2),
+            Some(false)
+        );
+        assert_eq!(state(4, None).holds_begun(&acquire, 2), Some(false));
+        assert_eq!(
+            RebuildState {
+                generation: generation(5, true),
+                lock: None,
+            }
+            .holds_begun(&acquire, 2),
+            Some(false),
+            "a force-released begin no longer holds the lock"
+        );
+
+        // The expired holder ended its own lease below the takeover's token: it can never land.
+        assert_eq!(state(4, None).holds_begun(&takeover, 3), Some(false));
     }
 
     #[test]

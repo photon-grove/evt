@@ -247,6 +247,31 @@ pub enum Error {
         attempts: usize,
     },
 
+    /// [`begin_rebuild`](crate::RebuildFence::begin_rebuild)'s transaction failed in a way that
+    /// leaves it unknown whether it applied: a timeout, a lost connection or response, a server
+    /// fault, a connection dropped during `COMMIT`. The caller may hold the lock under `lease`,
+    /// the lease the begin would have returned, or the begin may still land: never treat it as
+    /// "not taken", because a lock that is taken and never ended keeps every commit refused.
+    ///
+    /// Settle it with [`RebuildState::holds_begun`](crate::RebuildState::holds_begun) over a
+    /// fresh [`rebuild_state`](crate::RebuildFence::rebuild_state): the lock holds `lease` (it
+    /// applied, so carry on under it or end it), or it can no longer apply (begin again), or it is
+    /// still unknown. "Holds" is exact only when the owner token is unique to the caller: a
+    /// concurrent begin under the same token from the same generation writes the same lease. A
+    /// throttled or cancelled begin is refused before anything is written and never reports this.
+    /// It is not retryable as it stands: a begin that applied refuses a second one with
+    /// [`Error::RebuildLockHeld`] naming the caller's own owner token.
+    #[error("rebuild begin for {:?} may or may not have taken the lock: {source}", lease.owner)]
+    RebuildBeginIndeterminate {
+        /// The lease the begin would have returned, fencing token included.
+        lease: Box<crate::RebuildLease>,
+        /// The generation value the begin's transaction was conditioned on: it can apply only
+        /// while the generation still has this value.
+        observed: i64,
+        /// The indeterminate failure.
+        source: BoxError,
+    },
+
     /// The rebuild lock and generation disagree in a way the protocol cannot produce (an odd
     /// generation with no lock and no force-release flag, or a lock with an even generation),
     /// because every transition writes both in one transaction. It is reported, never repaired.

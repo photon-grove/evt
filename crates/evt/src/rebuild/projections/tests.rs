@@ -371,6 +371,7 @@ struct Probe {
     inner: MemRepository,
     writes: Mutex<Vec<(usize, bool, bool)>>,
     fail_write: std::sync::atomic::AtomicUsize,
+    fail_begin: Mutex<Option<BeginFault>>,
     expired: Mutex<Vec<(EntityId, EventSequence)>>,
 }
 
@@ -380,9 +381,21 @@ impl Probe {
             inner,
             writes: Mutex::new(Vec::new()),
             fail_write: Default::default(),
+            fail_begin: Mutex::new(None),
             expired: Mutex::new(Vec::new()),
         }
     }
+}
+
+/// How the next begin fails with [`Error::RebuildBeginIndeterminate`].
+#[derive(Clone, Copy, Debug)]
+enum BeginFault {
+    /// It really took the lock.
+    Applied,
+    /// It did not, and the generation has not moved: it might still.
+    Unknown,
+    /// It did not, and another rebuild began and ended meanwhile, so it never can.
+    Overtaken,
 }
 
 impl Repository for Probe {
@@ -478,7 +491,34 @@ impl RebuildFence for Probe {
     }
 
     async fn begin_rebuild(&self, owner: &str, lease: Duration) -> Result<RebuildLease, Error> {
-        self.inner.begin_rebuild(owner, lease).await
+        let fault = self.fail_begin.lock().unwrap().take();
+        let Some(fault) = fault else {
+            return self.inner.begin_rebuild(owner, lease).await;
+        };
+
+        let observed = self.inner.rebuild_generation().await?.value;
+        let lease = match fault {
+            BeginFault::Applied => self.inner.begin_rebuild(owner, lease).await?,
+            BeginFault::Unknown | BeginFault::Overtaken => {
+                let lease = RebuildLease {
+                    owner: owner.to_owned(),
+                    generation: observed + 1,
+                    lease_expires_at: 0,
+                };
+                if matches!(fault, BeginFault::Overtaken) {
+                    let other = self.inner.begin_rebuild("other", LEASE).await?;
+                    self.inner.end_rebuild(&other).await?;
+                }
+
+                lease
+            }
+        };
+
+        Err(Error::RebuildBeginIndeterminate {
+            lease: Box::new(lease),
+            observed,
+            source: "injected: the begin's result is unknown".into(),
+        })
     }
 
     async fn renew_rebuild(
@@ -562,6 +602,72 @@ async fn the_rebuild_holds_the_fence_and_writes_guarded_batches_of_at_most_99() 
         .execute("after", Add(1), Metadata::default())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn an_indeterminate_begin_is_begun_again_only_when_it_can_no_longer_apply() {
+    let run = |fault| async move {
+        let probe = Probe::new(MemRepository::new());
+        ledgers(&probe.inner, 3).await;
+        *probe.fail_begin.lock().unwrap() = Some(fault);
+        let result = ProjectionRebuild::new(&probe)
+            .with_projector(Totals::arc("totals"))
+            .aggregate::<Ledger>()
+            .run("rebuild-1", LEASE)
+            .await;
+
+        (probe, result)
+    };
+
+    // Another rebuild moved the generation from the begin's, so it can never apply: begin again.
+    let (probe, result) = run(BeginFault::Overtaken).await;
+    assert_eq!(result.unwrap().puts, 3);
+    assert_eq!(probe.inner.rebuild_generation().await.unwrap().value, 4);
+
+    // Still unknown: the error says so, with the lease the begin may yet take.
+    let (probe, result) = run(BeginFault::Unknown).await;
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::RebuildBeginIndeterminate { lease, observed: 0, .. }
+                if lease.owner == "rebuild-1" && lease.generation == 1
+        ),
+        "{error:?}"
+    );
+    assert!(!error.is_retryable());
+    assert!(
+        probe
+            .inner
+            .list_views_by_pk("totals")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // It applied, but a concurrent run under the same owner token would have written the same
+    // lease, so the run neither carries on under it nor ends it: it reports the lock it may hold.
+    let (probe, result) = run(BeginFault::Applied).await;
+    let Err(Error::RebuildBeginIndeterminate {
+        lease, observed, ..
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    let state = probe.inner.rebuild_state().await.unwrap();
+    assert_eq!(state.holds_begun(&lease, observed), Some(true));
+    assert!(
+        probe
+            .inner
+            .list_views_by_pk("totals")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A caller whose owner token is its own settles it and ends the lock.
+    probe.inner.end_rebuild(&lease).await.unwrap();
+    assert!(probe.inner.rebuild_generation().await.unwrap().is_settled());
 }
 
 async fn ledgers<R: Repository>(repository: &R, count: usize) {

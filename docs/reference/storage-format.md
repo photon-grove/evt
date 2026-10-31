@@ -2067,6 +2067,26 @@ traffic a lifecycle transaction can lose several races in a row and `Begin` retu
 acquire from a quiesced state by one, so a reader pinned to any earlier epoch sees a changed
 generation either way.
 
+A begin transaction whose result is unknown (DynamoDB: a timeout, a dispatch failure, an
+unparseable response, a 5xx or a server-fault code, `TransactionInProgressException`; PostgreSQL:
+an error the database did not raise at `COMMIT`, such as a dropped connection) is
+`RebuildBeginIndeterminate`, carrying the lease the transaction would have produced and the
+generation value its conditions named (`observed`). A throttled request or a cancellation
+(throttling, a failed condition, a transaction conflict) wrote nothing: it keeps its
+classification, and a lost race decides again. The caller settles an indeterminate begin by
+reading the state, generation first: the lock holds the lease (same owner and fencing token), so
+the begin applied; or the generation has moved from `observed` without it, so the begin does not
+hold the lock and can never apply, because its condition named `observed` and the generation only
+grows; or the generation is still `observed` and the begin may still land. Go's
+`RebuildState.HoldsBegun` and Rust's `RebuildState::holds_begun` implement that rule. "The lock
+holds the lease" is exact only when the owner token is unique to the caller, because two
+concurrent begins under one token from the same generation produce the same lease. So Rust's
+`ProjectionRebuild::run` and `rebuild_with_lock` (whose owner token every journal rebuild shares)
+begin again only when the begin can no longer apply, and otherwise return the error. A
+separate error rather than Rust's `Indeterminate` (or Go's `AmbiguousWriteError`), because those
+belong to outcome-carrying commits, which a store settles by re-reading the outcome row; a begin
+is settled from the lock row, and needs the fencing token it would have produced to do it.
+
 Request shapes. The acquire's generation condition is the union written above, with all five
 values always bound, because DynamoDB rejects a request that binds a value its expressions do not
 use. A branch that does not apply binds its value to `-1`, which no generation equals:
@@ -2106,6 +2126,7 @@ languages and none is a conflict or a stale-fence rejection.
 | `RebuildLockHeld` (`Error::RebuildLockHeld`)         | `Begin` found an unexpired lock. Names the owner and the expiry. Not retried by the engine.                                        |
 | `RebuildLeaseLost` (`Error::RebuildLeaseLost`)       | `Renew`, `End`, `ForceRelease`, or a guarded write found the lock gone, owned by someone else, held under another generation (a later incarnation of the same owner token), or (guarded write) expired.         |
 | `RebuildConflict` (`Error::RebuildConflict`)         | `Begin` lost its race eight times. Transient.                                                                                  |
+| `RebuildBeginIndeterminate` (`Error::RebuildBeginIndeterminate`) | `Begin`'s transaction failed with its result unknown. Carries the lease it would have returned and the generation it observed. Never transient: settle it from the state. |
 | `RebuildStateInvalid` (`Error::RebuildStateInvalid`) | The two rows disagree in a way this protocol cannot produce.                                                                       |
 | `RebuildUnavailable` (`Error::RebuildUnavailable`)   | A reader found an odd generation: a rebuild is in progress, or a force-release left derived state untrustworthy. Transient.    |
 | `RebuildEpochChanged` (`Error::RebuildEpochChanged`) | A reader's generation changed between its before and after reads. Transient.                                                   |
@@ -3397,7 +3418,8 @@ name.)
   transaction each, under the exclusive advisory lock, and read the state inside it, so a
   conditional statement that matches no row means a writer outside the protocol moved the rows: the
   attempt rolls back and `Begin` decides again, at most eight times, then fails with the transient
-  `RebuildConflict` (release and force-release report `RebuildLeaseLost`). Leases are stored as
+  `RebuildConflict` (release and force-release report `RebuildLeaseLost`). A `COMMIT` of a begin
+  that fails with no database error is `RebuildBeginIndeterminate`. Leases are stored as
   `timestamptz` and compared as whole epoch seconds (the same seconds the DynamoDB item stores)
   by converting both sides in SQL:
 

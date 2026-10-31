@@ -214,12 +214,15 @@ func (f *rebuildFence) Begin(ctx context.Context, owner string, lease time.Durat
 	}
 
 	for attempt := 1; attempt <= evt.MaxRebuildBeginAttempts; attempt++ {
-		var started evt.RebuildLease
+		var (
+			started  evt.RebuildLease
+			observed int64
+		)
 
 		err = f.repo.inTx(ctx, func(tx pgx.Tx) error {
 			var berr error
 
-			started, berr = f.begin(ctx, tx, owner, seconds)
+			started, observed, berr = f.begin(ctx, tx, owner, seconds)
 
 			return berr
 		})
@@ -227,9 +230,11 @@ func (f *rebuildFence) Begin(ctx context.Context, owner string, lease time.Durat
 			return started, nil
 		}
 
-		if !errors.Is(err, errRebuildMoved) {
-			return evt.RebuildLease{}, err
+		if errors.Is(err, errRebuildMoved) {
+			continue
 		}
+
+		return evt.RebuildLease{}, beginError(err, started, observed)
 	}
 
 	return evt.RebuildLease{}, &policy.ClassifiedError{
@@ -238,28 +243,41 @@ func (f *rebuildFence) Begin(ctx context.Context, owner string, lease time.Durat
 	}
 }
 
+// beginError maps a failed Begin attempt: a COMMIT whose result is unknown may have taken the lock
+// under begun, which the attempt had decided on from the observed generation before it committed.
+func beginError(err error, begun evt.RebuildLease, observed int64) error {
+	var indeterminate *indeterminateCommitError
+	if errors.As(err, &indeterminate) {
+		return &evt.RebuildBeginIndeterminateError{Lease: begun, Observed: observed, Cause: indeterminate.err}
+	}
+
+	return err
+}
+
 // begin runs one Begin attempt inside tx. A conditional statement that matches no row returns
 // errRebuildMoved, which rolls the attempt back.
-func (f *rebuildFence) begin(ctx context.Context, tx pgx.Tx, owner string, seconds int64) (evt.RebuildLease, error) {
+func (f *rebuildFence) begin(
+	ctx context.Context, tx pgx.Tx, owner string, seconds int64,
+) (evt.RebuildLease, int64, error) {
 	if err := f.lockExclusive(ctx, tx); err != nil {
-		return evt.RebuildLease{}, err
+		return evt.RebuildLease{}, 0, err
 	}
 
 	generation, err := f.generation(ctx, tx, true)
 	if err != nil {
-		return evt.RebuildLease{}, err
+		return evt.RebuildLease{}, 0, err
 	}
 
 	lock, err := f.lock(ctx, tx, true)
 	if err != nil {
-		return evt.RebuildLease{}, err
+		return evt.RebuildLease{}, 0, err
 	}
 
 	now := f.repo.clock()
 
 	plan, err := evt.PlanRebuildBegin(evt.RebuildState{Generation: generation, Lock: lock}, now)
 	if err != nil {
-		return evt.RebuildLease{}, err
+		return evt.RebuildLease{}, 0, err
 	}
 
 	expiry := now.Unix() + seconds
@@ -271,14 +289,14 @@ func (f *rebuildFence) begin(ctx context.Context, tx pgx.Tx, owner string, secon
 	}
 
 	if err != nil {
-		return evt.RebuildLease{}, err
+		return evt.RebuildLease{}, 0, err
 	}
 
 	return evt.RebuildLease{
 		Owner:          owner,
 		Generation:     generation.Value + plan.Increment,
 		LeaseExpiresAt: time.Unix(expiry, 0),
-	}, nil
+	}, generation.Value, nil
 }
 
 func (f *rebuildFence) acquire(

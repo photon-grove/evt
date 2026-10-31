@@ -300,3 +300,54 @@ func TestIsRebuildTransient_NamesTheRefusalsARetryCanOutwait(t *testing.T) {
 	require.ErrorIs(t, &evt.RebuildInProgressError{}, evt.ErrRebuildInProgress)
 	require.False(t, evt.IsOptimisticConflict(&evt.RebuildInProgressError{}), "a refusal is never a conflict")
 }
+
+func TestRebuildState_HoldsBegunSettlesOnceTheGenerationMovesFromTheObservedOne(t *testing.T) {
+	// An acquire from settled 2 (token 3), and a takeover of the odd 3 (token 5).
+	acquire := evt.RebuildLease{Owner: "w", Generation: 3}
+	takeover := evt.RebuildLease{Owner: "w", Generation: 5}
+	state := func(value int64, lock *evt.RebuildLock) evt.RebuildState {
+		return evt.RebuildState{Generation: evt.RebuildGeneration{Value: value}, Lock: lock}
+	}
+	lock := func(owner string, generation int64) *evt.RebuildLock {
+		return &evt.RebuildLock{Owner: owner, Generation: generation}
+	}
+
+	check := func(s evt.RebuildState, lease evt.RebuildLease, observed int64, held, settled bool, msg string) {
+		t.Helper()
+
+		gotHeld, gotSettled := s.HoldsBegun(lease, observed)
+		require.Equal(t, [2]bool{held, settled}, [2]bool{gotHeld, gotSettled}, msg)
+	}
+
+	// The lock holds the lease: the begin applied (the two DynamoDB reads may straddle it).
+	check(state(3, lock("w", 3)), acquire, 2, true, true, "held")
+	check(state(2, lock("w", 3)), acquire, 2, true, true, "held, generation read first")
+
+	// The generation is still the observed one: the begin may yet land.
+	check(state(2, nil), acquire, 2, false, false, "pending")
+	check(state(3, lock("x", 3)), takeover, 3, false, false, "a pending takeover")
+
+	// It moved without the lease: another begin won, or this one was replaced.
+	check(state(3, lock("other", 3)), acquire, 2, false, true, "another begin won")
+	check(state(4, nil), acquire, 2, false, true, "ended since")
+	check(evt.RebuildState{Generation: evt.RebuildGeneration{Value: 5, ForceReleased: true}}, acquire, 2, false, true, "force-released")
+	check(state(5, lock("w", 5)), acquire, 2, false, true, "a later begin by the same owner token is not this lease")
+
+	// The expired holder ended its own lease below the takeover's token: it can never land.
+	check(state(4, nil), takeover, 3, false, true, "the holder ended first")
+}
+
+func TestRebuildBeginIndeterminateError_KeepsItsLeaseAndCause(t *testing.T) {
+	cause := context.DeadlineExceeded
+	err := fmt.Errorf("rebuilding: %w", &evt.RebuildBeginIndeterminateError{
+		Lease: evt.RebuildLease{Owner: "w", Generation: 1},
+		Cause: cause,
+	})
+
+	var indeterminate *evt.RebuildBeginIndeterminateError
+	require.ErrorAs(t, err, &indeterminate)
+	require.Equal(t, int64(1), indeterminate.Lease.Generation)
+	require.ErrorIs(t, err, cause)
+	require.True(t, evt.IsRebuildBeginIndeterminateErr(err))
+	require.False(t, evt.IsRebuildTransient(err))
+}
