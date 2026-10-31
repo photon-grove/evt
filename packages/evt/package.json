@@ -23,6 +23,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./dynamodb": {
+      "types": "./dist/dynamodb/index.d.ts",
+      "default": "./dist/dynamodb/index.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

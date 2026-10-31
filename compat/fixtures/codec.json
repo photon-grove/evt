@@ -141,15 +141,15 @@
         "entityId": "acct-1",
         "entityType": "account",
         "payload": "{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 ☕ \\\"q\\\" \\\\ \\t\"}",
-        "metadataJson": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"},\"commitId\":\"\"}"
+        "metadataJson": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001  \\b \\f\"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"},\"commitId\":\"\"}"
       },
-      "serializedEventJson": "{\"id\":\"acct-1:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"},\"commitId\":\"\"}}",
+      "serializedEventJson": "{\"id\":\"acct-1:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001  \\b \\f\"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"},\"commitId\":\"\"}}",
       "dynamoItem": {
         "entityType": {
           "S": "account"
         },
         "metadata": {
-          "S": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"},\"commitId\":\"\"}"
+          "S": "{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001  \\b \\f\"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"},\"commitId\":\"\"}"
         },
         "payload": {
           "S": "{\"amountCents\":1,\"memo\":\"Coffee & <cake> \u2028 \u2029 ☕ \\\"q\\\" \\\\ \\t\"}"
@@ -167,7 +167,7 @@
           "N": "1"
         }
       },
-      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001 \"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"},\"commitId\":\"\"}}}",
+      "snsMessage": "{\"version\":\"\",\"id\":\"acct-1:4\",\"detail-type\":\"account:deposited\",\"source\":\"evt-compat\",\"account\":\"\",\"time\":\"0001-01-01T00:00:00Z\",\"region\":\"\",\"resources\":null,\"detail\":{\"id\":\"acct-1:4\",\"sequence\":4,\"type\":\"account:deposited\",\"version\":1,\"entityId\":\"acct-1\",\"entityType\":\"account\",\"payload\":\"eyJhbW91bnRDZW50cyI6MSwibWVtbyI6IkNvZmZlZSAmIDxjYWtlPiDigKgg4oCpIOKYlSBcInFcIiBcXCBcdCJ9\",\"metadata\":{\"commandId\":\"cmd \\u003c\\u0026\\u003e \\u2028 \\u2029\",\"trace\":null,\"origin\":{\"source\":\"\\u003cscript\\u003ealert('x')\\u003c/script\\u003e\",\"endpoint\":\"tab\\tnew\\nline \\\"quote\\\" \\\\ \\u0001  \\b \\f\"},\"address\":\"é ü 漢字 🚀\",\"region\":\"us-west-2\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"principalId\":\"user\\u003c\\u0026\\u003e \\u2028\",\"causationId\":\"cmd\\t\\\"quoted\\\"\",\"extensions\":{\"\\u003ck\\u003e\\u0026ey\":\"v\\u003c\\u0026\\u003e \\u2028\",\"é\":\"漢字\"},\"commitId\":\"\"}}}",
       "snsAttributes": {
         "commandId": "cmd <&> \u2028 \u2029",
         "correlationId": "cmd <&> \u2028 \u2029",
@@ -482,6 +482,11 @@
       "name": "whitespace-and-escapes",
       "input": "{ \"region\" : \"us\\u002dwest\\u002d2\", \"timestamp\":\"t\" }",
       "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"us-west-2\",\"timestamp\":\"t\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"\"}"
+    },
+    {
+      "name": "short-escapes",
+      "input": "{\"region\":\"a\\bb\\fc\",\"timestamp\":\"\\u0008\\u000c\"}",
+      "canonical": "{\"commandId\":null,\"trace\":null,\"origin\":null,\"address\":null,\"region\":\"a\\bb\\fc\",\"timestamp\":\"\\b\\f\",\"principalId\":null,\"causationId\":null,\"extensions\":{},\"commitId\":\"\"}"
     },
     {
       "name": "null-trace-value",

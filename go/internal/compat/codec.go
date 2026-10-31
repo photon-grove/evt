@@ -79,7 +79,7 @@ func codecEvents() []namedEvent {
 
 	escaping := evt.Metadata{
 		CommandID:   ptr(evt.CommandID("cmd <&> \u2028 \u2029")),
-		Origin:      &evt.Origin{Source: "<script>alert('x')</script>", Endpoint: "tab\tnew\nline \"quote\" \\ \u0001 \u007f"},
+		Origin:      &evt.Origin{Source: "<script>alert('x')</script>", Endpoint: "tab\tnew\nline \"quote\" \\ \u0001 \u007f \b \f"},
 		Address:     ptr("é ü 漢字 🚀"),
 		Region:      Region,
 		Timestamp:   DefaultTimestamp,
@@ -146,6 +146,8 @@ var metadataDecodeInputs = []struct{ name, input string }{
 	{"trace-keys-sorted", `{"trace":{"b":"2","a":"1","c":"3"},"region":"eu-west-1"}`},
 	{"empty-address-kept", `{"address":"","origin":{"source":null,"endpoint":"e"}}`},
 	{"whitespace-and-escapes", "{ \"region\" : \"us\\u002dwest\\u002d2\", \"timestamp\":\"t\" }"},
+	// Go writes U+0008 and U+000C as the short escapes \b and \f, whichever form the input used.
+	{"short-escapes", `{"region":"a\bb\fc","timestamp":"\u0008\u000c"}`},
 	{"null-trace-value", `{"trace":{"traceparent":null,"tracestate":"a"}}`},
 	// The v0.9 keys (C6). A pre-v0.9 object without them decodes leniently and re-encodes with the
 	// defaults; causationId re-encodes as the commandId when it was not stored.
