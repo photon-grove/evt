@@ -1,37 +1,36 @@
 // Runs every fixture vector the TypeScript implementation covers so far. Each phase of ADR 0009
 // adds the vectors for what it builds.
-import {Checks, loadFixture} from './harness.js'
+import {codecVectors} from './codec.js'
+import {Checks, field, list, loadFixture, str} from './harness.js'
 
 const checks = new Checks()
 
-// The published entry point resolves through the exports map on this runtime.
+// The published entry points resolve through the exports map on this runtime.
 const evt: object = await import('@photon-grove/evt')
 checks.equal('@photon-grove/evt loads', typeof evt, 'object')
+const dynamodb: object = await import('@photon-grove/evt/dynamodb')
+checks.equal('@photon-grove/evt/dynamodb loads', typeof dynamodb, 'object')
 
+await codecVectors(checks)
 await outcomeDigests()
 
 checks.report()
 
-interface DigestVector {
-  name: string
-  canonicalHex: string
-  digest: string
-}
-
 // outcomes.json digests: Web Crypto's SHA-256 of the canonical identity bytes, which the outcome
 // identity digest will use.
 async function outcomeDigests(): Promise<void> {
-  const {digests} = (await loadFixture('outcomes.json')) as {digests: DigestVector[]}
+  const digests = list(field(await loadFixture('outcomes.json'), 'digests'))
   checks.equal('outcomes digests present', digests.length > 0, true)
   const got = await Promise.all(
     digests.map(async (vector) => {
-      const digest = await crypto.subtle.digest('SHA-256', hexBytes(vector.canonicalHex))
-      return bytesHex(new Uint8Array(digest))
+      const canonical = hexBytes(str(field(vector, 'canonicalHex')))
+      return bytesHex(new Uint8Array(await crypto.subtle.digest('SHA-256', canonical)))
     }),
   )
 
   digests.forEach((vector, i) => {
-    checks.equal(`outcomes digest ${vector.name}`, got[i], vector.digest)
+    const name = `outcomes digest ${str(field(vector, 'name'))}`
+    checks.equal(name, got[i], str(field(vector, 'digest')))
   })
 }
 
