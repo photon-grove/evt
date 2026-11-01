@@ -60,6 +60,10 @@ impl ViewPage {
 /// entity-type listings included. An entity-type listing may lag behind a commit on DynamoDB, which
 /// serves it from a global secondary index that can only be read eventually consistently.
 ///
+/// U+0000 is refused on every backend with [`Error::InvalidArgument`] before any request: in a
+/// written row's key, owner, entity type or payload (a batch holding one writes nothing), and in a
+/// key or entity type a read, delete or list names. PostgreSQL `text` cannot hold it.
+///
 /// A `limit` of `None` or `Some(0)` leaves the page size to the backend (DynamoDB: its 1 MB
 /// response cap). A `cursor` is the opaque [`ViewPage::next_cursor`] of an earlier page of the
 /// same listing: base64url JSON of the last key, byte-identical to Go's, so a cursor can move
@@ -135,6 +139,12 @@ pub trait ViewRepository: Send + Sync {
         sk: &str,
     ) -> impl Future<Output = Result<Vec<ViewRow>, Error>> + Send {
         async move {
+            // Every key is checked before the first read, as DynamoDB's batch read does.
+            let sk = resolve_key("-", sk)?;
+            for pk in pks {
+                nul_free(pk, "pk")?;
+            }
+
             let mut seen = std::collections::BTreeSet::new();
             let mut views = Vec::new();
 

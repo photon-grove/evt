@@ -591,6 +591,16 @@ async fn view_nul_refusals<V: ViewRepository>(repo: &V) -> CaseResult {
         refused,
     )?;
     expect_err(
+        repo.delete_view(&pk, "s\0k").await,
+        "a delete of such an sk",
+        refused,
+    )?;
+    expect_err(
+        repo.batch_get_views_at(&[], "s\0k").await,
+        "a batch read at such an sk, with no key",
+        refused,
+    )?;
+    expect_err(
         repo.batch_get_views(&[pk.as_str(), nul_pk.as_str()]).await,
         "a batch read naming such a pk",
         refused,

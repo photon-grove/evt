@@ -249,9 +249,11 @@ way. The entity-type listings read the `entityType-index` global secondary index
 can only read eventually consistently, so a row a commit just wrote can be missing from them for a
 moment. Rust's `DynamoViewRepository` behaves the same way (`with_consistent_read`).
 
-The view repository refuses U+0000 in a row's key, owner, entity type or payload, and in a key or
-entity type a read or list names, with `evt.ErrInvalidArgument` before any request (Rust
-`Error::InvalidArgument`). PostgreSQL can't store it, so every backend refuses it alike.
+The view repository refuses U+0000 in a written row's key, owner, entity type or payload (a
+`PutViews` batch holding one writes nothing), and in a key or entity type a read, delete or list
+names, with `evt.ErrInvalidArgument` before any request (Rust `Error::InvalidArgument`).
+PostgreSQL can't store it, so every backend refuses it alike. A row written with U+0000 before
+this check can no longer be read, listed or deleted through the repository: remove it out of band.
 
 ## Local tables
 

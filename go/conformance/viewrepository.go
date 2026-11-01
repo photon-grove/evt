@@ -75,6 +75,7 @@ func testViewRepositoryRefusesNUL(t *testing.T, repo evt.ViewRepository) {
 		DeleteView(context.Context, string, string) error
 	}); ok {
 		require.ErrorIs(t, deleter.DeleteView(ctx, nulPK, evt.DefaultViewSK), evt.ErrInvalidArgument, "a delete of such a pk")
+		require.ErrorIs(t, deleter.DeleteView(ctx, pk, "s\x00k"), evt.ErrInvalidArgument, "a delete of such an sk")
 	}
 
 	if reader, ok := repo.(interface {
@@ -82,5 +83,18 @@ func testViewRepositoryRefusesNUL(t *testing.T, repo evt.ViewRepository) {
 	}); ok {
 		_, err = reader.BatchGetViews(ctx, []string{pk, nulPK})
 		require.ErrorIs(t, err, evt.ErrInvalidArgument, "a batch read naming such a pk")
+	}
+
+	if reader, ok := repo.(interface {
+		BatchGetViewsAtSK(context.Context, []string, string) ([]*evt.SerializedView, error)
+	}); ok {
+		_, err = reader.BatchGetViewsAtSK(ctx, []string{pk}, "s\x00k")
+		require.ErrorIs(t, err, evt.ErrInvalidArgument, "a batch read at such an sk")
+	}
+
+	if streamer, ok := repo.(evt.ViewStreamer); ok {
+		visit := func(*evt.SerializedView) error { return nil }
+		require.ErrorIs(t, streamer.ListViewsByPKEach(ctx, nulPK, visit), evt.ErrInvalidArgument, "a stream of such a pk")
+		require.ErrorIs(t, streamer.ListViewsByEntityTypeEach(ctx, entityType+"\x00", visit), evt.ErrInvalidArgument, "a stream of such an entity type")
 	}
 }

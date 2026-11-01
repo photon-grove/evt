@@ -35,6 +35,10 @@ type PagedResult struct {
 // trades that for half the read cost on listings). An entity-type listing may lag behind a
 // commit: DynamoDB serves it from a global secondary index, which can only be read eventually
 // consistently.
+//
+// U+0000 is refused with ErrInvalidArgument before any request, in a written row's key, owner,
+// entity type or payload, and in a key or entity type a read, delete or list names, because
+// PostgreSQL text cannot hold it (conformance.RunViewRepositorySuite checks it).
 type ViewRepository interface {
 	// GetView retrieves a view by partition key (pk). Returns nil if not found.
 	GetView(ctx context.Context, pk string) (*SerializedView, error)
