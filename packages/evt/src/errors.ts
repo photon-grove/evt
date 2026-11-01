@@ -19,6 +19,8 @@
  * - `commitTooLarge`: the commit is over the transaction budget. Nothing was written.
  * - `compactionUncovered`: no snapshot covers the events compaction was asked to delete.
  * - `reservedEntityId`: a write to an entity ID in a namespace only the engine writes.
+ * - `replay`: a stored event failed to upcast or decode while an aggregate loaded.
+ * - `snapshot`: a stored snapshot failed to decode while an aggregate loaded.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -31,6 +33,8 @@ export type EvtErrorCode =
   | 'commitTooLarge'
   | 'compactionUncovered'
   | 'reservedEntityId'
+  | 'replay'
+  | 'snapshot'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'
@@ -158,6 +162,42 @@ export class ReservedEntityIdError extends EvtError {
   }
 }
 
+/** A load failed closed on a stored event: an upcaster threw, or the payload didn't decode. */
+export class ReplayError extends EvtError {
+  override readonly name = 'ReplayError'
+  override readonly code = 'replay'
+  readonly eventType: string
+  /** The stored version, or the version an earlier upcaster produced. */
+  readonly version: number
+  readonly phase: 'upcast' | 'decode'
+
+  constructor(
+    eventType: string,
+    version: number,
+    phase: 'upcast' | 'decode',
+    detail: string,
+    cause?: unknown,
+  ) {
+    const doing = phase === 'upcast' ? 'upcasting' : 'decoding'
+    super('replay', `replay failed while ${doing} ${eventType} v${version}: ${detail}`, {cause})
+    this.eventType = eventType
+    this.version = version
+    this.phase = phase
+  }
+}
+
+/** A load found a stored snapshot whose payload the aggregate's state codec doesn't decode. */
+export class SnapshotError extends EvtError {
+  override readonly name = 'SnapshotError'
+  override readonly code = 'snapshot'
+  readonly entityId: string
+
+  constructor(entityId: string, cause: unknown) {
+    super('snapshot', `decoding snapshot for entity ${entityId}: ${messageOf(cause)}`, {cause})
+    this.entityId = entityId
+  }
+}
+
 /** Whether an error is an optimistic-concurrency conflict: a `conflict` or a `sequenceGap`. */
 export function isConflict(error: unknown): boolean {
   return error instanceof EvtError && (error.code === 'conflict' || error.code === 'sequenceGap')
@@ -166,4 +206,9 @@ export function isConflict(error: unknown): boolean {
 /** Whether reloading and running the command again may succeed. So far, only after a conflict. */
 export function isRetryable(error: unknown): boolean {
   return isConflict(error)
+}
+
+/** An error's message, or the value itself as text. */
+export function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }

@@ -1,7 +1,10 @@
 // Runs every fixture vector the TypeScript implementation covers so far. Each phase of ADR 0009
 // adds the vectors for what it builds.
+import {DEFAULT_RETRY_POLICY} from '@photon-grove/evt'
+
 import {codecVectors} from './codec.js'
-import {Checks, field, list, loadFixture, str} from './harness.js'
+import {Checks, field, list, loadFixture, num, str} from './harness.js'
+import {scenarioChecks} from './scenarios.js'
 
 const checks = new Checks()
 
@@ -13,6 +16,8 @@ checks.equal('@photon-grove/evt/dynamodb loads', typeof dynamodb, 'object')
 
 await codecVectors(checks)
 await outcomeDigests()
+await retryDefaults()
+await scenarioChecks(checks)
 
 checks.report()
 
@@ -32,6 +37,14 @@ async function outcomeDigests(): Promise<void> {
     const name = `outcomes digest ${str(field(vector, 'name'))}`
     checks.equal(name, got[i], str(field(vector, 'digest')))
   })
+}
+
+// outcomes.json retry: the default policy Go and Rust retry with.
+async function retryDefaults(): Promise<void> {
+  const retry = field(await loadFixture('outcomes.json'), 'retry')
+  for (const key of ['maxAttempts', 'baseDelayMs', 'maxDelayMs'] as const) {
+    checks.equal(`retry ${key}`, DEFAULT_RETRY_POLICY[key], num(field(retry, key)))
+  }
 }
 
 function hexBytes(hex: string): Uint8Array<ArrayBuffer> {

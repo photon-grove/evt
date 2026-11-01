@@ -3863,8 +3863,8 @@ These differences are deliberate and covered by tests. Keep them documented here
   reads back exactly. The event version, TTL seconds and other small integers are `number`, and a
   stored value past 2^53 − 1 is refused as an invalid record, where Go and Rust read it.
 - Event versions. Rust refuses to decode a stored event whose version, after upcasting, is not
-  the version its type declares (`PayloadError::VersionMismatch`). Go decodes it into the current
-  struct. Deploy readers before writers when an event version changes.
+  the version its type declares (`PayloadError::VersionMismatch`), and so does TypeScript (a
+  `ReplayError`). Go decodes it into the current struct. Deploy readers before writers when an event version changes.
 - Floats. Not normalized across languages, as described under [JSON encoding](#json-encoding).
 - Duplicate-command window. Both languages only see command IDs in events after the latest
   snapshot. This is shared behavior, listed here because it surprises readers. The `dedupe-window`

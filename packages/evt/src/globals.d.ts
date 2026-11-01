@@ -34,4 +34,6 @@ declare var crypto: {
 
 declare function setTimeout(callback: () => void, ms?: number): unknown
 
+declare function clearTimeout(id: unknown): void
+
 declare function queueMicrotask(callback: () => void): void
