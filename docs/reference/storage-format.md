@@ -3044,8 +3044,8 @@ including its expiry second). A lapsed one is taken over the same way. `renew_co
 `end_compaction` (which writes the released payload, keeping the token) are conditioned on the
 lease's exact payload. `force_release_compaction(scope, owner)` is the operator's: it releases the
 named owner's lease whatever its token or expiry. A lease that no longer matches is
-`CompactionLeaseLost`. The first acquire on a table declares `journal-compaction: 1` on the feature
-marker, after validating the marker (a declared feature this build does not model is refused).
+`CompactionLeaseLost`. An acquire validates the feature marker (a declared feature this build does
+not model is refused) and declares nothing.
 
 Writes. Every compaction write is one `TransactWriteItems` of up to 99 view actions followed by
 a `ConditionCheck` on the rebuild generation item (events table) that it still holds the settled
@@ -3061,7 +3061,10 @@ lease's length) before a write when less than half of it is left. A failed epoch
 are transient.
 
 A run. `compact(lease, through)` with `floor ≤ through ≤ high watermark` and `through ≥ 1`
-(otherwise `InvalidArgument`, before any write), under a settled rebuild epoch:
+(otherwise `InvalidArgument`, before any write), under a settled rebuild epoch. Before its first
+write, once the checkpoint and the preflight below have passed, the run declares
+`journal-compaction: 1` on the feature marker (nothing is written if it is already declared), so a
+refused run leaves the marker as it was:
 
 1. Build, if `through` is above the floor. A preflight first streams the whole range and
    writes nothing: it resumes the manifest's last chunk (checked against its digest), reads the
@@ -3078,8 +3081,9 @@ A run. `compact(lease, through)` with `floor ≤ through ≤ high watermark` and
 
 A run with `through` equal to the floor skips steps 1 and 2: it finishes an interrupted run, or
 prunes rows a rebuild restored. Every step is idempotent and leaves the scope consistent, so a run
-that stops for any reason is finished by compacting again. `compact_with_lease` takes a lease,
-runs, and releases it (also after a failure). A crash between writing new chunks and the swap
+that stops for any reason is finished by compacting again. `compact_with_lease` checks the
+checkpoint against the floor and the high watermark first, so a refused one takes no lease, then
+takes a lease, runs, and releases it (also after a failure). A crash between writing new chunks and the swap
 leaves unreferenced chunks at indexes the next run overwrites. Compaction is maintenance with its
 own transactions: no commit carries a compaction action, so the commit budget is unchanged
 (97 event and projector operations, 96 with a snapshot).

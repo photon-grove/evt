@@ -45,6 +45,11 @@ where
         }
     };
 
+    // First, while nothing has declared compaction on the table.
+    record(
+        "a refused compaction takes no lease and declares nothing",
+        Box::pin(refused_runs_change_nothing(repo, views)).await,
+    );
     record(
         "a compaction snapshots the prefix, deletes its rows, and hands readers below it a 410",
         Box::pin(snapshot_and_gone(repo, views)).await,
@@ -771,6 +776,60 @@ where
         |err| matches!(err, Error::InvalidArgument(_)),
     )?;
     end_compaction(repo, &held).await?;
+
+    Ok(())
+}
+
+/// The compaction declaration a table's feature marker holds, if any.
+async fn compaction_declared<R: CompactionStore>(repo: &R) -> Result<Option<i64>, Failure> {
+    Ok(repo
+        .read_manifest()
+        .await?
+        .and_then(|marker| marker.features.get(JOURNAL_COMPACTION_FEATURE).copied()))
+}
+
+async fn refused_runs_change_nothing<R, V>(repo: &R, views: &V) -> CaseResult
+where
+    R: Repository + CompactionStore + Clone,
+    R::Operation: Clone,
+    V: ViewRepository,
+{
+    let ns = namespace();
+    let scope = world(&ns);
+    fill(repo, &ns, 3).await?;
+    let declared = compaction_declared(repo).await?;
+
+    // A checkpoint of 0, one above the watermark, and a mistyped scope (no journal at all) are
+    // refused before a lease is taken.
+    let mistyped = Scope::new(format!("{ns}-wrold"))?;
+    for (scope, through) in [(&scope, 0), (&scope, 4), (&mistyped, 1)] {
+        expect_err(
+            compact_with_lease(repo, scope, through, &owner(&ns), LEASE).await,
+            &format!("a compaction of {scope} through {through}"),
+            |err| matches!(err, Error::InvalidArgument(_)),
+        )?;
+        ensure!(
+            read_lease(repo, scope).await?.is_none(),
+            "a refused compaction of {scope} through {through} took no lease"
+        );
+    }
+
+    // A lease alone declares nothing, and neither does a run its preflight refuses.
+    views.delete_view(&scope.row_pk(), &row_sk(2)).await?;
+    let mut held = begin_compaction(repo, &scope, &owner(&ns), LEASE).await?;
+    expect_err(
+        compact(repo, &mut held, 3).await,
+        "a compaction over a gap",
+        |err| matches!(err, Error::InvalidJournal(_)),
+    )?;
+    end_compaction(repo, &held).await?;
+
+    ensure_eq!(
+        compaction_declared(repo).await?,
+        declared,
+        "the compaction declaration"
+    );
+    ensure_eq!(read_manifest(repo, &scope).await?, None, "no manifest");
 
     Ok(())
 }
