@@ -354,6 +354,28 @@ describe('Store.load', () => {
     expect(reads).toBe(2)
   })
 
+  test('a compaction that leaves no events after the snapshot reloads', async () => {
+    const repository = await holding(storedEvent(1, 'account:deposited', 1, '{"amountCents":4}'))
+    let reads = 0
+    const compacting: Repository = {
+      ...delegate(repository),
+      async events(id, options) {
+        reads++
+        if (reads === 1) {
+          // Another writer appends, snapshots and compacts between this load's two reads.
+          await store(repository, 1).execute(account, 'a', {type: 'deposit', amountCents: 1})
+          await repository.compactBelow('a', 2n)
+        }
+
+        return repository.events(id, options)
+      },
+    }
+
+    const loaded = await store(compacting).load(account, 'a')
+    expect(loaded).toMatchObject({sequence: 2n, state: {balanceCents: 5}})
+    expect(reads).toBe(1)
+  })
+
   test('a gap that persists fails after three reads', async () => {
     const repository = await holding(storedEvent(1, 'account:deposited', 1, '{"amountCents":1}'))
     let reads = 0
@@ -516,6 +538,9 @@ describe('json()', () => {
 
     expect(codec.decode(encoder.encode('{"n":9007199254740991}'))).toEqual({n: 9007199254740991})
     expect(() => codec.decode(encoder.encode('{"n":9007199254740993}'))).toThrow(EvtError)
+    // Nor is one written that decode would refuse.
+    expect(() => codec.encode({n: 2 ** 53})).toThrow(/9007199254740992/)
+    expect(codec.encode({n: 1e21})).toEqual(encoder.encode('{"n":1e+21}'))
   })
 
   test('keeps a __proto__ key as a plain property', () => {

@@ -539,7 +539,8 @@ error before any write and is never split.
 3. If not found: load all events from sequence 1
 4. Apply all loaded events to rebuild state
 5. A gap in the loaded sequence reloads (Rust and TypeScript, up to three reads) or returns a
-   conflict at once (Go)
+   conflict at once (Go). TypeScript reads the snapshot again when no events follow it, and
+   counts a newer one as a gap, since a compaction between its two reads leaves none to see
 
 ## Compaction
 

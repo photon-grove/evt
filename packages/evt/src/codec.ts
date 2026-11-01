@@ -1,7 +1,7 @@
 // Payload codecs: how an application turns event data and aggregate state into stored bytes and
 // back. evt stores the bytes verbatim, so a codec owns their format.
 
-import {EvtError} from './errors.js'
+import {EvtError, messageOf} from './errors.js'
 import {JsonNumber, type JsonValue, parseJson, stringifyJson} from './json.js'
 import {utf8Decode, utf8Encode} from './utf8.js'
 
@@ -44,9 +44,10 @@ export interface JsonOptions<T> {
  * byte, with a map whose keys are written sorted, needs a codec of its own that decodes the map as
  * a `Map`. An integer past `Number.MAX_SAFE_INTEGER` is refused rather than rounded.
  *
- * With a `schema`, each value is validated before it's encoded and after it's decoded, so an
- * event or a snapshot the schema refuses fails its commit instead of every later load. The schema
- * must not transform values: the value is encoded as given.
+ * Encoding refuses a value decoding would refuse, and with a `schema`, each value is validated
+ * before it's encoded and after it's decoded, so an event or a snapshot that couldn't be read back
+ * fails its commit instead of every later load. The schema must not transform values: the value
+ * is encoded as given.
  */
 export function json<T>(options: JsonOptions<T> = {}): Codec<T> {
   const schema = options.schema
@@ -57,7 +58,10 @@ export function json<T>(options: JsonOptions<T> = {}): Codec<T> {
         validate(schema, value, 'invalidArgument')
       }
 
-      return utf8Encode(stringifyJson(value))
+      const text = stringifyJson(value)
+      readable(text)
+
+      return utf8Encode(text)
     },
     decode(bytes) {
       const value = plainJson(parseJson(utf8Decode(bytes, 'payload')))
@@ -103,6 +107,16 @@ export function plainJson(value: JsonValue): unknown {
   }
 
   return value
+}
+
+// Refuses JSON that decode would refuse, such as an integer past the safe range, so the value
+// fails its commit instead of every later load.
+function readable(text: string): void {
+  try {
+    plainJson(parseJson(text))
+  } catch (error) {
+    throw new EvtError('invalidArgument', messageOf(error), {cause: error})
+  }
 }
 
 function validate<T>(

@@ -122,7 +122,8 @@ export class Store {
    *
    * The events must continue the sequence. A gap means another writer snapshotted and compacted
    * the stream between the two reads, so the load starts over, up to three times, and then fails
-   * with a {@link SequenceGapError}.
+   * with a {@link SequenceGapError}. When no events follow, the snapshot is read again to rule out
+   * a compaction that left no gap to see.
    */
   async load<S, C, D extends EventDefinitions>(
     aggregate: Aggregate<S, C, D>,
@@ -234,6 +235,15 @@ export class Store {
     const events = snapshot
       ? await this.repository.eventsAfter(entityId, sequence, options)
       : await this.repository.events(entityId, options)
+
+    // With no events after it, a snapshot and a compaction between the two reads would leave no
+    // gap to see, so the snapshot is read again: a newer one means the stream moved past it.
+    if (events.length === 0) {
+      const covered = (await this.repository.snapshot(entityId, options))?.eventSequence ?? 0n
+      if (covered > sequence) {
+        throw new SequenceGapError(entityId, sequence, covered + 1n)
+      }
+    }
 
     const seenCommandIds = new Set<string>()
     for (const stored of events) {
