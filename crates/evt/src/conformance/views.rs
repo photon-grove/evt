@@ -124,6 +124,10 @@ where
         "a failing projector is an internal failure: nothing written, nothing recorded, no retry",
         Box::pin(view_projector_failure(repo, target)).await,
     );
+    record(
+        "an application projector's operation on a journal partition is refused and writes nothing",
+        Box::pin(view_reserved_partitions(repo, target)).await,
+    );
 
     if !failures.is_empty() {
         panic!(
@@ -2119,6 +2123,57 @@ where
         repo.outcome(&command).await?.is_none(),
         "an internal failure records no outcome"
     );
+
+    Ok(())
+}
+
+async fn view_reserved_partitions<R, T>(repo: &R, target: &T) -> CaseResult
+where
+    R: Repository,
+    T: CommitViewTarget<R>,
+{
+    for prefix in crate::RESERVED_VIEW_PREFIXES {
+        let id = ledger_id();
+        let pk = format!("{prefix}{id}");
+        let (key, owner) = (pk.clone(), id.clone());
+        let projector = Scripted::new("sneaky", move |_| {
+            vec![
+                ViewOperation::put(format!("{owner}-allowed"), "VIEW", owner.clone(), "t", "{}"),
+                ViewOperation::put(
+                    key.clone(),
+                    "00000000000000000001",
+                    owner.clone(),
+                    "journal",
+                    "{}",
+                ),
+            ]
+        });
+
+        let error = store_failed(
+            Store::<Ledger, _>::new(repo, ())
+                .with_snapshot_interval(0)
+                .with_commit_projector(projector)
+                .execute(&id, Add(1), metadata())
+                .await,
+            &format!("a projector writing {pk}"),
+        )?;
+        ensure!(
+            matches!(
+                &error,
+                Error::ReservedViewKey { pk: refused, projector, operation: 1 }
+                    if refused == &pk && projector == "sneaky"
+            ),
+            "the refusal names the key, the projector and the operation: {error:?}"
+        );
+        ensure!(!error.is_retryable(), "it is not retryable");
+        ensure!(repo.events(&id).await?.is_empty(), "no event was written");
+        ensure!(
+            row(target, &format!("{id}-allowed"), "VIEW")
+                .await?
+                .is_none(),
+            "no row was written"
+        );
+    }
 
     Ok(())
 }

@@ -105,9 +105,9 @@ pub use outcome::{
 };
 pub use projection::{
     CommitProjector, CommitStream, CommitView, MAX_VIEW_PK_BYTES, MAX_VIEW_SK_BYTES, ProjectedView,
-    ProjectorOperationError, REASON_CONDITION_FAILED, ViewCondition, ViewOperation,
-    ViewOperationKind, ViewRow, check_views, group_commits, project_commit, replay_views,
-    view_operation_size,
+    ProjectorOperationError, REASON_CONDITION_FAILED, RESERVED_VIEW_PREFIXES, ViewCondition,
+    ViewOperation, ViewOperationKind, ViewRow, check_views, group_commits, project_commit,
+    replay_views, view_operation_size,
 };
 pub use rebuild::{
     MAX_REBUILD_BEGIN_ATTEMPTS, MAX_REBUILD_OWNER_BYTES, MAX_REBUILD_VIEW_BATCH, ProjectionRebuild,

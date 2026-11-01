@@ -1103,12 +1103,28 @@ async fn a_journal_key_a_view_row_also_plans_fails_before_any_write_and_releases
         .await
         .unwrap_err();
 
-    assert!(matches!(error, Error::SharedViewKey { .. }), "{error:?}");
+    // The journal's partitions are reserved, so the application projector is refused when it
+    // projects, before the plan could find the key shared with the journal.
+    assert!(
+        matches!(&error, Error::ReservedViewKey { projector, .. } if projector == "on-the-journal"),
+        "{error:?}"
+    );
     assert!(
         derived_rows(&memory).await.is_empty(),
         "nothing was written"
     );
     assert!(memory.rebuild_generation().await.unwrap().is_settled());
+}
+
+#[test]
+fn the_journal_partitions_are_reserved() {
+    for prefix in [
+        super::ROW_PARTITION_PREFIX,
+        super::COUNTER_PARTITION_PREFIX,
+        super::COMPACTION_PARTITION_PREFIX,
+    ] {
+        assert!(crate::RESERVED_VIEW_PREFIXES.contains(&prefix), "{prefix}");
+    }
 }
 
 #[tokio::test]

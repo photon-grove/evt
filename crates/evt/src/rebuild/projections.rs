@@ -344,9 +344,8 @@ where
     /// counters are derived from every event of `journal`'s entity types
     /// ([`journal::replay`](crate::journal::replay)), read under the lock, and written in the same
     /// guarded batches as the views, so readers see one rebuild (one generation) for both. A
-    /// journal key that a view row also plans fails the run with [`Error::SharedViewKey`] (or
-    /// [`Error::DuplicateViewKey`] when the same stream owns both) before
-    /// anything is written. With a journal the rebuild may have no projectors: it then rebuilds the
+    /// projector that plans a row in the journal's partitions fails the run with
+    /// [`Error::ReservedViewKey`] before anything is written. With a journal the rebuild may have no projectors: it then rebuilds the
     /// journal alone, and needs no aggregate types.
     ///
     /// Pass the journal configuration the table's [`JournalRepository`](crate::journal::JournalRepository)

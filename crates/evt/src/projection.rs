@@ -28,6 +28,13 @@ use crate::repository::Repository;
 /// journal's are never shown it ([`CommitProjector::engine_metadata`]).
 pub(crate) const ENGINE_ALLOCATION_KEY: &str = "evt.journal";
 
+/// The view partition-key prefixes the engine reserves for its own rows: the journal's rows,
+/// counters and compaction rows. An application projector's operation whose `pk` begins with one
+/// is refused ([`Error::ReservedViewKey`]) in every build, with the `journal` feature or without,
+/// so no table holds application rows where the journal keeps its own.
+pub const RESERVED_VIEW_PREFIXES: [&str; 3] =
+    ["journal#", "journal-counter#", "journal-compaction#"];
+
 /// The longest view partition key, in UTF-8 bytes (DynamoDB's own limit), so a projector fails
 /// identically on every backend instead of committing on PostgreSQL and failing on DynamoDB.
 pub const MAX_VIEW_PK_BYTES: usize = 2048;
@@ -781,8 +788,10 @@ pub(crate) fn project_with<'a>(
     let mut projected = Vec::new();
     for (index, projector) in projectors {
         let history = projector.history();
+        // The sealed method is true for the engine's own projectors only (the journal's).
+        let engine = projector.reads_engine_metadata();
         let operations = projector
-            .project(&view.visible_to(history, projector.reads_engine_metadata()))
+            .project(&view.visible_to(history, engine))
             .map_err(|source| {
                 Error::Projector(Box::new(CommitProjectorFailed {
                     projector: projector.name().to_owned(),
@@ -799,6 +808,9 @@ pub(crate) fn project_with<'a>(
             };
 
             check_owner(&item, view, history)?;
+            if !engine {
+                check_unreserved(&item)?;
+            }
             projected.push(item);
         }
     }
@@ -1122,6 +1134,23 @@ fn check_owner(
              its history",
             stream.entity_type.as_str()
         ));
+    }
+
+    Ok(())
+}
+
+/// Refuses an application projector's operation on a partition the engine reserves
+/// ([`RESERVED_VIEW_PREFIXES`]) with [`Error::ReservedViewKey`].
+fn check_unreserved(view: &ProjectedView) -> Result<(), Error> {
+    if RESERVED_VIEW_PREFIXES
+        .iter()
+        .any(|prefix| view.op.pk.starts_with(prefix))
+    {
+        return Err(Error::ReservedViewKey {
+            pk: view.op.pk.clone(),
+            projector: view.projector.clone(),
+            operation: view.operation,
+        });
     }
 
     Ok(())
