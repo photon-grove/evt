@@ -45,9 +45,9 @@ where
         }
     };
 
-    // First, while nothing has declared compaction on the table.
+    // First, so that on a fresh table nothing has declared compaction yet.
     record(
-        "a refused compaction takes no lease and declares nothing",
+        "a compaction refused before its lease takes none, and no refused run declares anything",
         Box::pin(refused_runs_change_nothing(repo, views)).await,
     );
     record(
@@ -813,6 +813,34 @@ where
             "a refused compaction of {scope} through {through} took no lease"
         );
     }
+
+    // A table declaring a feature this build does not model is refused before the checkpoint is
+    // looked at, as during a rebuild.
+    repo.update_manifest(|manifest| {
+        manifest.features.insert(format!("{ns}-unmodeled"), 1);
+    })
+    .await?;
+    let unmodeled = compact_with_lease(repo, &scope, 0, &owner(&ns), LEASE).await;
+    repo.update_manifest(|manifest| {
+        manifest.features.remove(&format!("{ns}-unmodeled"));
+    })
+    .await?;
+    expect_err(
+        unmodeled,
+        "a compaction of a table declaring an unmodeled feature",
+        |err| matches!(err, Error::UnsupportedFeature { feature, .. } if *feature == format!("{ns}-unmodeled")),
+    )?;
+
+    let rebuild = repo.begin_rebuild(&format!("{ns}-rebuild"), LEASE).await?;
+    let during = compact_with_lease(repo, &scope, 0, &owner(&ns), LEASE).await;
+    repo.end_rebuild(&rebuild).await?;
+    expect_err(during, "a compaction during a rebuild", |err| {
+        matches!(err, Error::RebuildUnavailable { .. })
+    })?;
+    ensure!(
+        read_lease(repo, &scope).await?.is_none(),
+        "neither took a lease"
+    );
 
     // A lease alone declares nothing, and neither does a run its preflight refuses.
     views.delete_view(&scope.row_pk(), &row_sk(2)).await?;

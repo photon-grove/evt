@@ -532,10 +532,11 @@ async fn check_checkpoint<S: CompactionStore + ?Sized>(
     Ok((stored, old))
 }
 
-/// [`compact`] holding a lease for the run: checks `through` against the scope's floor and high
-/// watermark, acquires the lease as `owner` ([`begin_compaction`]), compacts, and releases it, also
-/// when the run fails (the run leaves the scope consistent). A checkpoint refused by the first
-/// check takes no lease and declares nothing.
+/// [`compact`] holding a lease for the run: checks the rebuild fence and the feature marker, then
+/// `through` against the scope's floor and high watermark, acquires the lease as `owner`
+/// ([`begin_compaction`]), compacts, and releases it, also when the run fails (the run leaves the
+/// scope consistent). A run refused before the lease takes none, and no refused run declares
+/// anything.
 pub async fn compact_with_lease<S: CompactionStore + ?Sized>(
     store: &S,
     scope: &Scope,
@@ -543,6 +544,10 @@ pub async fn compact_with_lease<S: CompactionStore + ?Sized>(
     owner: &str,
     lease: Duration,
 ) -> Result<CompactionReport, Error> {
+    // The fence and the marker first, so a rebuild in progress stays retriable and a table this
+    // build does not model is refused before its compaction rows are read.
+    observe_rebuild_epoch(store).await?;
+    check_marker(store).await?;
     check_checkpoint(store, scope, through).await?;
 
     let mut held = begin_compaction(store, scope, owner, lease).await?;

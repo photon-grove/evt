@@ -1664,7 +1664,8 @@ declares it before a writer writes, by an explicit initialization or by a lazily
 ([Stream Heads](#required-feature)). `photon-evt` models
 `journal` and `journal-compaction` at format version 1 when built with its `journal` cargo feature.
 It declares `journal` with the first journaled commit ([Journal](#feature-marker-and-history)) and
-`journal-compaction` with the first compaction lease ([Compaction](#journal-compaction)). A
+`journal-compaction` before a compaction run's first write, once its checkpoint and preflight pass
+([Compaction](#journal-compaction)). A
 fourth, `postgres-views` (format version 1, `photon-evt` 0.3, ADR 0008), records that a
 PostgreSQL store's commit-wide views live in its evt-owned [views table](#postgresql-views-table).
 Rust models it (it is in `SUPPORTED_FEATURES`), and a Rust PostgreSQL repository without the views
@@ -3082,9 +3083,9 @@ refused run leaves the marker as it was:
 A run with `through` equal to the floor skips steps 1 and 2: it finishes an interrupted run, or
 prunes rows a rebuild restored. Every step is idempotent and leaves the scope consistent, so a run
 that stops for any reason is finished by compacting again. `compact_with_lease` checks the
-checkpoint against the floor and the high watermark first, so a refused one takes no lease, then
-takes a lease, runs, and releases it (also after a failure). A crash between writing new chunks and the swap
-leaves unreferenced chunks at indexes the next run overwrites. Compaction is maintenance with its
+rebuild fence, the marker, and the checkpoint against the floor and the high watermark first, so a
+run they refuse takes no lease. It then takes a lease, runs, and releases it (also after a
+failure). A crash between writing new chunks and the swap leaves unreferenced chunks at indexes the next run overwrites. Compaction is maintenance with its
 own transactions: no commit carries a compaction action, so the commit budget is unchanged
 (97 event and projector operations, 96 with a snapshot).
 
