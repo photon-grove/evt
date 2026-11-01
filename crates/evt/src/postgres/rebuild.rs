@@ -120,7 +120,19 @@ impl PostgresRepository {
             return Ok(Attempt::Moved);
         }
 
-        tx.commit().await.map_err(|err| commit_error(err, false))?;
+        if let Err(err) = tx.commit().await {
+            // An error the database did not raise (the connection dropped while `COMMIT` was in
+            // flight) leaves it unknown whether the lock was taken.
+            if err.as_db_error().is_none() {
+                return Err(Error::RebuildBeginIndeterminate {
+                    lease: Box::new(lease),
+                    observed: generation.value,
+                    source: Box::new(err),
+                });
+            }
+
+            return Err(commit_error(err, false));
+        }
 
         Ok(Attempt::Begun(lease))
     }

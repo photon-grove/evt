@@ -1,6 +1,7 @@
 package policy_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -34,4 +35,22 @@ func TestClassify_RebuildFenceRefusalsAreTransient(t *testing.T) {
 	// An explicit classification wins over the fence's default.
 	permanent := &policy.ClassifiedError{Class: policy.ClassPermanent, Err: &evt.RebuildInProgressError{}}
 	require.Equal(t, policy.ClassPermanent, policy.Classify(permanent))
+}
+
+// A Begin whose result is unknown may hold the lock, so it is never transient, even when its cause
+// is explicitly classified as such.
+func TestClassify_AnIndeterminateBeginIsUnknown(t *testing.T) {
+	for name, cause := range map[string]error{
+		"a timeout":          context.DeadlineExceeded,
+		"a classified cause": &policy.ClassifiedError{Class: policy.ClassTransient, Err: context.DeadlineExceeded},
+	} {
+		err := fmt.Errorf("rebuilding: %w", &evt.RebuildBeginIndeterminateError{Cause: cause})
+		require.Equal(t, policy.ClassUnknown, policy.Classify(err), name)
+	}
+
+	// A classification the caller wraps around it is its own, and wins.
+	dropped := &policy.ClassifiedError{Class: policy.ClassPermanent, Err: &evt.RebuildBeginIndeterminateError{
+		Cause: &policy.ClassifiedError{Class: policy.ClassTransient, Err: context.DeadlineExceeded},
+	}}
+	require.Equal(t, policy.ClassPermanent, policy.Classify(dropped))
 }

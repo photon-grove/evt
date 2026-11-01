@@ -26,9 +26,17 @@ func Classify(err error) Class {
 		return ClassUnknown
 	}
 
+	// A Begin whose result is unknown may hold the lock: a classification inside it (of its cause, a
+	// timeout, say) must not make it look transient. One wrapped around it is the caller's own.
+	indeterminate := evt.IsRebuildBeginIndeterminateErr(err)
+
 	var classified *ClassifiedError
-	if stderrors.As(err, &classified) {
+	if stderrors.As(err, &classified) && (!indeterminate || evt.IsRebuildBeginIndeterminateErr(classified.Err)) {
 		return classified.Class
+	}
+
+	if indeterminate {
+		return ClassUnknown
 	}
 
 	// The rebuild fence's refusals (ADR 0004, C10) are retried later, whoever returns them: a

@@ -843,6 +843,12 @@ let balance = read_at_rebuild_epoch(&repository, |_| async { read_balance().awai
   `end_rebuild`, and `write_rebuild_views` take the lease and act only while the lock names both
   its owner and its token. A worker that lost its lock, including a stale incarnation that reuses
   its owner token after a takeover, gets `Error::RebuildLeaseLost` and writes nothing.
+- A `begin_rebuild` whose result is unknown (a timeout, a lost response, a server fault, a
+  connection dropped during `COMMIT`) is `Error::RebuildBeginIndeterminate`, carrying the lease it
+  would have returned and the generation it was conditioned on. It may hold the lock, so never
+  treat it as not taken: settle it with `rebuild_state().await?.holds_begun(&lease, observed)`,
+  which is exact when the owner token is unique to the caller. A throttled begin wrote nothing and
+  stays `Error::Transient`.
 - `force_release_rebuild` is the operator's escape hatch for a wedged worker. It ends the lease at
   once, so a new rebuild can begin, but leaves the generation unsettled, so readers stay fenced
   (`Error::RebuildUnavailable`) and every commit is still refused (`Error::RebuildInProgress`) until
@@ -876,6 +882,10 @@ let report = ProjectionRebuild::new(&repository)
 - It takes the lock for the whole run, so commits fail with `RebuildInProgress` while it reads and
   writes. It computes and checks every row first, then writes them in guarded batches (at most 99
   operations within the commit byte budget), renews the lease, and releases the lock when it's done.
+  A begin whose result is unknown is begun again once a fresh read shows it can no longer apply,
+  and otherwise the run returns `RebuildBeginIndeterminate`, so the caller knows it may hold the
+  lock. It doesn't carry on under a begin the read shows applied: a concurrent run under the same
+  owner token would have written the same lease.
 - A current-state projector runs once per stream, over that stream's final state. Final states
   come from `EventLog::stream_entities_from_snapshots`, so compacted streams start from their
   snapshot. Only rebuild projectors whose rows depend on their owner's state alone: a row that

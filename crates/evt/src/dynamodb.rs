@@ -4142,6 +4142,62 @@ mod tests {
     }
 
     #[test]
+    fn only_a_begin_whose_result_is_unknown_is_indeterminate() {
+        use aws_sdk_dynamodb::error::ErrorMetadata;
+
+        let lease = || crate::RebuildLease {
+            owner: "w".into(),
+            generation: 1,
+            lease_expires_at: 100,
+        };
+        let service = |code: &str| {
+            SdkError::<TransactWriteItemsError, ()>::service_error(
+                TransactWriteItemsError::generic(ErrorMetadata::builder().code(code).build()),
+                (),
+            )
+        };
+        let begin = |err| rebuild::begin_error(Box::new(err), lease(), 0);
+
+        // The begin may have applied: the error carries the lease it would have returned.
+        for unknown in [
+            SdkError::<TransactWriteItemsError, ()>::timeout_error("response lost"),
+            service("InternalServerError"),
+            service("TransactionInProgressException"),
+        ] {
+            let error = begin(unknown);
+            assert!(
+                matches!(
+                    &error,
+                    Some(Error::RebuildBeginIndeterminate { lease: held, observed: 0, .. })
+                        if **held == lease()
+                ),
+                "{error:?}"
+            );
+        }
+
+        // Refused before anything was written: definitive, and transient where a retry can pass.
+        for throttled in [
+            service("ThrottlingException"),
+            service("ProvisionedThroughputExceededException"),
+            cancelled(&[Some("ThrottlingError"), Some("None")]),
+            cancelled(&[Some("None"), Some("ProvisionedThroughputExceeded")]),
+        ] {
+            let error = begin(throttled);
+            assert!(matches!(error, Some(Error::Transient(_))), "{error:?}");
+        }
+        let error = begin(service("ValidationException"));
+        assert!(matches!(error, Some(Error::Backend(_))), "{error:?}");
+
+        // A lost race reads the state and decides again.
+        for raced in [
+            cancelled(&[Some("ConditionalCheckFailed"), Some("None")]),
+            cancelled(&[Some("TransactionConflict"), Some("TransactionConflict")]),
+        ] {
+            assert!(begin(raced).is_none());
+        }
+    }
+
+    #[test]
     fn a_gateway_fault_with_an_unknown_code_is_an_unknown_result() {
         use aws_sdk_dynamodb::error::ErrorMetadata;
 

@@ -12,8 +12,8 @@ use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::{ConditionCheck, Delete, Put, TransactWriteItem, Update};
 
 use super::{
-    DynamoRepository, cancellation_reasons, failed_items, from_sdk_item, n, s, sdk, sdk_error,
-    to_sdk_item,
+    DynamoRepository, HttpStatus, cancellation_reasons, commit_result_unknown, failed_items,
+    from_sdk_item, n, s, sdk, sdk_error, throttled, to_sdk_item,
 };
 use crate::error::{BoxError, Error};
 use crate::projection::{ProjectedView, ProjectorOperationError};
@@ -349,9 +349,11 @@ impl RebuildFence for DynamoRepository {
             let items = self.rebuild_begin_items(&plan, &lease, now)?;
             match self.transact(items).await {
                 Ok(()) => return Ok(lease),
-                // Another operation raced the read: read the state again and decide again.
-                Err(err) if race_lost(&*err) => {}
-                Err(err) => return Err(fence_error(*err)),
+                Err(err) => {
+                    if let Some(error) = begin_error(err, lease, state.generation.value) {
+                        return Err(error);
+                    }
+                }
             }
         }
 
@@ -482,6 +484,34 @@ where
     cancellation_reasons(err)
         .iter()
         .any(|code| matches!(code, Some("ConditionalCheckFailed" | "TransactionConflict")))
+}
+
+/// Maps a failed begin transaction: `None` when it lost a race to another operation (read the
+/// state again and decide again), [`Error::RebuildBeginIndeterminate`] carrying `lease` and the
+/// `observed` generation its conditions named when its result is unknown, and otherwise
+/// [`fence_error`]. A throttled or cancelled transaction was
+/// refused before anything was written, so it is never indeterminate.
+pub(super) fn begin_error<R>(
+    err: Box<SdkError<TransactWriteItemsError, R>>,
+    lease: RebuildLease,
+    observed: i64,
+) -> Option<Error>
+where
+    R: HttpStatus + std::fmt::Debug + Send + Sync + 'static,
+{
+    if race_lost(&*err) {
+        return None;
+    }
+
+    if !throttled(&*err) && commit_result_unknown(&*err) {
+        return Some(Error::RebuildBeginIndeterminate {
+            lease: Box::new(lease),
+            observed,
+            source: err,
+        });
+    }
+
+    Some(fence_error(*err))
 }
 
 /// Maps a failed fence transaction: a concurrent transaction or throttling is transient (the

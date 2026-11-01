@@ -82,6 +82,24 @@ func (s RebuildState) InProgress() bool {
 	return s.Lock != nil
 }
 
+// HoldsBegun settles a Begin whose result is unknown (*RebuildBeginIndeterminateError) from a state
+// read after it failed, given the error's Lease and Observed generation. settled is false while the
+// generation is still observed, because the begin may still land. Once settled, held reports
+// whether the lock holds the lease: true means the begin applied; false means it does not hold the
+// lock and the begin can no longer take it, because the generation moved from the value its
+// transaction was conditioned on and the generation only grows (a begin that applied and was then
+// force-released or taken over settles the same way). held is exact only when the owner token is
+// unique to the caller: a concurrent begin under the same token from the same generation writes the
+// same lease. State reads the generation before the lock, so a begin that lands between the two
+// reads still settles as held.
+func (s RebuildState) HoldsBegun(lease RebuildLease, observed int64) (held, settled bool) {
+	if s.Lock != nil && s.Lock.Owner == lease.Owner && s.Lock.Generation == lease.Generation {
+		return true, true
+	}
+
+	return false, s.Generation.Value != observed
+}
+
 // RebuildLease is what Begin returns: the owner, the odd generation the transaction produced, and
 // the second the lease lapses. The generation is the lease's fencing token: Renew, End, and
 // WriteViews present the whole lease, and a lock held by anyone else, or by the same owner token
@@ -110,7 +128,10 @@ type RebuildFence interface {
 	// Begin acquires the lock from a quiesced or force-released state, or takes over an expired
 	// lease. An unexpired lease is refused with *RebuildLockHeldError. The returned lease carries
 	// the odd generation the transaction produced. Lease is rounded up to whole seconds and must
-	// be at least one second.
+	// be at least one second. A transaction whose result is unknown (a timeout, a lost response,
+	// a server fault, a connection dropped during COMMIT) is *RebuildBeginIndeterminateError,
+	// carrying the lease it would have returned and the generation it observed; a throttled or cancelled one wrote nothing and
+	// keeps its classification.
 	Begin(ctx context.Context, owner string, lease time.Duration) (RebuildLease, error)
 
 	// Renew extends the lease to the given duration from now and returns it with the new expiry. It
@@ -223,6 +244,38 @@ func (e *RebuildConflictError) Error() string {
 func IsRebuildConflictErr(err error) bool {
 	var conflict *RebuildConflictError
 	return errors.As(err, &conflict)
+}
+
+// RebuildBeginIndeterminateError is returned by Begin when its transaction failed in a way that
+// leaves it unknown whether it applied: a timeout, a lost connection or response, a server fault, a
+// connection dropped during COMMIT. The caller may hold the lock under Lease, the lease the begin
+// would have returned, or the begin may still land: never treat it as "not taken", because a lock
+// that is taken and never ended keeps every commit refused. Settle it with RebuildState.HoldsBegun
+// over a fresh State read, which is exact when the owner token is unique to the caller. A throttled or cancelled begin is refused before anything is written and
+// never reports this. policy.Classify reports it as policy.ClassUnknown whatever its cause, unless
+// the caller wraps it in its own policy.ClassifiedError: a begin that applied refuses a second one
+// with *RebuildLockHeldError naming the caller's own owner.
+type RebuildBeginIndeterminateError struct {
+	// Lease is the lease the begin would have returned, fencing token included.
+	Lease RebuildLease
+	// Observed is the generation value the begin's transaction was conditioned on: it can apply
+	// only while the generation still has this value.
+	Observed int64
+	Cause    error
+}
+
+// Error returns the error message string.
+func (e *RebuildBeginIndeterminateError) Error() string {
+	return fmt.Sprintf("rebuild begin for %q may or may not have taken the lock: %v", e.Lease.Owner, e.Cause)
+}
+
+// Unwrap returns the indeterminate failure.
+func (e *RebuildBeginIndeterminateError) Unwrap() error { return e.Cause }
+
+// IsRebuildBeginIndeterminateErr returns true when err is a RebuildBeginIndeterminateError.
+func IsRebuildBeginIndeterminateErr(err error) bool {
+	var indeterminate *RebuildBeginIndeterminateError
+	return errors.As(err, &indeterminate)
 }
 
 // RebuildStateInvalidError reports that the lock row and the generation disagree in a way the

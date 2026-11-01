@@ -447,7 +447,10 @@ where
     /// settles the generation. The lease is renewed for another `lease` whenever half of it has
     /// passed: checked after each entity, after each type's events are read, every 1024 replayed
     /// commits, and before each batch. A lock another rebuild holds is
-    /// [`Error::RebuildLockHeld`]; a configuration error is [`Error::InvalidConfig`], before the
+    /// [`Error::RebuildLockHeld`]. A begin whose result is unknown is begun again once it can no
+    /// longer apply, and is otherwise [`Error::RebuildBeginIndeterminate`]: the run may hold the
+    /// lock under the error's lease, which a caller whose owner token is its own settles with
+    /// [`RebuildState::holds_begun`](crate::RebuildState::holds_begun) and ends. A configuration error is [`Error::InvalidConfig`], before the
     /// lock is taken, except a diff's ownership errors, which are found while planning (before any
     /// write, so the lock is released).
     ///

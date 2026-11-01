@@ -277,20 +277,32 @@ func (f *rebuildFence) Begin(ctx context.Context, owner string, lease time.Durat
 
 		expiry := now.Unix() + seconds
 
-		_, terr := f.repo.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-			TransactItems: f.beginItems(plan, owner, state.Generation.Value+plan.Increment, now.Unix(), expiry),
-		})
-		if terr == nil {
-			return evt.RebuildLease{
-				Owner:          owner,
-				Generation:     state.Generation.Value + plan.Increment,
-				LeaseExpiresAt: time.Unix(expiry, 0),
-			}, nil
+		begun := evt.RebuildLease{
+			Owner:          owner,
+			Generation:     state.Generation.Value + plan.Increment,
+			LeaseExpiresAt: time.Unix(expiry, 0),
 		}
 
-		if !raceLost(terr) {
-			return evt.RebuildLease{}, fmt.Errorf("rebuild fence: begin: %w", terr)
+		_, terr := f.repo.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: f.beginItems(plan, owner, begun.Generation, now.Unix(), expiry),
+		})
+		if terr == nil {
+			return begun, nil
 		}
+
+		if raceLost(terr) {
+			continue
+		}
+
+		// A cancelled or throttled transaction was refused before anything was written; a timeout,
+		// a lost response, or a server fault may have applied it.
+		if indeterminateCommit(terr) {
+			return evt.RebuildLease{}, &evt.RebuildBeginIndeterminateError{
+				Lease: begun, Observed: state.Generation.Value, Cause: terr,
+			}
+		}
+
+		return evt.RebuildLease{}, wrapClassifiedError(fmt.Errorf("rebuild fence: begin: %w", terr))
 	}
 
 	if invalid != nil {
