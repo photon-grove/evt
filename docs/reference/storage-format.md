@@ -608,15 +608,18 @@ An operation whose owner the commit did not write, or (history-dependent) whose 
 declared, is `InvalidViewOperation`, reported when the projector returns.
 
 Reserved partitions. The partitions of the [journal](#journal) (`pk` beginning `journal#`,
-`journal-counter#` or `journal-compaction#`) are the engine's. An operation of any other projector
-that targets one is refused when the projector returns, after its owner check and before the
-checks above, on every entry point that runs projectors (a command, a transaction, a replay, a
-rebuild): Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey` (the projector, the operation
-index and the `pk`; an invalid argument, never retried). Only the journal's own projector, which
-Rust identifies by the sealed `CommitProjector::engine_metadata`, writes there; Go has no journal,
-so no Go projector may. The check is in the projector pipeline: a repository commit carrying
-hand-built view operations, and direct view-repository writes, are trusted, as they are for
-compaction rows.
+`journal-counter#` or `journal-compaction#`) are the engine's. An operation of any other
+commit-wide projector that targets one is refused when the projector returns, after its owner check
+and before the checks above, on every entry point that runs commit-wide projectors (a command, a
+transaction, a replay, a rebuild): Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey` (the
+projector, the operation index and the `pk`; an invalid argument, never retried). Only the
+journal's own projector, which Rust identifies by the sealed `CommitProjector::engine_metadata`,
+writes there, and only the engine runs it: a Rust store or transaction that registers it is refused
+with `InvalidConfig` before it runs, as a rebuild is, because it would read the allocations a caller
+put in metadata. Go has no journal, so no Go projector may write there. The check is in the
+commit-wide projector pipeline: per-aggregate projectors (which return backend operations), a
+repository commit carrying hand-built view operations, and direct view-repository writes are
+trusted, as they are for compaction rows.
 
 A commit that carries operations but no event is `ProjectorOnlyCommit` / `ProjectorWithoutEvents`
 first ([Writes](#writes)). Operations count against `CommitTooLarge` ([Budget](#writes)) and are

@@ -1523,3 +1523,42 @@ async fn a_diff_rebuild_with_the_journal_deletes_journal_rows_no_event_holds() {
         .unwrap_err();
     assert!(matches!(error, Error::InvalidConfig(_)), "{error:?}");
 }
+
+#[tokio::test]
+async fn an_application_cannot_register_the_journals_projector() {
+    let journaled = JournalRepository::new(MemRepository::new(), journal());
+    let memory = journaled.inner().clone();
+    let store = Store::<Ledger, _>::new(&memory, ()).with_commit_projector(journaled.projector());
+
+    // Given the caller's metadata it would plan a journal row with nothing behind it.
+    let forged = super::encode_allocations(&[super::Allocation {
+        scope: "all".into(),
+        position: 5,
+    }]);
+    let metadata = Metadata::new("local").with_extension(super::ALLOCATION_KEY, forged);
+    let error = store
+        .execute("l-1", Add(1), metadata.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::ExecuteError::Store(Error::InvalidConfig(_))),
+        "{error:?}"
+    );
+
+    let mut transaction = store.transaction();
+    let mut ledger = transaction.read::<Ledger>("l-1").await.unwrap();
+    transaction
+        .append(
+            &mut ledger,
+            vec![crate::conformance::Added { amount: 1 }.into()],
+        )
+        .unwrap();
+    let error = transaction.commit(&metadata).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidConfig(_)), "{error:?}");
+
+    assert!(memory.events(&"l-1".into()).await.unwrap().is_empty());
+    assert!(
+        derived_rows(&memory).await.is_empty(),
+        "nothing was written"
+    );
+}

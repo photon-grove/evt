@@ -778,6 +778,26 @@ pub fn project_commit(
     project_with(projectors.iter().enumerate(), view)
 }
 
+/// [`project_commit`] for the projectors an application registers on a store or a transaction.
+/// The engine's own projectors (the journal's) run only inside the engine, which replaces any
+/// allocation a caller forged in metadata before they see it, so one registered here is refused
+/// with [`Error::InvalidConfig`] before anything runs: given the caller's metadata it could plan a
+/// journal row no counter or stored event backs.
+pub(crate) fn project_application(
+    projectors: &[Arc<dyn CommitProjector>],
+    view: &CommitView,
+) -> Result<Vec<ProjectedView>, Error> {
+    if let Some(projector) = projectors.iter().find(|p| p.reads_engine_metadata()) {
+        return Err(Error::InvalidConfig(format!(
+            "commit-wide projector {:?} reads engine metadata (the journal's); journal commits \
+             with a `JournalRepository`",
+            projector.name()
+        )));
+    }
+
+    project_commit(projectors, view)
+}
+
 /// Runs the given projectors, each with its index among the store's (or the rebuild's)
 /// projectors, over a commit view, whether or not it carries events, with the owner and
 /// operation checks of [`project_commit`].

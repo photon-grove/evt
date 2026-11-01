@@ -433,7 +433,8 @@ func (e *DuplicateViewKeyError) Error() string {
 func (e *DuplicateViewKeyError) Unwrap() error { return ErrInvalidArgument }
 
 // ReservedViewKeyError reports a projector's view operation on a partition the engine reserves for
-// the journal: a pk beginning "journal#", "journal-counter#" or "journal-compaction#". It is not a conflict and is never retried. Nothing was written.
+// the journal: a pk beginning "journal#", "journal-counter#" or "journal-compaction#". It is not a
+// conflict and is never retried. Nothing was written.
 type ReservedViewKeyError struct {
 	ProjectorOperationRef
 	PK string
