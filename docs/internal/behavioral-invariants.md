@@ -511,16 +511,17 @@ error before any write and is never split.
   `eventSeq` always equals that last event's sequence and the payload is consistent with it
 - A per-type size overrides the default wherever the type is committed (Go
   `Store.WithSnapshotSize`, Rust `Aggregate::SNAPSHOT_INTERVAL`, where `Some(0)` disables the
-  type's snapshots)
+  type's snapshots, TypeScript `snapshotInterval` on `defineAggregate`, where `0` does)
 - Catch-up (Go `WithCatchUpSnapshotThreshold`, Rust `with_catch_up_snapshot_threshold`, off by
   default): a load that replays at least the threshold writes a standalone, monotonic snapshot of
   the folded state at sequence `seq + 1`; a failed write is logged and never fails the load. Rust's
-  loaded state then carries the new `seq`; Go's does not
+  loaded state then carries the new `seq`; Go's does not. TypeScript has no catch-up yet (ADR 0009
+  defers it)
 - An oversized snapshot is skipped, never a failed commit: before staging a snapshot (commit,
   transaction, outcome commit, or catch-up), the store measures its item as the commit preflight
-  does plus the widest `ttl` (Go `evt.SnapshotCommitSize`, Rust `snapshot_commit_size`). Over
-  380,000 bytes (`MaxCommitItemBytes` / `MAX_COMMIT_ITEM_BYTES`) the snapshot is left out with a
-  warning, the commit proceeds as one that does not reach the interval, and the snapshot sequence
+  does plus the widest `ttl` (Go `evt.SnapshotCommitSize`, Rust `snapshot_commit_size`, TypeScript
+  `snapshotCommitSize`). Over 380,000 bytes (`MaxCommitItemBytes` / `MAX_COMMIT_ITEM_BYTES`) the
+  snapshot is left out (with a warning in Go and Rust; TypeScript logs nothing), the commit proceeds as one that does not reach the interval, and the snapshot sequence
   does not advance. Same rule on every backend. Aggregate state must stay bounded; unbounded
   history belongs in events
 
@@ -537,6 +538,9 @@ error before any write and is never split.
 2. If found: unmarshal snapshot, then load events after `eventSeq`
 3. If not found: load all events from sequence 1
 4. Apply all loaded events to rebuild state
+5. A gap in the loaded sequence reloads (Rust and TypeScript, up to three reads) or returns a
+   conflict at once (Go). TypeScript reads the snapshot again when no events follow it, and
+   counts a newer one as a gap, since a compaction between its two reads leaves none to see
 
 ## Compaction
 
