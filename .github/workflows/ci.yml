@@ -226,7 +226,7 @@ jobs:
         run: |
           node packages/evt-compat/dist/fixtures.js
           node packages/evt-compat/dist/memory.js
-          (cd packages/evt && node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/memory')")
+          (cd packages/evt && node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/memory'); require('@photon-grove/evt/testing')")
 
   integration:
     name: DynamoDB integration
