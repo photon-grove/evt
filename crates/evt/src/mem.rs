@@ -54,6 +54,9 @@ pub struct MemRepository {
     /// The feature-marker version this handle validated, if it has written yet. Per handle, not
     /// shared with clones.
     validated: Mutex<CachedMarker>,
+    /// Whether this handle is a journal writer ([`FeatureMarker::accept_journal`]), which accepts a
+    /// store that declares the journal. Copied to clones.
+    journaling: bool,
 }
 
 impl Clone for MemRepository {
@@ -66,6 +69,7 @@ impl Clone for MemRepository {
             rebuild: self.rebuild.clone(),
             clock: self.clock.clone(),
             validated: Mutex::new(*self.validated()),
+            journaling: self.journaling,
         }
     }
 }
@@ -248,7 +252,7 @@ impl MemRepository {
             return Ok(());
         }
 
-        match features::validate_marker_for_write(stored.as_ref()) {
+        match features::validate_marker_for_write(stored.as_ref(), self.journaling) {
             Ok(marker) => *validated = Some(marker),
             Err(Error::StreamHeadsNotMigrated) if !streams.values().any(Stream::holds_data) => {
                 let mut next = stored.clone().unwrap_or_default();
@@ -619,7 +623,7 @@ impl Repository for MemRepository {
         // feature this build does not model) is refused before the stream is read, so the refusal
         // wins over `CompactionUncovered`. It never declares the feature itself, and never
         // touches a head.
-        features::validate_marker_for_write(manifest.as_ref())?;
+        features::validate_marker_for_write(manifest.as_ref(), self.journaling)?;
 
         let mut streams = self.lock();
         let Some(stream) = streams.get_mut(entity_id) else {
@@ -677,6 +681,10 @@ impl Repository for MemRepository {
 }
 
 impl FeatureMarker for MemRepository {
+    fn accept_journal(&mut self) {
+        self.journaling = true;
+    }
+
     async fn read_manifest(&self) -> Result<Option<FeatureManifest>, Error> {
         Ok(self.manifest_lock().clone())
     }

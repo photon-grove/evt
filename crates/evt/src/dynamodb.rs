@@ -155,6 +155,9 @@ pub struct DynamoRepository {
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
     /// its own writer: clones validate independently, like separate processes.
     validated_marker: Mutex<CachedMarker>,
+    /// Whether this handle is a journal writer ([`FeatureMarker::accept_journal`]), which accepts a
+    /// store that declares the journal. Copied to clones.
+    journaling: bool,
     /// The `ttl`s this instance loaded, for the head update of a stream with retention.
     loaded_ttls: Mutex<LoadedTtls>,
 }
@@ -171,6 +174,7 @@ impl Clone for DynamoRepository {
             lazy_initialization: self.lazy_initialization,
             clock: self.clock.clone(),
             validated_marker: Mutex::new(*self.validated_marker()),
+            journaling: self.journaling,
             // Like a separate process, a clone remembers nothing it did not load itself.
             loaded_ttls: Mutex::new(LoadedTtls::default()),
         }
@@ -195,6 +199,7 @@ impl DynamoRepository {
             lazy_initialization: false,
             clock: Clock::default(),
             validated_marker: Mutex::new(None),
+            journaling: false,
             loaded_ttls: Mutex::new(LoadedTtls::default()),
         }
     }
@@ -356,7 +361,7 @@ impl DynamoRepository {
         &self,
         observed: Option<&FeatureManifest>,
     ) -> Result<ValidatedMarker, Error> {
-        match features::validate_marker_for_write(observed) {
+        match features::validate_marker_for_write(observed, self.journaling) {
             Err(Error::StreamHeadsNotMigrated) if !self.lazy_initialization => {
                 Err(Error::StoreNotInitialized)
             }
@@ -2170,6 +2175,10 @@ impl FeatureMarker for DynamoRepository {
 
     fn refuses_uninitialized(&self) -> bool {
         !self.lazy_initialization
+    }
+
+    fn accept_journal(&mut self) {
+        self.journaling = true;
     }
 
     async fn initialize(&self) -> Result<bool, Error> {

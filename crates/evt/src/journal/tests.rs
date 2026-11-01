@@ -1116,12 +1116,15 @@ async fn a_journal_that_cannot_be_replayed_fails_the_rebuild_before_any_write() 
     let memory = journaled_ledgers().await;
     wipe(&memory).await;
 
-    // An event written around the journal that claims a position another event holds.
+    // An event that claims a position another event holds, from a writer that accepts the journal
+    // table without journaling its commits (any other handle is refused).
     let forged = super::encode_allocations(&[super::Allocation {
         scope: "all".into(),
         position: 1,
     }]);
-    Store::<Ledger, _>::new(&memory, ())
+    let mut forger = memory.clone();
+    crate::FeatureMarker::accept_journal(&mut forger);
+    Store::<Ledger, _>::new(&forger, ())
         .execute(
             "l-3",
             Add(1),

@@ -110,6 +110,9 @@ pub struct PostgresRepository {
     /// The feature-marker version this handle validated, if it has written yet. Each handle is
     /// its own writer: clones validate independently, like separate processes.
     validated_marker: Mutex<CachedMarker>,
+    /// Whether this handle is a journal writer ([`FeatureMarker::accept_journal`]), which accepts a
+    /// store that declares the journal. Copied to clones.
+    journaling: bool,
     /// The clock rebuild leases are read from.
     clock: Clock,
     /// Records that the rebuild-lock relation exists, so a commit's lock assertion probes the
@@ -136,6 +139,7 @@ impl Clone for PostgresRepository {
             snapshots_table: self.snapshots_table.clone(),
             view_writer: self.view_writer.clone(),
             validated_marker: Mutex::new(*self.validated_marker()),
+            journaling: self.journaling,
             clock: self.clock.clone(),
             rebuild_ready: self.rebuild_ready.clone(),
             views_encoding_checked: self.views_encoding_checked.clone(),
@@ -153,6 +157,7 @@ impl fmt::Debug for PostgresRepository {
             .field("snapshots_table", &self.snapshots_table)
             .field("view_writer", &self.view_writer.is_some())
             .field("views_table_target", &self.views_table_target)
+            .field("journaling", &self.journaling)
             .finish_non_exhaustive()
     }
 }
@@ -169,6 +174,7 @@ impl PostgresRepository {
             snapshots_table: DEFAULT_SNAPSHOTS_TABLE.to_owned(),
             view_writer: None,
             validated_marker: Mutex::new(None),
+            journaling: false,
             clock: Clock::default(),
             rebuild_ready: Arc::new(AtomicBool::new(false)),
             views_encoding_checked: Arc::new(AtomicBool::new(false)),
@@ -570,8 +576,14 @@ impl PostgresRepository {
 
         let observed = self.read_manifest().await?;
 
-        match self.validate_for_write(observed.as_ref(), false) {
-            Ok(_) => Ok(()),
+        // The journal is the write's own check: a commit re-validates in its transaction, and a
+        // rebuild view write, which may be the journal's, accepts it.
+        let validated = self
+            .refuse_foreign_views(observed.as_ref())
+            .and_then(|()| features::validate_marker_for_write(observed.as_ref(), true).map(drop));
+
+        match validated {
+            Ok(()) => Ok(()),
             Err(Error::StreamHeadsNotMigrated) => self.initialize().await.map(|_| ()),
             Err(error) => Err(error),
         }
@@ -616,7 +628,7 @@ impl PostgresRepository {
             ));
         }
 
-        features::validate_marker_for_write(observed)
+        features::validate_marker_for_write(observed, self.journaling)
     }
 
     /// Refuses a store that declares `postgres-views` unless this repository writes its views to
@@ -1643,6 +1655,10 @@ impl Repository for PostgresRepository {
 }
 
 impl FeatureMarker for PostgresRepository {
+    fn accept_journal(&mut self) {
+        self.journaling = true;
+    }
+
     async fn read_manifest(&self) -> Result<Option<FeatureManifest>, Error> {
         PostgresRepository::read_manifest(self).await
     }

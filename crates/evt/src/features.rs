@@ -73,7 +73,8 @@ pub const POSTGRES_VIEWS_VERSION: i64 = 1;
 /// cargo feature,
 /// `journal` and `journal-compaction` at format version 1. A build without the feature refuses a
 /// journal table, so a writer that cannot maintain the journal cannot leave it short, and a build
-/// that predates compaction refuses a compacted one.
+/// that predates compaction refuses a compacted one. Even with the feature, only a journal writer
+/// ([`FeatureMarker::accept_journal`]) writes to a journal table.
 #[cfg(not(feature = "journal"))]
 pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[
     (POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION),
@@ -88,7 +89,8 @@ pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[
 /// cargo feature,
 /// `journal` and `journal-compaction` at format version 1. A build without the feature refuses a
 /// journal table, so a writer that cannot maintain the journal cannot leave it short, and a build
-/// that predates compaction refuses a compacted one.
+/// that predates compaction refuses a compacted one. Even with the feature, only a journal writer
+/// ([`FeatureMarker::accept_journal`]) writes to a journal table.
 #[cfg(feature = "journal")]
 pub const SUPPORTED_FEATURES: &[(&str, i64)] = &[
     (JOURNAL_FEATURE, JOURNAL_VERSION),
@@ -281,19 +283,45 @@ pub fn marker_matches(validated: CachedMarker, observed: Option<&FeatureManifest
 /// (DynamoDB by default) or initializes the store itself, but only one it has confirmed holds no
 /// data (see [`FeatureMarker::initialize`], and [`FeatureMarker::declare_stream_heads`] for the
 /// unconditional declaration a migration performs).
+///
+/// Unless `journaling` (the handle is a journal writer, see [`FeatureMarker::accept_journal`]), a
+/// manifest that declares `journal` or `journal-compaction` is refused too, with
+/// [`Error::UnsupportedFeature`]: an event committed around the journal would be missing from it
+/// with no gap to show it.
 pub fn validate_marker_for_write(
     observed: Option<&FeatureManifest>,
+    journaling: bool,
 ) -> Result<ValidatedMarker, Error> {
     let Some(manifest) = observed else {
         return Err(Error::StreamHeadsNotMigrated);
     };
 
     manifest.validate_supported()?;
+    if !journaling {
+        refuse_journal(manifest)?;
+    }
     if !manifest.declares_stream_heads() {
         return Err(Error::StreamHeadsNotMigrated);
     }
 
     Ok(ValidatedMarker::Version(manifest.version))
+}
+
+/// The extensions only a journal writer maintains.
+const JOURNAL_ONLY: [&str; 2] = [JOURNAL_FEATURE, JOURNAL_COMPACTION_FEATURE];
+
+/// Refuses a manifest that declares an extension only a journal writer maintains.
+fn refuse_journal(manifest: &FeatureManifest) -> Result<(), Error> {
+    for feature in JOURNAL_ONLY {
+        if let Some(&version) = manifest.features.get(feature) {
+            return Err(Error::UnsupportedFeature {
+                feature: feature.to_owned(),
+                version,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// A repository that stores the feature-marker row ([`FEATURES_ID`]). Every backend implements it,
@@ -335,6 +363,17 @@ pub trait FeatureMarker: Send + Sync {
     fn refuses_uninitialized(&self) -> bool {
         false
     }
+
+    /// Makes this handle a journal writer, which accepts a store that declares `journal` or
+    /// `journal-compaction` on its write paths (commits, snapshot writes, compaction). Every other
+    /// handle refuses such a store with [`Error::UnsupportedFeature`], even in a build with the
+    /// `journal` cargo feature, so an event committed around the journal cannot go missing from
+    /// it. `JournalRepository::new` calls it on the repository it wraps, and clones of that handle
+    /// made afterwards are journal writers too; the handle it was cloned from is not.
+    ///
+    /// A decorator under the journal must forward it to the repository it wraps, or that
+    /// repository refuses the journal's table. The default does nothing.
+    fn accept_journal(&mut self) {}
 
     /// Initializes the store: declares `stream-heads` on a store that holds no data, with the
     /// verification ADR 0007 requires, and returns whether this call declared it.
@@ -531,7 +570,7 @@ mod tests {
     fn writers_require_the_stream_heads_feature() {
         // No marker row, or a row without the feature: not migrated.
         assert!(matches!(
-            validate_marker_for_write(None),
+            validate_marker_for_write(None, false),
             Err(Error::StreamHeadsNotMigrated)
         ));
 
@@ -540,7 +579,7 @@ mod tests {
             ..FeatureManifest::default()
         };
         assert!(matches!(
-            validate_marker_for_write(Some(&manifest)),
+            validate_marker_for_write(Some(&manifest), false),
             Err(Error::StreamHeadsNotMigrated)
         ));
 
@@ -551,7 +590,7 @@ mod tests {
             "the canonical encoding of the declaration"
         );
         assert!(matches!(
-            validate_marker_for_write(Some(&manifest)),
+            validate_marker_for_write(Some(&manifest), false),
             Ok(ValidatedMarker::Version(2))
         ));
 
@@ -559,8 +598,41 @@ mod tests {
         let mut unsupported = FeatureManifest::default();
         unsupported.features.insert("journal-compaction".into(), 2);
         assert!(matches!(
-            validate_marker_for_write(Some(&unsupported)),
+            validate_marker_for_write(Some(&unsupported), true),
             Err(Error::UnsupportedFeature { .. })
+        ));
+    }
+
+    #[test]
+    fn only_a_journal_writer_accepts_a_journal_table() {
+        let mut manifest = FeatureManifest {
+            version: 3,
+            ..FeatureManifest::default()
+        };
+        manifest.declare_stream_heads();
+        manifest.declare_journal();
+
+        if cfg!(feature = "journal") {
+            assert!(matches!(
+                validate_marker_for_write(Some(&manifest), true),
+                Ok(ValidatedMarker::Version(3))
+            ));
+        }
+        assert!(matches!(
+            validate_marker_for_write(Some(&manifest), false),
+            Err(Error::UnsupportedFeature { feature, version: 1 }) if feature == JOURNAL_FEATURE
+        ));
+
+        // Compaction is the journal's too.
+        manifest.features.remove(JOURNAL_FEATURE);
+        manifest.features.insert(
+            JOURNAL_COMPACTION_FEATURE.to_owned(),
+            JOURNAL_COMPACTION_VERSION,
+        );
+        assert!(matches!(
+            validate_marker_for_write(Some(&manifest), false),
+            Err(Error::UnsupportedFeature { feature, version: 1 })
+                if feature == JOURNAL_COMPACTION_FEATURE
         ));
     }
 
