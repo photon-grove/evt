@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -89,6 +90,10 @@ type View struct {
 // GetView retrieves a view by PK using the default sort key "VIEW".
 // For views with custom sort keys, use ListViewsByPK instead.
 func (repo *ViewRepository) GetView(ctx context.Context, pk string) (*evt.SerializedView, error) {
+	if err := nulFree("pk", pk); err != nil {
+		return nil, err
+	}
+
 	input := dynamodb.GetItemInput{
 		TableName:      &repo.ViewsTable,
 		ConsistentRead: aws.Bool(true),
@@ -130,6 +135,16 @@ func (repo *ViewRepository) BatchGetViews(ctx context.Context, pks []string) ([]
 // semantics; only the sort key differs. Callers reading rows that live at a custom
 // sort key batch them through here instead of the DefaultViewSK shorthand.
 func (repo *ViewRepository) BatchGetViewsAtSK(ctx context.Context, pks []string, sk string) ([]*evt.SerializedView, error) {
+	if err := nulFree("sk", sk); err != nil {
+		return nil, err
+	}
+
+	for _, pk := range pks {
+		if err := nulFree("pk", pk); err != nil {
+			return nil, err
+		}
+	}
+
 	keys := make([]map[string]types.AttributeValue, 0, len(pks))
 	seen := make(map[string]struct{}, len(pks))
 	for _, pk := range pks {
@@ -263,6 +278,14 @@ func (repo *ViewRepository) PutViews(ctx context.Context, views []*evt.Serialize
 
 // DeleteView removes a view row by primary key. If SK is empty, it defaults to "VIEW".
 func (repo *ViewRepository) DeleteView(ctx context.Context, pk string, sk string) error {
+	if err := nulFree("pk", pk); err != nil {
+		return err
+	}
+
+	if err := nulFree("sk", sk); err != nil {
+		return err
+	}
+
 	if sk == "" {
 		sk = evt.DefaultViewSK
 	}
@@ -313,6 +336,10 @@ func (repo *ViewRepository) writeBatch(ctx context.Context, writes []types.Write
 // default sort key and preserving the TTL field. (MarshalViewToItem, used by the
 // event-sourced projector path, intentionally omits TTL.)
 func (repo *ViewRepository) marshalViewItem(view *evt.SerializedView) (map[string]types.AttributeValue, error) {
+	if err := checkViewRow(view); err != nil {
+		return nil, err
+	}
+
 	sk := view.SK
 	if sk == "" {
 		sk = evt.DefaultViewSK
@@ -362,6 +389,10 @@ func (repo *ViewRepository) ListViewsByEntityType(ctx context.Context, entityTyp
 // invoking fn per view without buffering the whole result set. A GSI read is eventually
 // consistent, so a row a commit just wrote may be missing.
 func (repo *ViewRepository) ListViewsByEntityTypeEach(ctx context.Context, entityType evt.EntityType, fn func(*evt.SerializedView) error) error {
+	if err := nulFree("entityType", string(entityType)); err != nil {
+		return err
+	}
+
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
 		IndexName:              aws.String(entityTypeIndexName),
@@ -377,6 +408,10 @@ func (repo *ViewRepository) ListViewsByEntityTypeEach(ctx context.Context, entit
 // ListViewsByEntityTypePaged queries by entity type with cursor-based pagination. It reads the
 // entityType GSI, so it is eventually consistent.
 func (repo *ViewRepository) ListViewsByEntityTypePaged(ctx context.Context, entityType evt.EntityType, limit int, cursor string) (*evt.PagedResult, error) {
+	if err := nulFree("entityType", string(entityType)); err != nil {
+		return nil, err
+	}
+
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
 		IndexName:              aws.String(entityTypeIndexName),
@@ -482,6 +517,10 @@ func (repo *ViewRepository) ListViewsByPK(ctx context.Context, pk string) ([]*ev
 // ListViewsByPKEach streams views for the given partition key, invoking fn per view without
 // buffering the whole result set. Every page is strongly consistent unless WithConsistentRead(false).
 func (repo *ViewRepository) ListViewsByPKEach(ctx context.Context, pk string, fn func(*evt.SerializedView) error) error {
+	if err := nulFree("pk", pk); err != nil {
+		return err
+	}
+
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
 		ConsistentRead:         aws.Bool(repo.consistentRead),
@@ -531,6 +570,10 @@ func (repo *ViewRepository) eachViewPage(ctx context.Context, input *dynamodb.Qu
 // consistent unless WithConsistentRead(false), so a page read straight after a commit sees the rows
 // it wrote.
 func (repo *ViewRepository) ListViewsByPKPaged(ctx context.Context, pk string, limit int, cursor string) (*evt.PagedResult, error) {
+	if err := nulFree("pk", pk); err != nil {
+		return nil, err
+	}
+
 	input := dynamodb.QueryInput{
 		TableName:              &repo.ViewsTable,
 		ConsistentRead:         aws.Bool(repo.consistentRead),
@@ -600,4 +643,35 @@ func (repo *ViewRepository) marshalMap(in any) (map[string]types.AttributeValue,
 // unmarshalMap decodes an attribute map into a struct.
 func (repo *ViewRepository) unmarshalMap(value map[string]types.AttributeValue, out any) error {
 	return repo.decoder.Decode(&types.AttributeValueMemberM{Value: value}, out)
+}
+
+// nulFree refuses U+0000 in a view row's text, or in a key or entity type a read names, with
+// *evt.InvalidArgumentError (errors.Is ErrInvalidArgument) before any request. PostgreSQL text cannot
+// hold it, so every backend refuses it and the same call has the same result on each, as for the
+// commit path's view operations.
+func nulFree(argument, value string) error {
+	if strings.ContainsRune(value, 0) {
+		return &evt.InvalidArgumentError{Argument: argument, Message: "a view " + argument + " must not contain U+0000"}
+	}
+
+	return nil
+}
+
+// checkViewRow refuses U+0000 in a row's key, owner, entity type, or payload.
+func checkViewRow(view *evt.SerializedView) error {
+	fields := []struct{ argument, value string }{
+		{"pk", view.PK},
+		{"sk", view.SK},
+		{"owner", string(view.EntityID)},
+		{"entityType", string(view.EntityType)},
+		{"payload", string(view.Payload)},
+	}
+
+	for _, field := range fields {
+		if err := nulFree(field.argument, field.value); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

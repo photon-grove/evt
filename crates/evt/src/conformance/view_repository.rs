@@ -61,6 +61,10 @@ pub async fn view_repository_cases<V: ViewRepository>(repo: &V) {
         "a row with an empty pk or a non-UTF-8 payload is refused before any write",
         Box::pin(view_refusals(repo)).await,
     );
+    record(
+        "U+0000 in a row or in a key a read names is refused, and a batch holding it writes nothing",
+        Box::pin(view_nul_refusals(repo)).await,
+    );
 
     if !failures.is_empty() {
         panic!(
@@ -537,6 +541,71 @@ async fn view_refusals<V: ViewRepository>(repo: &V) -> CaseResult {
         Vec::<ViewRow>::new(),
         "nothing was written"
     );
+
+    Ok(())
+}
+
+async fn view_nul_refusals<V: ViewRepository>(repo: &V) -> CaseResult {
+    let ns = namespace();
+    let (pk, entity_type) = (format!("{ns}-a"), format!("{ns}-t"));
+    let refused = |err: &Error| matches!(err, Error::InvalidArgument(_));
+
+    // PostgreSQL text cannot hold U+0000, so every backend refuses it, in each text of a row.
+    let rows = [
+        row(&format!("{pk}\0"), "VIEW", &entity_type, "{}"),
+        row(&pk, "s\0k", &entity_type, "{}"),
+        ViewRow::new(pk.as_str(), "VIEW", "own\0er", entity_type.as_str(), "{}"),
+        row(&pk, "VIEW", &format!("{entity_type}\0"), "{}"),
+        row(&pk, "VIEW", &entity_type, "{\"a\":\"\0\"}"),
+    ];
+    for bad in &rows {
+        expect_err(repo.put_view(bad).await, &format!("{bad:?}"), refused)?;
+    }
+
+    let good = row(&pk, "good", &entity_type, "{}");
+    expect_err(
+        repo.put_views(&[good, rows[4].clone()]).await,
+        "a batch with U+0000 in a payload",
+        refused,
+    )?;
+    ensure_eq!(
+        repo.list_views_by_pk(&pk).await?,
+        Vec::<ViewRow>::new(),
+        "nothing was written"
+    );
+
+    let nul_pk = format!("{pk}\0");
+    expect_err(
+        repo.get_view_at(&nul_pk, "VIEW").await,
+        "a read of such a pk",
+        refused,
+    )?;
+    expect_err(
+        repo.get_view_at(&pk, "s\0k").await,
+        "a read of such an sk",
+        refused,
+    )?;
+    expect_err(
+        repo.delete_view(&nul_pk, "VIEW").await,
+        "a delete of such a pk",
+        refused,
+    )?;
+    expect_err(
+        repo.batch_get_views(&[pk.as_str(), nul_pk.as_str()]).await,
+        "a batch read naming such a pk",
+        refused,
+    )?;
+    expect_err(
+        repo.list_views_by_pk_paged(&nul_pk, None, None).await,
+        "a listing of such a pk",
+        refused,
+    )?;
+    expect_err(
+        repo.list_views_by_entity_type_paged(&format!("{entity_type}\0"), None, None)
+            .await,
+        "a listing of such an entity type",
+        refused,
+    )?;
 
     Ok(())
 }

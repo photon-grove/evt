@@ -1017,6 +1017,10 @@ loop {
 A cursor is Go's: base64url JSON of the last key, so it moves between a Go and a Rust process. A
 page can come back empty with a cursor on DynamoDB, so keep going until the cursor is `None`.
 
+Every backend refuses U+0000 with `Error::InvalidArgument` before any request, because PostgreSQL
+`text` can't store it: in a written row's key, owner, entity type or payload (a batch holding one
+writes nothing), and in a key or entity type a read, delete or list names.
+
 Point reads and partition listings see every commit that has returned, so a handler can commit and
 read its own write. `DynamoViewRepository` gets that with strongly consistent reads of the base
 table, at twice the read capacity of an eventual read. `with_consistent_read(false)` opts the

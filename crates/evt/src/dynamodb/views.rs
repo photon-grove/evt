@@ -12,7 +12,9 @@ use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
 use super::{DynamoRepository, from_sdk_item, s, sdk, sdk_error, to_sdk, to_sdk_item};
 use crate::error::Error;
 use crate::projection::ViewRow;
-use crate::views::{DEFAULT_VIEW_SK, ViewPage, ViewRepository, check_view_row, resolve_key};
+use crate::views::{
+    DEFAULT_VIEW_SK, ViewPage, ViewRepository, check_view_row, nul_free, resolve_key,
+};
 use crate::wire::dynamo::{
     self as wire, MAX_VIEW_BATCH_GET, MAX_VIEW_BATCH_WRITE, ViewQuery, encode_view_cursor,
     view_key, view_query_by_entity_type, view_query_by_pk, view_row_from_item, view_row_item,
@@ -314,6 +316,10 @@ impl ViewRepository for DynamoViewRepository {
 
     async fn batch_get_views_at(&self, pks: &[&str], sk: &str) -> Result<Vec<ViewRow>, Error> {
         let sk = resolve_key("-", sk)?;
+        for pk in pks {
+            nul_free(pk, "pk")?;
+        }
+
         let mut seen = BTreeSet::new();
         let keys: Vec<_> = pks
             .iter()
@@ -335,6 +341,7 @@ impl ViewRepository for DynamoViewRepository {
         limit: Option<usize>,
         cursor: Option<&str>,
     ) -> Result<ViewPage, Error> {
+        nul_free(pk, "pk")?;
         self.query_page(view_query_by_pk(pk, limit, cursor)?).await
     }
 
@@ -344,6 +351,7 @@ impl ViewRepository for DynamoViewRepository {
         limit: Option<usize>,
         cursor: Option<&str>,
     ) -> Result<ViewPage, Error> {
+        nul_free(entity_type, "entity type")?;
         self.query_page(view_query_by_entity_type(entity_type, limit, cursor)?)
             .await
     }

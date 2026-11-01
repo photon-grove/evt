@@ -15,7 +15,7 @@ use tokio_postgres::Row;
 use super::{pool_error, read_committed, statement_error};
 use crate::error::Error;
 use crate::projection::ViewRow;
-use crate::views::{ViewPage, ViewRepository, check_view_row, page_limit, resolve_key};
+use crate::views::{ViewPage, ViewRepository, check_view_row, nul_free, page_limit, resolve_key};
 use crate::wire::dynamo::{AttributeValue, Item, decode_view_cursor, encode_view_cursor};
 use crate::wire::postgres::{MAX_VIEW_INDEX_KEY_BYTES, MAX_VIEW_PAGE_ROWS, views_table};
 
@@ -243,38 +243,11 @@ pub(super) fn row(row: &Row) -> Result<ViewRow, Error> {
     })
 }
 
-/// Refuses a string PostgreSQL `text` cannot hold: one with U+0000. DynamoDB and the in-memory
-/// repository store it, so this is a typed refusal rather than the database's own error.
-fn nul_free(value: &str, field: &str) -> Result<(), Error> {
-    if value.contains('\0') {
-        return Err(Error::InvalidArgument(format!(
-            "a PostgreSQL view {field} cannot contain U+0000"
-        )));
-    }
-
-    Ok(())
-}
-
-/// A point key, resolved as every backend resolves it, then checked for U+0000.
-fn key<'a>(pk: &str, sk: &'a str) -> Result<&'a str, Error> {
-    let sk = resolve_key(pk, sk)?;
-    nul_free(pk, "pk")?;
-    nul_free(sk, "sk")?;
-
-    Ok(sk)
-}
-
-/// Checks a row before writing it: the checks every backend makes, U+0000, then the index key
-/// bound. Returns the sort key it is stored under (`VIEW` for an empty one).
+/// Checks a row before writing it: the checks every backend makes (U+0000 included), then the
+/// index key bound. Returns the sort key it is stored under (`VIEW` for an empty one).
 fn checked(view: &ViewRow) -> Result<&str, Error> {
     check_view_row(view)?;
-    let sk = key(&view.pk, &view.sk)?;
-    nul_free(&view.entity_id, "owner")?;
-    nul_free(&view.entity_type, "entity type")?;
-    nul_free(
-        std::str::from_utf8(&view.payload).unwrap_or_default(),
-        "payload",
-    )?;
+    let sk = resolve_key(&view.pk, &view.sk)?;
     let key_bytes = view.entity_type.len() + view.pk.len() + sk.len();
 
     if key_bytes > MAX_VIEW_INDEX_KEY_BYTES {
@@ -298,7 +271,7 @@ fn upsert_sql(table: &str) -> String {
 
 impl ViewRepository for PgViewRepository {
     async fn get_view_at(&self, pk: &str, sk: &str) -> Result<Option<ViewRow>, Error> {
-        let sk = key(pk, sk)?;
+        let sk = resolve_key(pk, sk)?;
         let client = self.client().await?;
         let found = client
             .query_opt(
@@ -363,7 +336,7 @@ impl ViewRepository for PgViewRepository {
     }
 
     async fn delete_view(&self, pk: &str, sk: &str) -> Result<(), Error> {
-        let sk = key(pk, sk)?;
+        let sk = resolve_key(pk, sk)?;
         let client = self.client().await?;
         client
             .execute(

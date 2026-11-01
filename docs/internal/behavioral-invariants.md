@@ -109,6 +109,13 @@ both backends). The row shape and rules are specified in the
 [storage format](../reference/storage-format.md#views); the invariants are under
 [Commit-Wide Projectors](#commit-wide-projectors-v09-c7).
 
+The view repository (Go `dynamo.ViewRepository`; Rust `ViewRepository` on mem, DynamoDB and
+PostgreSQL) refuses U+0000 in a written row's `pk`, `sk`, owner, entity type or payload, and in a
+`pk`, `sk` or entity type a read, delete or list names, with the typed invalid-argument error before
+any request. A batch holding such a row writes nothing. PostgreSQL `text` cannot hold U+0000, so the
+same call has the same result on every backend (Go `conformance.RunViewRepositorySuite`, Rust
+`view_repository_cases`).
+
 ## Serialization Formats
 
 ### SerializedEvent

@@ -249,6 +249,10 @@ way. The entity-type listings read the `entityType-index` global secondary index
 can only read eventually consistently, so a row a commit just wrote can be missing from them for a
 moment. Rust's `DynamoViewRepository` behaves the same way (`with_consistent_read`).
 
+The view repository refuses U+0000 in a row's key, owner, entity type or payload, and in a key or
+entity type a read or list names, with `evt.ErrInvalidArgument` before any request (Rust
+`Error::InvalidArgument`). PostgreSQL can't store it, so every backend refuses it alike.
+
 ## Local tables
 
 The [`infra/local`](https://github.com/photon-grove/evt/tree/main/infra/local) Terraform stack
