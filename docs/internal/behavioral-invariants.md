@@ -785,8 +785,12 @@ The stored shapes are in the [storage format](../reference/storage-format.md#jou
   0, or that the journal repairs, is raised to the floor before allocating.
 - **A rebuild restores compacted rows** and leaves the compaction partition alone; compacting again
   at the floor prunes them. Wiping the views table un-compacts the scope; nothing is lost.
-- **The marker declares it.** The first compaction lease declares `journal-compaction: 1`; builds
-  that do not model it refuse the table. Compaction adds no action to any commit.
+- **The marker declares it, once a run has been checked.** A run declares `journal-compaction: 1`
+  before its first write, after its checkpoint (between the floor and the high watermark, never 0)
+  and its range (the preflight) have been checked; builds that do not model it refuse the table.
+  Taking a lease declares nothing, and `compact_with_lease` checks the checkpoint before it takes
+  one, so a refused run (a mistyped scope, a checkpoint above the watermark) leaves the table
+  without the declaration or a lease. Compaction adds no action to any commit.
 
 ## Projector System
 

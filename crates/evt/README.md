@@ -805,8 +805,11 @@ match page(&repository, &scope, after, 100).await {
   unchanged). `page`, `JournalRepository`, and compaction require it. Compaction rows
   that are not the engine's (`SYSTEM#JOURNAL`) are refused with `Error::ForeignJournalRow`, and a
   preflight refuses a gapped range or an oversized manifest before anything is written.
-- The first lease declares `journal-compaction` on the feature marker, so a build that predates
-  compaction refuses the table. `photon_evt::conformance::compaction_cases` checks a backend
+- A run declares `journal-compaction` on the feature marker before its first write, so a build
+  that predates compaction refuses the table. It checks its checkpoint and range first, and
+  `compact_with_lease` checks the checkpoint before it takes the lease, so a refused checkpoint (a
+  mistyped scope, a checkpoint above the high watermark) leaves no declaration and no lease.
+  `photon_evt::conformance::compaction_cases` checks a backend
   (`CompactionStore`, implemented by the in-memory, DynamoDB and PostgreSQL repositories).
 
 The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#journal),
