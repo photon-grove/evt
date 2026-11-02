@@ -485,6 +485,11 @@ key `entityType` (no range key).
   padded base64url. Go and Rust cursors are interchangeable. An empty cursor is the first page.
 - A reader treats an absent string attribute as empty, an absent `ttl` as zero, and a number in a
   string attribute as its text. A `ttl` that is not an integer is a corrupt row.
+- U+0000 is refused before any request, on every backend, because PostgreSQL `text` cannot hold
+  it: in a written row's `pk`, `sk`, owner, entity type or payload (a batch holding one writes
+  nothing), and in the `pk`, `sk` or entity type a read, a delete or a list names. The refusal is
+  the typed invalid-argument error (Go `ErrInvalidArgument`, Rust `Error::InvalidArgument`), as
+  on the commit path ([engine checks](#views)).
 
 `compat/fixtures/views.json` pins the items, request keys and expressions, cursors, and the
 payload bytes of the typed codec (`viewcodec.Codec` in Go, `ViewCodec` in Rust: the payload is the
@@ -3567,6 +3572,8 @@ View repository (`PgViewRepository`, `photon_evt::ViewRepository`), outside the 
   cursor even when no row follows, as on DynamoDB, and an empty cursor is the first page. A cursor
   with the wrong keys, or one that continues another partition or entity type, is
   `InvalidArgument`.
+- U+0000 is refused with `InvalidArgument` before any statement, as on every backend (see the
+  view repository under [DynamoDB](#views)).
 - TTL. Readers return a row whose `ttl` has passed, as DynamoDB does until its sweep deletes it.
   `PgViewRepository::purge_expired(now)` deletes them through the partial index, a batch at a time:
   `DELETE … WHERE (pk, sk) IN (SELECT pk, sk FROM … WHERE ttl > 0 AND ttl <= $1 ORDER BY ttl LIMIT 1000) AND ttl > 0 AND ttl <= $1`,
@@ -3889,9 +3896,6 @@ See [ADR 0001](../adr/0001-event-compaction-and-snapshot-truncation.md).
 
 These differences are deliberate and covered by tests. Keep them documented here.
 
-- U+0000 in PostgreSQL view rows ([PostgreSQL views table](#postgresql-views-table)). PostgreSQL
-  `text` cannot hold it, so the view repository refuses it in a key, owner, entity type or payload
-  with `InvalidArgument`, where DynamoDB and the in-memory repository store it.
 - View key size on PostgreSQL ([PostgreSQL views table](#postgresql-views-table)). A btree index
   entry holds at most 2,704 bytes, so the views table refuses a row whose `entity_type`, `pk` and
   `sk` together exceed 2,600 UTF-8 bytes (`InvalidArgument` from the view repository), which

@@ -60,6 +60,10 @@ impl ViewPage {
 /// entity-type listings included. An entity-type listing may lag behind a commit on DynamoDB, which
 /// serves it from a global secondary index that can only be read eventually consistently.
 ///
+/// U+0000 is refused on every backend with [`Error::InvalidArgument`] before any request: in a
+/// written row's key, owner, entity type or payload (a batch holding one writes nothing), and in a
+/// key or entity type a read, delete or list names. PostgreSQL `text` cannot hold it.
+///
 /// A `limit` of `None` or `Some(0)` leaves the page size to the backend (DynamoDB: its 1 MB
 /// response cap). A `cursor` is the opaque [`ViewPage::next_cursor`] of an earlier page of the
 /// same listing: base64url JSON of the last key, byte-identical to Go's, so a cursor can move
@@ -135,6 +139,12 @@ pub trait ViewRepository: Send + Sync {
         sk: &str,
     ) -> impl Future<Output = Result<Vec<ViewRow>, Error>> + Send {
         async move {
+            // Every key is checked before the first read, as DynamoDB's batch read does.
+            let sk = resolve_key("-", sk)?;
+            for pk in pks {
+                nul_free(pk, "pk")?;
+            }
+
             let mut seen = std::collections::BTreeSet::new();
             let mut views = Vec::new();
 
@@ -207,8 +217,9 @@ pub trait ViewRepository: Send + Sync {
     }
 }
 
-/// Checks the parts of a row every backend refuses before writing: an empty partition key, and a
-/// payload that is not valid UTF-8 (DynamoDB stores it as a string).
+/// Checks the parts of a row every backend refuses before writing: an empty partition key, a
+/// payload that is not valid UTF-8 (DynamoDB stores it as a string), and U+0000 in the key, the
+/// owner, the entity type or the payload ([`nul_free`]).
 pub(crate) fn check_view_row(view: &ViewRow) -> Result<(), Error> {
     if view.pk.is_empty() {
         return Err(Error::InvalidArgument(
@@ -216,10 +227,27 @@ pub(crate) fn check_view_row(view: &ViewRow) -> Result<(), Error> {
         ));
     }
 
-    if std::str::from_utf8(&view.payload).is_err() {
+    let Ok(payload) = std::str::from_utf8(&view.payload) else {
         return Err(Error::InvalidRecord(
             "view payload is not valid UTF-8 and cannot be stored as a string".into(),
         ));
+    };
+
+    nul_free(&view.pk, "pk")?;
+    nul_free(&view.sk, "sk")?;
+    nul_free(&view.entity_id, "owner")?;
+    nul_free(&view.entity_type, "entity type")?;
+    nul_free(payload, "payload")
+}
+
+/// Refuses U+0000 in a view row's text or in a key or entity type a read names. PostgreSQL `text`
+/// cannot hold it, so every backend refuses it with [`Error::InvalidArgument`], and the same call
+/// has the same result on each, as for the commit path's view operations.
+pub(crate) fn nul_free(value: &str, field: &str) -> Result<(), Error> {
+    if value.contains('\0') {
+        return Err(Error::InvalidArgument(format!(
+            "a view {field} cannot contain U+0000"
+        )));
     }
 
     Ok(())
@@ -306,14 +334,17 @@ macro_rules! forward_view_repository {
 
 forward_view_repository!(&T, std::sync::Arc<T>);
 
-/// Resolves a point key: an empty `pk` is refused, and an empty `sk` means `"VIEW"`, as it does for
-/// a write, so every operation reads the key a write stored.
+/// Resolves a point key: an empty `pk` and U+0000 in either part are refused, and an empty `sk`
+/// means `"VIEW"`, as it does for a write, so every operation reads the key a write stored.
 pub(crate) fn resolve_key<'a>(pk: &str, sk: &'a str) -> Result<&'a str, Error> {
     if pk.is_empty() {
         return Err(Error::InvalidArgument(
             "a view key needs a non-empty pk".into(),
         ));
     }
+
+    nul_free(pk, "pk")?;
+    nul_free(sk, "sk")?;
 
     Ok(if sk.is_empty() { DEFAULT_VIEW_SK } else { sk })
 }

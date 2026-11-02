@@ -8,7 +8,7 @@ use super::MemRepository;
 use crate::error::Error;
 use crate::projection::ViewRow;
 use crate::views::{
-    DEFAULT_VIEW_SK, ViewPage, ViewRepository, check_view_row, page_limit, resolve_key,
+    DEFAULT_VIEW_SK, ViewPage, ViewRepository, check_view_row, nul_free, page_limit, resolve_key,
 };
 use crate::wire::dynamo::{AttributeValue, Item, decode_view_cursor, encode_view_cursor};
 
@@ -45,6 +45,7 @@ impl ViewRepository for MemRepository {
         limit: Option<usize>,
         cursor: Option<&str>,
     ) -> Result<ViewPage, Error> {
+        nul_free(pk, "pk")?;
         let after = cursor_key(cursor, |key| text(key, "pk") == Some(pk))?;
         let rows = self.views_lock();
 
@@ -72,6 +73,7 @@ impl ViewRepository for MemRepository {
         limit: Option<usize>,
         cursor: Option<&str>,
     ) -> Result<ViewPage, Error> {
+        nul_free(entity_type, "entity type")?;
         let after = cursor_key(cursor, |key| text(key, "entityType") == Some(entity_type))?;
         let rows = self.views_lock();
 

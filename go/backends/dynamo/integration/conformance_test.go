@@ -160,3 +160,15 @@ func Test_FeatureMarkerConformance(t *testing.T) {
 		},
 	})
 }
+
+// Test_ViewRepositoryConformance runs the shared view repository cases against a views table of
+// their own.
+func Test_ViewRepositoryConformance(t *testing.T) {
+	ctx := context.Background()
+	client := dynamodb.NewFromConfig(newClientConfig(t))
+	viewsTable := newIsolatedViewsTable(ctx, t, client)
+
+	conformance.RunViewRepositorySuite(t, func() evt.ViewRepository {
+		return dynamo.NewViewRepository(client, viewsTable)
+	})
+}

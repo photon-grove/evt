@@ -3722,28 +3722,6 @@ async fn postgres_view_repository_conforms() {
             .is_some()
     );
 
-    // PostgreSQL text cannot hold U+0000: a typed refusal, not the database's error.
-    for row in [
-        ViewRow::new("nul\0pk", "VIEW", "owner", "kind", b"{}".to_vec()),
-        ViewRow::new("nul", "s\0k", "owner", "kind", b"{}".to_vec()),
-        ViewRow::new("nul", "VIEW", "own\0er", "kind", b"{}".to_vec()),
-        ViewRow::new("nul", "VIEW", "owner", "ki\0nd", b"{}".to_vec()),
-        ViewRow::new("nul", "VIEW", "owner", "kind", b"{\"a\":\"\0\"}".to_vec()),
-    ] {
-        assert!(
-            matches!(views.put_view(&row).await, Err(Error::InvalidArgument(_))),
-            "{row:?}"
-        );
-    }
-    assert!(matches!(
-        views.get_view_at("nul\0pk", "VIEW").await,
-        Err(Error::InvalidArgument(_))
-    ));
-    assert!(matches!(
-        views.list_views_by_pk_paged("nul\0pk", None, None).await,
-        Err(Error::InvalidArgument(_))
-    ));
-
     // A batch keeps a repeated key's last row, whatever order the keys come in.
     views
         .put_views(&[
