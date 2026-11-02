@@ -13,6 +13,7 @@
   <a href="https://docs.rs/photon-evt"><img alt="docs.rs" src="https://img.shields.io/docsrs/photon-evt?label=docs.rs"></a>
   <a href="https://crates.io/crates/photon-evt-lambda"><img alt="photon-evt-lambda on crates.io" src="https://img.shields.io/crates/v/photon-evt-lambda?label=photon-evt-lambda&amp;logo=awslambda&amp;color=0f766e"></a>
   <a href="https://pkg.go.dev/github.com/photon-grove/evt/go"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/photon-grove/evt/go.svg"></a>
+  <a href="https://www.npmjs.com/package/@photon-grove/evt"><img alt="@photon-grove/evt on npm" src="https://img.shields.io/npm/v/@photon-grove/evt?label=%40photon-grove%2Fevt&amp;logo=npm&amp;color=0f766e"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-172033"></a>
 </p>
 
@@ -33,7 +34,9 @@ you need.
 Reach for it when the history matters as much as the current state: an audit trail you can trust,
 read models you can delete and rebuild, and retries that never record the same fact twice. Because
 the Rust and Go code share one storage format byte for byte, a Rust service and a Go service can
-append to the same streams.
+append to the same streams. A TypeScript package, [`@photon-grove/evt`](packages/evt/README.md), is
+being built to the same format in phases. So far it has the core, the in-memory backend and the
+testing helpers.
 
 ## Highlights
 
@@ -268,7 +271,8 @@ The same pages, with interactive architecture diagrams, are on the
 | [`go/`](go/) | The Go module `github.com/photon-grove/evt/go`, tagged `go/vX.Y.Z` because Go requires that prefix for a module in a subdirectory |
 | [`compat/`](compat/) | Shared scenarios and golden fixtures that keep the two languages writing the same bytes |
 | [`docs/`](docs/) | The guide, the reference, and the architecture decision records |
-| [`website/`](website/), [`packages/`](packages/) | The docs site and the diagram package it uses |
+| [`packages/evt`](packages/evt/) | The TypeScript package `@photon-grove/evt`, with its fixture runner in `packages/evt-compat` |
+| [`website/`](website/), [`packages/react-flow-diagrams`](packages/react-flow-diagrams/) | The docs site and the diagram package it uses |
 
 ## Contributing
 

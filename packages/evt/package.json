@@ -1,8 +1,15 @@
 {
   "name": "@photon-grove/evt",
   "version": "0.0.0",
-  "private": true,
   "description": "Event sourcing for TypeScript, wire-compatible with the Go and Rust evt implementations.",
+  "keywords": [
+    "event-sourcing",
+    "cqrs",
+    "dynamodb",
+    "postgresql"
+  ],
+  "homepage": "https://github.com/photon-grove/evt/tree/main/packages/evt#readme",
+  "bugs": "https://github.com/photon-grove/evt/issues",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

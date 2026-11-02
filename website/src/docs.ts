@@ -41,7 +41,7 @@ const DOC_CONFIG: Record<string, DocConfig> = {
   'guide/getting-started': {
     group: GUIDES,
     order: 1,
-    summary: 'Model an aggregate in Rust (then Go), test it in memory, make retries safe, and move it to DynamoDB or PostgreSQL.',
+    summary: 'Model an aggregate in Rust (then Go and TypeScript), test it in memory, make retries safe, and move it to DynamoDB or PostgreSQL.',
   },
   'guide/concepts': {
     group: GUIDES,
@@ -51,7 +51,7 @@ const DOC_CONFIG: Record<string, DocConfig> = {
   'guide/examples': {
     group: GUIDES,
     order: 2.5,
-    summary: 'Every runnable example in both languages, what it shows, and the command that runs it.',
+    summary: 'Every runnable example in each language, what it shows, and the command that runs it.',
   },
   'guide/projections': {
     group: GUIDES,
