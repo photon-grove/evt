@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.11.0](https://github.com/photon-grove/evt/compare/go/v0.10.0...go/v0.11.0) (2026-11-02)
+
+
+### Features
+
+* **ts:** add the wire layer and check it against codec.json ([#248](https://github.com/photon-grove/evt/issues/248)) ([67c3711](https://github.com/photon-grove/evt/commit/67c3711faa09afb1358403fdfb67c0a7d5a32636))
+
+
+### Bug Fixes
+
+* **projectors:** refuse application writes to engine-reserved journal partitions ([#256](https://github.com/photon-grove/evt/issues/256)) ([e952288](https://github.com/photon-grove/evt/commit/e95228877506c5b266e5390dd982f2b136f5fcab))
+* **rebuild:** report a begin whose result is unknown as RebuildBeginIndeterminate ([#251](https://github.com/photon-grove/evt/issues/251)) ([3d314cd](https://github.com/photon-grove/evt/commit/3d314cd1a4a675e1588b0df170b3774a9a614396))
+* **views:** refuse U+0000 in view rows on every backend ([#254](https://github.com/photon-grove/evt/issues/254)) ([faa9fbd](https://github.com/photon-grove/evt/commit/faa9fbdc1613ff1b4cdd699974d8fab805a6301e))
+
 ## [0.10.0](https://github.com/photon-grove/evt/compare/go/v0.9.1...go/v0.10.0) (2026-10-30)
 
 

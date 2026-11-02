@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "photon-evt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aws-sdk-dynamodb",
  "deadpool-postgres",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "photon-evt-lambda"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "photon-evt",
  "serde",
