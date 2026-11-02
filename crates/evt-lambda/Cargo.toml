@@ -1,6 +1,6 @@
 [package]
 name = "photon-evt-lambda"
-version = "0.2.0"
+version = "0.3.0"
 description = "AWS Lambda helpers for photon-evt: DynamoDB Streams event decode, event-source filter patterns, journal wake-ups, and partial batch failures."
 readme = "README.md"
 keywords = ["event-sourcing", "dynamodb", "lambda", "aws", "streams"]
@@ -22,7 +22,7 @@ journal = ["photon-evt/journal"]
 [dependencies]
 # No SDK and no runtime: stream records are DynamoDB JSON, which photon-evt's wire module models.
 # release-please keeps this requirement at photon-evt's released version (release-please-config.json).
-photon-evt = { path = "../evt", version = "0.3.0" }
+photon-evt = { path = "../evt", version = "0.4.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
