@@ -15,6 +15,8 @@ fileGroups:
     - /pnpm-lock.yaml
   tests:
     - test/**/*
+    - examples/**/*
+    - /docs/guide/getting-started.md
     - scripts/**/*
     - tsconfig.test.json
     - vitest.config.ts

@@ -49,6 +49,16 @@
           "jsonpath": "$.package[?(@.name.value==='photon-evt-lambda')].version"
         }
       ]
+    },
+    "packages/evt": {
+      "release-type": "node",
+      "package-name": "@photon-grove/evt",
+      "initial-version": "0.1.0",
+      "component": "evt-ts",
+      "include-component-in-tag": true,
+      "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true
     }
   }
 }

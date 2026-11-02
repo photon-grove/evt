@@ -59,7 +59,7 @@ jobs:
                 go=true rust=true ;;
               docs/guide/getting-started.md)
                 # Its Rust blocks are checked against crates/evt/examples/getting_started.rs, and
-                # its TypeScript blocks will be against packages/evt/examples/getting-started.ts.
+                # its TypeScript blocks against packages/evt/examples/getting-started.ts.
                 go=true rust=true ts=true ;;
               crates/* | Cargo.toml | Cargo.lock | rust-toolchain.toml)
                 rust=true compat=true ;;
