@@ -11,6 +11,7 @@ import (
 	evt "github.com/photon-grove/evt/go"
 	"github.com/photon-grove/evt/go/backends/dynamo"
 	dynamomock "github.com/photon-grove/evt/go/backends/dynamo/internal/mock"
+	"github.com/photon-grove/evt/go/conformance"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -446,5 +447,17 @@ func Test_ViewRepository_ReadConsistency(t *testing.T) {
 		_, err = eventual.GetView(ctx, "pk1")
 		require.NoError(t, err)
 		client.AssertExpectations(t)
+	})
+}
+
+// Test_ViewRepository_Conformance runs the shared view repository cases over the mock client. Only
+// the partition listing that proves nothing was written reaches it: every refusal comes before any
+// request, so any other call fails the test as unexpected.
+func Test_ViewRepository_Conformance(t *testing.T) {
+	client := dynamomock.NewClient()
+	client.On("Query", mock.Anything, mock.Anything, mock.Anything).Return(&dynamodb.QueryOutput{}, nil)
+
+	conformance.RunViewRepositorySuite(t, func() evt.ViewRepository {
+		return dynamo.NewViewRepository(client, "views")
 	})
 }
