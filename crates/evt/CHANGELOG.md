@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/photon-grove/evt/compare/photon-evt-v0.3.0...photon-evt-v0.4.0) (2026-11-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **journal:** a repository handle not wrapped by JournalRepository is refused on a journal table, even in a build with the journal feature. JournalRepository::new now requires R: FeatureMarker, and a decorator placed under the journal must forward accept_journal to its inner repository.
+
+### Bug Fixes
+
+* **journal:** accept the journal marker per repository handle ([#257](https://github.com/photon-grove/evt/issues/257)) ([bda29fe](https://github.com/photon-grove/evt/commit/bda29fe53931cbb987f184a87a928ed8704e2797))
+* **journal:** check a compaction checkpoint before declaring the marker or taking the lease ([#255](https://github.com/photon-grove/evt/issues/255)) ([8b35bd7](https://github.com/photon-grove/evt/commit/8b35bd75fbfe506c025f665d489809192adbe9d3))
+* **projectors:** refuse application writes to engine-reserved journal partitions ([#256](https://github.com/photon-grove/evt/issues/256)) ([e952288](https://github.com/photon-grove/evt/commit/e95228877506c5b266e5390dd982f2b136f5fcab))
+* **rebuild:** report a begin whose result is unknown as RebuildBeginIndeterminate ([#251](https://github.com/photon-grove/evt/issues/251)) ([3d314cd](https://github.com/photon-grove/evt/commit/3d314cd1a4a675e1588b0df170b3774a9a614396))
+* **views:** refuse U+0000 in view rows on every backend ([#254](https://github.com/photon-grove/evt/issues/254)) ([faa9fbd](https://github.com/photon-grove/evt/commit/faa9fbdc1613ff1b4cdd699974d8fab805a6301e))
+
 ## [0.3.0](https://github.com/photon-grove/evt/compare/photon-evt-v0.2.1...photon-evt-v0.3.0) (2026-10-30)
 
 

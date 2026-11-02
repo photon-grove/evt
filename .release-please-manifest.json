@@ -1,5 +1,5 @@
 {
-  "go": "0.10.0",
-  "crates/evt": "0.3.0",
-  "crates/evt-lambda": "0.2.0"
+  "go": "0.11.0",
+  "crates/evt": "0.4.0",
+  "crates/evt-lambda": "0.3.0"
 }
