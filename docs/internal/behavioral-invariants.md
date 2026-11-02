@@ -638,6 +638,15 @@ transaction as the events. The byte-level rules are in the
   owner must never change: reuse a key with a tombstone put by its owner, never delete-then-put by
   another stream. `GroupCommits` returns an order every stream agrees with, and `ReplayViews`
   refuses a row two streams write (`SharedViewKeyError`).
+- The journal's partitions are the engine's. An operation whose `pk` begins `journal#`,
+  `journal-counter#` or `journal-compaction#` is refused when the projector returns, live, on
+  replay and in a rebuild (Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey`, both
+  invalid arguments, never retried), unless the projector is the engine's own (the journal's,
+  identified by the sealed `CommitProjector::engine_metadata`; Go has none). Only the engine runs
+  that projector: a Rust store or transaction that registers it is refused with `InvalidConfig`
+  before it runs, as a rebuild is. So an application projector cannot overwrite its stream's
+  journal rows. Per-aggregate projectors (backend operations), a repository commit that carries
+  hand-built view operations, and direct view-repository writes are trusted.
 - Only the in-memory replay of history-dependent projectors exists today; the state entry point and
   the state-based rebuild of current-state projectors are not implemented.
 - A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` returns true; a
@@ -789,8 +798,12 @@ The stored shapes are in the [storage format](../reference/storage-format.md#jou
   0, or that the journal repairs, is raised to the floor before allocating.
 - **A rebuild restores compacted rows** and leaves the compaction partition alone; compacting again
   at the floor prunes them. Wiping the views table un-compacts the scope; nothing is lost.
-- **The marker declares it.** The first compaction lease declares `journal-compaction: 1`; builds
-  that do not model it refuse the table. Compaction adds no action to any commit.
+- **The marker declares it, once a run has been checked.** A run declares `journal-compaction: 1`
+  before its first write, after its checkpoint (between the floor and the high watermark, never 0)
+  and its range (the preflight) have been checked; builds that do not model it refuse the table.
+  Taking a lease declares nothing, and `compact_with_lease` checks the checkpoint before it takes
+  one, so a refused run (a mistyped scope, a checkpoint above the watermark) leaves the table
+  without the declaration or a lease. Compaction adds no action to any commit.
 
 ## Projector System
 

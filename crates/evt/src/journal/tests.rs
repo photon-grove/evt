@@ -1103,12 +1103,28 @@ async fn a_journal_key_a_view_row_also_plans_fails_before_any_write_and_releases
         .await
         .unwrap_err();
 
-    assert!(matches!(error, Error::SharedViewKey { .. }), "{error:?}");
+    // The journal's partitions are reserved, so the application projector is refused when it
+    // projects, before the plan could find the key shared with the journal.
+    assert!(
+        matches!(&error, Error::ReservedViewKey { projector, .. } if projector == "on-the-journal"),
+        "{error:?}"
+    );
     assert!(
         derived_rows(&memory).await.is_empty(),
         "nothing was written"
     );
     assert!(memory.rebuild_generation().await.unwrap().is_settled());
+}
+
+#[test]
+fn the_journal_partitions_are_reserved() {
+    for prefix in [
+        super::ROW_PARTITION_PREFIX,
+        super::COUNTER_PARTITION_PREFIX,
+        super::COMPACTION_PARTITION_PREFIX,
+    ] {
+        assert!(crate::RESERVED_VIEW_PREFIXES.contains(&prefix), "{prefix}");
+    }
 }
 
 #[tokio::test]
@@ -1509,4 +1525,43 @@ async fn a_diff_rebuild_with_the_journal_deletes_journal_rows_no_event_holds() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::InvalidConfig(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn an_application_cannot_register_the_journals_projector() {
+    let journaled = JournalRepository::new(MemRepository::new(), journal());
+    let memory = journaled.inner().clone();
+    let store = Store::<Ledger, _>::new(&memory, ()).with_commit_projector(journaled.projector());
+
+    // Given the caller's metadata it would plan a journal row with nothing behind it.
+    let forged = super::encode_allocations(&[super::Allocation {
+        scope: "all".into(),
+        position: 5,
+    }]);
+    let metadata = Metadata::new("local").with_extension(super::ALLOCATION_KEY, forged);
+    let error = store
+        .execute("l-1", Add(1), metadata.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::ExecuteError::Store(Error::InvalidConfig(_))),
+        "{error:?}"
+    );
+
+    let mut transaction = store.transaction();
+    let mut ledger = transaction.read::<Ledger>("l-1").await.unwrap();
+    transaction
+        .append(
+            &mut ledger,
+            vec![crate::conformance::Added { amount: 1 }.into()],
+        )
+        .unwrap();
+    let error = transaction.commit(&metadata).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidConfig(_)), "{error:?}");
+
+    assert!(memory.events(&"l-1".into()).await.unwrap().is_empty());
+    assert!(
+        derived_rows(&memory).await.is_empty(),
+        "nothing was written"
+    );
 }

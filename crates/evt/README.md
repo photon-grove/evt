@@ -583,6 +583,13 @@ row and rewrite it, as its owner, with a tombstone payload. A rebuild orders the
 its owner's sequence, the only commit order the log keeps, and `replay_views` refuses a row that
 two streams write (`Error::SharedViewKey`).
 
+The journal's partitions are the engine's: an operation whose `pk` begins `journal#`,
+`journal-counter#` or `journal-compaction#` (`RESERVED_VIEW_PREFIXES`) fails with
+`Error::ReservedViewKey` before anything is written, unless it comes from the journal's own
+projector, which only the engine runs (a store or transaction that registers it fails with
+`Error::InvalidConfig`). So a commit-wide projector can't overwrite the journal rows its stream
+owns. Per-aggregate projectors return backend operations and are trusted, like hand-built ones.
+
 A PostgreSQL view writer has to enforce the owner in SQL, because the engine can't. The statements
 it returns must have these semantics (see `PostgresRepository::with_view_writer`):
 
@@ -806,8 +813,11 @@ match page(&repository, &scope, after, 100).await {
   unchanged). `page`, `JournalRepository`, and compaction require it. Compaction rows
   that are not the engine's (`SYSTEM#JOURNAL`) are refused with `Error::ForeignJournalRow`, and a
   preflight refuses a gapped range or an oversized manifest before anything is written.
-- The first lease declares `journal-compaction` on the feature marker, so a build that predates
-  compaction refuses the table. `photon_evt::conformance::compaction_cases` checks a backend
+- A run declares `journal-compaction` on the feature marker before its first write, so a build
+  that predates compaction refuses the table. It checks its checkpoint and range first, and
+  `compact_with_lease` checks the checkpoint before it takes the lease, so a refused checkpoint (a
+  mistyped scope, a checkpoint above the high watermark) leaves no declaration and no lease.
+  `photon_evt::conformance::compaction_cases` checks a backend
   (`CompactionStore`, implemented by the in-memory, DynamoDB and PostgreSQL repositories).
 
 The stored shapes are in the [storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#journal),

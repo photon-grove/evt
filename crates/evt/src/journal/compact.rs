@@ -29,7 +29,7 @@ use super::compaction::{
 use super::read::{JournalCompactionStore, MAX_PAGE_ROWS};
 use super::scope::{Scope, row_sk};
 use crate::error::Error;
-use crate::features::{JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION};
+use crate::features::{FeatureManifest, JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION};
 use crate::projection::ViewRow;
 use crate::rebuild::{self, RebuildEpoch, observe_rebuild_epoch};
 
@@ -160,17 +160,26 @@ pub async fn read_lease<S: JournalCompactionStore + ?Sized>(
         .transpose()
 }
 
-/// Declares `journal-compaction` on the feature marker before the first compaction, so a build that
-/// does not know compaction (and would read a compacted scope's missing rows as lost, or allocate
-/// below its floor) refuses the table. The marker is checked first: a table declaring a feature
-/// this build does not model is refused.
-async fn ensure_declared<S: CompactionStore + ?Sized>(store: &S) -> Result<(), Error> {
+/// Reads the feature marker and refuses a table declaring a feature this build does not model.
+async fn check_marker<S: CompactionStore + ?Sized>(
+    store: &S,
+) -> Result<Option<FeatureManifest>, Error> {
     let manifest = store.read_manifest().await?;
 
     if let Some(manifest) = &manifest {
         manifest.validate_supported()?;
     }
 
+    Ok(manifest)
+}
+
+/// Declares `journal-compaction` on the feature marker before a run's first write, so a build that
+/// does not know compaction (and would read a compacted scope's missing rows as lost, or allocate
+/// below its floor) refuses the table. It runs only once the run's checkpoint and its range have
+/// been checked, so a refused run leaves the table as it was. The marker is checked first
+/// ([`check_marker`]).
+async fn ensure_declared<S: CompactionStore + ?Sized>(store: &S) -> Result<(), Error> {
+    let manifest = check_marker(store).await?;
     let declared = manifest
         .as_ref()
         .and_then(|manifest| manifest.features.get(JOURNAL_COMPACTION_FEATURE).copied());
@@ -214,9 +223,11 @@ fn lease_lost(scope: &Scope, owner: &str) -> Error {
 /// A scope has at most one compaction at a time. The lease row records the holder, a fencing token
 /// that rises with every acquire and takeover, and the second the lease lapses (the repository's
 /// clock). An unexpired lease is refused with [`Error::CompactionLeaseHeld`]. The acquire is
-/// refused while a rebuild holds or left the fence ([`Error::RebuildUnavailable`]), and the first
-/// one declares `journal-compaction` on the feature marker. When its write loses a race it reads the
-/// lease again, a few times, and then fails transiently.
+/// refused while a rebuild holds or left the fence ([`Error::RebuildUnavailable`]), and on a table
+/// declaring a feature this build does not model ([`Error::UnsupportedFeature`]). It declares
+/// nothing: [`compact`] declares `journal-compaction` on the feature marker before its first
+/// write. When its write loses a race it reads the lease again, a few times, and then fails
+/// transiently.
 pub async fn begin_compaction<S: CompactionStore + ?Sized>(
     store: &S,
     scope: &Scope,
@@ -226,7 +237,7 @@ pub async fn begin_compaction<S: CompactionStore + ?Sized>(
     let seconds = rebuild::check_lease(owner, lease)?;
     let epoch = observe_rebuild_epoch(store).await?;
 
-    ensure_declared(store).await?;
+    check_marker(store).await?;
 
     for _ in 0..MAX_LEASE_ATTEMPTS {
         let stored = read_engine_row(store, scope, LEASE_SORT_KEY).await?;
@@ -452,29 +463,13 @@ pub async fn compact<S: CompactionStore + ?Sized>(
         epoch,
     };
 
-    let stored = read_engine_row(store, scope, MANIFEST_SORT_KEY).await?;
-    let old = stored
-        .as_ref()
-        .map(|row| CompactionManifest::decode(scope, &row.payload))
-        .transpose()?;
+    let (stored, old) = check_checkpoint(store, scope, through).await?;
     let floor = old.as_ref().map_or(0, |manifest| manifest.checkpoint);
-
-    if through == 0 || through < floor {
-        return Err(Error::InvalidArgument(format!(
-            "{scope} is compacted through {floor}; compact through {floor} or more, not {through}"
-        )));
-    }
-
-    let watermark = store.read_counter(scope).await?;
-    if through > watermark {
-        return Err(Error::InvalidArgument(format!(
-            "{scope} has allocated through {watermark}; it cannot be compacted through {through}"
-        )));
-    }
 
     let (manifest, chunks_written) = if through > floor {
         build(&mut run, old, stored.map(|row| row.payload), through).await?
     } else {
+        ensure_declared(store).await?;
         (old.expect("a floor comes from a manifest"), 0)
     };
 
@@ -506,8 +501,42 @@ pub async fn compact<S: CompactionStore + ?Sized>(
     })
 }
 
-/// [`compact`] holding a lease for the run: acquires it as `owner` ([`begin_compaction`]),
-/// compacts, and releases it, also when the run fails (the run leaves the scope consistent).
+/// Refuses a checkpoint outside `floor..=high watermark` (or 0) with [`Error::InvalidArgument`],
+/// reading nothing but the scope's manifest and counter, and returns the stored manifest row and
+/// the manifest it holds.
+async fn check_checkpoint<S: CompactionStore + ?Sized>(
+    store: &S,
+    scope: &Scope,
+    through: u64,
+) -> Result<(Option<ViewRow>, Option<CompactionManifest>), Error> {
+    let stored = read_engine_row(store, scope, MANIFEST_SORT_KEY).await?;
+    let old = stored
+        .as_ref()
+        .map(|row| CompactionManifest::decode(scope, &row.payload))
+        .transpose()?;
+    let floor = old.as_ref().map_or(0, |manifest| manifest.checkpoint);
+
+    if through == 0 || through < floor {
+        return Err(Error::InvalidArgument(format!(
+            "{scope} is compacted through {floor}; compact through {floor} or more, not {through}"
+        )));
+    }
+
+    let watermark = store.read_counter(scope).await?;
+    if through > watermark {
+        return Err(Error::InvalidArgument(format!(
+            "{scope} has allocated through {watermark}; it cannot be compacted through {through}"
+        )));
+    }
+
+    Ok((stored, old))
+}
+
+/// [`compact`] holding a lease for the run: checks the rebuild fence and the feature marker, then
+/// `through` against the scope's floor and high watermark, acquires the lease as `owner`
+/// ([`begin_compaction`]), compacts, and releases it, also when the run fails (the run leaves the
+/// scope consistent). A run refused before the lease takes none, and no refused run declares
+/// anything.
 pub async fn compact_with_lease<S: CompactionStore + ?Sized>(
     store: &S,
     scope: &Scope,
@@ -515,6 +544,12 @@ pub async fn compact_with_lease<S: CompactionStore + ?Sized>(
     owner: &str,
     lease: Duration,
 ) -> Result<CompactionReport, Error> {
+    // The fence and the marker first, so a rebuild in progress stays retriable and a table this
+    // build does not model is refused before its compaction rows are read.
+    observe_rebuild_epoch(store).await?;
+    check_marker(store).await?;
+    check_checkpoint(store, scope, through).await?;
+
     let mut held = begin_compaction(store, scope, owner, lease).await?;
     let result = compact(store, &mut held, through).await;
 
@@ -683,6 +718,7 @@ async fn build<S: CompactionStore + ?Sized>(
         Some(run),
     )
     .await?;
+    ensure_declared(store).await?;
     let tail = old.as_ref().map(|old| old.chunks.len() as u64 - 1);
 
     let mut written = 0;

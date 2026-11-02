@@ -20,7 +20,9 @@ use crate::outcome::{
     CommandIdentity, CommandOutcome, DigestInput, Outcome, OutcomeCommand, OutcomeConfig,
     Rejection, Settled, ToRejection, pre_check, principal, require_command_id, settle,
 };
-use crate::projection::{CommitProjector, CommitStream, CommitView, HistoryLedger, project_commit};
+use crate::projection::{
+    CommitProjector, CommitStream, CommitView, HistoryLedger, project_application,
+};
 use crate::repository::{
     Commit, CommitReceipt, NewSnapshot, Repository, snapshot_events_due, snapshot_fits,
 };
@@ -411,7 +413,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         let views = if self.commit_projectors.is_empty() {
             Vec::new()
         } else {
-            project_commit(
+            project_application(
                 &self.commit_projectors,
                 &CommitView::new(
                     stamped.commit_id.clone(),

@@ -205,6 +205,10 @@ presence condition. So a write by any other stream fails the commit with a
 `*evt.ProjectorOperationError` (reason `ConditionalCheckFailed`) when it happens, not at some later
 rebuild.
 
+Keys beginning `journal#`, `journal-counter#` or `journal-compaction#` belong to the journal (a
+Rust extension, ADR 0005), whatever their owner. An operation there fails with
+`*evt.ReservedViewKeyError` (`errors.Is` `evt.ErrInvalidArgument`) before anything is written.
+
 A row's owner must never change. The log keeps only one commit order, which is each stream's
 sequence order. The writes to a row can be put back in order only while they all come from commits
 that wrote the same stream. That's why a key never changes hands by a delete from one stream and a

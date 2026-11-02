@@ -607,6 +607,20 @@ operation in order and returns the first failure as a typed error:
 An operation whose owner the commit did not write, or (history-dependent) whose owner's type is not
 declared, is `InvalidViewOperation`, reported when the projector returns.
 
+Reserved partitions. The partitions of the [journal](#journal) (`pk` beginning `journal#`,
+`journal-counter#` or `journal-compaction#`) are the engine's. An operation of any other
+commit-wide projector that targets one is refused when the projector returns, after its owner check
+and before the checks above, on every entry point that runs commit-wide projectors (a command, a
+transaction, a replay, a rebuild): Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey` (the
+projector, the operation index and the `pk`; an invalid argument, never retried). Only the
+journal's own projector, which Rust identifies by the sealed `CommitProjector::engine_metadata`,
+writes there, and only the engine runs it: a Rust store or transaction that registers it is refused
+with `InvalidConfig` before it runs, as a rebuild is, because it would read the allocations a caller
+put in metadata. Go has no journal, so no Go projector may write there. The check is in the
+commit-wide projector pipeline: per-aggregate projectors (which return backend operations), a
+repository commit carrying hand-built view operations, and direct view-repository writes are
+trusted, as they are for compaction rows.
+
 A commit that carries operations but no event is `ProjectorOnlyCommit` / `ProjectorWithoutEvents`
 first ([Writes](#writes)). Operations count against `CommitTooLarge` ([Budget](#writes)) and are
 sized as described there. A repository that was given view operations but has no place to write
@@ -1664,7 +1678,8 @@ declares it before a writer writes, by an explicit initialization or by a lazily
 ([Stream Heads](#required-feature)). `photon-evt` models
 `journal` and `journal-compaction` at format version 1 when built with its `journal` cargo feature.
 It declares `journal` with the first journaled commit ([Journal](#feature-marker-and-history)) and
-`journal-compaction` with the first compaction lease ([Compaction](#journal-compaction)). A
+`journal-compaction` before a compaction run's first write, once its checkpoint and preflight pass
+([Compaction](#journal-compaction)). A
 fourth, `postgres-views` (format version 1, `photon-evt` 0.3, ADR 0008), records that a
 PostgreSQL store's commit-wide views live in its evt-owned [views table](#postgresql-views-table).
 Rust models it (it is in `SUPPORTED_FEATURES`), and a Rust PostgreSQL repository without the views
@@ -2783,7 +2798,9 @@ Ownership. The journal rows are produced by a commit-wide, history-dependent pro
 owner, the row is written only if absent (`attribute_not_exists(pk)`, so a position is claimed
 exactly once and a write by any other stream fails), and the owner never changes. The projector is
 a pure function of its commit view: grouping stored events by commit and running it reproduces the
-live rows.
+live rows. No other projector can write the journal's partitions
+([reserved partitions](#views)), so an application projector cannot overwrite a row its stream
+owns.
 
 The counters are the one exception, and a specified one. A counter is shared by every stream
 that writes its scope, so no stream can own it, and the rule that a view operation's owner is a
@@ -3046,8 +3063,8 @@ including its expiry second). A lapsed one is taken over the same way. `renew_co
 `end_compaction` (which writes the released payload, keeping the token) are conditioned on the
 lease's exact payload. `force_release_compaction(scope, owner)` is the operator's: it releases the
 named owner's lease whatever its token or expiry. A lease that no longer matches is
-`CompactionLeaseLost`. The first acquire on a table declares `journal-compaction: 1` on the feature
-marker, after validating the marker (a declared feature this build does not model is refused).
+`CompactionLeaseLost`. An acquire validates the feature marker (a declared feature this build does
+not model is refused) and declares nothing.
 
 Writes. Every compaction write is one `TransactWriteItems` of up to 99 view actions followed by
 a `ConditionCheck` on the rebuild generation item (events table) that it still holds the settled
@@ -3063,7 +3080,10 @@ lease's length) before a write when less than half of it is left. A failed epoch
 are transient.
 
 A run. `compact(lease, through)` with `floor ≤ through ≤ high watermark` and `through ≥ 1`
-(otherwise `InvalidArgument`, before any write), under a settled rebuild epoch:
+(otherwise `InvalidArgument`, before any write), under a settled rebuild epoch. Before its first
+write, once the checkpoint and the preflight below have passed, the run declares
+`journal-compaction: 1` on the feature marker (nothing is written if it is already declared), so a
+refused run leaves the marker as it was:
 
 1. Build, if `through` is above the floor. A preflight first streams the whole range and
    writes nothing: it resumes the manifest's last chunk (checked against its digest), reads the
@@ -3080,9 +3100,10 @@ A run. `compact(lease, through)` with `floor ≤ through ≤ high watermark` and
 
 A run with `through` equal to the floor skips steps 1 and 2: it finishes an interrupted run, or
 prunes rows a rebuild restored. Every step is idempotent and leaves the scope consistent, so a run
-that stops for any reason is finished by compacting again. `compact_with_lease` takes a lease,
-runs, and releases it (also after a failure). A crash between writing new chunks and the swap
-leaves unreferenced chunks at indexes the next run overwrites. Compaction is maintenance with its
+that stops for any reason is finished by compacting again. `compact_with_lease` checks the
+rebuild fence, the marker, and the checkpoint against the floor and the high watermark first, so a
+run they refuse takes no lease. It then takes a lease, runs, and releases it (also after a
+failure). A crash between writing new chunks and the swap leaves unreferenced chunks at indexes the next run overwrites. Compaction is maintenance with its
 own transactions: no commit carries a compaction action, so the commit budget is unchanged
 (97 event and projector operations, 96 with a snapshot).
 
