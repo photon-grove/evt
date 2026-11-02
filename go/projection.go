@@ -33,6 +33,12 @@ const (
 	MaxViewSKBytes = 1024
 )
 
+// reservedViewPrefixes are the view partition-key prefixes the engine reserves for the journal's
+// rows, counters and compaction rows (ADR 0005). Go has no journal, so no Go projector may write
+// there: ProjectCommit refuses an operation whose pk begins with one (*ReservedViewKeyError), so no
+// table holds application rows where a journaling writer keeps its own.
+var reservedViewPrefixes = []string{"journal#", "journal-counter#", "journal-compaction#"}
+
 // ViewOperationKind is the kind of a view operation.
 type ViewOperationKind string
 
@@ -426,6 +432,22 @@ func (e *DuplicateViewKeyError) Error() string {
 // Unwrap keeps the error matchable with errors.Is(err, ErrInvalidArgument).
 func (e *DuplicateViewKeyError) Unwrap() error { return ErrInvalidArgument }
 
+// ReservedViewKeyError reports a projector's view operation on a partition the engine reserves for
+// the journal: a pk beginning "journal#", "journal-counter#" or "journal-compaction#". It is not a
+// conflict and is never retried. Nothing was written.
+type ReservedViewKeyError struct {
+	ProjectorOperationRef
+	PK string
+}
+
+// Error describes the refused key.
+func (e *ReservedViewKeyError) Error() string {
+	return fmt.Sprintf("reserved view key: %s: %q is in a partition the engine reserves", e.ProjectorOperationRef, e.PK)
+}
+
+// Unwrap keeps the error matchable with errors.Is(err, ErrInvalidArgument).
+func (e *ReservedViewKeyError) Unwrap() error { return ErrInvalidArgument }
+
 // ViewsNotConfiguredError refuses a commit that carries view operations to a repository that has
 // no place to write them: no views table, no view writer. Dropping them would commit the events
 // without the rows that were meant to be atomic with them, so the repository fails closed before
@@ -541,7 +563,8 @@ func invalidViewReason(op ViewOperation) string {
 //
 // Each projector is given the view its kind may see (CommitView.visibleTo). Every operation must
 // name an owner stream the commit wrote, and a history-dependent projector's owner must also be of
-// an entity type it declares in History (*InvalidViewOperationError otherwise). A projector's error
+// an entity type it declares in History (*InvalidViewOperationError otherwise). No operation may
+// target a partition the engine reserves for the journal (*ReservedViewKeyError). A projector's error
 // is a *ProjectorError; the combined operations are validated with CheckViews. A nil projector is
 // skipped but keeps its position.
 func ProjectCommit(ctx context.Context, projectors []CommitProjector, view CommitView) ([]ProjectedView, error) {
@@ -567,6 +590,10 @@ func ProjectCommit(ctx context.Context, projectors []CommitProjector, view Commi
 			item := ProjectedView{Projector: projector.Name(), ProjectorIndex: index, Operation: operation, Op: op}
 
 			if err := checkOwner(item, view, history); err != nil {
+				return nil, err
+			}
+
+			if err := checkUnreserved(item); err != nil {
 				return nil, err
 			}
 
@@ -612,6 +639,19 @@ func (v CommitView) visibleTo(history []EntityType) CommitView {
 	}
 
 	return v
+}
+
+// checkUnreserved refuses an operation on a partition the engine reserves for the journal.
+func checkUnreserved(view ProjectedView) error {
+	for _, prefix := range reservedViewPrefixes {
+		if strings.HasPrefix(view.Op.PK, prefix) {
+			ref := ProjectorOperationRef{Projector: view.Projector, ProjectorIndex: view.ProjectorIndex, Operation: view.Operation}
+
+			return &ReservedViewKeyError{ProjectorOperationRef: ref, PK: view.Op.PK}
+		}
+	}
+
+	return nil
 }
 
 // checkOwner requires an operation to name an owner stream the commit wrote and, for a

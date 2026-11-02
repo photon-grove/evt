@@ -583,6 +583,13 @@ row and rewrite it, as its owner, with a tombstone payload. A rebuild orders the
 its owner's sequence, the only commit order the log keeps, and `replay_views` refuses a row that
 two streams write (`Error::SharedViewKey`).
 
+The journal's partitions are the engine's: an operation whose `pk` begins `journal#`,
+`journal-counter#` or `journal-compaction#` (`RESERVED_VIEW_PREFIXES`) fails with
+`Error::ReservedViewKey` before anything is written, unless it comes from the journal's own
+projector, which only the engine runs (a store or transaction that registers it fails with
+`Error::InvalidConfig`). So a commit-wide projector can't overwrite the journal rows its stream
+owns. Per-aggregate projectors return backend operations and are trusted, like hand-built ones.
+
 A PostgreSQL view writer has to enforce the owner in SQL, because the engine can't. The statements
 it returns must have these semantics (see `PostgresRepository::with_view_writer`):
 

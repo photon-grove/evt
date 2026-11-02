@@ -24,7 +24,7 @@ use crate::outcome::{
     require_command_id, settle,
 };
 use crate::projection::{
-    CommitProjector, CommitStream, CommitView, HistoryLedger, project_commit, ready_projectors,
+    CommitProjector, CommitStream, CommitView, HistoryLedger, project_application, ready_projectors,
 };
 use crate::repository::{
     Commit, FenceProvenance, NewSnapshot, ReadFence, Repository, TransactionCommit,
@@ -1056,7 +1056,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         // in the transaction's byte order, with the final stamped events and the state after them.
         // Every attempt of fence-aware retry prepares a fresh transaction, so the operations are
         // derived again each time and nothing from a failed attempt carries over.
-        let views = project_commit(
+        let views = project_application(
             &self.commit_projectors,
             &CommitView::new(metadata.commit_id.clone(), view_streams),
         )?;

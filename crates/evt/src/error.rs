@@ -369,6 +369,24 @@ pub enum Error {
         second: (String, usize),
     },
 
+    /// An application projector's view operation targets a partition the engine reserves for its
+    /// own rows: the journal's rows (`journal#`), counters (`journal-counter#`) and compaction rows
+    /// (`journal-compaction#`), [`RESERVED_VIEW_PREFIXES`](crate::RESERVED_VIEW_PREFIXES). Only the
+    /// engine's own projectors write there, so a projector cannot corrupt its stream's journal
+    /// rows. It is not a conflict and is never retried. Nothing was written.
+    #[error(
+        "reserved view key: projector {projector:?} operation {operation}: {pk:?} is in a \
+         partition the engine reserves"
+    )]
+    ReservedViewKey {
+        /// The partition key.
+        pk: String,
+        /// The projector that emitted the operation.
+        projector: String,
+        /// The operation's index among that projector's operations.
+        operation: usize,
+    },
+
     /// Stored events whose commits cannot be put in an order that respects every stream's own
     /// sequence: one commit wrote a stream before another, which wrote a second stream before the
     /// first. No live system writes that.

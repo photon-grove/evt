@@ -607,6 +607,20 @@ operation in order and returns the first failure as a typed error:
 An operation whose owner the commit did not write, or (history-dependent) whose owner's type is not
 declared, is `InvalidViewOperation`, reported when the projector returns.
 
+Reserved partitions. The partitions of the [journal](#journal) (`pk` beginning `journal#`,
+`journal-counter#` or `journal-compaction#`) are the engine's. An operation of any other
+commit-wide projector that targets one is refused when the projector returns, after its owner check
+and before the checks above, on every entry point that runs commit-wide projectors (a command, a
+transaction, a replay, a rebuild): Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey` (the
+projector, the operation index and the `pk`; an invalid argument, never retried). Only the
+journal's own projector, which Rust identifies by the sealed `CommitProjector::engine_metadata`,
+writes there, and only the engine runs it: a Rust store or transaction that registers it is refused
+with `InvalidConfig` before it runs, as a rebuild is, because it would read the allocations a caller
+put in metadata. Go has no journal, so no Go projector may write there. The check is in the
+commit-wide projector pipeline: per-aggregate projectors (which return backend operations), a
+repository commit carrying hand-built view operations, and direct view-repository writes are
+trusted, as they are for compaction rows.
+
 A commit that carries operations but no event is `ProjectorOnlyCommit` / `ProjectorWithoutEvents`
 first ([Writes](#writes)). Operations count against `CommitTooLarge` ([Budget](#writes)) and are
 sized as described there. A repository that was given view operations but has no place to write
@@ -2784,7 +2798,9 @@ Ownership. The journal rows are produced by a commit-wide, history-dependent pro
 owner, the row is written only if absent (`attribute_not_exists(pk)`, so a position is claimed
 exactly once and a write by any other stream fails), and the owner never changes. The projector is
 a pure function of its commit view: grouping stored events by commit and running it reproduces the
-live rows.
+live rows. No other projector can write the journal's partitions
+([reserved partitions](#views)), so an application projector cannot overwrite a row its stream
+owns.
 
 The counters are the one exception, and a specified one. A counter is shared by every stream
 that writes its scope, so no stream can own it, and the rule that a view operation's owner is a

@@ -141,6 +141,7 @@ func runProjectorCases(t *testing.T, newRepo func() evt.Repository, opts SuiteOp
 		{"Projectors/AFailedOperationIsTypedNotRetriedAndRecordsNoOutcome", testProjectorFailureIsTyped},
 		{"Projectors/APreparationDerivesItsOperationsAgain", testProjectorsRunAgainOnReprepare},
 		{"Projectors/AHistoryDependentProjectorIsDeclaredAndRefusesCompaction", testProjectorsDeclareHistory},
+		{"Projectors/AJournalPartitionIsRefusedAndNothingIsWritten", testProjectorsRefuseReservedPartitions},
 	}
 
 	for _, c := range cases {
@@ -383,4 +384,54 @@ func testProjectorsDeclareHistory(t *testing.T, newRepo func() evt.Repository, r
 	stored, err := repo.GetEvents(ctx, id)
 	require.NoError(t, err)
 	require.Len(t, stored, 2, "nothing was deleted")
+}
+
+// onTheJournal is a projector that writes a row beside its own and one in a partition the engine
+// reserves for the journal, both owned by the stream.
+type onTheJournal struct{ namespace, prefix string }
+
+func (onTheJournal) Name() string { return "on-the-journal" }
+
+func (onTheJournal) History() []evt.EntityType { return nil }
+
+func (p onTheJournal) ProjectCommit(_ context.Context, commit evt.CommitView) ([]evt.ViewOperation, error) {
+	operations := make([]evt.ViewOperation, 0, 2*len(commit.Streams))
+
+	for _, stream := range commit.Streams {
+		operations = append(operations,
+			evt.PutView(p.namespace+"#allowed", string(stream.EntityID), stream.EntityID, stream.EntityType, []byte(`{}`)),
+			evt.PutView(p.prefix+p.namespace, "00000000000000000001", stream.EntityID, "journal", []byte(`{}`)),
+		)
+	}
+
+	return operations, nil
+}
+
+func testProjectorsRefuseReservedPartitions(t *testing.T, newRepo func() evt.Repository, read ViewReader) {
+	t.Helper()
+	ctx := context.Background()
+	repo := newRepo()
+
+	for _, prefix := range []string{"journal#", "journal-counter#", "journal-compaction#"} {
+		ns := newNamespace()
+		id := evt.EntityID(ns + "-a")
+		store := snapshots.NewStore(repo, 1).WithCommitProjectors(onTheJournal{namespace: ns, prefix: prefix})
+
+		err := store.Execute(ctx, &tally{}, id, &tallyUp{By: 1}, tallyMetadata(ns+"-one"))
+
+		var reserved *evt.ReservedViewKeyError
+		require.ErrorAs(t, err, &reserved, prefix)
+		require.ErrorIs(t, err, evt.ErrInvalidArgument)
+		require.Equal(t, prefix+ns, reserved.PK)
+		require.Equal(t, "on-the-journal", reserved.Projector)
+		require.Equal(t, 1, reserved.Operation)
+
+		events, err := repo.GetEvents(ctx, id)
+		require.NoError(t, err)
+		require.Empty(t, events, "no event was written")
+
+		view, err := read(ctx, repo, ns+"#allowed", string(id))
+		require.NoError(t, err)
+		require.Nil(t, view, "no row was written")
+	}
 }
