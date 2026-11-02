@@ -377,7 +377,7 @@ impl RebuildFence for PostgresRepository {
         rebuild::check_owner(owner)?;
         rebuild::check_view_batch(views)?;
         if self.views_table_target {
-            self.ensure_stream_heads().await?;
+            self.ensure_stream_heads(true).await?;
             self.ensure_views_declared().await?;
         }
         let statements = self.view_statements(views)?;

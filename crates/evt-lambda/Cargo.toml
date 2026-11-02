@@ -15,8 +15,8 @@ include = ["src/**", "examples/**", "README.md", "LICENSE", "Cargo.toml"]
 [features]
 default = []
 # Journal wake-ups (ADR 0005, X3) for consumers of the sync journal. It enables photon-evt's
-# `journal` feature, which is build-wide: every repository in the build then accepts a table that
-# declares the journal. A Lambda that also commits events must commit them through the journal.
+# `journal` feature. Only a repository wrapped by `JournalRepository` writes to a table that
+# declares the journal, so a Lambda that also commits events must commit them through the journal.
 journal = ["photon-evt/journal"]
 
 [dependencies]

@@ -186,7 +186,7 @@ impl CompactionStore for PostgresRepository {
         }
 
         // A store compacted before its first commit still records where its views live.
-        self.ensure_stream_heads().await?;
+        self.ensure_stream_heads(true).await?;
         self.ensure_views_declared().await?;
 
         let mut client = self.pool.get().await.map_err(super::pool_error)?;

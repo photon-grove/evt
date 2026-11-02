@@ -568,19 +568,19 @@ impl PostgresRepository {
     /// [`Error::StreamHeadsNotMigrated`]. It runs before the commit transaction, only while the
     /// handle has not validated a manifest yet: a declaration needs the exclusive lock, which a
     /// commit holding the shared lock must not wait for. The commit then re-validates inside its
-    /// own transaction.
-    async fn ensure_stream_heads(&self) -> Result<(), Error> {
+    /// own transaction. `journaling` is whether the write accepts a journal table: this handle's
+    /// own flag for commits and snapshot writes, and always for rebuild view writes and journal
+    /// compaction, which are the journal's own.
+    async fn ensure_stream_heads(&self, journaling: bool) -> Result<(), Error> {
         if self.validated_marker().is_some() {
             return Ok(());
         }
 
         let observed = self.read_manifest().await?;
 
-        // The journal is the write's own check: a commit re-validates in its transaction, and a
-        // rebuild view write, which may be the journal's, accepts it.
-        let validated = self
-            .refuse_foreign_views(observed.as_ref())
-            .and_then(|()| features::validate_marker_for_write(observed.as_ref(), true).map(drop));
+        let validated = self.refuse_foreign_views(observed.as_ref()).and_then(|()| {
+            features::validate_marker_for_write(observed.as_ref(), journaling).map(drop)
+        });
 
         match validated {
             Ok(()) => Ok(()),
@@ -1101,7 +1101,7 @@ impl PostgresRepository {
             .filter(|stream| !stream.events.is_empty())
             .collect();
 
-        self.ensure_stream_heads().await?;
+        self.ensure_stream_heads(self.journaling).await?;
         self.ensure_views_declared().await?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
@@ -1497,7 +1497,7 @@ impl Repository for PostgresRepository {
     async fn put_snapshot(&self, snapshot: &SerializedSnapshot) -> Result<bool, Error> {
         features::check_not_reserved(&snapshot.entity_id)?;
 
-        self.ensure_stream_heads().await?;
+        self.ensure_stream_heads(self.journaling).await?;
 
         let mut client = self.pool.get().await.map_err(pool_error)?;
         let tx = read_committed(&mut client).await?;

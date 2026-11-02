@@ -371,8 +371,10 @@ pub trait FeatureMarker: Send + Sync {
     /// it. `JournalRepository::new` calls it on the repository it wraps, and clones of that handle
     /// made afterwards are journal writers too; the handle it was cloned from is not.
     ///
-    /// A decorator under the journal must forward it to the repository it wraps, or that
-    /// repository refuses the journal's table. The default does nothing.
+    /// It only lifts the refusal: a commit through a journal writer is not journaled unless it goes
+    /// through a `JournalRepository`. A decorator under the journal must forward it to the
+    /// repository it wraps, or that repository refuses the journal's table. The default does
+    /// nothing.
     fn accept_journal(&mut self) {}
 
     /// Initializes the store: declares `stream-heads` on a store that holds no data, with the

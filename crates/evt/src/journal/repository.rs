@@ -91,7 +91,9 @@ impl<R: FeatureMarker> JournalRepository<R> {
 }
 
 impl<R> JournalRepository<R> {
-    /// The wrapped repository.
+    /// The wrapped repository. It is a journal writer, so a commit through it (or a clone of it)
+    /// is accepted on the journal's table but not journaled: commit through the
+    /// `JournalRepository` itself.
     pub fn inner(&self) -> &R {
         &self.inner
     }

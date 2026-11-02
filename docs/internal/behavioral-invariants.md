@@ -728,8 +728,8 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   writer refuses as uninitialized is refused before anything is declared, so a
   `StoreNotInitialized` refusal writes nothing; a commit refused because the store is uninitialized
   or unmigrated takes back everything the attempt declared — the `journal` declaration and the
-  `historyDependent` entries it added. A build without the cargo feature
-  refuses the table; a build with it, wrapped or not, accepts it.
+  `historyDependent` entries it added. A build without the cargo feature refuses the table; in a
+  build with it, only a journal writer accepts it (below).
 - **Rebuilds run under the rebuild lock.** `rebuild` writes rows and counters unconditionally
   through the lease-guarded `write_rebuild_views` (owner and fencing token, at most 99 operations a
   batch); live commits fail with `RebuildInProgress` while the lock is held, and consumers read with

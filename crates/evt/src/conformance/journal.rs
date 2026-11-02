@@ -1458,6 +1458,20 @@ where
         "compaction around the journal",
         refused,
     )?;
+    expect_err(
+        bypass
+            .commit_transaction(TransactionCommit::new(vec![Commit {
+                entity_id: other.id.clone(),
+                events: other.events(1..=1),
+                snapshot: None,
+                operations: Vec::new(),
+                views: Vec::new(),
+                outcome: None,
+            }]))
+            .await,
+        "a transaction committed around the journal",
+        refused,
+    )?;
     ensure_eq!(repo.events(&a.id).await?.len(), 1, "the journaled stream");
     ensure!(
         repo.events(&other.id).await?.is_empty(),

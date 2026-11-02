@@ -2928,8 +2928,8 @@ show it. So acceptance is per repository handle, not per build: only the handle 
 `JournalRepository` wraps (and its later clones) accepts a store that declares `journal` or
 `journal-compaction`. Every other handle refuses it on commits, snapshot writes and compaction with
 `UnsupportedFeature`, even in a build with the cargo feature. Rebuild view writes and the
-journal-compaction functions are the journal's own and accept it. A blind spot remains for
-events that existed before the journal was enabled for their type, or that were compacted: they have no
+journal-compaction functions are the journal's own and accept it. A blind spot remains for events
+that existed before the journal was enabled for their type, or that were compacted: they have no
 allocation and no row, and nothing reports it. Enable the journal before writing the events it
 covers.
 
