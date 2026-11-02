@@ -109,6 +109,10 @@ where
         Box::pin(declares_feature_and_history(repo)).await,
     );
     record(
+        "only a journal writer writes to a journal table; any other handle is refused",
+        Box::pin(only_journal_writers_write(repo)).await,
+    );
+    record(
         "a rebuild under the lock refuses live commits and reproduces the live journal",
         Box::pin(rebuild_under_the_lock(repo, views)).await,
     );
@@ -807,6 +811,10 @@ impl<R: FeatureMarker> FeatureMarker for Lagging<R> {
         self.uninitialized
     }
 
+    fn accept_journal(&mut self) {
+        self.inner.accept_journal();
+    }
+
     fn initialize(&self) -> impl Future<Output = Result<bool, Error>> + Send {
         self.inner.initialize()
     }
@@ -1396,14 +1404,96 @@ where
         "a handle that finds the declaration does not bump the manifest"
     );
 
-    // Compaction of the journaled type is refused in every process; an uncovered one is not.
-    repo.put_snapshot(&a.snapshot(1, 3, "{}")).await?;
+    // Compaction of the journaled type is refused, even by a journal writer.
+    journaled.put_snapshot(&a.snapshot(1, 3, "{}")).await?;
     expect_err(
-        repo.compact_below(&a.id, EventSequence(3)).await,
+        journaled.compact_below(&a.id, EventSequence(3)).await,
         "compacting a journaled stream",
         |err| matches!(err, Error::HistoryDependentProjection { .. }),
     )?;
     ensure_eq!(repo.events(&a.id).await?.len(), 3, "nothing was deleted");
+
+    Ok(())
+}
+
+/// A handle that is not a journal writer refuses a journal table on every write path, whatever the
+/// entity type, so no event can be committed around the journal. The handle the journal wraps, and
+/// clones of it, write as usual.
+async fn only_journal_writers_write<R>(repo: &R) -> CaseResult
+where
+    R: Repository + FeatureMarker + JournalCompactionStore + Clone,
+    R::Operation: Clone,
+{
+    let ns = namespace();
+    let bypass = repo.clone();
+    let journaled = JournalRepository::new(repo.clone(), journal(&ns));
+    let (a, other) = (
+        Stream::new(&ns, "a", "ledger"),
+        Stream::new(&ns, "o", "other"),
+    );
+
+    a.commit(&journaled, a.events(1..=1), None).await?;
+
+    let refused = |err: &Error| {
+        matches!(err, Error::UnsupportedFeature { feature, version }
+            if feature == JOURNAL_FEATURE && *version == JOURNAL_VERSION)
+    };
+    expect_err(
+        a.commit(&bypass, a.events(2..=2), None).await,
+        "a journaled type committed around the journal",
+        refused,
+    )?;
+    expect_err(
+        other.commit(&bypass, other.events(1..=1), None).await,
+        "an uncovered type committed around the journal",
+        refused,
+    )?;
+    expect_err(
+        bypass.put_snapshot(&a.snapshot(1, 1, "{}")).await,
+        "a snapshot written around the journal",
+        refused,
+    )?;
+    expect_err(
+        bypass.compact_below(&other.id, EventSequence(1)).await,
+        "compaction around the journal",
+        refused,
+    )?;
+    expect_err(
+        bypass
+            .commit_transaction(TransactionCommit::new(vec![Commit {
+                entity_id: other.id.clone(),
+                events: other.events(1..=1),
+                snapshot: None,
+                operations: Vec::new(),
+                views: Vec::new(),
+                outcome: None,
+            }]))
+            .await,
+        "a transaction committed around the journal",
+        refused,
+    )?;
+    ensure_eq!(repo.events(&a.id).await?.len(), 1, "the journaled stream");
+    ensure!(
+        repo.events(&other.id).await?.is_empty(),
+        "nothing was committed around the journal"
+    );
+    ensure!(
+        repo.snapshot(&a.id).await?.is_none(),
+        "no snapshot was written around the journal"
+    );
+
+    // The journal's own handle, and a clone of it, are journal writers.
+    let inner = journaled.inner().clone();
+    other.commit(&inner, other.events(1..=1), None).await?;
+    journaled
+        .inner()
+        .put_snapshot(&a.snapshot(1, 1, "{}"))
+        .await?;
+    ensure_eq!(
+        repo.events(&other.id).await?.len(),
+        1,
+        "the uncovered stream"
+    );
 
     Ok(())
 }

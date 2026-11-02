@@ -716,12 +716,13 @@ without the feature refuse the table.
   rows (a restore, a rebuild beside writers) is healed from the highest row.
 - A cursor ahead of the journal. `page` flags `cursor_ahead` when `after` is above the high
   watermark (after a restore, say). The page isn't caught up, and the consumer should resync.
-- Every writer of the table must commit through a `JournalRepository`. The marker stops builds
-  without the feature, not a writer that bypasses the journal, and the `journal` cargo feature is
-  build-wide, so a build that enables it accepts a journal table through every repository,
-  wrapped or not. A bypassing writer's events would be missing from the scopes. Enable the journal
-  before writing the events it covers: earlier events have no row and no gap shows it. A commit's
-  journal rows and counters count toward the commit budget (97 event and projector operations, 96 with a snapshot).
+- Every writer of the table must commit through a `JournalRepository`. Only the repository handle a
+  `JournalRepository` wraps (and clones of it) accepts a journal table: every other handle refuses
+  it on commits, snapshot writes and compaction with `Error::UnsupportedFeature`, even in a build
+  with the `journal` cargo feature, as does a build without it. A decorator under the journal must
+  forward `FeatureMarker::accept_journal`. Enable the journal before writing the events it covers:
+  earlier events have no row and no gap shows it. A commit's journal rows and counters count
+  toward the commit budget (97 event and projector operations, 96 with a snapshot).
 - Rebuilds run under the [rebuild lock](#rebuild-fence) and write the rows and counters through
   `write_rebuild_views`, fenced on the lease's owner and fencing token. To rebuild the journal with
   your commit-wide views under one lease, use `ProjectionRebuild::with_journal`

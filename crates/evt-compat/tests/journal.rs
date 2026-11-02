@@ -230,14 +230,14 @@ async fn stored_items_and_marker() {
     );
     assert!(manifest.is_history_dependent(&"ledger".into()));
 
-    // A newer journal format is refused by this build, on commit and on snapshot writes.
+    // A newer journal format is refused by this build, even by the journal's own writer.
     repository
         .update_manifest(|manifest| {
             manifest.features.insert("journal".into(), 2);
         })
         .await
         .unwrap();
-    let refused = Store::<Ledger, _>::new(&repository, ())
+    let refused = Store::<Ledger, _>::new(&journaled, ())
         .execute("acct-2", Add(1), Metadata::new("local"))
         .await
         .unwrap_err();

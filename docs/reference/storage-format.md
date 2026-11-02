@@ -2944,12 +2944,14 @@ block `evt-doctor migrate-heads`, or forbidding compaction for types nothing eve
 the rows are rebuilt from the events, so the events are never compacted. A build without the
 `journal` cargo feature models only `stream-heads`, so it refuses the table on its first commit,
 snapshot write, or compaction (`UnsupportedFeature`), as does Go. A build that does model the
-journal refuses a newer format version the same way. The marker cannot tell a journaling writer from
-one that commits events some other way, so every writer of a journal table must commit through the
-journal. An event written otherwise is missing from its scopes, with no gap to show it. The cargo
-feature is also build-wide: any dependency that enables it makes every repository in the build
-accept a journal table, whether or not it is wrapped. The same blind spot applies to events that
-existed before the journal was enabled for their type, or that were compacted: they have no
+journal refuses a newer format version the same way. Every writer of a journal table must commit
+through the journal, because an event written otherwise is missing from its scopes with no gap to
+show it. So acceptance is per repository handle, not per build: only the handle a
+`JournalRepository` wraps (and its later clones) accepts a store that declares `journal` or
+`journal-compaction`. Every other handle refuses it on commits, snapshot writes and compaction with
+`UnsupportedFeature`, even in a build with the cargo feature. Rebuild view writes and the
+journal-compaction functions are the journal's own and accept it. A blind spot remains for events
+that existed before the journal was enabled for their type, or that were compacted: they have no
 allocation and no row, and nothing reports it. Enable the journal before writing the events it
 covers.
 

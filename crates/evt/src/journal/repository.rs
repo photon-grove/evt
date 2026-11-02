@@ -63,8 +63,11 @@ use crate::retry::Budget;
 ///
 /// Every writer that commits to a journal table must go through a `JournalRepository` with an
 /// equivalent configuration: an event committed any other way is silently missing from the
-/// journal. The feature marker stops builds without the `journal` cargo feature; it cannot tell a
-/// journaling writer from one that bypasses the journal.
+/// journal. So [`new`](Self::new) makes the repository it wraps a journal writer
+/// ([`FeatureMarker::accept_journal`]), and every other repository handle refuses a table that
+/// declares the journal, as does a build without the `journal` cargo feature. A decorator under
+/// the journal must forward `accept_journal`. The marker cannot tell two journals with different
+/// configurations apart.
 #[derive(Clone, Debug)]
 pub struct JournalRepository<R> {
     inner: R,
@@ -72,17 +75,25 @@ pub struct JournalRepository<R> {
     declared: Arc<AtomicBool>,
 }
 
-impl<R> JournalRepository<R> {
-    /// Journals the commits of `inner`.
-    pub fn new(inner: R, journal: Journal) -> Self {
+impl<R: FeatureMarker> JournalRepository<R> {
+    /// Journals the commits of `inner`, which becomes a journal writer
+    /// ([`FeatureMarker::accept_journal`]): it accepts a table that declares the journal, which
+    /// every other repository handle refuses.
+    pub fn new(mut inner: R, journal: Journal) -> Self {
+        inner.accept_journal();
+
         Self {
             inner,
             journal,
             declared: Arc::new(AtomicBool::new(false)),
         }
     }
+}
 
-    /// The wrapped repository.
+impl<R> JournalRepository<R> {
+    /// The wrapped repository. It is a journal writer, so a commit through it (or a clone of it)
+    /// is accepted on the journal's table but not journaled: commit through the
+    /// `JournalRepository` itself.
     pub fn inner(&self) -> &R {
         &self.inner
     }

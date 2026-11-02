@@ -174,12 +174,14 @@ table and fan out from a function when more consumers need the wake-ups. Filtere
 no invocations. The decoders don't look at the table name (`eventSourceARN`), so the same filters
 and decoders would work unchanged on a dedicated journal table's stream.
 
-### The `journal` feature is build-wide
+### The `journal` feature
 
-Enabling `journal` here enables `photon-evt`'s `journal` feature. That feature is build-wide (ADR
-0005): every repository in the build then accepts a table that declares the journal. A function
-that only consumes events does not need the feature. A function that consumes wake-ups and also
-commits events to a journal table must commit them through `JournalRepository`.
+Enabling `journal` here enables `photon-evt`'s `journal` feature, which lets the build model a
+journal table (ADR 0005). Only a repository wrapped by `JournalRepository`, and its later clones,
+writes to one: any other repository refuses a table that declares the journal with
+`UnsupportedFeature`, on commits and snapshot writes. A function that only consumes events does not
+need the feature. A function that consumes wake-ups and also commits events to a journal table
+must commit them through `JournalRepository`.
 
 ## Deployment sketch (Terraform)
 
