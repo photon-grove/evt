@@ -107,11 +107,18 @@ form Go's module proxy expects for a module in a subdirectory. When Release Plea
 release, the `goreleaser` job in `release.yml` builds `evt-doctor` and uploads the archives to
 that `go/vX.Y.Z` release. GoReleaser only parses plain semver tags, so it builds from a local
 `vX.Y.Z` tag that is never pushed. The Rust crates are tagged
-`photon-evt-vX.Y.Z` and `photon-evt-lambda-vX.Y.Z`. Before 1.0, a breaking change bumps the minor version
-of the Go module and of each crate, and for the crates a new feature bumps only the patch. Merging a crate's release pull request runs its publish
-job in `release.yml`, which pushes it to crates.io.
+`photon-evt-vX.Y.Z` and `photon-evt-lambda-vX.Y.Z`, and the TypeScript package `evt-ts-vX.Y.Z`. Before 1.0, a breaking change bumps the minor version
+of the Go module, each crate and the TypeScript package, and for the crates and the TypeScript package a new feature bumps only the patch. Merging a crate's release pull request runs its publish
+job in `release.yml`, which pushes it to crates.io. Merging the TypeScript package's release pull request runs `publish-npm`, which publishes `@photon-grove/evt` to npm.
+Release Please assigns commits to a package by the paths they touch, so a commit lands in the TypeScript changelog when it changes `packages/evt`.
 
 crates.io only allows trusted publishing for a crate that already exists, so a crate's first
 release authenticates with a `CARGO_REGISTRY_TOKEN` secret. After that, configure a trusted
 publisher on crates.io (repository `photon-grove/evt`, workflow `release.yml`, environment
 `crates-io`) and delete the secret. Later releases authenticate over OIDC.
+
+npm publishes with trusted publishing from the first real release, so there's no npm token at all.
+`publish-npm` runs in the `npm` environment, and `npm publish --provenance` links each version to
+its workflow run. npm only adds a trusted publisher to a package that exists, so before the first
+release a `0.0.0` placeholder is published by hand. The steps are in
+[ADR 0009](docs/adr/0009-typescript-implementation.md#npm-bootstrap-maintainer).

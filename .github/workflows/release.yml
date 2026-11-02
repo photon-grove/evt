@@ -23,6 +23,8 @@ jobs:
       crate_tag_name: ${{ steps.release.outputs['crates/evt--tag_name'] }}
       lambda_release_created: ${{ steps.release.outputs['crates/evt-lambda--release_created'] }}
       lambda_tag_name: ${{ steps.release.outputs['crates/evt-lambda--tag_name'] }}
+      ts_release_created: ${{ steps.release.outputs['packages/evt--release_created'] }}
+      ts_tag_name: ${{ steps.release.outputs['packages/evt--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
@@ -150,3 +152,47 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
         run: cargo publish -p photon-evt-lambda --locked
+
+  # Publishes @photon-grove/evt when release-please tags it (evt-ts-vX.Y.Z). npm trusted publishing
+  # exchanges this job's OIDC token for a short-lived publish credential, so there's no npm token
+  # secret, and --provenance links the version to this run. npm only adds a trusted publisher to a
+  # package that exists, so the first release needs the 0.0.0 placeholder from the bootstrap steps
+  # in docs/adr/0009-typescript-implementation.md.
+  publish-npm:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.ts_release_created == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # moon compares against main, which a shallow checkout lacks.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release-please.outputs.ts_tag_name }}
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.20.0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.5
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+
+      # Builds dist/, then runs the unit tests and the fixture runner against it.
+      - name: Build and test
+        run: pnpm exec moon run evt-ts:check evt-ts:test
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - name: Upgrade npm
+        run: npm install --global npm@^11.5.1
+
+      - name: Publish @photon-grove/evt
+        working-directory: packages/evt
+        run: npm publish --access public --provenance

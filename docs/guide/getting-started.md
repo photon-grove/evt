@@ -2,7 +2,7 @@
 
 This guide builds a bank account aggregate in Rust, tests it against the in-memory backend, makes
 retries safe, and moves it to DynamoDB or PostgreSQL without changing the aggregate. The same model
-in Go comes after. Every Rust snippet here is copied from
+in Go and in TypeScript comes after. Every Rust snippet here is copied from
 [`crates/evt/examples/getting_started.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/getting_started.rs),
 which CI builds and tests, and a test fails if the two drift apart. From a checkout of this
 repository, run the whole program with:
@@ -676,6 +676,210 @@ The same swap works for PostgreSQL: `postgres.NewStore` (or `postgres.NewReposit
 `snapshots.NewStore`) over a `pgxpool.Pool`. The aggregate still doesn't change. The
 [PostgreSQL guide](postgres.md) has the schema and local setup.
 
+## The same model in TypeScript
+
+[`@photon-grove/evt`](https://github.com/photon-grove/evt/blob/main/packages/evt/README.md) is the
+TypeScript implementation of the same storage format. So far it has the core, the in-memory backend
+and the given/when/then helpers. The DynamoDB and PostgreSQL backends and command outcomes come in
+later releases, and the [feature matrix](../reference/feature-matrix.md) tracks them. This section
+builds the Rust bank account again, with the same event types and payload JSON. Every TypeScript
+snippet is copied from
+[`packages/evt/examples/getting-started.ts`](https://github.com/photon-grove/evt/blob/main/packages/evt/examples/getting-started.ts)
+and its test file, which CI type-checks and runs.
+
+### Install the package
+
+```sh
+npm install @photon-grove/evt
+```
+
+It's ESM only, with no runtime dependencies. CI runs it on Node 22.12 and later, Bun and Deno, and
+it uses only web-standard globals (`TextEncoder`, Web Crypto, `AbortSignal`), so it doesn't need
+Node's built-ins. CommonJS code on Node can still `require()` it.
+
+### Declare the events and the aggregate
+
+The snippets share these imports:
+
+```ts
+import {
+  type EventOf,
+  type Loaded,
+  Store,
+  defineAggregate,
+  defineEvents,
+  json,
+} from '@photon-grove/evt'
+import {MemRepository} from '@photon-grove/evt/memory'
+```
+
+`defineEvents` gives each event type a version and a codec. `json()` writes plain objects with
+evt's own JSON writer, in property order, and it takes an optional
+[Standard Schema](https://standardschema.dev) validator such as Zod or Valibot. `EventOf` is the
+union of `{type, data}` objects the aggregate decides on and applies.
+
+```ts
+export const accountEvents = defineEvents({
+  'bank_account.opened': {
+    version: 1,
+    codec: json<{accountId: string; balance: number}>(),
+  },
+  'bank_account.money_deposited': {
+    version: 1,
+    codec: json<{accountId: string; amount: number}>(),
+  },
+})
+
+export type AccountEvent = EventOf<typeof accountEvents>
+```
+
+Commands are whatever your handler takes. The state is plain data, because snapshots store it as
+JSON, and its field names are part of the contract, as they are in Rust.
+
+```ts
+export type AccountCommand =
+  | {type: 'open'; accountId: string; initialBalance: number}
+  | {type: 'deposit'; amount: number}
+
+export interface Account {
+  id: string
+  balance: number
+  opened: boolean
+}
+```
+
+`defineAggregate` ties them together. `handle` decides on a command against the current state and
+returns a decision: accept with events, or reject with a code and a message. `apply` folds one event
+into a new state and never validates. Return a new object from `apply` rather than changing the one
+you're given.
+
+```ts
+export const account = defineAggregate({
+  type: 'bank_account',
+  events: accountEvents,
+  state: json<Account>(),
+  initial: (): Account => ({id: '', balance: 0, opened: false}),
+
+  handle(state, command: AccountCommand) {
+    switch (command.type) {
+      case 'open':
+        if (state.opened) {
+          return reject('already-opened', 'account already opened')
+        }
+        return accept({
+          type: 'bank_account.opened',
+          data: {accountId: command.accountId, balance: command.initialBalance},
+        })
+
+      case 'deposit':
+        if (!state.opened) {
+          return reject('not-opened', 'account not opened')
+        }
+        if (command.amount <= 0) {
+          return reject('invalid-amount', 'amount must be positive')
+        }
+        return accept({
+          type: 'bank_account.money_deposited',
+          data: {accountId: state.id, amount: command.amount},
+        })
+    }
+  },
+
+  apply(state, event) {
+    switch (event.type) {
+      case 'bank_account.opened':
+        return {id: event.data.accountId, balance: event.data.balance, opened: true}
+      case 'bank_account.money_deposited':
+        return {...state, balance: state.balance + event.data.amount}
+    }
+  },
+})
+```
+
+The decisions are plain objects, so two small helpers keep `handle` readable:
+
+```ts
+function accept(...events: AccountEvent[]) {
+  return {kind: 'accept', events} as const
+}
+
+function reject(code: string, message: string) {
+  return {kind: 'reject', rejection: {code, message}} as const
+}
+```
+
+### Run it in memory
+
+A `Store` puts aggregates on a repository. `execute` loads the stream, runs `handle`, and commits
+the events with a conditional write on the stream's head, so a writer that raced you gets a
+`ConflictError` instead of a silent overwrite. It resolves to what the command did: `committed`,
+`rejected` with the rejection, or `duplicate` when an event since the latest snapshot already
+carries the metadata's command ID.
+
+```ts
+export async function openAndDeposit(): Promise<Loaded<Account>> {
+  const store = new Store(new MemRepository())
+
+  await store.execute(account, 'acct-1', {type: 'open', accountId: 'acct-1', initialBalance: 100})
+  await store.execute(account, 'acct-1', {type: 'deposit', amount: 25})
+
+  // A rejected command commits nothing, and its result carries the rejection.
+  const result = await store.execute(account, 'acct-1', {type: 'deposit', amount: 0})
+  if (result.kind !== 'rejected' || result.rejection.code !== 'invalid-amount') {
+    throw new Error(`expected a rejection, got ${result.kind}`)
+  }
+
+  // Each load folds the stream (from its latest snapshot, if any) into a fresh state.
+  return store.load(account, 'acct-1')
+}
+```
+
+`executeWithRetry` runs a command again after a conflict, waiting a jittered backoff between
+attempts. The store writes a snapshot every five events by default (the `snapshotInterval` option
+changes that), so a load reads the latest snapshot plus the tail. Sequences are `bigint`s
+(the loaded `sequence` is `2n` here), because Go and Rust store them as 64-bit integers.
+
+### Test it with given/when/then
+
+`@photon-grove/evt/testing` adds `scenario`: seed a stream with events, run one command through a
+real `Store` over `MemRepository`, and assert the events, the state or the rejection. A failure
+throws an `AssertionError` with the expected and actual values, so it works in Vitest, Jest,
+`node:test` or any other runner.
+
+```ts
+import {scenario} from '@photon-grove/evt/testing'
+import {expect, test} from 'vitest'
+
+import {type AccountEvent, account} from './getting-started.ts'
+
+function opened(accountId: string, balance: number): AccountEvent {
+  return {type: 'bank_account.opened', data: {accountId, balance}}
+}
+
+test('opening emits an opened event', async () => {
+  await scenario(account)
+    .when({type: 'open', accountId: 'acct-1', initialBalance: 100})
+    .thenEvents(opened('acct-1', 100))
+})
+
+test('depositing adds to the balance', async () => {
+  await scenario(account)
+    .given(opened('acct-1', 100))
+    .when({type: 'deposit', amount: 25})
+    .thenState((state) => {
+      expect(state.balance).toBe(125)
+    })
+})
+
+test('depositing before opening is rejected', async () => {
+  await scenario(account).when({type: 'deposit', amount: 10}).thenRejected('not-opened')
+})
+```
+
+`Fixture` seeds and reads several streams, for tests that span aggregates. The
+[package README](https://github.com/photon-grove/evt/blob/main/packages/evt/README.md#testing)
+covers both.
+
 ## Where to go next
 
 [Concepts](concepts.md) covers the vocabulary and the contract behind each type. The
@@ -685,4 +889,6 @@ models and rebuilding them, [Command outcomes and retries](commands.md) is about
 [Streams and projectors](streams.md) is about async fan-out on Lambda. The
 [`photon-evt` README](https://github.com/photon-grove/evt/blob/main/crates/evt/README.md) covers
 the rest of the Rust API: transactions, commit-wide projectors, the sync journal and Lambda
-handlers.
+handlers. The
+[`@photon-grove/evt` README](https://github.com/photon-grove/evt/blob/main/packages/evt/README.md)
+does the same for TypeScript.

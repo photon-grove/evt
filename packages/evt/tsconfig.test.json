@@ -9,6 +9,6 @@
     "noEmit": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["src", "test", "scripts", "vitest.config.ts"],
+  "include": ["src", "test", "examples", "scripts", "vitest.config.ts"],
   "exclude": ["src/globals.d.ts"]
 }

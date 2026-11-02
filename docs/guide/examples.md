@@ -77,3 +77,21 @@ The Go examples live in `go/examples/`, one package per example.
   ```
 
 Run the tests of all three with `go -C go test ./examples/...`.
+
+## TypeScript
+
+The TypeScript example lives in `packages/evt/examples/`, with its tests beside it.
+
+- **Getting started** ([source](../../packages/evt/examples/getting-started.ts)). The bank account
+  of the [getting started guide](getting-started.md#the-same-model-in-typescript): events and an
+  aggregate from `defineEvents` and `defineAggregate`, a `Store` over `MemRepository`, a
+  rejection, and given/when/then tests from `@photon-grove/evt/testing`.
+
+  It runs on Node 24, which runs TypeScript files directly:
+
+  ```sh
+  pnpm --filter @photon-grove/evt run build
+  node packages/evt/examples/getting-started.ts
+  ```
+
+Run its tests with `pnpm --filter @photon-grove/evt exec vitest run examples`.
