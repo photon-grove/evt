@@ -6,5 +6,16 @@
     "suspicious": "error",
     "perf": "error"
   },
+  "rules": {
+    "vitest/expect-expect": ["error", {"assertFunctionNames": [
+          "expect",
+          "**.thenEvents",
+          "**.thenNoEvents",
+          "**.thenRejected",
+          "**.thenDuplicate",
+          "**.thenError",
+          "**.thenState"
+        ]}]
+  },
   "ignorePatterns": ["dist"]
 }
