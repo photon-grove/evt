@@ -15,7 +15,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.9.9",
-    "oxlint": "1.88.0",
+    "oxlint": "1.90.0",
     "typescript": "^7.0.2"
   }
 }
