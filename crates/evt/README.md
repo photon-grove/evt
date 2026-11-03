@@ -21,7 +21,7 @@ stream first. `MemRepository` backs tests, and the `dynamodb` and `postgres` fea
 durable backends. Upcasters migrate old payload versions as they're read, `compact_below` deletes
 only events a snapshot already covers, and in-band projectors write views in the same transaction
 as the events. The [concepts guide](https://github.com/photon-grove/evt/blob/main/docs/guide/concepts.md) walks through each of these, and the
-[getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md) builds one end to end in Rust, then in Go.
+[getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md) builds one end to end in Rust, then in Go and TypeScript.
 
 `Store::transaction` goes further. It loads several aggregates, appends decided events to any of
 them, and commits once, so all the streams land or none does. Streams it read but didn't write are
