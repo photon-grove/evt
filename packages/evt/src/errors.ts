@@ -19,6 +19,12 @@
  * - `commitTooLarge`: the commit is over the transaction budget. Nothing was written.
  * - `compactionUncovered`: no snapshot covers the events compaction was asked to delete.
  * - `reservedEntityId`: a write to an entity ID in a namespace only the engine writes.
+ * - `unsupportedFeature`: the store declares a feature this package doesn't model. Nothing was
+ *   written.
+ * - `streamHeadsNotMigrated`: the store holds data but doesn't declare stream-heads. Nothing was
+ *   written.
+ * - `rebuildInProgress`: a projection rebuild holds the store, so commits wait. Retryable.
+ * - `historyDependentProjection`: compaction was refused for a history-dependent entity type.
  * - `replay`: a stored event failed to upcast or decode while an aggregate loaded.
  * - `snapshot`: a stored snapshot failed to decode while an aggregate loaded.
  */
@@ -33,6 +39,10 @@ export type EvtErrorCode =
   | 'commitTooLarge'
   | 'compactionUncovered'
   | 'reservedEntityId'
+  | 'unsupportedFeature'
+  | 'streamHeadsNotMigrated'
+  | 'rebuildInProgress'
+  | 'historyDependentProjection'
   | 'replay'
   | 'snapshot'
 
@@ -162,6 +172,81 @@ export class ReservedEntityIdError extends EvtError {
   }
 }
 
+/** A feature and one of its stored-format versions. */
+export interface FeaturePair {
+  readonly name: string
+  readonly version: number
+}
+
+/**
+ * The store's feature manifest declares pairs this package doesn't model, so it refuses to write:
+ * a commit, a snapshot write, compaction or initialization. Nothing was written.
+ */
+export class UnsupportedFeatureError extends EvtError {
+  override readonly name = 'UnsupportedFeatureError'
+  override readonly code = 'unsupportedFeature'
+  /** Every unsupported pair, sorted by name. */
+  readonly unsupported: readonly FeaturePair[]
+
+  constructor(unsupported: readonly FeaturePair[]) {
+    const pairs = unsupported.map((pair) => `${pair.name}@${pair.version}`).join(', ')
+    super('unsupportedFeature', `store declares unsupported features (${pairs}); refusing to write`)
+    this.unsupported = unsupported
+  }
+}
+
+/**
+ * The store holds data but its feature manifest doesn't declare stream-heads: its streams may have
+ * no head items, so a head-aware write could fail every stream. Migrate the store with every older
+ * writer stopped. Nothing was written.
+ */
+export class StreamHeadsNotMigratedError extends EvtError {
+  override readonly name = 'StreamHeadsNotMigratedError'
+  override readonly code = 'streamHeadsNotMigrated'
+
+  constructor() {
+    super(
+      'streamHeadsNotMigrated',
+      'store does not declare the stream-heads feature and holds data without per-stream head ' +
+        'items; migrate it before writing',
+    )
+  }
+}
+
+/**
+ * A projection rebuild holds the store, or one was force-released and no rebuild has finished
+ * since, so every commit is refused. Retryable: the command can run again once the rebuild ends.
+ */
+export class RebuildInProgressError extends EvtError {
+  override readonly name = 'RebuildInProgressError'
+  override readonly code = 'rebuildInProgress'
+
+  constructor() {
+    super('rebuildInProgress', 'a projection rebuild is in progress')
+  }
+}
+
+/**
+ * Compaction was refused because the store declares the entity's type history-dependent: its
+ * projectors' rebuild replays the events compaction would delete. Nothing was deleted.
+ */
+export class HistoryDependentProjectionError extends EvtError {
+  override readonly name = 'HistoryDependentProjectionError'
+  override readonly code = 'historyDependentProjection'
+  readonly entityType: string
+  readonly entityId: string
+
+  constructor(entityType: string, entityId: string) {
+    super(
+      'historyDependentProjection',
+      `entity type ${entityType} is declared history-dependent; compaction would delete the ` +
+        `commits its rebuild replays (entity ${entityId})`,
+    )
+    this.entityType = entityType
+    this.entityId = entityId
+  }
+}
+
 /** A load failed closed on a stored event: an upcaster threw, or the payload didn't decode. */
 export class ReplayError extends EvtError {
   override readonly name = 'ReplayError'
@@ -203,9 +288,12 @@ export function isConflict(error: unknown): boolean {
   return error instanceof EvtError && (error.code === 'conflict' || error.code === 'sequenceGap')
 }
 
-/** Whether reloading and running the command again may succeed. So far, only after a conflict. */
+/**
+ * Whether reloading and running the command again may succeed: after a conflict, or while a
+ * rebuild holds the store.
+ */
 export function isRetryable(error: unknown): boolean {
-  return isConflict(error)
+  return isConflict(error) || (error instanceof EvtError && error.code === 'rebuildInProgress')
 }
 
 /** An error's message, or the value itself as text. */

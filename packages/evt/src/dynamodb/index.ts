@@ -1,4 +1,4 @@
-// @photon-grove/evt/dynamodb: the DynamoDB backend. So far it holds the item codec, which imports
+// @photon-grove/evt/dynamodb: the DynamoDB backend. So far it holds the item codecs, which import
 // nothing from the AWS SDK.
 
 export {
@@ -19,3 +19,4 @@ export {
   sortKey,
   viewItem,
 } from './item.js'
+export {FEATURES_PK, REBUILD_LOCK_PK, manifestFromItem, markerItem} from './marker.js'

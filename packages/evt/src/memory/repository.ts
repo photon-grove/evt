@@ -1,21 +1,34 @@
 // The in-memory repository. It enforces the storage contract the way the live backends do: a head
-// per stream that every commit raises, optimistic concurrency against it, and the same failure
-// classification and transaction budget. It's for tests and local development.
+// per stream that every commit raises, optimistic concurrency against it, the feature marker and
+// the rebuild-lock check, and the same failure classification and transaction budget. It's for
+// tests and local development.
 
 import {
   ConflictError,
   CompactionUncoveredError,
   EvtError,
+  HistoryDependentProjectionError,
+  RebuildInProgressError,
   SequenceGapError,
   StreamHeadDriftError,
+  StreamHeadsNotMigratedError,
 } from '../errors.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
+import {
+  type FeatureManifest,
+  checkSupported,
+  checkWritable,
+  declaresStreamHeads,
+  entityTypeSet,
+  withStreamHeads,
+} from '../features.js'
 import {int64Argument} from '../fields.js'
 import type {Metadata} from '../metadata.js'
 import {
   type CallOptions,
   type Commit,
   type Repository,
+  type StoreInitializer,
   checkBudget,
   checkNotReserved,
   commitSizes,
@@ -30,8 +43,26 @@ interface Stream {
   head: bigint
 }
 
-// Reads a repository's streams, for headFixtures. The class's static block sets it.
+/** The state of the rebuild fence's two rows that a commit's lock check reads. */
+export interface RebuildState {
+  /** The generation counter: odd while a rebuild holds the store or after a force-release. */
+  generation: bigint
+  /**
+   * The lock row: a rebuild's lease, the item a force-release leaves in its place, or none. A
+   * commit is refused while either exists, and while the generation is odd.
+   */
+  lock: 'held' | 'forceReleased' | null
+}
+
+// The store-wide control rows: the feature marker and the rebuild fence.
+interface Controls {
+  manifest: FeatureManifest | null
+  rebuild: RebuildState
+}
+
+// Read a repository's private state, for the fixtures. The class's static block sets them.
 let streamsOf: (repo: MemRepository) => Map<string, Stream>
+let controlsOf: (repo: MemRepository) => Controls
 
 /**
  * An in-memory {@link Repository}. Every call copies what it stores and what it returns, so a
@@ -39,9 +70,26 @@ let streamsOf: (repo: MemRepository) => Map<string, Stream>
  *
  * Each call runs to completion before another starts, so concurrent commits to one stream behave
  * like racing writers on a live backend: one wins and the rest fail with a conflict.
+ *
+ * A fresh store is initialized by its first commit or snapshot write, which declares stream-heads
+ * on its feature manifest, so {@link initialize} is needed only where code treats every backend
+ * alike.
  */
-export class MemRepository implements Repository {
+export class MemRepository implements Repository, StoreInitializer {
   readonly #streams = new Map<string, Stream>()
+  readonly #controls: Controls = {manifest: null, rebuild: {generation: 0n, lock: null}}
+
+  async initialize(options?: CallOptions): Promise<boolean> {
+    options?.signal?.throwIfAborted()
+    checkSupported(this.#controls.manifest)
+    if (declaresStreamHeads(this.#controls.manifest)) {
+      return false
+    }
+
+    this.#declareStreamHeads()
+
+    return true
+  }
 
   async commit(commit: Commit, options?: CallOptions): Promise<void> {
     options?.signal?.throwIfAborted()
@@ -53,6 +101,14 @@ export class MemRepository implements Repository {
 
     // Every backend budgets a commit the same way, so an oversized one fails before any write.
     checkBudget(commitSizes(commit, () => undefined))
+
+    // The control rows come first, as the two checks that open every live commit: the marker,
+    // then the rebuild lock, which an unsettled generation fails, a force-released one included.
+    this.#checkManifest()
+    const {rebuild} = this.#controls
+    if (rebuild.lock !== null || rebuild.generation % 2n !== 0n) {
+      throw new RebuildInProgressError()
+    }
 
     const held = this.#streams.get(commit.entityId) ?? emptyStream()
     checkWrite(commit, held)
@@ -120,6 +176,7 @@ export class MemRepository implements Repository {
     checkNotReserved(snapshot.entityId)
     int64Argument(snapshot.sequence, 'snapshot.sequence')
     int64Argument(snapshot.eventSequence, 'snapshot.eventSequence')
+    this.#checkManifest()
 
     // The stream's head must cover the snapshot. One of an empty stream (event sequence 0) may
     // have no head at all.
@@ -153,10 +210,20 @@ export class MemRepository implements Repository {
       return 0
     }
 
+    // Compaction validates the manifest, but never declares stream-heads itself.
+    const {manifest} = this.#controls
+    checkWritable(manifest)
+
     const stream = this.#streams.get(entityId)
-    const covered = stream?.snapshot?.eventSequence ?? null
-    if (stream === undefined || covered === null || covered < through) {
+    const snapshot = stream?.snapshot
+    const covered = snapshot?.eventSequence ?? null
+    if (stream === undefined || !snapshot || covered === null || covered < through) {
       throw new CompactionUncoveredError(entityId, through, covered)
+    }
+
+    // A history-dependent type's rebuild replays the events compaction would delete.
+    if (manifest?.historyDependent.includes(snapshot.entityType)) {
+      throw new HistoryDependentProjectionError(snapshot.entityType, entityId)
     }
 
     let deleted = 0
@@ -172,6 +239,27 @@ export class MemRepository implements Repository {
 
   static {
     streamsOf = (repo) => repo.#streams
+    controlsOf = (repo) => repo.#controls
+  }
+
+  // Refuses a write to a store whose manifest declares an unsupported pair, and declares
+  // stream-heads on a store without it, as its first writer, when the store holds no data.
+  #checkManifest(): void {
+    checkSupported(this.#controls.manifest)
+    if (!declaresStreamHeads(this.#controls.manifest)) {
+      this.#declareStreamHeads()
+    }
+  }
+
+  #declareStreamHeads(): void {
+    const holdsData = Array.from(this.#streams.values()).some(
+      (stream) => stream.events.size > 0 || stream.snapshot !== null,
+    )
+    if (holdsData) {
+      throw new StreamHeadsNotMigratedError()
+    }
+
+    this.#controls.manifest = withStreamHeads(this.#controls.manifest)
   }
 
   // The stream's events by sequence, ascending or descending. Sequences are unique.
@@ -279,6 +367,68 @@ export function headFixtures(repo: MemRepository): HeadFixtures {
 
       return head > 0n ? head : null
     },
+  }
+}
+
+/** A feature manifest's declarable parts, which a declaration changes in place. */
+export interface ManifestDraft {
+  features: Map<string, number>
+  historyDependent: string[]
+  retention: string[]
+}
+
+/** What a conformance suite needs to declare features and hold the rebuild lock. */
+export interface ControlFixtures {
+  /** The stored manifest, or null when the store has no marker row. */
+  manifest(): FeatureManifest | null
+  /** Changes the manifest in one declaration, bumping its version by one, and returns it. */
+  declare(change: (draft: ManifestDraft) => void): FeatureManifest
+  /** Sets the rebuild fence's rows, as a rebuild's lifecycle would. */
+  setRebuild(state: RebuildState): void
+}
+
+/**
+ * Hooks that change a repository's control rows, for conformance suites only. A declaration may
+ * declare features this package doesn't model, which then refuse every write.
+ */
+export function controlFixtures(repo: MemRepository): ControlFixtures {
+  const controls = controlsOf(repo)
+
+  return {
+    manifest() {
+      return controls.manifest && cloneManifest(controls.manifest)
+    },
+    declare(change) {
+      const draft: ManifestDraft = {
+        features: new Map(controls.manifest?.features),
+        historyDependent: [...(controls.manifest?.historyDependent ?? [])],
+        retention: [...(controls.manifest?.retention ?? [])],
+      }
+      change(draft)
+
+      // Stored as the marker row stores them: each set sorted and deduplicated.
+      controls.manifest = {
+        version: (controls.manifest?.version ?? 0n) + 1n,
+        features: new Map(draft.features),
+        historyDependent: entityTypeSet(draft.historyDependent),
+        retention: entityTypeSet(draft.retention),
+      }
+
+      return cloneManifest(controls.manifest)
+    },
+    setRebuild(state) {
+      int64Argument(state.generation, 'generation')
+      controls.rebuild = {...state}
+    },
+  }
+}
+
+function cloneManifest(manifest: FeatureManifest): FeatureManifest {
+  return {
+    version: manifest.version,
+    features: new Map(manifest.features),
+    historyDependent: [...manifest.historyDependent],
+    retention: [...manifest.retention],
   }
 }
 

@@ -65,6 +65,15 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   current one as it's read, in the order they're declared. `jsonUpcaster(from, to, migrate)` does
   it on the parsed JSON, losslessly. A stored version the upcasters don't bring to the declared one
   fails the load with a `ReplayError` rather than decoding into the wrong shape.
+- **The feature marker.** A store keeps one manifest of the features it uses. Every write path
+  refuses a store that declares a feature this package doesn't model (the journal, journal
+  compaction, the PostgreSQL views table) with an `UnsupportedFeatureError`, and compaction
+  refuses an entity type the manifest declares history-dependent. `MemRepository` declares the
+  required `stream-heads` feature on a fresh store's first write, and `initialize()` declares it
+  up front.
+- **Rebuilds.** While a projection rebuild holds the store, every commit fails with a
+  `RebuildInProgressError`. It's retryable, so `executeWithRetry` runs the command again after its
+  backoff, though a rebuild usually outlasts the default policy's attempts.
 - **Sequences** are `bigint`s, because Go and Rust store them as 64-bit integers.
 
 Errors are `EvtError`s with a `code`. `isConflict` and `isRetryable` tell them apart.

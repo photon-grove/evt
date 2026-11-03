@@ -15,13 +15,14 @@ import {commitIds} from '../src/commit-id.ts'
 import {
   ConflictError,
   EvtError,
+  RebuildInProgressError,
   ReplayError,
   SequenceGapError,
   SnapshotError,
 } from '../src/errors.ts'
 import {type SerializedEvent, encodeEvent, eventId} from '../src/event.ts'
 import type {JsonValue} from '../src/json.ts'
-import {MemRepository} from '../src/memory/repository.ts'
+import {MemRepository, controlFixtures} from '../src/memory/repository.ts'
 import {type Metadata, emptyMetadata} from '../src/metadata.ts'
 import type {Commit, Repository} from '../src/repository.ts'
 import {DEFAULT_RETRY_POLICY, checkRetryPolicy, retryDelay, sleep} from '../src/retry.ts'
@@ -472,6 +473,42 @@ describe('Store.executeWithRetry', () => {
     expect(waits[0]).toBeLessThanOrEqual(25)
     expect(waits[1]).toBeGreaterThanOrEqual(25)
     expect(waits[1]).toBeLessThanOrEqual(50)
+  })
+
+  test('runs the command again once a rebuild settles', async () => {
+    const repository = new MemRepository()
+    const controls = controlFixtures(repository)
+    controls.setRebuild({generation: 1n, lock: 'held'})
+
+    // The rebuild ends during the first wait.
+    const waits: number[] = []
+    const result = await store(repository).executeWithRetry(
+      account,
+      'a',
+      {type: 'deposit', amountCents: 1},
+      {
+        sleep: async (ms) => {
+          waits.push(ms)
+          controls.setRebuild({generation: 2n, lock: null})
+        },
+      },
+    )
+
+    expect(result.kind).toBe('committed')
+    expect(waits).toHaveLength(1)
+  })
+
+  test('throws the rebuild error as it is when the attempts run out', async () => {
+    const repository = new MemRepository()
+    controlFixtures(repository).setRebuild({generation: 3n, lock: 'forceReleased'})
+    const error = await failure(
+      store(repository).executeWithRetry(account, 'a', {type: 'deposit', amountCents: 1}, {
+        policy: {maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0},
+      }),
+    )
+
+    expect(error).toBeInstanceOf(RebuildInProgressError)
+    expect(await repository.events('a')).toEqual([])
   })
 
   test('throws the last conflict when the attempts run out', async () => {
