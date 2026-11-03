@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/photon-grove/evt/compare/photon-evt-lambda-v0.2.0...photon-evt-lambda-v0.3.0) (2026-11-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **journal:** a repository handle not wrapped by JournalRepository is refused on a journal table, even in a build with the journal feature. JournalRepository::new now requires R: FeatureMarker, and a decorator placed under the journal must forward accept_journal to its inner repository.
+
+### Bug Fixes
+
+* **journal:** accept the journal marker per repository handle ([#257](https://github.com/photon-grove/evt/issues/257)) ([bda29fe](https://github.com/photon-grove/evt/commit/bda29fe53931cbb987f184a87a928ed8704e2797))
+
 ## [0.2.0](https://github.com/photon-grove/evt/compare/photon-evt-lambda-v0.1.0...photon-evt-lambda-v0.2.0) (2026-10-30)
 
 
