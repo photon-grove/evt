@@ -119,8 +119,8 @@ export interface Projection<S> {
   readonly state: S
   /** The state as the aggregate's state codec encodes it, as a snapshot stores it. */
   readonly encodedState: Uint8Array
-  /** The commit's events, as they are stored. */
-  readonly events: readonly SerializedEvent[]
+  /** Copies of the commit's events, as they are stored. */
+  readonly events: readonly Readonly<SerializedEvent>[]
 }
 
 /**

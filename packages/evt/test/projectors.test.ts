@@ -122,6 +122,28 @@ describe('the store', () => {
     expect(Object.isFrozen(seen[0])).toBe(true)
   })
 
+  test("can't change the events the commit stores, or another projector's view", async () => {
+    const seen: Projection<State>[] = []
+    const tamper: Projector<State> = {
+      project({events: [first]}) {
+        // The digit of {"n":1}.
+        first!.payload![5] = 0x39
+        first!.metadata.extensions.set('tampered', 'yes')
+
+        return null
+      },
+    }
+    const repository = new Recorded()
+    const aggregate = counter([tamper, recording('after', seen)])
+    await new Store(repository).execute(aggregate, 'c', {add: [1]})
+
+    const [stored] = await repository.events('c')
+    expect(decoder.decode(stored!.payload!)).toBe('{"n":1}')
+    expect(stored!.metadata.extensions.has('tampered')).toBe(false)
+    expect(decoder.decode(seen[0]!.events[0]!.payload!)).toBe('{"n":1}')
+    expect(Object.isFrozen(seen[0]!.events[0])).toBe(true)
+  })
+
   test('commits no projections without events', async () => {
     const seen: Projection<State>[] = []
     const repository = new Recorded()

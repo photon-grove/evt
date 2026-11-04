@@ -5,6 +5,7 @@ import {
   type Aggregate,
   type EventDefinitions,
   type EventOf,
+  type Projection,
   type Rejection,
   encodeEventData,
   replayEvent,
@@ -358,17 +359,27 @@ export class Store {
       return []
     }
 
-    // Frozen, with copies of the commit's own events and bytes, so no projector can change what
-    // another one sees, or what the commit writes.
-    const projection = Object.freeze({
-      entityType: aggregate.type,
-      entityId,
-      state,
-      encodedState: (snapshot?.payload ?? aggregate.state.encode(state)).slice(),
-      events: Object.freeze([...events]),
-    })
+    // Each projector gets its own frozen copy of the events, their metadata and every byte array,
+    // so none can change what another one sees, or what the commit writes.
+    const encodedState = snapshot?.payload ?? aggregate.state.encode(state)
+    const detached = (): Projection<S> =>
+      Object.freeze({
+        entityType: aggregate.type,
+        entityId,
+        state,
+        encodedState: encodedState.slice(),
+        events: Object.freeze(
+          events.map((event) =>
+            Object.freeze({
+              ...event,
+              payload: event.payload && event.payload.slice(),
+              metadata: Object.freeze(copyMetadata(event.metadata)),
+            }),
+          ),
+        ),
+      })
 
-    return projectors.flatMap((projector) => projector.project(projection) ?? [])
+    return projectors.flatMap((projector) => projector.project(detached()) ?? [])
   }
 
   // The command's metadata with the store's region and the clock's timestamp where it has none,
