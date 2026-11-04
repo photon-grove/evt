@@ -73,6 +73,14 @@ tasks:
       - build-compat
     options:
       cache: false
+  # The conformance suites against a local PostgreSQL server at DATABASE_URL. The run creates
+  # event logs under its own table names and drops them.
+  integration-postgres:
+    command: node ../evt-compat/dist/postgres.js
+    deps:
+      - build-compat
+    options:
+      cache: false
   # The fixture runner on the other runtimes, against the same build. Bun and Deno come from
   # .prototools locally and from the pinned setup actions in CI.
   runtimes:

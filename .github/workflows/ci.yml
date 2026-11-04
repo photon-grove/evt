@@ -333,7 +333,9 @@ jobs:
   postgres-integration:
     name: PostgreSQL integration
     needs: changes
-    if: needs.changes.outputs.go == 'true' || needs.changes.outputs.compat == 'true'
+    if: >-
+      needs.changes.outputs.go == 'true' || needs.changes.outputs.compat == 'true' ||
+      needs.changes.outputs.ts == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
@@ -394,6 +396,13 @@ jobs:
         env:
           DATABASE_URL: postgres://evt:evt@localhost:5432/evt_local?sslmode=disable
         run: pnpm exec moon run evt:integration-postgres
+
+      - name: Run TypeScript PostgreSQL conformance
+        if: needs.changes.outputs.ts == 'true'
+        timeout-minutes: 5
+        env:
+          DATABASE_URL: postgres://evt:evt@localhost:5432/evt_local?sslmode=disable
+        run: pnpm exec moon run evt-ts:integration-postgres
 
       - uses: ./.github/actions/setup-rust
         if: needs.changes.outputs.compat == 'true'

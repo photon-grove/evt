@@ -71,6 +71,9 @@ terraform -chdir=infra/local-postgres apply -auto-approve
 moon run evt:integration-postgres
 ```
 
+`moon run evt-ts:integration-postgres` runs the TypeScript conformance suites against the same
+database (or `DATABASE_URL`), under table names of their own.
+
 With both stacks up, `moon run evt-rust:integration evt-rust:integration-postgres` runs the Rust
 conformance suite and the Go/Rust cross-language suite against each backend, and on PostgreSQL
 also the live parity checks in `crates/evt-compat/tests/postgres_atomicity.rs`. The cross-language

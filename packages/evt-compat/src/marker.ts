@@ -1,7 +1,7 @@
 // feature-marker.json: the declarations (the manifest's stored JSON texts and its DynamoDB item,
 // for each declaration of a chain) and the streamHeads requests of the DynamoDB writer. The view
-// commits and the PostgreSQL rows and writes wait for the backends that write them. postgres.ts
-// checks the PostgreSQL schemas.
+// commits and the PostgreSQL rows and writes wait for the backends that write them. The
+// postgresSchemas DDL is checked byte for byte, so every language creates the same schema.
 import {
   type Commit,
   type FeatureManifest,
@@ -22,6 +22,7 @@ import {
   markerItem,
   snapshotTransaction,
 } from '@photon-grove/evt/dynamodb'
+import {pgTables, schemaDdl} from '@photon-grove/evt/postgres'
 
 import {milliseconds} from './codec.js'
 import {type Checks, canonical, field, int, list, loadFixture, num, plain, str} from './harness.js'
@@ -202,4 +203,18 @@ function normalize(action: TransactItem): unknown {
   }
 
   return normalized
+}
+
+export async function postgresSchemaVectors(checks: Checks): Promise<void> {
+  const schemas = list(field(await loadFixture('feature-marker.json'), 'postgresSchemas'))
+  checks.equal('postgres schemas present', schemas.length > 0, true)
+
+  for (const vector of schemas) {
+    const events = str(field(vector, 'eventsTable'))
+    const snapshots = str(field(vector, 'snapshotsTable'))
+    const name = `postgres schema ${events}/${snapshots}`
+    checks.run(name, () => {
+      checks.equal(name, schemaDdl(pgTables(events, snapshots)), str(field(vector, 'ddl')))
+    })
+  }
 }

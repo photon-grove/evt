@@ -18,7 +18,7 @@ cargo build --quiet -p evt-compat --features drivers --bin evt-compat
 go_driver="target/compat/evt-compat-go-${backend}"
 rust_driver="target/debug/evt-compat"
 
-# TypeScript has no PostgreSQL repository yet, so it joins only the DynamoDB run.
+# The TypeScript driver writes only the DynamoDB run so far.
 ts_driver=(node packages/evt-compat/dist/live.js)
 ts_scenarios=""
 if [ "$backend" = dynamo ]; then

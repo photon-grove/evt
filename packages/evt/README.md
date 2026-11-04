@@ -11,9 +11,9 @@ held to the fixtures Go and Rust generate, byte for byte.
 npm install @photon-grove/evt
 ```
 
-So far it has the core, the in-memory and DynamoDB backends, the PostgreSQL schema, and the testing
-helpers. Commit-wide projectors, the PostgreSQL repository, command outcomes and multi-stream
-transactions come in later releases, and the
+So far it has the core, the in-memory, DynamoDB and PostgreSQL backends, and the testing helpers.
+Commit-wide projectors, command outcomes and multi-stream transactions come in later releases, and
+the
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -27,7 +27,7 @@ builds a bank account aggregate with it, end to end.
 | `@photon-grove/evt/memory`   | `MemRepository`, the in-memory backend for tests and local development     |
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
 | `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, and the item and request codecs       |
-| `@photon-grove/evt/postgres` | The PostgreSQL schema: table names, derived relations and `schemaDdl`      |
+| `@photon-grove/evt/postgres` | `PgRepository`, and the schema: table names, relations and `schemaDdl`     |
 
 ## DynamoDB
 
@@ -63,6 +63,31 @@ the feature manifest from Go or Rust, so that their writers refuse read fences o
 `viewProjector('views')`, listed in an aggregate's `projectors`, puts the entity's view row with
 every commit, in the same transaction: `pk = {type}#{id}`, `sk = VIEW`, and the state as its
 codec encodes it, as Go's `dynamo.NewViewProjector` does.
+
+## PostgreSQL
+
+`PgRepository` takes a pool shaped like `pg`'s `Pool`, and writes the tables the
+[PostgreSQL guide](https://github.com/photon-grove/evt/blob/main/docs/guide/postgres.md) describes,
+as Go's and Rust's repositories do:
+
+```ts
+import {Store} from '@photon-grove/evt'
+import {PgRepository} from '@photon-grove/evt/postgres'
+import {Pool} from 'pg'
+
+const repository = new PgRepository(new Pool({connectionString: process.env.DATABASE_URL}))
+await repository.ensureSchema() // idempotent, safe on every start
+const store = new Store(repository)
+```
+
+The package imports no driver: Neon's serverless `Pool` works too, and so does a single connection
+without `connect()`, such as PGlite, which the repository runs one operation at a time on. Every
+value it sends is a string and every column it reads is text, so no driver's type parsing touches a
+stored value. `{eventsTable, snapshotsTable}` let several event logs share a database. A writer
+initializes a fresh store itself on its first write, as Go's and Rust's do, and `initialize()` is
+there for a deploy step that treats every backend alike. Every transaction runs at `READ
+COMMITTED`, whatever the server's default. An abort is checked between statements and rolls the
+transaction back.
 
 ## Runtimes
 

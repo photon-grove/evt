@@ -4,8 +4,7 @@ import {DEFAULT_RETRY_POLICY} from '@photon-grove/evt'
 
 import {codecVectors} from './codec.js'
 import {Checks, field, list, loadFixture, num, str} from './harness.js'
-import {headVectors, markerVectors} from './marker.js'
-import {postgresSchemaVectors} from './postgres.js'
+import {headVectors, markerVectors, postgresSchemaVectors} from './marker.js'
 import {scenarioChecks} from './scenarios.js'
 
 const checks = new Checks()

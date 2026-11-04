@@ -3163,10 +3163,11 @@ compare-and-set, so its journal reads are refused with `ViewsNotConfigured`.
 
 ## PostgreSQL
 
-The schema is created by Go's `postgres.Repository.EnsureSchema` or Rust's
-`PostgresRepository::ensure_schema`, which run the same idempotent DDL. Rust's also creates the
+The schema is created by Go's `postgres.Repository.EnsureSchema`, Rust's
+`PostgresRepository::ensure_schema` or TypeScript's `PgRepository.ensureSchema`, which run the same
+idempotent DDL. Rust's also creates the
 Rust-only [views table](#postgresql-views-table), which Go's does not. Table names default to
-`evt_events` and `evt_snapshots` and can be changed in both implementations. The v0.9 auxiliary
+`evt_events` and `evt_snapshots` and can be changed in every implementation. The v0.9 auxiliary
 relations derive from the configured events table name through a reserved infix
 (`{events}__evt_command_outcomes`, `{events}__evt_features`, `{events}__evt_rebuild_lock`,
 `{events}__evt_rebuild_generation`, `{events}__evt_stream_heads`, and the entity-type index
@@ -3267,8 +3268,8 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   rebuild lifecycle and its guarded view writes, feature declarations, `EnsureSchema`, and the
   stream-head migration and repair writes) runs at `READ COMMITTED`, set explicitly whatever the
   server's or role's `default_transaction_isolation` (Go issues `SET TRANSACTION ISOLATION LEVEL
-  READ COMMITTED` as the first statement, Rust starts it with `START TRANSACTION ISOLATION LEVEL
-  READ COMMITTED`). The one exception is Go's read-only stream-head scans (`VerifyStreamHeads`
+  READ COMMITTED` as the first statement, Rust and TypeScript start it with `START TRANSACTION
+  ISOLATION LEVEL READ COMMITTED`). The one exception is Go's read-only stream-head scans (`VerifyStreamHeads`
   and the dry runs of the migration and repair), which take no locks and want one consistent
   `REPEATABLE READ READ ONLY` snapshot. A Go `DB` that is itself an ambient transaction must
   already run at `READ COMMITTED`: PostgreSQL cannot change the level of a transaction under way,
@@ -3311,9 +3312,10 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   DynamoDB. An event insert that finds its sequence already stored, after the stream's head
   statement passed, is an event above the head: `StreamHeadDrift`. In Rust, a serialization failure
   (`40001`) or deadlock (`40P01`), raised by any statement in the commit (head statement,
-  projector, insert, or snapshot upsert), is `Error::Transient` and is retried.
+  projector, insert, or snapshot upsert), is `Error::Transient` and is retried, and TypeScript
+  reports it as a `TransientError`.
 - Commits and out-of-band snapshot writes first take a per-entity transaction lock,
-  `SELECT pg_advisory_xact_lock(1702261760, hashtext($1))` with the entity ID. Both languages run
+  `SELECT pg_advisory_xact_lock(1702261760, hashtext($1))` with the entity ID. Every language runs
   this exact statement, so a snapshot write cannot interleave with a commit of the same stream. A multi-stream commit locks every stream in its read set, written and fenced, once
   each, in ascending entity-ID byte order (the bytewise order that also pins the transaction
   layout, never a locale collation). Byte order is a total order over the IDs, so two commits
