@@ -1,6 +1,6 @@
 {
-  "go": "0.11.1",
+  "go": "0.12.0",
   "crates/evt": "0.4.1",
   "crates/evt-lambda": "0.3.0",
-  "packages/evt": "0.1.1"
+  "packages/evt": "0.1.2"
 }

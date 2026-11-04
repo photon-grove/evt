@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.2](https://github.com/photon-grove/evt/compare/evt-ts-v0.1.1...evt-ts-v0.1.2) (2026-11-04)
+
+
+### Features
+
+* **ts:** add PgRepository ([#280](https://github.com/photon-grove/evt/issues/280)) ([daebc61](https://github.com/photon-grove/evt/commit/daebc61bbeb6690c8267a7f75a49f538a0b5f439))
+* **ts:** add the per-entity view projector ([#276](https://github.com/photon-grove/evt/issues/276)) ([e4c7747](https://github.com/photon-grove/evt/commit/e4c77475b4bb71d2828dad69cb532a6ebe85b925))
+* **ts:** add the PostgreSQL schema layer ([#279](https://github.com/photon-grove/evt/issues/279)) ([a4db99f](https://github.com/photon-grove/evt/commit/a4db99f1374747514c9696f69866f12b6ee992f6))
+
+
+### Performance Improvements
+
+* **ts:** read a retained stream's remaining items once per failed event put ([#275](https://github.com/photon-grove/evt/issues/275)) ([1c470a2](https://github.com/photon-grove/evt/commit/1c470a2c18b63067e0d8ec067dae577277054b4f))
+
 ## [0.1.1](https://github.com/photon-grove/evt/compare/evt-ts-v0.1.0...evt-ts-v0.1.1) (2026-11-04)
 
 
