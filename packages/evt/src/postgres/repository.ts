@@ -69,7 +69,9 @@ export interface PgRepositoryOptions {
 /** The backend name a projector group for the PostgreSQL repository would carry. */
 export const POSTGRES_BACKEND = 'postgres'
 
-// The event columns every read selects, each as text, so no driver parses a stored value.
+// The event columns every read selects, each as text, so no driver parses a stored value. An
+// ORDER BY names the table's column, since a bare `sequence` would sort the text alias: 10
+// before 9.
 const EVENT_COLUMNS =
   'event_id, sequence::text AS sequence, event_type, version::text AS version, entity_id, ' +
   "entity_type, encode(payload, 'hex') AS payload, metadata::text AS metadata"
@@ -235,7 +237,7 @@ export class PgRepository implements Repository, StoreInitializer {
     options?.signal?.throwIfAborted()
     const rows = await this.#read(
       `SELECT ${EVENT_COLUMNS} FROM ${this.#tables.events} WHERE entity_id = $1 ` +
-        'ORDER BY sequence ASC',
+        `ORDER BY ${this.#tables.events}.sequence ASC`,
       [entityId],
     )
 
@@ -251,7 +253,8 @@ export class PgRepository implements Repository, StoreInitializer {
     int64Argument(after, 'after')
     const rows = await this.#read(
       `SELECT ${EVENT_COLUMNS} FROM ${this.#tables.events} ` +
-        'WHERE entity_id = $1 AND sequence > $2::bigint ORDER BY sequence ASC',
+        'WHERE entity_id = $1 AND sequence > $2::bigint ' +
+        `ORDER BY ${this.#tables.events}.sequence ASC`,
       [entityId, after.toString()],
     )
 
@@ -269,7 +272,7 @@ export class PgRepository implements Repository, StoreInitializer {
 
     const rows = await this.#read(
       `SELECT ${EVENT_COLUMNS} FROM ${this.#tables.events} WHERE entity_id = $1 ` +
-        'ORDER BY sequence DESC LIMIT $2::bigint',
+        `ORDER BY ${this.#tables.events}.sequence DESC LIMIT $2::bigint`,
       [entityId, n.toString()],
     )
 

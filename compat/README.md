@@ -29,7 +29,7 @@ Both sides implement the same account domain: `go/internal/compat/account.go` an
 | `cargo test -p evt-compat`               | The Rust output matches the fixtures byte for byte, running every step in Rust against `MemRepository`.        |
 | `moon run evt-ts:test evt-ts:runtimes`   | The TypeScript fixture runner (`packages/evt-compat`) reproduces the vectors it covers so far, and its conformance suite passes against `MemRepository`, on Node, Bun and Deno. It generates no fixtures. |
 | `scripts/compat-integration.sh dynamo`   | Go and Rust take turns writing the same streams in the local DynamoDB emulator, then both verify every stream. Two passes over the scenarios TypeScript supports come first, in which the TypeScript driver stands in for Go, then for Rust. |
-| `scripts/compat-integration.sh postgres` | The same against local PostgreSQL.                                                                             |
+| `scripts/compat-integration.sh postgres` | The same against local PostgreSQL, TypeScript passes included.                                                 |
 
 The marker vectors include duplicate-input set canonicalization, the complete transaction order
 (marker check, rebuild-lock check, projector operations, then per written stream its head update,
@@ -49,16 +49,19 @@ one, with the statements both drivers issue (a plain `INSERT` for an `absent` pu
 otherwise, and a `DELETE`).
 
 The TypeScript driver (`packages/evt-compat/src/live.ts`, run as `node
-packages/evt-compat/dist/live.js`) joins the DynamoDB run as a stand-in, as
+packages/evt-compat/dist/live.js`) joins both runs as a stand-in, as
 [ADR 0009](../docs/adr/0009-typescript-implementation.md) describes. `scenarios` prints the
 scenarios it supports, and `step --as go|rust` executes that language's steps of those scenarios
 and stamps that language's name, so the streams match the fixtures unchanged. Each of its two
 passes has its own run ID and takes only those scenarios: the other language's driver writes its
 own steps of them, limited by `step -scenarios` (Go) or `--scenarios` (Rust), and Go, Rust and
-TypeScript verify them, then Go and Rust compare their enumerations. The other scenarios would
-only repeat the Go and Rust pass, and Moto copies a table for every action of a transaction, so a
-fuller table slows every pass: the TypeScript passes run first, while the tables are smallest. TypeScript joins neither the PostgreSQL run nor the enumeration
-check yet.
+TypeScript verify them, then Go and Rust compare their enumerations. TypeScript verifies what each
+backend stores, as Go does: the DynamoDB items and the SNS messages they publish, or the PostgreSQL
+event, snapshot and head rows. The other scenarios would only repeat the Go and Rust pass, and Moto
+copies a table for every action of a transaction, so a fuller table slows every pass: the
+TypeScript passes run first, while the tables are smallest. TypeScript doesn't join the
+enumeration check yet. Its driver refuses any `AWS_ENDPOINT_URL` or `DATABASE_URL` whose host
+isn't a loopback address or a `.localhost` name, so a compose service name won't do.
 
 The live runs need the local stacks from [CONTRIBUTING.md](../CONTRIBUTING.md#integration-tests). Moon
 runs them, together with the Rust conformance suite, as `evt-rust:integration` and

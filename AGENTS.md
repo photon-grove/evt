@@ -170,7 +170,7 @@
 - CI integration checks start Moto or PostgreSQL, apply the local Terraform, and run
   `evt:integration` / `evt:integration-postgres`, plus `evt-rust:integration` /
   `evt-rust:integration-postgres` when the storage format may have changed or the TypeScript
-  packages changed (the TypeScript driver writes in the DynamoDB run).
+  packages changed (the TypeScript driver writes in both runs).
 - A `changes` job classifies changed paths: Rust-only changes skip Go jobs, Go-only changes skip
   the Rust job, and only TypeScript, fixture and shared-config changes run the TypeScript job. Keep
   its path lists in `.github/workflows/ci.yml` in sync when adding directories. Go lives under
