@@ -29,7 +29,9 @@ import {
   isSnapshotItem,
   snapshotFromItem,
   snapshotItem,
+  type TransactItem,
   viewItem,
+  viewProjector,
 } from '@photon-grove/evt/dynamodb'
 
 import {type Checks, canonical, field, int, list, loadFixture, num, plain, str} from './harness.js'
@@ -202,8 +204,23 @@ function viewVector(checks: Checks, name: string, vector: JsonValue): void {
   const payload = stringifyJson(account)
   checks.equal(`${name}: state`, payload, state)
 
-  const got = viewItem('account', str(field(vector, 'entityId')), encoder.encode(payload))
-  checks.equal(`${name}: view item`, canonical(got), canonical(field(vector, 'dynamoItem')))
+  const entityId = str(field(vector, 'entityId'))
+  const want = canonical(field(vector, 'dynamoItem'))
+  const got = viewItem('account', entityId, encoder.encode(payload))
+  checks.equal(`${name}: view item`, canonical(got), want)
+
+  // The vector is the put Go's view projector writes, so the projector must write the same one.
+  const group = viewProjector('views').project({
+    entityType: 'account',
+    entityId,
+    state: account,
+    encodedState: encoder.encode(payload),
+    events: [],
+  })
+  const [put, ...others] = (group?.operations ?? []) as TransactItem[]
+  checks.equal(`${name}: projector operations`, others.length === 0 && put?.Put !== undefined, true)
+  checks.equal(`${name}: projector table`, put?.Put?.TableName, 'views')
+  checks.equal(`${name}: projector item`, canonical(put?.Put?.Item), want)
 }
 
 function item(value: JsonValue): Item {

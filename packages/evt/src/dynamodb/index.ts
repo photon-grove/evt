@@ -37,6 +37,7 @@ export {
 } from './client.js'
 export {FEATURES_PK, REBUILD_LOCK_PK, manifestFromItem, markerItem} from './marker.js'
 export {DynamoRepository, type DynamoRepositoryOptions} from './repository.js'
+export {DYNAMODB_BACKEND, transactItemSize, viewProjector} from './views.js'
 export {
   type CommitTtl,
   type SnapshotTtl,

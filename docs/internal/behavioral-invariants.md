@@ -828,9 +828,13 @@ type EventProjector interface {
 ### ViewProjector Behavior
 
 - Creates `ViewPutGroup` transactions
-- Nil aggregate or empty entity ID returns `nil, nil`
+- Nil aggregate or empty entity ID returns `nil, nil` (TypeScript `viewProjector`: an empty
+  entity ID projects `null`)
 - JSON marshal errors are propagated
-- View PK defaults to `string(entityID)`
+- The view key is `pk = {entityType}#{entityID}`, `sk = VIEW`
+- Go runs the projectors for a decision with no events too, so a `ViewProjector` aggregate's no-op
+  command fails with `ProjectorOnlyCommitError`. The TypeScript Store runs them only for a commit
+  with events, so the same command commits nothing
 
 ## Upcasting
 

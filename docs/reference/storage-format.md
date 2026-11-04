@@ -226,8 +226,8 @@ A commit is one `TransactWriteItems` call, at most 100 actions. The actions appe
    transaction groups come first, then those of the commit-wide projectors. A commit that
    carries projector operations must also write at least one event: views are projections of
    committed events, so operations with no backing event are refused with a typed error
-   (`ProjectorOnlyCommit` in Go, `ProjectorWithoutEvents` in Rust) before any write, on every
-   backend.
+   (`ProjectorOnlyCommit` in Go, `ProjectorWithoutEvents` in Rust, `ProjectorOnlyCommitError`
+   in TypeScript) before any write, on every backend.
 4. The written streams, in ascending entity-ID byte order. Each stream is one contiguous group,
    in this order:
    1. The head update, an `Update` of the stream's head item ([Stream heads](#stream-heads)).

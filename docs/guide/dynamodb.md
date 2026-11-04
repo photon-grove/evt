@@ -37,7 +37,8 @@ why. You tune the repository with chainable options:
 The TypeScript package's `DynamoRepository` (`@photon-grove/evt/dynamodb`) writes the same table.
 It takes the AWS SDK's low-level `DynamoDB` client, needs the same one-time initialization
 (`repository.initialize()`), and has `lazyInitialization`, `consistentRead` and `retention`
-options. It doesn't take a views table yet, so don't point it at entity types that have views.
+options. It writes the per-entity view row ([Entity-views table](#entity-views-table)), but not
+commit-wide views yet, so don't point it at entity types that have commit-wide projectors.
 
 ## Event-log table
 
@@ -245,6 +246,20 @@ rebuild-lock checks and before the written streams. A put carries all five attri
 `attribute_not_exists(pk)` and an `IfPresent` delete on `attribute_exists(pk)`. A failed condition
 is a `*evt.ProjectorOperationError`. The rules are in
 [commit-wide projectors](projections.md#commit-wide-projectors).
+
+The older per-entity view projector writes one row per entity: `pk = {entityType}#{entityId}`,
+`sk = VIEW`, and the state after the commit as its payload, put unconditionally in the commit's
+transaction right after the two control checks. In Go it's `dynamo.NewViewProjector(table)` in an
+aggregate's `Projectors()`. Commit-wide projectors supersede it, but a TypeScript writer of a type
+a Go service projects this way must write the row too, so the TypeScript package has
+`viewProjector(table)` for an aggregate's `projectors`:
+
+```ts
+const account = defineAggregate({
+  // type, events, state, initial, handle, apply
+  projectors: [viewProjector('views')],
+})
+```
 
 Views are a rebuildable cache, not a source of truth. The `viewcodec` package offers a typed JSON
 helper over `evt.ViewRepository` so projectors and readers share one codec. Use `viewcodec.New[T]`
