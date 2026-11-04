@@ -240,13 +240,14 @@ Error() → err.Error()  // Returns underlying error message
   initializing the same empty store let exactly one of them write (the loser re-reads the manifest
   its conditional write guards on and reports `false`), and the manifest version bumps once. It
   declares nothing but `stream-heads`
-- `*StoreNotInitializedError` (`evt.ErrStoreNotInitialized`; Rust `Error::StoreNotInitialized`)
-  refuses every write path of a DynamoDB writer to a store that does not declare `stream-heads`,
-  without scanning and without writing anything, so a DynamoDB writer never needs `dynamodb:Scan`.
-  It is not a conflict and not transient. A writer that opts into lazy initialization
-  (`WithLazyInitialization(true)`, Rust `with_lazy_initialization(true)`), and every PostgreSQL and
-  in-memory writer, initializes the store on its first write instead (and refuses a populated one
-  with `*StreamHeadsNotMigratedError`)
+- `*StoreNotInitializedError` (`evt.ErrStoreNotInitialized`; Rust `Error::StoreNotInitialized`;
+  TypeScript `StoreNotInitializedError`) refuses every write path of a DynamoDB writer to a store
+  that does not declare `stream-heads`, without scanning and without writing anything, so a
+  DynamoDB writer never needs `dynamodb:Scan`. It is not a conflict and not transient. A writer
+  that opts into lazy initialization (`WithLazyInitialization(true)`, Rust
+  `with_lazy_initialization(true)`, TypeScript `{lazyInitialization: true}`), and every PostgreSQL
+  and in-memory writer, initializes the store on its first write instead (and refuses a populated
+  one with `*StreamHeadsNotMigratedError`)
 
 ## Transaction System
 
@@ -986,8 +987,9 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   against `attribute_not_exists(pk)`), ordered first in the transaction. A writer validates the
   feature set once, at first write, and caches the version; a declaration bumps the version in the
   same conditional write that updates the feature set, so every writer cached at the old version
-  fails, re-validates, and retries (typed via `evt.ErrFeatureManifestChanged`, classified
-  transient); a re-validation that finds an unsupported pair refuses outright.
+  fails, re-validates, and retries (typed via `evt.ErrFeatureManifestChanged`, TypeScript
+  `FeatureManifestChangedError`, classified transient); a re-validation that finds an unsupported
+  pair refuses outright.
 - Enforcement is unconditional. Default repositories support no extensions;
   `WithFeatureMarker` customizes the supported set, never disables the check. PostgreSQL holds
   the shared feature advisory lock across validation and writes in the same transaction.

@@ -32,7 +32,11 @@ export interface Commit {
 
 /** Options every repository call takes. */
 export interface CallOptions {
-  /** Aborts the call. An abort before the call starts rejects with the signal's reason. */
+  /**
+   * Aborts the call. An abort before the call starts rejects with the signal's reason and writes
+   * nothing. An abort while a live backend's write is in flight rejects too, but the write may
+   * have been applied: load the stream again before deciding it wasn't.
+   */
   signal?: AbortSignal | undefined
 }
 
@@ -53,9 +57,9 @@ export interface CallOptions {
  * - refuse an entity ID in a reserved namespace on every write path, before any request;
  * - refuse every write (a commit, a snapshot write, compaction) to a store whose feature manifest
  *   declares a pair this package doesn't model, with an {@link UnsupportedFeatureError}, and to
- *   one that holds data but doesn't declare stream-heads, with a
- *   {@link StreamHeadsNotMigratedError}. A backend may declare stream-heads on a fresh store's
- *   first commit or snapshot write;
+ *   one that doesn't declare stream-heads: with a {@link StreamHeadsNotMigratedError} when it
+ *   holds data, and otherwise either by declaring stream-heads on the first commit or snapshot
+ *   write or with a {@link StoreNotInitializedError}, as the backend initializes;
  * - refuse a commit, but not a snapshot write or compaction, while a projection rebuild holds the
  *   store, with a {@link RebuildInProgressError}, after the manifest's refusals and before every
  *   stream's;
@@ -101,8 +105,9 @@ export interface Repository {
 
 /**
  * A repository whose store can be initialized explicitly: its feature manifest declares
- * stream-heads before any writer writes. A backend whose writers initialize a fresh store on
- * their first write needs it only where code treats every backend alike.
+ * stream-heads before any writer writes. A strict backend, such as DynamoDB by default, refuses
+ * every write until then. One whose writers initialize a fresh store on their first write, such
+ * as the in-memory one, needs it only where code treats every backend alike.
  */
 export interface StoreInitializer {
   /**

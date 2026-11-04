@@ -64,6 +64,14 @@ tasks:
       - '@group(sources)'
       - '@group(tests)'
       - '@group(compat)'
+  # The conformance suites against a local DynamoDB emulator at AWS_ENDPOINT_URL (Moto in CI),
+  # never real AWS. The run creates its own tables and deletes them.
+  integration:
+    command: node ../evt-compat/dist/dynamodb.js
+    deps:
+      - build-compat
+    options:
+      cache: false
   # The fixture runner on the other runtimes, against the same build. Bun and Deno come from
   # .prototools locally and from the pinned setup actions in CI.
   runtimes:

@@ -44,12 +44,21 @@
     },
     "./package.json": "./package.json"
   },
+  "peerDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-dynamodb": {
+      "optional": true
+    }
+  },
   "scripts": {
     "build": "tsc",
     "check": "tsc --noEmit && tsc -p tsconfig.test.json && oxlint --deny-warnings && node scripts/check-imports.ts",
     "test": "vitest run"
   },
   "devDependencies": {
+    "@aws-sdk/client-dynamodb": "3.1154.0",
     "@types/node": "^25.9.9",
     "oxlint": "1.88.0",
     "typescript": "^7.0.2",

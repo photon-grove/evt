@@ -182,10 +182,9 @@ export class Store {
   }
 
   /**
-   * Like {@link execute}, but loads and runs the command again after a retryable error (a
-   * conflict, or a rebuild holding the store), waiting {@link retryDelay} between attempts. When
-   * the attempts run out, the last error is thrown. A rejection or a duplicate is a result, never
-   * retried.
+   * Like {@link execute}, but loads and runs the command again after a retryable error (see
+   * {@link isRetryable}), waiting {@link retryDelay} between attempts. When the attempts run out,
+   * the last error is thrown. A rejection or a duplicate is a result, never retried.
    */
   async executeWithRetry<S, C, D extends EventDefinitions>(
     aggregate: Aggregate<S, C, D>,
