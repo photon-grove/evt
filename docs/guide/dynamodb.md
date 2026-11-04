@@ -36,8 +36,8 @@ why. You tune the repository with chainable options:
 
 The TypeScript package's `DynamoRepository` (`@photon-grove/evt/dynamodb`) writes the same table.
 It takes the AWS SDK's low-level `DynamoDB` client, needs the same one-time initialization
-(`repository.initialize()`), and has `lazyInitialization` and `consistentRead` options. It doesn't
-take retention or a views table yet, so don't point it at entity types that use either.
+(`repository.initialize()`), and has `lazyInitialization`, `consistentRead` and `retention`
+options. It doesn't take a views table yet, so don't point it at entity types that have views.
 
 ## Event-log table
 
@@ -198,6 +198,14 @@ a DynamoDB `ttl`:
 ```go
 repo := dynamo.NewRepository(client, eventsTable).
     WithRetention(dynamo.Retention{"scratch_job": 24 * time.Hour})
+```
+
+The TypeScript repository takes it in whole milliseconds, and stamps the same `ttl`s:
+
+```ts
+const repository = new DynamoRepository(client, eventsTable, {
+  retention: {scratch_job: 24 * 60 * 60 * 1000},
+})
 ```
 
 Only policed types get a `ttl`, and durable types never expire. A retained stream's head item

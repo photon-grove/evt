@@ -17,6 +17,7 @@ export {
   snapshotFromItem,
   snapshotItem,
   sortKey,
+  ttlFromItem,
   viewItem,
 } from './item.js'
 export {
@@ -36,4 +37,9 @@ export {
 } from './client.js'
 export {FEATURES_PK, REBUILD_LOCK_PK, manifestFromItem, markerItem} from './marker.js'
 export {DynamoRepository, type DynamoRepositoryOptions} from './repository.js'
-export {commitTransaction, snapshotTransaction} from './requests.js'
+export {
+  type CommitTtl,
+  type SnapshotTtl,
+  commitTransaction,
+  snapshotTransaction,
+} from './requests.js'
