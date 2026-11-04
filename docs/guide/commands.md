@@ -174,5 +174,6 @@ or an ambiguous write that never resolved) is retried the same way but returned 
 attempts run out.
 
 This means handlers and `Prepare` functions can run more than once, and they have to be safe to
-repeat. The store resets the aggregate between attempts from a deep copy of its exported fields. So
-keep the state `Apply` changes in exported fields, and don't mutate the command in a handler.
+repeat. The store resets the aggregate between attempts from a deep copy of its exported fields,
+including the ones an embedded struct promotes. So keep the state `Apply` changes in exported
+fields, and don't mutate the command in a handler.

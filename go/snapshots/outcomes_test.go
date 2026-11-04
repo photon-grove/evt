@@ -18,6 +18,7 @@ import (
 
 	evt "github.com/photon-grove/evt/go"
 	"github.com/photon-grove/evt/go/backends/mem"
+	"github.com/photon-grove/evt/go/policy"
 	"github.com/photon-grove/evt/go/snapshots"
 	etest "github.com/photon-grove/evt/go/test"
 )
@@ -509,4 +510,50 @@ func TestOutcomes_TheEngineChecksARejectionBeforeCanonicalizingIt(t *testing.T) 
 			require.Nil(t, stored, "nothing is written")
 		})
 	}
+}
+
+// lostOutcomePutRepository commits a result as another writer would, reports the commit's outcome
+// put as lost, and fails the read that follows it.
+type lostOutcomePutRepository struct {
+	evt.OutcomeRepository
+
+	reads int
+}
+
+func (r *lostOutcomePutRepository) Commit(ctx context.Context, result evt.SerializedResult) error {
+	if err := r.OutcomeRepository.Commit(ctx, result); err != nil {
+		return err
+	}
+
+	return &evt.OutcomeConflictError{CommandID: result.Outcome.CommandID}
+}
+
+func (r *lostOutcomePutRepository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.Outcome, error) {
+	r.reads++
+	if r.reads == 2 {
+		return nil, context.DeadlineExceeded
+	}
+
+	return r.OutcomeRepository.GetOutcome(ctx, id)
+}
+
+func TestOutcomes_AFailedReadAfterALostOutcomePutIsRetryable(t *testing.T) {
+	ctx := context.Background()
+
+	repo := &lostOutcomePutRepository{OutcomeRepository: memOutcomes(t)}
+	store := snapshots.NewStore(repo, 0).WithOutcomes().WithRetry(snapshots.RetryPolicy{MaxAttempts: 1})
+
+	_, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.True(t, policy.IsTransient(err), "the row exists, so the next attempt's pre-read answers it: %v", err)
+	require.NotErrorIs(t, err, evt.ErrOutcomeConflict, "a lost outcome put is never retried, so it must not be the cause")
+
+	// With the default policy the next attempt's pre-read finds the winner's row and replays it.
+	repo = &lostOutcomePutRepository{OutcomeRepository: memOutcomes(t)}
+	store = snapshots.NewStore(repo, 0).WithOutcomes()
+
+	outcome, err := store.ExecuteWithOutcome(ctx, etest.NewAggregate("e-1"), "e-1", createCommand(), commandMetadata("cmd-1"))
+	require.NoError(t, err)
+	require.True(t, outcome.Replayed)
+	require.Equal(t, 3, repo.reads, "the first pre-read, the failed reread, and the second attempt's pre-read")
 }
