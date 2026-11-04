@@ -20,8 +20,8 @@ use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
 use crate::outcome::{
-    CommandIdentity, CommandOutcome, Outcome, OutcomeConfig, Rejection, Settled, pre_check,
-    require_command_id, settle,
+    CommandIdentity, CommandOutcome, DigestInput, Outcome, OutcomeConfig, RecordedIdentity,
+    Rejection, Settled, pre_check, require_command_id, settle,
 };
 use crate::projection::{
     CommitProjector, CommitStream, CommitView, HistoryLedger, project_application, ready_projectors,
@@ -45,16 +45,46 @@ static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct PendingCommand {
     command_id: CommandId,
     digest: String,
+    /// The identity the outcome row records beside the digest.
+    identity: RecordedIdentity,
     metadata: Metadata,
 }
 
 impl PendingCommand {
+    /// Computes the digest of a validated command ID and digest input with the configured
+    /// digester, and the identity its outcome row records.
+    pub(crate) fn new(
+        config: &OutcomeConfig,
+        command_id: CommandId,
+        input: &DigestInput,
+        metadata: &Metadata,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            command_id,
+            digest: config.digest(input)?,
+            identity: RecordedIdentity::of(input),
+            metadata: metadata.clone(),
+        })
+    }
+
     pub(crate) fn command_id(&self) -> &CommandId {
         &self.command_id
     }
 
     pub(crate) fn digest(&self) -> &str {
         &self.digest
+    }
+
+    /// An accepted outcome of the command, its identity recorded.
+    pub(crate) fn accepted(&self) -> Outcome {
+        Outcome::accepted(self.command_id.clone(), self.digest.clone())
+            .with_identity(self.identity.clone())
+    }
+
+    /// A rejected outcome of the command, its identity recorded.
+    pub(crate) fn rejected(&self, rejection: Rejection) -> Outcome {
+        Outcome::rejected(self.command_id.clone(), self.digest.clone(), rejection)
+            .with_identity(self.identity.clone())
     }
 }
 
@@ -67,13 +97,13 @@ pub(crate) fn freeze_command(
 ) -> Result<PendingCommand, Error> {
     crate::outcome::check_targets(identity.targets())?;
     let command_id = require_command_id(metadata)?;
-    let digest = config.digest(&identity.digest_input(metadata))?;
 
-    Ok(PendingCommand {
+    PendingCommand::new(
+        config,
         command_id,
-        digest,
-        metadata: metadata.clone(),
-    })
+        &identity.digest_input(metadata),
+        metadata,
+    )
 }
 
 /// What a transaction's last failed [`read`](Transaction::read) looked like, so a retrying caller
@@ -768,7 +798,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
         let mut commit = self.prepare(&pending.metadata)?;
 
-        let mut outcome = Outcome::accepted(pending.command_id.clone(), pending.digest.clone());
+        let mut outcome = pending.accepted();
         if let Some(response) = response {
             outcome = outcome.with_response(response);
         }
@@ -800,7 +830,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         .await?
         {
             Settled::Committed => Ok(CommandOutcome::fresh(stored, committed, Vec::new())),
-            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
+            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(*outcome)),
         }
     }
 
@@ -891,11 +921,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         rejection: Rejection,
         mut commit: TransactionCommit<R::Operation>,
     ) -> Result<CommandOutcome, Error> {
-        commit.outcome = Some(Outcome::rejected(
-            pending.command_id.clone(),
-            pending.digest.clone(),
-            rejection.canonical()?,
-        ));
+        commit.outcome = Some(pending.rejected(rejection.canonical()?));
         let stored = commit
             .stored_outcome()
             .expect("the commit carries the outcome");
@@ -923,7 +949,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
         .await?
         {
             Settled::Committed => Ok(CommandOutcome::fresh(stored, committed, Vec::new())),
-            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
+            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(*outcome)),
         }
     }
 
@@ -954,8 +980,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
     async fn persist_stale_fence(&self, pending: &PendingCommand) -> Result<CommandOutcome, Error> {
         persist_rejection(
             self.repository,
-            &pending.command_id,
-            &pending.digest,
+            pending,
             self.recovery_wait(),
             Rejection::stale_fence(),
         )
@@ -1093,12 +1118,12 @@ impl<'a, R: Repository> Transaction<'a, R> {
 /// result resolve through the outcome row, like any outcome-carrying commit.
 pub(crate) async fn persist_rejection<R: Repository, E>(
     repository: &R,
-    command_id: &CommandId,
-    digest: &str,
+    pending: &PendingCommand,
     recovery_wait: Duration,
     rejection: Rejection,
 ) -> Result<CommandOutcome<E>, Error> {
-    let outcome = Outcome::rejected(command_id.clone(), digest, rejection.canonical()?);
+    let (command_id, digest) = (pending.command_id(), pending.digest());
+    let outcome = pending.rejected(rejection.canonical()?);
     let commit = TransactionCommit::new(Vec::new()).with_outcome(outcome);
     let stored = commit
         .stored_outcome()
@@ -1108,7 +1133,7 @@ pub(crate) async fn persist_rejection<R: Repository, E>(
 
     match settle(repository, command_id, digest, recovery_wait, result).await? {
         Settled::Committed => Ok(CommandOutcome::fresh(stored, Vec::new(), Vec::new())),
-        Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
+        Settled::Replayed(outcome) => Ok(CommandOutcome::replay(*outcome)),
     }
 }
 

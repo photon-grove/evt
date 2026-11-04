@@ -14,9 +14,10 @@ use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Aggregate, CommandIdentity, DigestInput, EntityId, EntityType, Error, EventId, EventSequence,
     EventType, EventVersion, FeatureManifest, FeatureMarker, MAX_COMMAND_ID_BYTES,
-    MAX_COMMIT_ITEM_BYTES, MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, Rejection,
-    RejectionCode, RetryPolicy, SerializedEvent, SerializedSnapshot, canonical_digest_bytes,
-    canonical_numbers, default_digest, json, snapshot_commit_size, snapshot_events_due,
+    MAX_COMMIT_ITEM_BYTES, MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, PrincipalId,
+    RecordedIdentity, Rejection, RejectionCode, RetryPolicy, SerializedEvent, SerializedSnapshot,
+    canonical_digest_bytes, canonical_numbers, default_digest, json, snapshot_commit_size,
+    snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -682,6 +683,15 @@ struct OutcomeInputVector {
     response: Option<String>,
     event_ids: Vec<String>,
     rejection: Option<String>,
+    identity: Option<IdentityVector>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityVector {
+    command_type: String,
+    targets: Vec<String>,
+    principal: Option<String>,
 }
 
 fn outcome_fixtures() -> OutcomeFixtures {
@@ -857,6 +867,11 @@ fn outcome_rows_match_go_byte_for_byte() {
             }
         }
         outcome.event_ids = input.event_ids.iter().map(EventId::new).collect();
+        outcome.identity = input.identity.map(|identity| RecordedIdentity {
+            command_type: identity.command_type,
+            targets: identity.targets.iter().map(EntityId::new).collect(),
+            principal: identity.principal.map(PrincipalId::new),
+        });
 
         // The DynamoDB item, byte for byte, and its budget size.
         let item = dynamo::outcome_item(&outcome).unwrap();
@@ -898,6 +913,9 @@ fn outcome_rows_match_go_byte_for_byte() {
             "events": row.events,
             "rejection": row.rejection,
             "code": row.code,
+            "command_type": row.command_type,
+            "targets": row.targets,
+            "principal": row.principal,
         });
         assert_eq!(pg, vector.postgres_row, "{name}: postgres row");
         assert_eq!(row.into_outcome().unwrap(), outcome, "{name}: decode row");

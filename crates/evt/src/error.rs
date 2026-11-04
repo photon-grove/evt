@@ -602,13 +602,15 @@ pub enum Error {
         length: usize,
     },
 
-    /// A stored response or an encoded rejection is over 65536 bytes. Returned before any write.
+    /// A stored response, an encoded rejection, or a recorded identity is over 65536 bytes.
+    /// Returned before any write.
     #[error(
         "outcome {what} is {size} bytes; the limit is {} bytes",
         crate::outcome::MAX_OUTCOME_BYTES
     )]
     OutcomeTooLarge {
-        /// The oversized value: `response` or `rejection`.
+        /// The oversized value: `response`, `rejection`, or `identity` (the recorded identity's
+        /// command type, targets, and principal together).
         what: &'static str,
         /// The value's size in bytes.
         size: usize,
@@ -623,6 +625,21 @@ pub enum Error {
         command_id: CommandId,
         /// The stored outcome the ID belongs to.
         prior_outcome: Box<crate::outcome::Outcome>,
+    },
+
+    /// An outcome lookup by command ID and principal
+    /// ([`Store::resolve_command_for_principal`](crate::Store::resolve_command_for_principal))
+    /// found a row that does not belong to the asking principal. `recorded` is `false` for a row
+    /// that records no identity (written before outcomes recorded it): the lookup fails closed.
+    /// It never carries the stored outcome, so a principal cannot read another's response. Not
+    /// retryable.
+    #[error("{}", principal_mismatch(.command_id, *.recorded))]
+    OutcomePrincipalMismatch {
+        /// The command ID looked up.
+        command_id: CommandId,
+        /// Whether the row records an identity (of another principal); `false` when it records
+        /// none.
+        recorded: bool,
     },
 
     /// A commit's outcome put lost its `attribute_not_exists(pk)` condition: another writer
@@ -663,6 +680,16 @@ pub enum Error {
     /// carries no outcome (whose result may be unknown but cannot be recovered).
     #[error(transparent)]
     Backend(BoxError),
+}
+
+fn principal_mismatch(command_id: &CommandId, recorded: bool) -> String {
+    if recorded {
+        return format!("the outcome of command {command_id} belongs to another principal");
+    }
+
+    format!(
+        "the outcome of command {command_id} records no identity, so it cannot be matched to a principal"
+    )
 }
 
 impl Error {

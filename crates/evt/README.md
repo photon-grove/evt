@@ -213,6 +213,14 @@ outcome for the same identity, `Error::IdempotencyKeyReuse` (carrying the stored
 ID was recorded for another payload, target or principal, and `Ok(None)` when there is no row,
 which doesn't prove the command never landed.
 
+Every outcome row also records the identity its digest came from (`Outcome::identity`, a
+`RecordedIdentity`: the command type, the sorted targets and the principal). A caller that holds
+only a command ID and the asking principal calls
+`Store::resolve_command_for_principal(&command_id, principal)` instead. It returns the stored
+outcome when the row's principal is the asking one (no principal matches no principal), `Ok(None)`
+when there is no row, and `Error::OutcomePrincipalMismatch` otherwise, never carrying the stored
+outcome. A row written before outcomes recorded their identity fails closed with `recorded: false`.
+
 `execute_with_outcome`, `execute_with_response` and `Store::execute_transaction` retry a command
 that conflicts with another writer, up to the store's `RetryPolicy` (`OutcomeConfig::with_retry`).
 The default is 5 attempts, 25 ms doubling to 1 s, jittered, waiting on `Repository::backoff`.

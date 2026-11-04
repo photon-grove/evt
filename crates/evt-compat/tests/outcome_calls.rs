@@ -296,6 +296,10 @@ async fn outcome_scenarios_store_the_rows_go_recorded_on_postgres() {
             row.rejection
                 .map(|rejection| serde_json::from_str::<Value>(&rejection).unwrap()),
             row.code,
+            row.command_type,
+            row.targets
+                .map(|targets| serde_json::from_str::<Value>(&targets).unwrap()),
+            row.principal,
         )
     };
 

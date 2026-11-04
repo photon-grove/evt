@@ -441,3 +441,49 @@ async fn go_and_rust_ddl_create_and_upgrade_in_either_order() {
         }
     }
 }
+
+/// An outcomes table created before outcomes recorded their identity gains the columns on the next
+/// `ensure_schema`: its rows read back with no identity, and new rows record theirs.
+#[tokio::test]
+async fn the_outcome_identity_columns_upgrade_an_existing_table() {
+    use photon_evt::wire::postgres::outcomes_table;
+    use photon_evt::{Outcome, PrincipalId, RecordedIdentity, TransactionCommit};
+
+    let (repo, events, _) = repository().await;
+    let outcomes = outcomes_table(&events);
+
+    // Back to the table's earlier shape, with a row written by an older writer.
+    repo.pool()
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "ALTER TABLE {outcomes} DROP COLUMN command_type, DROP COLUMN targets, DROP COLUMN principal;
+             INSERT INTO {outcomes} (command_id, status, digest) VALUES ('legacy', 'accepted', 'legacy-digest')"
+        ))
+        .await
+        .unwrap();
+
+    repo.ensure_schema().await.unwrap();
+    repo.ensure_schema()
+        .await
+        .expect("the upgrade is idempotent");
+
+    let legacy = repo.outcome(&"legacy".into()).await.unwrap().unwrap();
+    assert_eq!(legacy.identity, None, "an older row records no identity");
+
+    let identity = RecordedIdentity {
+        command_type: "account:open".into(),
+        targets: vec!["acct-1".into()],
+        principal: Some(PrincipalId::new("user:42")),
+    };
+    repo.commit_transaction(
+        TransactionCommit::new(Vec::new())
+            .with_outcome(Outcome::accepted("recorded", "d").with_identity(identity.clone())),
+    )
+    .await
+    .unwrap();
+
+    let recorded = repo.outcome(&"recorded".into()).await.unwrap().unwrap();
+    assert_eq!(recorded.identity, Some(identity));
+}

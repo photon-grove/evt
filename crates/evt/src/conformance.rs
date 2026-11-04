@@ -4583,6 +4583,10 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         Box::pin(rejection_events_caller_fence(repo)).await,
     );
 
+    for (name, result) in Box::pin(identity::identity_cases(repo)).await {
+        record(name, result);
+    }
+
     if !failures.is_empty() {
         panic!(
             "{} command-outcome case(s) failed:\n\n{}",
@@ -7677,6 +7681,7 @@ async fn rejection_events_caller_fence<R: Repository>(repo: &R) -> CaseResult {
 
 #[cfg(feature = "journal")]
 mod compaction;
+mod identity;
 #[cfg(feature = "journal")]
 mod journal;
 mod rebuild;

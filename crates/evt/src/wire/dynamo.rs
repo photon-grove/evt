@@ -50,7 +50,7 @@ use crate::features::{COMMAND_OUTCOME_PREFIX, FEATURES_ID, FEATURES_SORT_KEY, Fe
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::json;
 use crate::metadata::Metadata;
-use crate::outcome::{Outcome, OutcomeStatus, Rejection};
+use crate::outcome::{Outcome, OutcomeStatus, RecordedIdentity, Rejection};
 use crate::projection::ViewRow;
 use crate::rebuild::{
     REBUILD_GENERATION_ID, REBUILD_LOCK_ID, REBUILD_SORT_KEY, RebuildGeneration, RebuildLock,
@@ -470,8 +470,10 @@ pub fn outcome_key(command_id: &crate::ids::CommandId) -> String {
 
 /// Encodes a command outcome as its item (`pk = command-outcome#<id>`, `sk = 1`): `status`,
 /// `digest`, then `response` (padded base64) when there are response bytes, `events` (a JSON array
-/// of event IDs) when the commit wrote any, and `rejection` with `code` when rejected. This is
-/// the single source of the item's shape, shared by the writer and the commit budget.
+/// of event IDs) when the commit wrote any, `rejection` with `code` when rejected, and the
+/// recorded identity when the outcome has one: `commandType`, `targets` (a JSON array of stream
+/// IDs), and `principal` when the command had one. This is the single source of the item's shape,
+/// shared by the writer and the commit budget.
 pub fn outcome_item(outcome: &Outcome) -> Result<Item, Error> {
     let mut item = Item::new();
     item.insert("pk".into(), s(outcome_key(&outcome.command_id)));
@@ -497,6 +499,15 @@ pub fn outcome_item(outcome: &Outcome) -> Result<Item, Error> {
     if let Some(rejection) = &outcome.rejection {
         item.insert("rejection".into(), s(rejection.encode()?));
         item.insert("code".into(), s(rejection.code.as_str()));
+    }
+
+    if let Some(identity) = &outcome.identity {
+        item.insert("commandType".into(), s(identity.command_type.as_str()));
+        item.insert("targets".into(), s(identity.encode_targets()?));
+
+        if let Some(principal) = &identity.principal {
+            item.insert("principal".into(), s(principal.as_str()));
+        }
     }
 
     Ok(item)
@@ -552,6 +563,7 @@ pub fn outcome_from_item(item: &Item) -> Result<Outcome, Error> {
         response,
         event_ids,
         rejection,
+        identity: None,
     };
     outcome.validate_stored()?;
 
@@ -570,7 +582,17 @@ pub fn outcome_from_item(item: &Item) -> Result<Outcome, Error> {
         )));
     }
 
-    Ok(outcome)
+    let identity = RecordedIdentity::decode(
+        &outcome.command_id,
+        optional_string(item, "commandType")?,
+        optional_string(item, "targets")?,
+        optional_string(item, "principal")?,
+    )?;
+
+    Ok(Outcome {
+        identity,
+        ..outcome
+    })
 }
 
 /// Encodes a single-item view row: `pk = {entityType}#{entityId}`, `sk = "VIEW"`.
@@ -1209,6 +1231,25 @@ mod tests {
             outcome_from_item(&outcome_item(&noop).unwrap()).unwrap(),
             noop
         );
+
+        let identity = RecordedIdentity {
+            command_type: "t".into(),
+            targets: vec!["a".into(), "b".into()],
+            principal: Some("user:1".into()),
+        };
+        let recorded = Outcome::accepted("cmd-4", "d").with_identity(identity.clone());
+        let item = outcome_item(&recorded).unwrap();
+        assert_eq!(item.get("targets"), Some(&s(r#"["a","b"]"#)));
+        assert_eq!(outcome_from_item(&item).unwrap(), recorded);
+
+        // Without a principal, the attribute is absent.
+        let anonymous = Outcome::accepted("cmd-5", "d").with_identity(RecordedIdentity {
+            principal: None,
+            ..identity
+        });
+        let item = outcome_item(&anonymous).unwrap();
+        assert_eq!(item.get("principal"), None);
+        assert_eq!(outcome_from_item(&item).unwrap(), anonymous);
     }
 
     #[test]

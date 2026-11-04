@@ -9,7 +9,7 @@ use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::ids::{EntityId, EntityType, EventId, EventSequence, EventType, EventVersion};
 use crate::json;
 use crate::metadata::Metadata;
-use crate::outcome::{Outcome, OutcomeStatus, Rejection};
+use crate::outcome::{Outcome, OutcomeStatus, RecordedIdentity, Rejection};
 
 /// The default event table.
 pub const DEFAULT_EVENTS_TABLE: &str = "evt_events";
@@ -154,9 +154,17 @@ CREATE TABLE IF NOT EXISTS {outcomes} (
     rejection  jsonb,
     code       text,
     created_at timestamptz NOT NULL DEFAULT now(),
+    command_type text,
+    targets      jsonb,
+    principal    text,
     CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)
            OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))
 );
+
+ALTER TABLE {outcomes}
+    ADD COLUMN IF NOT EXISTS command_type text,
+    ADD COLUMN IF NOT EXISTS targets      jsonb,
+    ADD COLUMN IF NOT EXISTS principal    text;
 
 CREATE TABLE IF NOT EXISTS {features} (
     id                integer PRIMARY KEY,
@@ -415,19 +423,23 @@ pub fn check_table_names(events_table: &str, snapshots_table: &str) -> Result<()
 
 /// The `INSERT` of a command outcome (v0.9, C3). It runs last in the commit transaction; a unique
 /// violation (`23505`) on it means another writer recorded the outcome first. `$4` is the
-/// response bytes, `$5` the JSON array of event IDs, `$6` the rejection JSON, `$7` its code.
+/// response bytes, `$5` the JSON array of event IDs, `$6` the rejection JSON, `$7` its code, and
+/// `$8`, `$9`, `$10` the recorded identity's command type, targets JSON array, and principal.
 pub fn insert_outcome_sql(events_table: &str) -> String {
     format!(
-        "INSERT INTO {} (command_id, status, digest, response, events, rejection, code) \
-         VALUES ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, $7)",
+        "INSERT INTO {} (command_id, status, digest, response, events, rejection, code, \
+         command_type, targets, principal) \
+         VALUES ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, $7, $8, $9::text::jsonb, $10)",
         outcomes_table(events_table)
     )
 }
 
-/// The `SELECT` of a command outcome by ID (`$1`). `events` and `rejection` come back as JSON text.
+/// The `SELECT` of a command outcome by ID (`$1`). `events`, `rejection`, and `targets` come back
+/// as JSON text.
 pub fn select_outcome_sql(events_table: &str) -> String {
     format!(
-        "SELECT status, digest, response, events::text, rejection::text, code FROM {} WHERE command_id = $1",
+        "SELECT status, digest, response, events::text, rejection::text, code, command_type, \
+         targets::text, principal FROM {} WHERE command_id = $1",
         outcomes_table(events_table)
     )
 }
@@ -449,6 +461,13 @@ pub struct OutcomeRow {
     pub rejection: Option<String>,
     /// `code`; only when rejected.
     pub code: Option<String>,
+    /// `command_type`, the recorded identity's command type; `NULL` on a row that records none.
+    pub command_type: Option<String>,
+    /// `targets` (jsonb), as JSON text: the recorded identity's target stream IDs; `NULL` on a
+    /// row that records no identity.
+    pub targets: Option<String>,
+    /// `principal`, the recorded identity's principal; `NULL` when the command had none.
+    pub principal: Option<String>,
 }
 
 impl OutcomeRow {
@@ -472,6 +491,20 @@ impl OutcomeRow {
                 .rejection
                 .as_ref()
                 .map(|rejection| rejection.code.to_string()),
+            command_type: outcome
+                .identity
+                .as_ref()
+                .map(|identity| identity.command_type.clone()),
+            targets: outcome
+                .identity
+                .as_ref()
+                .map(RecordedIdentity::encode_targets)
+                .transpose()?,
+            principal: outcome
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.principal.as_ref())
+                .map(ToString::to_string),
         })
     }
 
@@ -493,6 +526,7 @@ impl OutcomeRow {
                 .as_deref()
                 .map(Rejection::decode)
                 .transpose()?,
+            identity: None,
         };
         outcome.validate_stored()?;
 
@@ -513,7 +547,18 @@ impl OutcomeRow {
             )));
         }
 
-        Ok(outcome)
+        // jsonb normalizes the targets text too; the decoded array is what counts.
+        let identity = RecordedIdentity::decode(
+            &outcome.command_id,
+            self.command_type.as_deref(),
+            self.targets.as_deref(),
+            self.principal.as_deref(),
+        )?;
+
+        Ok(Outcome {
+            identity,
+            ..outcome
+        })
     }
 }
 
@@ -651,6 +696,38 @@ mod tests {
             ..row
         };
         assert_eq!(respaced.into_outcome().unwrap(), rejected);
+
+        let recorded = Outcome::accepted("cmd-4", "d").with_identity(RecordedIdentity {
+            command_type: "t".into(),
+            targets: vec!["a".into(), "b".into()],
+            principal: None,
+        });
+        let row = OutcomeRow::from_outcome(&recorded).unwrap();
+        assert_eq!(
+            (
+                row.command_type.as_deref(),
+                row.targets.as_deref(),
+                row.principal.as_deref()
+            ),
+            (Some("t"), Some(r#"["a","b"]"#), None)
+        );
+        let respaced = OutcomeRow {
+            targets: Some(r#"["a", "b"]"#.into()),
+            ..row
+        };
+        assert_eq!(respaced.into_outcome().unwrap(), recorded);
+
+        // A row without the columns records no identity; one with a command type and no targets
+        // is corrupt.
+        assert_eq!(noop.clone().into_outcome().unwrap().identity, None);
+        let corrupt = OutcomeRow {
+            command_type: Some("t".into()),
+            ..noop
+        };
+        assert!(matches!(
+            corrupt.into_outcome(),
+            Err(Error::InvalidRecord(_))
+        ));
     }
 
     #[test]

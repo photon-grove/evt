@@ -10,6 +10,7 @@
 //! pieces here are:
 //!
 //! - [`Outcome`], the stored row, and [`CommandOutcome`], what an execution returns;
+//! - [`RecordedIdentity`], the command identity a row records beside its digest;
 //! - [`Rejection`], [`RejectionCode`], and [`ToRejection`], the persisted domain refusal;
 //! - [`DigestInput`], [`default_digest`], and [`OutcomeConfig`], the command identity digest;
 //! - [`CommandIdentity`] and [`OutcomeCommand`], how a command describes itself to the digest.
@@ -36,7 +37,8 @@ use crate::sha256::sha256_hex;
 /// is the 16-byte `command-outcome#` prefix plus the ID.
 pub const MAX_COMMAND_ID_BYTES: usize = 512;
 
-/// The largest stored response, and separately the largest encoded rejection, in bytes.
+/// The largest stored response, and separately the largest encoded rejection and the largest
+/// recorded identity, in bytes.
 pub const MAX_OUTCOME_BYTES: usize = 65536;
 
 /// The tag that pins the canonical identity encoding. A change to the encoding bumps it.
@@ -349,6 +351,104 @@ pub struct Outcome {
     pub event_ids: Vec<EventId>,
     /// The rejection, set exactly when the status is [`Rejected`](OutcomeStatus::Rejected).
     pub rejection: Option<Rejection>,
+    /// The identity the digest was computed from, as the row records it: `None` for a row written
+    /// before outcomes recorded their identity. It is descriptive; the digest stays the
+    /// idempotency key.
+    pub identity: Option<RecordedIdentity>,
+}
+
+/// The command identity an outcome row records beside its digest (storage spec, Recorded
+/// identity): the command type, the target streams deduplicated and sorted by byte order as the
+/// digest takes them, and the principal, `None` when the command had none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordedIdentity {
+    /// The command type, as the digest takes it. It may be empty.
+    pub command_type: String,
+    /// The target stream IDs, deduplicated and sorted by byte order.
+    pub targets: Vec<EntityId>,
+    /// The metadata's principal, `None` when the command had none.
+    pub principal: Option<PrincipalId>,
+}
+
+impl RecordedIdentity {
+    /// The identity an outcome records for a digest input. An empty principal is none.
+    pub fn of(input: &DigestInput) -> Self {
+        let mut targets = input.targets.clone();
+        targets.sort();
+        targets.dedup();
+
+        Self {
+            command_type: input.command_type.clone(),
+            targets,
+            principal: (!input.principal.is_empty())
+                .then(|| PrincipalId::new(input.principal.as_str())),
+        }
+    }
+
+    /// The stored JSON array of the target stream IDs, by the shared JSON rules: `[]` when there
+    /// are none.
+    pub fn encode_targets(&self) -> Result<String, Error> {
+        Ok(json::to_string(&self.targets)?)
+    }
+
+    /// The bytes the identity's fields take, as the bound counts them: the UTF-8 bytes of the
+    /// command type, the principal, and the encoded targets.
+    fn size(&self) -> Result<usize, Error> {
+        Ok(self.command_type.len()
+            + self.encode_targets()?.len()
+            + self
+                .principal
+                .as_ref()
+                .map_or(0, |principal| principal.as_str().len()))
+    }
+
+    /// Rebuilds an outcome row's recorded identity from its stored fields, each `None` when
+    /// absent. A row without a command type records no identity (`Ok(None)`), unless it has
+    /// targets or a principal. A command type without targets, or targets that are not a JSON
+    /// array of strings, is a corrupt row ([`Error::InvalidRecord`]).
+    pub fn decode(
+        command_id: &CommandId,
+        command_type: Option<&str>,
+        targets: Option<&str>,
+        principal: Option<&str>,
+    ) -> Result<Option<Self>, Error> {
+        let corrupt = |reason: String| {
+            Err(Error::InvalidRecord(format!(
+                "stored outcome for command {command_id} is corrupt: {reason}"
+            )))
+        };
+
+        let Some(command_type) = command_type else {
+            if targets.is_some() || principal.is_some() {
+                return corrupt(
+                    "the recorded identity has targets or a principal but no command type".into(),
+                );
+            }
+
+            return Ok(None);
+        };
+
+        let Some(targets) = targets else {
+            return corrupt("the recorded identity has a command type but no targets".into());
+        };
+
+        // As Go's decoder takes it: a `null` element is the empty string, a `null` array is no
+        // array at all.
+        let Ok(decoded) = serde_json::from_str::<Vec<Option<String>>>(targets) else {
+            return corrupt(format!(
+                "the recorded targets are not a JSON array of strings: {targets:?}"
+            ));
+        };
+
+        Ok(Some(Self {
+            command_type: command_type.to_owned(),
+            targets: decoded
+                .into_iter()
+                .map(|target| EntityId::new(target.unwrap_or_default()))
+                .collect(),
+            principal: principal.map(PrincipalId::new),
+        }))
+    }
 }
 
 impl Outcome {
@@ -410,6 +510,7 @@ impl Outcome {
             response: None,
             event_ids: Vec::new(),
             rejection: None,
+            identity: None,
         }
     }
 
@@ -426,7 +527,16 @@ impl Outcome {
             response: None,
             event_ids: Vec::new(),
             rejection: Some(rejection),
+            identity: None,
         }
+    }
+
+    /// Records the command identity with the outcome. The engine records
+    /// [`RecordedIdentity::of`] the command's digest input on every row it writes.
+    #[must_use]
+    pub fn with_identity(mut self, identity: RecordedIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Stores response bytes with the outcome. An empty response is stored as none.
@@ -1001,7 +1111,7 @@ pub(crate) fn require_command_id(metadata: &Metadata) -> Result<CommandId, Error
 }
 
 /// Validates an outcome before any write, in the order the spec pins: the command ID first, then
-/// the response bound, then the rejection bound.
+/// the response bound, then the rejection bound, then the recorded identity's bound.
 pub fn check_outcome(outcome: &Outcome) -> Result<(), Error> {
     check_command_id(&outcome.command_id)?;
 
@@ -1047,6 +1157,16 @@ pub fn check_outcome(outcome: &Outcome) -> Result<(), Error> {
         rejection.encode()?;
     }
 
+    if let Some(identity) = &outcome.identity {
+        let size = identity.size()?;
+        if size > MAX_OUTCOME_BYTES {
+            return Err(Error::OutcomeTooLarge {
+                what: "identity",
+                size,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -1067,7 +1187,7 @@ pub(crate) enum Settled {
     /// This call's commit applied.
     Committed,
     /// Another commit already recorded the outcome (a lost race or an applied ambiguous write).
-    Replayed(Outcome),
+    Replayed(Box<Outcome>),
 }
 
 /// What polling for an outcome row found.
@@ -1254,7 +1374,9 @@ pub(crate) async fn settle<R: Repository>(
         Ok(()) => Ok(Settled::Committed),
         Err(conflict @ Error::OutcomeConflict { .. }) => {
             match read_bounded(repository, command_id, window).await {
-                Some(Ok(Some(stored))) => Ok(Settled::Replayed(same_command(stored, digest)?)),
+                Some(Ok(Some(stored))) => {
+                    Ok(Settled::Replayed(Box::new(same_command(stored, digest)?)))
+                }
                 // The row that won the race is gone again; nothing can be said about the command.
                 Some(Ok(None)) => Err(conflict),
                 Some(Err(err)) => Err(err),
@@ -1275,7 +1397,9 @@ pub(crate) async fn settle<R: Repository>(
             .await;
 
             match polled {
-                Polled::Found(stored) => Ok(Settled::Replayed(same_command(*stored, digest)?)),
+                Polled::Found(stored) => {
+                    Ok(Settled::Replayed(Box::new(same_command(*stored, digest)?)))
+                }
                 Polled::Corrupt(err) => Err(err),
                 Polled::Absent | Polled::Unreadable(None) => Err(Error::AmbiguousWrite {
                     command_id: command_id.clone(),
@@ -1303,7 +1427,9 @@ pub(crate) async fn settle<R: Repository>(
             | Error::SequenceGap { .. }
             | Error::FenceConflict { .. }),
         ) => match read_bounded(repository, command_id, window).await {
-            Some(Ok(Some(stored))) => Ok(Settled::Replayed(same_command(stored, digest)?)),
+            Some(Ok(Some(stored))) => {
+                Ok(Settled::Replayed(Box::new(same_command(stored, digest)?)))
+            }
             // A malformed row is corruption, not a conflict to retry past.
             Some(Err(err @ Error::InvalidRecord(_))) => Err(err),
             _ => Err(conflict),
@@ -1553,6 +1679,82 @@ mod tests {
             canonical_digest_bytes(&input("t", &["a", "B"], "", "")),
             canonical_digest_bytes(&input("t", &["B", "a"], "", ""))
         );
+    }
+
+    #[test]
+    fn the_recorded_identity_takes_the_targets_as_the_digest_does() {
+        let identity = RecordedIdentity::of(&input("t", &["b", "a", "b"], "", ""));
+        assert_eq!(
+            identity,
+            RecordedIdentity {
+                command_type: "t".into(),
+                targets: vec!["a".into(), "b".into()],
+                principal: None,
+            }
+        );
+        assert_eq!(identity.encode_targets().unwrap(), r#"["a","b"]"#);
+
+        let none = RecordedIdentity::of(&input("", &[], "", "user:1"));
+        assert_eq!(none.encode_targets().unwrap(), "[]");
+        assert_eq!(none.principal, Some(PrincipalId::new("user:1")));
+    }
+
+    #[test]
+    fn a_recorded_identity_decodes_or_is_corrupt() {
+        let id = CommandId::new("cmd");
+        let decode = |command_type, targets, principal| {
+            RecordedIdentity::decode(&id, command_type, targets, principal)
+        };
+
+        assert_eq!(decode(None, None, None).unwrap(), None);
+        assert_eq!(
+            decode(Some("t"), Some(r#"["a"]"#), Some("p")).unwrap(),
+            Some(RecordedIdentity {
+                command_type: "t".into(),
+                targets: vec!["a".into()],
+                principal: Some("p".into()),
+            })
+        );
+
+        for (command_type, targets, principal) in [
+            (None, Some("[]"), None),
+            (None, None, Some("p")),
+            (Some("t"), None, None),
+            (Some("t"), Some("null"), None),
+            (Some("t"), Some(r#"{"a":1}"#), None),
+            (Some("t"), Some("[1]"), None),
+        ] {
+            assert!(
+                matches!(
+                    decode(command_type, targets, principal),
+                    Err(Error::InvalidRecord(_))
+                ),
+                "{command_type:?} {targets:?} {principal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recorded_identity_is_bounded() {
+        let at = |size: usize| {
+            // `["x..."]` is the target's length plus four bytes, beside the type and principal.
+            let identity = RecordedIdentity {
+                command_type: "t".into(),
+                targets: vec![EntityId::new("x".repeat(size - 1 - 4 - 1))],
+                principal: Some("p".into()),
+            };
+
+            check_outcome(&Outcome::accepted("cmd", "d").with_identity(identity))
+        };
+
+        assert!(at(MAX_OUTCOME_BYTES).is_ok());
+        assert!(matches!(
+            at(MAX_OUTCOME_BYTES + 1),
+            Err(Error::OutcomeTooLarge {
+                what: "identity",
+                size,
+            }) if size == MAX_OUTCOME_BYTES + 1
+        ));
     }
 
     #[test]

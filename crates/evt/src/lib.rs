@@ -99,9 +99,9 @@ pub use metadata::{Metadata, Origin, format_rfc3339, rfc3339_now};
 pub use numbers::canonical_numbers;
 pub use outcome::{
     CommandIdentity, CommandOutcome, DigestInput, Digester, MAX_COMMAND_ID_BYTES,
-    MAX_OUTCOME_BYTES, Outcome, OutcomeCommand, OutcomeConfig, OutcomeStatus, Rejection,
-    RejectionCode, ToRejection, canonical_digest_bytes, canonical_json, check_command_id,
-    check_outcome, decode_event_ids, default_digest, encode_event_ids,
+    MAX_OUTCOME_BYTES, Outcome, OutcomeCommand, OutcomeConfig, OutcomeStatus, RecordedIdentity,
+    Rejection, RejectionCode, ToRejection, canonical_digest_bytes, canonical_json,
+    check_command_id, check_outcome, decode_event_ids, default_digest, encode_event_ids,
 };
 pub use projection::{
     CommitProjector, CommitStream, CommitView, MAX_VIEW_PK_BYTES, MAX_VIEW_SK_BYTES, ProjectedView,
