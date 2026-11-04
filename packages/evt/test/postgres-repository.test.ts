@@ -123,6 +123,24 @@ describe('PgRepository', () => {
     expect(log).not.toContain('COMMIT')
   })
 
+  test('rejects a commit aborted while its COMMIT is in flight, with no rollback', async () => {
+    const controller = new AbortController()
+    const {client, log} = fake({
+      fail: (text) => {
+        if (text === 'COMMIT') {
+          controller.abort(new Error('stop'))
+        }
+      },
+    })
+    const commit = new PgRepository(client).commit(
+      {entityId: 'a', events: [event(1)]},
+      {signal: controller.signal},
+    )
+
+    await expect(commit).rejects.toThrow('stop')
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
   test.each(['40001', '40P01'])('reports SQLSTATE %s as transient', async (code) => {
     const {client, log} = fake({
       fail: (text) =>
@@ -167,7 +185,7 @@ describe('PgRepository', () => {
     await expect(commit).rejects.toMatchObject({code: 'invalidArgument'})
   })
 
-  test('runs one operation at a time on a client without connect(), across repositories', async () => {
+  test('runs one operation at a time on a connection, across repositories', async () => {
     const {client, log} = fake({pooled: false, delay: 1})
     const repo = new PgRepository(client)
     const other = new PgRepository(client, {eventsTable: 'other_events'})

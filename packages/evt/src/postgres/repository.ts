@@ -652,13 +652,12 @@ async function inTransaction<T>(
     return rowsOf(await connection.query(statement, values))
   }
 
+  let result: T
   try {
     await connection.query('START TRANSACTION ISOLATION LEVEL READ COMMITTED')
-    const result = await work(run)
+    result = await work(run)
     signal?.throwIfAborted()
     await connection.query('COMMIT')
-
-    return result
   } catch (error) {
     try {
       await connection.query('ROLLBACK')
@@ -668,6 +667,12 @@ async function inTransaction<T>(
 
     throw transient(error)
   }
+
+  // An abort while the COMMIT was in flight rejects too, though the commit may have applied, as
+  // CallOptions promises: there is nothing left to roll back.
+  signal?.throwIfAborted()
+
+  return result
 }
 
 // A driver error PostgreSQL raised for a rollback a retry may not hit again, as a TransientError.
