@@ -522,6 +522,43 @@ func TestCommit_ExpiredResidualOfARetainedStreamHeals(t *testing.T) {
 	require.True(t, evt.IsOptimisticConflict(err))
 }
 
+// A snapshot without a ttl (written before retention was configured) never expires, so a retained
+// stream whose head item and events TTL deleted around it is drift, not a conflict that never heals.
+func TestCommit_ATTLLessSnapshotKeepsAnExpiredResidualDrift(t *testing.T) {
+	ctx := context.Background()
+	fake := compat.NewFakeDynamo()
+	now := time.Unix(1_791_763_200, 0)
+	retention := dynamo.Retention{"scratch": time.Hour}
+
+	repo := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithRetention(retention).WithClock(func() time.Time { return now })
+	require.NoError(t, repo.Commit(ctx, evt.SerializedResult{Events: headEvents("ttl-less", 1, 2, "scratch")}))
+
+	plain := dynamo.NewRepository(fake, "events").WithLazyInitialization(true)
+	require.NoError(t, plain.PutSnapshot(ctx, "scratch", "ttl-less", []byte(`{}`), 1, 2))
+
+	_, err := fake.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{{
+		Delete: &types.Delete{
+			TableName: aws.String("events"),
+			Key: map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: "ttl-less"},
+				"sk": &types.AttributeValueMemberN{Value: "-1"},
+			},
+		},
+	}}})
+	require.NoError(t, err)
+
+	// The events have expired, but the snapshot never will.
+	expired := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithRetention(retention).
+		WithClock(func() time.Time { return now.Add(3 * time.Hour) })
+
+	err = expired.Commit(ctx, evt.SerializedResult{Events: headEvents("ttl-less", 1, 1, "scratch")})
+
+	var drift *evt.StreamHeadDriftError
+	require.ErrorAs(t, err, &drift)
+	require.True(t, drift.HeadAbsent)
+	require.False(t, policy.IsTransient(err))
+}
+
 // interleavingClient runs a callback after the failure-path probe derived a stream's head and
 // before it reads the head item, as a commit landing between the two reads.
 type interleavingClient struct {

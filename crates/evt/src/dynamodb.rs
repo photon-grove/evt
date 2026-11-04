@@ -1135,7 +1135,9 @@ impl DynamoRepository {
             .consistent_read(true)
             .key("pk", s(entity_id.as_str()))
             .key("sk", n(wire::SNAPSHOT_SORT_KEY))
-            .projection_expression("#ttl")
+            // The key is projected too: an item lacking every projected attribute reads back
+            // empty, which would make a snapshot without a `ttl` look absent, so expired.
+            .projection_expression("sk, #ttl")
             .expression_attribute_names("#ttl", "ttl")
             .send()
             .await

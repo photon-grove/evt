@@ -182,10 +182,12 @@ func (repo *Repository) remainingItemsExpired(ctx context.Context, entityID evt.
 		return ok && int64(ttl) <= now
 	}
 
+	// The key is projected too: an item lacking every projected attribute reads back as an empty
+	// map, which would make a snapshot without a ttl look absent, so expired.
 	snapshot, err := repo.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:            &repo.EventsTable,
 		ConsistentRead:       aws.Bool(true),
-		ProjectionExpression: aws.String("#ttl"),
+		ProjectionExpression: aws.String("sk, #ttl"),
 		ExpressionAttributeNames: map[string]string{
 			"#ttl": "ttl",
 		},

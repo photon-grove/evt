@@ -2390,8 +2390,9 @@ as a `stale-fence` rejection. It is raised when:
 - The stream's head update passed and an event put failed (the cancellation reasons show the head
   update as passing): an event exists above the head. For an entity type with retention this goes
   through the retention-aware probe first, because TTL can delete the head before an expired event:
-  the engine reads the stream's remaining items (the snapshot and a `sk > 0` query projecting `sk`
-  and `ttl`), and if every one has a `ttl` in the past the failure is a transient conflict that
+  the engine reads the stream's remaining items (the snapshot and a `sk > 0` query, each projecting
+  `sk` and `ttl`: the key keeps a snapshot without a `ttl` from reading back empty, as if absent),
+  and if every one has a `ttl` in the past the failure is a transient conflict that
   heals when TTL deletes them. Otherwise it is drift. A type without retention is drift at once.
 - The probe finds drift.
 - An out-of-band snapshot write finds the snapshot ahead of the head, or no head item (it reports
