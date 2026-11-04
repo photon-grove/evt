@@ -376,8 +376,10 @@ error before any write and is never split.
 - A lost outcome put is never a generic optimistic-concurrency conflict and is never resolved by
   re-preparing the command: it is `OutcomeConflict`, and it outranks every other failed item in the
   commit's classification, so the engine resolves it by re-reading the row. A re-read that fails
-  is retryable (in Go a transient error unless the failure is classified permanent), so the next
-  attempt's outcome pre-read answers the command. An ordinary conflict
+  is retryable where it can be, so the next attempt's outcome pre-read answers the command: Go
+  makes any failure not classified permanent transient, and Rust makes a re-read that stalls past
+  the recovery window `Error::Transient` (a backend's `Transient` stays retryable, a definitive
+  `Backend` error is returned). An ordinary conflict
   of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
   returns the winner's outcome
 - Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
