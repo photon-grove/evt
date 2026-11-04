@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/photon-grove/evt/compare/go/v0.11.1...go/v0.12.0) (2026-11-04)
+
+
+### Features
+
+* **ts:** join the DynamoDB cross-language run as a stand-in writer ([#278](https://github.com/photon-grove/evt/issues/278)) ([f1f3090](https://github.com/photon-grove/evt/commit/f1f3090842556119efd10a825c18cc0bbd1d7258))
+
+
+### Performance Improvements
+
+* **dynamo:** read a retained stream's remaining items once per failed event put ([#274](https://github.com/photon-grove/evt/issues/274)) ([81b729e](https://github.com/photon-grove/evt/commit/81b729e1af7d06800a271d116813d707bb12ea14)), closes [#273](https://github.com/photon-grove/evt/issues/273)
+
 ## [0.11.1](https://github.com/photon-grove/evt/compare/go/v0.11.0...go/v0.11.1) (2026-11-04)
 
 

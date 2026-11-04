@@ -7,7 +7,10 @@ Accepted (2026-10-18). Tracking: matrix row C12 in
 [#159](https://github.com/photon-grove/evt/issues/159). The core commit path is implemented in Go
 and Rust, and the migration tool (`evt-doctor migrate-heads`, Go only; see the
 [runbook](../guide/migrating-to-stream-heads.md)) is implemented; the real-DynamoDB billing measurement
-(`go/backends/dynamo/awsmeasure_test.go`, run by a human) is still to be run. The normative text is the
+(`go/backends/dynamo/awsmeasure_test.go`, run by a human) is still to be run ([#283](https://github.com/photon-grove/evt/issues/283)). Of
+the scenarios listed under Migration and compatibility, `stream-heads-compaction` is covered by the
+existing `compaction-handoff` scenario and `stream-heads-migration` stays in the Go live suites,
+because the migration tool is Go only. The normative text is the
 [Stream Heads](../reference/storage-format.md#stream-heads) section of the storage spec, and the
 sections of the spec that describe commits, fences, and failures follow it.
 
@@ -724,8 +727,8 @@ them:
    running after the declaration leaves stale heads, and `migrate-heads --repair` fixes them.
 2. **Condition-check billing: unconfirmed.** The WCU numbers assume a `ConditionCheck` bills by the
    size of the item it reads. They stay marked as unconfirmed until measured on real DynamoDB with
-   `ReturnConsumedCapacity`; that measurement is on the
-   [#159](https://github.com/photon-grove/evt/issues/159) checklist. `go/backends/dynamo/awsmeasure_test.go` is the
+   `ReturnConsumedCapacity`; that measurement is tracked in
+   [#283](https://github.com/photon-grove/evt/issues/283). `go/backends/dynamo/awsmeasure_test.go` is the
    script for it (behind the `awsmeasure` build tag; a human runs it with AWS credentials that can
    create a scratch table, and pastes its table here). The action-count result stands either way.
 3. **Retention: decided.** The head item carries `ttl` for retained types and fences stay refused

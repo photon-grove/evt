@@ -81,6 +81,7 @@ pub(crate) fn freeze_command(
 /// `Clone`, so the variant and the message stand in for the error's identity: a step that returns
 /// the read's error unchanged (with `?`) matches.
 struct ReadFailure {
+    entity_id: EntityId,
     variant: std::mem::Discriminant<Error>,
     message: String,
 }
@@ -418,27 +419,32 @@ impl<'a, R: Repository> Transaction<'a, R> {
         self.check_open()?;
         self.check_unread(&entity_id)?;
 
-        let loaded =
-            match load_with_catch_up::<A, R>(self.repository, entity_id, self.catch_up_threshold)
-                .await
-            {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    self.read_failure = Some(ReadFailure {
-                        variant: std::mem::discriminant(&error),
-                        message: error.to_string(),
-                    });
+        let loaded = match load_with_catch_up::<A, R>(
+            self.repository,
+            entity_id.clone(),
+            self.catch_up_threshold,
+        )
+        .await
+        {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.read_failure = Some(ReadFailure {
+                    entity_id,
+                    variant: std::mem::discriminant(&error),
+                    message: error.to_string(),
+                });
 
-                    return Err(error);
-                }
-            };
+                return Err(error);
+            }
+        };
 
         self.read_loaded(loaded)
     }
 
     /// Reports whether `error` is the error of this transaction's last failed
-    /// [`read`](Transaction::read), passed on unchanged. Fence-aware retry retries only such an
-    /// error from a prepare step: one the step made up itself is its own failure.
+    /// [`read`](Transaction::read), passed on unchanged, and that stream has not been read
+    /// successfully since. Fence-aware retry retries only such an error from a prepare step: one
+    /// the step made up itself, or one returned after it recovered the stream, is its own failure.
     pub(crate) fn is_read_failure(&self, error: &Error) -> bool {
         self.read_failure.as_ref().is_some_and(|failure| {
             failure.variant == std::mem::discriminant(error) && failure.message == error.to_string()
@@ -452,6 +458,16 @@ impl<'a, R: Repository> Transaction<'a, R> {
     ) -> Result<Read<A, R::Operation>, Error> {
         self.check_open()?;
         self.check_unread(loaded.entity_id())?;
+
+        // The stream is read now, so an earlier failure to read it is over: a step that recovered
+        // from it and then fails with the same text fails on its own account.
+        if self
+            .read_failure
+            .as_ref()
+            .is_some_and(|failure| &failure.entity_id == loaded.entity_id())
+        {
+            self.read_failure = None;
+        }
 
         self.streams.push(StreamState {
             entity_id: loaded.entity_id.clone(),
@@ -737,7 +753,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
     /// Failures resolve as the storage spec pins:
     ///
     /// - a lost outcome put resolves through the winner's row (the stored outcome, or
-    ///   [`Error::IdempotencyKeyReuse`]);
+    ///   [`Error::IdempotencyKeyReuse`]), or is a retryable [`Error::Transient`] when the row
+    ///   cannot be read within the recovery window;
     /// - an indeterminate commit failure is recovered by re-reading the row, never by re-running
     ///   the command ([`Error::AmbiguousWrite`] when it did not apply or cannot be told);
     /// - a failed **caller-stamped** fence persists a `stale-fence` rejection instead of

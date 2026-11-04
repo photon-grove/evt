@@ -686,7 +686,8 @@ impl Error {
     }
 
     /// Reports whether reloading and running the command again may succeed: a conflict, a
-    /// transient backend failure, an ambiguous write that provably did not apply, or a transient
+    /// transient backend failure, an ambiguous write the recovery window did not settle (safe to
+    /// run again with the same command ID, whose outcome row answers it if it landed), or a transient
     /// rebuild-fence refusal (a commit refused during a rebuild, a lost
     /// [`begin_rebuild`](crate::RebuildFence::begin_rebuild) race, an unavailable or changed
     /// reader epoch).
