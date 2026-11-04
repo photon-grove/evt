@@ -2705,11 +2705,12 @@ stored items gain the head item, and each PostgreSQL stream a heads row recorded
 `stream-heads-drift`, with the `putSnapshot` and `appendRawBypassingHead` ops). It also touched
 `go/internal/compat/fakedynamo.go` (an `Update` action and the new condition strings), the in-memory
 backends, both conformance suites, `docs/internal/behavioral-invariants.md`, `docs/guide/dynamodb.md`, and
-`docs/guide/streams.md`. The migration scenarios (`stream-heads-migration`, `stream-heads-compaction`)
-are not in the shared scenarios yet. The migration is Go only, and a shared fixture table cannot be
-re-declared mid-run, so the Go live suites exercise it on both backends instead (v0.8-layout
-stores, resume, verify, repair, the declare re-verify, and head-aware writers afterwards). The
-cross-language scenarios stay on the [#159](https://github.com/photon-grove/evt/issues/159) fixtures item.
+`docs/guide/streams.md`. Two of the ADR's scenarios are not separate shared scenarios.
+`stream-heads-compaction` is covered by `compaction-handoff`, in which each language compacts the
+other's stream while both keep writing, and whose fixture pins the head item after the run.
+`stream-heads-migration` cannot be shared: the migration is Go only, and a shared fixture table
+cannot be re-declared mid-run. The Go live suites exercise it on both backends instead (v0.8-layout
+stores, resume, verify, repair, the declare re-verify, and head-aware writers afterwards).
 
 ## Journal
 
@@ -3983,9 +3984,10 @@ These differences are deliberate and covered by tests. Keep them documented here
 The head item changed the recorded action order of `multi-stream` and `read-fences` (the
 fixtures regenerate from the Go implementation) and added two scenarios, `stream-heads-snapshot-guard`
 and `stream-heads-drift`. The harness grew the ops they need: `putSnapshot` (an out-of-band snapshot
-write) and `appendRawBypassingHead` (an event appended with no head update). The remaining ADR 0007
-scenarios (`stream-heads-migration`, `stream-heads-compaction`) are not in the shared scenarios: the
-migration tool is Go only and covered by the Go live suites. See
+write) and `appendRawBypassingHead` (an event appended with no head update). Of the remaining ADR
+0007 scenarios, `compaction-handoff` covers `stream-heads-compaction` (its fixture pins the head
+item after cross-language compaction), and `stream-heads-migration` is not shared: the migration
+tool is Go only and covered by the Go live suites. See
 [ADR 0007](../adr/0007-per-stream-head-item.md#migration-and-compatibility).
 
 The v0.9 core reshape extends `compat/scenarios.json` with the interleaved Go/Rust
