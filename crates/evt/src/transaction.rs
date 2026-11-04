@@ -751,8 +751,10 @@ impl<'a, R: Repository> Transaction<'a, R> {
         response: Option<Vec<u8>>,
     ) -> Result<CommandOutcome, Error> {
         // A command that would be accepted on a stream the client saw at another head is refused
-        // as stale, through the same fenced, outcome-only commit as a domain rejection.
+        // as stale, through the same fenced, outcome-only commit as a domain rejection. The
+        // command's own checks come first, in the order `reject` makes them.
         if !self.expected.is_empty() {
+            self.check_recordable()?;
             let stale = self.stale_versions()?;
             if !stale.is_empty() {
                 let rejection = self.outcomes.as_ref().map_or_else(
@@ -934,6 +936,38 @@ impl<'a, R: Repository> Transaction<'a, R> {
             .map_or(Duration::ZERO, OutcomeConfig::recovery_wait)
     }
 
+    /// Makes the checks [`take_command`](Transaction::take_command) and [`reject`](Transaction::reject)
+    /// make before recording an outcome, without taking the command: outcomes enabled, the
+    /// command begun, the transaction not poisoned, and no pre-v0.9 duplicate of the command ID.
+    fn check_recordable(&self) -> Result<(), Error> {
+        self.check_open()?;
+        if self.outcomes.is_none() {
+            return Err(Error::InvalidConfig(
+                "command outcomes are not enabled; call with_outcomes".into(),
+            ));
+        }
+
+        let Some(pending) = &self.command else {
+            return Err(Error::InvalidArgument(
+                "begin_command must be called before the transaction records an outcome".into(),
+            ));
+        };
+
+        if self.poisoned {
+            return Err(Error::TransactionPoisoned);
+        }
+
+        if self
+            .streams
+            .iter()
+            .any(|stream| stream.seen_command_ids.contains(&pending.command_id))
+        {
+            return Err(Error::DuplicateCommand(pending.command_id.clone()));
+        }
+
+        Ok(())
+    }
+
     fn take_command(&mut self) -> Result<PendingCommand, Error> {
         self.check_open()?;
         if self.outcomes.is_none() {
@@ -962,8 +996,11 @@ impl<'a, R: Repository> Transaction<'a, R> {
     /// expectations against its own load, so an acceptance never commits once an expected stream
     /// has moved.
     ///
-    /// Expecting one stream at two different heads is [`Error::InvalidArgument`], and so is
-    /// accepting a command that expects a stream the transaction never read.
+    /// It needs command outcomes ([`Transaction::with_outcomes`] or [`Store::with_outcomes`](crate::Store::with_outcomes)):
+    /// without them it is [`Error::InvalidArgument`], as a recorded rejection is the only way it
+    /// can refuse. Expecting a negative head or one stream at two different heads is
+    /// [`Error::InvalidArgument`] too, and so is accepting a command that expects a stream the
+    /// transaction never read.
     pub fn expect(
         &mut self,
         entity_id: impl Into<EntityId>,
@@ -971,6 +1008,14 @@ impl<'a, R: Repository> Transaction<'a, R> {
     ) -> Result<&mut Self, Error> {
         self.check_open()?;
         let entity_id = entity_id.into();
+
+        if self.outcomes.is_none() {
+            return Err(Error::InvalidArgument(
+                "client-expected versions are recorded as command outcomes; enable with_outcomes \
+                 and begin the command with begin_command"
+                    .into(),
+            ));
+        }
 
         if head.get() < 0 {
             return Err(Error::InvalidArgument(format!(

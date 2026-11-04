@@ -487,8 +487,10 @@ error before any write and is never split.
 - A client-expected head (Go `Transaction.Expect`, Rust `Transaction::expect`) is checked only on
   acceptance, before any write: a mismatch records the stale-version rejection (details
   `{"streams":[{"actual","entityId","expected"}]}` sorted by entity ID) through the fenced
-  rejection commit instead of the acceptance, a domain rejection never consults it, and an
-  expectation for an unread stream is an invalid argument that records nothing. Every attempt
+  rejection commit instead of the acceptance, a domain rejection never consults it, and accepting
+  with an expectation for an unread stream is an invalid argument that records nothing.
+  Declaring one needs outcomes in both languages (Rust never ignores it on a plain transaction),
+  and an empty replacement code keeps the engine's default in both Every attempt
   re-checks against its own load, so an acceptance never commits after an expected stream moved.
   Expectations are not part of the identity digest
 - Exhausted attempts on a conflict persist a `stale-fence` rejection (message `the state this

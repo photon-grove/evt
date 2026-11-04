@@ -4534,30 +4534,11 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         "exhausted retries persist a stale-fence rejection that replays identically",
         Box::pin(retry_exhausted(repo)).await,
     );
-    record(
-        "a matching client-expected head commits",
-        Box::pin(expected_head_matches(repo)).await,
-    );
-    record(
-        "a stale client-expected head records the stale-version rejection",
-        Box::pin(expected_head_stale(repo)).await,
-    );
-    record(
-        "a domain rejection wins over a stale client-expected head",
-        Box::pin(expected_head_domain_rejection_wins(repo)).await,
-    );
-    record(
-        "an expectation on a stream the command never read is refused",
-        Box::pin(expected_head_unread(repo)).await,
-    );
-    record(
-        "the engine's stale rejection codes are configurable",
-        Box::pin(stale_codes_configurable(repo)).await,
-    );
-    record(
-        "an expected stream that moves during the commit ends in stale-version",
-        Box::pin(expected_head_moves_during_commit(repo)).await,
-    );
+    // Client-expected versions run in a function of their own, so this one's future (and its
+    // poll frame in debug builds) stays within a test thread's stack.
+    for (name, result) in Box::pin(expected_version_cases(repo)).await {
+        record(name, result);
+    }
     record(
         "a write set that changes between attempts is still one command identity",
         Box::pin(retry_write_set_changes(repo)).await,
@@ -6340,6 +6321,60 @@ impl StampedCommand<'_> {
     }
 }
 
+/// The client-expected version cases (Go `Transaction.Expect`, Rust
+/// [`Transaction::expect`](crate::Transaction::expect)) and
+/// the configurable stale codes, as part of [`outcome_cases`].
+async fn expected_version_cases<R: Repository>(repo: &R) -> Vec<(&'static str, CaseResult)> {
+    let mut results = Vec::new();
+
+    results.push((
+        "a matching client-expected head commits",
+        Box::pin(expected_head_matches(repo)).await,
+    ));
+    results.push((
+        "a stale client-expected head records the stale-version rejection",
+        Box::pin(expected_head_stale(repo)).await,
+    ));
+    results.push((
+        "a domain rejection wins over a stale client-expected head",
+        Box::pin(expected_head_domain_rejection_wins(repo)).await,
+    ));
+    results.push((
+        "an expectation on a stream the command never read is refused",
+        Box::pin(expected_head_unread(repo)).await,
+    ));
+    results.push((
+        "the engine's stale rejection codes are configurable",
+        Box::pin(stale_codes_configurable(repo)).await,
+    ));
+    results.push((
+        "an expected stream that moves during the commit ends in stale-version",
+        Box::pin(expected_head_moves_during_commit(repo)).await,
+    ));
+    results.push((
+        "every stale expected stream is listed, sorted by ID",
+        Box::pin(expected_heads_listed_sorted(repo)).await,
+    ));
+    results.push((
+        "a rejection with events ignores client-expected heads",
+        Box::pin(expected_head_reject_with_events(repo)).await,
+    ));
+    results.push((
+        "a begun command records stale-version from commit_with_outcome",
+        Box::pin(expected_head_manual_flow(repo)).await,
+    ));
+    results.push((
+        "expect validates its head and needs outcomes",
+        Box::pin(expect_validation(repo)).await,
+    ));
+    results.push((
+        "exhausted retries take the replaced stale-fence code",
+        Box::pin(exhausted_retries_take_the_stale_fence_code(repo)).await,
+    ));
+
+    results
+}
+
 /// A command that expects `watched` at a client-supplied head, reads it, and deposits into
 /// `target`, or refuses with `reject`.
 struct ExpectingCommand<'a> {
@@ -6612,6 +6647,246 @@ async fn expected_head_moves_during_commit<R: Repository>(repo: &R) -> CaseResul
     ensure!(
         repo.events(&target).await?.is_empty(),
         "the acceptance never committed"
+    );
+
+    Ok(())
+}
+
+async fn expected_heads_listed_sorted<R: Repository>(repo: &R) -> CaseResult {
+    let base = ledger_id();
+    // `…-b` sorts after `…-a`; the command expects them in the other order.
+    let (first, second, target) = (
+        EntityId::new(format!("{base}-b")),
+        EntityId::new(format!("{base}-a")),
+        ledger_id(),
+    );
+    seed(repo, &first, 5).await?;
+    seed(repo, &second, 5).await?;
+    seed(repo, &second, 5).await?;
+
+    let identity = CommandIdentity::new("ledger:copy").with_targets([
+        first.clone(),
+        second.clone(),
+        target.clone(),
+    ]);
+    let outcome = outcome_store(repo)
+        .execute_transaction(&identity, &command_metadata(&command_id()), |tx| {
+            let (first, second, target) = (first.clone(), second.clone(), target.clone());
+
+            Box::pin(async move {
+                for (id, head) in [(&first, 0), (&second, 1)] {
+                    tx.expect(id.clone(), EventSequence(head))?;
+                    tx.read::<Ledger>(id).await?;
+                }
+                let mut ledger = tx.read::<Ledger>(&target).await?;
+                tx.append(&mut ledger, added(1))?;
+
+                Ok(Decision::accept())
+            })
+        })
+        .await?;
+
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::stale_version(&[
+            StaleVersion {
+                entity_id: second.clone(),
+                expected: EventSequence(1),
+                actual: EventSequence(2),
+            },
+            StaleVersion {
+                entity_id: first.clone(),
+                expected: EventSequence(0),
+                actual: EventSequence(1),
+            },
+        ])),
+        "every stale stream, sorted by ID"
+    );
+
+    Ok(())
+}
+
+async fn expected_head_reject_with_events<R: Repository>(repo: &R) -> CaseResult {
+    let (watched, target) = (ledger_id(), ledger_id());
+    seed(repo, &watched, 5).await?;
+    seed(repo, &watched, 5).await?;
+
+    let refused = Rejection::new("apply-failed", "the base is stale");
+    let identity =
+        CommandIdentity::new("ledger:apply").with_targets([watched.clone(), target.clone()]);
+    let outcome = outcome_store(repo)
+        .execute_transaction(&identity, &command_metadata(&command_id()), |tx| {
+            let (watched, target, refused) = (watched.clone(), target.clone(), refused.clone());
+
+            Box::pin(async move {
+                tx.expect(watched.clone(), EventSequence(1))?;
+                tx.read::<Ledger>(&watched).await?;
+                let mut ledger = tx.read::<Ledger>(&target).await?;
+                tx.append(&mut ledger, added(1))?;
+
+                Ok(Decision::reject_with_events(refused))
+            })
+        })
+        .await?;
+
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(refused),
+        "the domain rejection"
+    );
+    ensure_eq!(
+        repo.events(&target).await?.len(),
+        1,
+        "its events committed, whatever the client expected"
+    );
+
+    Ok(())
+}
+
+async fn expected_head_manual_flow<R: Repository>(repo: &R) -> CaseResult {
+    let (watched, target) = (ledger_id(), ledger_id());
+    seed(repo, &watched, 5).await?;
+    seed(repo, &watched, 5).await?;
+
+    let store = outcome_store(repo);
+    let identity =
+        CommandIdentity::new("ledger:copy").with_targets([watched.clone(), target.clone()]);
+    let mut tx = store.transaction();
+    match tx
+        .begin_command(&identity, &command_metadata(&command_id()))
+        .await?
+    {
+        Begin::Proceed => {}
+        Begin::Replayed(replayed) => {
+            return Err(Failure(format!("a fresh command replayed: {replayed:?}")));
+        }
+    }
+
+    tx.read::<Ledger>(&watched).await?;
+    tx.expect(watched.clone(), EventSequence(1))?; // after the read
+    let mut ledger = tx.read::<Ledger>(&target).await?;
+    tx.append(&mut ledger, added(1))?;
+    let outcome = tx.commit_with_outcome(Some(b"ok".to_vec())).await?;
+
+    ensure!(outcome.is_rejected(), "a stale expectation: {outcome:?}");
+    ensure_eq!(
+        outcome.rejection().map(|rejection| rejection.code.clone()),
+        Some(RejectionCode::STALE_VERSION),
+        "the stale-version code"
+    );
+    ensure!(
+        outcome.response().is_none(),
+        "the acceptance's response is not stored"
+    );
+    ensure!(repo.events(&target).await?.is_empty(), "nothing committed");
+
+    Ok(())
+}
+
+async fn expect_validation<R: Repository>(repo: &R) -> CaseResult {
+    let watched = ledger_id();
+    let store = outcome_store(repo);
+    let mut tx = store.transaction();
+
+    ensure!(
+        matches!(
+            tx.expect(watched.clone(), EventSequence(-1)),
+            Err(Error::InvalidArgument(_))
+        ),
+        "a negative head"
+    );
+    tx.expect(watched.clone(), EventSequence(2))?;
+    tx.expect(watched.clone(), EventSequence(2))?; // the same head again is fine
+    ensure!(
+        matches!(
+            tx.expect(watched.clone(), EventSequence(3)),
+            Err(Error::InvalidArgument(_))
+        ),
+        "one stream at two heads"
+    );
+
+    let plain = Store::<Ledger, _>::new(repo, ());
+    ensure!(
+        matches!(
+            plain
+                .transaction()
+                .expect(watched.clone(), EventSequence(0)),
+            Err(Error::InvalidArgument(_))
+        ),
+        "a store without outcomes refuses expect rather than ignoring it"
+    );
+
+    // An empty replacement code keeps the default.
+    let (stale, target) = (ledger_id(), ledger_id());
+    seed(repo, &stale, 5).await?;
+    let store = Store::<Ledger, _>::new(repo, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(
+            outcome_config()
+                .with_stale_version_code(RejectionCode::new(""))
+                .with_stale_fence_code(RejectionCode::new("")),
+        );
+    let outcome = ExpectingCommand::new(&stale, &target, 3)
+        .run(&store, &command_id())
+        .await?;
+    ensure_eq!(
+        outcome.rejection().map(|rejection| rejection.code.clone()),
+        Some(RejectionCode::STALE_VERSION),
+        "an empty code keeps the default"
+    );
+
+    Ok(())
+}
+
+async fn exhausted_retries_take_the_stale_fence_code<R: Repository>(repo: &R) -> CaseResult {
+    let legacy = RejectionCode::new("legacy-stale");
+    let config = || {
+        outcome_config()
+            .with_retry(RetryPolicy::new(2))
+            .with_stale_fence_code(legacy.clone())
+    };
+
+    // A transaction whose watched stream moves before every commit.
+    let (watched, target) = (ledger_id(), ledger_id());
+    seed(repo, &watched, 1).await?;
+    let meddling = Meddling::new(repo, &watched, Trigger::Events, u32::MAX);
+    let store = Store::<Ledger, _>::new(&meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config());
+    let identity = CommandIdentity::new("ledger:copy").with_targets([target.clone()]);
+    let outcome = store
+        .execute_transaction(&identity, &command_metadata(&command_id()), |tx| {
+            let (watched, target) = (watched.clone(), target.clone());
+
+            Box::pin(async move {
+                tx.read::<Ledger>(&watched).await?;
+                let mut ledger = tx.read::<Ledger>(&target).await?;
+                tx.append(&mut ledger, added(1))?;
+
+                Ok(Decision::accept())
+            })
+        })
+        .await?;
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::retries_exhausted(2).with_code(legacy.clone())),
+        "a transaction's exhausted retries"
+    );
+
+    // A single-aggregate command whose own stream moves before every commit.
+    let single = ledger_id();
+    seed(repo, &single, 1).await?;
+    let meddling = Meddling::new(repo, &single, Trigger::Events, u32::MAX);
+    let store = Store::<Ledger, _>::new(&meddling, ())
+        .with_snapshot_interval(0)
+        .with_outcomes(config());
+    let outcome = store
+        .execute_with_outcome(&single, Add(2), command_metadata(&command_id()))
+        .await?;
+    ensure_eq!(
+        outcome.rejection().cloned(),
+        Some(Rejection::retries_exhausted(2).with_code(legacy)),
+        "a single-aggregate command's exhausted retries"
     );
 
     Ok(())

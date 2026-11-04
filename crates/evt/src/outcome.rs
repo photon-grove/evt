@@ -853,20 +853,24 @@ impl OutcomeConfig {
     /// Replaces the code of the stale-fence rejections the engine records, a failed
     /// caller-stamped fence and exhausted retries, which is
     /// [`STALE_FENCE`](RejectionCode::STALE_FENCE) by default. Use it to keep an application's
-    /// existing wire code; the message and details are unchanged.
+    /// existing wire code; the message and details are unchanged. An empty code keeps the default.
     #[must_use]
     pub fn with_stale_fence_code(mut self, code: RejectionCode) -> Self {
-        self.stale_fence_code = code;
+        if !code.as_str().is_empty() {
+            self.stale_fence_code = code;
+        }
         self
     }
 
     /// Replaces the code of the stale-version rejection the engine records when a client-expected
     /// head went stale ([`Transaction::expect`](crate::Transaction::expect)), which is
     /// [`STALE_VERSION`](RejectionCode::STALE_VERSION) by default. The message and details are
-    /// unchanged.
+    /// unchanged. An empty code keeps the default.
     #[must_use]
     pub fn with_stale_version_code(mut self, code: RejectionCode) -> Self {
-        self.stale_version_code = code;
+        if !code.as_str().is_empty() {
+            self.stale_version_code = code;
+        }
         self
     }
 

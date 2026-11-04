@@ -1556,10 +1556,13 @@ stream the transaction reads before or after the call. The rules, the same in bo
   it, so a domain rejection such as `not-found` or `taken` always wins over a stale version.
 - If any expected stream's loaded head differs from the expectation, the command records the
   stale-version rejection instead of committing its events. It is committed like a plain domain
-  rejection, with the fences of every stream the transaction read, so a conflict on it re-prepares
-  the command like any other conflict.
-- An expectation for a stream the transaction never read, a negative head, or one stream expected
-  at two different heads is an invalid argument, returned before any write. Nothing is recorded.
+  rejection, with the fences of every stream the transaction read, so under Go
+  `ExecuteTransaction` / Rust `execute_transaction` a conflict on it re-prepares the command like
+  any other conflict (a hand-driven `BeginCommand` / `begin_command` returns the conflict instead).
+- Declaring an expectation needs a store with outcomes, a non-negative head, and one head per
+  stream; otherwise the call is an invalid argument. Accepting a command that expects a stream the
+  transaction never read is an invalid argument too, returned before any write, and nothing is
+  recorded. A rejection never checks expectations, so it records as usual.
 - There is no separate attempt budget. Every attempt checks the expectations against its own
   load, and the engine fence pins an accepted commit to the head it loaded, so an acceptance never
   commits once an expected stream has moved: the next attempt decides stale (or rejects). A

@@ -20,6 +20,10 @@ func testExpectedVersions(t *testing.T, repo evt.OutcomeRepository) {
 	t.Run("DomainRejectionWins", func(t *testing.T) { testExpectedHeadDomainRejectionWins(t, repo) })
 	t.Run("UnreadStreamIsRefused", func(t *testing.T) { testExpectedHeadUnread(t, repo) })
 	t.Run("StaleCodesAreConfigurable", func(t *testing.T) { testStaleCodesConfigurable(t, repo) })
+	t.Run("EveryStaleStreamIsListedSorted", func(t *testing.T) { testExpectedHeadsListedSorted(t, repo) })
+	t.Run("RejectionWithEventsIgnoresExpectations", func(t *testing.T) { testExpectedHeadRejectWithEvents(t, repo) })
+	t.Run("ManualCommandFlow", func(t *testing.T) { testExpectedHeadManualFlow(t, repo) })
+	t.Run("ExpectValidation", func(t *testing.T) { testExpectValidation(t, repo) })
 }
 
 // expectingCopy reads the watched stream, expects it at head, and appends a deposit to the target.
@@ -195,6 +199,21 @@ func testStaleCodesConfigurable(t *testing.T, repo evt.OutcomeRepository) {
 	require.True(t, outcome.Rejected())
 	require.Equal(t, evt.RejectionCode("legacy-stale"), outcome.Rejection.Code)
 	require.Equal(t, evt.CallerFenceStaleRejection().Message, outcome.Rejection.Message)
+
+	// Exhausted retries record the stale-fence rejection under the replaced code too: the watched
+	// stream moves before every commit.
+	store.WithRetry(snapshots.ImmediateRetryPolicy(2))
+	env.interfere(false, hasEvents, func() { env.deposit(t, watched, 1) })
+	defer func() { env.faulty.Intercept = nil }()
+
+	var copies int
+
+	outcome, err = store.ExecuteTransaction(ctx, identity, withCommand(env.commandID("exhausted")),
+		readThenCopy(watched, target, &copies, new([]int)))
+	require.NoError(t, err)
+	require.Equal(t, evt.RejectionCode("legacy-stale"), outcome.Rejection.Code)
+	require.Equal(t, evt.RetriesExhaustedRejection(2).Message, outcome.Rejection.Message)
+	require.Equal(t, 2, copies)
 }
 
 // testExpectedHeadMovesDuringCommit moves the expected stream after the first attempt loaded it:
@@ -221,4 +240,127 @@ func testExpectedHeadMovesDuringCommit(t *testing.T, repo evt.OutcomeRepository)
 	require.Equal(t, encodedRejection(t, want), encodedRejection(t, *outcome.Rejection))
 	require.Equal(t, 2, calls, "the fence conflict re-prepared once, and the second attempt decided stale")
 	require.Empty(t, env.events(t, target), "the acceptance never committed")
+}
+
+func testExpectedHeadsListedSorted(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newRetryEnv(t, repo, 3)
+
+	// b sorts after a; the command expects them in the other order.
+	first, second, target := evt.EntityID(env.ns+"-b"), evt.EntityID(env.ns+"-a"), evt.EntityID(env.ns+"-target")
+	env.deposit(t, first, 5)
+	env.deposit(t, second, 5)
+	env.deposit(t, second, 5)
+
+	prepare := func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+		for _, expected := range []struct {
+			id   evt.EntityID
+			head evt.EventSequence
+		}{{first, 0}, {second, 1}} {
+			if err := tx.Expect(expected.id, expected.head); err != nil {
+				return nil, err
+			}
+
+			if err := tx.Read(ctx, newLedger(expected.id), expected.id); err != nil {
+				return nil, err
+			}
+		}
+
+		if err := tx.Read(ctx, newLedger(target), target); err != nil {
+			return nil, err
+		}
+
+		return nil, tx.Append(target, &ledgerEvent{Kind: "deposited", Amount: 1})
+	}
+
+	identity := evt.CommandIdentity{Type: "ledger:copy", Targets: []evt.EntityID{first, second, target}}
+	outcome, err := env.store.ExecuteTransaction(ctx, identity, withCommand(env.commandID("both")), prepare)
+	require.NoError(t, err)
+
+	want := evt.StaleVersionRejection([]evt.StaleVersion{
+		{EntityID: second, Expected: 1, Actual: 2},
+		{EntityID: first, Expected: 0, Actual: 1},
+	})
+	require.Equal(t, encodedRejection(t, want), encodedRejection(t, *outcome.Rejection), "every stale stream, sorted by ID")
+}
+
+func testExpectedHeadRejectWithEvents(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newRetryEnv(t, repo, 3)
+
+	watched, target := evt.EntityID(env.ns+"-watched"), evt.EntityID(env.ns+"-target")
+	env.deposit(t, watched, 5)
+	env.deposit(t, watched, 5)
+
+	refused := &domainRejection{evt.Rejection{Code: "apply-failed", Message: "the base is stale"}}
+
+	prepare := func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+		if err := tx.Expect(watched, 1); err != nil {
+			return nil, err
+		}
+
+		if err := tx.Read(ctx, newLedger(watched), watched); err != nil {
+			return nil, err
+		}
+
+		if err := tx.Read(ctx, newLedger(target), target); err != nil {
+			return nil, err
+		}
+
+		if err := tx.Append(target, &ledgerEvent{Kind: "flagged"}); err != nil {
+			return nil, err
+		}
+
+		return nil, evt.RejectWithEvents(refused)
+	}
+
+	identity := evt.CommandIdentity{Type: "ledger:apply", Targets: []evt.EntityID{watched, target}}
+	outcome, err := env.store.ExecuteTransaction(ctx, identity, withCommand(env.commandID("flagged")), prepare)
+	require.NoError(t, err)
+	require.Equal(t, encodedRejection(t, refused.rejection), encodedRejection(t, *outcome.Rejection))
+	require.Len(t, env.events(t, target), 1, "the rejection's events committed, whatever the client expected")
+}
+
+func testExpectedHeadManualFlow(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newRetryEnv(t, repo, 3)
+
+	watched, target := evt.EntityID(env.ns+"-watched"), evt.EntityID(env.ns+"-target")
+	env.deposit(t, watched, 5)
+	env.deposit(t, watched, 5)
+
+	identity := evt.CommandIdentity{Type: "ledger:copy", Targets: []evt.EntityID{watched, target}}
+	tx, replayed, err := env.store.BeginCommand(ctx, identity, withCommand(env.commandID("manual")))
+	require.NoError(t, err)
+	require.Nil(t, replayed)
+
+	require.NoError(t, tx.Read(ctx, newLedger(watched), watched))
+	require.NoError(t, tx.Expect(watched, 1), "Expect may follow the read")
+	require.NoError(t, tx.Read(ctx, newLedger(target), target))
+	require.NoError(t, tx.Append(target, &ledgerEvent{Kind: "deposited", Amount: 1}))
+
+	outcome, err := tx.Complete(ctx, []byte(`{"ok":true}`))
+	require.NoError(t, err)
+	require.True(t, outcome.Rejected())
+	require.Equal(t, evt.RejectionStaleVersion, outcome.Rejection.Code)
+	require.Empty(t, outcome.Response, "the acceptance's response is not stored")
+	require.Empty(t, env.events(t, target))
+}
+
+func testExpectValidation(t *testing.T, repo evt.OutcomeRepository) {
+	ctx := context.Background()
+	env := newRetryEnv(t, repo, 3)
+	watched := evt.EntityID(env.ns + "-watched")
+
+	identity := evt.CommandIdentity{Type: "ledger:copy", Targets: []evt.EntityID{watched}}
+	tx, _, err := env.store.BeginCommand(ctx, identity, withCommand(env.commandID("validate")))
+	require.NoError(t, err)
+
+	require.ErrorIs(t, tx.Expect(watched, -1), evt.ErrInvalidArgument, "a negative head")
+	require.NoError(t, tx.Expect(watched, 2))
+	require.NoError(t, tx.Expect(watched, 2), "the same head again is fine")
+	require.ErrorIs(t, tx.Expect(watched, 3), evt.ErrInvalidArgument, "one stream at two heads")
+
+	plain := snapshots.NewStore(repo, 0).Transaction()
+	require.ErrorIs(t, plain.Expect(watched, 0), evt.ErrInvalidArgument, "a store without outcomes")
 }
