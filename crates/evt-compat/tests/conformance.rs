@@ -1144,6 +1144,43 @@ async fn dynamo_retained_stream_heads(repository: &DynamoRepository) {
         );
     }
 
+    // A snapshot without a ttl (written before retention was configured) never expires: with the
+    // head item gone and the events expired around it, the residue is drift, not a conflict that
+    // would never heal.
+    let ttl_less = EntityId::new(format!("retained-{nanos}-ttl-less"));
+    handle(3600, long_ago)
+        .commit(commit(&ttl_less, 1..=2))
+        .await
+        .unwrap();
+    assert!(
+        DynamoRepository::new(client.clone(), table)
+            .with_lazy_initialization(true)
+            .put_snapshot(&SerializedSnapshot {
+                entity_type: entity_type.as_str().into(),
+                entity_id: ttl_less.clone(),
+                sequence: EventSequence(1),
+                event_sequence: EventSequence(2),
+                payload: b"{}".to_vec(),
+            })
+            .await
+            .unwrap()
+    );
+    HeadFixtures::<DynamoRepository>::delete_head(&heads, &ttl_less)
+        .await
+        .unwrap();
+    let result = live.commit(commit(&ttl_less, 1..=1)).await;
+    assert!(
+        matches!(
+            &result,
+            Err(Error::StreamHeadDrift {
+                stored: None,
+                derived: EventSequence(2),
+                ..
+            })
+        ),
+        "a create over an expired residue with a ttl-less snapshot is drift: {result:?}"
+    );
+
     // A head above the derived head: TTL deleted the tail events the head counted. For a type
     // with retention that is the expired-tail transient, a conflict that heals, whether or not
     // the items that remain have expired.
