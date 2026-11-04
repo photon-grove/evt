@@ -53,8 +53,8 @@ GetEventID(entityID, sequence) → "{entityID}:{sequence}"
   snapshot's `eventSeq`). No event or snapshot query, `latest(n)`, or compaction range returns it,
   and every scan, enumeration, heads read, and stream consumer skips `sk < 1`
 - `ttl` is written **only** for entity types covered by a `Repository` retention policy
-  (`WithRetention`); every other row omits the attribute entirely (`json:"ttl,omitempty"`) and is
-  never auto-expired. It is a no-op unless the table has DynamoDB TTL enabled on the `ttl` attribute.
+  (`WithRetention`; Rust `with_retention`, TypeScript `retention`); every other row omits the
+  attribute entirely (`json:"ttl,omitempty"`) and is never auto-expired. It is a no-op unless the table has DynamoDB TTL enabled on the `ttl` attribute.
   Policy a type **only** when its events are transient and no projection rebuild replays them —
   otherwise DynamoDB would silently delete history a wipe-and-replay depends on.
 - Each event is stamped `committedAt + duration`, and DynamoDB TTL expires items individually, so

@@ -12,14 +12,17 @@ import {
   eventId,
 } from '@photon-grove/evt'
 import {
+  type CommitTtl,
   type Item,
   type TransactItem,
   commitTransaction,
+  expiry,
   manifestFromItem,
   markerItem,
   snapshotTransaction,
 } from '@photon-grove/evt/dynamodb'
 
+import {milliseconds} from './codec.js'
 import {type Checks, canonical, field, int, list, loadFixture, num, plain, str} from './harness.js'
 
 export async function markerVectors(checks: Checks): Promise<void> {
@@ -60,14 +63,17 @@ export async function markerVectors(checks: Checks): Promise<void> {
 }
 
 // The streamHeads vectors this package's writers produce so far: single-stream commits and
-// snapshot writes without retention. Multi-stream commits with fences wait for transactions, and
-// the retained forms for retention.
+// snapshot writes, with and without retention. Multi-stream commits with fences wait for
+// transactions.
 const HEAD_VECTORS = new Set([
   'create',
   'append',
   'create-with-snapshot',
   'append-with-later-snapshot',
+  'retained-create',
+  'retained-append',
   'put-snapshot',
+  'put-snapshot-retained',
   'put-snapshot-empty-stream',
 ])
 
@@ -99,7 +105,9 @@ export async function headVectors(checks: Checks): Promise<void> {
           eventSequence: int(field(put, 'eventSequence')),
           payload: encoder.encode('{}'),
         }
-        const got = snapshotTransaction(HEAD_TABLE, snapshot, 1n).map(normalize)
+        const ttl = vectorTtl(request, snapshot.entityType)
+        const guarded = ttl === undefined ? undefined : {ttl, refresh: true}
+        const got = snapshotTransaction(HEAD_TABLE, snapshot, 1n, guarded).map(normalize)
         checks.equal(name, canonical(got), want)
 
         return
@@ -111,10 +119,44 @@ export async function headVectors(checks: Checks): Promise<void> {
       }
 
       // The vectors' sizes are the commit budget's, which packages/evt's tests check.
-      const got = commitTransaction(HEAD_TABLE, headCommit(stream), 1n).map(normalize)
+      const commit = headCommit(stream)
+      const ttl = commitTtl(request, commit)
+      const got = commitTransaction(HEAD_TABLE, commit, 1n, ttl).map(normalize)
       checks.equal(name, canonical(got), want)
     })
   }
+}
+
+// The `ttl` an item of the entity type gets from the vector's clock and retention, if it has one.
+function vectorTtl(request: JsonValue, entityType: string): number | undefined {
+  const retention = request instanceof Map ? request.get('retentionNanos') : undefined
+  const nanos = retention instanceof Map ? retention.get(entityType) : undefined
+  if (nanos === undefined) {
+    return undefined
+  }
+
+  const clockMs = milliseconds(int(field(request, 'clockUnixNano')))
+
+  return expiry(clockMs, milliseconds(int(nanos)))
+}
+
+// A retained commit's `ttl`s. An append's head covers the `ttl` the writer loaded, which the
+// vector seeds on the stream's head item.
+function commitTtl(request: JsonValue, commit: Commit): CommitTtl | undefined {
+  const ttl = vectorTtl(request, commit.events[0]!.entityType)
+  if (ttl === undefined) {
+    return undefined
+  }
+  if (commit.events[0]!.sequence <= 1n) {
+    return {items: ttl, head: ttl}
+  }
+
+  const seeded = request instanceof Map ? request.get('seeded') : undefined
+  const loaded = (seeded === undefined ? [] : list(seeded))
+    .filter((stream) => str(field(stream, 'entityId')) === commit.entityId)
+    .map((stream) => num(field(stream, 'ttl')))
+
+  return {items: ttl, head: Math.max(ttl, ...loaded)}
 }
 
 function headCommit(stream: JsonValue): Commit {

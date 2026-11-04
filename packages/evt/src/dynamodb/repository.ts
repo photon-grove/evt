@@ -2,7 +2,8 @@
 // sequence, 0 for the inline snapshot and -1 for the head item), as the storage format lays it
 // out. Every commit is one TransactWriteItems call that opens with the feature-marker and
 // rebuild-lock checks, and a failed one is classified by its cancellation reasons, then by reading
-// the stream, the way the Go and Rust repositories classify it.
+// the stream, the way the Go and Rust repositories classify it. Entity types with retention carry a
+// `ttl` on every item, and the head item's is never lowered (storage format, "Retention").
 //
 // Pages, retries and the probe's reads each depend on the call before them, so they await in loops
 // on purpose.
@@ -46,12 +47,20 @@ import {
   HEAD_SORT_KEY,
   type Item,
   eventFromItem,
+  expiry,
   headFromItem,
   snapshotFromItem,
   sortKey,
+  ttlFromItem,
 } from './item.js'
 import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
-import {commitTransaction, controlKey, headKey, snapshotTransaction} from './requests.js'
+import {
+  type CommitTtl,
+  commitTransaction,
+  controlKey,
+  headKey,
+  snapshotTransaction,
+} from './requests.js'
 
 /** How a {@link DynamoRepository} reads and initializes its store. */
 export interface DynamoRepositoryOptions {
@@ -67,6 +76,20 @@ export interface DynamoRepositoryOptions {
    * failure-path probe, compaction and the feature marker always read consistently.
    */
   consistentRead?: boolean
+  /**
+   * How long the items of each entity type live, in whole milliseconds, keyed by entity type.
+   * Every event, snapshot and head item of a type with a positive retention carries a DynamoDB
+   * `ttl`, the write time plus the retention in Unix seconds, for the table's TTL to delete. A
+   * type that isn't listed, or has 0, is kept forever. TTL deletes items in no order, so retain
+   * only short-lived streams that nothing replays. Declare the retained types in the store's
+   * feature manifest too, from Go or Rust, so that their writers refuse read fences on them.
+   */
+  retention?: Readonly<Record<string, number>> | ReadonlyMap<string, number>
+  /**
+   * The clock that stamps `ttl`s and decides which have passed, in Unix milliseconds as
+   * `Date.now` gives them, never seconds. `Date.now` by default.
+   */
+  clock?: () => number
 }
 
 // A declaration is a read-modify-write; racing declarations retry this many times.
@@ -80,6 +103,12 @@ const LATEST_PAGE_SIZE = 100
 
 // The most deletes in one compaction transaction, beside its marker check.
 const COMPACTION_BATCH_SIZE = 99
+
+// How many streams' loaded `ttl`s a repository remembers before it forgets them all.
+const MAX_TTL_FLOORS = 4096
+
+// How often a snapshot write sends its head guard again after another writer moved the head.
+const MAX_SNAPSHOT_GUARD_RETRIES = 4
 
 /**
  * A {@link Repository} on a DynamoDB event-log table, through the AWS SDK's low-level `DynamoDB`
@@ -95,6 +124,11 @@ export class DynamoRepository implements Repository, StoreInitializer {
   readonly #table: string
   readonly #lazy: boolean
   readonly #consistentRead: boolean
+  readonly #retention: ReadonlyMap<string, number>
+  readonly #clock: () => number
+
+  // The largest `ttl` this repository loaded for each stream, which a commit's head `ttl` covers.
+  readonly #ttlFloors = new Map<string, number>()
 
   // The manifest version this writer validated, or null until it validates.
   #validated: bigint | null = null
@@ -106,6 +140,8 @@ export class DynamoRepository implements Repository, StoreInitializer {
     this.#table = eventsTable
     this.#lazy = options.lazyInitialization ?? false
     this.#consistentRead = options.consistentRead ?? true
+    this.#retention = retentionMap(options.retention)
+    this.#clock = options.clock ?? Date.now
   }
 
   /** The events table this repository writes. */
@@ -153,16 +189,18 @@ export class DynamoRepository implements Repository, StoreInitializer {
       return
     }
 
+    // One `ttl` for the whole commit, so its head's is never below one of its own items.
+    const entityType = commit.events[0]!.entityType
+    const ttl = this.#ttlFor(entityType)
+
     // Every backend budgets a commit the same way, so an oversized one fails before any request.
-    checkBudget(commitSizes(commit, () => undefined))
+    checkBudget(commitSizes(commit, (type) => (type === entityType ? ttl : undefined)))
 
     const request = requestOptions(options)
     const version = await this.#markerVersion(request)
+    const items = commitTransaction(this.#table, commit, version, this.#commitTtl(commit, ttl))
     try {
-      await this.#client.transactWriteItems(
-        {TransactItems: commitTransaction(this.#table, commit, version)},
-        request,
-      )
+      await this.#client.transactWriteItems({TransactItems: items}, request)
     } catch (error) {
       throw await this.#classifyCommit(commit, error, request)
     }
@@ -185,7 +223,7 @@ export class DynamoRepository implements Repository, StoreInitializer {
     const events: SerializedEvent[] = []
     const pages = this.#query(entityId, from, true, undefined, requestOptions(options))
     for await (const page of pages) {
-      events.push(...decodeEvents(page))
+      events.push(...this.#decodeEvents(page))
     }
 
     return events
@@ -203,7 +241,7 @@ export class DynamoRepository implements Repository, StoreInitializer {
     const limit = Math.min(n, LATEST_PAGE_SIZE)
     const events: SerializedEvent[] = []
     for await (const page of this.#query(entityId, 0n, false, limit, requestOptions(options))) {
-      events.push(...decodeEvents(page))
+      events.push(...this.#decodeEvents(page))
       if (events.length >= n) {
         break
       }
@@ -224,40 +262,63 @@ export class DynamoRepository implements Repository, StoreInitializer {
     int64Argument(snapshot.sequence, 'snapshot.sequence')
     const eventSequence = int64Argument(snapshot.eventSequence, 'snapshot.eventSequence')
 
+    // Stamped now, as the snapshot's own items are, so it expires with its stream.
+    const ttl = this.#ttlFor(snapshot.entityType)
     const request = requestOptions(options)
     const version = await this.#markerVersion(request)
-    try {
-      await this.#client.transactWriteItems(
-        {TransactItems: snapshotTransaction(this.#table, snapshot, version)},
-        request,
-      )
+    for (let retries = 0, refresh = true; ; retries++) {
+      const guarded = ttl === undefined ? undefined : {ttl, refresh}
+      try {
+        await this.#client.transactWriteItems(
+          {TransactItems: snapshotTransaction(this.#table, snapshot, version, guarded)},
+          request,
+        )
+        this.#observeTtl(snapshot.entityId, ttl)
 
-      return true
-    } catch (error) {
-      const codes = cancellationCodes(error)
-      const failed = codes?.indexOf(CONDITION_FAILED) ?? -1
-      if (failed === 0) {
-        throw await this.#markerCheckFailed(error, request)
-      }
-      if (failed === 1) {
-        // The head doesn't cover the snapshot: a stream whose log is ahead of its head.
+        return true
+      } catch (error) {
+        const codes = cancellationCodes(error)
+        const failed = codes?.indexOf(CONDITION_FAILED) ?? -1
+        if (failed === 0) {
+          throw await this.#markerCheckFailed(error, request)
+        }
+        if (failed === 2) {
+          // A newer snapshot is stored, and stays.
+          return false
+        }
+        if (failed !== 1) {
+          if (codes?.some((code) => THROTTLED.has(code))) {
+            throw new TransientError('the snapshot write was throttled', {cause: error})
+          }
+
+          throw error
+        }
+
+        // The head guard failed. A refreshing guard can fail on its ttl clause alone, when another
+        // writer moved the head: the head covers the snapshot, so send it again, refreshing only
+        // when the stored ttl is still below the snapshot's.
         const head = await this.#readHead(snapshot.entityId, request)
+        const refreshed = guarded?.refresh === true && eventSequence > 0n
+        if (refreshed && head !== null && head.head >= eventSequence) {
+          if (retries >= MAX_SNAPSHOT_GUARD_RETRIES) {
+            throw new TransientError(
+              `the head item of ${snapshot.entityId} kept moving under its snapshot write`,
+              {cause: error},
+            )
+          }
+
+          refresh = (head.ttl ?? 0) < ttl!
+          continue
+        }
+
+        // The head doesn't cover the snapshot: a stream whose log is ahead of its head.
         const derived = await this.#deriveHead(snapshot.entityId, request)
         throw drift(
           snapshot.entityId,
-          head,
+          head?.head ?? null,
           derived > eventSequence ? derived : eventSequence,
         )
       }
-      if (failed === 2) {
-        // A newer snapshot is stored, and stays.
-        return false
-      }
-      if (codes?.some((code) => THROTTLED.has(code))) {
-        throw new TransientError('the snapshot write was throttled', {cause: error})
-      }
-
-      throw error
     }
   }
 
@@ -333,6 +394,57 @@ export class DynamoRepository implements Repository, StoreInitializer {
         ExpressionAttributeValues: {':observed': {N: manifest.version.toString()}},
       },
     }
+  }
+
+  // The `ttl` an item of the entity type written now carries, or undefined without retention.
+  #ttlFor(entityType: string): number | undefined {
+    const retention = this.#retention.get(entityType)
+    const ttl = retention === undefined ? undefined : expiry(this.#clock(), retention)
+
+    // An expiry at or before the epoch is no ttl at all, as Go writes none for 0.
+    return ttl !== undefined && ttl > 0 ? ttl : undefined
+  }
+
+  // The commit's `ttl`s: its own on its items, and on its head the larger of its own and what this
+  // writer loaded for the stream, except on a create, which has nothing to cover.
+  #commitTtl(commit: Commit, ttl: number | undefined): CommitTtl | undefined {
+    if (ttl === undefined) {
+      return undefined
+    }
+
+    const create = commit.events[0]!.sequence <= 1n
+    const floor = create ? 0 : (this.#ttlFloors.get(commit.entityId) ?? 0)
+
+    return {items: ttl, head: Math.max(ttl, floor)}
+  }
+
+  // Remembers a loaded item's `ttl` for its stream. The memory is bounded: a full one is cleared,
+  // which costs at most a conflict and a retry, whose load observes the `ttl` again.
+  #observeTtl(entityId: string, ttl: number | undefined): void {
+    if (ttl === undefined || ttl <= 0) {
+      return
+    }
+
+    const current = this.#ttlFloors.get(entityId)
+    if (current === undefined && this.#ttlFloors.size >= MAX_TTL_FLOORS) {
+      this.#ttlFloors.clear()
+    }
+    if (current === undefined || ttl > current) {
+      this.#ttlFloors.set(entityId, ttl)
+    }
+  }
+
+  #decodeEvents(items: Item[]): SerializedEvent[] {
+    const events: SerializedEvent[] = []
+    for (const item of items) {
+      const event = eventFromItem(item)
+      if (event.sequence >= 1n) {
+        this.#observeTtl(event.entityId, ttlFromItem(item))
+        events.push(event)
+      }
+    }
+
+    return events
   }
 
   // The manifest version the next write checks, validating it first when this writer hasn't.
@@ -436,9 +548,10 @@ export class DynamoRepository implements Repository, StoreInitializer {
     const eventFailed = codes.slice(head + 1, eventsEnd).includes(CONDITION_FAILED)
     const {entityId} = commit
     const first = commit.events[0]!.sequence
+    const retained = this.#retention.has(commit.events[0]!.entityType)
 
     if (codes[head] === CONDITION_FAILED) {
-      const verdict = await this.#probe(entityId, request)
+      const verdict = await this.#probe(entityId, retained, request)
       if (verdict.drift) {
         return verdict.drift
       }
@@ -446,10 +559,13 @@ export class DynamoRepository implements Repository, StoreInitializer {
         return new SequenceGapError(entityId, verdict.stored, first)
       }
     } else if (codes[head] === 'None' && eventFailed) {
-      // The head update passed and an event put failed: an event sits above the head.
-      const verdict = await this.#probe(entityId, request)
-
-      return verdict.drift ?? drift(entityId, verdict.head, verdict.derived)
+      // The head update passed and an event put failed: an event sits above the head. With
+      // retention, TTL can delete the head before an expired event, so a create passes its head
+      // condition and fails on the leftover item: a conflict until TTL deletes the rest.
+      const verdict = await this.#probe(entityId, retained, request)
+      if (!retained || !(await this.#remainingItemsExpired(entityId, request))) {
+        return verdict.drift ?? drift(entityId, verdict.head, verdict.derived)
+      }
     }
 
     return new ConflictError(
@@ -460,16 +576,26 @@ export class DynamoRepository implements Repository, StoreInitializer {
 
   // Classifies a stream whose head update failed, as the failure-path probe does: a stored head
   // below the head its log derives is drift, an equal one is healthy, and one above it is either a
-  // writer that committed in between (derive again) or drift.
-  async #probe(entityId: string, request: RequestOptions): Promise<Verdict> {
+  // writer that committed in between (derive again) or drift. With retention, TTL deletes items in
+  // no order, so a head above its log, or a missing head over items that have all expired, is a
+  // conflict that heals once TTL deletes the rest.
+  async #probe(entityId: string, retained: boolean, request: RequestOptions): Promise<Verdict> {
     const derived = await this.#deriveHead(entityId, request)
-    const head = await this.#readHead(entityId, request)
+    const head = (await this.#readHead(entityId, request))?.head ?? null
     const stored = head ?? 0n
     if (stored < derived) {
+      if (retained && head === null && (await this.#remainingItemsExpired(entityId, request))) {
+        return {healthy: false, drift: null, stored, head, derived}
+      }
+
       return {healthy: false, drift: drift(entityId, head, derived), stored, head, derived}
     }
     if (stored === derived) {
       return {healthy: true, drift: null, stored, head, derived}
+    }
+    if (retained) {
+      // The head outlived part of the log it counted: TTL deleted the tail first.
+      return {healthy: false, drift: null, stored, head, derived}
     }
 
     const second = await this.#deriveHead(entityId, request)
@@ -514,8 +640,60 @@ export class DynamoRepository implements Repository, StoreInitializer {
     return derived
   }
 
-  // The stored head, or null when the stream has no head item.
-  async #readHead(entityId: string, request: RequestOptions): Promise<bigint | null> {
+  // Whether every item still stored for the stream, its snapshot and its events, has a `ttl` that
+  // has passed, so TTL will delete it. An item without a `ttl` never expires.
+  async #remainingItemsExpired(entityId: string, request: RequestOptions): Promise<boolean> {
+    const now = Math.floor(this.#clock() / 1000)
+    const expired = (item: Item): boolean => {
+      const ttl = ttlFromItem(item)
+
+      return ttl !== undefined && ttl <= now
+    }
+
+    const snapshot = await this.#client.getItem(
+      {
+        TableName: this.#table,
+        Key: controlKey(entityId),
+        ConsistentRead: true,
+        // The key too, so a snapshot without a ttl doesn't read back empty, as an absent one does.
+        ProjectionExpression: 'sk, #ttl',
+        ExpressionAttributeNames: {'#ttl': 'ttl'},
+      },
+      request,
+    )
+    const item = snapshot.Item as Item | undefined
+    if (item && Object.keys(item).length > 0 && !expired(item)) {
+      return false
+    }
+
+    let start: Item | undefined
+    do {
+      const page = await this.#client.query(
+        {
+          TableName: this.#table,
+          KeyConditionExpression: 'pk = :pk AND sk > :sk',
+          ExpressionAttributeNames: {'#ttl': 'ttl'},
+          ExpressionAttributeValues: {':pk': {S: entityId}, ':sk': {N: '0'}},
+          ConsistentRead: true,
+          ProjectionExpression: 'sk, #ttl',
+          ...(start && {ExclusiveStartKey: start}),
+        },
+        request,
+      )
+      if (((page.Items ?? []) as Item[]).some((event) => !expired(event))) {
+        return false
+      }
+      start = page.LastEvaluatedKey as Item | undefined
+    } while (start !== undefined)
+
+    return true
+  }
+
+  // The stored head and its `ttl`, or null when the stream has no head item.
+  async #readHead(
+    entityId: string,
+    request: RequestOptions,
+  ): Promise<{head: bigint; ttl: number | undefined} | null> {
     const output = await this.#client.getItem(
       {TableName: this.#table, Key: headKey(entityId), ConsistentRead: true},
       request,
@@ -526,7 +704,11 @@ export class DynamoRepository implements Repository, StoreInitializer {
     }
 
     // A head item without its attribute reads as head 0, as Go reads it, so it classifies as drift.
-    return item['head'] === undefined ? 0n : headFromItem(item).head
+    const head =
+      item['head'] === undefined ? {head: 0n, ttl: ttlFromItem(item)} : headFromItem(item)
+    this.#observeTtl(entityId, head.ttl)
+
+    return head
   }
 
   async #readSnapshot(
@@ -539,8 +721,13 @@ export class DynamoRepository implements Repository, StoreInitializer {
       request,
     )
     const item = output.Item as Item | undefined
+    if (!item || Object.keys(item).length === 0) {
+      return null
+    }
 
-    return item && Object.keys(item).length > 0 ? snapshotFromItem(item) : null
+    this.#observeTtl(entityId, ttlFromItem(item))
+
+    return snapshotFromItem(item)
   }
 
   // The marker row, with a strongly consistent read, or null when the store has none.
@@ -777,8 +964,33 @@ function drift(entityId: string, head: bigint | null, derived: bigint): StreamHe
   return new StreamHeadDriftError(entityId, head, derived)
 }
 
-function decodeEvents(items: Item[]): SerializedEvent[] {
-  return items.map(eventFromItem).filter((event) => event.sequence >= 1n)
+// The retention option as a map of the entity types with a positive retention, each checked to be
+// whole milliseconds.
+function retentionMap(
+  retention: Readonly<Record<string, number>> | ReadonlyMap<string, number> | undefined,
+): ReadonlyMap<string, number> {
+  const entries = isMap(retention) ? [...retention.entries()] : Object.entries(retention ?? {})
+  const retained = new Map<string, number>()
+  for (const [entityType, milliseconds] of entries) {
+    if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) {
+      throw new EvtError(
+        'invalidArgument',
+        `the retention of ${entityType} must be whole, non-negative milliseconds: ${milliseconds}`,
+      )
+    }
+    if (milliseconds > 0) {
+      retained.set(entityType, milliseconds)
+    }
+  }
+
+  return retained
+}
+
+// A map by its methods, so one from another realm counts too.
+function isMap<K, V>(value: object | undefined): value is ReadonlyMap<K, V> {
+  const map = value as Partial<ReadonlyMap<K, V>> | undefined
+
+  return typeof map?.get === 'function' && typeof map.entries === 'function'
 }
 
 function reservedItem(item: Item): boolean {

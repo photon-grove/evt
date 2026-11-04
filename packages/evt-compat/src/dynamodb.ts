@@ -7,10 +7,12 @@ import {DynamoDB} from '@aws-sdk/client-dynamodb'
 import process from 'node:process'
 
 import {
+  ConflictError,
   type FeatureManifest,
   FeatureManifestChangedError,
   type SerializedEvent,
   StoreNotInitializedError,
+  StreamHeadDriftError,
   StreamHeadsNotMigratedError,
   emptyMetadata,
   eventId,
@@ -22,6 +24,7 @@ import {
   headFromItem,
   manifestFromItem,
   markerItem,
+  ttlFromItem,
 } from '@photon-grove/evt/dynamodb'
 
 import {
@@ -54,6 +57,7 @@ const client = new DynamoDB({
 const run = Date.now().toString(36)
 const shared = `evt-ts-conformance-${run}`
 const marked = `evt-ts-marker-${run}`
+const tableCount = {value: 0}
 
 const checks = new Checks()
 const created: string[] = []
@@ -74,23 +78,26 @@ try {
   await markerConformance(checks, lazy, controlFixtures(marked))
 
   await initialization(created)
+  await retention(created)
 } finally {
   await Promise.all(created.map(deleteTable))
 }
 
 checks.report()
 
+// A fresh table for one case, deleted with the others at the end of the run.
+async function freshTable(tables: string[]): Promise<string> {
+  const table = `evt-ts-case-${run}-${++tableCount.value}`
+  await createTable(table)
+  tables.push(table)
+
+  return table
+}
+
 // What DynamoDB alone does: refuse an uninitialized store, initialize one, and revalidate after
 // another writer declares. Each case gets a fresh table.
 async function initialization(tables: string[]): Promise<void> {
-  let count = 0
-  const fresh = async (): Promise<string> => {
-    const table = `evt-ts-init-${run}-${++count}`
-    await createTable(table)
-    tables.push(table)
-
-    return table
-  }
+  const fresh = (): Promise<string> => freshTable(tables)
 
   await checks.case('dynamodb: a strict writer refuses an uninitialized store', async () => {
     const repo = new DynamoRepository(client, await fresh())
@@ -152,6 +159,100 @@ async function initialization(tables: string[]): Promise<void> {
     await repo.commit({entityId: 'a', events: [ledgerEvent('a', 2)]})
     ensure((await repo.events('a')).length === 2, 'the retried commit wrote')
   })
+}
+
+// Retention: the ttl every item of a retained stream carries, the head's never-lower rule, and a
+// stream whose items TTL deleted out of order. Moto stores ttl attributes but never deletes them,
+// so the deletions are written by hand. Each case gets a fresh, initialized table.
+async function retention(tables: string[]): Promise<void> {
+  // 2027-01-15, and the ttl of an item written then and kept for a minute or an hour.
+  let now = 1_800_000_000_000
+  const clock = (): number => now
+  const minute = {retention: {ledger: 60_000}, clock}
+  const hour = {retention: {ledger: 3_600_000}, clock}
+  const fresh = async (): Promise<string> => {
+    const table = await freshTable(tables)
+    await new DynamoRepository(client, table).initialize()
+
+    return table
+  }
+
+  await checks.case('dynamodb: a retained commit stamps its ttl on every item', async () => {
+    const table = await fresh()
+    const repo = new DynamoRepository(client, table, minute)
+    const payload = new TextEncoder().encode('{}')
+    await repo.commit({
+      entityId: 'a',
+      events: [ledgerEvent('a', 1), ledgerEvent('a', 2)],
+      snapshot: {entityType: 'ledger', sequence: 1n, payload},
+    })
+
+    for (const sk of [-1n, 0n, 1n, 2n]) {
+      const ttl = await ttlOf(table, sk)
+      ensure(ttl === 1_800_000_060, `item ${sk} expires at 1800000060: got ${ttl}`)
+    }
+  })
+
+  await checks.case('dynamodb: a retained head never lowers its ttl', async () => {
+    const table = await fresh()
+    await new DynamoRepository(client, table, hour).commit({
+      entityId: 'a',
+      events: [ledgerEvent('a', 1)],
+    })
+
+    // A writer with a shorter retention that hasn't loaded the stream conflicts, rather than
+    // lower the head's ttl. One that has loaded its events covers the ttl they carry.
+    const append = {entityId: 'a', events: [ledgerEvent('a', 2)]}
+    const unloaded = new DynamoRepository(client, table, minute)
+    await refuses(unloaded.commit(append), ConflictError, 'an append that would lower the ttl')
+    const loaded = new DynamoRepository(client, table, minute)
+    await loaded.events('a')
+    await loaded.commit(append)
+
+    ensure((await ttlOf(table, -1n)) === 1_800_003_600, "the head keeps the hour's ttl")
+    ensure((await ttlOf(table, 2n)) === 1_800_000_060, "the event carries the minute's")
+  })
+
+  await checks.case('dynamodb: a retained snapshot write refreshes its head', async () => {
+    const table = await fresh()
+    const repo = new DynamoRepository(client, table, minute)
+    await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
+
+    now += 600_000
+    ensure(await repo.putSnapshot(snapshot('a', 1n)), 'the snapshot is written')
+    ensure((await ttlOf(table, 0n)) === 1_800_000_660, 'the snapshot carries its own ttl')
+    ensure((await ttlOf(table, -1n)) === 1_800_000_660, "the head's ttl covers it")
+    now -= 600_000
+  })
+
+  await checks.case('dynamodb: a retained stream TTL emptied out of order conflicts', async () => {
+    // TTL deleted the head first, leaving an event that has expired too: a create passes its head
+    // condition and fails on the event, a conflict until TTL deletes it. Without retention, or
+    // with the event still live, it's drift.
+    const cases = [
+      [minute, 1_799_999_000, ConflictError],
+      [minute, 1_800_009_000, StreamHeadDriftError],
+      [{}, 1_799_999_000, StreamHeadDriftError],
+    ] as const
+    for (const [options, ttl, want] of cases) {
+      const table = await fresh()
+      await client.putItem({TableName: table, Item: eventItem(ledgerEvent('a', 1), ttl)})
+      const repo = new DynamoRepository(client, table, options)
+      const commit = repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
+      await refuses(commit, want, `a create over an item expiring at ${ttl}`)
+    }
+  })
+}
+
+// The ttl of stream a's item at `sk`, read back.
+async function ttlOf(table: string, sk: bigint): Promise<number | undefined> {
+  const {Item: item} = await client.getItem({
+    TableName: table,
+    Key: key('a', sk),
+    ConsistentRead: true,
+  })
+
+  return item ? ttlFromItem(item as Item) : undefined
 }
 
 function ledgerEvent(entityId: string, sequence: number): SerializedEvent {

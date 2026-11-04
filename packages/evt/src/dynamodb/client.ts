@@ -52,6 +52,7 @@ export interface GetItemInput {
   Key: Item
   ConsistentRead?: boolean
   ProjectionExpression?: string
+  ExpressionAttributeNames?: Record<string, string>
 }
 
 export interface PutItemInput extends Expressions {
@@ -62,6 +63,7 @@ export interface PutItemInput extends Expressions {
 export interface QueryInput {
   TableName: string
   KeyConditionExpression: string
+  ExpressionAttributeNames?: Record<string, string>
   ExpressionAttributeValues: Item
   ConsistentRead?: boolean
   ProjectionExpression?: string

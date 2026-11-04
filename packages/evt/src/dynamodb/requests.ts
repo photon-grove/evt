@@ -4,7 +4,7 @@
 // puts, and its snapshot put when it has one.
 
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
-import {int64Argument} from '../fields.js'
+import {int64Argument, safeIntegerArgument} from '../fields.js'
 import type {Commit} from '../repository.js'
 import type {TransactItem} from './client.js'
 import {type HeadAction, headUpdate} from './head.js'
@@ -31,6 +31,13 @@ export const SNAPSHOT_GUARD_CONDITION = 'head >= :new'
 
 /** The guard of a snapshot of an empty stream (event sequence 0), which needs no head. */
 export const SNAPSHOT_GUARD_EMPTY_CONDITION = 'attribute_not_exists(head) OR head >= :new'
+
+/** The update expression of a retained stream's snapshot guard: it refreshes the head's `ttl`. */
+export const SNAPSHOT_GUARD_RETAINED_UPDATE = 'SET #ttl = :t'
+
+/** {@link SNAPSHOT_GUARD_CONDITION} with retention: the head's `ttl` is raised, never lowered. */
+export const SNAPSHOT_GUARD_RETAINED_CONDITION =
+  'head >= :new AND (attribute_not_exists(#ttl) OR #ttl <= :t)'
 
 /** A snapshot write's put: it never lowers the stored snapshot's event sequence. */
 export const SNAPSHOT_WRITE_CONDITION = 'attribute_not_exists(eventSeq) OR eventSeq <= :new'
@@ -68,15 +75,38 @@ export function rebuildLockCheck(table: string): TransactItem {
   }
 }
 
+/** The `ttl`s of a commit to a stream with retention, in Unix seconds. */
+export interface CommitTtl {
+  /** The commit's own `ttl`, which its event and snapshot items carry. */
+  items: number
+  /**
+   * The head item's: the commit's own `ttl` on a create, and on an append the larger of it and
+   * the largest `ttl` the writer loaded for the stream, because the head's is never lowered.
+   */
+  head: number
+}
+
+/** The `ttl` of a snapshot written outside a commit, to a stream with retention. */
+export interface SnapshotTtl {
+  /** The snapshot's `ttl`, in Unix seconds, stamped when it's written. */
+  ttl: number
+  /**
+   * Whether the head guard refreshes the head's `ttl` to at least the snapshot's. True unless the
+   * stored head's `ttl` is known to cover it already.
+   */
+  refresh: boolean
+}
+
 /**
  * The actions of a commit with at least one event, in order, by a writer that validated the
- * feature manifest at `markerVersion`. Exported for the compatibility fixtures: its signature
- * changes when commits carry retention and span streams.
+ * feature manifest at `markerVersion`. `ttl` is given only for a stream with retention. Exported
+ * for the compatibility fixtures: its signature changes when commits span streams.
  */
 export function commitTransaction(
   table: string,
   commit: Commit,
   markerVersion: bigint,
+  ttl?: CommitTtl,
 ): TransactItem[] {
   const first = commit.events[0]
   const last = commit.events.at(-1)
@@ -85,9 +115,10 @@ export function commitTransaction(
   }
 
   const items = [markerCheck(table, markerVersion), rebuildLockCheck(table)]
-  items.push(headUpdateItem(table, headUpdate(commit.entityId, first.sequence, last.sequence)))
+  const head = headUpdate(commit.entityId, first.sequence, last.sequence, ttl?.head)
+  items.push(headUpdateItem(table, head))
   for (const event of commit.events) {
-    items.push(eventPut(table, event))
+    items.push(eventPut(table, event, ttl?.items))
   }
 
   const snapshot = commit.snapshot
@@ -99,7 +130,7 @@ export function commitTransaction(
       eventSequence: last.sequence,
       payload: snapshot.payload,
     }
-    items.push(commitSnapshotPut(table, stored))
+    items.push(commitSnapshotPut(table, stored, ttl?.items))
   }
 
   return items
@@ -107,37 +138,66 @@ export function commitTransaction(
 
 /**
  * The actions of a snapshot written outside a commit: the marker check, the head guard, and the
- * put, which never lowers the stored snapshot. It carries no rebuild-lock check. Exported for the
- * compatibility fixtures: its signature changes when snapshot writes carry retention.
+ * put, which never lowers the stored snapshot. It carries no rebuild-lock check. `ttl` is given
+ * only for a stream with retention. Exported for the compatibility fixtures.
  */
 export function snapshotTransaction(
   table: string,
   snapshot: SerializedSnapshot,
   markerVersion: bigint,
+  ttl?: SnapshotTtl,
 ): TransactItem[] {
   const eventSequence = int64Argument(snapshot.eventSequence, 'snapshot.eventSequence')
-  const values = {':new': number(eventSequence)}
 
   return [
     markerCheck(table, markerVersion),
+    snapshotGuard(table, snapshot.entityId, eventSequence, ttl),
     {
+      Put: {
+        TableName: table,
+        Item: snapshotItem(snapshot, ttl?.ttl),
+        ConditionExpression: SNAPSHOT_WRITE_CONDITION,
+        ExpressionAttributeValues: {':new': number(eventSequence)},
+      },
+    },
+  ]
+}
+
+// The head item's action in a snapshot write: a check that the head covers the snapshot, or, for a
+// stream with retention, an update that also keeps the head's `ttl` at least the snapshot's. A
+// snapshot of an empty stream may have no head item, so it's always a check: an update would
+// create a head item without a head.
+function snapshotGuard(
+  table: string,
+  entityId: string,
+  eventSequence: bigint,
+  ttl: SnapshotTtl | undefined,
+): TransactItem {
+  const values: Record<string, {N: string}> = {':new': number(eventSequence)}
+  if (eventSequence === 0n || ttl === undefined || !ttl.refresh) {
+    return {
       ConditionCheck: {
         TableName: table,
-        Key: headKey(snapshot.entityId),
+        Key: headKey(entityId),
         ConditionExpression:
           eventSequence === 0n ? SNAPSHOT_GUARD_EMPTY_CONDITION : SNAPSHOT_GUARD_CONDITION,
         ExpressionAttributeValues: values,
       },
+    }
+  }
+
+  values[':t'] = number(BigInt(safeIntegerArgument(ttl.ttl, 'ttl')))
+
+  return {
+    Update: {
+      TableName: table,
+      Key: headKey(entityId),
+      UpdateExpression: SNAPSHOT_GUARD_RETAINED_UPDATE,
+      ConditionExpression: SNAPSHOT_GUARD_RETAINED_CONDITION,
+      ExpressionAttributeNames: {'#ttl': 'ttl'},
+      ExpressionAttributeValues: values,
     },
-    {
-      Put: {
-        TableName: table,
-        Item: snapshotItem(snapshot),
-        ConditionExpression: SNAPSHOT_WRITE_CONDITION,
-        ExpressionAttributeValues: values,
-      },
-    },
-  ]
+  }
 }
 
 function headUpdateItem(table: string, action: HeadAction): TransactItem {
@@ -157,21 +217,25 @@ function headUpdateItem(table: string, action: HeadAction): TransactItem {
   return {Update: update}
 }
 
-function eventPut(table: string, event: SerializedEvent): TransactItem {
+function eventPut(table: string, event: SerializedEvent, ttl: number | undefined): TransactItem {
   return {
-    Put: {TableName: table, Item: eventItem(event), ConditionExpression: EVENT_PUT_CONDITION},
+    Put: {TableName: table, Item: eventItem(event, ttl), ConditionExpression: EVENT_PUT_CONDITION},
   }
 }
 
 // A commit's snapshot follows the stored one: sequence 1 needs none, and a later one needs the
 // one before it.
-function commitSnapshotPut(table: string, snapshot: SerializedSnapshot): TransactItem {
+function commitSnapshotPut(
+  table: string,
+  snapshot: SerializedSnapshot,
+  ttl: number | undefined,
+): TransactItem {
   const sequence = int64Argument(snapshot.sequence, 'snapshot.sequence')
   if (sequence <= 1n) {
     return {
       Put: {
         TableName: table,
-        Item: snapshotItem(snapshot),
+        Item: snapshotItem(snapshot, ttl),
         ConditionExpression: FIRST_SNAPSHOT_CONDITION,
       },
     }
@@ -180,7 +244,7 @@ function commitSnapshotPut(table: string, snapshot: SerializedSnapshot): Transac
   return {
     Put: {
       TableName: table,
-      Item: snapshotItem(snapshot),
+      Item: snapshotItem(snapshot, ttl),
       ConditionExpression: NEXT_SNAPSHOT_CONDITION,
       ExpressionAttributeValues: {':seq': number(sequence - 1n)},
     },

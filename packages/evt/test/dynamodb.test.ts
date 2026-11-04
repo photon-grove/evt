@@ -7,16 +7,25 @@ import {fileURLToPath} from 'node:url'
 import {describe, expect, test} from 'vitest'
 
 import type {DynamoClient, Page, TransactItem} from '../src/dynamodb/client.ts'
-import {type Item, snapshotItem} from '../src/dynamodb/item.ts'
+import {
+  type Item,
+  eventItem,
+  expiry,
+  headItem,
+  snapshotItem,
+  sortKey,
+} from '../src/dynamodb/item.ts'
 import {markerItem} from '../src/dynamodb/marker.ts'
 import {DynamoRepository} from '../src/dynamodb/repository.ts'
-import {commitTransaction} from '../src/dynamodb/requests.ts'
+import {commitTransaction, snapshotTransaction} from '../src/dynamodb/requests.ts'
 import {
   ConflictError,
+  EvtError,
   FeatureManifestChangedError,
   HistoryDependentProjectionError,
   RebuildInProgressError,
   StoreNotInitializedError,
+  StreamHeadDriftError,
   TransientError,
   UnsupportedFeatureError,
   isRetryable,
@@ -230,12 +239,280 @@ describe('DynamoRepository', () => {
   })
 })
 
+// A client over a table of items, whose transactions answer `answers` in turn without writing.
+class Table implements DynamoClient {
+  readonly transactions: TransactItem[][] = []
+  readonly items = new Map<string, Item>()
+  readonly #answers: (Error | null)[]
+
+  constructor(...answers: (Error | null)[]) {
+    this.put(manifest(1n))
+    this.#answers = answers
+  }
+
+  put(item: Item): void {
+    this.items.set(key(item), item)
+  }
+
+  async getItem(input: {Key: Item}): Promise<{Item?: Item}> {
+    const item = this.items.get(key(input.Key))
+
+    return item ? {Item: item} : {}
+  }
+
+  async putItem(): Promise<unknown> {
+    throw new Error('unexpected putItem')
+  }
+
+  // Only the stream queries the repository makes: `pk = :pk AND sk > :sk`.
+  async query(input: {
+    ExpressionAttributeValues: Item
+    ScanIndexForward?: boolean
+    Limit?: number
+  }): Promise<Page> {
+    const pk = (input.ExpressionAttributeValues[':pk'] as {S: string}).S
+    const after = sortKey({sk: input.ExpressionAttributeValues[':sk']!})!
+    const events = [...this.items.values()].filter(
+      (item) => (item['pk'] as {S: string}).S === pk && sortKey(item)! > after,
+    )
+    events.sort((a, b) => (sortKey(a)! < sortKey(b)! ? -1 : 1))
+    if (input.ScanIndexForward === false) {
+      events.reverse()
+    }
+
+    return {Items: events.slice(0, input.Limit ?? events.length)}
+  }
+
+  async scan(): Promise<Page> {
+    return {Items: []}
+  }
+
+  async transactWriteItems(input: {TransactItems: TransactItem[]}): Promise<unknown> {
+    this.transactions.push(input.TransactItems)
+    const answer = this.#answers.shift()
+    if (answer) {
+      throw answer
+    }
+
+    return {}
+  }
+}
+
+function key(item: Item): string {
+  return `${(item['pk'] as {S: string}).S} ${(item['sk'] as {N: string}).N}`
+}
+
+// The failures of a snapshot write's head guard, and of a commit's head update or event put.
+function guardFailed(): Error {
+  return cancelled('None', 'ConditionalCheckFailed', 'None')
+}
+
+function headFailed(): Error {
+  return cancelled('None', 'None', 'ConditionalCheckFailed', 'None')
+}
+
+function eventFailed(): Error {
+  return cancelled('None', 'None', 'None', 'ConditionalCheckFailed')
+}
+
+// The kind of each snapshot write's head guard.
+function guards(client: Table): string[] {
+  return client.transactions.map((transaction) => Object.keys(transaction[1]!)[0]!)
+}
+
+describe('retention', () => {
+  // 1,000 s past the epoch, with a minute's retention: items expire at 1,060 s.
+  const NOW = 1_000_000
+  const TTL = 1060
+  const options = {retention: {t: 60_000}, clock: () => NOW}
+
+  test('stamps one ttl on a commit, and on a create its head', async () => {
+    const client = new Table()
+    const commit = {
+      entityId: 'a',
+      events: [event(1), event(2)],
+      snapshot: {entityType: 't', sequence: 1n, payload: new TextEncoder().encode('{}')},
+    }
+    await new DynamoRepository(client, 'events', options).commit(commit)
+
+    const want = commitTransaction('events', commit, 1n, {items: TTL, head: TTL})
+    expect(client.transactions).toEqual([want])
+    expect(want[2]?.Update?.ExpressionAttributeValues?.[':t']).toEqual({N: '1060'})
+    expect(want[3]?.Put?.Item['ttl']).toEqual({N: '1060'})
+    expect(want.at(-1)?.Put?.Item['ttl']).toEqual({N: '1060'})
+  })
+
+  test("an append's head never lowers the ttl the writer loaded", async () => {
+    const client = new Table()
+    client.put(headItem('a', 1n, 5000))
+    client.put(eventItem(event(1), 5000))
+    const repo = new DynamoRepository(client, 'events', options)
+    await repo.events('a')
+
+    const commit = {entityId: 'a', events: [event(2)]}
+    await repo.commit(commit)
+
+    expect(client.transactions).toEqual([
+      commitTransaction('events', commit, 1n, {items: TTL, head: 5000}),
+    ])
+  })
+
+  test('stamps nothing on a type without retention', async () => {
+    const client = new Table()
+    const commit = {entityId: 'a', events: [event(1)]}
+    await new DynamoRepository(client, 'events', {retention: {u: 60_000, t: 0}}).commit(commit)
+
+    expect(client.transactions).toEqual([commitTransaction('events', commit, 1n)])
+  })
+
+  test('takes a Map, and covers the ttl of a snapshot it wrote', async () => {
+    let now = NOW + 600_000
+    const client = new Table()
+    const repo = new DynamoRepository(client, 'events', {
+      retention: new Map([['t', 60_000]]),
+      clock: () => now,
+    })
+    const snapshot = {
+      entityType: 't',
+      entityId: 'a',
+      sequence: 1n,
+      eventSequence: 1n,
+      payload: new TextEncoder().encode('{}'),
+    }
+    await repo.putSnapshot(snapshot)
+
+    // The clock stepped back: the head still covers the snapshot's later ttl.
+    now = NOW
+    const commit = {entityId: 'a', events: [event(2)]}
+    await repo.commit(commit)
+
+    expect(client.transactions[1]).toEqual(
+      commitTransaction('events', commit, 1n, {items: TTL, head: TTL + 600}),
+    )
+  })
+
+  test('writes no ttl for an expiry at the epoch', async () => {
+    const client = new Table()
+    const commit = {entityId: 'a', events: [event(1)]}
+    const repo = new DynamoRepository(client, 'events', {retention: {t: 1}, clock: () => 0})
+    await repo.commit(commit)
+
+    expect(client.transactions).toEqual([commitTransaction('events', commit, 1n)])
+  })
+
+  test.each([-1, 0.5, Number.NaN])('refuses a retention of %s ms', (retention) => {
+    const construct = () => new DynamoRepository(new Table(), 'events', {retention: {t: retention}})
+
+    expect(construct).toThrow(EvtError)
+  })
+
+  describe('a snapshot write', () => {
+    const snapshot = {
+      entityType: 't',
+      entityId: 'a',
+      sequence: 1n,
+      eventSequence: 6n,
+      payload: new TextEncoder().encode('{}'),
+    }
+    test("refreshes the head's ttl in its guard", async () => {
+      const client = new Table()
+      await new DynamoRepository(client, 'events', options).putSnapshot(snapshot)
+
+      expect(client.transactions).toEqual([
+        snapshotTransaction('events', snapshot, 1n, {ttl: TTL, refresh: true}),
+      ])
+    })
+
+    test("sends a plain check when the moved head's ttl covers the snapshot", async () => {
+      const client = new Table(guardFailed())
+      client.put(headItem('a', 7n, 2000))
+      await new DynamoRepository(client, 'events', options).putSnapshot(snapshot)
+
+      expect(guards(client)).toEqual(['Update', 'ConditionCheck'])
+      expect(client.transactions[1]).toEqual(
+        snapshotTransaction('events', snapshot, 1n, {ttl: TTL, refresh: false}),
+      )
+    })
+
+    test("refreshes again when the moved head's ttl is lower", async () => {
+      const client = new Table(guardFailed())
+      client.put(headItem('a', 7n, 1000))
+      await new DynamoRepository(client, 'events', options).putSnapshot(snapshot)
+
+      expect(guards(client)).toEqual(['Update', 'Update'])
+    })
+
+    test('is transient once the head keeps moving', async () => {
+      const client = new Table(...Array.from({length: 5}, guardFailed))
+      client.put(headItem('a', 7n, 1000))
+      const write = new DynamoRepository(client, 'events', options).putSnapshot(snapshot)
+
+      await expect(write).rejects.toBeInstanceOf(TransientError)
+      expect(client.transactions).toHaveLength(5)
+    })
+
+    test('is drift when the head is below the snapshot', async () => {
+      const client = new Table(guardFailed())
+      client.put(headItem('a', 5n, 1000))
+      const write = new DynamoRepository(client, 'events', options).putSnapshot(snapshot)
+
+      await expect(write).rejects.toBeInstanceOf(StreamHeadDriftError)
+      expect(client.transactions).toHaveLength(1)
+    })
+  })
+
+  describe('a failed commit', () => {
+    test.each([
+      {retained: true, want: ConflictError},
+      {retained: false, want: StreamHeadDriftError},
+    ])('with its head above its log (retained: $retained)', async ({retained, want}) => {
+      const client = new Table(headFailed())
+      client.put(headItem('a', 5n, 5000))
+      client.put(eventItem(event(3), 5000))
+      const repo = new DynamoRepository(client, 'events', retained ? options : {})
+      const commit = repo.commit({entityId: 'a', events: [event(6)]})
+
+      await expect(commit).rejects.toBeInstanceOf(want)
+    })
+
+    test.each([
+      {ttl: 900, want: ConflictError},
+      {ttl: 5000, want: StreamHeadDriftError},
+    ])('with no head over an event that expires at $ttl', async ({ttl, want}) => {
+      const client = new Table(headFailed())
+      client.put(eventItem(event(1), ttl))
+      const repo = new DynamoRepository(client, 'events', options)
+      const commit = repo.commit({entityId: 'a', events: [event(2)]})
+
+      await expect(commit).rejects.toBeInstanceOf(want)
+    })
+
+    test.each([
+      {ttl: 1000, want: ConflictError},
+      {ttl: 1001, want: StreamHeadDriftError},
+    ])('whose head passed over an event that expires at $ttl', async ({ttl, want}) => {
+      const client = new Table(eventFailed())
+      client.put(eventItem(event(1), ttl))
+      const repo = new DynamoRepository(client, 'events', options)
+      const commit = repo.commit({entityId: 'a', events: [event(1)]})
+
+      await expect(commit).rejects.toBeInstanceOf(want)
+    })
+  })
+})
+
 describe('the commit budget', () => {
   // The single-stream commits of feature-marker.json's streamHeads vectors, which the fixture
   // runner checks request by request; their sizes need the budget's internals.
   const fixture = join(dirname(fileURLToPath(import.meta.url)), '../../../compat/fixtures')
   const vectors = JSON.parse(readFileSync(join(fixture, 'feature-marker.json'), 'utf8'))
-    .streamHeads as {name: string; request: {streams?: Stream[]}; sizes?: number[]}[]
+    .streamHeads as {name: string; request: Request; sizes?: number[]}[]
+
+  interface Request {
+    streams?: Stream[]
+    clockUnixNano?: number
+    retentionNanos?: Record<string, number>
+  }
 
   interface Stream {
     entityId: string
@@ -246,10 +523,7 @@ describe('the commit budget', () => {
   }
 
   const singleStream = vectors.filter(
-    (vector) =>
-      vector.request.streams?.length === 1 &&
-      vector.sizes !== undefined &&
-      !('retentionNanos' in vector.request),
+    (vector) => vector.request.streams?.length === 1 && vector.sizes !== undefined,
   )
 
   test('covers the single-stream commits', () => {
@@ -258,6 +532,8 @@ describe('the commit budget', () => {
       'append',
       'create-with-snapshot',
       'append-with-later-snapshot',
+      'retained-create',
+      'retained-append',
     ])
   })
 
@@ -291,8 +567,13 @@ describe('the commit budget', () => {
             payload: new TextEncoder().encode('{}'),
           }
 
+    // The clock and the retention are whole milliseconds, exact as JSON numbers.
+    const retention = request.retentionNanos?.[stream.entityType]
+    const ttl =
+      retention === undefined ? undefined : expiry(request.clockUnixNano! / 1e6, retention / 1e6)
+
     // Go lists the head update after the stream's puts, and the budget only sums them.
-    const got = commitSizes({entityId: stream.entityId, events, snapshot}, () => undefined)
+    const got = commitSizes({entityId: stream.entityId, events, snapshot}, () => ttl)
     expect(ascending(got)).toEqual(ascending(sizes!))
   })
 })

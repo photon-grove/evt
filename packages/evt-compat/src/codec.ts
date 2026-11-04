@@ -219,7 +219,7 @@ function at(value: JsonValue | undefined): JsonValue {
 }
 
 // The fixture records nanoseconds. The TS clock and retention are whole milliseconds.
-function milliseconds(nanos: bigint): number {
+export function milliseconds(nanos: bigint): number {
   if (nanos % 1_000_000n !== 0n) {
     throw new Error(`${nanos} ns is not a whole number of milliseconds`)
   }

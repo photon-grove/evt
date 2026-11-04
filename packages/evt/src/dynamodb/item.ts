@@ -151,12 +151,14 @@ export function snapshotFromItem(item: Item): SerializedSnapshot {
 
 /** Decodes a head item into its head and its `ttl`, if it has one. */
 export function headFromItem(item: Item): {head: bigint; ttl: number | undefined} {
+  return {head: requiredNumber(item, 'head'), ttl: ttlFromItem(item)}
+}
+
+/** An item's `ttl` in Unix seconds, or undefined when it has none. */
+export function ttlFromItem(item: Item): number | undefined {
   const ttl = optionalNumber(item, 'ttl')
 
-  return {
-    head: requiredNumber(item, 'head'),
-    ttl: ttl === undefined ? undefined : safeInteger(ttl, 'ttl'),
-  }
+  return ttl === undefined ? undefined : safeInteger(ttl, 'ttl')
 }
 
 /** Whether an item is a stream's inline snapshot (`sk = 0`). */

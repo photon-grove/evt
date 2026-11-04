@@ -11,9 +11,9 @@ held to the fixtures Go and Rust generate, byte for byte.
 npm install @photon-grove/evt
 ```
 
-So far it has the core, the in-memory and DynamoDB backends, and the testing helpers. Retention and
-views on DynamoDB, the PostgreSQL backend, command outcomes and multi-stream transactions come in
-later releases, and the
+So far it has the core, the in-memory and DynamoDB backends, and the testing helpers. Views on
+DynamoDB, the PostgreSQL backend, command outcomes and multi-stream transactions come in later
+releases, and the
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -51,6 +51,13 @@ to make sure it's fresh, and `{lazyInitialization: true}` makes the first write 
 tests and local use. Reads are strongly consistent unless `{consistentRead: false}`. When another
 writer declares a feature, the next write fails once with a retryable
 `FeatureManifestChangedError`, which `executeWithRetry` runs again.
+
+`{retention: {scratch_job: 86_400_000}}` stamps a DynamoDB `ttl` on every event, snapshot and head
+item of the entity types it names, their write time plus the retention in milliseconds, as Go's
+`WithRetention` does. A head's `ttl` is never lowered: a writer with a shorter retention that
+hasn't loaded the stream gets a conflict, and its retry passes. TTL deletes items in no order, so
+use retention only for short-lived streams that nothing replays, and declare the retained types in
+the feature manifest from Go or Rust, so that their writers refuse read fences on them.
 
 ## Runtimes
 
