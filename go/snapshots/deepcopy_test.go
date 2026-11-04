@@ -27,7 +27,8 @@ func TestDeepCopy_CopiesTheFieldsAnUnexportedEmbeddedStructPromotes(t *testing.T
 		Name:         "n",
 	}
 
-	dup := deepCopy(reflect.ValueOf(original), copied{}).Interface().(embeddingAggregate)
+	dup, ok := deepCopy(reflect.ValueOf(original), copied{}).Interface().(embeddingAggregate)
+	require.True(t, ok)
 	dup.Labels["a"] = "changed"
 	dup.Tags[0] = "changed"
 
@@ -40,7 +41,8 @@ func TestDeepCopy_ASelfReferencingMapOrSliceTerminates(t *testing.T) {
 	selfMap := map[string]any{}
 	selfMap["self"] = selfMap
 
-	mapCopy := deepCopy(reflect.ValueOf(selfMap), copied{}).Interface().(map[string]any)
+	mapCopy, ok := deepCopy(reflect.ValueOf(selfMap), copied{}).Interface().(map[string]any)
+	require.True(t, ok)
 	require.Equal(t, reflect.ValueOf(mapCopy).Pointer(), reflect.ValueOf(mapCopy["self"]).Pointer(),
 		"the copy refers to itself, as the original does")
 	require.NotEqual(t, reflect.ValueOf(selfMap).Pointer(), reflect.ValueOf(mapCopy).Pointer())
@@ -48,7 +50,8 @@ func TestDeepCopy_ASelfReferencingMapOrSliceTerminates(t *testing.T) {
 	selfSlice := []any{nil}
 	selfSlice[0] = selfSlice
 
-	sliceCopy := deepCopy(reflect.ValueOf(selfSlice), copied{}).Interface().([]any)
+	sliceCopy, ok := deepCopy(reflect.ValueOf(selfSlice), copied{}).Interface().([]any)
+	require.True(t, ok)
 	require.Equal(t, reflect.ValueOf(sliceCopy).Pointer(), reflect.ValueOf(sliceCopy[0]).Pointer())
 	require.NotEqual(t, reflect.ValueOf(selfSlice).Pointer(), reflect.ValueOf(sliceCopy).Pointer())
 }
