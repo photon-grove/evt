@@ -1420,7 +1420,9 @@ the error) and only then by fence provenance:
   and a gap that persists is returned as an error rather than recorded against the command ID.
   Only a failed read that a multi-stream prepare step passes on counts: an error the step makes up
   itself, even one shaped like a conflict or a transient failure, is the step's own failure and is
-  returned at once in both languages.
+  returned at once in both languages. A Go transaction is consumed by a failed read; a Rust one
+  stays usable, and a later successful read of the same stream ends the failure, so an error the
+  step returns after it is its own.
 - `StreamHeadDrift` is neither. A stream whose head item disagrees with its log
   ([Classification](#failure-classification)) is not a conflict and not transient: the engine returns it at
   once, like any internal failure, records no outcome, and never turns it into a `stale-fence`
