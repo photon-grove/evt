@@ -1,6 +1,7 @@
 // feature-marker.json: the declarations (the manifest's stored JSON texts and its DynamoDB item,
 // for each declaration of a chain) and the streamHeads requests of the DynamoDB writer. The view
-// commits and the PostgreSQL vectors wait for the backends that write them.
+// commits and the PostgreSQL rows and writes wait for the backends that write them. postgres.ts
+// checks the PostgreSQL schemas.
 import {
   type Commit,
   type FeatureManifest,
