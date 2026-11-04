@@ -176,3 +176,35 @@ attempts run out.
 This means handlers and `Prepare` functions can run more than once, and they have to be safe to
 repeat. The store resets the aggregate between attempts from a deep copy of its exported fields. So
 keep the state `Apply` changes in exported fields, and don't mutate the command in a handler.
+
+## Client-expected versions
+
+A client often decides on what it last saw: it sends the version of a stream along with the
+command, and the command should be refused if that stream has moved since. Declare it in your
+`Prepare` with `tx.Expect(entityID, head)`, for a stream the transaction reads:
+
+```go
+prepare := func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+	if err := tx.Expect(profileID, request.ProfileVersion); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Read(ctx, profile, profileID); err != nil {
+		return nil, err
+	}
+
+	// ... decide, and Append or return a domain rejection
+	return nil, nil
+}
+```
+
+The check runs only when the command would be accepted. If the stream's loaded head differs, the
+engine records a `stale-version` rejection instead of committing, listing each stale stream with
+the expected and actual head. A domain rejection, such as `not-found`, is recorded as it is, so a
+stale version never hides it. Every retry attempt re-checks against its own load, so an acceptance
+never commits once the stream has moved. Put the client version in the command's payload too: like
+anything that distinguishes a request, it isn't part of the identity digest otherwise.
+
+To keep an existing wire code, replace the engine's codes when you enable outcomes:
+`snapshots.WithStaleVersionCode("stale")` and `snapshots.WithStaleFenceCode("stale")` (Rust:
+`OutcomeConfig::with_stale_version_code` and `with_stale_fence_code`). Only the code changes.

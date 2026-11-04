@@ -7,7 +7,7 @@
 //! handle, so each stream's events are serialized by its own `A` while one commit spans streams
 //! of several aggregate types, such as a profile and the unique-name claim that guards it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -20,8 +20,8 @@ use crate::ids::{CommandId, EntityId, EntityType, EventSequence};
 use crate::json;
 use crate::metadata::Metadata;
 use crate::outcome::{
-    CommandIdentity, CommandOutcome, Outcome, OutcomeConfig, Rejection, Settled, pre_check,
-    require_command_id, settle,
+    CommandIdentity, CommandOutcome, Outcome, OutcomeConfig, Rejection, Settled, StaleVersion,
+    pre_check, require_command_id, settle,
 };
 use crate::projection::{
     CommitProjector, CommitStream, CommitView, HistoryLedger, project_application, ready_projectors,
@@ -211,6 +211,9 @@ pub struct Transaction<'a, R: Repository> {
     command: Option<PendingCommand>,
     /// The last [`read`](Transaction::read) that failed to load its stream.
     read_failure: Option<ReadFailure>,
+    /// The client-expected heads declared with [`expect`](Transaction::expect), checked when the
+    /// command is accepted.
+    expected: BTreeMap<EntityId, EventSequence>,
 }
 
 impl<A: Aggregate, R: Repository> Store<A, R> {
@@ -279,6 +282,7 @@ impl<'a, R: Repository> Transaction<'a, R> {
             outcomes: None,
             command: None,
             read_failure: None,
+            expected: BTreeMap::new(),
         }
     }
 
@@ -746,6 +750,20 @@ impl<'a, R: Repository> Transaction<'a, R> {
         mut self,
         response: Option<Vec<u8>>,
     ) -> Result<CommandOutcome, Error> {
+        // A command that would be accepted on a stream the client saw at another head is refused
+        // as stale, through the same fenced, outcome-only commit as a domain rejection.
+        if !self.expected.is_empty() {
+            let stale = self.stale_versions()?;
+            if !stale.is_empty() {
+                let rejection = self.outcomes.as_ref().map_or_else(
+                    || Rejection::stale_version(&stale),
+                    |config| config.stale_version(&stale),
+                );
+
+                return self.reject(rejection).await;
+            }
+        }
+
         let pending = self.take_command()?;
         self.ready_projectors().await?;
 
@@ -931,6 +949,79 @@ impl<'a, R: Repository> Transaction<'a, R> {
         })
     }
 
+    /// Declares the head a client last saw for a stream the transaction reads (or will read before
+    /// it commits). It is checked only when the command is accepted
+    /// ([`commit_with_outcome`](Transaction::commit_with_outcome)): if the head the transaction
+    /// loaded differs, the command records the stale-version rejection
+    /// ([`Rejection::stale_version`], under
+    /// [`OutcomeConfig::with_stale_version_code`]) instead of committing, through the same fenced,
+    /// outcome-only commit as [`reject`](Transaction::reject). [`reject`](Transaction::reject) and
+    /// [`reject_with_events`](Transaction::reject_with_events) never consult it, so a domain
+    /// rejection wins over a stale version. Under
+    /// [`Store::execute_transaction`](crate::Store::execute_transaction) every attempt checks the
+    /// expectations against its own load, so an acceptance never commits once an expected stream
+    /// has moved.
+    ///
+    /// Expecting one stream at two different heads is [`Error::InvalidArgument`], and so is
+    /// accepting a command that expects a stream the transaction never read.
+    pub fn expect(
+        &mut self,
+        entity_id: impl Into<EntityId>,
+        head: EventSequence,
+    ) -> Result<&mut Self, Error> {
+        self.check_open()?;
+        let entity_id = entity_id.into();
+
+        if head.get() < 0 {
+            return Err(Error::InvalidArgument(format!(
+                "expected head {} of {entity_id} is negative",
+                head.get()
+            )));
+        }
+
+        if let Some(earlier) = self.expected.get(&entity_id)
+            && *earlier != head
+        {
+            return Err(Error::InvalidArgument(format!(
+                "{entity_id} is expected at head {} and {}",
+                earlier.get(),
+                head.get()
+            )));
+        }
+
+        self.expected.insert(entity_id, head);
+
+        Ok(self)
+    }
+
+    /// Compares the client-expected heads with the heads this transaction loaded and returns the
+    /// streams that differ.
+    fn stale_versions(&self) -> Result<Vec<StaleVersion>, Error> {
+        let mut stale = Vec::new();
+
+        for (entity_id, expected) in &self.expected {
+            let Some(stream) = self
+                .streams
+                .iter()
+                .find(|stream| &stream.entity_id == entity_id)
+            else {
+                return Err(Error::InvalidArgument(format!(
+                    "{entity_id} has an expected head but the transaction never read it"
+                )));
+            };
+
+            if stream.head != *expected {
+                stale.push(StaleVersion {
+                    entity_id: entity_id.clone(),
+                    expected: *expected,
+                    actual: stream.head,
+                });
+            }
+        }
+
+        Ok(stale)
+    }
+
     /// Persists the `stale-fence` rejection of a failed caller-stamped fence with an outcome-only
     /// transaction that carries none of the failed commit's other items: no fences (they are
     /// stale by definition), no events, no snapshots, no projector operations.
@@ -940,7 +1031,11 @@ impl<'a, R: Repository> Transaction<'a, R> {
             &pending.command_id,
             &pending.digest,
             self.recovery_wait(),
-            Rejection::stale_fence(),
+            self.outcomes
+                .as_ref()
+                .map_or_else(Rejection::stale_fence, |config| {
+                    config.stale_fence(Rejection::stale_fence())
+                }),
         )
         .await
     }

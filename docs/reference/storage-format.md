@@ -1293,8 +1293,12 @@ bug is fixed starts clean. A domain rejection whose encoded form exceeds the 655
 bound ([Command outcomes](#command-outcomes)) writes no outcome either: the command fails with
 `OutcomeTooLarge` before any write, and the caller retries once the rejection is smaller.
 Engine-provided rejection codes are `not-found` and `bad-command`
-(Go's former `NotFoundError`/`BadCommandError`), and the engine's own stale-fence rejection
-([Fence-aware retry](#fence-aware-retry)). Domain error enums map onto rejection codes in each
+(Go's former `NotFoundError`/`BadCommandError`), and the engine's own stale-fence and
+stale-version rejections ([Fence-aware retry](#fence-aware-retry),
+[Client-expected versions](#client-expected-versions)). A store can replace the code of either
+engine rejection to keep an application's existing wire code (Go `snapshots.WithStaleFenceCode` and
+`WithStaleVersionCode`, Rust `OutcomeConfig::with_stale_fence_code` and `with_stale_version_code`);
+the message and details stay as pinned. Domain error enums map onto rejection codes in each
 language. Codes are free-form strings beyond the engine-provided ones.
 
 A `stale-fence` rejection is durable even though the condition it records is transient: exactly
@@ -1539,6 +1543,51 @@ Although a stale fence is transient by nature, the rejection is a durable, termi
 command: the caller re-reads, re-decides, and submits a new command ID. The old ID replays its
 stored `stale-fence` rejection verbatim, like any rejected outcome, and the same ID with another
 identity is `IdempotencyKeyReuse`.
+
+### Client-expected versions
+
+A client can send the head it last saw for a stream the command reads, so the command is refused
+as stale when that stream has moved since. A multi-stream command declares it on its transaction
+(Go `Transaction.Expect(entityID, head)`, Rust `Transaction::expect(entity_id, head)`), for a
+stream the transaction reads before or after the call. The rules, the same in both languages:
+
+- The check runs only when the command is accepted (Go `Complete`, Rust `commit_with_outcome`),
+  before anything is written. A command that rejects (`Reject`, `RejectWithEvents`) never consults
+  it, so a domain rejection such as `not-found` or `taken` always wins over a stale version.
+- If any expected stream's loaded head differs from the expectation, the command records the
+  stale-version rejection instead of committing its events. It is committed like a plain domain
+  rejection, with the fences of every stream the transaction read, so a conflict on it re-prepares
+  the command like any other conflict.
+- An expectation for a stream the transaction never read, a negative head, or one stream expected
+  at two different heads is an invalid argument, returned before any write. Nothing is recorded.
+- There is no separate attempt budget. Every attempt checks the expectations against its own
+  load, and the engine fence pins an accepted commit to the head it loaded, so an acceptance never
+  commits once an expected stream has moved: the next attempt decides stale (or rejects). A
+  conflict on a stream the client did not expect still re-prepares as usual.
+- Expectations are not part of the [identity digest](#identity-digest). Like everything else that
+  distinguishes a request, a client version belongs in the command's payload.
+
+The stale-version rejection's shape is pinned in both languages: the code is `stale-version`
+(unless the store replaces it), the message is `a client-expected stream version is stale`, and
+`details` lists every mismatched stream, sorted by entity ID, with the head the client expected and
+the head the attempt loaded. Keys sort as the JSON encoding sorts them:
+
+```json
+{
+  "code": "stale-version",
+  "message": "a client-expected stream version is stale",
+  "details": {
+    "streams": [
+      { "actual": 1, "entityId": "claim#ada", "expected": 0 },
+      { "actual": 6, "entityId": "profile#u-1", "expected": 4 }
+    ]
+  }
+}
+```
+
+The stored rejection is the canonical encoding of that object, as `compat/fixtures/outcomes.json`
+pins under `rejected stale version`. Like `stale-fence` it is a durable outcome: the command ID
+replays it, and the remedy is a new command ID decided on fresh state.
 
 ### The outcome-only transaction
 

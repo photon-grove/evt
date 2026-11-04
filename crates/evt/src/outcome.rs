@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{BoxError, Error};
 use crate::event::SerializedEvent;
-use crate::ids::{CommandId, EntityId, EntityType, EventId, PrincipalId};
+use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence, PrincipalId};
 use crate::json;
 use crate::metadata::Metadata;
 use crate::repository::Repository;
@@ -79,7 +79,8 @@ impl fmt::Display for OutcomeStatus {
 
 /// A free-form, machine-readable reason for a rejection. The engine provides
 /// [`NOT_FOUND`](RejectionCode::NOT_FOUND), [`BAD_COMMAND`](RejectionCode::BAD_COMMAND), and
-/// [`STALE_FENCE`](RejectionCode::STALE_FENCE); applications add their own.
+/// [`STALE_FENCE`](RejectionCode::STALE_FENCE), and [`STALE_VERSION`](RejectionCode::STALE_VERSION);
+/// applications add their own.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct RejectionCode(Cow<'static, str>);
@@ -94,6 +95,11 @@ impl RejectionCode {
     /// The state a command was decided on went stale and the command cannot be decided again: a
     /// caller-stamped read fence failed, or fence-aware retry ran out of attempts (C5).
     pub const STALE_FENCE: Self = Self(Cow::Borrowed("stale-fence"));
+
+    /// A client-expected head of a stream the command read
+    /// ([`Transaction::expect`](crate::Transaction::expect)) no longer matched the stream, and the
+    /// command would otherwise have been accepted.
+    pub const STALE_VERSION: Self = Self(Cow::Borrowed("stale-version"));
 
     /// Creates an application-defined code.
     pub fn new(code: impl Into<String>) -> Self {
@@ -224,6 +230,39 @@ impl Rejection {
             "the state this command was decided on kept changing; retries were exhausted",
         )
         .with_details(serde_json::json!({ "attempts": attempts }))
+    }
+
+    /// The engine's [`STALE_VERSION`](RejectionCode::STALE_VERSION) rejection, recorded when
+    /// client-expected heads went stale. Its details list every mismatched stream, sorted by entity
+    /// ID, as `{"streams":[{"actual":n,"entityId":id,"expected":n}]}`, so Go and Rust store the
+    /// same bytes.
+    pub fn stale_version(stale: &[StaleVersion]) -> Self {
+        let mut sorted = stale.to_vec();
+        sorted.sort_by(|a, b| a.entity_id.as_str().cmp(b.entity_id.as_str()));
+
+        let streams: Vec<serde_json::Value> = sorted
+            .iter()
+            .map(|stream| {
+                serde_json::json!({
+                    "actual": stream.actual.get(),
+                    "entityId": stream.entity_id.as_str(),
+                    "expected": stream.expected.get(),
+                })
+            })
+            .collect();
+
+        Self::new(
+            RejectionCode::STALE_VERSION,
+            "a client-expected stream version is stale",
+        )
+        .with_details(serde_json::json!({ "streams": streams }))
+    }
+
+    /// Replaces the rejection's code, keeping its message and details.
+    #[must_use]
+    pub(crate) fn with_code(mut self, code: RejectionCode) -> Self {
+        self.code = code;
+        self
     }
 
     /// Encodes the rejection as its stored JSON, byte for byte as Go's `EncodeRejection` writes
@@ -771,6 +810,20 @@ pub struct OutcomeConfig {
     digester: Digester,
     recovery_wait: Duration,
     retry: RetryPolicy,
+    stale_fence_code: RejectionCode,
+    stale_version_code: RejectionCode,
+}
+
+/// One stream whose client-expected head did not match: the head the client expected and the head
+/// the command's attempt loaded. See [`Rejection::stale_version`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleVersion {
+    /// The stream.
+    pub entity_id: EntityId,
+    /// The head the client expected.
+    pub expected: EventSequence,
+    /// The head the attempt loaded.
+    pub actual: EventSequence,
 }
 
 impl Default for OutcomeConfig {
@@ -792,7 +845,39 @@ impl OutcomeConfig {
             digester: Arc::new(default_digest),
             recovery_wait: Duration::from_secs(10),
             retry: RetryPolicy::default(),
+            stale_fence_code: RejectionCode::STALE_FENCE,
+            stale_version_code: RejectionCode::STALE_VERSION,
         }
+    }
+
+    /// Replaces the code of the stale-fence rejections the engine records, a failed
+    /// caller-stamped fence and exhausted retries, which is
+    /// [`STALE_FENCE`](RejectionCode::STALE_FENCE) by default. Use it to keep an application's
+    /// existing wire code; the message and details are unchanged.
+    #[must_use]
+    pub fn with_stale_fence_code(mut self, code: RejectionCode) -> Self {
+        self.stale_fence_code = code;
+        self
+    }
+
+    /// Replaces the code of the stale-version rejection the engine records when a client-expected
+    /// head went stale ([`Transaction::expect`](crate::Transaction::expect)), which is
+    /// [`STALE_VERSION`](RejectionCode::STALE_VERSION) by default. The message and details are
+    /// unchanged.
+    #[must_use]
+    pub fn with_stale_version_code(mut self, code: RejectionCode) -> Self {
+        self.stale_version_code = code;
+        self
+    }
+
+    /// The engine's stale-fence rejection under the configured code.
+    pub(crate) fn stale_fence(&self, rejection: Rejection) -> Rejection {
+        rejection.with_code(self.stale_fence_code.clone())
+    }
+
+    /// The engine's stale-version rejection under the configured code.
+    pub(crate) fn stale_version(&self, stale: &[StaleVersion]) -> Rejection {
+        Rejection::stale_version(stale).with_code(self.stale_version_code.clone())
     }
 
     /// Bounds fence-aware retry (C5), [`RetryPolicy::default`] by default. See
