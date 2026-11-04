@@ -117,6 +117,58 @@ func (store *Store) ResolveCommand(
 	return replayed, err
 }
 
+// ResolveCommandForPrincipal reads a command's outcome row by command ID alone and answers it for
+// the asking principal (nil when there is none), for a caller that cannot rebuild the command's full
+// identity. Nothing is run or written. It returns the stored outcome (Replayed) when the row's
+// recorded principal is the asking one (both absent counts as equal), nil, nil when the command has
+// no outcome, and *evt.OutcomePrincipalMismatchError otherwise: with Recorded true for a row of
+// another principal, and Recorded false for a row written before outcomes recorded their identity,
+// which cannot be matched and fails closed. The error never carries the stored outcome. The digest
+// is not compared: use ResolveCommand to check the full identity.
+func (store *Store) ResolveCommandForPrincipal(
+	ctx context.Context,
+	commandID evt.CommandID,
+	principal *evt.PrincipalID,
+) (*evt.CommandOutcome, error) {
+	repo, err := store.outcomeRepository()
+	if err != nil {
+		return nil, err
+	}
+
+	if err = evt.CheckCommandID(commandID); err != nil {
+		return nil, err
+	}
+
+	if principal != nil {
+		if err = evt.CheckMetadata(evt.Metadata{PrincipalID: principal}); err != nil {
+			return nil, err
+		}
+	}
+
+	stored, err := repo.GetOutcome(ctx, commandID)
+	if err != nil || stored == nil {
+		return nil, err
+	}
+
+	if stored.Identity == nil {
+		return nil, &evt.OutcomePrincipalMismatchError{CommandID: commandID}
+	}
+
+	if !samePrincipal(stored.Identity.Principal, principal) {
+		return nil, &evt.OutcomePrincipalMismatchError{CommandID: commandID, Recorded: true}
+	}
+
+	return &evt.CommandOutcome{Outcome: *stored, Replayed: true}, nil
+}
+
+func samePrincipal(a, b *evt.PrincipalID) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+
+	return *a == *b
+}
+
 // executed is the result of running a command through the outcome path: the outcome, plus the
 // handler's own domain error when this call produced a rejection.
 type executed struct {
@@ -614,6 +666,9 @@ type command struct {
 	id     evt.CommandID
 	digest string
 
+	// identity is the identity the outcome row records beside the digest.
+	identity *evt.RecordedIdentity
+
 	metadata evt.Metadata
 }
 
@@ -658,6 +713,7 @@ func (store *Store) newCommand(identity evt.CommandIdentity, metadata evt.Metada
 		repo:     repo,
 		id:       *metadata.CommandID,
 		digest:   digest,
+		identity: evt.RecordedIdentityOf(input),
 		metadata: metadata.Clone(),
 	}, nil
 }
@@ -737,6 +793,7 @@ func (c *command) commit(
 		Digest:    c.digest,
 		Response:  bytes.Clone(response),
 		Rejection: rejection,
+		Identity:  c.identity.Clone(),
 	}
 
 	normalized, err := evt.NormalizeCommit(result)
@@ -754,6 +811,7 @@ func (c *command) commit(
 // cloneOutcome copies the byte slice an outcome shares with the commit that produced it.
 func cloneOutcome(outcome evt.Outcome) evt.Outcome {
 	outcome.Response = bytes.Clone(outcome.Response)
+	outcome.Identity = outcome.Identity.Clone()
 
 	return outcome
 }

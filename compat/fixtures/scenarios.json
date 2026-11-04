@@ -3604,6 +3604,9 @@
         {
           "commandId": "compat-fixture-outcomes-idempotency-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "305701838d819fc249c1e5836e7f74e074a56dc8d9cbc3b9d1276381ca438492"
             },
@@ -3618,12 +3621,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-idempotency\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-idempotency-c2",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "b71d532099127a4838d124970e3d356da34722a1d1a492399f71f1fb3dd1de2c"
             },
@@ -3641,12 +3650,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-idempotency\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-idempotency-c3",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:batchDeposit"
+            },
             "digest": {
               "S": "4853b4a3c1c94fcb57a56c2722f4db86e61f8f576756cc86df4b9729c56dafeb"
             },
@@ -3664,12 +3679,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-idempotency\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-idempotency-c4",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "85c612ee1e8b0c585787cd4152f353d0a7848b3e7c1f14260e85240c987d42e7"
             },
@@ -3679,6 +3700,9 @@
             "pk": {
               "S": "command-outcome#compat-fixture-outcomes-idempotency-c4"
             },
+            "principal": {
+              "S": "user:42"
+            },
             "response": {
               "S": "eyJiYWxhbmNlQ2VudHMiOjg1MH0="
             },
@@ -3687,12 +3711,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-idempotency\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-idempotency-c5",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "ff044a0cea65ef1de1cf5baa6d68e1f049475744b5cbf6dd9b42949eb96c5a44"
             },
@@ -3710,6 +3740,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-idempotency\"]"
             }
           }
         }
@@ -4061,6 +4094,9 @@
         {
           "commandId": "compat-fixture-outcomes-noop-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "aa9f9bfc226cdab173a06506f0c3e34560b36ea9bb00bd7d466beea684472e60"
             },
@@ -4075,12 +4111,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-noop\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-noop-c2",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "426f428b5bec579002f1570f4569c5ee880e92a7501c94accc2b4fb7b6861145"
             },
@@ -4098,12 +4140,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-noop\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-noop-c3",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:balance"
+            },
             "digest": {
               "S": "31381729cceeedba149cfee16f522e4b9985a7958c2b032c03baf1e37132edc3"
             },
@@ -4118,12 +4166,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-noop\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-noop-c4",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:audit"
+            },
             "digest": {
               "S": "2649fe4f67c4e2a0fa1ae79dacf8776c0cef2745130579f4922680e12c96e9de"
             },
@@ -4138,12 +4192,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-noop-c5",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:ping"
+            },
             "digest": {
               "S": "6c6c040abacfdffc901cb59db9071ef2b890d1c03a0ed3b27de26fb197a95051"
             },
@@ -4155,12 +4215,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-noop\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-noop-c6",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "6c3f1745c332b517c4783fa672fc006c2e8afce031a4e600d4ea405854285fc0"
             },
@@ -4178,6 +4244,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-noop\"]"
             }
           }
         }
@@ -4529,6 +4598,9 @@
         {
           "commandId": "compat-fixture-outcomes-rejection-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "7616da42aa3ff73599e2cc4ab80aec94c70f04606592b432ddeea74a9cc69830"
             },
@@ -4543,6 +4615,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection\"]"
             }
           }
         },
@@ -4551,6 +4626,9 @@
           "dynamoItem": {
             "code": {
               "S": "insufficient-funds"
+            },
+            "commandType": {
+              "S": "account:withdraw"
             },
             "digest": {
               "S": "51090b753ac40624866e472733395b634bfcbcf0a1cef682db6f614d9a928a6f"
@@ -4566,12 +4644,18 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-rejection-c3",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "e0ff0202273cda8a62d24390039911528f2cdeee9bf7d00972f9704fba83c946"
             },
@@ -4589,6 +4673,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection\"]"
             }
           }
         },
@@ -4597,6 +4684,9 @@
           "dynamoItem": {
             "code": {
               "S": "amount-must-be-positive"
+            },
+            "commandType": {
+              "S": "account:deposit"
             },
             "digest": {
               "S": "cb47bdf7cc1986a7573e5d878c96d5c18d16afb32de8b702629bf11f16dc4196"
@@ -4612,6 +4702,9 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection\"]"
             }
           }
         },
@@ -4620,6 +4713,9 @@
           "dynamoItem": {
             "code": {
               "S": "account-already-opened"
+            },
+            "commandType": {
+              "S": "account:open"
             },
             "digest": {
               "S": "36cd967144f2c9747b1338bb032f6b5bd5a3e3af8ee5a7e60bd208e87bc1cbd9"
@@ -4635,12 +4731,18 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-rejection-c6",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:withdraw"
+            },
             "digest": {
               "S": "dbe56cde2a98ccce5acfb3cb9cb572278abf50a6c1b38bc7340122d6d8ff32ba"
             },
@@ -4658,6 +4760,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection\"]"
             }
           }
         }
@@ -5127,6 +5232,9 @@
         {
           "commandId": "compat-fixture-outcomes-rejection-events-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "b5095d222b0f40fe6ce783a4f516888772d1cb6e078a313e6f914e220dcea2df"
             },
@@ -5141,12 +5249,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection-events\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-rejection-events-c2",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "fc6717cd76ffbd92d1f9d2ef4da89283d71c78d91353ca5d8604a372e68b7af9"
             },
@@ -5164,6 +5278,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection-events\"]"
             }
           }
         },
@@ -5172,6 +5289,9 @@
           "dynamoItem": {
             "code": {
               "S": "insufficient-funds"
+            },
+            "commandType": {
+              "S": "account:withdrawAudited"
             },
             "digest": {
               "S": "7e6751554410403f57aa12870589691c84490455e2ec38112338d8b11ca17da3"
@@ -5190,6 +5310,9 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection-events\"]"
             }
           }
         },
@@ -5198,6 +5321,9 @@
           "dynamoItem": {
             "code": {
               "S": "insufficient-funds"
+            },
+            "commandType": {
+              "S": "account:withdrawAudited"
             },
             "digest": {
               "S": "ce68e5df11e0463f995b2439fcef9fc7f5322b955d626e1ee891d1cd44f7e364"
@@ -5216,12 +5342,18 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection-events\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-rejection-events-c5",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:withdrawAudited"
+            },
             "digest": {
               "S": "7366b1a2a1106ba515a056e82242f8cd0b560b4247fd31cd1ac4378f3dc3bdf6"
             },
@@ -5239,6 +5371,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection-events\"]"
             }
           }
         },
@@ -5247,6 +5382,9 @@
           "dynamoItem": {
             "code": {
               "S": "insufficient-funds"
+            },
+            "commandType": {
+              "S": "account:withdraw"
             },
             "digest": {
               "S": "965d9b2e095e283ce7328377bae62ed95303ea8d54138b8ac5a1e7397bcd792b"
@@ -5262,6 +5400,9 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-rejection-events\"]"
             }
           }
         }
@@ -5629,6 +5770,9 @@
         {
           "commandId": "compat-fixture-outcomes-ambiguous-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "c18ba91047dcee6483d42a31f38d1026e568d5e63f1dc308150c17bc8f32eead"
             },
@@ -5643,12 +5787,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-ambiguous\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-ambiguous-c2",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "ac28b36c99fa27ae9c62611750cf8e3c1a9fc021925a9988096a18f306b2646a"
             },
@@ -5666,12 +5816,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-ambiguous\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-ambiguous-c3",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "54131323b1d0bbacdae8476f06a8a549125b6c9c753b412a64994b32786fa15d"
             },
@@ -5689,6 +5845,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-ambiguous\"]"
             }
           }
         },
@@ -5697,6 +5856,9 @@
           "dynamoItem": {
             "code": {
               "S": "insufficient-funds"
+            },
+            "commandType": {
+              "S": "account:withdraw"
             },
             "digest": {
               "S": "2500810bb95a6612b955616dd3baf43d70748767e52d865933d7ebc124a5c0b1"
@@ -5712,12 +5874,18 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-ambiguous\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-outcomes-ambiguous-c5",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "e3b9ec76e58bdc598ea1e364af4ebff9a48bf7457efc74db8f5e4589b1d0d27a"
             },
@@ -5735,6 +5903,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-outcomes-ambiguous\"]"
             }
           }
         }
@@ -6315,6 +6486,9 @@
         {
           "commandId": "compat-fixture-stream-heads-drift-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "544a0da0249b47de2a3880c9679a93ca31375dac1bf4bcf464cb0a5f7cbb8084"
             },
@@ -6329,12 +6503,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-stream-heads-drift\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-stream-heads-drift-c2",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "dd286610e5db0420d742f47d6657098f5efa08c3d8da612822706fac2124aa1b"
             },
@@ -6352,6 +6532,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-stream-heads-drift\"]"
             }
           }
         }
@@ -8013,6 +8196,9 @@
         {
           "commandId": "compat-fixture-commit-wide-projector-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "641fc1b78337db90422b167906fa88a5dc113a09f80d3d236c6f2519ae21a088"
             },
@@ -8027,12 +8213,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-commit-wide-projector-c2",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "417d6491f8094d7be4c17ea021f197c812783efab676e5cd98b093316612c950"
             },
@@ -8050,12 +8242,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-commit-wide-projector-c3",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:batchDeposit"
+            },
             "digest": {
               "S": "e74f66211e9f3a0f7a89d59a5e2e0e5ea88323206d770caa1f0a94eef1647e3d"
             },
@@ -8073,6 +8271,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         },
@@ -8081,6 +8282,9 @@
           "dynamoItem": {
             "code": {
               "S": "insufficient-funds"
+            },
+            "commandType": {
+              "S": "account:withdrawAudited"
             },
             "digest": {
               "S": "b86b4bf3bdbfb3cd2158b796350819f0688b22f657f3851a402ea2b457858dcc"
@@ -8099,6 +8303,9 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         },
@@ -8107,6 +8314,9 @@
           "dynamoItem": {
             "code": {
               "S": "insufficient-funds"
+            },
+            "commandType": {
+              "S": "account:withdraw"
             },
             "digest": {
               "S": "3cbb5244b9f2827af278deff72e39d99bc7b268d07936e8355167efd119e7a75"
@@ -8122,12 +8332,18 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-commit-wide-projector-c6",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:ping"
+            },
             "digest": {
               "S": "7eeefe83db78d258d2af0d35f2587f90f2d297c244a7bab857d3fa8816666b91"
             },
@@ -8139,12 +8355,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-commit-wide-projector-c7",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:tag"
+            },
             "digest": {
               "S": "c17359d32d3adfb49761fa3dfc95e15128a7d1759ac9d9127f3750a85b9ab204"
             },
@@ -8159,12 +8381,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-commit-wide-projector-c8",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:withdraw"
+            },
             "digest": {
               "S": "d0b93b43b7b9c2f1874741af9a2c987a08847b3564b3e648cb40a415e858d5ce"
             },
@@ -8182,12 +8410,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-commit-wide-projector-c9",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "2dabb41e013fe30116e4b6d4e845c043676d60904bfc1deaec74f9d719756ccc"
             },
@@ -8205,6 +8439,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-commit-wide-projector\"]"
             }
           }
         }
@@ -8610,6 +8847,9 @@
         {
           "commandId": "compat-fixture-reserved-namespaces-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "b86ee360cb8617fcb610329b038572bed8aea48a24f748d7392e6587483fb180"
             },
@@ -8624,12 +8864,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-reserved-namespaces\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-reserved-namespaces-c2",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "4c77caeb5333d2971100dc68b9f43ee9a2d21a73457ff7650e36166ec7de88f0"
             },
@@ -8647,12 +8893,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-reserved-namespaces\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-reserved-namespaces-c7",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:deposit"
+            },
             "digest": {
               "S": "081ad230b21bd1a1b33118bf4514d5e580aa43cea8e0e7744f4bc71b1b5608f1"
             },
@@ -8670,6 +8922,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-reserved-namespaces\"]"
             }
           }
         }
@@ -13207,6 +13462,9 @@
         {
           "commandId": "compat-fixture-fence-aware-retry-c1",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:open"
+            },
             "digest": {
               "S": "e6f0ba7ff24ab61f898e8e8bb5e99ea43a117f5e223812c723bfd2b3892668ad"
             },
@@ -13221,12 +13479,18 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-fence-aware-retry\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-fence-aware-retry-c2",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:copy"
+            },
             "digest": {
               "S": "ccb02fc2141edb894fd4bc2d9c8f0c0d6fd75bd1a6ef33c1ff3aeb8c25df7d9b"
             },
@@ -13241,6 +13505,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-fence-aware-retry\"]"
             }
           }
         },
@@ -13249,6 +13516,9 @@
           "dynamoItem": {
             "code": {
               "S": "stale-fence"
+            },
+            "commandType": {
+              "S": "account:copy"
             },
             "digest": {
               "S": "6493286af66d3a2685295bf0172eb58a6f8ce77384ca53b7b29399c494589504"
@@ -13264,12 +13534,18 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-fence-aware-retry\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-fence-aware-retry-c4",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:copy"
+            },
             "digest": {
               "S": "01ac1498685414d656280ac82de23812833dd70a7aff1987cbe25316800dff84"
             },
@@ -13284,6 +13560,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-fence-aware-retry\"]"
             }
           }
         },
@@ -13292,6 +13571,9 @@
           "dynamoItem": {
             "code": {
               "S": "stale-fence"
+            },
+            "commandType": {
+              "S": "account:copy"
             },
             "digest": {
               "S": "6e0831f40cd62964ae9744a06659c932f3ce62f304e6a56a909833c98b5f48a8"
@@ -13307,12 +13589,18 @@
             },
             "status": {
               "S": "rejected"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-fence-aware-retry\"]"
             }
           }
         },
         {
           "commandId": "compat-fixture-fence-aware-retry-c6",
           "dynamoItem": {
+            "commandType": {
+              "S": "account:copy"
+            },
             "digest": {
               "S": "ad09196acf9c8adef82a4217d14f493744ea0b6d0621c647d2906f8a07b2364c"
             },
@@ -13327,6 +13615,9 @@
             },
             "status": {
               "S": "accepted"
+            },
+            "targets": {
+              "S": "[\"compat-fixture-fence-aware-retry\"]"
             }
           }
         }

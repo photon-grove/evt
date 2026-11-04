@@ -77,11 +77,11 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 	// An absent attribute reads as empty; a present one of the wrong DynamoDB type is a corrupt
 	// row, not an empty value.
 	var (
-		texts   [6]string
-		present [6]bool
+		texts   [9]string
+		present [9]bool
 	)
 
-	for i, name := range []string{"status", "digest", "response", "events", "rejection", "code"} {
+	for i, name := range []string{"status", "digest", "response", "events", "rejection", "code", "commandType", "targets", "principal"} {
 		attribute, exists := output.Item[name]
 		if !exists {
 			continue
@@ -107,6 +107,18 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 
 	if outcome.Rejection != nil && texts[5] != string(outcome.Rejection.Code) {
 		return nil, &evt.CorruptOutcomeError{CommandID: id, Reason: "the code attribute disagrees with the rejection"}
+	}
+
+	optional := func(i int) *string {
+		if !present[i] {
+			return nil
+		}
+
+		return &texts[i]
+	}
+
+	if outcome.Identity, err = evt.DecodeRecordedIdentity(id, optional(6), optional(7), optional(8)); err != nil {
+		return nil, err
 	}
 
 	return &outcome, nil

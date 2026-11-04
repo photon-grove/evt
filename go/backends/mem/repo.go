@@ -201,6 +201,7 @@ func (repo Repository) GetOutcome(_ context.Context, id evt.CommandID) (*evt.Out
 func cloneOutcome(outcome evt.Outcome) evt.Outcome {
 	outcome.Response = slices.Clone(outcome.Response)
 	outcome.EventIDs = slices.Clone(outcome.EventIDs)
+	outcome.Identity = outcome.Identity.Clone()
 
 	if outcome.Rejection != nil {
 		// A JSON round trip copies nested maps and slices too, and yields the form the durable

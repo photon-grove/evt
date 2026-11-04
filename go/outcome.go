@@ -293,6 +293,141 @@ type Outcome struct {
 
 	// Rejection is set when Status is OutcomeRejected.
 	Rejection *Rejection
+
+	// Identity is the identity the digest was computed from, as the row records it: nil for a row
+	// written before outcomes recorded their identity. It is descriptive; the digest stays the
+	// idempotency key.
+	Identity *RecordedIdentity
+}
+
+// RecordedIdentity is the command identity an outcome row records beside its digest (storage
+// spec, Recorded identity): the command type, the target streams deduplicated and sorted by byte
+// order as the digest takes them, and the principal, nil when the command had none.
+type RecordedIdentity struct {
+	Type      CommandType
+	Targets   []EntityID
+	Principal *PrincipalID
+}
+
+// RecordedIdentityOf returns the identity an outcome records for a digest input.
+func RecordedIdentityOf(input DigestInput) *RecordedIdentity {
+	targets := slices.Clone(input.Targets)
+	slices.Sort(targets)
+	targets = slices.Compact(targets)
+
+	if targets == nil {
+		targets = []EntityID{}
+	}
+
+	identity := &RecordedIdentity{Type: input.CommandType, Targets: targets}
+	if input.Principal != "" {
+		principal := PrincipalID(input.Principal)
+		identity.Principal = &principal
+	}
+
+	return identity
+}
+
+// Clone returns a copy that shares no storage with the identity.
+func (identity *RecordedIdentity) Clone() *RecordedIdentity {
+	if identity == nil {
+		return nil
+	}
+
+	clone := &RecordedIdentity{Type: identity.Type, Targets: slices.Clone(identity.Targets)}
+	if identity.Principal != nil {
+		principal := *identity.Principal
+		clone.Principal = &principal
+	}
+
+	return clone
+}
+
+// EncodeTargets returns the stored JSON array of the identity's target stream IDs.
+func (identity RecordedIdentity) EncodeTargets() (string, error) {
+	targets := identity.Targets
+	if targets == nil {
+		targets = []EntityID{}
+	}
+
+	data, err := json.Marshal(targets)
+	if err != nil {
+		return "", fmt.Errorf("encode outcome targets: %w", err)
+	}
+
+	return string(data), nil
+}
+
+// size is the bytes the identity's fields take, as the bound counts them.
+func (identity RecordedIdentity) size() (int, error) {
+	targets, err := identity.EncodeTargets()
+	if err != nil {
+		return 0, err
+	}
+
+	size := len(identity.Type) + len(targets)
+	if identity.Principal != nil {
+		size += len(*identity.Principal)
+	}
+
+	return size, nil
+}
+
+// DecodeRecordedIdentity rebuilds an outcome row's recorded identity from its stored fields, each
+// nil when absent. A row without a command type records no identity (nil, nil). A command type
+// without targets, or targets that are not a JSON array of strings, is a *CorruptOutcomeError.
+func DecodeRecordedIdentity(id CommandID, commandType, targets, principal *string) (*RecordedIdentity, error) {
+	corrupt := func(reason string) error { return &CorruptOutcomeError{CommandID: id, Reason: reason} }
+
+	if commandType == nil {
+		if targets != nil || principal != nil {
+			return nil, corrupt("the recorded identity has targets or a principal but no command type")
+		}
+
+		return nil, nil
+	}
+
+	if targets == nil {
+		return nil, corrupt("the recorded identity has a command type but no targets")
+	}
+
+	var decoded []EntityID
+	if err := json.Unmarshal([]byte(*targets), &decoded); err != nil || decoded == nil {
+		return nil, corrupt(fmt.Sprintf("the recorded targets are not a JSON array of strings: %q", *targets))
+	}
+
+	identity := &RecordedIdentity{Type: CommandType(*commandType), Targets: decoded}
+	if principal != nil {
+		value := PrincipalID(*principal)
+		identity.Principal = &value
+	}
+
+	return identity, nil
+}
+
+// ErrOutcomePrincipalMismatch matches an OutcomePrincipalMismatchError with errors.Is.
+var ErrOutcomePrincipalMismatch = errors.New("command outcome belongs to another principal")
+
+// OutcomePrincipalMismatchError answers an outcome lookup by command ID and principal whose row
+// does not belong to the asking principal. Recorded is false for a row that records no identity
+// (written before outcomes recorded it): the lookup fails closed. It never carries the stored
+// outcome.
+type OutcomePrincipalMismatchError struct {
+	CommandID CommandID
+	Recorded  bool
+}
+
+func (e *OutcomePrincipalMismatchError) Error() string {
+	if !e.Recorded {
+		return fmt.Sprintf("the outcome of command %q records no identity, so it cannot be matched to a principal", e.CommandID)
+	}
+
+	return fmt.Sprintf("the outcome of command %q belongs to another principal", e.CommandID)
+}
+
+// Is makes errors.Is(err, ErrOutcomePrincipalMismatch) match.
+func (e *OutcomePrincipalMismatchError) Is(target error) bool {
+	return target == ErrOutcomePrincipalMismatch
 }
 
 // Accepted reports whether the command was accepted.
@@ -619,6 +754,17 @@ func CheckOutcome(outcome *Outcome) error {
 		}
 	}
 
+	if outcome.Identity != nil {
+		size, err := outcome.Identity.size()
+		if err != nil {
+			return err
+		}
+
+		if size > MaxOutcomeBytes {
+			return &OutcomeTooLargeError{What: "identity", Size: size}
+		}
+	}
+
 	return nil
 }
 
@@ -632,9 +778,11 @@ func (e *CommandIDTooLongError) Error() string {
 	return fmt.Sprintf("command ID is %d bytes; the limit is %d", e.Length, MaxCommandIDBytes)
 }
 
-// OutcomeTooLargeError refuses a response or rejection over MaxOutcomeBytes before any write.
+// OutcomeTooLargeError refuses a response, rejection, or recorded identity over MaxOutcomeBytes
+// before any write.
 type OutcomeTooLargeError struct {
-	// What names the oversized value: "response" or "rejection".
+	// What names the oversized value: "response", "rejection", or "identity" (the recorded
+	// identity's command type, targets, and principal together).
 	What string
 
 	// Size is the value's size in bytes.
@@ -924,7 +1072,8 @@ type OutcomeAttribute struct {
 }
 
 // OutcomeAttributes returns the attributes of the DynamoDB outcome item in the spec's order: pk,
-// sk, status, digest, then response, events, rejection, and code when present. The response is
+// sk, status, digest, then response, events, rejection, code, commandType, targets, and principal
+// when present. The response is
 // standard padded base64; events is the JSON array of event IDs; rejection is the rejection's
 // JSON. It is the single source of the item's shape, shared by the DynamoDB writer and the
 // commit budget.
@@ -959,6 +1108,22 @@ func OutcomeAttributes(outcome Outcome) ([]OutcomeAttribute, error) {
 			OutcomeAttribute{Name: "rejection", Value: string(rejection)},
 			OutcomeAttribute{Name: "code", Value: string(outcome.Rejection.Code)},
 		)
+	}
+
+	if identity := outcome.Identity; identity != nil {
+		targets, err := identity.EncodeTargets()
+		if err != nil {
+			return nil, err
+		}
+
+		attributes = append(attributes,
+			OutcomeAttribute{Name: "commandType", Value: string(identity.Type)},
+			OutcomeAttribute{Name: "targets", Value: targets},
+		)
+
+		if identity.Principal != nil {
+			attributes = append(attributes, OutcomeAttribute{Name: "principal", Value: string(*identity.Principal)})
+		}
 	}
 
 	return attributes, nil
