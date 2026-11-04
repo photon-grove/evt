@@ -27,6 +27,11 @@ store := postgres.NewStoreFromRepo(repo) // or postgres.NewStore(pool)
 interface. The `WithEventsTable` and `WithSnapshotsTable` options let several logical event logs
 share one database.
 
+The TypeScript package's `PgRepository` (`@photon-grove/evt/postgres`) writes the same tables. It
+takes a pool shaped like `pg`'s `Pool`, has `ensureSchema()` and the `eventsTable` and
+`snapshotsTable` options, and initializes a fresh store on its first write. It writes no view rows
+yet, so don't point it at entity types that have projectors.
+
 ## Schema
 
 `EnsureSchema` owns the table definitions, so the relational schema stays in lockstep with the Go
