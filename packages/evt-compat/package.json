@@ -15,7 +15,7 @@
   },
   "devDependencies": {
     "@aws-sdk/client-dynamodb": "3.1161.0",
-    "@types/node": "^25.9.9",
+    "@types/node": "^26.6.6",
     "oxlint": "1.90.0",
     "typescript": "^7.0.2"
   }
