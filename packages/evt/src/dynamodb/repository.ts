@@ -562,8 +562,12 @@ export class DynamoRepository implements Repository, StoreInitializer {
       // The head update passed and an event put failed: an event sits above the head. With
       // retention, TTL can delete the head before an expired event, so a create passes its head
       // condition and fails on the leftover item: a conflict until TTL deletes the rest.
+      // The probe already read the remaining items when it found the head item absent below the
+      // head its log derives; read them only if it didn't.
       const verdict = await this.#probe(entityId, retained, request)
-      if (!retained || !(await this.#remainingItemsExpired(entityId, request))) {
+      const expired =
+        retained && (verdict.expired ?? (await this.#remainingItemsExpired(entityId, request)))
+      if (!expired) {
         return verdict.drift ?? drift(entityId, verdict.head, verdict.derived)
       }
     }
@@ -584,8 +588,11 @@ export class DynamoRepository implements Repository, StoreInitializer {
     const head = (await this.#readHead(entityId, request))?.head ?? null
     const stored = head ?? 0n
     if (stored < derived) {
-      if (retained && head === null && (await this.#remainingItemsExpired(entityId, request))) {
-        return {healthy: false, drift: null, stored, head, derived}
+      if (retained && head === null) {
+        const expired = await this.#remainingItemsExpired(entityId, request)
+        const drifted = expired ? null : drift(entityId, head, derived)
+
+        return {healthy: false, drift: drifted, stored, head, derived, expired}
       }
 
       return {healthy: false, drift: drift(entityId, head, derived), stored, head, derived}
@@ -958,6 +965,8 @@ interface Verdict {
   stored: bigint
   head: bigint | null
   derived: bigint
+  /** What `#remainingItemsExpired` found, when the probe read the remaining items. */
+  expired?: boolean
 }
 
 function drift(entityId: string, head: bigint | null, derived: bigint): StreamHeadDriftError {

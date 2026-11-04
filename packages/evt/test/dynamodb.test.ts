@@ -498,8 +498,64 @@ describe('retention', () => {
 
       await expect(commit).rejects.toBeInstanceOf(want)
     })
+
+    // The probe reads the remaining items when the head item is absent; the classification reads
+    // them itself only when the probe didn't, as with a head item below the events.
+    test.each([
+      {head: 0, ttl: 1000, want: ConflictError},
+      {head: 0, ttl: 5000, want: StreamHeadDriftError},
+      {head: 1, ttl: 1000, want: ConflictError},
+      {head: 1, ttl: 5000, want: StreamHeadDriftError},
+    ])(
+      'whose head passed reads the remaining items once (head: $head, ttl: $ttl)',
+      async ({head, ttl, want}) => {
+        const client = new ExpiryReads(eventFailed())
+        if (head > 0) {
+          client.put(headItem('a', BigInt(head), ttl))
+        }
+        client.put(eventItem(event(1), ttl))
+        client.put(eventItem(event(2), ttl))
+        const repo = new DynamoRepository(client, 'events', options)
+        const commit = repo.commit({entityId: 'a', events: [event(head + 1)]})
+
+        await expect(commit).rejects.toBeInstanceOf(want)
+        expect(client.snapshotReads).toBe(1)
+        expect(client.eventQueries).toBe(1)
+      },
+    )
   })
 })
+
+// A table that counts the reads of a stream's remaining items: the snapshot GetItem (sk=0) and
+// the event Query that project its ttl.
+class ExpiryReads extends Table {
+  snapshotReads = 0
+  eventQueries = 0
+
+  override async getItem(input: {
+    Key: Item
+    ExpressionAttributeNames?: Record<string, string>
+  }): Promise<{Item?: Item}> {
+    if (sortKey(input.Key) === 0n && input.ExpressionAttributeNames?.['#ttl'] === 'ttl') {
+      this.snapshotReads++
+    }
+
+    return super.getItem(input)
+  }
+
+  override async query(input: {
+    ExpressionAttributeValues: Item
+    ExpressionAttributeNames?: Record<string, string>
+    ScanIndexForward?: boolean
+    Limit?: number
+  }): Promise<Page> {
+    if (input.ExpressionAttributeNames?.['#ttl'] === 'ttl') {
+      this.eventQueries++
+    }
+
+    return super.query(input)
+  }
+}
 
 describe('the commit budget', () => {
   // The single-stream commits of feature-marker.json's streamHeads vectors, which the fixture
