@@ -32,7 +32,7 @@ cargo fmt --all
 moon run evt-rust:check evt-rust:test
 ```
 
-The TypeScript package runs on Node 24, and its fixture runner (`packages/evt-compat`) also runs on
+The TypeScript package runs on Node 26, and its fixture runner (`packages/evt-compat`) also runs on
 Bun and Deno, whose versions are pinned in `.prototools`. `evt-ts:check` type-checks `src/` with
 only the web-standard globals in `packages/evt/src/globals.d.ts`, runs oxlint, and rejects any
 Node built-in import. `evt-ts:test` runs the Vitest unit tests, the fixture runner and the

@@ -54,7 +54,7 @@ writer declares a feature, the next write fails once with a retryable
 
 ## Runtimes
 
-The package is ESM only and has no runtime dependencies. CI runs it on Node 24, Node 22.12, Bun and
+The package is ESM only and has no runtime dependencies. CI runs it on Node 26, Node 22.12, Bun and
 Deno. Its code uses only web-standard globals (`TextEncoder`, `TextDecoder`, Web Crypto,
 `AbortSignal`, timers), never Node's built-ins, so it should run on edge runtimes and in browsers
 too, though CI doesn't run them yet. It never uses top-level await, so CommonJS code on Node 22.12
