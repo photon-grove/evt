@@ -18,7 +18,9 @@ import {
 import {markerItem} from '../src/dynamodb/marker.ts'
 import {DynamoRepository} from '../src/dynamodb/repository.ts'
 import {commitTransaction, snapshotTransaction} from '../src/dynamodb/requests.ts'
+import {viewProjector} from '../src/dynamodb/views.ts'
 import {
+  CommitTooLargeError,
   ConflictError,
   EvtError,
   FeatureManifestChangedError,
@@ -498,6 +500,74 @@ describe('retention', () => {
 
       await expect(commit).rejects.toBeInstanceOf(want)
     })
+  })
+})
+
+describe('projector operations', () => {
+  const view = viewProjector<unknown>('views').project({
+    entityType: 't',
+    entityId: 'a',
+    state: null,
+    encodedState: new TextEncoder().encode('{}'),
+    events: [],
+  })!
+  const commit = {entityId: 'a', events: [event(1)], projections: [view]}
+
+  test('follow the control checks, before the stream', async () => {
+    const client = new Table()
+    await new DynamoRepository(client, 'events').commit(commit)
+
+    const [transaction] = client.transactions
+    expect(transaction).toHaveLength(5)
+    expect(transaction?.[2]).toEqual(view.operations[0])
+    expect(transaction?.[3]?.Update?.Key).toEqual({pk: {S: 'a'}, sk: {N: '-1'}})
+  })
+
+  test("shift the stream's items when a failure is classified", async () => {
+    // The head update, after the view put, failed on a stream with no head: a conflict. Read
+    // without the shift, it would be a passing head update and a failed event put, which is drift.
+    const client = new Table(cancelled('None', 'None', 'None', 'ConditionalCheckFailed', 'None'))
+    const write = new DynamoRepository(client, 'events').commit(commit)
+
+    await expect(write).rejects.toBeInstanceOf(ConflictError)
+  })
+
+  test('for another backend are refused before any request', async () => {
+    const refusing: DynamoClient = {
+      getItem: () => Promise.reject(new Error('unexpected getItem')),
+      putItem: () => Promise.reject(new Error('unexpected putItem')),
+      query: () => Promise.reject(new Error('unexpected query')),
+      scan: () => Promise.reject(new Error('unexpected scan')),
+      transactWriteItems: () => Promise.reject(new Error('unexpected transactWriteItems')),
+    }
+    const repo = new DynamoRepository(refusing, 'events', {lazyInitialization: true})
+    const other = {backend: 'test', operations: [1], sizes: [1]}
+    const write = repo.commit({...commit, projections: [other]})
+
+    await expect(write).rejects.toMatchObject({code: 'invalidCommit'})
+  })
+
+  test('are budgeted by the actions sent, not the sizes their group reports', async () => {
+    const large = viewProjector<unknown>('views').project({
+      entityType: 't',
+      entityId: 'a',
+      state: null,
+      encodedState: new TextEncoder().encode('x'.repeat(390_000)),
+      events: [],
+    })!
+    const client = new Table()
+    const projections = [{...large, sizes: [0]}]
+    const write = new DynamoRepository(client, 'events').commit({...commit, projections})
+
+    await expect(write).rejects.toBeInstanceOf(CommitTooLargeError)
+    expect(client.transactions).toEqual([])
+  })
+
+  test('report a failure of their own as it is', async () => {
+    const failure = cancelled('None', 'None', 'ConditionalCheckFailed', 'None', 'None')
+    const write = new DynamoRepository(new Table(failure), 'events').commit(commit)
+
+    await expect(write).rejects.toBe(failure)
   })
 })
 

@@ -30,6 +30,8 @@
  * - `transient`: the backend throttled the write. Retryable. Nothing was written.
  * - `rebuildInProgress`: a projection rebuild holds the store, so commits wait. Retryable.
  * - `historyDependentProjection`: compaction was refused for a history-dependent entity type.
+ * - `projectorOnlyCommit`: a commit carries projector operations but no events. Nothing was
+ *   written.
  * - `replay`: a stored event failed to upcast or decode while an aggregate loaded.
  * - `snapshot`: a stored snapshot failed to decode while an aggregate loaded.
  */
@@ -51,6 +53,7 @@ export type EvtErrorCode =
   | 'transient'
   | 'rebuildInProgress'
   | 'historyDependentProjection'
+  | 'projectorOnlyCommit'
   | 'replay'
   | 'snapshot'
 
@@ -298,6 +301,26 @@ export class HistoryDependentProjectionError extends EvtError {
     )
     this.entityType = entityType
     this.entityId = entityId
+  }
+}
+
+/**
+ * A commit carried projector operations but no events. Views are projections of committed events,
+ * so operations with no event behind them are refused on every backend. Nothing was written.
+ */
+export class ProjectorOnlyCommitError extends EvtError {
+  override readonly name = 'ProjectorOnlyCommitError'
+  override readonly code = 'projectorOnlyCommit'
+  /** How many projector operations the commit carried. */
+  readonly operations: number
+
+  constructor(operations: number) {
+    super(
+      'projectorOnlyCommit',
+      `a commit carries ${operations} projector operations but no events; views need a ` +
+        'backing event in the same commit',
+    )
+    this.operations = operations
   }
 }
 

@@ -54,11 +54,13 @@ import {
   ttlFromItem,
 } from './item.js'
 import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
+import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
 import {
   type CommitTtl,
   commitTransaction,
   controlKey,
   headKey,
+  projectorItems,
   snapshotTransaction,
 } from './requests.js'
 
@@ -194,7 +196,12 @@ export class DynamoRepository implements Repository, StoreInitializer {
     const ttl = this.#ttlFor(entityType)
 
     // Every backend budgets a commit the same way, so an oversized one fails before any request.
-    checkBudget(commitSizes(commit, (type) => (type === entityType ? ttl : undefined)))
+    // The projector operations are sized from the actions this repository sends, which refuses a
+    // group for another backend here too.
+    const sizes = projectorItems(commit).map(transactItemSize)
+    const group = {backend: DYNAMODB_BACKEND, operations: sizes, sizes}
+    const budgeted = {...commit, projections: [group]}
+    checkBudget(commitSizes(budgeted, (type) => (type === entityType ? ttl : undefined)))
 
     const request = requestOptions(options)
     const version = await this.#markerVersion(request)
@@ -542,8 +549,10 @@ export class DynamoRepository implements Repository, StoreInitializer {
       return new RebuildInProgressError()
     }
 
-    // The stream's head update, then its event puts and its snapshot put.
-    const head = 2
+    // The projector operations, then the stream's head update, its event puts and its snapshot
+    // put.
+    const projected = projectorItems(commit).length
+    const head = 2 + projected
     const eventsEnd = head + 1 + commit.events.length
     const eventFailed = codes.slice(head + 1, eventsEnd).includes(CONDITION_FAILED)
     const {entityId} = commit
@@ -566,6 +575,11 @@ export class DynamoRepository implements Repository, StoreInitializer {
       if (!retained || !(await this.#remainingItemsExpired(entityId, request))) {
         return verdict.drift ?? drift(entityId, verdict.head, verdict.derived)
       }
+    }
+
+    // Only a projector operation's condition failed: its own error, as Go reports it.
+    if (failed < head && !codes.slice(head).includes(CONDITION_FAILED)) {
+      return error
     }
 
     return new ConflictError(

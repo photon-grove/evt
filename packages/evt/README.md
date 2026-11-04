@@ -11,8 +11,8 @@ held to the fixtures Go and Rust generate, byte for byte.
 npm install @photon-grove/evt
 ```
 
-So far it has the core, the in-memory and DynamoDB backends, and the testing helpers. Views on
-DynamoDB, the PostgreSQL backend, command outcomes and multi-stream transactions come in later
+So far it has the core, the in-memory and DynamoDB backends, and the testing helpers. Commit-wide
+projectors, the PostgreSQL backend, command outcomes and multi-stream transactions come in later
 releases, and the
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
@@ -26,7 +26,7 @@ builds a bank account aggregate with it, end to end.
 | `@photon-grove/evt`          | Aggregates, codecs, upcasters, the `Store`, retry, and the wire codecs     |
 | `@photon-grove/evt/memory`   | `MemRepository`, the in-memory backend for tests and local development     |
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
-| `@photon-grove/evt/dynamodb` | `DynamoRepository`, and the DynamoDB item and request codecs               |
+| `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, and the item and request codecs       |
 
 ## DynamoDB
 
@@ -58,6 +58,10 @@ item of the entity types it names, their write time plus the retention in millis
 hasn't loaded the stream gets a conflict, and its retry passes. TTL deletes items in no order, so
 use retention only for short-lived streams that nothing replays, and declare the retained types in
 the feature manifest from Go or Rust, so that their writers refuse read fences on them.
+
+`viewProjector('views')`, listed in an aggregate's `projectors`, puts the entity's view row with
+every commit, in the same transaction: `pk = {type}#{id}`, `sk = VIEW`, and the state as its
+codec encodes it, as Go's `dynamo.NewViewProjector` does.
 
 ## Runtimes
 
@@ -103,6 +107,11 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   refuses an entity type the manifest declares history-dependent. `MemRepository` declares the
   required `stream-heads` feature on a fresh store's first write, and `initialize()` declares it
   up front.
+- **Projectors.** An aggregate's `projectors` run on the state after each commit's events, and
+  the operations they return are written in the commit's own transaction, by the backend they
+  name. `MemRepository` budgets them and writes none, as Go's in-memory repository does, so code
+  with projectors runs on it unchanged. A commit with operations but no events is refused with a
+  `ProjectorOnlyCommitError`.
 - **Rebuilds.** While a projection rebuild holds the store, every commit fails with a
   `RebuildInProgressError`. It's retryable, so `executeWithRetry` runs the command again after its
   backoff, though a rebuild usually outlasts the default policy's attempts.

@@ -1,15 +1,17 @@
 // The `TransactWriteItems` actions of a commit and of a snapshot write, built from the storage
 // format alone (storage format, "Writes"). Every commit opens with the two control checks, the
-// feature marker's and the rebuild lock's, then writes the stream: its head update, its event
-// puts, and its snapshot put when it has one.
+// feature marker's and the rebuild lock's, then its projector operations, then writes the stream:
+// its head update, its event puts, and its snapshot put when it has one.
 
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {int64Argument, safeIntegerArgument} from '../fields.js'
+import {EvtError} from '../errors.js'
 import type {Commit} from '../repository.js'
 import type {TransactItem} from './client.js'
 import {type HeadAction, headUpdate} from './head.js'
 import {HEAD_SORT_KEY, type Item, SNAPSHOT_SORT_KEY, eventItem, snapshotItem} from './item.js'
 import {FEATURES_PK, REBUILD_LOCK_PK} from './marker.js'
+import {DYNAMODB_BACKEND} from './views.js'
 
 /** The marker check of a writer that validated the manifest at version `:v`. */
 export const MARKER_CHECK_CONDITION = 'attribute_not_exists(pk) OR version = :v'
@@ -99,8 +101,9 @@ export interface SnapshotTtl {
 
 /**
  * The actions of a commit with at least one event, in order, by a writer that validated the
- * feature manifest at `markerVersion`. `ttl` is given only for a stream with retention. Exported
- * for the compatibility fixtures: its signature changes when commits span streams.
+ * feature manifest at `markerVersion`. `ttl` is given only for a stream with retention. A projector
+ * group for any backend but DynamoDB is refused. Exported for the compatibility fixtures: its
+ * signature changes when commits span streams.
  */
 export function commitTransaction(
   table: string,
@@ -115,6 +118,7 @@ export function commitTransaction(
   }
 
   const items = [markerCheck(table, markerVersion), rebuildLockCheck(table)]
+  items.push(...projectorItems(commit))
   const head = headUpdate(commit.entityId, first.sequence, last.sequence, ttl?.head)
   items.push(headUpdateItem(table, head))
   for (const event of commit.events) {
@@ -198,6 +202,22 @@ function snapshotGuard(
       ExpressionAttributeValues: values,
     },
   }
+}
+
+/** The DynamoDB actions of a commit's projector groups, in order. */
+export function projectorItems(commit: Commit): TransactItem[] {
+  const items: TransactItem[] = []
+  for (const group of commit.projections ?? []) {
+    if (group.backend !== DYNAMODB_BACKEND) {
+      throw new EvtError(
+        'invalidCommit',
+        `invalid commit: a DynamoDB repository can't write a ${group.backend} projector group`,
+      )
+    }
+    items.push(...(group.operations as TransactItem[]))
+  }
+
+  return items
 }
 
 function headUpdateItem(table: string, action: HeadAction): TransactItem {

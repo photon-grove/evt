@@ -4,7 +4,12 @@
 import {headActionSize, headUpdate} from './dynamodb/head.js'
 import {eventItem, itemSize, snapshotItem} from './dynamodb/item.js'
 import {FEATURES_PK, REBUILD_LOCK_PK} from './dynamodb/marker.js'
-import {CommitTooLargeError, EvtError, ReservedEntityIdError} from './errors.js'
+import {
+  CommitTooLargeError,
+  EvtError,
+  ProjectorOnlyCommitError,
+  ReservedEntityIdError,
+} from './errors.js'
 import {type SerializedEvent, type SerializedSnapshot, eventId} from './event.js'
 import {MAX_COMMIT_ITEM_BYTES} from './snapshots.js'
 
@@ -18,8 +23,23 @@ export interface NewSnapshot {
 }
 
 /**
+ * Operations a projector adds to a commit, for the backend it names to write in the commit's own
+ * transaction (Go's transaction groups). The DynamoDB repository writes `dynamodb` groups, whose
+ * operations are `TransactWriteItems` actions. The in-memory repository budgets every group and
+ * writes none, as Go's does, so code with projectors runs on it unchanged.
+ */
+export interface ProjectorGroup {
+  /** The backend whose transaction carries the operations, such as `dynamodb`. */
+  readonly backend: string
+  /** The operations, in the order they're written. */
+  readonly operations: readonly unknown[]
+  /** Each operation's size in the commit budget, as DynamoDB counts it. */
+  readonly sizes: readonly number[]
+}
+
+/**
  * Everything a repository writes atomically for one command. A commit with no events is a no-op,
- * and its snapshot is ignored.
+ * and its snapshot is ignored, unless it carries projector operations: then it's refused.
  */
 export interface Commit {
   /** The stream the events are appended to. */
@@ -28,6 +48,8 @@ export interface Commit {
   events: SerializedEvent[]
   /** The snapshot to write, when the commit reaches a snapshot boundary. */
   snapshot?: NewSnapshot | null | undefined
+  /** The operations the aggregate's projectors add, written first, in order. */
+  projections?: readonly ProjectorGroup[] | null | undefined
 }
 
 /** Options every repository call takes. */
@@ -53,7 +75,9 @@ export interface CallOptions {
  *   {@link StreamHeadDriftError}, ranked above a gap and any other conflict;
  * - refuse a commit's snapshot whose sequence isn't the stored snapshot's plus one (1 with none
  *   stored) with a {@link ConflictError};
- * - write a commit's events, head and snapshot atomically, or nothing;
+ * - write a commit's events, head and snapshot atomically, or nothing, with the projector
+ *   operations it writes (a backend writes only its own groups), and refuse projector operations
+ *   without events with a {@link ProjectorOnlyCommitError};
  * - refuse an entity ID in a reserved namespace on every write path, before any request;
  * - refuse every write (a commit, a snapshot write, compaction) to a store whose feature manifest
  *   declares a pair this package doesn't model, with an {@link UnsupportedFeatureError}, and to
@@ -147,11 +171,27 @@ export function checkNotReserved(entityId: string): void {
  * Checks that a commit's events can be stored as written: each belongs to the commit's entity and
  * has the ID `{entityId}:{sequence}`, they share one entity type, the first sequence is at least
  * 1, and the sequences are contiguous. A snapshot must have the events' entity type and a
- * sequence of at least 1. A commit with no events is valid, and its snapshot isn't checked.
+ * sequence of at least 1, and each projector group a size per operation. A commit with no events
+ * is valid, and its snapshot isn't checked, but its projector operations are refused.
  */
 export function validateCommit(commit: Commit): void {
+  let operations = 0
+  for (const group of commit.projections ?? []) {
+    if (group.sizes.length !== group.operations.length) {
+      throw invalidCommit(
+        `a ${group.backend} projector group has ${group.operations.length} operations but ` +
+          `${group.sizes.length} sizes`,
+      )
+    }
+    operations += group.operations.length
+  }
+
   const [first] = commit.events
   if (first === undefined) {
+    if (operations > 0) {
+      throw new ProjectorOnlyCommitError(operations)
+    }
+
     return
   }
 
@@ -207,9 +247,10 @@ export function validateCommit(commit: Commit): void {
 
 /**
  * The size of each action a commit's transaction carries, in order: the feature-marker and
- * rebuild-lock checks, then the stream's head update, its event puts, and its snapshot put when
- * it writes one. `ttl` gives the expiry an entity type's items carry, if it's retained. Every
- * backend budgets a commit by these sizes, so an oversized commit fails the same way on each.
+ * rebuild-lock checks, the projector operations, then the stream's head update, its event puts,
+ * and its snapshot put when it writes one. `ttl` gives the expiry an entity type's items carry, if
+ * it's retained. Every backend budgets a commit by these sizes, so an oversized commit fails the
+ * same way on each.
  */
 export function commitSizes(
   commit: Commit,
@@ -217,6 +258,10 @@ export function commitSizes(
 ): number[] {
   // The control rows every commit checks: the feature marker and the rebuild lock.
   const sizes = [controlCheckSize(FEATURES_PK), controlCheckSize(REBUILD_LOCK_PK)]
+  for (const group of commit.projections ?? []) {
+    sizes.push(...group.sizes)
+  }
+
   const first = commit.events[0]
   const last = commit.events.at(-1)
   if (first === undefined || last === undefined) {

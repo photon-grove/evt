@@ -25,6 +25,7 @@ import {
   manifestFromItem,
   markerItem,
   ttlFromItem,
+  viewProjector,
 } from '@photon-grove/evt/dynamodb'
 
 import {
@@ -35,7 +36,7 @@ import {
   conformance,
   markerConformance,
 } from './conformance.js'
-import {Checks} from './harness.js'
+import {Checks, canonical} from './harness.js'
 
 // Only a local emulator: a loopback address or a .localhost name.
 const endpoint = process.env['AWS_ENDPOINT_URL'] ?? ''
@@ -79,6 +80,7 @@ try {
 
   await initialization(created)
   await retention(created)
+  await views(created)
 } finally {
   await Promise.all(created.map(deleteTable))
 }
@@ -255,6 +257,57 @@ async function ttlOf(table: string, sk: bigint): Promise<number | undefined> {
   return item ? ttlFromItem(item as Item) : undefined
 }
 
+// The per-entity view projector: its row is written in the commit's own transaction, so a refused
+// commit leaves the row as it was.
+async function views(tables: string[]): Promise<void> {
+  await checks.case('dynamodb: a view projector writes its row with the commit', async () => {
+    const table = await freshTable(tables)
+    const viewsTable = `${table}-views`
+    await createTable(viewsTable, 'S')
+    tables.push(viewsTable)
+    await new DynamoRepository(client, table).initialize()
+
+    const repo = new DynamoRepository(client, table)
+    const projector = viewProjector<unknown>(viewsTable)
+    const commit = (sequence: number, state: string) => {
+      const events = [ledgerEvent('a', sequence)]
+      const encodedState = new TextEncoder().encode(state)
+      const group = projector.project({
+        entityType: 'ledger',
+        entityId: 'a',
+        state: null,
+        encodedState,
+        events,
+      })
+
+      return repo.commit({entityId: 'a', events, projections: [group!]})
+    }
+    const row = async (): Promise<unknown> => {
+      const {Item: item} = await client.getItem({
+        TableName: viewsTable,
+        Key: {pk: {S: 'ledger#a'}, sk: {S: 'VIEW'}},
+        ConsistentRead: true,
+      })
+
+      return item
+    }
+
+    await commit(1, '{"n":1}')
+    await commit(2, '{"n":2}')
+    const want = {
+      pk: {S: 'ledger#a'},
+      sk: {S: 'VIEW'},
+      entityID: {S: 'a'},
+      entityType: {S: 'ledger'},
+      payload: {S: '{"n":2}'},
+    }
+    ensure(canonical(await row()) === canonical(want), 'the row holds the latest state')
+
+    await refuses(commit(2, '{"n":9}'), ConflictError, 'a commit that lost the race')
+    ensure(canonical(await row()) === canonical(want), "the refused commit's row wasn't written")
+  })
+}
+
 function ledgerEvent(entityId: string, sequence: number): SerializedEvent {
   return {
     id: eventId(entityId, BigInt(sequence)),
@@ -305,13 +358,14 @@ async function refuses(
   throw new Error(`${what}: resolved, want a ${type.name}`)
 }
 
-async function createTable(name: string): Promise<void> {
+// An events table, whose sort key is the event sequence, or a views table, whose sort key is text.
+async function createTable(name: string, sortKey: 'N' | 'S' = 'N'): Promise<void> {
   await client.createTable({
     TableName: name,
     BillingMode: 'PAY_PER_REQUEST',
     AttributeDefinitions: [
       {AttributeName: 'pk', AttributeType: 'S'},
-      {AttributeName: 'sk', AttributeType: 'N'},
+      {AttributeName: 'sk', AttributeType: sortKey},
     ],
     KeySchema: [
       {AttributeName: 'pk', KeyType: 'HASH'},

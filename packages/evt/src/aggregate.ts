@@ -5,6 +5,7 @@ import type {Codec} from './codec.js'
 import {EvtError, ReplayError, messageOf} from './errors.js'
 import type {SerializedEvent} from './event.js'
 import {type JsonValue, parseJson, stringifyJson} from './json.js'
+import type {ProjectorGroup} from './repository.js'
 import {utf8Decode, utf8Encode} from './utf8.js'
 
 /**
@@ -103,6 +104,33 @@ export interface AggregateDefinition<S, C, D extends EventDefinitions> {
    * snapshots.
    */
   readonly snapshotInterval?: number | undefined
+  /**
+   * The projectors whose operations every commit of this type writes in the same transaction as
+   * its events, in this order, such as the DynamoDB backend's `viewProjector`.
+   */
+  readonly projectors?: readonly Projector<S>[] | undefined
+}
+
+/** What a projector sees of a commit: its entity, the state after its events, and the events. */
+export interface Projection<S> {
+  readonly entityType: string
+  readonly entityId: string
+  /** The state after the commit's events. */
+  readonly state: S
+  /** The state as the aggregate's state codec encodes it, as a snapshot stores it. */
+  readonly encodedState: Uint8Array
+  /** The commit's events, as they are stored. */
+  readonly events: readonly SerializedEvent[]
+}
+
+/**
+ * Builds the operations a commit writes beside its events, in the same transaction, such as a
+ * view of the entity's state. Its group names the backend that writes it. `project` returns null
+ * when the commit needs none. It runs only for a commit with events, again on every retry, and it
+ * must not fail or change the state.
+ */
+export interface Projector<S> {
+  project(projection: Projection<S>): ProjectorGroup | null
 }
 
 /** A checked aggregate type. */

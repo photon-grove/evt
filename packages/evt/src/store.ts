@@ -13,7 +13,7 @@ import {commitIds} from './commit-id.js'
 import {EvtError, SequenceGapError, SnapshotError, isConflict, isRetryable} from './errors.js'
 import {type SerializedEvent, eventId} from './event.js'
 import {type Metadata, emptyMetadata} from './metadata.js'
-import type {CallOptions, NewSnapshot, Repository} from './repository.js'
+import type {CallOptions, NewSnapshot, ProjectorGroup, Repository} from './repository.js'
 import {
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
@@ -146,8 +146,10 @@ export class Store {
 
   /**
    * Loads the aggregate, runs the command, and commits its events, with a snapshot when the
-   * commit reaches the snapshot interval. A snapshot whose item is over the per-item commit budget
-   * is left out, so the commit still succeeds and later loads replay from the one before.
+   * commit reaches the snapshot interval, and the aggregate's projector operations. A snapshot
+   * whose item is over the per-item commit budget is left out, so the commit still succeeds and
+   * later loads replay from the one before, but a projector's own items are budgeted as they are:
+   * a view row of a state that large fails the commit.
    *
    * A command ID already carried by an event folded in since the latest snapshot makes the
    * command a `duplicate`, and the handler doesn't run. A conflict with another writer throws;
@@ -175,8 +177,13 @@ export class Store {
       return {kind: 'committed', state: loaded, events: []}
     }
 
-    const {state, events, snapshot} = this.#stage(aggregate, loaded, decision.events, metadata)
-    await this.repository.commit({entityId, events, snapshot}, options)
+    const {state, events, snapshot, projections} = this.#stage(
+      aggregate,
+      loaded,
+      decision.events,
+      metadata,
+    )
+    await this.repository.commit({entityId, events, snapshot, projections}, options)
 
     return {kind: 'committed', state, events}
   }
@@ -262,14 +269,19 @@ export class Store {
     return {entityId, state, sequence, snapshotSequence, seenCommandIds}
   }
 
-  // Applies the decided events, and builds the stored events and the snapshot the policy calls
-  // for. The state is only used once the commit succeeds.
+  // Applies the decided events, and builds the stored events, the snapshot the policy calls for,
+  // and the projectors' operations. The state is only used once the commit succeeds.
   #stage<S, C, D extends EventDefinitions>(
     aggregate: Aggregate<S, C, D>,
     loaded: Loaded<S>,
     decided: readonly EventOf<D>[],
     metadata: Metadata,
-  ): {state: Loaded<S>; events: SerializedEvent[]; snapshot: NewSnapshot | null} {
+  ): {
+    state: Loaded<S>
+    events: SerializedEvent[]
+    snapshot: NewSnapshot | null
+    projections: ProjectorGroup[]
+  } {
     const entityId = loaded.entityId
     let sequence = loaded.sequence
     let state = loaded.state
@@ -329,7 +341,34 @@ export class Store {
       },
       events,
       snapshot,
+      projections: this.#project(aggregate, entityId, state, events, snapshot),
     }
+  }
+
+  // The operations the aggregate's projectors add to the commit, in declaration order.
+  #project<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    entityId: string,
+    state: S,
+    events: SerializedEvent[],
+    snapshot: NewSnapshot | null,
+  ): ProjectorGroup[] {
+    const projectors = aggregate.projectors ?? []
+    if (projectors.length === 0) {
+      return []
+    }
+
+    // Frozen, with copies of the commit's own events and bytes, so no projector can change what
+    // another one sees, or what the commit writes.
+    const projection = Object.freeze({
+      entityType: aggregate.type,
+      entityId,
+      state,
+      encodedState: (snapshot?.payload ?? aggregate.state.encode(state)).slice(),
+      events: Object.freeze([...events]),
+    })
+
+    return projectors.flatMap((projector) => projector.project(projection) ?? [])
   }
 
   // The command's metadata with the store's region and the clock's timestamp where it has none,
