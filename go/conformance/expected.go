@@ -183,12 +183,12 @@ func testStaleCodesConfigurable(t *testing.T, repo evt.OutcomeRepository) {
 	// A caller-stamped fence that is already stale records the stale-fence rejection under the
 	// replaced code.
 	fenced := func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
-		if err := tx.Read(ctx, newLedger(target), target); err != nil {
-			return nil, err
+		if readErr := tx.Read(ctx, newLedger(target), target); readErr != nil {
+			return nil, readErr
 		}
 
-		if err := tx.Fence(evt.ReadFence{EntityID: watched, EntityType: ledgerType, Head: 7}); err != nil {
-			return nil, err
+		if fenceErr := tx.Fence(evt.ReadFence{EntityID: watched, EntityType: ledgerType, Head: 7}); fenceErr != nil {
+			return nil, fenceErr
 		}
 
 		return nil, tx.Append(target, &ledgerEvent{Kind: "deposited", Amount: 1})
