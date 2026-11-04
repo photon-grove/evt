@@ -462,6 +462,13 @@ describe('retention', () => {
       expect(client.transactions).toHaveLength(5)
     })
 
+    test('is transient on a transaction conflict', async () => {
+      const client = new Table(cancelled('None', 'TransactionConflict', 'None'))
+      const write = new DynamoRepository(client, 'events', options).putSnapshot(snapshot)
+
+      await expect(write).rejects.toBeInstanceOf(TransientError)
+    })
+
     test('is drift when the head is below the snapshot', async () => {
       const client = new Table(guardFailed())
       client.put(headItem('a', 5n, 1000))

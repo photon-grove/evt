@@ -2542,7 +2542,8 @@ fn failed_items<'a>(codes: &'a [Option<&str>], code: &'a str) -> impl Iterator<I
 
 /// Maps a failed commit to an error. A failed stream condition is an optimistic-concurrency
 /// conflict, and throttling and a concurrent transaction ([`TransactionConflict`]) are transient:
-/// `execute_with_retry` retries both. A failed projector condition is a projector error, so the command is not rerun for it.
+/// `execute_with_retry` retries both. A failed projector condition is a projector error, so the
+/// command is not rerun for it.
 ///
 /// A commit that carries an outcome (`carries_outcome`) whose result is genuinely unknown (see
 /// [`commit_result_unknown`]) is [`Error::Indeterminate`], which the store settles by re-reading the

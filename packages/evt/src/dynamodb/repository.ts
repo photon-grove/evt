@@ -340,6 +340,12 @@ export class DynamoRepository implements TransactionalRepository, StoreInitializ
           if (codes?.some((code) => THROTTLED.has(code))) {
             throw new TransientError('the snapshot write was throttled', {cause: error})
           }
+          if (codes?.includes('TransactionConflict')) {
+            throw new TransientError(
+              `transaction conflict on ${snapshot.entityId}: another writer was committing at the same time`,
+              {cause: error},
+            )
+          }
 
           throw error
         }
