@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/photon-grove/evt/compare/photon-evt-v0.4.0...photon-evt-v0.4.1) (2026-11-04)
+
+
+### Bug Fixes
+
+* **dynamo:** project the key when the retention probe reads the snapshot ([#271](https://github.com/photon-grove/evt/issues/271)) ([607b266](https://github.com/photon-grove/evt/commit/607b2661bd46426d842cebeccc44c48028ed98e6))
+
 ## [0.4.0](https://github.com/photon-grove/evt/compare/photon-evt-v0.3.0...photon-evt-v0.4.0) (2026-11-02)
 
 
