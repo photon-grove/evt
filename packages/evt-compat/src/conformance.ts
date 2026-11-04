@@ -54,6 +54,7 @@ export async function conformance(
   const cases: [string, () => Promise<void>][] = [
     ['isolate entities', () => isolateEntities(repo)],
     ['commit and read', () => commitAndRead(repo)],
+    ['reads order events by sequence, past nine', () => numericOrder(repo)],
     ['metadata survives commit and read', () => metadataRoundTrip(repo)],
     ['reject events from another entity or of another type', () => foreignEvents(repo)],
     ['reject events out of order', () => outOfOrderEvents(repo)],
@@ -252,6 +253,21 @@ async function commitAndRead(repo: Repository): Promise<void> {
   for (const [after, want] of reads) {
     ensureEqual(await repo.eventsAfter(stream.id, after), want, `eventsAfter(${after})`)
   }
+}
+
+// Sequences in the tens, so a backend that orders them as text (10 before 9) fails.
+async function numericOrder(repo: Repository): Promise<void> {
+  const stream = new Stream(namespace(), 'order')
+  await stream.commit(repo, stream.events(1, 12))
+
+  ensureEqual(await repo.events(stream.id), stream.events(1, 12), 'events() past nine')
+  ensureEqual(await repo.eventsAfter(stream.id, 8n), stream.events(9, 12), 'eventsAfter(8)')
+  const latest = await repo.latest(stream.id, 4)
+  ensureEqual(
+    latest.map((event) => event.sequence),
+    [12n, 11n, 10n, 9n],
+    'latest(4) past nine',
+  )
 }
 
 async function metadataRoundTrip(repo: Repository): Promise<void> {
