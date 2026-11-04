@@ -1,5 +1,5 @@
-// @photon-grove/evt/dynamodb: the DynamoDB backend. So far it holds the item codecs, which import
-// nothing from the AWS SDK.
+// @photon-grove/evt/dynamodb: the DynamoDB backend. It imports nothing from the AWS SDK: the
+// repository takes the SDK's `DynamoDB` client, or anything shaped like it, as a DynamoClient.
 
 export {
   type AttributeValue,
@@ -19,4 +19,21 @@ export {
   sortKey,
   viewItem,
 } from './item.js'
+export {
+  type ConditionCheckAction,
+  type DeleteAction,
+  type DynamoClient,
+  type Expressions,
+  type GetItemInput,
+  type Page,
+  type PutAction,
+  type PutItemInput,
+  type QueryInput,
+  type RequestOptions,
+  type ScanInput,
+  type TransactItem,
+  type UpdateAction,
+} from './client.js'
 export {FEATURES_PK, REBUILD_LOCK_PK, manifestFromItem, markerItem} from './marker.js'
+export {DynamoRepository, type DynamoRepositoryOptions} from './repository.js'
+export {commitTransaction, snapshotTransaction} from './requests.js'

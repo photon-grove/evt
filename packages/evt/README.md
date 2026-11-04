@@ -11,8 +11,9 @@ held to the fixtures Go and Rust generate, byte for byte.
 npm install @photon-grove/evt
 ```
 
-So far it has the core, the in-memory backend and the testing helpers. The DynamoDB and
-PostgreSQL backends, command outcomes and multi-stream transactions come in later releases, and the
+So far it has the core, the in-memory and DynamoDB backends, and the testing helpers. Retention and
+views on DynamoDB, the PostgreSQL backend, command outcomes and multi-stream transactions come in
+later releases, and the
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -20,12 +21,36 @@ builds a bank account aggregate with it, end to end.
 
 ## Entry points
 
-| Import                       | Contents                                                                    |
-| ---------------------------- | --------------------------------------------------------------------------- |
-| `@photon-grove/evt`          | Aggregates, codecs, upcasters, the `Store`, retry, and the wire codecs      |
-| `@photon-grove/evt/memory`   | `MemRepository`, the in-memory backend for tests and local development      |
-| `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository`  |
-| `@photon-grove/evt/dynamodb` | The DynamoDB item codec, with no SDK. The repository comes with the backend |
+| Import                       | Contents                                                                   |
+| ---------------------------- | -------------------------------------------------------------------------- |
+| `@photon-grove/evt`          | Aggregates, codecs, upcasters, the `Store`, retry, and the wire codecs     |
+| `@photon-grove/evt/memory`   | `MemRepository`, the in-memory backend for tests and local development     |
+| `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
+| `@photon-grove/evt/dynamodb` | `DynamoRepository`, and the DynamoDB item and request codecs               |
+
+## DynamoDB
+
+`DynamoRepository` takes the AWS SDK's low-level client, `DynamoDB` from `@aws-sdk/client-dynamodb`
+(an optional peer dependency), and the event-log table, laid out as the
+[DynamoDB guide](https://github.com/photon-grove/evt/blob/main/docs/guide/dynamodb.md) describes:
+
+```ts
+import {DynamoDB} from '@aws-sdk/client-dynamodb'
+import {Store} from '@photon-grove/evt'
+import {DynamoRepository} from '@photon-grove/evt/dynamodb'
+
+const repository = new DynamoRepository(new DynamoDB({}), 'event-log')
+await repository.initialize() // once, at deploy time
+const store = new Store(repository)
+```
+
+The package imports nothing from the SDK, so any client with the same methods works. A store must
+be initialized before writers start: until then every write fails with a
+`StoreNotInitializedError`, so writers never need `dynamodb:Scan`. `initialize()` scans the table
+to make sure it's fresh, and `{lazyInitialization: true}` makes the first write do it instead, for
+tests and local use. Reads are strongly consistent unless `{consistentRead: false}`. When another
+writer declares a feature, the next write fails once with a retryable
+`FeatureManifestChangedError`, which `executeWithRetry` runs again.
 
 ## Runtimes
 

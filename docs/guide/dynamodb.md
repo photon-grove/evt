@@ -34,6 +34,11 @@ why. You tune the repository with chainable options:
 | `WithViewsTable(name)` | Where commit-wide projectors write their rows (see [Entity-views table](#entity-views-table)). |
 | `WithLogger(logger)` | Inject a `*slog.Logger` for structured logs. |
 
+The TypeScript package's `DynamoRepository` (`@photon-grove/evt/dynamodb`) writes the same table.
+It takes the AWS SDK's low-level `DynamoDB` client, needs the same one-time initialization
+(`repository.initialize()`), and has `lazyInitialization` and `consistentRead` options. It doesn't
+take retention or a views table yet, so don't point it at entity types that use either.
+
 ## Event-log table
 
 One table holds the events and inline snapshots for every entity. The partition key `pk` (`S`) is

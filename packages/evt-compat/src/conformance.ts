@@ -15,6 +15,7 @@ import {
   ConflictError,
   EvtError,
   type FeatureManifest,
+  FeatureManifestChangedError,
   HistoryDependentProjectionError,
   type NewSnapshot,
   RebuildInProgressError,
@@ -996,6 +997,21 @@ export async function markerConformance(
   }
 }
 
+// A writer that validated the manifest before a declaration fails its next write once with a
+// retryable FeatureManifestChangedError, and validates again. A write expected to succeed after a
+// declaration runs again once for it.
+async function settled<T>(write: () => Promise<T>): Promise<T> {
+  try {
+    return await write()
+  } catch (error) {
+    if (!(error instanceof FeatureManifestChangedError)) {
+      throw error
+    }
+
+    return write()
+  }
+}
+
 function streamHeadsOnly(draft: ManifestDraft): void {
   draft.features = new Map([[STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION]])
   draft.historyDependent = []
@@ -1027,7 +1043,7 @@ async function unmigratedStore(
   controls: ControlFixtures,
 ): Promise<void> {
   const stream = new Stream(namespace(), '1')
-  await stream.commit(repo, stream.events(1, 2), stream.newSnapshot(1, '{}'))
+  await settled(() => stream.commit(repo, stream.events(1, 2), stream.newSnapshot(1, '{}')))
 
   // The store holds data, so no writer may declare stream-heads for it.
   await controls.declare((draft) => {
@@ -1047,7 +1063,7 @@ async function unmigratedStore(
   ensureEqual(await controls.manifest(), before, 'the refused writes declared nothing')
 
   await controls.declare(streamHeadsOnly)
-  await stream.commit(repo, stream.events(3, 3))
+  await settled(() => stream.commit(repo, stream.events(3, 3)))
 }
 
 function unsupported(...pairs: [string, number][]) {
@@ -1062,7 +1078,7 @@ async function unsupportedFeature(
   controls: ControlFixtures,
 ): Promise<void> {
   const stream = new Stream(namespace(), '1')
-  await stream.commit(repo, stream.events(1, 2), stream.newSnapshot(1, '{}'))
+  await settled(() => stream.commit(repo, stream.events(1, 2), stream.newSnapshot(1, '{}')))
 
   // A feature this package doesn't model, and one it models at another stored-format version.
   await controls.declare((draft) => {
@@ -1102,7 +1118,7 @@ async function unsupportedFeature(
   )
 
   await controls.declare(streamHeadsOnly)
-  await stream.commit(repo, stream.events(3, 3))
+  await settled(() => stream.commit(repo, stream.events(3, 3)))
 }
 
 async function declarationVersion(controls: ControlFixtures): Promise<void> {
@@ -1124,7 +1140,7 @@ async function historyDependentRefusal(
   const audited = new Stream(ns, 'audited', 'audit')
   const plain = new Stream(ns, 'plain')
   for (const stream of [audited, plain]) {
-    await stream.commit(repo, stream.events(1, 3), stream.newSnapshot(1, '{}'))
+    await settled(() => stream.commit(repo, stream.events(1, 3), stream.newSnapshot(1, '{}')))
   }
 
   await controls.declare((draft) => {
@@ -1143,7 +1159,7 @@ async function historyDependentRefusal(
   ensureEqual(await repo.compactBelow(plain.id, 3n), 3, 'another entity type compacts')
 
   // The commit path is not refused.
-  await audited.commit(repo, audited.events(4, 4))
+  await settled(() => audited.commit(repo, audited.events(4, 4)))
 
   await controls.declare(streamHeadsOnly)
   ensureEqual(await repo.compactBelow(audited.id, 3n), 3, 'the type compacts once removed')
@@ -1165,7 +1181,7 @@ async function retentionSet(
 
   // A store-wide set changes nothing for a commit that carries no fences.
   const stream = new Stream(ns, '1', 'session')
-  await stream.commit(repo, stream.events(1, 1))
+  await settled(() => stream.commit(repo, stream.events(1, 1)))
 
   await controls.declare(streamHeadsOnly)
 }
@@ -1179,7 +1195,7 @@ async function rebuildInProgress(
   controls: ControlFixtures,
 ): Promise<void> {
   const stream = new Stream(namespace(), '1')
-  await stream.commit(repo, stream.events(1, 3), stream.newSnapshot(1, '{}'))
+  await settled(() => stream.commit(repo, stream.events(1, 3), stream.newSnapshot(1, '{}')))
 
   // A held lock, then the item a force-release leaves in its place, which keeps the generation
   // odd.
@@ -1210,7 +1226,7 @@ async function rebuildInProgress(
 
   // A completed release settles the generation, even, and commits pass again.
   await controls.setRebuild({generation: 4n, lock: null})
-  await stream.commit(repo, stream.events(4, 4))
+  await settled(() => stream.commit(repo, stream.events(4, 4)))
 }
 
 async function controlRanking(
@@ -1219,7 +1235,7 @@ async function controlRanking(
 ): Promise<void> {
   const ns = namespace()
   const stream = new Stream(ns, '1')
-  await stream.commit(repo, stream.events(1, 2))
+  await settled(() => stream.commit(repo, stream.events(1, 2)))
   await controls.setRebuild({generation: 1n, lock: 'held'})
 
   // A stale commit and a gap report the rebuild, not the conflict.
@@ -1266,5 +1282,5 @@ async function controlRanking(
 
   await controls.declare(streamHeadsOnly)
   await controls.setRebuild({generation: 2n, lock: null})
-  await stream.commit(repo, stream.events(3, 3))
+  await settled(() => stream.commit(repo, stream.events(3, 3)))
 }

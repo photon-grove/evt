@@ -23,6 +23,11 @@
  *   written.
  * - `streamHeadsNotMigrated`: the store holds data but doesn't declare stream-heads. Nothing was
  *   written.
+ * - `storeNotInitialized`: the store doesn't declare stream-heads, and the writer doesn't
+ *   initialize a store itself. Nothing was written.
+ * - `featureManifestChanged`: another writer changed the store's feature manifest since this one
+ *   validated it. Retryable: the writer validates it again.
+ * - `transient`: the backend throttled the write. Retryable. Nothing was written.
  * - `rebuildInProgress`: a projection rebuild holds the store, so commits wait. Retryable.
  * - `historyDependentProjection`: compaction was refused for a history-dependent entity type.
  * - `replay`: a stored event failed to upcast or decode while an aggregate loaded.
@@ -41,6 +46,9 @@ export type EvtErrorCode =
   | 'reservedEntityId'
   | 'unsupportedFeature'
   | 'streamHeadsNotMigrated'
+  | 'storeNotInitialized'
+  | 'featureManifestChanged'
+  | 'transient'
   | 'rebuildInProgress'
   | 'historyDependentProjection'
   | 'replay'
@@ -214,6 +222,52 @@ export class StreamHeadsNotMigratedError extends EvtError {
 }
 
 /**
+ * The store's feature manifest doesn't declare stream-heads, and this writer doesn't initialize a
+ * store itself (the DynamoDB default), so it refuses rather than scan the table to learn whether
+ * it's fresh. Initialize a fresh store once, at deploy time, or migrate one written before stream
+ * heads. Nothing was written.
+ */
+export class StoreNotInitializedError extends EvtError {
+  override readonly name = 'StoreNotInitializedError'
+  override readonly code = 'storeNotInitialized'
+
+  constructor() {
+    super(
+      'storeNotInitialized',
+      'store is not initialized: the feature manifest does not declare stream-heads; initialize ' +
+        'a fresh store, or migrate one written before stream heads, before writing',
+    )
+  }
+}
+
+/**
+ * Another writer changed the store's feature manifest after this one validated it, so the commit's
+ * marker check failed. The writer has validated the new manifest, which it supports. Retryable.
+ * Nothing was written.
+ */
+export class FeatureManifestChangedError extends EvtError {
+  override readonly name = 'FeatureManifestChangedError'
+  override readonly code = 'featureManifestChanged'
+
+  constructor(options?: {cause?: unknown}) {
+    super('featureManifestChanged', 'feature manifest changed under this writer', options)
+  }
+}
+
+/**
+ * The backend refused the write for now, such as a DynamoDB transaction cancelled for throttling.
+ * Retryable, after a backoff. Nothing was written. The backend's error is its cause.
+ */
+export class TransientError extends EvtError {
+  override readonly name = 'TransientError'
+  override readonly code = 'transient'
+
+  constructor(detail: string, options?: {cause?: unknown}) {
+    super('transient', `transient failure: ${detail}`, options)
+  }
+}
+
+/**
  * A projection rebuild holds the store, or one was force-released and no rebuild has finished
  * since, so every commit is refused. Retryable: the command can run again once the rebuild ends.
  */
@@ -289,11 +343,20 @@ export function isConflict(error: unknown): boolean {
 }
 
 /**
- * Whether reloading and running the command again may succeed: after a conflict, or while a
- * rebuild holds the store.
+ * Whether reloading and running the command again may succeed: after a conflict, while a rebuild
+ * holds the store, after the feature manifest changed under the writer, or after throttling.
  */
 export function isRetryable(error: unknown): boolean {
-  return isConflict(error) || (error instanceof EvtError && error.code === 'rebuildInProgress')
+  if (isConflict(error)) {
+    return true
+  }
+
+  return (
+    error instanceof EvtError &&
+    (error.code === 'rebuildInProgress' ||
+      error.code === 'featureManifestChanged' ||
+      error.code === 'transient')
+  )
 }
 
 /** An error's message, or the value itself as text. */

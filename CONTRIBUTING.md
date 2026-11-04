@@ -58,6 +58,9 @@ terraform -chdir=infra/local apply -auto-approve
 AWS_ENDPOINT_URL=http://localhost:4566 moon run evt:integration
 ```
 
+`AWS_ENDPOINT_URL=http://localhost:4566 moon run evt-ts:integration` runs the TypeScript
+conformance suites against the same emulator, in tables of their own.
+
 The PostgreSQL tests need a local server. Terraform provisions the database and role, and
 `postgres.Repository.EnsureSchema` owns the tables:
 

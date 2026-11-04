@@ -4,7 +4,7 @@ import {DEFAULT_RETRY_POLICY} from '@photon-grove/evt'
 
 import {codecVectors} from './codec.js'
 import {Checks, field, list, loadFixture, num, str} from './harness.js'
-import {markerVectors} from './marker.js'
+import {headVectors, markerVectors} from './marker.js'
 import {scenarioChecks} from './scenarios.js'
 
 const checks = new Checks()
@@ -17,6 +17,7 @@ checks.equal('@photon-grove/evt/dynamodb loads', typeof dynamodb, 'object')
 
 await codecVectors(checks)
 await markerVectors(checks)
+await headVectors(checks)
 await outcomeDigests()
 await retryDefaults()
 await scenarioChecks(checks)
