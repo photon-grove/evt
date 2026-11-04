@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	evt "github.com/photon-grove/evt/go"
 )
 
 type embeddedBase struct {
@@ -49,4 +51,35 @@ func TestDeepCopy_ASelfReferencingMapOrSliceTerminates(t *testing.T) {
 	sliceCopy := deepCopy(reflect.ValueOf(selfSlice), copied{}).Interface().([]any)
 	require.Equal(t, reflect.ValueOf(sliceCopy).Pointer(), reflect.ValueOf(sliceCopy[0]).Pointer())
 	require.NotEqual(t, reflect.ValueOf(selfSlice).Pointer(), reflect.ValueOf(sliceCopy).Pointer())
+}
+
+type backReferenceBase struct {
+	Owner *backReferencingAggregate
+	Self  any
+}
+
+// backReferencingAggregate satisfies evt.Aggregate through a nil embedded interface; only its
+// fields matter here.
+type backReferencingAggregate struct {
+	evt.Aggregate
+	backReferenceBase
+
+	Count int
+}
+
+func TestCaptureAggregate_APointerBackToTheAggregateStaysOne(t *testing.T) {
+	aggregate := &backReferencingAggregate{}
+	aggregate.Owner = aggregate
+	aggregate.Self = aggregate
+
+	reset, ok := captureAggregate(aggregate)
+	require.True(t, ok)
+
+	aggregate.Count = 7
+	aggregate.Owner = nil
+	reset()
+
+	require.Zero(t, aggregate.Count)
+	require.Same(t, aggregate, aggregate.Owner, "restored to the caller's aggregate, not a detached copy")
+	require.Same(t, aggregate, aggregate.Self)
 }

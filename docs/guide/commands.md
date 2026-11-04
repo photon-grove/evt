@@ -176,4 +176,5 @@ attempts run out.
 This means handlers and `Prepare` functions can run more than once, and they have to be safe to
 repeat. The store resets the aggregate between attempts from a deep copy of its exported fields,
 including the ones an embedded struct promotes. So keep the state `Apply` changes in exported
-fields, and don't mutate the command in a handler.
+fields and dependencies (clients, locks) in unexported ones, and don't mutate the command in a
+handler.

@@ -247,18 +247,23 @@ func (store *Store) run(
 // fields — every map, slice, pointer, and nested struct, including the fields promoted from an
 // embedded struct of an unexported type — because those are exactly the state a snapshot persists,
 // so state a constructor initialized (a labels map, say) cannot be aliased and kept dirty by Apply.
-// Other unexported fields, and an embedded pointer to an unexported type, are copied shallowly. Any
-// other entity kind cannot be reset: resettable is false and reset does nothing.
+// Other unexported fields, and an embedded pointer to an unexported type, are copied shallowly, and a
+// pointer back to the entity itself stays one. A dependency held in an exported field (a client, a
+// lock) is copied like state, so keep dependencies in unexported fields. Any other entity kind
+// cannot be reset: resettable is false and reset does nothing.
 func captureAggregate(aggregate evt.Aggregate) (reset func(), resettable bool) {
 	value := reflect.ValueOf(aggregate)
 	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() || value.Elem().Kind() != reflect.Struct {
 		return func() {}, false
 	}
 
-	saved := deepCopy(value.Elem(), copied{})
+	// A field that points back at the aggregate itself keeps pointing at the caller's aggregate,
+	// not at a detached copy of it.
+	root := func() copied { return copied{{typ: value.Type(), ptr: value.Pointer()}: value} }
+	saved := deepCopy(value.Elem(), root())
 
 	// Each reset installs a fresh copy, so a later attempt cannot alias what an earlier one saved.
-	return func() { value.Elem().Set(deepCopy(saved, copied{})) }, true
+	return func() { value.Elem().Set(deepCopy(saved, root())) }, true
 }
 
 // copied remembers the copy made of each pointer, map, and slice, so a value that refers to itself
