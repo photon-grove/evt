@@ -225,19 +225,21 @@ Error() → err.Error()  // Returns underlying error message
   item, re-derive when the head is ahead); a head update that passed beside a failed event put is
   drift
 - `*StreamHeadsNotMigratedError` (`evt.ErrStreamHeadsNotMigrated`; Rust
-  `Error::StreamHeadsNotMigrated`) refuses a write to a store whose feature marker does not declare
-  `stream-heads` while the store holds data: every write path that validates the marker (commits,
-  including outcome-only and rejection commits, `PutSnapshot`, `CompactBelow`) returns it. A store
-  with no data is declared by initializing it. It is not a conflict and not transient
+  `Error::StreamHeadsNotMigrated`; TypeScript `StreamHeadsNotMigratedError`) refuses a write to a
+  store whose feature marker does not declare `stream-heads` while the store holds data: every
+  write path that validates the marker (commits, including outcome-only and rejection commits,
+  `PutSnapshot`, `CompactBelow`) returns it. A store with no data is declared by initializing it.
+  It is not a conflict and not transient
 - A store is **initialized** once, before writers start: `StoreInitializer.Initialize` (Rust
-  `FeatureMarker::initialize`, or `evt-doctor init`) declares `stream-heads` on a store that holds
-  no non-reserved item, with the same verification as the migration's declaration (on DynamoDB a
-  strongly consistent Scan, the declaration, then a second Scan that retracts it if a stream without
-  a head item appeared), and refuses a populated store with `*StreamHeadsNotMigratedError`. It is
-  idempotent, across concurrent handles included: a store that already declares the feature is
-  neither scanned nor written, two jobs initializing the same empty store let exactly one of them
-  write (the loser re-reads the manifest its conditional write guards on and reports `false`), and
-  the manifest version bumps once. It declares nothing but `stream-heads`
+  `FeatureMarker::initialize`, TypeScript `StoreInitializer.initialize`, or `evt-doctor init`)
+  declares `stream-heads` on a store that holds no non-reserved item, with the same verification
+  as the migration's declaration (on DynamoDB a strongly consistent Scan, the declaration, then a
+  second Scan that retracts it if a stream without a head item appeared), and refuses a populated
+  store with `*StreamHeadsNotMigratedError`. It is idempotent, across concurrent handles
+  included: a store that already declares the feature is neither scanned nor written, two jobs
+  initializing the same empty store let exactly one of them write (the loser re-reads the manifest
+  its conditional write guards on and reports `false`), and the manifest version bumps once. It
+  declares nothing but `stream-heads`
 - `*StoreNotInitializedError` (`evt.ErrStoreNotInitialized`; Rust `Error::StoreNotInitialized`)
   refuses every write path of a DynamoDB writer to a store that does not declare `stream-heads`,
   without scanning and without writing anything, so a DynamoDB writer never needs `dynamodb:Scan`.

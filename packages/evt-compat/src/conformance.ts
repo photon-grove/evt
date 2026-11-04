@@ -1,8 +1,9 @@
 // A backend-neutral conformance suite for Repository implementations, the TypeScript counterpart
 // of Rust's photon_evt::conformance and Go's conformance package. It checks the contract the
 // Repository interface documents: ordering, isolation, optimistic concurrency, stream heads,
-// snapshots, compaction, the budget and the reserved namespaces. Every case namespaces its entity
-// IDs and types, so a durable backend can share one table across runs.
+// snapshots, compaction, the budget, the reserved namespaces, the feature marker and the
+// rebuild-lock check. Every case namespaces its entity IDs and types, so a durable backend can
+// share one table across runs.
 //
 // The cases follow the Rust suite's, and keep its names, for what TypeScript implements so far.
 // Every step depends on the ones before it, so the cases await in loops on purpose.
@@ -13,13 +14,21 @@ import {
   CompactionUncoveredError,
   ConflictError,
   EvtError,
+  type FeatureManifest,
+  HistoryDependentProjectionError,
   type NewSnapshot,
+  RebuildInProgressError,
   type Repository,
   ReservedEntityIdError,
+  STREAM_HEADS_FEATURE,
+  STREAM_HEADS_VERSION,
   SequenceGapError,
   type SerializedEvent,
   type SerializedSnapshot,
+  type StoreInitializer,
   StreamHeadDriftError,
+  StreamHeadsNotMigratedError,
+  UnsupportedFeatureError,
   emptyMetadata,
   eventId,
   isConflict,
@@ -912,4 +921,350 @@ async function streamHeadDrift(repo: Repository, fixtures: HeadFixtures): Promis
     'a create over a stream with events and no head',
     isDrift(b.id, null, 2n),
   )
+}
+
+/**
+ * What the feature-marker cases need to change a store's control rows, which no repository call
+ * can do yet: declare features, and set the rebuild fence's rows as a rebuild would.
+ */
+export interface ControlFixtures {
+  manifest(): FeatureManifest | null | Promise<FeatureManifest | null>
+  declare(change: (draft: ManifestDraft) => void): FeatureManifest | Promise<FeatureManifest>
+  setRebuild(state: RebuildState): void | Promise<void>
+}
+
+/**
+ * The rebuild fence's rows as a commit's lock check reads them: the generation, and the lock row,
+ * which is a rebuild's lease, the item a force-release leaves in its place, or none.
+ */
+export interface RebuildState {
+  generation: bigint
+  lock: 'held' | 'forceReleased' | null
+}
+
+/** A manifest's declarable parts, which a declaration changes in place. */
+export interface ManifestDraft {
+  features: Map<string, number>
+  historyDependent: string[]
+  retention: string[]
+}
+
+/**
+ * Runs the feature-marker and rebuild-lock cases. Declarations are store-wide, so give it a store
+ * no other suite writes to at the same time. It resets the manifest to stream-heads alone and the
+ * rebuild fence to settled first, and leaves them so. The repository must initialize a store on
+ * its first write: one that refuses an uninitialized store instead reports another error where
+ * the cases take stream-heads away.
+ */
+export async function markerConformance(
+  checks: Checks,
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const cases: [string, () => Promise<void>][] = [
+    ['the manifest starts with stream-heads alone', () => resetControls(repo, controls)],
+    [
+      'a store that does not declare stream-heads refuses every write path',
+      () => unmigratedStore(repo, controls),
+    ],
+    [
+      'an unsupported declaration refuses every write path, and its removal lifts it',
+      () => unsupportedFeature(repo, controls),
+    ],
+    ['one declaration bumps the version once', () => declarationVersion(controls)],
+    [
+      'the durable historyDependent set refuses compaction',
+      () => historyDependentRefusal(repo, controls),
+    ],
+    ['the retention set is stored sorted and deduplicated', () => retentionSet(repo, controls)],
+    [
+      'an unsettled rebuild generation refuses commits, and only commits',
+      () => rebuildInProgress(repo, controls),
+    ],
+    [
+      'the marker outranks the rebuild lock, which outranks every stream check',
+      () => controlRanking(repo, controls),
+    ],
+  ]
+
+  try {
+    for (const [name, check] of cases) {
+      await checks.case(`conformance: ${name}`, check)
+    }
+  } finally {
+    await resetControls(repo, controls)
+  }
+}
+
+function streamHeadsOnly(draft: ManifestDraft): void {
+  draft.features = new Map([[STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION]])
+  draft.historyDependent = []
+  draft.retention = []
+}
+
+async function resetControls(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  await controls.setRebuild({generation: 0n, lock: null})
+  await controls.declare(streamHeadsOnly)
+
+  const manifest = await controls.manifest()
+  ensureEqual(
+    manifest && Array.from(manifest.features),
+    [[STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION]],
+    'the reset manifest declares stream-heads alone',
+  )
+  ensure(!(await repo.initialize()), 'initializing a store that declares stream-heads is a no-op')
+}
+
+function notMigrated(error: unknown): boolean {
+  return error instanceof StreamHeadsNotMigratedError && !isRetryable(error)
+}
+
+async function unmigratedStore(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const stream = new Stream(namespace(), '1')
+  await stream.commit(repo, stream.events(1, 2), stream.newSnapshot(1, '{}'))
+
+  // The store holds data, so no writer may declare stream-heads for it.
+  await controls.declare((draft) => {
+    draft.features.delete(STREAM_HEADS_FEATURE)
+  })
+  const writes: [string, () => Promise<unknown>][] = [
+    ['a commit', () => stream.commit(repo, stream.events(3, 3))],
+    ['a snapshot write', () => repo.putSnapshot(stream.snapshot(2, 2, '{}'))],
+    ['compaction', () => repo.compactBelow(stream.id, 2n)],
+    ['initialization', () => repo.initialize()],
+  ]
+  const before = await controls.manifest()
+  for (const [what, write] of writes) {
+    await expectError(write(), `${what} to a store without stream-heads`, notMigrated)
+  }
+  ensureEqual(await repo.events(stream.id), stream.events(1, 2), 'the refused writes wrote nothing')
+  ensureEqual(await controls.manifest(), before, 'the refused writes declared nothing')
+
+  await controls.declare(streamHeadsOnly)
+  await stream.commit(repo, stream.events(3, 3))
+}
+
+function unsupported(...pairs: [string, number][]) {
+  return (error: unknown): boolean =>
+    error instanceof UnsupportedFeatureError &&
+    !isRetryable(error) &&
+    canonical(error.unsupported.map((pair) => [pair.name, pair.version])) === canonical(pairs)
+}
+
+async function unsupportedFeature(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const stream = new Stream(namespace(), '1')
+  await stream.commit(repo, stream.events(1, 2), stream.newSnapshot(1, '{}'))
+
+  // A feature this package doesn't model, and one it models at another stored-format version.
+  await controls.declare((draft) => {
+    draft.features.set('journal', 1)
+  })
+  // A declaration that changes only a durable set doesn't bless the unsupported feature.
+  const refusals: [() => unknown, ReturnType<typeof unsupported>][] = [
+    [() => undefined, unsupported(['journal', 1])],
+    [
+      () => controls.declare((draft) => draft.retention.push(`${stream.entityType}-retained`)),
+      unsupported(['journal', 1]),
+    ],
+    [
+      () => controls.declare((draft) => draft.features.set(STREAM_HEADS_FEATURE, 2)),
+      unsupported(['journal', 1], [STREAM_HEADS_FEATURE, 2]),
+    ],
+  ]
+  for (const [declare, matches] of refusals) {
+    await declare()
+    const before = await controls.manifest()
+    const writes: [string, () => Promise<unknown>][] = [
+      ['a commit', () => stream.commit(repo, stream.events(3, 3))],
+      ['a snapshot write', () => repo.putSnapshot(stream.snapshot(2, 2, '{}'))],
+      ['compaction', () => repo.compactBelow(stream.id, 2n)],
+      ['initialization', () => repo.initialize()],
+    ]
+    for (const [what, write] of writes) {
+      await expectError(write(), `${what} to a store declaring unsupported features`, matches)
+    }
+    ensureEqual(await controls.manifest(), before, 'the refused writes declared nothing')
+  }
+  ensureEqual(await repo.events(stream.id), stream.events(1, 2), 'the refused writes wrote nothing')
+  ensureEqual(
+    await repo.snapshot(stream.id),
+    stream.snapshot(1, 2, '{}'),
+    'the refused snapshot write left the snapshot',
+  )
+
+  await controls.declare(streamHeadsOnly)
+  await stream.commit(repo, stream.events(3, 3))
+}
+
+async function declarationVersion(controls: ControlFixtures): Promise<void> {
+  const before = await controls.manifest()
+  const after = await controls.declare((draft) => {
+    draft.historyDependent.push('a', 'b')
+    draft.retention.push('c')
+  })
+  ensureEqual(after.version, (before?.version ?? 0n) + 1n, 'the version after one declaration')
+
+  await controls.declare(streamHeadsOnly)
+}
+
+async function historyDependentRefusal(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const ns = namespace()
+  const audited = new Stream(ns, 'audited', 'audit')
+  const plain = new Stream(ns, 'plain')
+  for (const stream of [audited, plain]) {
+    await stream.commit(repo, stream.events(1, 3), stream.newSnapshot(1, '{}'))
+  }
+
+  await controls.declare((draft) => {
+    draft.historyDependent.push(audited.entityType)
+  })
+  await expectError(
+    repo.compactBelow(audited.id, 3n),
+    'compacting a history-dependent entity type',
+    (error) =>
+      error instanceof HistoryDependentProjectionError &&
+      error.entityType === audited.entityType &&
+      error.entityId === audited.id,
+  )
+  ensureEqual(await repo.events(audited.id), audited.events(1, 3), 'the refusal deleted nothing')
+
+  ensureEqual(await repo.compactBelow(plain.id, 3n), 3, 'another entity type compacts')
+
+  // The commit path is not refused.
+  await audited.commit(repo, audited.events(4, 4))
+
+  await controls.declare(streamHeadsOnly)
+  ensureEqual(await repo.compactBelow(audited.id, 3n), 3, 'the type compacts once removed')
+}
+
+async function retentionSet(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const ns = namespace()
+  const declared = await controls.declare((draft) => {
+    draft.retention.push(`${ns}-session`, `${ns}-account`, `${ns}-session`)
+  })
+  ensureEqual(
+    declared.retention,
+    [`${ns}-account`, `${ns}-session`],
+    'the retention set is sorted and deduplicated',
+  )
+
+  // A store-wide set changes nothing for a commit that carries no fences.
+  const stream = new Stream(ns, '1', 'session')
+  await stream.commit(repo, stream.events(1, 1))
+
+  await controls.declare(streamHeadsOnly)
+}
+
+function inProgress(error: unknown): boolean {
+  return error instanceof RebuildInProgressError && isRetryable(error) && !isConflict(error)
+}
+
+async function rebuildInProgress(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const stream = new Stream(namespace(), '1')
+  await stream.commit(repo, stream.events(1, 3), stream.newSnapshot(1, '{}'))
+
+  // A held lock, then the item a force-release leaves in its place, which keeps the generation
+  // odd.
+  const unsettled: RebuildState[] = [
+    {generation: 1n, lock: 'held'},
+    {generation: 3n, lock: 'forceReleased'},
+  ]
+  for (const state of unsettled) {
+    await controls.setRebuild(state)
+    await expectError(
+      stream.commit(repo, stream.events(4, 4)),
+      `a commit while the rebuild fence is ${canonical(state)}`,
+      inProgress,
+    )
+  }
+  ensureEqual(
+    await repo.events(stream.id),
+    stream.events(1, 3),
+    'the refused commits wrote nothing',
+  )
+
+  // A snapshot write and compaction carry no lock check.
+  ensure(
+    await repo.putSnapshot(stream.snapshot(2, 3, '{}')),
+    'a snapshot write during a rebuild',
+  )
+  ensureEqual(await repo.compactBelow(stream.id, 2n), 2, 'compaction during a rebuild')
+
+  // A completed release settles the generation, even, and commits pass again.
+  await controls.setRebuild({generation: 4n, lock: null})
+  await stream.commit(repo, stream.events(4, 4))
+}
+
+async function controlRanking(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const ns = namespace()
+  const stream = new Stream(ns, '1')
+  await stream.commit(repo, stream.events(1, 2))
+  await controls.setRebuild({generation: 1n, lock: 'held'})
+
+  // A stale commit and a gap report the rebuild, not the conflict.
+  const streamFailures: [string, SerializedEvent[]][] = [
+    ['a stale commit', stream.events(2, 2)],
+    ['a gap', stream.events(4, 4)],
+  ]
+  for (const [what, events] of streamFailures) {
+    await expectError(stream.commit(repo, events), `${what} during a rebuild`, inProgress)
+  }
+
+  // A commit refused before it reaches the store keeps its own error.
+  const other = new Stream(ns, 'other')
+  const early: [string, () => Promise<unknown>, (error: unknown) => boolean][] = [
+    [
+      'an invalid commit',
+      () => repo.commit({entityId: stream.id, events: other.events(1, 1)}),
+      coded('invalidCommit'),
+    ],
+    [
+      'a reserved entity ID',
+      () => repo.commit({entityId: 'SYSTEM#ranking', events: []}),
+      (error) => error instanceof ReservedEntityIdError,
+    ],
+    [
+      'an oversized commit',
+      () => stream.commit(repo, stream.events(3, 101)),
+      (error) => error instanceof CommitTooLargeError,
+    ],
+  ]
+  for (const [what, call, matches] of early) {
+    await expectError(call(), `${what} during a rebuild`, matches)
+  }
+
+  // The marker outranks the lock.
+  await controls.declare((draft) => {
+    draft.features.set('journal', 1)
+  })
+  await expectError(
+    stream.commit(repo, stream.events(3, 3)),
+    'a commit to a store declaring an unsupported feature during a rebuild',
+    unsupported(['journal', 1]),
+  )
+
+  await controls.declare(streamHeadsOnly)
+  await controls.setRebuild({generation: 2n, lock: null})
+  await stream.commit(repo, stream.events(3, 3))
 }

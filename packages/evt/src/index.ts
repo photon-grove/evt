@@ -30,11 +30,16 @@ export {
   ConflictError,
   EvtError,
   type EvtErrorCode,
+  HistoryDependentProjectionError,
+  RebuildInProgressError,
   ReplayError,
   ReservedEntityIdError,
   SequenceGapError,
   SnapshotError,
   StreamHeadDriftError,
+  StreamHeadsNotMigratedError,
+  UnsupportedFeatureError,
+  type FeaturePair,
   isConflict,
   isRetryable,
 } from './errors.js'
@@ -47,6 +52,15 @@ export {
   encodeSnapshot,
   eventId,
 } from './event.js'
+export {
+  type FeatureManifest,
+  type ManifestTexts,
+  STREAM_HEADS_FEATURE,
+  STREAM_HEADS_VERSION,
+  SUPPORTED_FEATURES,
+  decodeManifest,
+  encodeManifest,
+} from './features.js'
 export {JsonNumber, type JsonValue, parseJson, stringifyJson} from './json.js'
 export {
   type Metadata,
@@ -56,7 +70,13 @@ export {
   emptyMetadata,
   encodeMetadata,
 } from './metadata.js'
-export type {CallOptions, Commit, NewSnapshot, Repository} from './repository.js'
+export type {
+  CallOptions,
+  Commit,
+  NewSnapshot,
+  Repository,
+  StoreInitializer,
+} from './repository.js'
 export {
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,

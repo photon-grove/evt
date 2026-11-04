@@ -3,6 +3,7 @@
 
 import {headActionSize, headUpdate} from './dynamodb/head.js'
 import {eventItem, itemSize, snapshotItem} from './dynamodb/item.js'
+import {FEATURES_PK, REBUILD_LOCK_PK} from './dynamodb/marker.js'
 import {CommitTooLargeError, EvtError, ReservedEntityIdError} from './errors.js'
 import {type SerializedEvent, type SerializedSnapshot, eventId} from './event.js'
 import {MAX_COMMIT_ITEM_BYTES} from './snapshots.js'
@@ -50,6 +51,16 @@ export interface CallOptions {
  *   stored) with a {@link ConflictError};
  * - write a commit's events, head and snapshot atomically, or nothing;
  * - refuse an entity ID in a reserved namespace on every write path, before any request;
+ * - refuse every write (a commit, a snapshot write, compaction) to a store whose feature manifest
+ *   declares a pair this package doesn't model, with an {@link UnsupportedFeatureError}, and to
+ *   one that holds data but doesn't declare stream-heads, with a
+ *   {@link StreamHeadsNotMigratedError}. A backend may declare stream-heads on a fresh store's
+ *   first commit or snapshot write;
+ * - refuse a commit, but not a snapshot write or compaction, while a projection rebuild holds the
+ *   store, with a {@link RebuildInProgressError}, after the manifest's refusals and before every
+ *   stream's;
+ * - refuse compaction of an entity whose type the manifest declares history-dependent, with a
+ *   {@link HistoryDependentProjectionError};
  * - return events in ascending sequence order, and `latest` in descending order.
  */
 export interface Repository {
@@ -88,6 +99,21 @@ export interface Repository {
   compactBelow(entityId: string, through: bigint, options?: CallOptions): Promise<number>
 }
 
+/**
+ * A repository whose store can be initialized explicitly: its feature manifest declares
+ * stream-heads before any writer writes. A backend whose writers initialize a fresh store on
+ * their first write needs it only where code treats every backend alike.
+ */
+export interface StoreInitializer {
+  /**
+   * Declares stream-heads on a store that holds no data, and resolves `true` when this call
+   * declared it. A store that already declares it is left alone and resolves `false`. One that
+   * holds data without it is refused with a {@link StreamHeadsNotMigratedError}, and one that
+   * declares an unsupported feature with an {@link UnsupportedFeatureError}.
+   */
+  initialize(options?: CallOptions): Promise<boolean>
+}
+
 /** The most actions one commit may carry, DynamoDB's transaction limit. */
 export const MAX_COMMIT_ACTIONS = 100
 
@@ -99,10 +125,6 @@ export const RESERVED_PREFIXES: readonly string[] = Object.freeze([
   'SYSTEM#',
   'command-outcome#',
 ])
-
-// The control rows every commit checks: the feature marker and the rebuild lock.
-const FEATURES_ID = 'SYSTEM#FEATURES'
-const REBUILD_LOCK_ID = 'SYSTEM#REBUILD'
 
 /** Whether an entity ID is in a reserved namespace. */
 export function isReserved(entityId: string): boolean {
@@ -188,7 +210,8 @@ export function commitSizes(
   commit: Commit,
   ttl: (entityType: string) => number | undefined,
 ): number[] {
-  const sizes = [controlCheckSize(FEATURES_ID), controlCheckSize(REBUILD_LOCK_ID)]
+  // The control rows every commit checks: the feature marker and the rebuild lock.
+  const sizes = [controlCheckSize(FEATURES_PK), controlCheckSize(REBUILD_LOCK_PK)]
   const first = commit.events[0]
   const last = commit.events.at(-1)
   if (first === undefined || last === undefined) {
