@@ -1,17 +1,22 @@
 // The storage contract every backend implements, and the commit rules every backend applies the
 // same way: validation, the reserved namespaces, and the transaction budget.
 
-import {headActionSize, headUpdate} from './dynamodb/head.js'
+import {headActionSize, headFence, headUpdate} from './dynamodb/head.js'
 import {eventItem, itemSize, snapshotItem} from './dynamodb/item.js'
 import {FEATURES_PK, REBUILD_LOCK_PK} from './dynamodb/marker.js'
 import {
   CommitTooLargeError,
   EvtError,
+  type FenceProvenance,
   ProjectorOnlyCommitError,
   ReservedEntityIdError,
+  RetentionConflictError,
+  SequenceGapError,
+  StreamHeadDriftError,
 } from './errors.js'
 import {type SerializedEvent, type SerializedSnapshot, eventId} from './event.js'
 import {MAX_COMMIT_ITEM_BYTES} from './snapshots.js'
+import {compareUtf8} from './utf8.js'
 
 /** A snapshot to write with a commit. Its event sequence is the commit's last event. */
 export interface NewSnapshot {
@@ -143,6 +148,131 @@ export interface StoreInitializer {
   initialize(options?: CallOptions): Promise<boolean>
 }
 
+/**
+ * A stream a transaction read but doesn't write, whose head must not move before it commits (ADR
+ * 0007): the fence passes while the stream's stored head still equals `head`.
+ */
+export interface ReadFence {
+  entityId: string
+  /** The stream's entity type, which a fence on a retained type is refused for. */
+  entityType: string
+  /** The head the transaction observed: 0 for a stream with no events. */
+  head: bigint
+  /** Whether the engine read the head itself, or the caller stamped it. */
+  provenance: FenceProvenance
+}
+
+/**
+ * Everything one transaction writes atomically: the streams it appends to, and fences on the
+ * streams it read. A fence on a stream the transaction also writes is dropped, since that stream's
+ * head update already conditions on the head it read. A transaction that writes nothing and fences
+ * nothing is a no-op.
+ */
+export interface TransactionCommit {
+  /** The streams written, each a {@link Commit}, at most one per stream. */
+  streams: readonly Commit[]
+  /** The streams read but not written, at most one fence per stream. */
+  fences?: readonly ReadFence[] | null | undefined
+}
+
+/**
+ * A repository that commits several streams atomically, with read fences (ADR 0004). A
+ * transaction is refused as a commit is, and also:
+ *
+ * - with `invalidCommit` when it writes a stream twice, fences a stream twice, fences at a head
+ *   below 0 or at the largest int64, or carries a snapshot for a stream it writes no events to;
+ * - with a {@link RetentionConflictError} when it fences an entity type with retention: by the
+ *   repository's own configuration before any request, and by the store's manifest after the
+ *   manifest's other refusals, but always before the rebuild lock's;
+ * - with a {@link FenceConflictError} when a fenced stream's head moved, unless the stream
+ *   drifted, ranked after every drift and gap of the transaction, in transaction order.
+ */
+export interface TransactionalRepository extends Repository {
+  /** Appends to every stream and checks every fence atomically. */
+  commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void>
+}
+
+/** A transaction as the backends write it. */
+export interface NormalizedTransaction {
+  /** The streams it writes events to, sorted by entity ID bytes, without their projections. */
+  readonly streams: readonly Commit[]
+  /** Its fences on the streams it doesn't write, sorted the same way. */
+  readonly fences: readonly ReadFence[]
+  /** The written streams' projector groups, in the order the streams were declared. */
+  readonly projections: readonly ProjectorGroup[]
+}
+
+/**
+ * Validates a transaction and puts it in the order every backend writes it: the written streams,
+ * then the fences, each sorted by entity ID bytes, the order that pins a DynamoDB transaction and
+ * PostgreSQL's locks. The projector groups keep the order the streams were declared in. Streams
+ * without events are dropped, and so are the fences on streams that write events, whose head
+ * updates condition on the head they read. A fence on a stream listed without events stays.
+ */
+export function normalizeTransaction(transaction: TransactionCommit): NormalizedTransaction {
+  const listed = new Set<string>()
+  for (const stream of transaction.streams) {
+    validateCommit(stream)
+    checkNotReserved(stream.entityId)
+    if (listed.has(stream.entityId)) {
+      throw invalidCommit(`duplicate stream ${stream.entityId}`)
+    }
+    listed.add(stream.entityId)
+  }
+
+  const fenced = new Set<string>()
+  for (const fence of transaction.fences ?? []) {
+    checkNotReserved(fence.entityId)
+    if (fence.head < 0n || fence.head >= MAX_INT64 || fenced.has(fence.entityId)) {
+      throw invalidCommit(`invalid or duplicate fence ${fence.entityId}`)
+    }
+    fenced.add(fence.entityId)
+  }
+
+  for (const stream of transaction.streams) {
+    if (stream.snapshot && stream.events.length === 0) {
+      throw invalidCommit(`the snapshot of ${stream.entityId} must cover this commit's last event`)
+    }
+  }
+
+  const written = transaction.streams.filter((stream) => stream.events.length > 0)
+  const projections = written.flatMap((stream) => stream.projections ?? [])
+  const streams = written.map((stream) => Object.assign({}, stream, {projections: undefined}))
+  streams.sort(byId)
+  const writes = new Set(streams.map((stream) => stream.entityId))
+  const fences = (transaction.fences ?? []).filter((fence) => !writes.has(fence.entityId))
+  fences.sort(byId)
+
+  return {streams, fences, projections}
+}
+
+/**
+ * Refuses a transaction that fences a retained entity type, by the store's manifest or the
+ * repository's own configuration.
+ */
+export function checkFenceRetention(
+  transaction: NormalizedTransaction,
+  retained: (entityType: string) => boolean,
+): void {
+  for (const fence of transaction.fences) {
+    if (retained(fence.entityType)) {
+      throw new RetentionConflictError(fence.entityType)
+    }
+  }
+}
+
+/**
+ * The error a failed transaction reports from the failures of its streams and fences, given in
+ * transaction order: the first drift, else the first gap, else the first of the rest.
+ */
+export function rankFailures(failures: readonly EvtError[]): EvtError | undefined {
+  return (
+    failures.find((failure) => failure instanceof StreamHeadDriftError) ??
+    failures.find((failure) => failure instanceof SequenceGapError) ??
+    failures[0]
+  )
+}
+
 /** The most actions one commit may carry, DynamoDB's transaction limit. */
 export const MAX_COMMIT_ACTIONS = 100
 
@@ -256,12 +386,41 @@ export function commitSizes(
   commit: Commit,
   ttl: (entityType: string) => number | undefined,
 ): number[] {
+  const transaction = {streams: [commit], fences: [], projections: commit.projections ?? []}
+
+  return transactionSizes(transaction, ttl)
+}
+
+/**
+ * The size of each action a transaction carries: the two control checks, every stream's projector
+ * operations, every written stream's head update, event puts and snapshot put, then a check on
+ * every fenced stream's head. Every backend budgets a transaction by these sizes.
+ */
+export function transactionSizes(
+  transaction: NormalizedTransaction,
+  ttl: (entityType: string) => number | undefined,
+): number[] {
   // The control rows every commit checks: the feature marker and the rebuild lock.
   const sizes = [controlCheckSize(FEATURES_PK), controlCheckSize(REBUILD_LOCK_PK)]
-  for (const group of commit.projections ?? []) {
+  for (const group of transaction.projections) {
     sizes.push(...group.sizes)
   }
+  for (const stream of transaction.streams) {
+    sizes.push(...streamSizes(stream, ttl))
+  }
+  for (const fence of transaction.fences) {
+    sizes.push(headActionSize(headFence(fence.entityId, fence.head)))
+  }
 
+  return sizes
+}
+
+// A written stream's actions: its head update, its event puts and its snapshot put.
+function streamSizes(
+  commit: Commit,
+  ttl: (entityType: string) => number | undefined,
+): number[] {
+  const sizes: number[] = []
   const first = commit.events[0]
   const last = commit.events.at(-1)
   if (first === undefined || last === undefined) {
@@ -309,6 +468,14 @@ export function checkBudget(sizes: readonly number[]): void {
     throw new CommitTooLargeError(sizes.length, bytes, largestItem)
   }
 }
+
+// Orders streams and fences by their entity IDs' UTF-8 bytes.
+function byId(a: {entityId: string}, b: {entityId: string}): number {
+  return compareUtf8(a.entityId, b.entityId)
+}
+
+// The largest int64, whose successor no head can reach.
+const MAX_INT64 = 2n ** 63n - 1n
 
 // A control check is sized by its key: `pk` and `sk = 0`.
 function controlCheckSize(pk: string): number {

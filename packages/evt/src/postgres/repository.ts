@@ -12,6 +12,7 @@ import {
   CompactionUncoveredError,
   ConflictError,
   EvtError,
+  FenceConflictError,
   HistoryDependentProjectionError,
   RebuildInProgressError,
   SequenceGapError,
@@ -34,13 +35,19 @@ import {decodeMetadata, emptyMetadata, encodeMetadata} from '../metadata.js'
 import {
   type CallOptions,
   type Commit,
-  type Repository,
+  type NormalizedTransaction,
   type StoreInitializer,
+  type TransactionCommit,
+  type TransactionalRepository,
   checkBudget,
+  checkFenceRetention,
   checkNotReserved,
-  commitSizes,
+  normalizeTransaction,
+  rankFailures,
+  transactionSizes,
   validateCommit,
 } from '../repository.js'
+import {compareUtf8} from '../utf8.js'
 import type {PgClient, PgConnection, PgQueryable} from './client.js'
 import {
   ENGINE_LOCK_EXCLUSIVE,
@@ -98,7 +105,7 @@ type Row = Record<string, unknown>
  * it validated. Every commit and snapshot write reads the manifest again under a shared lock that
  * no declaration can take while the write is open, and validates it again when it changed.
  */
-export class PgRepository implements Repository, StoreInitializer {
+export class PgRepository implements TransactionalRepository, StoreInitializer {
   readonly #client: PgClient
   readonly #tables: PgTables
 
@@ -171,11 +178,27 @@ export class PgRepository implements Repository, StoreInitializer {
     options?.signal?.throwIfAborted()
     validateCommit(commit)
     checkNotReserved(commit.entityId)
-    if (commit.events.length === 0) {
-      return
+    if (commit.events.length > 0) {
+      await this.#write(normalizeTransaction({streams: [commit]}), options)
     }
+  }
 
-    for (const group of commit.projections ?? []) {
+  /**
+   * Commits every stream and checks every fence in one transaction, in the order Go and Rust run
+   * it: every stream's entity lock, written and fenced, in ascending entity-ID byte order; the
+   * marker check, the fences' retention and the rebuild-lock assertion; every head statement and
+   * fence read, ranked; the event inserts; then the snapshot upserts.
+   */
+  async commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void> {
+    options?.signal?.throwIfAborted()
+    const normalized = normalizeTransaction(transaction)
+    if (normalized.streams.length > 0 || normalized.fences.length > 0) {
+      await this.#write(normalized, options)
+    }
+  }
+
+  async #write(transaction: NormalizedTransaction, options?: CallOptions): Promise<void> {
+    for (const group of transaction.projections) {
       if (group.backend !== POSTGRES_BACKEND || group.operations.length > 0) {
         throw new EvtError(
           'invalidCommit',
@@ -185,52 +208,109 @@ export class PgRepository implements Repository, StoreInitializer {
     }
 
     // Every backend budgets a commit the same way, so an oversized one fails before any request.
-    checkBudget(commitSizes(commit, () => undefined))
+    checkBudget(transactionSizes(transaction, () => undefined))
     await this.#ensureStreamHeads(options)
 
-    const {entityId, events} = commit
-    const first = events[0]!.sequence
-    const last = events.at(-1)!.sequence
     await this.#transaction(options, async (run) => {
-      await run(ENTITY_LOCK, [entityId])
-      await this.#checkManifest(run)
+      // Each stream once, in the bytewise order that also pins the transaction, so two
+      // transactions that share streams lock them in the same sequence and can't deadlock.
+      const ids = [...transaction.streams, ...transaction.fences].map(({entityId}) => entityId)
+      ids.sort(compareUtf8)
+      for (const [index, entityId] of ids.entries()) {
+        if (ids[index - 1] !== entityId) {
+          await run(ENTITY_LOCK, [entityId])
+        }
+      }
+
+      const manifest = await this.#checkManifest(run)
+      const retention = manifest.retention
+      checkFenceRetention(transaction, (entityType) => retention.includes(entityType))
       await this.#assertNoRebuildLock(run)
 
-      if (!(await this.#moveHead(run, entityId, events[0]!.entityType, first, last))) {
-        throw await this.#probe(run, entityId, first)
+      // Every head statement and fence read runs before any failure is reported, so the ranking
+      // sees them all.
+      const moved: boolean[] = []
+      for (const stream of transaction.streams) {
+        const {entityId, events} = stream
+        const first = events[0]!.sequence
+        const last = events.at(-1)!.sequence
+        moved.push(await this.#moveHead(run, entityId, events[0]!.entityType, first, last))
       }
-
-      for (const event of events) {
-        if (!(await this.#insertEvent(run, event))) {
-          // The head statement passed and the row exists: an event sits above the head. The
-          // entity lock rules out a racing writer.
-          throw drift(entityId, first - 1n, await this.#derivedHead(run, entityId))
+      const stale = []
+      for (const fence of transaction.fences) {
+        if ((await this.#storedHead(run, fence.entityId)) !== fence.head) {
+          stale.push(fence)
         }
       }
 
-      const snapshot = commit.snapshot
-      if (snapshot) {
-        const rows = await run(
-          `SELECT sequence::text AS sequence FROM ${this.#tables.snapshots} WHERE entity_id = $1`,
-          [entityId],
+      const failures: EvtError[] = []
+      for (const [index, stream] of transaction.streams.entries()) {
+        if (!moved[index]) {
+          failures.push(await this.#probe(run, stream.entityId, stream.events[0]!.sequence))
+        }
+      }
+      for (const fence of stale) {
+        // No first sequence: a fence that didn't drift is a fence conflict.
+        const verdict = await this.#probe(run, fence.entityId, 0n)
+        failures.push(
+          verdict instanceof StreamHeadDriftError
+            ? verdict
+            : new FenceConflictError(fence.entityId, fence.head, fence.provenance),
         )
-        const stored = rows[0] === undefined ? null : BigInt(text(rows[0], 'sequence'))
-        if (stored === null && snapshot.sequence !== 1n) {
-          throw new ConflictError(
-            entityId,
-            `snapshot sequence ${snapshot.sequence} has no stored predecessor`,
-          )
-        }
-        if (stored !== null && snapshot.sequence !== stored + 1n) {
-          throw new ConflictError(
-            entityId,
-            `snapshot sequence moved: stored ${stored}, commit writes ${snapshot.sequence}`,
-          )
-        }
+      }
+      const failure = rankFailures(failures)
+      if (failure !== undefined) {
+        throw failure
+      }
 
-        await this.#upsertSnapshot(run, {...snapshot, entityId, eventSequence: last})
+      for (const stream of transaction.streams) {
+        await this.#insertEvents(run, stream)
+      }
+      for (const stream of transaction.streams) {
+        await this.#writeCommitSnapshot(run, stream)
       }
     })
+  }
+
+  // A stream's event inserts, after its head statement passed. A row that already exists is an
+  // event above the head: the entity lock rules out a racing writer.
+  async #insertEvents(run: Statement, stream: Commit): Promise<void> {
+    const first = stream.events[0]!.sequence
+    for (const event of stream.events) {
+      if (!(await this.#insertEvent(run, event))) {
+        throw drift(stream.entityId, first - 1n, await this.#derivedHead(run, stream.entityId))
+      }
+    }
+  }
+
+  // A stream's commit snapshot, which must follow the stored one, as the DynamoDB put's condition
+  // requires.
+  async #writeCommitSnapshot(run: Statement, stream: Commit): Promise<void> {
+    const {entityId, snapshot} = stream
+    if (!snapshot) {
+      return
+    }
+
+    const rows = await run(
+      `SELECT sequence::text AS sequence FROM ${this.#tables.snapshots} WHERE entity_id = $1`,
+      [entityId],
+    )
+    const stored = rows[0] === undefined ? null : BigInt(text(rows[0], 'sequence'))
+    if (stored === null && snapshot.sequence !== 1n) {
+      throw new ConflictError(
+        entityId,
+        `snapshot sequence ${snapshot.sequence} has no stored predecessor`,
+      )
+    }
+    if (stored !== null && snapshot.sequence !== stored + 1n) {
+      throw new ConflictError(
+        entityId,
+        `snapshot sequence moved: stored ${stored}, commit writes ${snapshot.sequence}`,
+      )
+    }
+
+    const eventSequence = stream.events.at(-1)!.sequence
+    await this.#upsertSnapshot(run, {...snapshot, entityId, eventSequence})
   }
 
   async events(entityId: string, options?: CallOptions): Promise<SerializedEvent[]> {
@@ -376,16 +456,18 @@ export class PgRepository implements Repository, StoreInitializer {
   // The commit-time marker check, under the manifest's shared lock held to COMMIT, so a
   // declaration can't slip between the check and the write. A manifest that changed since this
   // writer validated it is validated again.
-  async #checkManifest(run: Statement): Promise<void> {
+  async #checkManifest(run: Statement): Promise<FeatureManifest> {
     await run(ENGINE_LOCK_SHARED, [featuresLockKey(this.#tables)])
     const manifest = await this.#readManifest(run)
     if (manifest !== null && manifest.version === this.#validated) {
-      return
+      return manifest
     }
 
     this.#validated = null
     checkWritable(manifest)
     this.#validated = manifest!.version
+
+    return manifest!
   }
 
   // The commit-time rebuild-lock assertion, under the rebuild fence's shared lock held to COMMIT:
