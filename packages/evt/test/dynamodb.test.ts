@@ -30,6 +30,7 @@ import {
   StreamHeadDriftError,
   TransientError,
   UnsupportedFeatureError,
+  isConflict,
   isRetryable,
 } from '../src/errors.ts'
 import {type SerializedEvent, eventId} from '../src/event.ts'
@@ -179,11 +180,14 @@ describe('DynamoRepository', () => {
     await expect(commit).rejects.toThrow(RebuildInProgressError)
   })
 
-  test('a transaction conflict is a conflict', async () => {
-    const client = new Scripted(manifest(1n), cancelled('None', 'None', 'TransactionConflict'))
-    const commit = commitOne(client)
+  test('a transaction conflict is transient, never a conflict', async () => {
+    // On the rebuild-lock check, an item no command changes: nothing the commit read went stale.
+    const client = new Scripted(manifest(1n), cancelled('None', 'TransactionConflict', 'None'))
+    const error = await commitOne(client).catch((thrown: unknown) => thrown)
 
-    await expect(commit).rejects.toThrow(ConflictError)
+    expect(error).toBeInstanceOf(TransientError)
+    expect(isConflict(error)).toBe(false)
+    expect(isRetryable(error)).toBe(true)
   })
 
   test('a throttled transaction is transient', async () => {

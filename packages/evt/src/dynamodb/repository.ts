@@ -578,11 +578,14 @@ export class DynamoRepository implements TransactionalRepository, StoreInitializ
 
     const failed = codes.indexOf(CONDITION_FAILED)
     if (failed === -1) {
+      // Another transaction was writing one of the items, perhaps one this commit never changes
+      // (a control check): nothing was written and nothing is known to be stale, so it is
+      // transient, like throttling, and never a conflict, as in Go and Rust.
       const colliding = codes.indexOf('TransactionConflict')
       if (colliding !== -1) {
-        return new ConflictError(
-          entityAt(layout, colliding),
-          'transaction conflict: another writer was committing at the same time',
+        return new TransientError(
+          `transaction conflict on ${entityAt(layout, colliding)}: another writer was committing at the same time`,
+          {cause: error},
         )
       }
       if (codes.some((code) => THROTTLED.has(code))) {

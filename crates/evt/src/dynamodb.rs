@@ -21,7 +21,7 @@ use aws_sdk_dynamodb::types::{
 };
 
 use crate::aggregate::{Aggregate, Projector};
-use crate::error::{BoxError, Error};
+use crate::error::{BoxError, Error, TransactionConflict};
 use crate::event::{SerializedEvent, SerializedSnapshot};
 use crate::features::{
     self, COMMAND_OUTCOME_PREFIX, CachedMarker, FeatureManifest, FeatureMarker, SYSTEM_PREFIX,
@@ -2063,10 +2063,9 @@ impl Repository for DynamoRepository {
                     // them retryable.
                     return Err(match classify_cancellation(0, &codes) {
                         Some(Cancellation::Throttled) => Error::Transient(Box::new(err)),
-                        Some(Cancellation::TransactionConflict) => Error::Conflict {
-                            entity_id: snapshot.entity_id.clone(),
-                            message: "transaction conflict: another writer was committing at the same time".into(),
-                        },
+                        Some(Cancellation::TransactionConflict) => Error::Transient(Box::new(
+                            TransactionConflict::new(snapshot.entity_id.clone(), err),
+                        )),
                         _ => sdk_error(err),
                     });
                 }
@@ -2465,7 +2464,8 @@ enum Cancellation {
     StreamCondition,
     /// Only projector conditions failed. Reloading cannot fix it.
     ProjectorCondition,
-    /// Another transaction was writing the same items at the same time.
+    /// Another transaction was writing the same items at the same time: transient, never a
+    /// conflict ([`TransactionConflict`]).
     TransactionConflict,
     /// DynamoDB throttled the transaction.
     Throttled,
@@ -2540,9 +2540,9 @@ fn failed_items<'a>(codes: &'a [Option<&str>], code: &'a str) -> impl Iterator<I
         .map(|(index, _)| index)
 }
 
-/// Maps a failed commit to an error. A failed stream condition or a concurrent transaction is an
-/// optimistic-concurrency conflict, and throttling is transient: `execute_with_retry` retries
-/// both. A failed projector condition is a projector error, so the command is not rerun for it.
+/// Maps a failed commit to an error. A failed stream condition is an optimistic-concurrency
+/// conflict, and throttling and a concurrent transaction ([`TransactionConflict`]) are transient:
+/// `execute_with_retry` retries both. A failed projector condition is a projector error, so the command is not rerun for it.
 ///
 /// A commit that carries an outcome (`carries_outcome`) whose result is genuinely unknown (see
 /// [`commit_result_unknown`]) is [`Error::Indeterminate`], which the store settles by re-reading the
@@ -2571,8 +2571,11 @@ where
         Some(Cancellation::StreamCondition) => {
             conflict("conditional check failed: the sequence or snapshot changed since it was read")
         }
+        // Another transaction was writing one of the items: nothing was written and nothing the
+        // commit was decided on is known to be stale, so it is transient, like throttling, and
+        // never exhausts into a stale-fence rejection.
         Some(Cancellation::TransactionConflict) => {
-            conflict("transaction conflict: another writer was committing at the same time")
+            Error::Transient(Box::new(TransactionConflict::new(entity_id.clone(), err)))
         }
         Some(Cancellation::ProjectorCondition) => Error::Projector(Box::new(err)),
         Some(Cancellation::Throttled) => Error::Transient(Box::new(err)),
@@ -5361,10 +5364,44 @@ mod tests {
         assert!(!matches!(error, Error::ProjectorOperation(_)));
     }
 
+    /// The [`TransactionConflict`] an error carries as its source, if any.
+    fn transaction_conflict(error: &Error) -> Option<&TransactionConflict> {
+        match error {
+            Error::Transient(source) => source.downcast_ref::<TransactionConflict>(),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transaction_conflict_is_transient_and_never_a_conflict() {
+        // On the rebuild-lock check (an item no command changes), on a stream's head update, and
+        // on a view item: none says that state the commit was decided on went stale.
+        for (failed, entity) in [(1, "a"), (7, "a"), (10, "b"), (4, "a")] {
+            let error = classified(&[(failed, "TransactionConflict")]).await;
+
+            assert!(
+                !error.is_conflict() && error.is_retryable(),
+                "item {failed}: {error:?}"
+            );
+            assert_eq!(
+                crate::retry::Retry::of(&error),
+                crate::retry::Retry::Transient,
+                "item {failed}: it never exhausts into a stale-fence rejection"
+            );
+            let conflict = transaction_conflict(&error).expect("a TransactionConflict source");
+            assert_eq!(conflict.entity_id.as_str(), entity, "item {failed}");
+        }
+
+        // A failed snapshot condition beside it is still a conflict: the stream moved.
+        let error = classified(&[(1, "TransactionConflict"), (9, "ConditionalCheckFailed")]).await;
+        assert!(error.is_conflict(), "{error:?}");
+        assert!(transaction_conflict(&error).is_none());
+    }
+
     #[tokio::test]
     async fn a_transaction_conflict_or_throttling_on_a_view_item_keeps_its_classification() {
         let error = classified(&[(4, "TransactionConflict")]).await;
-        assert!(error.is_conflict() && error.is_retryable(), "{error:?}");
+        assert!(transaction_conflict(&error).is_some(), "{error:?}");
 
         let error = classified(&[(4, "ThrottlingError")]).await;
         assert!(matches!(error, Error::Transient(_)), "{error:?}");
